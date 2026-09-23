@@ -13,7 +13,7 @@ wired  retainer_config
 wired  bans
 wired  alarms
 wired  monitor
-facade slow_subs           T-73
-facade slow_subs_settings  T-73
+wired  slow_subs
+wired  slow_subs_settings
 facade traces              T-74
 facade tracing             T-74

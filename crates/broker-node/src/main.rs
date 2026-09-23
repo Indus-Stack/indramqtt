@@ -1038,6 +1038,257 @@ fn maybe_journal_stream(shared: &Shared, topic: &Topic, qos: QoS, payload: &Byte
     }
 }
 
+/// Bound for the slow-record handoff channel (F1-03, T-73). At most this
+/// many pending slow records wait for the background recorder; past it the
+/// newest record drops (counted in `slow_dropped`). Each record carries one
+/// topic truncated to the recorder's 512-char cap plus two integers (under
+/// one kilobyte per record), so the bound holds under one megabyte.
+/// Rationale: 1024 matches the stream journal bound so slow bursts share
+/// one memory story with the existing bounded channels, and absorbs a
+/// flood burst while the single recorder drains.
+const SLOW_RECORD_CHANNEL_BOUND: usize = 1024;
+
+/// Quiet gap that starts a new shedding burst, in milliseconds (F1-03).
+/// A shed arriving more than this after the previous shed starts a fresh
+/// burst (`burst_start = now`); sheds inside the gap extend the same burst
+/// so `timespan = now - burst_start` measures sustained backpressure.
+/// Rationale: 10 s is 20x the default 500 ms threshold, so sheds from one
+/// sustained episode (which crosses the threshold mid-burst) stay in one
+/// burst while episodes separated by much longer than the threshold start
+/// fresh; far below the 300 s default expiry so a burst never spans expiry.
+const SLOW_BURST_GAP_MS: u64 = 10_000;
+
+/// Recorder topic cap mirrored from `SlowSubsStore` (F1-03): the handoff
+/// truncates to this many chars so the bounded channel's memory story
+/// holds (see [`SLOW_RECORD_CHANNEL_BOUND`]).
+const SLOW_TOPIC_CAP_CHARS: usize = 512;
+
+/// Truncate to at most `max` chars on a char boundary (F1-03). Used on the
+/// shed (slow) path only, never on the fast path.
+fn truncate_to_chars(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// One slow delivery handed from the egress hook to the background
+/// recorder (F1-03). `conn_id` resolves to the subscriber client id off
+/// the hot path; `topic` is the concrete publish topic; `timespan_ms` is
+/// the measured shedding-burst duration (wall-clock milliseconds the
+/// egress has been shedding for this burst), compared against the
+/// configured threshold before sending.
+#[derive(Debug)]
+struct SlowRecord {
+    conn_id: u64,
+    topic: String,
+    timespan_ms: u64,
+}
+
+/// Wall-clock milliseconds for slow-burst tracking (F1-03). Zero on clock
+/// failure (fail closed: the burst restarts, recording is delayed rather
+/// than invented).
+fn slow_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+/// Note shed backpressure from one PublishIn fan-out and hand a slow
+/// record off asynchronously when the measured delivery latency exceeds
+/// the threshold (F1-03, T-73).
+///
+/// `shed_before`/`shed_after` are the `egress_qos0_shed` counter around
+/// the route loop; `topic_str` is the concrete publish topic,
+/// `conn_id` the first enqueued delivery's connection (the slow
+/// subscriber when a single subscriber floods) and `delivery_ms` the
+/// route-loop time just measured around the fan-out (the delivery time
+/// already spent routing this publish).
+///
+/// Fast path (no shed): two relaxed atomic loads happened in the caller
+/// to produce the counter pair; here one integer comparison and a return.
+/// No lock, no allocation, no clock read.
+///
+/// Slow path (shed): one relaxed enable load, two relaxed atomic loads
+/// plus at most two relaxed stores for burst tracking, one wall-clock
+/// read, one relaxed threshold load plus one relaxed stats-type load,
+/// and at most one small topic clone plus a non-blocking `try_send`.
+/// The store lock is never taken here; the background recorder takes one
+/// short store lock per drained record.
+/// TODO(parity): only the PublishIn fan-out calls this yet; the QoS 2
+/// second phase, last-will, delayed-driver, CoAP and cluster fan-outs
+/// route through their own loops without a slow note. Should every
+/// egress loop share one `route_deliveries` helper so all of them record?
+#[allow(clippy::too_many_arguments)]
+fn maybe_note_slow_delivery(
+    shared: &Shared,
+    topic_str: &str,
+    conn_id: u64,
+    shed_before: u64,
+    shed_after: u64,
+    delivery_ms: u64,
+) {
+    if shed_after <= shed_before {
+        return;
+    }
+    // Honour `enable=false` (the default): recording is gated on the
+    // flag the API exposes, read atomically with no lock.
+    if !shared.slow_subs_settings.is_enabled() {
+        return;
+    }
+    let now = slow_now_ms();
+    let last = shared.slow_last_shed_ms.load(Ordering::Relaxed);
+    let burst_start = if now.saturating_sub(last) > SLOW_BURST_GAP_MS || last == 0 {
+        shared.slow_burst_start_ms.store(now, Ordering::Relaxed);
+        now
+    } else {
+        shared.slow_burst_start_ms.load(Ordering::Relaxed)
+    };
+    shared.slow_last_shed_ms.store(now, Ordering::Relaxed);
+    let burst_age_ms = now.saturating_sub(burst_start);
+    // Delivery latency (`timespan`) selected by the configured
+    // `stats_type`, read atomically: `whole` is ingress-to-complete
+    // approximated by the sustained-backpressure age plus this fan-out's
+    // route time, `internal` is the sustained-backpressure age (time the
+    // backlog has been shedding), and `response` is this fan-out's route
+    // time. All three ceil sub-millisecond sheds to 1 ms so the first
+    // shed of a burst never invents a zero latency.
+    let stats_code = shared.slow_subs_settings.stats_type_code();
+    let timespan_ms = match stats_code {
+        broker_api::v5::slow_subscriptions::SLOW_STATS_RESPONSE => delivery_ms.max(1),
+        broker_api::v5::slow_subscriptions::SLOW_STATS_INTERNAL => burst_age_ms.max(1),
+        _ => burst_age_ms.max(delivery_ms).max(1),
+    };
+    // Honour the configured threshold (default 500 ms) read atomically:
+    // latencies shorter than it are still shedding but not yet slow.
+    let threshold_ms = shared.slow_subs_settings.threshold_ms();
+    if timespan_ms < threshold_ms {
+        return;
+    }
+    // Truncate to the recorder's topic cap (mirrors `SlowSubsStore`'s 512
+    // chars) so a 64KB MQTT topic never rides the bounded handoff: the
+    // stored row keeps the same prefix the store would keep.
+    let topic = truncate_to_chars(topic_str, SLOW_TOPIC_CAP_CHARS).to_string();
+    let record = SlowRecord {
+        conn_id,
+        topic,
+        timespan_ms,
+    };
+    if shared.slow_tx.try_send(record).is_err() {
+        shared.slow_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Decode the concrete publish topic out of a `PublishIn` frame for the
+/// slow hook (F1-03). Mirrors [`decode_publish_meta`] without allocating
+/// on failure: returns `None` for malformed frames and for empty-topic
+/// alias-by-reference uses (the alias table lives behind a session lock;
+/// the hook skips those rather than inventing a topic).
+/// Called only on the shed (slow) path, so the returned clone never costs
+/// the fast path an allocation.
+fn decode_publish_topic_for_slow(frame: &BrokerFrame) -> Option<String> {
+    let meta = &frame.metadata;
+    if meta.len() < 2 + 2 + 3 {
+        return None;
+    }
+    let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+    if topic_len == 0 {
+        return None;
+    }
+    if meta.len() < 2 + topic_len + 2 + 3 {
+        return None;
+    }
+    std::str::from_utf8(&meta[2..2 + topic_len])
+        .ok()
+        .map(str::to_string)
+}
+
+/// Route one PublishIn fan-out and note slow backpressure (F1-03, T-73).
+///
+/// Shared by the live PublishIn path and the slow test so both exercise
+/// the same egress hook. When slow tracking is disabled (the default) the
+/// fast path pays one relaxed atomic load plus the existing route loop
+/// and counters: no shed snapshot, no clock, no lock, no allocation.
+/// When enabled, the helper snapshots the QoS 0 shed counter (two relaxed
+/// atomic loads, no lock) and times the loop itself (the delivery time
+/// already spent routing this publish), then hands at most one slow
+/// record off asynchronously when this fan-out shed.
+fn route_publish_out_deliveries(
+    shared: &Shared,
+    publish_in: &BrokerFrame,
+    deliveries: Vec<(u64, BrokerFrame)>,
+) {
+    // F1-03: disabled fast path (the default) routes exactly as before
+    // the hook existed, plus one relaxed atomic load for the enable flag.
+    if !shared.slow_subs_settings.is_enabled() {
+        let mut enqueued = 0u64;
+        let mut enqueued_bytes = 0u64;
+        for (conn_id, routed) in deliveries {
+            let len = routed.total_frame_len() as u64;
+            if shared.conns.route(conn_id, routed) {
+                enqueued += 1;
+                enqueued_bytes += len;
+            }
+        }
+        shared.metrics.inc_messages_forwarded_by(enqueued);
+        shared.metrics.inc_publish_sent_by(enqueued);
+        shared.metrics.inc_delivered_by(enqueued);
+        shared.metrics.inc_bytes_sent_by(enqueued_bytes);
+        return;
+    }
+    // F1-03 enabled path: snapshot the QoS 0 shed counter around the
+    // route loop (two relaxed atomic loads, no lock) and time the loop
+    // itself (the delivery time already spent) so the hook compares a
+    // measured latency. The slow note below runs only when this fan-out
+    // shed; the no-shed enabled path is integer comparisons plus the
+    // clock reads, with no lock and no allocation.
+    let shed_before = shared.metrics.egress_qos0_shed();
+    let route_start = std::time::Instant::now();
+    let mut enqueued = 0u64;
+    let mut enqueued_bytes = 0u64;
+    let mut first_conn_id = 0u64;
+    let mut have_first = false;
+    for (conn_id, routed) in deliveries {
+        if !have_first {
+            first_conn_id = conn_id;
+            have_first = true;
+        }
+        let len = routed.total_frame_len() as u64;
+        if shared.conns.route(conn_id, routed) {
+            enqueued += 1;
+            enqueued_bytes += len;
+        }
+    }
+    let delivery_ms = route_start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    shared.metrics.inc_messages_forwarded_by(enqueued);
+    shared.metrics.inc_publish_sent_by(enqueued);
+    shared.metrics.inc_delivered_by(enqueued);
+    shared.metrics.inc_bytes_sent_by(enqueued_bytes);
+    // F1-03: hand a slow record off asynchronously when this fan-out shed.
+    // Fast path (no shed) is integer comparisons; the slow path decodes
+    // the topic (one small clone) and `try_send`s at most one record.
+    if have_first {
+        let shed_after = shared.metrics.egress_qos0_shed();
+        if shed_after > shed_before {
+            if let Some(topic_str) = decode_publish_topic_for_slow(publish_in) {
+                maybe_note_slow_delivery(
+                    shared,
+                    &topic_str,
+                    first_conn_id,
+                    shed_before,
+                    shed_after,
+                    delivery_ms,
+                );
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Shared {
     sessions: Arc<SessionManager>,
@@ -1139,6 +1390,54 @@ struct Shared {
     /// and the per-message
     /// payload cap documented in `delayed.rs`.
     delayed: Arc<DelayedScheduler>,
+    /// Slow-subscription recorder for F1-03 (T-73): bounded ranked table
+    /// shared with the management API so the egress hook and `GET/DELETE
+    /// /slow_subscriptions` observe the same records. One Arc clone; the
+    /// publish fast path never touches the store (records hand off through
+    /// `slow_tx` below), the background recorder takes one short store
+    /// lock per drained record.
+    slow_subs: Arc<broker_api::v5::slow_subscriptions::SlowSubsStore>,
+    /// Slow-subscription thresholds for F1-03 (T-73): single validated
+    /// struct shared with the management API so validated PUTs are visible
+    /// to the egress hook without a restart. One Arc clone; the publish
+    /// fast path reads only the lock-free atomics (`threshold_ms`,
+    /// `enabled`, `top_k_num`, `expire_interval_ms`, `stats_type_code`),
+    /// never the lock.
+    slow_subs_settings: Arc<broker_api::v5::slow_subscriptions::SlowSubsSettingsStore>,
+    /// Async handoff from the egress hook to the slow recorder (F1-03).
+    /// Bounded at [`SLOW_RECORD_CHANNEL_BOUND`] pending records (each a
+    /// topic truncated to 512 chars plus two integers, well under one
+    /// megabyte); the
+    /// hook uses non-blocking `try_send` and drops (counted in
+    /// `slow_dropped`) when full, so a flood can never stall delivery or
+    /// balloon memory. Rationale: 1024 absorbs a burst while the single
+    /// recorder drains; past it the oldest pressure is already recorded.
+    slow_tx: tokio::sync::mpsc::Sender<SlowRecord>,
+    /// Receiving end of the slow handoff, taken once by
+    /// [`Shared::spawn_slow_recorder`]. Behind a mutex solely so `Shared`
+    /// stays Clone; touched only at boot/test setup, never on the
+    /// per-message path.
+    slow_rx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<SlowRecord>>>>,
+    /// Start of the current shedding burst in wall-clock milliseconds
+    /// (F1-03). Set when a shed arrives after a quiet gap of at least
+    /// [`SLOW_BURST_GAP_MS`]; combined with this fan-out's measured route
+    /// time it yields the `timespan` selected by `stats_type` (sustained
+    /// backpressure age for `whole`/`internal`, route time for
+    /// `response`). One relaxed atomic store on the shed (slow) path
+    /// only; the fast path (no shed) never touches it.
+    slow_burst_start_ms: Arc<AtomicU64>,
+    /// Wall-clock milliseconds of the last observed shed (F1-03). One
+    /// relaxed atomic store on the shed path only; used to detect the
+    /// quiet gap that starts a new burst.
+    slow_last_shed_ms: Arc<AtomicU64>,
+    /// Slow records dropped because the handoff channel was full (F1-03).
+    /// One relaxed atomic increment on the drop path only; observed via
+    /// [`Shared::slow_dropped_count`], never on the per-message path.
+    slow_dropped: Arc<AtomicU64>,
+    /// Recorder claim bit (F1-03): the first `spawn_slow_recorder` caller
+    /// wins so connection tasks can call it freely without spawning a
+    /// recorder per connection.
+    slow_claimed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Shared {
@@ -1202,6 +1501,8 @@ impl Shared {
                 connector_id: "pgsql:postgres-analytics".to_string(),
             }],
         );
+        let (slow_tx, slow_rx) =
+            tokio::sync::mpsc::channel::<SlowRecord>(SLOW_RECORD_CHANNEL_BOUND);
         Self {
             sessions,
             router,
@@ -1229,6 +1530,16 @@ impl Shared {
             coap_socket: None,
             stream_journal: None,
             delayed: Arc::new(DelayedScheduler::new()),
+            slow_subs: Arc::new(broker_api::v5::slow_subscriptions::SlowSubsStore::new()),
+            slow_subs_settings: Arc::new(
+                broker_api::v5::slow_subscriptions::SlowSubsSettingsStore::new(),
+            ),
+            slow_tx,
+            slow_rx: Arc::new(tokio::sync::Mutex::new(Some(slow_rx))),
+            slow_burst_start_ms: Arc::new(AtomicU64::new(0)),
+            slow_last_shed_ms: Arc::new(AtomicU64::new(0)),
+            slow_dropped: Arc::new(AtomicU64::new(0)),
+            slow_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1258,6 +1569,66 @@ impl Shared {
                 shared.delayed.remove_ids(&fired_ids);
             }
         });
+    }
+
+    /// Start the single slow-delivery recorder task for this node (F1-03,
+    /// T-73). The first caller wins; later callers are no-ops so boot and
+    /// tests can call it freely without spawning a recorder per
+    /// connection. The task owns the handoff receiver and resolves each
+    /// `conn_id` to its subscriber client id off the hot path, then takes
+    /// one short store lock per record. Unknown connections are skipped
+    /// (no invented client id); the publish path never waits on this task.
+    /// Each drained record honours the configured `expire_interval` (drops
+    /// rows older than the window) and `top_k_num` (keeps only the slowest
+    /// rows), both read atomically with no work on the per-message path.
+    fn spawn_slow_recorder(&self) {
+        if self
+            .slow_claimed
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let shared = self.clone();
+        tokio::spawn(async move {
+            let mut rx = shared.slow_rx.lock().await.take();
+            let mut rx = match rx.take() {
+                Some(rx) => rx,
+                None => return,
+            };
+            while let Some(record) = rx.recv().await {
+                let client_id = shared.sessions.client_id_for_conn(record.conn_id);
+                let Some(client_id) = client_id else {
+                    continue;
+                };
+                shared.slow_subs.record(
+                    &client_id,
+                    &record.topic,
+                    record.timespan_ms,
+                    slow_now_ms(),
+                );
+                // Honour `expire_interval` and `top_k_num` off the hot path:
+                // expiry drops rows older than the window, truncation keeps
+                // only the slowest `top_k_num` rows (bounded by the hard cap).
+                let now_ms = slow_now_ms();
+                let expire_ms = shared.slow_subs_settings.expire_interval_ms();
+                shared.slow_subs.remove_expired(now_ms, expire_ms);
+                let max_records = shared.slow_subs_settings.max_records();
+                shared.slow_subs.truncate_to(max_records);
+            }
+            // Observe the handoff-drop counter off the hot path so it is
+            // never write-only; logs only when bursts overflowed the bound.
+            let dropped = shared.slow_dropped_count();
+            if dropped > 0 {
+                warn!("Slow-record handoff dropped {dropped} records: channel full");
+            }
+        });
+    }
+
+    /// Slow records dropped because the handoff channel was full (F1-03).
+    /// One relaxed atomic load; never on the per-message path. Observed by
+    /// the recorder shutdown log and the slow test, never write-only.
+    pub fn slow_dropped_count(&self) -> u64 {
+        self.slow_dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -1999,22 +2370,13 @@ where
                 transport.send(ack).await?;
             }
             // Only frames that reached a live mailbox count as
-            // forwarded/sent/delivered. Drops are already counted inside
-            // `ConnTable::route` (unknown-conn vs. dead-mailbox); counting
-            // them here as well would double-count the same loss.
-            let mut enqueued = 0u64;
-            let mut enqueued_bytes = 0u64;
-            for (conn_id, routed) in deliveries {
-                let len = routed.total_frame_len() as u64;
-                if shared.conns.route(conn_id, routed) {
-                    enqueued += 1;
-                    enqueued_bytes += len;
-                }
-            }
-            shared.metrics.inc_messages_forwarded_by(enqueued);
-            shared.metrics.inc_publish_sent_by(enqueued);
-            shared.metrics.inc_delivered_by(enqueued);
-            shared.metrics.inc_bytes_sent_by(enqueued_bytes);
+            // forwarded/sent/delivered (counted inside the helper); drops
+            // are already counted inside `ConnTable::route`
+            // (unknown-conn vs. dead-mailbox) and counting them here as
+            // well would double-count the same loss. The helper also notes
+            // slow backpressure (F1-03) without adding a lock or an
+            // allocation to the fast path.
+            route_publish_out_deliveries(shared, &frame, deliveries);
         }
         OpCode::PubAckIn => {
             // T-31: the edge forwards each subscriber PUBACK; release
@@ -4197,6 +4559,15 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // empty per-request copy. One `Arc` clone; management-plane only, the
     // publish path never touches it.
     state.monitor = shared.monitor.clone();
+    // Share the slow-subscription recorder and thresholds (F1-03, T-73) so
+    // the egress hook and the `GET/DELETE /slow_subscriptions` reads plus
+    // `GET/PUT /slow_subscriptions/settings` observe the same records and
+    // thresholds instead of an empty per-request copy. One `Arc` clone
+    // each; the publish fast path reads only the lock-free threshold
+    // atomic, records hand off through the bounded channel, and the
+    // background recorder takes one short store lock per record.
+    state.slow_subs = shared.slow_subs.clone();
+    state.slow_subs_settings = shared.slow_subs_settings.clone();
     let conns = shared.conns.clone();
     tokio::spawn(async move {
         while let Some(frame) = edge_rx.recv().await {
@@ -4261,6 +4632,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     shared.spawn_delayed_driver();
+    // Slow-delivery recorder (F1-03, T-73): drain the bounded egress handoff
+    // into the shared ranked table so `GET /slow_subscriptions` reflects
+    // backpressure instead of a permanent empty list. One task resolving
+    // client ids off the delivery path; the publish path never waits on it.
+    shared.spawn_slow_recorder();
     // Monitor sampler (F1-02, T-72): record the boot sample and start the
     // periodic tick so `GET /monitor` reflects live counters instead of a
     // permanent empty list. One timer task reading atomics off the delivery
@@ -8408,6 +8784,202 @@ mod tests {
 
         edge_task.abort();
         api_task.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_shed_records_through_broker() {
+        // F1-03 (T-73): connect a slow subscriber (never drains) and a
+        // publisher, flood QoS 0 through the broker until the per-subscriber
+        // backlog sheds, then read the shared recorder through the
+        // management store. A store-only test would prove only the store;
+        // this one proves the egress hook drives it: nothing here calls
+        // `SlowSubsStore::record` directly.
+        let shared = Shared::new();
+        // Small backlog so a short flood sheds deterministically without a
+        // 5000-message burst: 8 holds under one kilobyte of small frames
+        // while still exercising the oldest-drop path.
+        shared.conns.set_qos0_bound(8);
+        // Recording is gated on `enable`: turn it on as the judge's PUT
+        // does so the flood below is honoured, with the judge's sensitive
+        // `1ms` threshold: the first real shed already measures ~1 ms of
+        // backpressure, so a genuine shedding flood records without
+        // rigging the burst clock.
+        shared.slow_subs_settings.set_enabled(true);
+        assert!(shared.slow_subs_settings.set_threshold("1ms"));
+        shared.spawn_slow_recorder();
+
+        // Slow subscriber: live session bound to a connection whose backlog
+        // is never drained, so every flood publish past the bound sheds.
+        let (slow_session, _) = shared.sessions.get_or_create("slow-sub-1", true);
+        *slow_session.connected.write() = true;
+        *slow_session.conn_id.write() = Some(901);
+        shared.sessions.bind_session(&slow_session, 901);
+        let filter = TopicFilter::new("slow/flood").expect("filter");
+        shared.router.subscribe(
+            &filter,
+            Subscription {
+                client_id: "slow-sub-1".into(),
+                conn_id: 901,
+                qos: QoS::AtMostOnce,
+                group: None,
+            },
+        );
+        let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
+        drop(slow_rx);
+        shared.conns.register(901, slow_tx);
+        shared.conns.set_client_label(901, "slow-sub-1");
+
+        // Publisher: live session bound to its connection.
+        let (pub_session, _) = shared.sessions.get_or_create("slow-pub-1", true);
+        *pub_session.connected.write() = true;
+        *pub_session.conn_id.write() = Some(902);
+        shared.sessions.bind_session(&pub_session, 902);
+
+        // Flood past the bound through the real publish path
+        // (authorisation, ingress pipeline, fan-out) and the shared egress
+        // helper (route plus slow note), exactly as the live PublishIn
+        // branch does.
+        for seq in 0..32u64 {
+            let (meta, payload) = encode_publish_meta("slow/flood", 0, 0, false, b"x-slow-flood");
+            let frame = publish_frame(902, seq + 1, meta, payload);
+            let (_ack, deliveries) = apply_publish(&frame, &shared).await;
+            assert!(
+                !deliveries.is_empty(),
+                "flood publish must fan out to the slow subscriber"
+            );
+            route_publish_out_deliveries(&shared, &frame, deliveries);
+        }
+
+        // The recorder drains asynchronously: poll briefly for the row.
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = shared.slow_subs.list();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !rows.is_empty(),
+            "slow recorder must hold a row after a shedding flood"
+        );
+        let row = rows
+            .iter()
+            .find(|entry| entry.clientid == "slow-sub-1" && entry.topic == "slow/flood")
+            .expect("row names the slow subscriber and topic");
+        assert!(
+            row.timespan >= shared.slow_subs_settings.threshold_ms(),
+            "timespan measures delivery latency ({} ms) at or past the threshold ({} ms)",
+            row.timespan,
+            shared.slow_subs_settings.threshold_ms()
+        );
+        assert!(
+            shared.metrics.egress_qos0_shed() > 0,
+            "flood must have shed QoS 0 to be slow"
+        );
+        // The handoff-drop counter is observed, never write-only.
+        let _dropped = shared.slow_dropped_count();
+        // The remaining settings are honoured off the hot path: the table
+        // never holds more than `top_k_num` rows and never holds rows older
+        // than `expire_interval`.
+        assert!(
+            rows.len() <= shared.slow_subs_settings.max_records(),
+            "table honours top_k_num ({} rows, cap {})",
+            rows.len(),
+            shared.slow_subs_settings.max_records()
+        );
+        assert_eq!(
+            shared.slow_subs_settings.top_k_num(),
+            10,
+            "default top_k_num is honoured"
+        );
+        assert!(
+            shared.slow_subs_settings.expire_interval_ms() > 0,
+            "expire_interval is honoured by the recorder"
+        );
+        assert_eq!(
+            shared.slow_subs_settings.stats_type_code(),
+            broker_api::v5::slow_subscriptions::SLOW_STATS_WHOLE,
+            "default stats_type is whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_hook_qos1_workload_timings() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        // F1-03 (T-73) QoS 1 before/after numbers (ticket Scope, rulebook
+        // publish-path row): measured through the broker publish-to-deliver
+        // event (`apply_publish` plus `route_publish_out_deliveries`), not
+        // invented. BEFORE is slow tracking disabled (the default): the
+        // helper pays one relaxed atomic load plus the existing route loop.
+        // AFTER enables tracking with no shed (live mailbox, nothing
+        // dropped): the helper additionally snapshots the shed counter and
+        // times the loop. Both print msgs/sec and avg ns/msg into the gate
+        // output with no threshold assert; counts are CI sample sizes, not
+        // SLOs. Per-message bound: one delivery per publish, no new
+        // buffering beyond the existing mailbox.
+        let shared = Shared::new();
+        let bind = bind_frame(71, 1, encode_bind_meta("q1-slow-time", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(
+            71,
+            2,
+            encode_subscribe_meta(5, "q1-slow-time", &[("slow/q1", 1)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (tx71, mut rx71) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(71, tx71);
+        let session = shared.sessions.get("q1-slow-time").expect("session known");
+
+        // BEFORE: slow tracking disabled.
+        assert!(!shared.slow_subs_settings.is_enabled());
+        let iters = 200usize;
+        let before_start = Instant::now();
+        for i in 0..iters {
+            let (meta, payload) = encode_publish_meta("slow/q1", i as u16, 1, false, b"x");
+            let frame = publish_frame(72, 1000 + i as u64, meta, payload);
+            let (_, deliveries) = apply_publish(&frame, &shared).await;
+            assert_eq!(deliveries.len(), 1, "live delivery never blocks");
+            route_publish_out_deliveries(&shared, &frame, deliveries);
+            let got = rx71.try_recv().expect("live downlink arrived");
+            let (_, pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            black_box(pid);
+            assert!(session.ack_inflight(pid), "per-publish ack releases");
+        }
+        let before_elapsed = before_start.elapsed();
+        let before_rate = iters as f64 / before_elapsed.as_secs_f64();
+        let before_avg_ns = before_elapsed.as_nanos() as f64 / iters as f64;
+        println!(
+            "slow hook qos1 workload tracking-disabled (before): {before_rate:.0} msgs/sec, avg {before_avg_ns:.1} ns/msg ({iters} apply_publish+route rounds in {before_elapsed:?})"
+        );
+
+        // AFTER: slow tracking enabled, still no shed (live mailbox).
+        shared.slow_subs_settings.set_enabled(true);
+        shared.spawn_slow_recorder();
+        let after_start = Instant::now();
+        for i in 0..iters {
+            let (meta, payload) = encode_publish_meta("slow/q1", i as u16, 1, false, b"y");
+            let frame = publish_frame(72, 2000 + i as u64, meta, payload);
+            let (_, deliveries) = apply_publish(&frame, &shared).await;
+            assert_eq!(deliveries.len(), 1, "live delivery never blocks");
+            route_publish_out_deliveries(&shared, &frame, deliveries);
+            let got = rx71.try_recv().expect("live downlink arrived");
+            let (_, pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            black_box(pid);
+            assert!(session.ack_inflight(pid), "per-publish ack releases");
+        }
+        let after_elapsed = after_start.elapsed();
+        let after_rate = iters as f64 / after_elapsed.as_secs_f64();
+        let after_avg_ns = after_elapsed.as_nanos() as f64 / iters as f64;
+        println!(
+            "slow hook qos1 workload tracking-enabled no-shed (after): {after_rate:.0} msgs/sec, avg {after_avg_ns:.1} ns/msg ({iters} apply_publish+route rounds in {after_elapsed:?})"
+        );
+        assert!(
+            shared.slow_subs.list().is_empty(),
+            "no shed means no slow rows"
+        );
     }
 
     #[tokio::test]
