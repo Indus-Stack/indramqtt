@@ -268,7 +268,24 @@ struct Args {
     /// inbound aliases (alias-carrying publishes are rejected).
     #[arg(long, default_value_t = broker_session::DEFAULT_TOPIC_ALIAS_MAXIMUM)]
     topic_alias_maximum: u16,
+
+    /// Monitor sampling interval in seconds (F1-02, T-72): how often the
+    /// background sampler copies live counters into the bounded monitor
+    /// ring behind `GET /monitor`. Default 10 keeps four hours of history
+    /// in the 1440-point ring (one point holds nineteen integers, well
+    /// under one megabyte) while waking the timer six times a minute;
+    /// each tick does a handful of atomic loads plus one short ring lock.
+    /// Clamped to 1..3600 at boot; 0 records a single boot sample and
+    /// disables the periodic tick (tests and one-shot runs).
+    #[arg(long, default_value_t = DEFAULT_MONITOR_SAMPLE_SECS)]
+    monitor_sample_secs: u64,
 }
+
+/// Default monitor sampling interval in seconds (F1-02, T-72). Ten seconds
+/// keeps four hours of history in the 1440-point ring while waking the
+/// sampler six times a minute; each tick reads atomics only, so the cost
+/// stays far below the per-message path.
+const DEFAULT_MONITOR_SAMPLE_SECS: u64 = 10;
 
 /// Map an inbound frame to its synchronous reply, if any.
 ///
@@ -1054,6 +1071,12 @@ struct Shared {
     /// events (trial/expiry/grace/lapse/ceiling) are visible via the API.
     /// One Arc clone; management-plane only.
     alarms: Arc<broker_api::v5::alarms::AlarmStore>,
+    /// Monitor history ring shared with the management API (F1-02, T-72)
+    /// so the sampler below and the `GET /monitor` reads observe the same
+    /// bounded buffer. One Arc clone; the sampler takes one short write
+    /// lock per tick, reads take one short read lock, and the publish
+    /// path never touches it.
+    monitor: Arc<broker_api::v5::monitor::MonitorHistory>,
     /// Cluster routing plane. `None` runs standalone; `Some` announces
     /// local subscriptions and forwards each publish once per matching
     /// remote node (single forward per node; remotes fan out locally).
@@ -1191,6 +1214,7 @@ impl Shared {
             bans: Arc::new(broker_api::v5::banned::BanStore::new()),
             licence: Arc::new(broker_api::licence::LicenceStore::new()),
             alarms: Arc::new(broker_api::v5::alarms::AlarmStore::new()),
+            monitor: Arc::new(broker_api::v5::monitor::MonitorHistory::new()),
             cluster: None,
             metrics,
             stats,
@@ -1818,6 +1842,64 @@ async fn sync_retained_stat(shared: &Shared) {
         Ok(matched) => shared.stats.set_retained(matched.len() as u64),
         Err(e) => warn!("Retained recount failed: {}", e),
     }
+}
+
+/// Current Unix time in seconds for monitor points. Zero on clock failure
+/// (fail closed: the point still records, ordered before real samples).
+fn monitor_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Sample live counters into the shared monitor ring (F1-02, T-72).
+///
+/// Off the delivery path by construction: reads only lock-free atomics
+/// (`Metrics` loads plus the `StatsStore` snapshot the lifecycle points
+/// keep exact), then takes one short ring write lock to push the point.
+/// The publish path never touches `Shared.monitor`, so a slow management
+/// read can never stall fan-out or fan-in. Constant-time per tick and
+/// bounded by `MAX_MONITOR_SAMPLES` in the ring.
+// TODO(parity): the ring shape carries durable/validation/transformation
+// and action counters that no kernel subsystem records yet; samples read
+// zero there until those subsystems report. Which counters should the
+// sampler combine next?
+fn sample_monitor(shared: &Shared) {
+    let conns = shared.metrics.connections_active().max(0) as u64;
+    let counters = broker_api::v5::monitor::LiveCounters {
+        connections: conns,
+        live_connections: conns,
+        topics: shared.stats.topics(),
+        subscriptions: shared.stats.subscriptions(),
+        received: shared.metrics.messages_received(),
+        sent: shared.metrics.messages_forwarded(),
+        dropped: shared.metrics.messages_dropped(),
+        rules_matched: shared.metrics.rules_executed(),
+    };
+    shared.monitor.capture_live(monitor_now_secs(), counters);
+}
+
+/// Spawn the monitor sampler (F1-02, T-72): one immediate boot sample so
+/// `GET /monitor` is never a permanent empty list, then one sample per
+/// `interval_secs`. The task owns only a `Shared` clone and sleeps between
+/// ticks, so it adds no lock, allocation or unbounded work to the publish
+/// or deliver path.
+fn spawn_monitor_sampler(shared: Shared, interval_secs: u64) {
+    sample_monitor(&shared);
+    if interval_secs == 0 {
+        return;
+    }
+    // Bound the timer: faster than one second wakes the task for no
+    // visible gain (points carry one-second stamps), slower than one hour
+    // leaves the history stale past the four-hour ring window.
+    let clamped = interval_secs.clamp(1, 3600);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(clamped)).await;
+            sample_monitor(&shared);
+        }
+    });
 }
 
 /// Process one frame from the edge: direct replies go back on our own
@@ -4110,6 +4192,11 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Arc clone each; management-plane only, never on the delivery path.
     state.licence = shared.licence.clone();
     state.alarms = shared.alarms.clone();
+    // Share the monitor ring (F1-02, T-72) so the kernel sampler and the
+    // `GET /monitor` reads observe the same bounded buffer instead of an
+    // empty per-request copy. One `Arc` clone; management-plane only, the
+    // publish path never touches it.
+    state.monitor = shared.monitor.clone();
     let conns = shared.conns.clone();
     tokio::spawn(async move {
         while let Some(frame) = edge_rx.recv().await {
@@ -4174,6 +4261,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     shared.spawn_delayed_driver();
+    // Monitor sampler (F1-02, T-72): record the boot sample and start the
+    // periodic tick so `GET /monitor` reflects live counters instead of a
+    // permanent empty list. One timer task reading atomics off the delivery
+    // path; see `spawn_monitor_sampler` for the interval bounds.
+    spawn_monitor_sampler(shared.clone(), args.monitor_sample_secs);
     // Offline queue durability (B4-06): back every detached durable
     // session's queue with `<data-dir>/offline`, then rebuild the
     // in-memory index from it so a restart replays instead of losing the
@@ -8231,6 +8323,87 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).expect("clients is JSON"),
             serde_json::json!(["metrics-probe"])
+        );
+
+        edge_task.abort();
+        api_task.abort();
+    }
+
+    #[tokio::test]
+    async fn monitor_sampler_records_live_traffic_through_broker() {
+        // F1-02 (T-72): connect, subscribe and publish through the broker,
+        // sample the live counters the way the timer does, then read the
+        // shared ring through the management API. A store-only test would
+        // prove only the store; this one proves the kernel drives it.
+        let shared = Shared::new();
+
+        // Management API on an ephemeral port, sharing node state
+        // (including the monitor ring via `serve_api`).
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind api");
+        let api_port = api_listener.local_addr().expect("api addr").port();
+        let api_task = tokio::spawn(serve_api(api_listener, shared.clone()));
+
+        // One edge connection: bind, subscribe, publish.
+        let bl_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let bl_addr = bl_listener.local_addr().expect("local addr");
+        let edge_shared = shared.clone();
+        let edge_task = tokio::spawn(async move {
+            let (stream, _) = bl_listener.accept().await.expect("accept");
+            handle_connection(stream, edge_shared)
+                .await
+                .expect("handle");
+        });
+
+        let client = bind_client(bl_addr, 802, "monitor-probe", true).await;
+        client
+            .send(subscribe_frame(
+                802,
+                2,
+                encode_subscribe_meta(3, "monitor-probe", &[("mon/+", 0)]),
+            ))
+            .await
+            .expect("subscribe");
+        let suback = client.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+        let (meta, payload) = encode_publish_meta("mon/1", 0, 0, false, b"x");
+        client
+            .send(publish_frame(802, 3, meta, payload))
+            .await
+            .expect("publish");
+        // Drain our own delivery so the mailbox cannot back up the test.
+        let delivered = client.recv().await.expect("recv delivery");
+        assert_eq!(delivered.header.opcode, OpCode::PublishOut);
+
+        // Timer tick after traffic: copy the live counters into the ring
+        // exactly as the background sampler does (atomics only, one short
+        // ring lock, never on the publish path).
+        sample_monitor(&shared);
+
+        let token = http_admin_token(api_port).await;
+        let (status, body) =
+            http_request_text(api_port, "GET", "/api/v5/monitor", None, Some(&token)).await;
+        assert_eq!(status, 200);
+        let rows: serde_json::Value = serde_json::from_str(&body).expect("monitor is JSON");
+        let rows = rows.as_array().expect("monitor history is an array");
+        assert!(!rows.is_empty(), "monitor must hold samples after traffic");
+        let latest = rows.last().expect("newest sample");
+        assert!(
+            latest["time_stamp"].as_u64().expect("time stamp") > 0,
+            "sample carries a time stamp: {latest}"
+        );
+        assert!(
+            latest["received"].as_u64().expect("received") >= 1,
+            "sample reflects the publish: {latest}"
+        );
+        assert!(
+            latest["sent"].as_u64().expect("sent") >= 1,
+            "sample reflects the delivery: {latest}"
+        );
+        assert!(
+            latest["connections"].as_u64().expect("connections") >= 1,
+            "sample reflects the connection: {latest}"
         );
 
         edge_task.abort();
