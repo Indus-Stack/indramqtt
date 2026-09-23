@@ -13,7 +13,9 @@
 //!   append additionally calls `sync_data` before returning. A crash then
 //!   loses at most the single append racing the crash; a torn tail is
 //!   truncated at the last good frame on the next load and counted, never
-//!   served. Cost: one `fsync` per buffered message (typically 0.1-1 ms).
+//!   served. Cost: one `fsync` per buffered message; the per-message cost
+//!   is measured by the pipeline's disconnect-reconnect BENCH workload,
+//!   never stated here.
 //! - With [`FsyncPolicy::NoSync`] bytes are only flushed to the OS. A
 //!   process crash keeps flushed data, but a power loss can lose the page
 //!   cache tail. Use it only for benchmarks where losing the tail is
@@ -49,9 +51,21 @@
 //! delivery path (detached sessions have no live traffic).
 //!
 //! Locking: the store itself holds no locks (each call opens, writes and
-//! closes its file). Callers serialize per-session appends under the
-//! session's own offline-queue lock so file order always matches queue
-//! order. No new lock is added to the publish or deliver path.
+//! closes its file). Callers serialize per-session file mutations under
+//! the session's own persist mutex so file order always matches queue
+//! order; the per-session queue lock is taken only for the memory push or
+//! snapshot, never held across file I/O. No new lock is added to the live
+//! publish or deliver path: files are touched only for detached durable
+//! matches, and live deliveries to connected sessions never touch a file
+//! or either lock.
+//!
+//! Rewrite temps: every `rewrite` writes a unique `.<key>.<pid>.<seq>.tmp`
+//! and renames it into place, so a crash between create and rename can
+//! leave an orphan temp behind. `open_with_config` sweeps those orphans
+//! (every `*.tmp` regular file in the directory, best effort) before
+//! returning, so no orphan survives an open: the bound is zero orphan
+//! temps after boot, and the sweep itself runs once per open (boot only,
+//! one directory listing) instead of per message.
 
 use super::stream::FsyncPolicy;
 use crate::{Result, StorageError};
@@ -121,6 +135,13 @@ pub struct OfflineQueueStore {
     fsync: FsyncPolicy,
     recovery_torn: AtomicU64,
     persist_failed: AtomicU64,
+    /// Monotonic writer nonce for unique rewrite temp files. Each
+    /// `rewrite` claims one value and embeds it in its temp name alongside
+    /// the client key, so two concurrent rewrites for one client (or two
+    /// clients at once) never share a temp path and rename atomically into
+    /// place. Unbounded in practice (u64); one increment per rewrite on the
+    /// detached-buffer path only.
+    tmp_seq: AtomicU64,
 }
 
 impl OfflineQueueStore {
@@ -132,17 +153,21 @@ impl OfflineQueueStore {
         Self::open_with_config(dir, OfflineConfig::default())
     }
 
-    /// Open (or create) the store in `dir` with `config`.
+    /// Open (or create) the store in `dir` with `config`. Sweeps orphan
+    /// rewrite temps left by a crash (see the module docs) before
+    /// returning so they cannot accumulate across restarts.
     pub fn open_with_config(dir: impl AsRef<Path>, config: OfflineConfig) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| {
             StorageError::Engine(format!("cannot create offline dir {}: {e}", dir.display()))
         })?;
+        sweep_orphan_tmps(&dir);
         Ok(Self {
             dir,
             fsync: config.fsync,
             recovery_torn: AtomicU64::new(0),
             persist_failed: AtomicU64::new(0),
+            tmp_seq: AtomicU64::new(0),
         })
     }
 
@@ -285,10 +310,20 @@ impl OfflineQueueStore {
         for record in records {
             bytes.extend_from_slice(&encode_frame(&encode_record(record)));
         }
+        // Unique temp per write: client key plus a monotonic counter (and
+        // pid so two processes on one directory never share a path).
+        // Renamed atomically into place; fsynced before the rename under
+        // `EveryWrite` so the durable queue never exposes a half-written
+        // file. Temp names end in `.tmp`, never `.log`, so `client_ids`
+        // never lists them; a crash between create and rename leaves an
+        // orphan that the next `open_with_config` sweeps (see
+        // `sweep_orphan_tmps`), so orphans cannot accumulate.
+        let seq = self.tmp_seq.fetch_add(1, Ordering::SeqCst);
         let tmp = self.dir.join(format!(
-            ".{}.{}.tmp",
+            ".{}.{}.{}.tmp",
             encode_client(client_id),
-            std::process::id()
+            std::process::id(),
+            seq
         ));
         let ok = (|| -> std::io::Result<()> {
             use std::io::Write as _;
@@ -501,6 +536,27 @@ fn truncate_to(path: &Path, len: u64) {
 fn sync_dir_best_effort(dir: &Path) {
     if let Ok(file) = std::fs::File::open(dir) {
         file.sync_all().ok();
+    }
+}
+
+/// Remove orphan rewrite temps (`*.tmp`) left when a crash landed
+/// between temp create and rename. Best effort: unreadable directories
+/// and per-file failures are ignored (the next open retries). Runs once
+/// per open (boot only, one directory listing), never per message, so the
+/// sweep itself is bounded and off the publish path.
+fn sweep_orphan_tmps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".tmp") {
+            continue;
+        }
+        std::fs::remove_file(entry.path()).ok();
     }
 }
 

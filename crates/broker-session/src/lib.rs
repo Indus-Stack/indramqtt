@@ -77,6 +77,15 @@ pub struct Session {
     /// [`SessionManager::set_offline_store`]; read once per buffer/drain
     /// (one short lock, never held across file I/O or the queue lock).
     offline_store: RwLock<Option<Arc<OfflineQueueStore>>>,
+    /// Serializes this session's durable queue file mutations (append,
+    /// eviction rewrite, drain delete, confirm rewrite). Held across the
+    /// file append, the memory push and any eviction rewrite so concurrent
+    /// buffers for the same detached client keep file order equal to queue
+    /// order; the queue lock itself is taken only for the memory section
+    /// in between, never across file I/O, so queue readers never wait for
+    /// an fsync. One mutex per session, detached-buffer path only; live
+    /// deliveries to connected sessions never touch it or a file.
+    offline_persist: std::sync::Mutex<()>,
     /// QoS 1 downlinks written toward the subscriber and not yet
     /// acknowledged (T-31). Held in delivery order so reconnect replay
     /// resends oldest-first with DUP set. Bounded per session by the
@@ -403,6 +412,7 @@ impl Session {
             subscriptions: RwLock::new(HashMap::new()),
             offline_queue: RwLock::new(VecDeque::new()),
             offline_store: RwLock::new(None),
+            offline_persist: std::sync::Mutex::new(()),
             inflight: RwLock::new(VecDeque::new()),
             inflight_spill: RwLock::new(VecDeque::new()),
             spill_count: AtomicUsize::new(0),
@@ -894,10 +904,13 @@ impl Session {
     /// memory queue, so an acknowledged publish that buffered here has
     /// already reached stable storage. Evictions past the cap rewrite the
     /// file from the surviving snapshot (`O(cap)`, bounded by the cap,
-    /// detached path only). The per-session queue lock is held across the
-    /// file append so concurrent buffers for the same detached client
-    /// keep file order equal to queue order; cross-client publishes never
-    /// share this lock, and live deliveries to connected sessions never
+    /// detached path only). The per-session persist mutex (not the queue
+    /// lock) is held across the file append, the memory push and any
+    /// eviction rewrite so concurrent buffers for the same detached client
+    /// keep file order equal to queue order; the queue lock itself is taken
+    /// only for the memory section in between, never across file I/O, so
+    /// queue readers never wait for an fsync. Cross-client publishes never
+    /// share either lock, and live deliveries to connected sessions never
     /// touch a file. A failed append queues nothing (fail closed): it is
     /// counted in the store and logged, the memory copy is dropped, and
     /// `false` is returned so the kernel publish path withholds the QoS 1
@@ -930,32 +943,51 @@ impl Session {
             payload: message.payload.clone(),
             publish_at_ms: message.publish_at_ms,
         };
-        let mut queue = self.offline_queue.write();
+        // One writer per client queue: the persist mutex stays held across
+        // the file append, the memory push and any eviction rewrite, so a
+        // concurrent buffer for the same client cannot append between the
+        // snapshot and the file replace and be clobbered, matching
+        // `confirm_offline_consumed`. The queue lock is taken only for the
+        // memory section in between, never across file I/O.
+        // Detached-buffer path only; live deliveries never touch either
+        // lock or a file.
+        let _persist = self
+            .offline_persist
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Err(e) = store.append(&self.client_id, &record) {
             tracing::warn!("Offline queue persist failed for {}: {e}", self.client_id);
             return false;
         }
-        let mut evicted = false;
-        if let Some(limit) = limit {
-            let limit = limit.max(1);
-            while queue.len() >= limit {
-                queue.pop_front();
-                evicted = true;
+        let snapshot: Option<Vec<OfflineRecord>> = {
+            let mut queue = self.offline_queue.write();
+            let mut evicted = false;
+            if let Some(limit) = limit {
+                let limit = limit.max(1);
+                while queue.len() >= limit {
+                    queue.pop_front();
+                    evicted = true;
+                }
             }
-        }
-        queue.push_back(message);
-        if evicted {
-            let snapshot: Vec<OfflineRecord> = queue
-                .iter()
-                .map(|queued| OfflineRecord {
-                    topic: queued.topic.clone(),
-                    qos: queued.qos,
-                    retain: queued.retain,
-                    payload: queued.payload.clone(),
-                    publish_at_ms: queued.publish_at_ms,
-                })
-                .collect();
-            drop(queue);
+            queue.push_back(message);
+            if evicted {
+                Some(
+                    queue
+                        .iter()
+                        .map(|queued| OfflineRecord {
+                            topic: queued.topic.clone(),
+                            qos: queued.qos,
+                            retain: queued.retain,
+                            payload: queued.payload.clone(),
+                            publish_at_ms: queued.publish_at_ms,
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        };
+        if let Some(snapshot) = snapshot {
             if let Err(e) = store.rewrite(&self.client_id, &snapshot) {
                 tracing::warn!("Offline queue rewrite failed for {}: {e}", self.client_id);
                 return false;
@@ -1002,7 +1034,10 @@ impl Session {
     /// durable store is installed the queue file is deleted alongside, so
     /// a restart after the handoff replays nothing (replay hands each
     /// entry to the new connection exactly once per drain, matching the
-    /// previous memory-only semantics).
+    /// previous memory-only semantics). The persist mutex is held across
+    /// the memory drain and the file delete so a concurrent buffer cannot
+    /// append between them and be lost; the queue lock itself is taken
+    /// only for the drain.
     ///
     /// Only for paths where the handoff is already complete (tests,
     /// management drains). The reconnect-replay path must use
@@ -1010,11 +1045,17 @@ impl Session {
     /// [`Session::confirm_offline_consumed`] so the file survives until
     /// each entry has reached the new mailbox.
     pub fn drain_offline(&self) -> Vec<QueuedMessage> {
+        let store = self.offline_store.read().clone();
+        let Some(store) = store else {
+            return self.offline_queue.write().drain(..).collect();
+        };
+        let _persist = self
+            .offline_persist
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let drained: Vec<QueuedMessage> = self.offline_queue.write().drain(..).collect();
         if !drained.is_empty() {
-            if let Some(store) = self.offline_store.read().clone() {
-                store.remove(&self.client_id);
-            }
+            store.remove(&self.client_id);
         }
         drained
     }
@@ -1024,8 +1065,18 @@ impl Session {
     /// entries first and then calls
     /// [`Session::confirm_offline_consumed`]: a crash between this drain
     /// and the confirm still finds the file on disk and replays
-    /// at-least-once instead of losing the backlog (fail closed).
+    /// at-least-once instead of losing the backlog (fail closed). Takes
+    /// the persist mutex for the drain so the drain pairs with the
+    /// confirm's rewrite under the same serialization as concurrent
+    /// buffers; no file I/O happens here.
     pub fn take_offline_retained(&self) -> Vec<QueuedMessage> {
+        if self.offline_store.read().is_some() {
+            let _persist = self
+                .offline_persist
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            return self.offline_queue.write().drain(..).collect();
+        }
         self.offline_queue.write().drain(..).collect()
     }
 
@@ -1052,26 +1103,34 @@ impl Session {
             }
             return;
         };
-        let mut queue = self.offline_queue.write();
-        if !unrouted.is_empty() {
-            let arrivals: Vec<QueuedMessage> = queue.drain(..).collect();
-            queue.extend(unrouted);
-            queue.extend(arrivals);
-        }
-        let snapshot: Vec<OfflineRecord> = queue
-            .iter()
-            .map(|queued| OfflineRecord {
-                topic: queued.topic.clone(),
-                qos: queued.qos,
-                retain: queued.retain,
-                payload: queued.payload.clone(),
-                publish_at_ms: queued.publish_at_ms,
-            })
-            .collect();
-        // The queue lock stays held across the rewrite so a concurrent
-        // `push_offline_with_limit` append cannot slip between the
-        // snapshot and the file replace and be clobbered. Detached-buffer
-        // path only; live deliveries never touch this lock or a file.
+        // The persist mutex stays held across the merge and the file
+        // rewrite so a concurrent `push_offline_with_limit` append cannot
+        // slip between the snapshot and the file replace and be
+        // clobbered. The queue lock is taken only for the merge and
+        // snapshot, never across the rewrite. Detached-buffer path only;
+        // live deliveries never touch either lock or a file.
+        let _persist = self
+            .offline_persist
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let snapshot: Vec<OfflineRecord> = {
+            let mut queue = self.offline_queue.write();
+            if !unrouted.is_empty() {
+                let arrivals: Vec<QueuedMessage> = queue.drain(..).collect();
+                queue.extend(unrouted);
+                queue.extend(arrivals);
+            }
+            queue
+                .iter()
+                .map(|queued| OfflineRecord {
+                    topic: queued.topic.clone(),
+                    qos: queued.qos,
+                    retain: queued.retain,
+                    payload: queued.payload.clone(),
+                    publish_at_ms: queued.publish_at_ms,
+                })
+                .collect()
+        };
         if let Err(e) = store.rewrite(&self.client_id, &snapshot) {
             tracing::warn!(
                 "Offline queue confirm rewrite failed for {}: {e}",
@@ -1888,6 +1947,123 @@ mod tests {
         // A clean start discards the previous durable queue by definition.
         manager.get_or_create("durable-restore-1", true);
         assert!(store.client_ids().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_offline_concurrent_enqueue_evict_survives_restart() {
+        // Lost-update guard: concurrent enqueue plus eviction for one
+        // client, and for two clients at once, through the session API the
+        // broker calls on deliver to an offline session
+        // (`SessionManager::queue_offline` -> `push_offline_with_limit` on
+        // the disconnect-buffer event). After the join every message not
+        // deliberately evicted by the bound is present after a restart from
+        // disk, by id, with no tolerance.
+        use std::collections::HashSet;
+
+        fn payload_id(id: u32) -> Bytes {
+            Bytes::from(id.to_be_bytes().to_vec())
+        }
+
+        fn payload_to_id(payload: &Bytes) -> u32 {
+            let bytes: [u8; 4] = payload.as_ref().try_into().expect("4-byte id payload");
+            u32::from_be_bytes(bytes)
+        }
+
+        fn message(id: u32) -> QueuedMessage {
+            QueuedMessage {
+                topic: Topic::new("job/queue").unwrap(),
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                payload: payload_id(id),
+                publish_at_ms: None,
+            }
+        }
+
+        let dir = unique_offline_dir("concurrent");
+        let store = Arc::new(OfflineQueueStore::open(&dir).expect("open offline store"));
+        // Finite cap with its reason: one dead client cannot balloon the
+        // node past `cap` entries (see DEFAULT_MAX_OFFLINE_QUEUE); the
+        // small test cap forces eviction rewrites on every push past it.
+        let cap = 100usize;
+        let manager = Arc::new(SessionManager::new_with_limits(Some(cap)));
+        manager.set_offline_store(store.clone());
+        for client in ["conc-a", "conc-b"] {
+            let (session, _) = manager.get_or_create(client, false);
+            *session.connected.write() = false;
+            *session.conn_id.write() = None;
+        }
+
+        // Distinct id spaces per client so a cross-client clobber is
+        // visible as a missing or foreign id. Four writers per client race
+        // appends and eviction rewrites for the same queue, while both
+        // clients' rewrites race each other for temp files.
+        let threads_per_client = 4usize;
+        let per_thread = 50usize;
+        std::thread::scope(|scope| {
+            for (client_index, client) in ["conc-a", "conc-b"].iter().enumerate() {
+                let base = (client_index as u32) * 100_000;
+                for writer in 0..threads_per_client {
+                    let manager = manager.clone();
+                    let client = client.to_string();
+                    scope.spawn(move || {
+                        let start = base + (writer as u32) * (per_thread as u32);
+                        for offset in 0..(per_thread as u32) {
+                            assert!(manager.queue_offline(&client, message(start + offset)));
+                        }
+                    });
+                }
+            }
+        });
+
+        for (client_index, client) in ["conc-a", "conc-b"].iter().enumerate() {
+            let base = (client_index as u32) * 100_000;
+            let pushed: HashSet<u32> = (0..(threads_per_client * per_thread) as u32)
+                .map(|offset| base + offset)
+                .collect();
+            let session = manager.get(client).expect("session known");
+            assert_eq!(session.offline_len(), cap);
+            let memory_ids: Vec<u32> = session
+                .take_offline_retained()
+                .iter()
+                .map(|queued| payload_to_id(&queued.payload))
+                .collect();
+            // Restore the memory queue: the snapshot above is ground truth
+            // for what the bound deliberately kept.
+            for id in &memory_ids {
+                session.push_restored_with_limit(vec![message(*id)], Some(cap));
+            }
+            assert_eq!(memory_ids.len(), cap);
+            let memory_set: HashSet<u32> = memory_ids.iter().copied().collect();
+            assert_eq!(memory_set.len(), cap, "survivors must be distinct");
+            for id in &memory_ids {
+                assert!(pushed.contains(id), "survivor {id} was never pushed");
+            }
+            // Restart from disk: the file must hold exactly the survivors
+            // in order, with no torn tail and no lost update.
+            let reopened = OfflineQueueStore::open(&dir).expect("reopen offline store");
+            let (loaded, torn) = reopened.load(client);
+            assert_eq!(torn, 0, "concurrent rewrites must not tear the file");
+            let disk_ids: Vec<u32> = loaded
+                .iter()
+                .map(|record| payload_to_id(&record.payload))
+                .collect();
+            assert_eq!(disk_ids, memory_ids, "disk must match memory exactly");
+        }
+
+        // The manager restore path rebuilds the same survivors detached.
+        let fresh = SessionManager::new_with_limits(Some(cap));
+        fresh.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&dir).expect("reopen offline store"),
+        ));
+        let stats = fresh.restore_offline_queues();
+        assert_eq!(stats.clients, 2);
+        assert_eq!(stats.messages, 2 * cap);
+        assert_eq!(stats.torn, 0);
+        for client in ["conc-a", "conc-b"] {
+            assert_eq!(fresh.get(client).expect("restored").offline_len(), cap);
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
