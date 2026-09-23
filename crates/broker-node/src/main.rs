@@ -13,7 +13,8 @@ use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{
-    InflightMessage, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage, SessionManager,
+    InflightMessage, InflightTrackOutcome, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage,
+    SessionManager,
 };
 use broker_storage::stream::{DurableStreamStore, StreamConfig};
 use broker_storage::{MemoryStore, RetainedStore};
@@ -108,6 +109,25 @@ struct Args {
     /// msg/s without drops.
     #[arg(long, default_value_t = broker_router::DEFAULT_QOS0_BACKLOG)]
     qos0_backlog: usize,
+
+    /// Per-session QoS 1 inflight window bound (B4-01). Each live session
+    /// tracks at most this many unacknowledged QoS 1 downlinks in the
+    /// fast in-memory window; past it overflow spills into the bounded
+    /// per-session spill buffer (still tracked for DUP redelivery).
+    /// Default 100 caps per-session live unacked state near 100 small
+    /// frames while absorbing a short ack stall without spilling.
+    #[arg(long, default_value_t = broker_session::DEFAULT_MAX_QOS1_INFLIGHT)]
+    qos1_inflight_window: usize,
+
+    /// Per-session QoS 1 spill bound past the window (B4-01). Overflow
+    /// beyond the window is still delivered live once and tracked here
+    /// for oldest-first DUP replay; past window + spill the newest live
+    /// delivery stays untracked (counted). Default 1000 (10x the window)
+    /// absorbs roughly a 1 s burst at 1k msg/s from a stalled
+    /// acknowledger while keeping per-session tracked memory bounded
+    /// near 1,100 messages total.
+    #[arg(long, default_value_t = broker_session::DEFAULT_MAX_QOS1_SPILL)]
+    qos1_spill: usize,
 
     /// CoAP gateway UDP listen address (B1-04). Empty disables the
     /// gateway (the default): nothing listens, nothing is dispatched,
@@ -1851,12 +1871,14 @@ async fn apply_subscribe(
 }
 
 /// Replay a resumed durable session's backlog onto its new connection:
-/// unacknowledged QoS 1 downlinks first (T-31, DUP set, original order,
-/// same packet ids), then uncompleted QoS 2 downlinks (D1-01, in queued
-/// order: PUBLISH with DUP set while waiting for PUBREC, PUBREL while
-/// waiting for PUBCOMP), then the offline queue of never-routed messages.
-/// Runs after the `SessionBinding` reply so the edge always observes
-/// binding before backlog. Returns the replayed frame count.
+/// unacknowledged QoS 1 window downlinks first (T-31, DUP set, original
+/// order, same packet ids), then the QoS 1 spill overflow (B4-01, DUP
+/// set, arrival order, same packet ids), then uncompleted QoS 2
+/// downlinks (D1-01, in queued order: PUBLISH with DUP set while waiting
+/// for PUBREC, PUBREL while waiting for PUBCOMP), then the offline queue
+/// of never-routed messages. Runs after the `SessionBinding` reply so
+/// the edge always observes binding before backlog. Returns the replayed
+/// frame count.
 async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
     let req = match decode_bind_meta(&frame.metadata) {
         Ok(req) => req,
@@ -1892,6 +1914,52 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
             if shared.conns.route(frame.header.conn_id, routed) {
                 replayed_bytes += len;
                 replayed += 1;
+            }
+        }
+    }
+    // B4-01: spilled overflow replays immediately after the window, in
+    // arrival order, with DUP set and the original packet ids. Entries
+    // stay held until their PUBACK like the window. This consults the
+    // spilled state written by `build_downlink_frames` on the
+    // publish-to-delivery event; driven by the reconnect (SessionBinding)
+    // event. Each mailbox arrival also bumps `inflight_spill_replayed`
+    // so spill redelivery is never silent. The spill snapshot (one Vec
+    // alloc sized by the spill length plus one frame alloc per spilled
+    // message, all bounded by max_spill) runs only when spill is
+    // non-empty (one relaxed atomic load via `has_spill`);
+    // steady-state reconnect with empty spill allocates exactly what the
+    // window replay allocated before B4-01. Spill-nonempty snapshot
+    // throughput is printed by
+    // `broker-session::test_qos1_inflight_hot_path_timings` (slow-path
+    // section); broker delivery/replay workload before/after numbers
+    // (steady-state `apply_publish` rate as the pre-change baseline vs
+    // spill-overflow and `replay_offline` rates) are printed by
+    // `qos1_inflight_delivery_workload_timings`; functional spill replay
+    // through this path is asserted by
+    // `qos1_inflight_spill_redelivers_everything_with_dup`.
+    if session.has_spill() {
+        for held in session.inflight_spill_snapshot() {
+            let topic_str = held.topic.as_str();
+            let mut meta = Vec::with_capacity(2 + topic_str.len() + 2 + 3);
+            meta.extend_from_slice(&(topic_str.len() as u16).to_be_bytes());
+            meta.extend_from_slice(topic_str.as_bytes());
+            meta.extend_from_slice(&held.packet_id.to_be_bytes());
+            meta.push(u8::from(held.qos));
+            meta.push(u8::from(held.retain));
+            meta.push(1u8); // dup: redelivery of a spilled unacked downlink
+            if let Ok(routed) = BrokerFrame::new(
+                OpCode::PublishOut,
+                frame.header.conn_id,
+                0, // stamped per-destination by ConnTable::route
+                Bytes::from(meta),
+                held.payload.clone(),
+            ) {
+                let len = routed.total_frame_len() as u64;
+                if shared.conns.route(frame.header.conn_id, routed) {
+                    replayed_bytes += len;
+                    replayed += 1;
+                    shared.metrics.inc_inflight_spill_replayed();
+                }
             }
         }
     }
@@ -2760,7 +2828,8 @@ fn build_downlink_frames(
     // `Bytes::clone` bumps a refcount without copying the bytes, so an
     // 8 KB publish fanned out to N subscribers costs one 8 KB buffer
     // plus N small handles. Per-subscriber memory stays bounded by the
-    // existing queue caps (`MAX_OFFLINE_QUEUE`, `MAX_QOS1_INFLIGHT`,
+    // existing queue caps (`MAX_OFFLINE_QUEUE`, the QoS 1 window
+    // `DEFAULT_MAX_QOS1_INFLIGHT` plus spill `DEFAULT_MAX_QOS1_SPILL`,
     // `MAX_QOS2_INFLIGHT`, the `ConnTable` QoS 0 bound); it is never
     // N copies of the payload. Clone once here so every per-subscriber
     // `clone` below shares this single root.
@@ -2779,22 +2848,38 @@ fn build_downlink_frames(
                         } else {
                             session.next_packet_id()
                         };
-                        // T-31: hold every QoS 1 downlink from the moment
-                        // it is written until its PUBACK arrives. At the
-                        // per-session bound the frame still goes out live
-                        // once but is left untracked (counted), so the
-                        // live delivery rate never pays for the window.
-                        // QoS 0 never touches session state here.
+                        // B4-01: hold every QoS 1 downlink from the moment
+                        // it is written until its PUBACK arrives. Inside
+                        // the window this is one bounded deque push under
+                        // a single lock with no allocation beyond the
+                        // message itself, so the publish fast path pays
+                        // nothing for the bound. Past the window the entry
+                        // spills into the bounded overflow buffer (still
+                        // tracked for DUP replay, counted); past window +
+                        // spill the frame still goes out live once but is
+                        // left untracked (counted), so the live delivery
+                        // rate never pays for the window. QoS 0 never
+                        // touches session state here. Driven by the
+                        // publish-to-delivery event. Before/after
+                        // delivery-workload numbers for this path are
+                        // printed by
+                        // `qos1_inflight_delivery_workload_timings`.
                         if effective == 1 {
-                            let tracked = session.track_inflight(InflightMessage {
+                            match session.track_inflight_or_spill(InflightMessage {
                                 packet_id: downlink_id,
                                 topic: topic.clone(),
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                 retain,
                                 payload: shared.clone(),
-                            });
-                            if !tracked {
-                                metrics.inc_inflight_dropped();
+                            }) {
+                                InflightTrackOutcome::Tracked => {}
+                                InflightTrackOutcome::Spilled => {
+                                    metrics.inc_inflight_spilled();
+                                }
+                                InflightTrackOutcome::Dropped => {
+                                    metrics.inc_inflight_dropped();
+                                    metrics.inc_inflight_spill_evicted();
+                                }
                             }
                         }
                         // D1-01: hold every QoS 2 downlink until its
@@ -3243,6 +3328,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the shared delivery table before any edge binds. One atomic store
     // at boot; the hot publish path pays a single relaxed load.
     shared.conns.set_qos0_bound(args.qos0_backlog);
+    // B4-01: apply the configured QoS 1 window and spill bounds to the
+    // session manager before any edge binds. Two atomic stores at boot;
+    // future sessions inherit them at creation, and the publish fast
+    // path pays one relaxed load for the window check only.
+    shared
+        .sessions
+        .set_max_qos1_inflight(args.qos1_inflight_window);
+    shared.sessions.set_max_qos1_spill(args.qos1_spill);
     // Config registry: create the data dir when missing, then load
     // `state.toml` (missing file yields validated defaults). A corrupt
     // file is a fatal boot error naming the file and the field, never a
@@ -4697,8 +4790,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn qos1_inflight_bound_drops_newest_from_tracking_and_counts() {
-        use broker_session::MAX_QOS1_INFLIGHT;
+    async fn qos1_inflight_bound_spills_past_window_and_counts() {
+        use broker_session::DEFAULT_MAX_QOS1_INFLIGHT;
         let shared = test_shared();
         let bind = bind_frame(61, 1, encode_bind_meta("q1-bound", false, 60));
         reply_for_frame(&bind, &shared.sessions).expect("bind replies");
@@ -4708,7 +4801,7 @@ mod tests {
 
         let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(61, tx61);
-        for i in 0..MAX_QOS1_INFLIGHT {
+        for i in 0..DEFAULT_MAX_QOS1_INFLIGHT {
             let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"x");
             let (_, deliveries) =
                 apply_publish(&publish_frame(62, 3 + i as u64, meta, payload), &shared).await;
@@ -4719,10 +4812,12 @@ mod tests {
             rx61.try_recv().expect("live downlink arrived");
         }
         let session = shared.sessions.get("q1-bound").expect("session known");
-        assert_eq!(session.inflight_len(), MAX_QOS1_INFLIGHT);
+        assert_eq!(session.inflight_len(), DEFAULT_MAX_QOS1_INFLIGHT);
         assert_eq!(shared.metrics.inflight_dropped(), 0);
+        assert_eq!(shared.metrics.inflight_spilled(), 0);
 
-        // One past the bound: still delivered live once, left untracked.
+        // One past the window: still delivered live once AND still
+        // tracked, now in the spill buffer (B4-01, no silent loss).
         let (meta, payload) = encode_publish_meta("t", 0x0FFF, 1, false, b"over");
         let (_, deliveries) = apply_publish(&publish_frame(62, 999, meta, payload), &shared).await;
         assert_eq!(deliveries.len(), 1, "bound never blocks live delivery");
@@ -4730,17 +4825,269 @@ mod tests {
             let _ = shared.conns.route(conn_id, frame);
         }
         rx61.try_recv()
-            .expect("over-bound downlink still delivered live");
+            .expect("over-window downlink still delivered live");
         assert_eq!(
             session.inflight_len(),
-            MAX_QOS1_INFLIGHT,
-            "store stays bounded at the limit"
+            DEFAULT_MAX_QOS1_INFLIGHT,
+            "window stays bounded at the limit"
         );
         assert_eq!(
-            shared.metrics.inflight_dropped(),
+            session.inflight_spill_len(),
             1,
-            "exactly one untracked delivery counted"
+            "overflow is tracked in spill"
         );
+        assert_eq!(session.inflight_total_len(), DEFAULT_MAX_QOS1_INFLIGHT + 1);
+        assert_eq!(shared.metrics.inflight_spilled(), 1, "spill counted");
+        assert_eq!(
+            shared.metrics.inflight_dropped(),
+            0,
+            "nothing untracked while spill has room"
+        );
+    }
+
+    #[tokio::test]
+    async fn qos1_inflight_spill_redelivers_everything_with_dup() {
+        use broker_session::{DEFAULT_MAX_QOS1_INFLIGHT, DEFAULT_MAX_QOS1_SPILL};
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-spill-all", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-spill-all", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        // Stall the acknowledger: publish window + spill + 3 without ever
+        // acking, through the broker publish-to-delivery event.
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        let total = DEFAULT_MAX_QOS1_INFLIGHT + 5;
+        assert!(
+            total < DEFAULT_MAX_QOS1_INFLIGHT + DEFAULT_MAX_QOS1_SPILL,
+            "test stays inside the spill bound"
+        );
+        let mut live_pids = Vec::new();
+        let mut live_payloads = Vec::new();
+        for i in 0..total {
+            let body = format!("spill-{i:04}");
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, body.as_bytes());
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 100 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "live delivery never blocks");
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            let got = rx61.try_recv().expect("live downlink arrived");
+            let (_, pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            assert_ne!(pid, 0);
+            live_pids.push(pid);
+            live_payloads.push(got.payload.clone());
+        }
+        let session = shared.sessions.get("q1-spill-all").expect("session known");
+        assert_eq!(session.inflight_len(), DEFAULT_MAX_QOS1_INFLIGHT);
+        assert_eq!(session.inflight_spill_len(), 5);
+        assert_eq!(shared.metrics.inflight_spilled(), 5);
+        assert_eq!(shared.metrics.inflight_dropped(), 0);
+
+        // Disconnect without acking anything, then reconnect: every QoS 1
+        // message replays, window oldest-first then spill oldest-first,
+        // every replay with DUP set and its original packet id.
+        let mut unbind_meta = vec![0x00u8, 0x0Bu8];
+        unbind_meta.extend_from_slice(b"q1-spill-all");
+        let unbind = BrokerFrame::new(
+            OpCode::UnbindConnection,
+            61,
+            4,
+            Bytes::from(unbind_meta),
+            Bytes::new(),
+        )
+        .expect("valid unbind frame");
+        apply_unbind(&unbind, &shared);
+        let rebind = bind_frame(63, 1, encode_bind_meta("q1-spill-all", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+        assert_eq!(replay_offline(&rebind, &shared).await, total);
+        assert_eq!(shared.metrics.inflight_spill_replayed(), 5);
+        for (pid, payload) in live_pids.iter().zip(live_payloads.iter()) {
+            let got = rx63.try_recv().expect("ordered redelivery past the window");
+            assert_eq!(&got.payload, payload, "original order preserved");
+            assert!(
+                decode_publish_dup(&got.metadata),
+                "every replay past the window carries DUP=1"
+            );
+            let (_, replay_pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            assert_eq!(&replay_pid, pid, "same packet id reused in order");
+        }
+        assert!(rx63.try_recv().is_err(), "no new traffic interleaved");
+    }
+
+    #[tokio::test]
+    async fn qos1_inflight_bound_configurable_and_overflow_counted() {
+        let shared = test_shared();
+        shared.sessions.set_max_qos1_inflight(3);
+        shared.sessions.set_max_qos1_spill(2);
+        assert_eq!(shared.sessions.max_qos1_inflight(), 3);
+        assert_eq!(shared.sessions.max_qos1_spill(), 2);
+
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-tiny", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let session = shared.sessions.get("q1-tiny").expect("session known");
+        assert_eq!(
+            session.max_inflight(),
+            3,
+            "manager bound reaches the session"
+        );
+        assert_eq!(session.max_spill(), 2);
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-tiny", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        for i in 0..6u16 {
+            let (meta, payload) = encode_publish_meta("t", i, 1, false, b"x");
+            let (_, deliveries) = apply_publish(
+                &publish_frame(62, 200 + u64::from(i), meta, payload),
+                &shared,
+            )
+            .await;
+            assert_eq!(deliveries.len(), 1);
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            rx61.try_recv().expect("live downlink arrived");
+        }
+        // Window 3 tracked, next 2 spilled, last one past both: live once,
+        // untracked, both drop counters bump.
+        assert_eq!(session.inflight_len(), 3);
+        assert_eq!(session.inflight_spill_len(), 2);
+        assert_eq!(session.inflight_total_len(), 5);
+        assert_eq!(shared.metrics.inflight_spilled(), 2);
+        assert_eq!(shared.metrics.inflight_dropped(), 1);
+        assert_eq!(shared.metrics.inflight_spill_evicted(), 1);
+    }
+
+    #[tokio::test]
+    async fn qos1_inflight_delivery_workload_timings() {
+        use broker_session::DEFAULT_MAX_QOS1_INFLIGHT;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // B4-01 delivery-workload before/after numbers (spec Done-when
+        // bullet 5, RULEBOOK hot-path row): measured through the broker
+        // publish-to-delivery event (`apply_publish`), not just the
+        // session store. BEFORE is the steady-state loop with the spill
+        // empty: `build_downlink_frames` takes only the window lock here,
+        // exactly the pre-B4-01 work plus one relaxed atomic load, so its
+        // rate is the pre-change baseline. AFTER is the overflow loop past
+        // the window, which additionally takes the spill lock and bumps
+        // `inflight_spilled`. Both print msgs/sec and avg ns/msg into the
+        // gate output with no threshold assert; counts are CI sample
+        // sizes, not SLOs. Per-message bound: window (default 100) + spill
+        // (default 1000) entries, each one shared `Bytes` handle plus topic
+        // bytes, never N payload copies.
+        let shared = test_shared();
+        let bind = bind_frame(61, 1, encode_bind_meta("q1-timing", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let sub = subscribe_frame(61, 2, encode_subscribe_meta(5, "q1-timing", &[("t", 1)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(61, tx61);
+        let session = shared.sessions.get("q1-timing").expect("session known");
+
+        // BEFORE: steady-state publish-to-delivery, spill empty. Every
+        // publish is acked at once so the window never fills and the spill
+        // lock is never taken (guarded by `has_spill`).
+        let steady_iters = 200usize;
+        let steady_start = Instant::now();
+        for i in 0..steady_iters {
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 1000 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "live delivery never blocks");
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            let got = rx61.try_recv().expect("live downlink arrived");
+            let (_, pid, _, _) = decode_publish_meta_parts(&got.metadata);
+            black_box(pid);
+            assert!(session.ack_inflight(pid), "steady-state ack releases");
+        }
+        let steady_elapsed = steady_start.elapsed();
+        assert!(
+            !session.has_spill(),
+            "steady-state loop must never touch the spill"
+        );
+        let steady_rate = steady_iters as f64 / steady_elapsed.as_secs_f64();
+        let steady_avg_ns = steady_elapsed.as_nanos() as f64 / steady_iters as f64;
+        println!(
+            "qos1 broker delivery workload steady-state (spill empty, before): {steady_rate:.0} msgs/sec, avg {steady_avg_ns:.1} ns/msg ({steady_iters} apply_publish+ack rounds in {steady_elapsed:?})"
+        );
+
+        // AFTER: fill the window without acking, then time overflow past it.
+        for i in 0..DEFAULT_MAX_QOS1_INFLIGHT {
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"y");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 2000 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "live delivery never blocks");
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            rx61.try_recv().expect("live downlink arrived");
+        }
+        assert_eq!(session.inflight_len(), DEFAULT_MAX_QOS1_INFLIGHT);
+        let spill_iters = 20usize;
+        let spill_start = Instant::now();
+        for i in 0..spill_iters {
+            let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"z");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(62, 3000 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1, "bound never blocks live delivery");
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            rx61.try_recv()
+                .expect("over-window downlink still delivered live");
+        }
+        let spill_elapsed = spill_start.elapsed();
+        assert_eq!(session.inflight_spill_len(), spill_iters);
+        assert_eq!(shared.metrics.inflight_spilled(), spill_iters as u64);
+        let spill_rate = spill_iters as f64 / spill_elapsed.as_secs_f64();
+        let spill_avg_ns = spill_elapsed.as_nanos() as f64 / spill_iters as f64;
+        println!(
+            "qos1 broker delivery workload spill-overflow (past window, after): {spill_rate:.0} msgs/sec, avg {spill_avg_ns:.1} ns/msg ({spill_iters} apply_publish rounds in {spill_elapsed:?})"
+        );
+
+        // Replay workload through the reconnect event, window then spill.
+        let mut unbind_meta = vec![0x00u8, 0x09u8];
+        unbind_meta.extend_from_slice(b"q1-timing");
+        let unbind = BrokerFrame::new(
+            OpCode::UnbindConnection,
+            61,
+            4,
+            Bytes::from(unbind_meta),
+            Bytes::new(),
+        )
+        .expect("valid unbind frame");
+        apply_unbind(&unbind, &shared);
+        let rebind = bind_frame(63, 1, encode_bind_meta("q1-timing", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+        let replay_start = Instant::now();
+        let replayed = replay_offline(&rebind, &shared).await;
+        let replay_elapsed = replay_start.elapsed();
+        assert_eq!(replayed, DEFAULT_MAX_QOS1_INFLIGHT + spill_iters);
+        let replay_rate = replayed as f64 / replay_elapsed.as_secs_f64();
+        let replay_avg_ns = replay_elapsed.as_nanos() as f64 / replayed as f64;
+        println!(
+            "qos1 broker replay workload (window plus spill, after): {replay_rate:.0} msgs/sec, avg {replay_avg_ns:.1} ns/msg ({replayed} replayed in {replay_elapsed:?})"
+        );
+        for _ in 0..replayed {
+            let got = rx63.try_recv().expect("ordered redelivery");
+            assert!(decode_publish_dup(&got.metadata), "replay carries DUP=1");
+        }
+        assert!(rx63.try_recv().is_err(), "no new traffic interleaved");
     }
 
     #[tokio::test]
