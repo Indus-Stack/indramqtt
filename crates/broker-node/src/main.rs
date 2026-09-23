@@ -1039,6 +1039,38 @@ fn maybe_journal_stream(shared: &Shared, topic: &Topic, qos: QoS, payload: &Byte
     }
 }
 
+/// Capture one publish into active trace sessions (F1-04, T-74).
+///
+/// Fast path (no tracing, the default): one relaxed atomic load on the
+/// global flag and a return. No lock, no allocation, no clock read.
+/// Slow path (sessions exist): resolve the publisher's last-known peer
+/// address (one session lookup plus at most one small clone, off the
+/// delivery locks) and delegate to `TraceStore::capture_publish`, which
+/// takes one short read lock, scans at most `MAX_TRACES` sessions with no
+/// allocation on no-match, and formats one small bounded line per matching
+/// session (see `MAX_TRACE_PAYLOAD_BYTES`). Appends reuse the store's
+/// per-session byte cap. Publishes without a known publisher id (detached
+/// timers, gateway ingress without a session) capture nothing.
+/// TODO(parity): should gateway and timer publishes without a publisher id
+/// capture into topic-filter sessions with an empty client id? Neither this
+/// rulebook nor the task spec decides; current choice is the conservative
+/// one (no capture) so a trace never invents a client identity.
+fn maybe_capture_trace(shared: &Shared, publisher: Option<&str>, topic: &Topic, payload: &Bytes) {
+    if !shared.tracing.is_enabled() {
+        return;
+    }
+    let Some(client_id) = publisher else {
+        return;
+    };
+    let peerhost = shared
+        .sessions
+        .get(client_id)
+        .and_then(|session| session.peerhost.read().clone());
+    shared
+        .traces
+        .capture_publish(client_id, peerhost.as_deref(), topic.as_str(), payload);
+}
+
 /// Bound for the slow-record handoff channel (F1-03, T-73). At most this
 /// many pending slow records wait for the background recorder; past it the
 /// newest record drops (counted in `slow_dropped`). Each record carries one
@@ -1405,6 +1437,20 @@ struct Shared {
     /// `enabled`, `top_k_num`, `expire_interval_ms`, `stats_type_code`),
     /// never the lock.
     slow_subs_settings: Arc<broker_api::v5::slow_subscriptions::SlowSubsSettingsStore>,
+    /// Trace-session registry for F1-04 (T-74): bounded capture sessions
+    /// shared with the management API so validated `POST /trace` writes are
+    /// visible to the publish hook without a restart. One Arc clone; the
+    /// publish fast path pays one atomic flag load (see `tracing` below)
+    /// plus one short read lock with a bounded scan when sessions exist,
+    /// and one small bounded line clone per matching session. Appends reuse
+    /// the store's per-session byte cap, so capture memory stays bounded.
+    traces: Arc<broker_api::v5::trace::TraceStore>,
+    /// Packet-tracing flag for F1-04 (T-74): single atomic bool shared with
+    /// the management API. The session lifecycle raises it while a session
+    /// exists and lowers it when none remains; the publish hook reads it
+    /// first (one relaxed atomic load, no lock, no allocation when
+    /// disabled). Disabled by default: no sessions means no capture.
+    tracing: Arc<broker_api::v5::tracing::TracingFlagStore>,
     /// Async handoff from the egress hook to the slow recorder (F1-03).
     /// Bounded at [`SLOW_RECORD_CHANNEL_BOUND`] pending records (each a
     /// topic truncated to 512 chars plus two integers, well under one
@@ -1535,6 +1581,8 @@ impl Shared {
             slow_subs_settings: Arc::new(
                 broker_api::v5::slow_subscriptions::SlowSubsSettingsStore::new(),
             ),
+            traces: Arc::new(broker_api::v5::trace::TraceStore::new()),
+            tracing: Arc::new(broker_api::v5::tracing::TracingFlagStore::new()),
             slow_tx,
             slow_rx: Arc::new(tokio::sync::Mutex::new(Some(slow_rx))),
             slow_burst_start_ms: Arc::new(AtomicU64::new(0)),
@@ -3565,6 +3613,12 @@ async fn ingress_pipeline_with_publisher(
     // plus one fsync.
     maybe_journal_stream(shared, topic, qos, payload);
 
+    // Trace capture (F1-04, T-74): append one bounded line per matching
+    // session. Disabled (the default) costs one atomic load; enabled costs
+    // one session lookup plus one short store read lock, with allocation
+    // only for matching sessions.
+    maybe_capture_trace(shared, publisher, topic, payload);
+
     let deliveries = build_downlink_frames_with_publisher(
         &shared.router,
         &shared.sessions,
@@ -4649,6 +4703,13 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // background recorder takes one short store lock per record.
     state.slow_subs = shared.slow_subs.clone();
     state.slow_subs_settings = shared.slow_subs_settings.clone();
+    // Share the trace-session registry and packet-tracing flag (F1-04,
+    // T-74) so validated management writes are visible to the publish hook
+    // without a restart. One `Arc` clone each; the publish fast path reads
+    // only the flag atomic plus one short store read lock, and capture
+    // appends reuse the store's per-session byte cap.
+    state.traces = shared.traces.clone();
+    state.tracing = shared.tracing.clone();
     let conns = shared.conns.clone();
     tokio::spawn(async move {
         while let Some(frame) = edge_rx.recv().await {
@@ -9168,6 +9229,95 @@ mod tests {
             shared.slow_subs_settings.stats_type_code(),
             broker_api::v5::slow_subscriptions::SLOW_STATS_WHOLE,
             "default stats_type is whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_capture_through_broker() {
+        // F1-04 (T-74): create a topic trace through the management write,
+        // publish through the real broker path, and read the capture through
+        // the shared store. A store-only test would prove only the store;
+        // this one proves the publish hook drives it: nothing here calls
+        // `TraceStore::append_log` or `capture_publish` directly.
+        use axum::extract::State;
+        let shared = Shared::new();
+        assert!(!shared.tracing.is_enabled());
+        assert!(shared.traces.is_empty());
+
+        // Management write shares both stores with the kernel, exactly as
+        // `serve_api` wires them: creating a session raises the global flag.
+        let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let mut api_state = broker_api::ApiState::standalone(engine);
+        api_state.traces = shared.traces.clone();
+        api_state.tracing = shared.tracing.clone();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": "trace-hook",
+                "type": "topic",
+                "topic": "trace/hook/#",
+            }))
+            .expect("trace body is JSON"),
+        );
+        let resp = broker_api::v5::trace::create_trace(State(api_state.clone()), body).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(
+            shared.tracing.is_enabled(),
+            "creating a session must raise the global flag"
+        );
+        // An uncaptured session reads empty, never a synthesised header.
+        assert_eq!(shared.traces.log_len("trace-hook"), 0);
+
+        // Publisher: live session bound to its connection so the publish
+        // path attributes the client id.
+        let (pub_session, _) = shared.sessions.get_or_create("trace-pub-1", true);
+        *pub_session.connected.write() = true;
+        *pub_session.conn_id.write() = Some(941);
+        shared.sessions.bind_session(&pub_session, 941);
+
+        // A non-matching publish captures nothing.
+        let (meta, payload) = encode_publish_meta("other/topic", 0, 0, false, b"no-capture");
+        let frame = publish_frame(941, 1, meta, payload);
+        let (_ack, deliveries) = apply_publish(&frame, &shared).await;
+        route_publish_out_deliveries(&shared, &frame, deliveries);
+        assert_eq!(
+            shared.traces.log_len("trace-hook"),
+            0,
+            "a session with no match must capture nothing"
+        );
+
+        // The matching publish lands in the same buffer the download and
+        // log reads serve.
+        let (meta, payload) = encode_publish_meta("trace/hook/x", 0, 0, false, b"trace-payload-1");
+        let frame = publish_frame(941, 2, meta, payload);
+        let (_ack, deliveries) = apply_publish(&frame, &shared).await;
+        route_publish_out_deliveries(&shared, &frame, deliveries);
+        let captured = shared.traces.read_log("trace-hook").expect("log exists");
+        let text = String::from_utf8(captured).expect("capture is text");
+        assert!(
+            text.contains("trace/hook/x") && text.contains("trace-payload-1"),
+            "trace log must capture the publish, got {text:?}"
+        );
+
+        // Stopping the last session lowers the flag and halts capture.
+        let resp = broker_api::v5::trace::stop_trace(
+            State(api_state.clone()),
+            axum::extract::Path("trace-hook".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(!shared.tracing.is_enabled());
+        let before = shared.traces.log_len("trace-hook");
+        let (meta, payload) = encode_publish_meta("trace/hook/x", 0, 0, false, b"trace-payload-2");
+        let frame = publish_frame(941, 3, meta, payload);
+        let (_ack, deliveries) = apply_publish(&frame, &shared).await;
+        route_publish_out_deliveries(&shared, &frame, deliveries);
+        assert_eq!(
+            shared.traces.log_len("trace-hook"),
+            before,
+            "a stopped session must capture nothing more"
         );
     }
 

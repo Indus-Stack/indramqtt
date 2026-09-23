@@ -15,5 +15,5 @@ wired  alarms
 wired  monitor
 wired  slow_subs
 wired  slow_subs_settings
-facade traces              T-74
-facade tracing             T-74
+wired  traces
+wired  tracing

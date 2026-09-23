@@ -107,13 +107,15 @@ pub struct ApiState {
     /// snapshot clone and never touch the per-message path.
     pub slow_subs_settings: Arc<crate::v5::slow_subscriptions::SlowSubsSettingsStore>,
     /// Packet-tracing flag for `GET/PUT /api/v5/tracing` (W1-32):
-    /// single atomic bool. Management-plane only; never touched on the
-    /// per-message path.
+    /// single atomic bool. Session lifecycle raises it while a session
+    /// exists and lowers it when none remains; the kernel publish event
+    /// reads it first as its cheap off-state check (F1-04, T-74).
     pub tracing: Arc<crate::v5::tracing::TracingFlagStore>,
     /// Trace-session registry for `GET/POST/DELETE /api/v5/trace` (W1-33)
     /// plus `DELETE /api/v5/trace/{name}` (W1-34):
-    /// bounded map of capture sessions. Management-plane only; never
-    /// touched on the per-message path.
+    /// bounded map of capture sessions. Reads and writes are
+    /// management-plane only; the kernel publish event appends through
+    /// `TraceStore::capture_publish` (F1-04, T-74).
     pub traces: Arc<crate::v5::trace::TraceStore>,
     /// Auto-subscribe list for `GET/PUT /api/v5/mqtt/auto_subscribe`
     /// (W1-39): bounded validated list plus the connect-time hook. The
