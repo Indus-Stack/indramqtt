@@ -86,6 +86,146 @@ pub fn split_shared_filter(filter: &TopicFilter) -> Option<(Option<Arc<str>>, To
 /// iteration order is unspecified (assert on membership, not order).
 pub type SubscriptionSet = AHashSet<Subscription>;
 
+/// Per-group shared-subscription dispatch strategy (B4-02).
+///
+/// Documented names (read from group configuration, never invented per
+/// message): `round_robin` (the default when a group has no entry),
+/// `random`, `hash_clientid` (stable member per publisher id),
+/// `hash_topic` (stable member per concrete publish topic) and `sticky`
+/// (pinned member while the membership is stable). An unknown name is
+/// rejected by [`SharedStrategy::parse`] with [`SharedStrategyError`],
+/// never silently mapped to round-robin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SharedStrategy {
+    /// Cycle across members in deterministic client-id order.
+    #[default]
+    RoundRobin,
+    /// Uniform pick across members on every delivery.
+    Random,
+    /// Stable member per publisher client id (`hash_clientid`).
+    HashClientId,
+    /// Stable member per concrete publish topic (`hash_topic`).
+    HashTopic,
+    /// Pinned member while the membership is stable (see
+    /// [`Router::set_shared_strategy`] for the rebalance rule).
+    Sticky,
+}
+
+/// Documented strategy names accepted by [`SharedStrategy::parse`].
+pub const VALID_SHARED_STRATEGIES: &[&str] = &[
+    "round_robin",
+    "random",
+    "hash_clientid",
+    "hash_topic",
+    "sticky",
+];
+
+/// Errors for shared-subscription group configuration (B4-02). Every
+/// variant names the field or value at fault; unknown strategy names
+/// list the documented set so callers can surface the message as-is.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SharedStrategyError {
+    /// The strategy name is not one of [`VALID_SHARED_STRATEGIES`].
+    #[error(
+        "unknown shared-subscription strategy {0:?}: expected one of round_robin, random, hash_clientid, hash_topic, sticky (field `strategy`)"
+    )]
+    Unknown(String),
+    /// The group name was empty.
+    #[error("shared-subscription group name must not be empty (field `group`)")]
+    EmptyGroup,
+    /// The group configuration table is full.
+    #[error("too many shared-subscription groups (cap {0}) (field `group`)")]
+    TooManyGroups(usize),
+}
+
+impl SharedStrategy {
+    /// Parse a documented strategy name (case-insensitive, trimmed).
+    /// Unknown names return [`SharedStrategyError::Unknown`].
+    pub fn parse(name: &str) -> Result<Self, SharedStrategyError> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "round_robin" | "round-robin" | "roundrobin" => Ok(Self::RoundRobin),
+            "random" => Ok(Self::Random),
+            "hash_clientid" | "hash-clientid" | "hash-client-id" => Ok(Self::HashClientId),
+            "hash_topic" | "hash-topic" => Ok(Self::HashTopic),
+            "sticky" => Ok(Self::Sticky),
+            other => Err(SharedStrategyError::Unknown(other.to_string())),
+        }
+    }
+
+    /// Canonical documented name for this strategy.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round_robin",
+            Self::Random => "random",
+            Self::HashClientId => "hash_clientid",
+            Self::HashTopic => "hash_topic",
+            Self::Sticky => "sticky",
+        }
+    }
+}
+
+/// Maximum shared-subscription groups with live per-message delivery
+/// state (round-robin cursors plus sticky affinity entries, B4-02).
+///
+/// Each entry is one map slot plus a small value, so the table costs a
+/// few tens of bytes per group and stays in the low tens of KB at the
+/// cap. Rationale: 1,024 matches the detached offline bound
+/// (`MAX_OFFLINE_QUEUE` = 1024) so group state shares one memory story
+/// with the existing per-subscriber queues; a deployment with more than
+/// a thousand live shared groups at once is a configuration problem, not
+/// a routing problem, and the eviction rule below keeps delivery working
+/// while bounding memory.
+///
+/// Eviction rule (documented): cursors and affinity entries are keyed by
+/// group name alone. When a delivery arrives for a group with no entry
+/// and the table is full, one arbitrary existing entry (the first key in
+/// iteration order) is evicted to make room. The evicted group's next
+/// delivery re-creates its entry from scratch (round-robin restarts at
+/// zero, sticky re-picks deterministically), so eviction costs at most
+/// one rotation step, never a drop.
+pub const MAX_SHARED_GROUPS: usize = 1_024;
+
+/// FNV-1a 64-bit hash over a string. Deterministic across runs (unlike
+/// the randomised per-process hashers), allocation-free, and cheap
+/// enough for the match path. Used for `hash_clientid`, `hash_topic`,
+/// sticky fingerprints and sticky initial picks.
+fn fnv1a64(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Fingerprint of a sorted member set for sticky stability checks:
+/// FNV-1a folded over each member client id with a separator so
+/// `["ab", "c"]` and `["a", "bc"]` never collide. `members` must
+/// already be sorted by client id. O(members), no allocation.
+fn fingerprint_members(members: &[Subscription]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for member in members {
+        for byte in member.client_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Sticky affinity entry: the pinned member plus the membership
+/// fingerprint it was picked for. While the fingerprint is unchanged
+/// the pinned member serves every delivery; any join or leave changes
+/// the fingerprint and triggers a deterministic re-pick.
+#[derive(Debug, Clone)]
+struct StickyEntry {
+    pinned: Arc<str>,
+    fingerprint: u64,
+}
+
 #[derive(Default)]
 struct TrieNode {
     // Exact child path segments (shared, never cloned on match)
@@ -150,8 +290,28 @@ pub struct Router {
     root: RwLock<TrieNode>,
     /// Round-robin cursors per shared-subscription group. Mutated under
     /// `matches`, hence behind the lock; keyed by group name alone so one
-    /// group balances across all its filters.
+    /// group balances across all its filters. Bounded by
+    /// [`MAX_SHARED_GROUPS`] with the arbitrary-evict rule documented
+    /// there.
     rr_cursors: RwLock<AHashMap<Arc<str>, usize>>,
+    /// Per-group dispatch strategy (B4-02). Written by
+    /// [`Router::set_shared_strategy`], read on every shared delivery by
+    /// `balance_shared_groups`. Keyed by group name; unconfigured groups
+    /// read as [`SharedStrategy::RoundRobin`]. Bounded by
+    /// [`MAX_SHARED_GROUPS`]: new groups past the cap are rejected with
+    /// [`SharedStrategyError::TooManyGroups`] (fail closed, never an
+    /// unbounded config map).
+    strategies: RwLock<AHashMap<Arc<str>, SharedStrategy>>,
+    /// Sticky affinity per shared-subscription group (B4-02). Keyed by
+    /// group name alone so the table stays bounded by
+    /// [`MAX_SHARED_GROUPS`] with the same arbitrary-evict rule as the
+    /// cursors. See [`StickyEntry`] for the pin/re-pick rule.
+    sticky: RwLock<AHashMap<Arc<str>, StickyEntry>>,
+    /// Xorshift random seed for the `random` strategy. One relaxed atomic
+    /// add per random delivery; no lock, no allocation, no per-message
+    /// map. Seeded once from the wall clock (fallback constant when the
+    /// clock is unavailable) so restarts do not repeat one sequence.
+    random_seed: std::sync::atomic::AtomicU64,
     /// Known concrete topics seen on publishes (W1-15). Separate lock
     /// from the subscription trie so management list reads never block
     /// the routing path and publishes only take a short write.
@@ -166,11 +326,74 @@ impl Default for Router {
 
 impl Router {
     pub fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15);
+        // A zero seed would stick one xorshift tap at zero; fold in the
+        // process id and a nonzero constant instead.
+        let seed = seed
+            .wrapping_add((std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15))
+            .wrapping_add(0x2545F4914F6CDD1D)
+            | 1;
         Self {
             root: RwLock::new(TrieNode::default()),
             rr_cursors: RwLock::new(AHashMap::new()),
+            strategies: RwLock::new(AHashMap::new()),
+            sticky: RwLock::new(AHashMap::new()),
+            random_seed: std::sync::atomic::AtomicU64::new(seed),
             known_topics: RwLock::new(AHashSet::new()),
         }
+    }
+
+    /// Set the dispatch strategy for one shared-subscription group
+    /// (B4-02). The name must be one of [`VALID_SHARED_STRATEGIES`];
+    /// unknown names are rejected with [`SharedStrategyError::Unknown`],
+    /// never mapped to a default. Empty group names are rejected. New
+    /// groups past [`MAX_SHARED_GROUPS`] are rejected with
+    /// [`SharedStrategyError::TooManyGroups`]; updating an existing
+    /// group's strategy always succeeds. Called off the delivery path
+    /// (management/config plane); deliveries only read.
+    pub fn set_shared_strategy(
+        &self,
+        group: &str,
+        strategy_name: &str,
+    ) -> Result<(), SharedStrategyError> {
+        if group.is_empty() {
+            return Err(SharedStrategyError::EmptyGroup);
+        }
+        let strategy = SharedStrategy::parse(strategy_name)?;
+        let mut strategies = self.strategies.write();
+        if !strategies.contains_key(group) && strategies.len() >= MAX_SHARED_GROUPS {
+            return Err(SharedStrategyError::TooManyGroups(MAX_SHARED_GROUPS));
+        }
+        strategies.insert(group.into(), strategy);
+        Ok(())
+    }
+
+    /// Dispatch strategy for `group`: the configured value, or
+    /// [`SharedStrategy::RoundRobin`] when the group has no entry. One
+    /// short read lock; no allocation on the hit path beyond the lock
+    /// guard.
+    pub fn shared_strategy(&self, group: &str) -> SharedStrategy {
+        self.strategies
+            .read()
+            .get(group)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Forget one group's configured strategy (management/config plane).
+    /// The group falls back to round-robin. Returns true when an entry
+    /// existed.
+    pub fn clear_shared_strategy(&self, group: &str) -> bool {
+        self.strategies.write().remove(group).is_some()
+    }
+
+    /// Number of groups with an explicit strategy entry (config-plane
+    /// hook for tests and operators).
+    pub fn shared_strategy_count(&self) -> usize {
+        self.strategies.read().len()
     }
 
     /// Remember one concrete publish topic for the management topic
@@ -283,17 +506,58 @@ impl Router {
     }
 
     pub fn matches(&self, topic: &Topic) -> SubscriptionSet {
+        self.matches_with_publisher(topic, None)
+    }
+
+    /// Match plus shared-group reduction with publisher context (B4-02).
+    ///
+    /// The delivery path calls this with the publishing client id so the
+    /// `hash_clientid` strategy hashes a real key; callers without a
+    /// publisher (management reads, rule republishes, retained replays)
+    /// pass `None`. A `None` publisher under `hash_clientid` hashes the
+    /// empty string deterministically (stable, still one member); see
+    /// the open-question note at the call site for what key those paths
+    /// should hash.
+    pub fn matches_with_publisher(
+        &self,
+        topic: &Topic,
+        publisher: Option<&str>,
+    ) -> SubscriptionSet {
         let root = self.root.read();
         let mut matched = SubscriptionSet::default();
         Self::match_recursive(&root, topic.as_str(), &mut matched);
-        self.balance_shared_groups(&mut matched);
+        // The trie read guard is held across balancing (as before): the
+        // balance step takes only short per-group state locks, never the
+        // trie write lock, so subscribers never block deliveries.
+        self.balance_shared_groups(&mut matched, topic, publisher);
         matched
     }
 
-    /// Reduce each shared group in `matched` to exactly one member,
-    /// round-robin by group. Members sort by client id first so the
-    /// rotation is deterministic. Plain subscriptions pass through.
-    fn balance_shared_groups(&self, matched: &mut SubscriptionSet) {
+    /// Reduce each shared group in `matched` to exactly one member using
+    /// that group's configured [`SharedStrategy`] (B4-02). Members sort
+    /// by client id first so every strategy but `random` is
+    /// deterministic. Plain subscriptions pass through untouched.
+    ///
+    /// Consulted by the publish delivery event: `matches` /
+    /// `matches_with_publisher` call this on every publish fan-out, and
+    /// the node delivery path (`build_downlink_frames` in
+    /// `crates/broker-node/src/main.rs`) consumes the reduced set.
+    ///
+    /// Per-delivery cost: one sort per group (O(m log m) in the member
+    /// count, the dominant term for large groups), then O(members) or
+    /// better selection with no allocation beyond the existing group
+    /// buckets and the single picked clone: round-robin is one short
+    /// cursor-lock increment, random is one relaxed atomic scramble, the
+    /// hashes are one FNV pass over the key, and sticky is one FNV
+    /// fingerprint pass plus at most one short affinity-lock update when
+    /// the membership changed. No per-message map grows without bound:
+    /// cursors and affinity entries stay within [`MAX_SHARED_GROUPS`].
+    fn balance_shared_groups(
+        &self,
+        matched: &mut SubscriptionSet,
+        topic: &Topic,
+        publisher: Option<&str>,
+    ) {
         if !matched.iter().any(|s| s.group.is_some()) {
             return;
         }
@@ -308,14 +572,114 @@ impl Router {
         if groups.is_empty() {
             return;
         }
-        let mut cursors = self.rr_cursors.write();
+        // Read all strategies under one short lock so the per-group loop
+        // below pays no lock per group on the hot path.
+        let strategies = self.strategies.read();
         for (group, mut members) in groups {
             members.sort_by(|a, b| a.client_id.cmp(&b.client_id));
-            let cursor = cursors.entry(group).or_insert(0);
-            let pick = members[*cursor % members.len()].clone();
-            *cursor = cursor.wrapping_add(1);
+            let strategy = strategies.get(&group).copied().unwrap_or_default();
+            let pick = match strategy {
+                SharedStrategy::RoundRobin => self.pick_round_robin(&group, &members),
+                SharedStrategy::Random => self.pick_random(&members),
+                SharedStrategy::HashClientId => {
+                    // TODO(parity): what key should non-MQTT delivery paths
+                    // (rule republishes, retained replays, cluster forwards,
+                    // management publishes) hash when there is no publisher
+                    // id? Current choice hashes the empty string: stable
+                    // (one member) but arbitrary. The MQTT ingress path
+                    // always passes the real publisher id.
+                    let key = publisher.unwrap_or("");
+                    Self::pick_hash(&members, key)
+                }
+                SharedStrategy::HashTopic => Self::pick_hash(&members, topic.as_str()),
+                SharedStrategy::Sticky => self.pick_sticky(&group, &members),
+            };
             matched.insert(pick);
         }
+    }
+
+    /// Round-robin pick: cursor per group, deterministic client-id order.
+    /// Bounded: a missing group past [`MAX_SHARED_GROUPS`] evicts one
+    /// arbitrary entry first (documented on the constant).
+    fn pick_round_robin(&self, group: &Arc<str>, members: &[Subscription]) -> Subscription {
+        debug_assert!(!members.is_empty());
+        let mut cursors = self.rr_cursors.write();
+        if !cursors.contains_key(group) && cursors.len() >= MAX_SHARED_GROUPS {
+            if let Some(victim) = cursors.keys().next().cloned() {
+                cursors.remove(&victim);
+            }
+        }
+        let cursor = cursors.entry(group.clone()).or_insert(0);
+        let pick = members[*cursor % members.len()].clone();
+        *cursor = cursor.wrapping_add(1);
+        pick
+    }
+
+    /// Uniform random pick. One relaxed atomic add plus an xorshift
+    /// scramble; no lock, no allocation.
+    fn pick_random(&self, members: &[Subscription]) -> Subscription {
+        debug_assert!(!members.is_empty());
+        let mut x = self
+            .random_seed
+            .fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed);
+        if x == 0 {
+            x = 0x2545F4914F6CDD1D;
+        }
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        let mixed = x.wrapping_mul(0x2545F4914F6CDD1D);
+        let index = (mixed >> 32) as usize % members.len();
+        members[index].clone()
+    }
+
+    /// Stable hash pick: member at `fnv1a64(key) % len` in sorted order.
+    /// O(key) + O(1); no lock, no allocation, no router state.
+    fn pick_hash(members: &[Subscription], key: &str) -> Subscription {
+        debug_assert!(!members.is_empty());
+        let index = (fnv1a64(key) as usize) % members.len();
+        members[index].clone()
+    }
+
+    /// Sticky pick (B4-02 rule): the first delivery for a group picks
+    /// deterministically at `fnv1a64(group) % members` in sorted order
+    /// and pins that client id. While the sorted membership fingerprint
+    /// is unchanged the pinned member serves every delivery. Any join or
+    /// leave changes the fingerprint and triggers a deterministic
+    /// re-pick at the new `fnv1a64(group) % members`. Pinning is by
+    /// client id (not connection), so a re-subscribe from a new
+    /// connection keeps the pin and delivers to the freshest member
+    /// object. Bounded like the cursors with the same arbitrary-evict
+    /// rule.
+    fn pick_sticky(&self, group: &Arc<str>, members: &[Subscription]) -> Subscription {
+        debug_assert!(!members.is_empty());
+        let fingerprint = fingerprint_members(members);
+        {
+            let sticky = self.sticky.read();
+            if let Some(entry) = sticky.get(group) {
+                if entry.fingerprint == fingerprint {
+                    if let Some(pinned) = members.iter().find(|m| m.client_id == entry.pinned) {
+                        return pinned.clone();
+                    }
+                }
+            }
+        }
+        let index = (fnv1a64(group.as_ref()) as usize) % members.len();
+        let pick = members[index].clone();
+        let mut sticky = self.sticky.write();
+        if !sticky.contains_key(group) && sticky.len() >= MAX_SHARED_GROUPS {
+            if let Some(victim) = sticky.keys().next().cloned() {
+                sticky.remove(&victim);
+            }
+        }
+        sticky.insert(
+            group.clone(),
+            StickyEntry {
+                pinned: pick.client_id.clone(),
+                fingerprint,
+            },
+        );
+        pick
     }
 
     /// Walk one topic remainder without allocating: `split_once` borrows
@@ -517,6 +881,209 @@ mod tests {
                 "worker-b"
             );
         }
+    }
+
+    fn shared_router_with(strategy: &str, group: &str) -> Router {
+        let router = Router::new();
+        let inner = TopicFilter::new("tasks").unwrap();
+        router.subscribe(
+            &inner,
+            Subscription::shared("worker-a", 1, QoS::AtMostOnce, group),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("worker-b", 2, QoS::AtMostOnce, group),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("worker-c", 3, QoS::AtMostOnce, group),
+        );
+        router
+            .set_shared_strategy(group, strategy)
+            .expect("documented strategy sets");
+        router
+    }
+
+    #[test]
+    fn test_shared_strategy_parse_vectors() {
+        assert_eq!(
+            SharedStrategy::parse("round_robin").unwrap(),
+            SharedStrategy::RoundRobin
+        );
+        assert_eq!(
+            SharedStrategy::parse("random").unwrap(),
+            SharedStrategy::Random
+        );
+        assert_eq!(
+            SharedStrategy::parse("hash_clientid").unwrap(),
+            SharedStrategy::HashClientId
+        );
+        assert_eq!(
+            SharedStrategy::parse("hash_topic").unwrap(),
+            SharedStrategy::HashTopic
+        );
+        assert_eq!(
+            SharedStrategy::parse("sticky").unwrap(),
+            SharedStrategy::Sticky
+        );
+        assert_eq!(SharedStrategy::default(), SharedStrategy::RoundRobin);
+    }
+
+    #[test]
+    fn test_shared_unknown_strategy_rejected_not_mapped() {
+        let router = Router::new();
+        let err = router
+            .set_shared_strategy("g1", "least-connections")
+            .expect_err("unknown strategy must fail");
+        assert!(matches!(err, SharedStrategyError::Unknown(_)));
+        assert!(err.to_string().contains("round_robin"));
+        // Rejected write leaves the default in place (round-robin), it
+        // does not install a silent mapping.
+        assert_eq!(router.shared_strategy("g1"), SharedStrategy::RoundRobin);
+        assert_eq!(router.shared_strategy_count(), 0);
+        assert!(!router.clear_shared_strategy("g1"));
+    }
+
+    #[test]
+    fn test_shared_hash_clientid_stable_per_publisher() {
+        let router = shared_router_with("hash_clientid", "hcid");
+        let topic = Topic::new("tasks").unwrap();
+        for publisher in ["pub-1", "pub-2", "pub-3"] {
+            let first = router
+                .matches_with_publisher(&topic, Some(publisher))
+                .iter()
+                .next()
+                .unwrap()
+                .client_id
+                .to_string();
+            for _ in 0..8 {
+                let again = router
+                    .matches_with_publisher(&topic, Some(publisher))
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .client_id
+                    .to_string();
+                assert_eq!(again, first, "one publisher id pins one member");
+            }
+        }
+    }
+
+    #[test]
+    fn test_shared_hash_topic_stable_per_topic() {
+        let router = shared_router_with("hash_topic", "htopic");
+        let a = Topic::new("tasks").unwrap();
+        let b = Topic::new("tasks").unwrap();
+        let first = router
+            .matches_with_publisher(&a, None)
+            .iter()
+            .next()
+            .unwrap()
+            .client_id
+            .to_string();
+        for _ in 0..8 {
+            let again = router
+                .matches_with_publisher(&b, None)
+                .iter()
+                .next()
+                .unwrap()
+                .client_id
+                .to_string();
+            assert_eq!(again, first, "one topic pins one member");
+        }
+    }
+
+    #[test]
+    fn test_shared_sticky_pins_while_stable_and_rebalances_on_leave() {
+        let router = shared_router_with("sticky", "stick");
+        let topic = Topic::new("tasks").unwrap();
+        let first = router
+            .matches(&topic)
+            .iter()
+            .next()
+            .unwrap()
+            .client_id
+            .to_string();
+        for _ in 0..16 {
+            let again = router
+                .matches(&topic)
+                .iter()
+                .next()
+                .unwrap()
+                .client_id
+                .to_string();
+            assert_eq!(again, first, "sticky holds while members stable");
+        }
+        // A leave changes the fingerprint and re-picks deterministically.
+        let inner = TopicFilter::new("tasks").unwrap();
+        router.unsubscribe(&inner, &first);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(
+                router
+                    .matches(&topic)
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .client_id
+                    .to_string(),
+            );
+        }
+        assert_eq!(seen.len(), 1, "re-pick pins the new member");
+        assert!(
+            !seen.contains(&first),
+            "departed member must not stay pinned"
+        );
+    }
+
+    #[test]
+    fn test_shared_random_reaches_every_member() {
+        let router = shared_router_with("random", "rand");
+        let topic = Topic::new("tasks").unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..90 {
+            seen.insert(
+                router
+                    .matches(&topic)
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .client_id
+                    .to_string(),
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "random must show liveness across all members, saw {seen:?}"
+        );
+    }
+
+    #[test]
+    fn test_shared_state_stays_bounded_by_group_cap() {
+        assert_eq!(MAX_SHARED_GROUPS, 1_024);
+        let router = Router::new();
+        let inner = TopicFilter::new("t").unwrap();
+        // Drive deliveries for more groups than the cap: cursors and
+        // sticky entries must evict instead of growing without bound.
+        for i in 0..(MAX_SHARED_GROUPS + 64) {
+            let group = format!("cap-g{i}");
+            router.subscribe(
+                &inner,
+                Subscription::shared("m-a", 1, QoS::AtMostOnce, group.as_str()),
+            );
+            router.subscribe(
+                &inner,
+                Subscription::shared("m-b", 2, QoS::AtMostOnce, group.as_str()),
+            );
+            if i % 2 == 0 {
+                router.set_shared_strategy(&group, "sticky").expect("set");
+            }
+            let topic = Topic::new("t").unwrap();
+            assert_eq!(router.matches(&topic).len(), 1);
+        }
+        assert!(router.rr_cursors.read().len() <= MAX_SHARED_GROUPS);
+        assert!(router.sticky.read().len() <= MAX_SHARED_GROUPS);
     }
 
     #[test]

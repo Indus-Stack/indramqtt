@@ -2170,7 +2170,19 @@ async fn apply_publish(
         None
     };
 
-    let deliveries = ingress_pipeline(shared, &topic, qos, retain, &frame.payload).await;
+    // B4-02: resolve the publisher once for the shared `hash_clientid`
+    // strategy. `None` (unknown session) hashes the empty string in the
+    // router; delivery still proceeds to exactly one member.
+    let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
+    let deliveries = ingress_pipeline_with_publisher(
+        shared,
+        &topic,
+        qos,
+        retain,
+        &frame.payload,
+        publisher.as_deref(),
+    )
+    .await;
     forward_cluster(shared, &topic, qos, &frame.payload).await;
 
     (ack, deliveries)
@@ -2212,15 +2224,35 @@ async fn apply_delayed_publish(
         None
     };
     if delay_secs == 0 {
-        let deliveries = ingress_pipeline(shared, &inner_topic, qos, retain, &frame.payload).await;
+        // B4-02: delayed delivery keeps the publisher when the session
+        // still exists so `hash_clientid` stays stable across the defer.
+        let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
+        let deliveries = ingress_pipeline_with_publisher(
+            shared,
+            &inner_topic,
+            qos,
+            retain,
+            &frame.payload,
+            publisher.as_deref(),
+        )
+        .await;
         forward_cluster(shared, &inner_topic, qos, &frame.payload).await;
         return (ack, deliveries);
     }
     let shared = shared.clone();
     let payload = frame.payload.clone();
+    let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        let deliveries = ingress_pipeline(&shared, &inner_topic, qos, retain, &payload).await;
+        let deliveries = ingress_pipeline_with_publisher(
+            &shared,
+            &inner_topic,
+            qos,
+            retain,
+            &payload,
+            publisher.as_deref(),
+        )
+        .await;
         // Outcome counting, like the immediate path: only live
         // mailboxes count as delivered; drops are already counted
         // inside `ConnTable::route`.
@@ -2326,12 +2358,15 @@ async fn apply_qos2_pubrel(
             return (comp, Vec::new());
         };
         if delay_secs == 0 {
-            let deliveries = ingress_pipeline(
+            // B4-02: the QoS 2 publisher id is the PUBREL sender, so the
+            // deferred fan-out hashes the same key as immediate delivery.
+            let deliveries = ingress_pipeline_with_publisher(
                 shared,
                 &inner_topic,
                 QoS::ExactlyOnce,
                 stored.retain,
                 &stored.payload,
+                Some(client_id.as_str()),
             )
             .await;
             forward_cluster(shared, &inner_topic, QoS::ExactlyOnce, &stored.payload).await;
@@ -2340,14 +2375,16 @@ async fn apply_qos2_pubrel(
         let shared_clone = shared.clone();
         let payload = stored.payload.clone();
         let retain = stored.retain;
+        let publisher = client_id.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-            let deliveries = ingress_pipeline(
+            let deliveries = ingress_pipeline_with_publisher(
                 &shared_clone,
                 &inner_topic,
                 QoS::ExactlyOnce,
                 retain,
                 &payload,
+                Some(publisher.as_str()),
             )
             .await;
             let mut enqueued = 0u64;
@@ -2367,12 +2404,14 @@ async fn apply_qos2_pubrel(
         });
         return (comp, Vec::new());
     }
-    let deliveries = ingress_pipeline(
+    // B4-02: QoS 2 second phase hashes the original publisher id.
+    let deliveries = ingress_pipeline_with_publisher(
         shared,
         &stored.topic,
         QoS::ExactlyOnce,
         stored.retain,
         &stored.payload,
+        Some(client_id.as_str()),
     )
     .await;
     forward_cluster(shared, &stored.topic, QoS::ExactlyOnce, &stored.payload).await;
@@ -2459,6 +2498,22 @@ async fn ingress_pipeline(
     retain: bool,
     payload: &Bytes,
 ) -> Vec<(u64, BrokerFrame)> {
+    ingress_pipeline_with_publisher(shared, topic, qos, retain, payload, None).await
+}
+
+/// [`ingress_pipeline`] with publisher context for shared strategies
+/// (B4-02). The MQTT ingress path passes the publishing client id; all
+/// other ingress paths (delayed timers without a live session, QoS 2
+/// second phase without a stored publisher, CoAP gateway, rule and
+/// management publishes) pass `None`.
+async fn ingress_pipeline_with_publisher(
+    shared: &Shared,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+    publisher: Option<&str>,
+) -> Vec<(u64, BrokerFrame)> {
     // Retained state tracks raw ingress: store (or clear on empty
     // payload) before rules and fan-out observe the message. Enforces
     // the same configurable limits as the management publish path
@@ -2535,7 +2590,7 @@ async fn ingress_pipeline(
     // plus one fsync.
     maybe_journal_stream(shared, topic, qos, payload);
 
-    let deliveries = build_downlink_frames(
+    let deliveries = build_downlink_frames_with_publisher(
         &shared.router,
         &shared.sessions,
         &shared.metrics,
@@ -2543,6 +2598,7 @@ async fn ingress_pipeline(
         qos,
         retain,
         payload,
+        publisher,
     );
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
@@ -2813,6 +2869,12 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
 /// PERF-10: each silent drop also bumps its kernel counter (detached
 /// clean drop, durable-queue eviction) exactly where the frame is
 /// discarded. Drops that happened before still happen.
+///
+/// B4-02: `publisher` carries the publishing client id for the shared
+/// `hash_clientid` strategy. The MQTT ingress path passes the real id;
+/// rule republishes, retained replays, cluster forwards and management
+/// publishes pass `None` (the router hashes the empty string there; see
+/// its open-question note on that branch).
 fn build_downlink_frames(
     router: &Router,
     sessions: &SessionManager,
@@ -2821,6 +2883,27 @@ fn build_downlink_frames(
     qos: QoS,
     retain: bool,
     payload: &Bytes,
+) -> Vec<(u64, BrokerFrame)> {
+    build_downlink_frames_with_publisher(
+        router, sessions, metrics, topic, qos, retain, payload, None,
+    )
+}
+
+/// [`build_downlink_frames`] with publisher context for shared
+/// strategies. This is the delivery event that drives
+/// `balance_shared_groups` (via `matches_with_publisher`): every publish
+/// fan-out reduces the matched shared groups through the router call and
+/// consumes the reduced set here.
+#[allow(clippy::too_many_arguments)]
+fn build_downlink_frames_with_publisher(
+    router: &Router,
+    sessions: &SessionManager,
+    metrics: &Metrics,
+    topic: &Topic,
+    qos: QoS,
+    retain: bool,
+    payload: &Bytes,
+    publisher: Option<&str>,
 ) -> Vec<(u64, BrokerFrame)> {
     let qos_raw = u8::from(qos);
     let topic_str = topic.as_str();
@@ -2835,7 +2918,7 @@ fn build_downlink_frames(
     // `clone` below shares this single root.
     let shared = payload.clone();
     let mut deliveries = Vec::new();
-    for sub in router.matches(topic) {
+    for sub in router.matches_with_publisher(topic, publisher) {
         let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
         match sessions.get(&sub.client_id) {
             Some(session) => {
@@ -4209,6 +4292,208 @@ mod tests {
         let (_, pid_b, qos_b, _) = decode_publish_meta_parts(&for_b.metadata);
         assert_eq!(qos_b, 0, "delivery downshifted to min(pub, sub)");
         assert_eq!(pid_b, 0, "QoS 0 downlink carries no packet id");
+    }
+
+    /// Subscribe one shared-group member through the broker subscribe
+    /// path (`apply_subscribe` with a `$share/<group>/tasks` filter) and
+    /// bind its session to `conn`, so later publishes deliver live.
+    async fn subscribe_shared_member(shared: &Shared, conn: u64, client: &str, group: &str) {
+        let filter = format!("$share/{group}/tasks");
+        let frame = subscribe_frame(
+            conn,
+            1,
+            encode_subscribe_meta(1, client, &[(filter.as_str(), 0)]),
+        );
+        let (reply, _) = apply_subscribe(&frame, shared).await;
+        reply.expect("shared subscribe replies");
+        let (session, _) = shared.sessions.get_or_create(client, true);
+        *session.conn_id.write() = Some(conn);
+    }
+
+    /// Publish one message through the broker ingress pipeline and
+    /// return the receiving connection ids (one per delivery).
+    async fn publish_shared_once(
+        shared: &Shared,
+        topic: &Topic,
+        publisher: Option<&str>,
+        payload: &[u8],
+    ) -> Vec<u64> {
+        ingress_pipeline_with_publisher(
+            shared,
+            topic,
+            QoS::AtMostOnce,
+            false,
+            &Bytes::from(payload.to_vec()),
+            publisher,
+        )
+        .await
+        .into_iter()
+        .map(|(conn, _)| conn)
+        .collect()
+    }
+
+    /// B4-02: round-robin through the broker rotates across members.
+    #[tokio::test]
+    async fn shared_strategy_round_robin_rotates_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(101u64, "rr-a"), (102, "rr-b"), (103, "rr-c")] {
+            subscribe_shared_member(&shared, conn, client, "rr").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("rr", "round_robin")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        let mut owners = Vec::new();
+        for i in 0..6u8 {
+            let got = publish_shared_once(&shared, &topic, Some("pub"), &[i]).await;
+            assert_eq!(got.len(), 1, "exactly one member per publish");
+            owners.push(got[0]);
+        }
+        assert_eq!(owners, vec![101, 102, 103, 101, 102, 103]);
+    }
+
+    /// B4-02: `hash_clientid` through the broker pins one member per
+    /// publisher id.
+    #[tokio::test]
+    async fn shared_strategy_hash_clientid_stable_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(111u64, "hc-a"), (112, "hc-b"), (113, "hc-c")] {
+            subscribe_shared_member(&shared, conn, client, "hc").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("hc", "hash_clientid")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        for publisher in ["pub-1", "pub-2", "pub-3"] {
+            let first = publish_shared_once(&shared, &topic, Some(publisher), b"x").await;
+            assert_eq!(first.len(), 1);
+            for _ in 0..5 {
+                let again = publish_shared_once(&shared, &topic, Some(publisher), b"x").await;
+                assert_eq!(again, first, "one publisher id pins one member");
+            }
+        }
+    }
+
+    /// B4-02: `hash_topic` through the broker pins one member per topic.
+    #[tokio::test]
+    async fn shared_strategy_hash_topic_stable_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(121u64, "ht-a"), (122, "ht-b"), (123, "ht-c")] {
+            subscribe_shared_member(&shared, conn, client, "ht").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("ht", "hash_topic")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        let first = publish_shared_once(&shared, &topic, Some("pub"), b"x").await;
+        assert_eq!(first.len(), 1);
+        for _ in 0..5 {
+            let again = publish_shared_once(&shared, &topic, Some("other-pub"), b"x").await;
+            assert_eq!(
+                again, first,
+                "one topic pins one member whatever the publisher"
+            );
+        }
+    }
+
+    /// B4-02: sticky through the broker holds one member while the
+    /// membership is stable.
+    #[tokio::test]
+    async fn shared_strategy_sticky_stable_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(131u64, "st-a"), (132, "st-b"), (133, "st-c")] {
+            subscribe_shared_member(&shared, conn, client, "st").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("st", "sticky")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        let first = publish_shared_once(&shared, &topic, Some("pub"), b"x").await;
+        assert_eq!(first.len(), 1);
+        for i in 0..10u8 {
+            let again = publish_shared_once(&shared, &topic, Some("pub"), &[i]).await;
+            assert_eq!(again, first, "sticky holds while members stable");
+        }
+    }
+
+    /// B4-02: random through the broker shows liveness across members.
+    #[tokio::test]
+    async fn shared_strategy_random_live_through_broker() {
+        let shared = test_shared();
+        for (conn, client) in [(141u64, "rn-a"), (142, "rn-b"), (143, "rn-c")] {
+            subscribe_shared_member(&shared, conn, client, "rn").await;
+        }
+        shared
+            .router
+            .set_shared_strategy("rn", "random")
+            .expect("set");
+        let topic = Topic::new("tasks").unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..60u8 {
+            let got = publish_shared_once(&shared, &topic, Some("pub"), &[i]).await;
+            assert_eq!(got.len(), 1);
+            seen.insert(got[0]);
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "random must reach every member, saw {seen:?}"
+        );
+    }
+
+    /// B4-02: an unknown strategy name is rejected, never mapped to
+    /// round-robin: the set call fails and the group keeps its default.
+    #[tokio::test]
+    async fn shared_strategy_unknown_rejected_through_broker() {
+        let shared = test_shared();
+        subscribe_shared_member(&shared, 151, "ux-a", "ux").await;
+        subscribe_shared_member(&shared, 152, "ux-b", "ux").await;
+        let err = shared
+            .router
+            .set_shared_strategy("ux", "least-connections")
+            .expect_err("unknown strategy must fail");
+        assert!(err.to_string().contains("round_robin"));
+        assert_eq!(
+            shared.router.shared_strategy("ux"),
+            broker_router::SharedStrategy::RoundRobin
+        );
+        // The group still balances (default), it was not left broken.
+        let topic = Topic::new("tasks").unwrap();
+        let got = publish_shared_once(&shared, &topic, Some("pub"), b"x").await;
+        assert_eq!(got.len(), 1);
+    }
+
+    /// B4-02: plain subscribers alongside shared members each receive a
+    /// copy through the broker.
+    #[tokio::test]
+    async fn shared_and_plain_coexist_through_broker() {
+        let shared = test_shared();
+        subscribe_shared_member(&shared, 161, "co-a", "co").await;
+        subscribe_shared_member(&shared, 162, "co-b", "co").await;
+        let frame = subscribe_frame(
+            163,
+            1,
+            encode_subscribe_meta(1, "co-plain", &[("tasks", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&frame, &shared).await;
+        reply.expect("plain subscribe replies");
+        let (session, _) = shared.sessions.get_or_create("co-plain", true);
+        *session.conn_id.write() = Some(163);
+        let topic = Topic::new("tasks").unwrap();
+        for i in 0..4u8 {
+            let mut got = publish_shared_once(&shared, &topic, Some("pub"), &[i]).await;
+            got.sort_unstable();
+            assert_eq!(got.len(), 2, "plain plus exactly one member");
+            assert!(got.contains(&163), "plain subscriber always present");
+            assert!(
+                got.contains(&161) || got.contains(&162),
+                "exactly one member joins, saw {got:?}"
+            );
+        }
     }
 
     /// D1-03: an 8 KB payload fanned out to N subscribers must share one
