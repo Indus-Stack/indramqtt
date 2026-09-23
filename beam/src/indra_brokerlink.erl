@@ -71,6 +71,7 @@
          encode_puback_meta/2,
          decode_puback_meta/1,
          encode_pubrec_meta/1,
+         encode_pubrec_meta/2,
          decode_pubrec_meta/1,
          encode_pubrel_meta/1,
          decode_pubrel_meta/1,
@@ -819,15 +820,29 @@ decode_suback_meta(_) ->
     {error, malformed_suback_meta}.
 
 %% @doc Encode PublishMeta (both PublishIn and PublishOut directions).
-%% Pre-alias form (no trailing alias section, decodes as alias 0).
+%% Pre-alias form (no trailing alias section, decodes as absent, never a
+%% protocol error). This is what the 3.1.1 edge sends when the socket
+%% carried no alias property: absent must stay distinguishable from an
+%% explicit on-wire alias 0 (B4-05, MQTT 5.0 §3.3.2.3.4: alias 0 is a
+%% protocol error, DISCONNECT 0x94), which only the /6 form can express.
 -spec encode_publish_meta(binary(), 0..65535, 0..2, boolean(), boolean()) -> binary().
-encode_publish_meta(Topic, PacketId, QoS, Retain, Dup) ->
-    encode_publish_meta(Topic, PacketId, QoS, Retain, Dup, 0).
+encode_publish_meta(Topic, PacketId, QoS, Retain, Dup)
+  when is_binary(Topic),
+       is_integer(PacketId), PacketId >= 0, PacketId =< 65535,
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       is_boolean(Retain), is_boolean(Dup) ->
+    true = (byte_size(Topic) >= 1) orelse erlang:error(badarg),
+    R = case Retain of true -> 1; false -> 0 end,
+    D = case Dup of true -> 1; false -> 0 end,
+    <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big, QoS:8, R:8, D:8>>.
 
-%% @doc Encode PublishMeta with a B4-05 topic alias (0 = no alias). An
+%% @doc Encode PublishMeta with a B4-05 topic alias. An
 %% empty topic is accepted only with a nonzero alias
 %% (alias-by-reference). The topic itself always travels in full next to
-%% the alias so a pre-alias peer still delivers correctly.
+%% the alias so a pre-alias peer still delivers correctly. NOTE: encoding
+%% an explicit alias 0 section is allowed here only so tests and a future
+%% v5 edge can express it; inbound it is a protocol error (DISCONNECT
+%% 0x94), never "no alias" — use the /5 form for absent.
 -spec encode_publish_meta(binary(), 0..65535, 0..2, boolean(), boolean(), 0..65535) -> binary().
 encode_publish_meta(Topic, PacketId, QoS, Retain, Dup, Alias)
   when is_binary(Topic),
@@ -893,10 +908,26 @@ encode_pubrec_meta(PacketId)
   when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
     <<PacketId:16/big>>.
 
-%% @doc Decode QoS 2 PUBREC metadata.
--spec decode_pubrec_meta(binary()) -> {ok, #{packet_id := 1..65535}} | {error, term()}.
+%% @doc Encode QoS 2 PUBREC metadata with a reason code (B4-05: 0x94
+%% Topic Alias Invalid on an alias reject; 0 is success and encodes like
+%% {@link encode_pubrec_meta/1} without the trailing byte).
+-spec encode_pubrec_meta(1..65535, 0..255) -> binary().
+encode_pubrec_meta(PacketId, 0)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
+    encode_pubrec_meta(PacketId);
+encode_pubrec_meta(PacketId, RC)
+  when is_integer(PacketId), PacketId >= 1, PacketId =< 65535,
+       is_integer(RC), RC >= 0, RC =< 255 ->
+    <<PacketId:16/big, RC:8>>.
+
+%% @doc Decode QoS 2 PUBREC metadata. Accepts the 2-byte pre-alias form
+%% (no reason key, treated as 0) and the 3-byte B4-05 form
+%% (`PacketId:16be | RC:8`, used by PUBREC 0x94 alias rejects).
+-spec decode_pubrec_meta(binary()) -> {ok, map()} | {error, term()}.
 decode_pubrec_meta(<<PacketId:16/big>>) when PacketId =/= 0 ->
     {ok, #{packet_id => PacketId}};
+decode_pubrec_meta(<<PacketId:16/big, RC:8>>) when PacketId =/= 0 ->
+    {ok, #{packet_id => PacketId, reason_code => RC}};
 decode_pubrec_meta(_) ->
     {error, malformed_pubrec_meta}.
 

@@ -1,3 +1,4 @@
+use broker_protocol::v5 as protocol_v5;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_storage::{OfflineQueueStore, OfflineRecord};
 use bytes::Bytes;
@@ -144,14 +145,17 @@ pub struct Session {
     pub qos2_outbound: RwLock<VecDeque<Qos2OutboundEntry>>,
     /// Inbound topic-alias table (B4-05, T-92): `alias -> topic` for
     /// publishes the client sends with an alias. Index 0 is always
-    /// `None` (alias 0 is never valid); the vector length is always
-    /// `max + 1`, so lookup is a bounded index with no per-message
-    /// allocation on the hot path (alias 0 returns before taking any
-    /// lock). Owned by the kernel (this session); written on the
-    /// PUBLISH event, bounded by [`Session::inbound_alias_max`].
-    /// TODO(parity): wire MQTT 5 property framing on the socket is still
-    /// open (the edge speaks 3.1.1 on the wire); aliases arrive via the
-    /// kernel BrokerLink publish meta until then.
+    /// `None` (alias 0 is never valid); once an alias-carrying publish
+    /// arrives the vector is sized to `max + 1`, so lookup is a bounded
+    /// index with no per-message allocation on the hot path (alias 0
+    /// returns before taking any lock, and publishes carrying no alias
+    /// never touch this table). Until the first such publish the table
+    /// stays empty, so connections that never use aliases pay no alias
+    /// allocation. Owned by the kernel (this session); written on the
+    /// PUBLISH event, bounded by [`Session::inbound_alias_max`]. The edge
+    /// decodes the MQTT 5 alias properties (34/35) on the socket and
+    /// forwards them in the BrokerLink publish meta; the kernel owns
+    /// this table and writes it on the PUBLISH event.
     pub inbound_aliases: RwLock<Vec<Option<Topic>>>,
     /// Maximum alias the client may use (B4-05). Advertised in CONNACK;
     /// written on the CONNECT event from the manager default.
@@ -406,7 +410,12 @@ impl Session {
             max_spill: AtomicUsize::new(DEFAULT_MAX_QOS1_SPILL),
             qos2_inbound: RwLock::new(HashMap::new()),
             qos2_outbound: RwLock::new(VecDeque::new()),
-            inbound_aliases: RwLock::new(vec![None; DEFAULT_TOPIC_ALIAS_MAXIMUM as usize + 1]),
+            // Inbound alias table starts empty (B4-05 hot path): sized to
+            // `max + 1` on the first alias-carrying PUBLISH, so the
+            // common no-alias connection pays no alias allocation here.
+            // The bound is enforced by the `inbound_alias_max` range
+            // check, never by the vector length.
+            inbound_aliases: RwLock::new(Vec::new()),
             inbound_alias_max: AtomicU16::new(DEFAULT_TOPIC_ALIAS_MAXIMUM),
             outbound_aliases: RwLock::new(Vec::new()),
             outbound_alias_max: AtomicU16::new(0),
@@ -715,12 +724,19 @@ impl Session {
     }
 
     /// Set the inbound alias maximum, resizing the table to `max + 1`
-    /// (index 0 stays unused). Shrinking drops mappings above the new
+    /// (index 0 stays unused) when it already holds entries. A fresh
+    /// (empty) table is left empty and sized on the first alias-carrying
+    /// PUBLISH instead, so connections that never use aliases pay no
+    /// alias allocation; the bound is enforced by the `max` range check,
+    /// never by the vector length. Shrinking drops mappings above the new
     /// maximum (fail closed on next use). CONNECT event only; never per
     /// message.
     pub fn set_inbound_alias_max(&self, max: u16) {
         self.inbound_alias_max.store(max, Ordering::Relaxed);
         let mut table = self.inbound_aliases.write();
+        if table.is_empty() {
+            return;
+        }
         let want = max as usize + 1;
         table.resize_with(want, || None);
         if table.len() > want {
@@ -749,11 +765,11 @@ impl Session {
     /// Overwrites the previous mapping for a valid alias (the documented
     /// behaviour). PUBLISH event only.
     pub fn register_inbound_alias(&self, alias: u16, topic: Topic) -> Result<(), AliasReject> {
-        if alias == 0 {
+        if alias == protocol_v5::NO_TOPIC_ALIAS {
             return Err(AliasReject::Zero);
         }
         let max = self.inbound_alias_max();
-        if max == 0 || alias > max {
+        if !protocol_v5::alias_in_range(alias, max) {
             return Err(AliasReject::OverMaximum);
         }
         let mut table = self.inbound_aliases.write();
@@ -769,11 +785,11 @@ impl Session {
     /// `None` with no lock; otherwise one read lock plus a bounded index,
     /// cloning the stored topic only on a hit.
     pub fn resolve_inbound_alias(&self, alias: u16) -> Option<Topic> {
-        if alias == 0 {
+        if alias == protocol_v5::NO_TOPIC_ALIAS {
             return None;
         }
         let max = self.inbound_alias_max.load(Ordering::Relaxed);
-        if max == 0 || alias > max {
+        if !protocol_v5::alias_in_range(alias, max) {
             return None;
         }
         self.inbound_aliases
@@ -794,7 +810,7 @@ impl Session {
     /// bounded linear scan (<= max entries), no allocation.
     pub fn outbound_alias_for(&self, topic_str: &str) -> Option<u16> {
         let max = self.outbound_alias_max.load(Ordering::Relaxed);
-        if max == 0 {
+        if max == protocol_v5::NO_TOPIC_ALIAS {
             return None;
         }
         let table = self.outbound_aliases.read();
@@ -816,7 +832,7 @@ impl Session {
     /// 0, so the table never grows per message).
     pub fn assign_outbound_alias(&self, topic: &Topic) -> Option<u16> {
         let max = self.outbound_alias_max.load(Ordering::Relaxed);
-        if max == 0 {
+        if max == protocol_v5::NO_TOPIC_ALIAS {
             return None;
         }
         let mut table = self.outbound_aliases.write();

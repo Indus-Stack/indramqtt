@@ -46,10 +46,16 @@ pub fn alias_in_range(alias: u16, max: u16) -> bool {
 
 /// Validate one inbound alias use. `Ok(())` means the alias may be
 /// registered (topic present) or resolved (topic absent); `Err` carries
-/// the reason code the publisher must receive.
+/// the reason code the publisher must receive. Alias 0 is never valid
+/// on the wire (MQTT 5.0 §3.3.2.3.4: protocol error, DISCONNECT 0x94);
+/// "no alias carried" is the absence of the property, never an explicit
+/// 0, so this helper rejects 0 even though the kernel `alias_present`
+/// fast path handles absence before calling it.
 pub fn check_inbound_alias(alias: u16, max: u16) -> Result<(), ProtocolError> {
     if alias == NO_TOPIC_ALIAS {
-        return Ok(());
+        return Err(ProtocolError::InvalidTopic(
+            "topic alias 0 is never valid".to_string(),
+        ));
     }
     if max == 0 || alias > max {
         return Err(ProtocolError::InvalidTopic(format!(
@@ -120,7 +126,8 @@ mod tests {
 
     #[test]
     fn inbound_check_maps_over_max_to_error() {
-        assert!(check_inbound_alias(0, 0).is_ok());
+        assert!(check_inbound_alias(0, 0).is_err());
+        assert!(check_inbound_alias(0, 10).is_err());
         assert!(check_inbound_alias(1, 0).is_err());
         assert!(check_inbound_alias(11, 10).is_err());
         assert!(check_inbound_alias(10, 10).is_ok());

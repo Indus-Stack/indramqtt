@@ -177,14 +177,21 @@ init_shard(Sock, Opts, Shards) ->
              buffer => <<>>,
              seq => 0,
               pending => undefined,
-              client_id => undefined,
-              keepalive => 0,
-              %% F1-01 last will captured from CONNECT (undefined when
-              %% the client registered none). Forwarded in every bind
-              %% (including rebinds after a core restart) and reported
-              %% via DisconnectIn on ungraceful close; the kernel owns
-              %% the session and the publish decision.
-              will => undefined,
+               client_id => undefined,
+               keepalive => 0,
+               %% F1-01 last will captured from CONNECT (undefined when
+               %% the client registered none). Forwarded in every bind
+               %% (including rebinds after a core restart) and reported
+               %% via DisconnectIn on ungraceful close; the kernel owns
+               %% the session and the publish decision.
+               will => undefined,
+               %% B4-05 negotiated protocol level (4 or 5) and the
+               %% CONNECT Topic Alias Maximum (client receive limit).
+               %% Level gates the CONNACK shape and PUBLISH decoding;
+               %% the maximum rides every (re)bind so the kernel
+               %% outbound table survives core restarts.
+               proto_level => 4,
+               client_alias_max => 0,
              session_id => undefined,
              subs_pending => #{},
              pubs_pending => #{},
@@ -732,36 +739,42 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
         {ok, #{client_id := ClientId, clean_start := CleanStart, keepalive := Keepalive,
                username := User, password := Pass, will_flag := WillFlag,
                will_qos := WillQos, will_retain := WillRetain,
-               will_topic := WillTopic, will_payload := WillPayload}} ->
+               will_topic := WillTopic, will_payload := WillPayload} = Conn} ->
             %% The peer address rides the bind so the kernel can refuse
             %% address-banned clients (B1-03); a bind without it simply
-            %% matches no address ban, never fails. B4-05: no alias
-            %% section rides this bind (3.1.1 clients negotiate no
-            %% maximum), so the kernel outbound bound stays 0 and
-            %% deliveries toward them always carry the full topic.
-            %% F1-01: the CONNECT last will rides the bind when present;
-            %% the kernel stores it on the session and publishes it on an
-            %% ungraceful close only. A will topic carrying wildcards (or
-            %% an empty one) can never route, so the CONNECT fails closed
-            %% here instead of registering half a will.
+            %% matches no address ban, never fails. B4-05: the CONNECT
+            %% Topic Alias Maximum rides the bind alias section (the
+            %% client's receive limit bounding the kernel outbound
+            %% table); 3.1.1 CONNECTs carry none, so the bound stays 0
+            %% and deliveries toward them always carry the full topic.
+            %% The negotiated level is stashed for CONNACK gating and
+            %% PUBLISH decoding below. Table ownership: kernel holds both
+            %% tables. F1-01: the CONNECT last will rides the bind when
+            %% present; the kernel stores it on the session and publishes
+            %% it on an ungraceful close only. A will topic carrying
+            %% wildcards (or an empty one) can never route, so the
+            %% CONNECT fails closed here instead of registering half
+            %% a will.
+            ProtoLevel = maps:get(protocol_level, Conn, 4),
+            ClientAliasMax = maps:get(alias_max, Conn, 0),
             case make_will(WillFlag, WillTopic, WillPayload, WillQos, WillRetain) of
                 {error, _} ->
                     stop_with(Data, protocol_error);
                 {ok, Will} ->
-                    %% No will rides the legacy /5 encoding byte-for-byte;
-                    %% a will rides the /7 encoding (alias maximum 0:
-                    %% 3.1.1 clients negotiate no maximum).
+                    %% No will rides the /6 encoding byte-for-byte;
+                    %% a will rides the /7 encoding (both carry the
+                    %% CONNECT alias maximum).
                     Meta = case Will of
                         undefined ->
                             (catch indra_brokerlink:encode_bind_meta(
                                      ClientId, CleanStart, Keepalive,
                                      {User, Pass},
-                                     peer_ip_opt(Data)));
+                                     peer_ip_opt(Data), ClientAliasMax));
                         _ ->
                             (catch indra_brokerlink:encode_bind_meta(
                                      ClientId, CleanStart, Keepalive,
                                      {User, Pass},
-                                     peer_ip_opt(Data), 0, Will))
+                                     peer_ip_opt(Data), ClientAliasMax, Will))
                     end,
                     case Meta of
                         <<_/binary>> ->
@@ -770,7 +783,9 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
                                 ok ->
                                     Pending = #{client_id => ClientId,
                                                 keepalive => Keepalive,
-                                                will => Will},
+                                                will => Will,
+                                                proto_level => ProtoLevel,
+                                                client_alias_max => ClientAliasMax},
                                     %% Stash bytes pipelined behind CONNECT; they drain once
                                     %% the handshake completes (see `drain_buffer`).
                                     {keep_state, Data#{seq => Seq + 1,
@@ -812,17 +827,18 @@ make_will(_, _, _, _, _) ->
 %% @private Re-send the pending bind to a replacement broker (core flap
 %% mid-handshake). Drops back to waiting on failure.
 resend_bind(#{broker := Broker, conn_id := ConnId, seq := Seq,
-              pending := #{client_id := ClientId, keepalive := Keepalive} = Pending} = Data) ->
+               pending := #{client_id := ClientId, keepalive := Keepalive} = Pending} = Data) ->
     Will = maps:get(will, Pending, undefined),
+    ClientAliasMax = maps:get(client_alias_max, Pending, 0),
     Meta = case Will of
         undefined ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {undefined, undefined},
-                                                     peer_ip_opt(Data)));
+                                                     peer_ip_opt(Data), ClientAliasMax));
         _ ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {undefined, undefined},
-                                                     peer_ip_opt(Data), 0, Will))
+                                                     peer_ip_opt(Data), ClientAliasMax, Will))
     end,
     case Meta of
         <<_/binary>> ->
@@ -867,23 +883,39 @@ peer_ip(_, _) ->
 
 handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
     case indra_brokerlink:decode_session_binding_meta(Meta) of
-        %% B4-05: the binding carries the kernel alias maximum for
-        %% CONNACK negotiation, but the 3.1.1 CONNACK has no property
-        %% channel for it, so the edge answers without it (fail closed:
-        %% the client never sends aliases it was never told about).
+        %% B4-05: the binding carries the kernel inbound alias maximum for
+        %% CONNACK negotiation. MQTT 5 peers learn it through the CONNACK
+        %% property (34) via encode_connack/3; 3.1.1 peers always get the
+        %% 4-byte encode_connack/2 shape (a property section would break
+        %% their framing), so alias_max 0 and every level-4 socket encode
+        %% with no property. Fail closed: a client never sends aliases it
+        %% was never told about. Table ownership: kernel holds both
+        %% tables; the edge only frames the wire values.
         {ok, #{session_id := SessionId,
                session_present := Present,
-               return_code := RC}} ->
-            Connack = indra_mqtt_codec:encode_connack(
-                        Present, indra_mqtt_codec:connack_return_code(RC)),
+               return_code := RC} = Binding} ->
+            AliasMax = maps:get(alias_max, Binding, 0),
+            Pending0 = maps:get(pending, Data, #{client_id => <<>>,
+                                                 keepalive => 0}),
+            ProtoLevel = maps:get(proto_level, Pending0, 4),
+            Connack = case ProtoLevel =:= 5 andalso AliasMax > 0 of
+                true ->
+                    indra_mqtt_codec:encode_connack(
+                      Present, indra_mqtt_codec:connack_return_code(RC), AliasMax);
+                false ->
+                    indra_mqtt_codec:encode_connack(
+                      Present, indra_mqtt_codec:connack_return_code(RC))
+            end,
             case sock_send(Mod, Sock, Connack) of
                 ok when RC =:= 0 ->
-                    Pending = maps:get(pending, Data, #{client_id => <<>>,
-                                                        keepalive => 0}),
+                    Pending = Pending0,
                     Data1 = Data#{session_id => SessionId,
                                   client_id => maps:get(client_id, Pending, <<>>),
                                   keepalive => maps:get(keepalive, Pending, 0),
-                                  will => maps:get(will, Pending, undefined)},
+                                  will => maps:get(will, Pending, undefined),
+                                  proto_level => ProtoLevel,
+                                  client_alias_max =>
+                                      maps:get(client_alias_max, Pending, 0)},
                     {next_state, connected, Data1,
                      [keepalive_action(Data1), {next_event, internal, drain_buffer}]};
                 ok ->
@@ -912,15 +944,16 @@ start_rebind(#{broker := Broker, conn_id := ConnId, seq := Seq,
                client_id := ClientId, keepalive := Keepalive} = Data)
   when is_binary(ClientId) ->
     Will = maps:get(will, Data, undefined),
+    ClientAliasMax = maps:get(client_alias_max, Data, 0),
     Meta = case Will of
         undefined ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {undefined, undefined},
-                                                     peer_ip_opt(Data)));
+                                                     peer_ip_opt(Data), ClientAliasMax));
         _ ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {undefined, undefined},
-                                                     peer_ip_opt(Data), 0, Will))
+                                                     peer_ip_opt(Data), ClientAliasMax, Will))
     end,
     case Meta of
         <<_/binary>> ->
@@ -1103,19 +1136,29 @@ handle_subscribe_packet(Payload, Data) ->
     end.
 
 handle_publish_packet(Payload, Flags, Data) ->
-    case indra_mqtt_codec:decode_publish(Payload, Flags) of
+    ProtoLevel = maps:get(proto_level, Data, 4),
+    case indra_mqtt_codec:decode_publish(Payload, Flags, ProtoLevel) of
         {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
-               retain := Retain, dup := Dup, payload := AppPayload} = Pub} ->
+               retain := Retain, dup := Dup, payload := AppPayload,
+               alias := Alias, alias_present := AliasPresent}} ->
             #{broker := Broker, conn_id := ConnId, seq := Seq,
               pubs_pending := Pending, qos2_pending := Qos2Pending} = Data,
-            %% B4-05: the 3.1.1 wire carries no alias yet (the codec
-            %% reports alias 0; TODO(parity): wire v5 properties on the
-            %% socket are still open), so the kernel inbound table only
-            %% sees alias 0 from this edge until then. Forward whatever
-            %% the codec reports via the /6 form.
-            Alias = maps:get(alias, Pub, 0),
-            Meta = indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup,
-                                                        Alias),
+            %% B4-05: the alias rides the PUBLISH alias property on v5
+            %% sockets (absent on 3.1.1, where the codec always reports
+            %% it absent). Forward absent via the /5 form, never an
+            %% explicit alias 0 section: absent means "no alias carried"
+            %% while an explicit 0 is a protocol error the kernel
+            %% rejects with DISCONNECT 0x94, and the two must stay
+            %% distinguishable on the wire. The kernel checks the alias
+            %% against the CONNACK-negotiated maximum on the PUBLISH
+            %% event, where the inbound table is written.
+            Meta = case AliasPresent of
+                false ->
+                    indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup);
+                true ->
+                    indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup,
+                                                         Alias)
+            end,
             case catch indra_brokerlink:send(Broker, ?PUBLISH_IN, ConnId, Seq + 1, Meta, AppPayload) of
                 ok when QoS =:= 1 ->
                     {ok, Data#{seq => Seq + 1,
@@ -1329,9 +1372,14 @@ emit_frames([{Header, Meta, Payload} = _Frame | Rest], Data, Pending, N, B) ->
         ?PUBLISH_OUT ->
             case indra_brokerlink:decode_publish_meta(Meta) of
                 {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
-                       retain := Retain, dup := Dup}} ->
+                       retain := Retain, dup := Dup, alias := Alias}} ->
+                    %% B4-05: the kernel-assigned alias rides the PUBLISH
+                    %% alias property toward v5 subscribers (0 means full
+                    %% topic, no alias). The meta value is already the
+                    %% wire value, framed directly with no round-trip.
                     Packet = indra_mqtt_codec:encode_publish(Topic, PacketId, QoS,
-                                                             Retain, Dup, Payload),
+                                                             Retain, Dup, Payload,
+                                                             Alias),
                     emit_frames(Rest, Data, [Packet | Pending], N + 1,
                                 B + byte_size(Meta) + byte_size(Payload));
                 {error, _} ->
@@ -1534,13 +1582,17 @@ handle_puback_out(Meta, #{sock := Sock, sockmod := Mod, pubs_pending := Pending}
     end.
 
 %% @private Forward one kernel PUBREC to the publishing client (D1-01
-%% inbound first phase). The pending entry stays until PUBCOMP so a
-%% duplicate PUBLISH still matches; unsolicited PUBRECs are still
-%% forwarded (the kernel only sends them for publishes it stored).
+%% inbound first phase, B4-05 alias rejects carry reason 0x94). The
+%% pending entry stays until PUBCOMP so a duplicate PUBLISH still
+%% matches; unsolicited PUBRECs are still forwarded (the kernel only
+%% sends them for publishes it stored). A nonzero reason code rides the
+%% MQTT 5 PUBREC reason field via encode_pubrec/2 so the publisher
+%% observes the 0x94 rejection instead of a bare PUBREC.
 handle_pubrec_out(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
     case indra_brokerlink:decode_pubrec_meta(Meta) of
-        {ok, #{packet_id := PacketId}} ->
-            case sock_send(Mod, Sock, indra_mqtt_codec:encode_pubrec(PacketId)) of
+        {ok, #{packet_id := PacketId} = Dec} ->
+            RC = maps:get(reason_code, Dec, 0),
+            case sock_send(Mod, Sock, indra_mqtt_codec:encode_pubrec(PacketId, RC)) of
                 ok ->
                     {keep_state, Data};
                 {error, _} ->

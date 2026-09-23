@@ -378,7 +378,7 @@ fn session_binding_reply(
     meta.extend_from_slice(&session_id.to_be_bytes());
     meta.push(u8::from(present));
     meta.push(return_code);
-    meta.extend_from_slice(&alias_max.to_be_bytes());
+    meta.extend_from_slice(&protocol_v5::encode_alias_maximum(alias_max));
 
     BrokerFrame::new(
         OpCode::SessionBinding,
@@ -795,7 +795,8 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     if rest.len() >= 2 {
         let (prefix, suffix) = rest.split_at(rest.len() - 2);
         if let Ok(identity) = decode_bind_identity(prefix) {
-            let client_alias_max = u16::from_be_bytes([suffix[0], suffix[1]]);
+            let client_alias_max =
+                protocol_v5::decode_alias_maximum(suffix).unwrap_or(protocol_v5::NO_TOPIC_ALIAS);
             return Ok(BindRequest {
                 client_id: client_id.to_string(),
                 clean_start: flags & 0x01 != 0,
@@ -2868,26 +2869,28 @@ async fn apply_publish(
     shared: &Shared,
 ) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
     shared.metrics.inc_publish_received();
-    let (raw_topic_str, packet_id, qos_raw, retain, alias) =
+    let (raw_topic_str, packet_id, qos_raw, retain, alias, alias_present) =
         match decode_publish_meta(&frame.metadata) {
             Some(parts) => parts,
             None => return (None, Vec::new()),
         };
     // B4-05 inbound topic aliases: resolve the effective topic before any
-    // other stage observes it. Alias 0 is the fast path (no lock, no
-    // table touch). Otherwise the kernel inbound table (written here on
-    // the PUBLISH event) maps the alias: a publish carrying both topic
-    // and alias registers the mapping, an empty-topic publish resolves
-    // it. An alias above the negotiated maximum, or an unregistered
-    // alias, is rejected with reason code 0x94 (Topic Alias Invalid) on
-    // QoS 1; QoS 0 drops silently and QoS 2 gets no PUBREC so the
-    // publisher retries instead of observing a false completion.
+    // other stage observes it. No alias section on the wire is the fast
+    // path (no lock, no table touch). Otherwise the kernel inbound table
+    // (written here on the PUBLISH event) maps the alias: a publish
+    // carrying both topic and alias registers the mapping, an empty-topic
+    // publish resolves it. Any unusable alias — explicit alias 0, an alias
+    // above the CONNACK-negotiated maximum, or an empty-topic alias with
+    // no prior mapping — is a protocol error (MQTT 5.0 §3.3.2.3.4): the
+    // publisher gets reason code 0x94 (Topic Alias Invalid) on QoS 1
+    // and QoS 2 (QoS 0 has no ack channel) and the kernel orders a
+    // DISCONNECT via `ConnClose` and detaches the connection, so the
+    // faulty connection never publishes again.
     //
-    // TODO(parity): QoS 2 has no reason-code channel on the current
-    // 2-byte PubRecOut meta, so a rejected QoS 2 alias cannot carry
-    // 0x94 yet; the rulebook does not decide this case and the current
-    // choice fails closed (no PUBREC, publisher retries).
-    let raw_topic_str = if alias == 0 {
+    // QoS 2 carries 0x94 through the 3-byte PubRecOut meta
+    // (`PacketId:16be | RC:8`) built by `qos2_reply_with_reason`; the
+    // pre-alias 2-byte form still decodes as reason 0.
+    let raw_topic_str = if !alias_present {
         raw_topic_str
     } else {
         match resolve_inbound_alias_topic(shared, frame.header.conn_id, &raw_topic_str, alias) {
@@ -2895,8 +2898,15 @@ async fn apply_publish(
             InboundAliasOutcome::Reject => {
                 let ack = match qos_raw {
                     1 => pub_ack_reply(frame, packet_id, protocol_v5::REASON_TOPIC_ALIAS_INVALID),
+                    2 => qos2_reply_with_reason(
+                        OpCode::PubRecOut,
+                        frame,
+                        packet_id,
+                        protocol_v5::REASON_TOPIC_ALIAS_INVALID,
+                    ),
                     _ => None,
                 };
+                order_alias_disconnect(shared, frame.header.conn_id);
                 return (ack, Vec::new());
             }
         }
@@ -3398,24 +3408,50 @@ fn apply_qos2_pubcomp(frame: &BrokerFrame, shared: &Shared) {
 /// `PubCompOut`) mirroring the request identity. Meta is the 2-byte
 /// packet id; a zero id yields no reply.
 fn qos2_reply(opcode: OpCode, frame: &BrokerFrame, packet_id: u16) -> Option<BrokerFrame> {
+    qos2_reply_with_reason(opcode, frame, packet_id, 0)
+}
+
+/// Build one QoS 2 acknowledgement carrying a reason code (B4-05, T-92:
+/// a rejected alias answers PUBREC 0x94 Topic Alias Invalid). Layout is
+/// `PacketId:16be | RC:8`; `RC 0` is success. The edge accepts both the
+/// 2-byte (pre-alias, RC 0) and 3-byte forms. A zero packet id yields no
+/// reply.
+fn qos2_reply_with_reason(
+    opcode: OpCode,
+    frame: &BrokerFrame,
+    packet_id: u16,
+    reason_code: u8,
+) -> Option<BrokerFrame> {
     if packet_id == 0 {
         return None;
+    }
+    let mut meta = Vec::with_capacity(3);
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    if opcode == OpCode::PubRecOut || reason_code != 0 {
+        meta.push(reason_code);
     }
     BrokerFrame::new(
         opcode,
         frame.header.conn_id,
         frame.header.sequence_no,
-        Bytes::from(packet_id.to_be_bytes().to_vec()),
+        Bytes::from(meta),
         Bytes::new(),
     )
     .ok()
 }
 
 /// Decode QoS 2 acknowledgement metadata into the packet id. Layout is
-/// `PacketId:16be` (mirrors the MQTT packet id; the return code that
-/// `PubAckIn` carries has no QoS 2 equivalent). The id must be nonzero;
-/// trailing bytes are tolerated.
+/// `PacketId:16be` optionally followed by `RC:8` (B4-05 PUBREC 0x94;
+/// pre-alias 2-byte frames decode as RC 0). The id must be nonzero;
+/// further trailing bytes are tolerated.
 fn decode_qos2_meta(meta: &[u8]) -> Option<u16> {
+    decode_qos2_meta_with_reason(meta).map(|(packet_id, _)| packet_id)
+}
+
+/// Decode QoS 2 acknowledgement metadata into `(packet_id, reason_code)`.
+/// Accepts the 2-byte pre-alias form (reason 0) and the 3-byte B4-05 form
+/// (`PacketId:16be | RC:8`, used by PUBREC 0x94 rejects).
+fn decode_qos2_meta_with_reason(meta: &[u8]) -> Option<(u16, u8)> {
     if meta.len() < 2 {
         return None;
     }
@@ -3423,7 +3459,8 @@ fn decode_qos2_meta(meta: &[u8]) -> Option<u16> {
     if packet_id == 0 {
         return None;
     }
-    Some(packet_id)
+    let reason_code = if meta.len() >= 3 { meta[2] } else { 0 };
+    Some((packet_id, reason_code))
 }
 
 /// The shared ingress pipeline: retained store/clear, rule execution,
@@ -3925,13 +3962,19 @@ fn build_downlink_frames_with_publisher(
                         // plus a bounded scan, no allocation) so repeat
                         // deliveries reuse without a write; only the first
                         // delivery of a new topic takes the write lock.
-                        // Max 0 skips the table with one atomic load.
+                        // Max 0 (the client sent no maximum, the common
+                        // case) costs one relaxed atomic load and skips
+                        // the table with no lock and no allocation.
                         // Driven by the delivery event. The alias rides in
                         // the downlink meta next to the full topic.
-                        let alias = session
-                            .outbound_alias_for(topic_str)
-                            .or_else(|| session.assign_outbound_alias(topic))
-                            .unwrap_or(0);
+                        let alias = if session.outbound_alias_max() == 0 {
+                            0
+                        } else {
+                            session
+                                .outbound_alias_for(topic_str)
+                                .or_else(|| session.assign_outbound_alias(topic))
+                                .unwrap_or(0)
+                        };
                         if let Some(frame) = encode_publish_out_with_dup(
                             conn_id,
                             topic_str,
@@ -4083,15 +4126,17 @@ fn encode_publish_out_with_dup(
     meta.push(qos);
     meta.push(u8::from(retain));
     meta.push(u8::from(dup));
-    meta.extend_from_slice(&alias.to_be_bytes());
-    BrokerFrame::new(
+    meta.extend_from_slice(&protocol_v5::encode_topic_alias(alias));
+    let frame = BrokerFrame::new(
         OpCode::PublishOut,
         conn_id,
         0, // stamped per-destination by ConnTable::route
         Bytes::from(meta),
         payload.clone(),
     )
-    .ok()
+    .ok()?;
+    debug_assert_eq!(decode_publish_out_alias(&frame.metadata), Some(alias));
+    Some(frame)
 }
 
 /// Encode one `PubRelOut` frame for `conn_id` (sequence stamped later
@@ -4351,14 +4396,19 @@ fn decode_subscribe_meta(meta: &[u8]) -> Option<SubscribeMeta> {
     Some((packet_id, client_id, subs))
 }
 
-/// Decode `PublishMeta` into `(topic, packet_id, qos, retain, alias)`.
+/// Decode `PublishMeta` into `(topic, packet_id, qos, retain, alias,
+/// alias_present)`.
 ///
 /// Layout: `TopicLen:16be | Topic | PacketId:16be | QoS:8 | Retain:8 |
-/// Dup:8`, optionally followed by the B4-05 alias section `Alias:16be`
-/// (0 or absent = no alias). A zero-length topic is accepted only when
-/// an alias is carried (alias-by-reference); otherwise the topic must be
-/// non-empty as before. Pre-alias encodings decode with alias 0.
-fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, u8, bool, u16)> {
+/// Dup:8`, optionally followed by the B4-05 alias section `Alias:16be`.
+/// `alias_present` is true only when the trailing section is on the wire;
+/// absent (pre-alias encoding) decodes as `(0, false)` and means "no alias
+/// carried". An explicit `Alias:16be = 0` section decodes as `(0, true)`
+/// and is never valid on the wire (MQTT 5.0 §3.3.2.3.4: alias 0 is a
+/// protocol error, DISCONNECT 0x94). A zero-length topic is accepted only
+/// when the alias section is present (alias-by-reference); otherwise the
+/// topic must be non-empty as before.
+fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, u8, bool, u16, bool)> {
     if meta.len() < 2 + 2 + 3 {
         return None;
     }
@@ -4382,23 +4432,52 @@ fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, u8, bool, u16)> {
     let packet_id = u16::from_be_bytes([meta[base], meta[base + 1]]);
     let qos = meta[base + 2];
     let retain = meta[base + 3] != 0;
-    let alias = if meta.len() == new_len {
-        u16::from_be_bytes([meta[base + 5], meta[base + 6]])
+    let (alias, alias_present) = if meta.len() == new_len {
+        let raw = [meta[base + 5], meta[base + 6]];
+        (
+            protocol_v5::decode_topic_alias(&raw).unwrap_or(protocol_v5::NO_TOPIC_ALIAS),
+            true,
+        )
     } else {
-        0
+        (protocol_v5::NO_TOPIC_ALIAS, false)
     };
-    if topic_len == 0 && alias == 0 {
+    if topic_len == 0 && !alias_present {
         return None;
     }
-    Some((topic, packet_id, qos, retain, alias))
+    Some((topic, packet_id, qos, retain, alias, alias_present))
 }
 
 /// Outcome of one inbound alias resolution (B4-05).
 enum InboundAliasOutcome {
     /// Effective topic to route.
     Topic(String),
-    /// The alias is unusable: the caller rejects with 0x94 (or drops).
+    /// The alias is unusable: the caller answers 0x94 (where it has a
+    /// channel) and orders a DISCONNECT via [`order_alias_disconnect`].
     Reject,
+}
+
+/// Order a DISCONNECT for one inbound topic-alias protocol error (B4-05,
+/// MQTT 5.0 §3.3.2.3.4: explicit alias 0, alias above the
+/// CONNACK-negotiated maximum, or empty-topic alias with no prior
+/// mapping; reason code 0x94 Topic Alias Invalid).
+///
+/// Best-effort and idempotent: routes a `ConnClose` frame to the edge so
+/// the socket closes (the 3.1.1 edge closes without a wire reason code;
+/// a future v5 edge sends DISCONNECT 0x94 first), then detaches the
+/// session exactly like the management kick path (verified unbind plus
+/// router sweep) so the faulty connection holds no state. Unknown
+/// connections only count a drop inside `ConnTable::route`; PUBLISH-event
+/// only, never on the per-message fast path (rejects only).
+fn order_alias_disconnect(shared: &Shared, conn_id: u64) {
+    if let Ok(close) = BrokerFrame::new(OpCode::ConnClose, conn_id, 0, Bytes::new(), Bytes::new()) {
+        let _ = shared.conns.route(conn_id, close);
+    }
+    if let Some(client_id) = shared.sessions.client_id_for_conn(conn_id) {
+        let swept = shared.sessions.unbind_connection(&client_id, conn_id);
+        for filter in &swept {
+            shared.router.unsubscribe(filter, &client_id);
+        }
+    }
 }
 
 /// Resolve one inbound alias use to its effective topic.
@@ -4406,8 +4485,9 @@ enum InboundAliasOutcome {
 /// * topic present (`raw` non-empty): validate the concrete topic, then
 ///   register `alias -> topic` on the publisher session (overwrites).
 /// * topic absent (`raw` empty): resolve a previously registered alias.
-/// * unknown connection, alias 0 handled by the caller, alias above the
-///   session maximum, or unknown alias: `Reject` (fail closed).
+/// * unknown connection, explicit alias 0, alias above the
+///   session maximum, or unknown alias: `Reject` (fail closed, caller
+///   disconnects with 0x94).
 ///
 /// PUBLISH event only; the session table write is one bounded index
 /// store under a single write lock.
@@ -4426,7 +4506,9 @@ fn resolve_inbound_alias_topic(
         None => return InboundAliasOutcome::Reject,
     };
     let max = session.inbound_alias_max();
-    if max == 0 || alias == 0 || alias > max {
+    if protocol_v5::check_inbound_alias(alias, max).is_err()
+        || !protocol_v5::alias_in_range(alias, max)
+    {
         return InboundAliasOutcome::Reject;
     }
     if !raw.is_empty() {
@@ -4449,9 +4531,8 @@ fn resolve_inbound_alias_topic(
 
 /// Read the outbound alias out of a `PublishOut` downlink frame.
 /// Pre-alias frames (old length) read as alias 0. Read by the edge on
-/// delivery and by the B4-05 tests; the kernel write path never reads
-/// it back, hence the allowance on non-test builds.
-#[allow(dead_code)]
+/// delivery, verified by the kernel write path (`encode_publish_out_with_dup`
+/// round-trips it back here), and by the B4-05 tests.
 fn decode_publish_out_alias(meta: &[u8]) -> Option<u16> {
     if meta.len() < 7 {
         return None;
@@ -5130,8 +5211,9 @@ mod tests {
     /// reply (0 for pre-alias 10-byte encodings).
     fn decode_session_binding_alias_max(meta: &[u8]) -> u16 {
         match meta.len() {
-            10 => 0,
-            12 => u16::from_be_bytes([meta[10], meta[11]]),
+            10 => protocol_v5::NO_TOPIC_ALIAS,
+            12 => protocol_v5::decode_alias_maximum(&meta[10..12])
+                .unwrap_or(protocol_v5::NO_TOPIC_ALIAS),
             len => panic!("SessionBinding meta must be 10 or 12 bytes, got {len}"),
         }
     }
@@ -5145,7 +5227,7 @@ mod tests {
         client_alias_max: u16,
     ) -> Bytes {
         let mut meta = encode_bind_meta(client_id, clean_start, keepalive).to_vec();
-        meta.extend_from_slice(&client_alias_max.to_be_bytes());
+        meta.extend_from_slice(&protocol_v5::encode_alias_maximum(client_alias_max));
         Bytes::from(meta)
     }
 
@@ -5225,7 +5307,7 @@ mod tests {
         meta.push(qos);
         meta.push(u8::from(retain));
         meta.push(0u8);
-        meta.extend_from_slice(&alias.to_be_bytes());
+        meta.extend_from_slice(&protocol_v5::encode_topic_alias(alias));
         (Bytes::from(meta), Bytes::from(payload.to_vec()))
     }
 
@@ -7215,6 +7297,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn topic_alias_over_maximum_orders_disconnect_with_0x94() {
+        // CTO ruling B4-05.1: an inbound alias above the CONNACK-negotiated
+        // maximum is refused with DISCONNECT 0x94. Drives bind, subscribe,
+        // publish and delivery through the broker, never the store alone.
+        let shared = test_shared();
+        let pub_bind = bind_frame(141, 1, encode_bind_meta("alias-disc-pub", false, 60));
+        reply_for_frame(&pub_bind, &shared.sessions).expect("pub binds");
+        let (tx141, mut rx141) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(141, tx141);
+        let sub_bind = bind_frame(142, 1, encode_bind_meta("alias-disc-sub", false, 60));
+        reply_for_frame(&sub_bind, &shared.sessions).expect("sub binds");
+        let sub = subscribe_frame(
+            142,
+            2,
+            encode_subscribe_meta(5, "alias-disc-sub", &[("sensors/#", 1)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (tx142, mut rx142) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(142, tx142);
+
+        let max = shared.sessions.max_topic_alias();
+        assert!(max > 0, "test needs aliases enabled");
+        let (meta, payload) =
+            encode_publish_meta_with_alias("sensors/temp", 7, 1, false, max + 1, b"x");
+        let (ack, deliveries) =
+            apply_publish(&publish_frame(141, 50, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 answers");
+        assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+        assert_eq!(
+            ack.metadata[2],
+            protocol_v5::REASON_TOPIC_ALIAS_INVALID,
+            "rejection carries 0x94"
+        );
+        assert!(deliveries.is_empty(), "rejected publish routes nowhere");
+        assert!(rx142.try_recv().is_err(), "subscriber sees nothing");
+        // The DISCONNECT rides the kernel->edge close channel for the
+        // offending connection.
+        let close = rx141.try_recv().expect("publisher is disconnected");
+        assert_eq!(
+            close.header.opcode,
+            OpCode::ConnClose,
+            "over-maximum alias orders DISCONNECT"
+        );
+        assert_eq!(close.header.conn_id, 141);
+        // The faulty connection holds no session state afterwards.
+        assert!(
+            shared.sessions.client_id_for_conn(141).is_none(),
+            "disconnected connection is detached"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_alias_explicit_zero_orders_disconnect_with_0x94() {
+        // CTO ruling B4-05.1: explicit alias 0 is never valid on the wire
+        // (MQTT 5.0 §3.3.2.3.4) and is refused with DISCONNECT 0x94. An
+        // absent alias section (pre-alias encoding) still routes normally.
+        let shared = test_shared();
+        let pub_bind = bind_frame(151, 1, encode_bind_meta("alias-zero-pub", false, 60));
+        reply_for_frame(&pub_bind, &shared.sessions).expect("pub binds");
+        let (tx151, mut rx151) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(151, tx151);
+
+        // Absent alias section: plain delivery, no disconnect.
+        let (meta, payload) = encode_publish_meta("sensors/ok", 0, 0, false, b"x");
+        let (_, deliveries) = apply_publish(&publish_frame(151, 60, meta, payload), &shared).await;
+        assert!(deliveries.is_empty(), "no subscribers yet");
+        assert!(rx151.try_recv().is_err(), "no disconnect for absent alias");
+
+        // Explicit alias 0 section with a concrete topic: QoS 1 gets
+        // PUBACK 0x94 plus DISCONNECT.
+        let (meta0, payload0) =
+            encode_publish_meta_with_alias("sensors/zero", 7, 1, false, 0, b"x");
+        let (ack, deliveries0) =
+            apply_publish(&publish_frame(151, 61, meta0, payload0), &shared).await;
+        let ack = ack.expect("QoS 1 answers");
+        assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+        assert_eq!(
+            ack.metadata[2],
+            protocol_v5::REASON_TOPIC_ALIAS_INVALID,
+            "explicit alias 0 carries 0x94"
+        );
+        assert!(deliveries0.is_empty());
+        let close = rx151.try_recv().expect("explicit alias 0 disconnects");
+        assert_eq!(close.header.opcode, OpCode::ConnClose);
+        assert_eq!(close.header.conn_id, 151);
+    }
+
+    #[tokio::test]
+    async fn topic_alias_reconnect_clears_state() {
+        // CTO ruling B4-05.1: mappings are per connection and never survive
+        // a reconnect. Drives bind, publish, rebind and resolve through
+        // the broker.
+        let shared = test_shared();
+        let bind = bind_frame(161, 1, encode_bind_meta("alias-reconn", false, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let (meta, payload) = encode_publish_meta_with_alias("re/one", 0, 0, false, 1, b"x");
+        let (_, deliveries) = apply_publish(&publish_frame(161, 10, meta, payload), &shared).await;
+        assert!(deliveries.is_empty(), "no subscribers yet");
+        let session = shared.sessions.get("alias-reconn").expect("session known");
+        assert_eq!(session.resolve_inbound_alias(1).unwrap().as_str(), "re/one");
+        // Reconnect on a new edge connection renegotiates: tables start
+        // empty with the current maxima.
+        let rebind = bind_frame(162, 1, encode_bind_meta("alias-reconn", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        assert!(
+            session.resolve_inbound_alias(1).is_none(),
+            "alias state dies with the connection"
+        );
+        assert_eq!(session.inbound_alias_len(), 0);
+        assert_eq!(session.outbound_alias_len(), 0);
+        assert_eq!(
+            session.inbound_alias_max(),
+            shared.sessions.max_topic_alias()
+        );
+    }
+
+    #[tokio::test]
     async fn topic_alias_state_per_connection_and_bounded() {
         // Done-when 4: alias state is per-connection and bounded.
         let shared = test_shared();
@@ -7253,12 +7453,24 @@ mod tests {
             "table holds at most the maximum"
         );
         let (meta, payload) = encode_publish_meta_with_alias("iso/over", 0, 0, false, 5, b"x");
+        // CTO ruling B4-05.1: an alias past the bound is a protocol error,
+        // so it is refused with DISCONNECT 0x94 (the faulty connection is
+        // detached and its per-connection state dies with it) rather than
+        // kept alive with its table intact.
+        let (tx121, mut rx121) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(121, tx121);
         let (_, deliveries) = apply_publish(&publish_frame(121, 99, meta, payload), &shared).await;
         assert!(deliveries.is_empty(), "alias past the bound is refused");
+        let close = rx121.try_recv().expect("over-bound alias disconnects");
+        assert_eq!(close.header.opcode, OpCode::ConnClose);
+        assert!(
+            shared.sessions.client_id_for_conn(121).is_none(),
+            "disconnected connection is detached"
+        );
         assert_eq!(
             first.inbound_alias_len(),
-            4,
-            "refused alias is never stored"
+            0,
+            "disconnect drops the per-connection table"
         );
     }
 
@@ -7311,6 +7523,8 @@ mod tests {
         println!(
             "alias broker delivery workload aliases-off (before): {off_rate:.0} msgs/sec, avg {off_avg_ns:.1} ns/msg ({iters} apply_publish rounds in {off_elapsed:?})"
         );
+        println!("BENCH alias_publish_deliver_off {off_avg_ns:.1} ns_per_msg");
+        println!("BENCH alias_publish_deliver_off_rate {off_rate:.0} msgs_per_sec");
 
         // Renegotiate with aliases: publisher registers alias 1 once,
         // then every publish resolves it; the subscriber negotiated a
@@ -7349,6 +7563,59 @@ mod tests {
         println!(
             "alias broker delivery workload aliases-on (after): {on_rate:.0} msgs/sec, avg {on_avg_ns:.1} ns/msg ({iters} aliased apply_publish rounds in {on_elapsed:?})"
         );
+        println!("BENCH alias_publish_deliver_on {on_avg_ns:.1} ns_per_msg");
+        println!("BENCH alias_publish_deliver_on_rate {on_rate:.0} msgs_per_sec");
+    }
+
+    /// Pipeline benchmark hook (B4-05 HOT-PATH): plain publish-to-deliver
+    /// rounds through the broker, printing `BENCH` lines for the gates.
+    /// `#[ignore]` so the pipeline's bench runner picks it up (three runs
+    /// on the base commit, three on the tree); it uses only broker APIs
+    /// that exist on the base commit (bind, subscribe, plain publish with
+    /// no alias section), so it compiles and runs on both. The tree's
+    /// alias fast path (no alias section: one branch, no lock, no table
+    /// touch) is what this measures; the on/off comparison lives in
+    /// `topic_alias_delivery_workload_timings` above.
+    #[tokio::test]
+    #[ignore]
+    async fn topic_alias_bench_baseline() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let shared = test_shared();
+        let sub_bind = bind_frame(171, 1, encode_bind_meta("alias-bench-sub", false, 60));
+        reply_for_frame(&sub_bind, &shared.sessions).expect("sub binds");
+        let sub = subscribe_frame(
+            171,
+            2,
+            encode_subscribe_meta(5, "alias-bench-sub", &[("bench/#", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (tx171, _rx171) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(171, tx171);
+        let pub_bind = bind_frame(172, 1, encode_bind_meta("alias-bench-pub", false, 60));
+        reply_for_frame(&pub_bind, &shared.sessions).expect("pub binds");
+        let iters = 200usize;
+        let start = Instant::now();
+        for i in 0..iters {
+            let (meta, payload) = encode_publish_meta("bench/t", 0, 0, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(172, 1000 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1);
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            let got = shared.conns.pop_qos0(171).expect("downlink arrived");
+            black_box(got);
+        }
+        let elapsed = start.elapsed();
+        let rate = iters as f64 / elapsed.as_secs_f64();
+        let avg_ns = elapsed.as_nanos() as f64 / iters as f64;
+        println!(
+            "alias broker delivery baseline: {rate:.0} msgs/sec, avg {avg_ns:.1} ns/msg ({iters} apply_publish rounds in {elapsed:?})"
+        );
+        println!("BENCH alias_publish_deliver_baseline {avg_ns:.1} ns_per_msg");
+        println!("BENCH alias_publish_deliver_baseline_rate {rate:.0} msgs_per_sec");
     }
 
     #[tokio::test]
