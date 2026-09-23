@@ -40,6 +40,23 @@ impl From<QoS> for SubscriptionOptions {
     }
 }
 
+/// One client's last will (F1-01): published by the kernel when the
+/// edge reports an ungraceful close (`DisconnectIn`), suppressed on a
+/// clean `DISCONNECT` (unbind). Stored on the session because the session
+/// is where the decision lives; the edge only detects the close.
+///
+/// Bound: one will per session; the topic is an MQTT string (<= 65535
+/// bytes) and the payload rides the BrokerLink bind meta (<= 65535 bytes
+/// of meta incl. topic and payload). Per-session will memory is therefore
+/// bounded near 128 KiB by the wire limit, with no new config needed.
+#[derive(Debug, Clone)]
+pub struct StoredWill {
+    pub topic: Topic,
+    pub qos: QoS,
+    pub retain: bool,
+    pub payload: Bytes,
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub id: SessionId,
@@ -154,6 +171,19 @@ pub struct Session {
     /// MQTT keepalive seconds from CONNECT (0 = disabled). Maintained by
     /// the edge at bind time; surfaced read-only for observability.
     pub keepalive_secs: RwLock<u16>,
+    /// Last will from CONNECT, if the client registered one. Written on
+    /// the CONNECT (bind) event, consumed exactly once on disconnect:
+    /// `DisconnectIn` takes and publishes it, `UnbindConnection` takes
+    /// and drops it (clean `DISCONNECT` suppresses the will). The take is
+    /// atomic, so an edge notice racing a kernel notice publishes once.
+    /// Disconnect-path only (bind/disconnect events); the publish and
+    /// delivery hot paths never touch this lock.
+    /// TODO(parity): a transport-death detach preserves the will for a
+    /// later rebind but never fires it, so a will is lost when the edge
+    /// itself dies without sending `DisconnectIn`. The rulebook does not
+    /// decide the transport-death policy; current choice avoids spurious
+    /// publishes while the edge may still hold the socket.
+    pub last_will: RwLock<Option<StoredWill>>,
     /// Authenticated username that owns this session, if any. Maintained
     /// by the edge at bind time; drives per-user quota accounting.
     pub username: RwLock<Option<String>>,
@@ -381,6 +411,7 @@ impl Session {
             outbound_aliases: RwLock::new(Vec::new()),
             outbound_alias_max: AtomicU16::new(0),
             keepalive_secs: RwLock::new(0),
+            last_will: RwLock::new(None),
             username: RwLock::new(None),
             peerhost: RwLock::new(None),
             connected_at_ms: RwLock::new(Some(now_ms())),
@@ -1035,6 +1066,21 @@ impl Session {
 
     pub fn offline_len(&self) -> usize {
         self.offline_queue.read().len()
+    }
+
+    /// Record the CONNECT last will, replacing any previous one. `None`
+    /// (CONNECT without a will) clears the previous will: the will is
+    /// per-connection state, so a reconnect without one registers none.
+    /// CONNECT (bind) event only.
+    pub fn set_last_will(&self, will: Option<StoredWill>) {
+        *self.last_will.write() = will;
+    }
+
+    /// Take the stored will exactly once, leaving `None` behind. The
+    /// first taker publishes (ungraceful close); a racing second taker
+    /// observes `None` and publishes nothing. Disconnect events only.
+    pub fn take_last_will(&self) -> Option<StoredWill> {
+        self.last_will.write().take()
     }
 }
 
@@ -1828,6 +1874,37 @@ mod tests {
         assert!(store.client_ids().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_last_will_takes_exactly_once() {
+        use super::StoredWill;
+
+        let manager = SessionManager::new();
+        let (session, _) = manager.get_or_create("will-1", true);
+        assert!(session.take_last_will().is_none());
+
+        session.set_last_will(Some(StoredWill {
+            topic: Topic::new("will/test").unwrap(),
+            qos: broker_protocol::QoS::AtLeastOnce,
+            retain: true,
+            payload: Bytes::from_static(b"gone"),
+        }));
+        let taken = session.take_last_will().expect("will stored");
+        assert_eq!(taken.topic.as_str(), "will/test");
+        assert_eq!(taken.payload, Bytes::from_static(b"gone"));
+        // Second take observes None: edge and kernel notices race safely.
+        assert!(session.take_last_will().is_none());
+
+        // Reconnect without a will clears the previous one.
+        session.set_last_will(Some(StoredWill {
+            topic: Topic::new("will/test").unwrap(),
+            qos: broker_protocol::QoS::AtMostOnce,
+            retain: false,
+            payload: Bytes::from_static(b"x"),
+        }));
+        session.set_last_will(None);
+        assert!(session.take_last_will().is_none());
     }
 
     #[test]

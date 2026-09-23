@@ -229,7 +229,17 @@ decode_connect_persistent_with_auth_and_will_test() ->    %% Flags C0 (username+
     ?assertEqual(true, maps:get(password_flag, Conn)),
     ?assertEqual(true, maps:get(will_flag, Conn)),
     ?assertEqual(1, maps:get(will_qos, Conn)),
-    ?assertEqual(false, maps:get(will_retain, Conn)).
+    ?assertEqual(false, maps:get(will_retain, Conn)),
+    %% F1-01: the will topic and message are captured for the bind.
+    ?assertEqual(<<"wt">>, maps:get(will_topic, Conn)),
+    ?assertEqual(<<"wm">>, maps:get(will_payload, Conn)).
+
+decode_connect_no_will_has_no_will_strings_test() ->
+    {ok, Pkt, _} = indra_mqtt_codec:decode_packet(connect_bytes(<<"s-1">>, 16#02, 60)),
+    {ok, Conn} = indra_mqtt_codec:decode_connect(maps:get(payload, Pkt)),
+    ?assertEqual(false, maps:get(will_flag, Conn)),
+    ?assertEqual(undefined, maps:get(will_topic, Conn)),
+    ?assertEqual(undefined, maps:get(will_payload, Conn)).
 
 decode_connect_captures_username_password_test() ->
     %% Flags C0 (username+password) | 02 (clean): 0xC2.

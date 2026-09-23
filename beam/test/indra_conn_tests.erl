@@ -658,6 +658,97 @@ recv_all(Sock) ->
     {ok, Bin} = gen_tcp:recv(Sock, 0, ?RECV_TIMEOUT),
     Bin.
 
+%% @private CONNECT with a last will (QoS 0, no retain).
+connect_packet_will(ClientId, WillTopic, WillPayload) ->
+    Flags = 16#02 bor 16#04,  %% clean + will
+    Var = <<0, 4, "MQTT", 4, Flags:8, 60:16/big>>,
+    Payload = <<(byte_size(ClientId)):16/big, ClientId/binary,
+                (byte_size(WillTopic)):16/big, WillTopic/binary,
+                (byte_size(WillPayload)):16/big, WillPayload/binary>>,
+    Body = <<Var/binary, Payload/binary>>,
+    <<16#10, (byte_size(Body)), Body/binary>>.
+
+%% @doc CONNECT carrying a will forwards it in the bind (F1-01).
+connect_forwards_will_in_bind_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5010}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-will">>,
+                                                      <<"will/test">>,
+                                                      <<"gone">>)),
+        [Sent] = wait_frames(Mock, 1),
+        ?assertEqual(16#0010, maps:get(opcode, Sent)),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-will">>, maps:get(client_id, Bind)),
+        ?assertEqual(<<"will/test">>, maps:get(will_topic, Bind)),
+        ?assertEqual(<<"gone">>, maps:get(will_payload, Bind)),
+        ?assertEqual(0, maps:get(will_qos, Bind)),
+        ?assertEqual(false, maps:get(will_retain, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(9, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+%% @doc Ungraceful close (TCP drops without DISCONNECT) reports
+%% DisconnectIn so the kernel publishes the stored will (F1-01).
+ungraceful_close_reports_disconnect_in_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5011}]),
+    _ = Port,
+    Ref = monitor(process, Conn),
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-gone">>,
+                                                      <<"will/test">>,
+                                                      <<"gone">>)),
+        [_Bind] = wait_frames(Mock, 1),
+        Binding = indra_brokerlink:encode_session_binding_meta(9, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ok = gen_tcp:close(Client),
+        receive {'DOWN', Ref, process, Conn, _} -> ok
+        after ?RECV_TIMEOUT -> error(conn_did_not_stop)
+        end,
+        [_, Disc] = wait_frames(Mock, 2),
+        ?assertEqual(16#0040, maps:get(opcode, Disc)),
+        ?assertEqual(5011, maps:get(conn_id, Disc)),
+        {ok, DDec} = indra_brokerlink:decode_disconnect_meta(maps:get(meta, Disc)),
+        ?assertEqual(<<"dev-gone">>, maps:get(client_id, DDec))
+    after
+        teardown(LSock, Mock, Client, Conn),
+        demonitor(Ref, [flush])
+    end.
+
+%% @doc Clean DISCONNECT sends Unbind only, never a will notice (F1-01:
+%% a clean close suppresses the will).
+clean_disconnect_sends_unbind_only_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5012}]),
+    _ = Port,
+    Ref = monitor(process, Conn),
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-clean">>,
+                                                      <<"will/test">>,
+                                                      <<"gone">>)),
+        [_Bind] = wait_frames(Mock, 1),
+        Binding = indra_brokerlink:encode_session_binding_meta(10, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ok = gen_tcp:send(Client, <<16#E0, 16#00>>),
+        receive {'DOWN', Ref, process, Conn, _} -> ok
+        after ?RECV_TIMEOUT -> error(conn_did_not_stop)
+        end,
+        Frames = wait_frames(Mock, 2),
+        Opcodes = [maps:get(opcode, F) || F <- Frames],
+        ?assertEqual([16#0010, 16#0012], Opcodes)
+    after
+        teardown(LSock, Mock, Client, Conn),
+        demonitor(Ref, [flush])
+    end.
+
 %%====================================================================
 %% PERF-09 bounded, counted edge ingress
 %%====================================================================

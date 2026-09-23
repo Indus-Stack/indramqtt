@@ -414,6 +414,64 @@ bind_meta_alias_roundtrip_test() ->
                    indra_brokerlink:encode_bind_meta(<<"dev-l">>, true, 60)),
     ?assertEqual(0, maps:get(client_alias_max, LDec)).
 
+%%====================================================================
+%% Last-will bind section (F1-01)
+%%====================================================================
+
+bind_meta_will_roundtrip_test() ->
+    Will = #{topic => <<"will/test">>, payload => <<"client-gone">>,
+             qos => 0, retain => false},
+    Meta = indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 5,
+                                            {undefined, undefined},
+                                            undefined, 0, Will),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"dev-w">>, maps:get(client_id, Dec)),
+    ?assertEqual(true, maps:get(clean_start, Dec)),
+    ?assertEqual(5, maps:get(keepalive, Dec)),
+    ?assertEqual(<<"will/test">>, maps:get(will_topic, Dec)),
+    ?assertEqual(<<"client-gone">>, maps:get(will_payload, Dec)),
+    ?assertEqual(0, maps:get(will_qos, Dec)),
+    ?assertEqual(false, maps:get(will_retain, Dec)),
+    %% With credentials, peer and alias the will still rides first.
+    Full = indra_brokerlink:encode_bind_meta(<<"dev-w">>, false, 60,
+                                            {<<"alice">>, <<"s3cret">>},
+                                            <<"192.0.2.10">>, 7, Will),
+    {ok, FDec} = indra_brokerlink:decode_bind_meta(Full),
+    ?assertEqual(<<"alice">>, maps:get(username, FDec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, FDec)),
+    ?assertEqual(7, maps:get(client_alias_max, FDec)),
+    ?assertEqual(<<"will/test">>, maps:get(will_topic, FDec)),
+    %% No-will binds decode with undefined will strings, and the /7
+    %% encoding without a will is exactly the /6 encoding.
+    Legacy = indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 5,
+                                              {undefined, undefined},
+                                              undefined),
+    ?assertEqual(indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 5,
+                                                  {undefined, undefined},
+                                                  undefined, 0),
+                 indra_brokerlink:encode_bind_meta(<<"dev-w">>, true, 5,
+                                                  {undefined, undefined},
+                                                  undefined, 0, undefined)),
+    {ok, LDec} = indra_brokerlink:decode_bind_meta(Legacy),
+    ?assertEqual(undefined, maps:get(will_topic, LDec)),
+    ?assertEqual(undefined, maps:get(will_payload, LDec)),
+    %% Empty will topic rejected at encode time (fail closed).
+    ?assertError(badarg,
+                 indra_brokerlink:encode_bind_meta(<<"d">>, true, 5,
+                                                  {undefined, undefined},
+                                                  undefined, 0,
+                                                  #{topic => <<>>,
+                                                    payload => <<"x">>,
+                                                    qos => 0,
+                                                    retain => false})).
+
+disconnect_meta_roundtrip_test() ->
+    Meta = indra_brokerlink:encode_disconnect_meta(<<"dev-9">>),
+    ?assertEqual({ok, #{client_id => <<"dev-9">>}},
+                 indra_brokerlink:decode_disconnect_meta(Meta)),
+    ?assertEqual({error, malformed_unbind_meta},
+                 indra_brokerlink:decode_disconnect_meta(<<0, 4, "ab">>)).
+
 session_binding_alias_roundtrip_test() ->
     %% The /4 form carries the kernel inbound bound for CONNACK
     %% negotiation; the /3 form decodes with maximum 0.

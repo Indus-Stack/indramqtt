@@ -304,6 +304,15 @@ fn reply_for_frame(frame: &BrokerFrame, sessions: &SessionManager) -> Option<Bro
 fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> BrokerFrame {
     let (session_id, present, return_code) = match decode_bind_meta(&frame.metadata) {
         Ok(req) => {
+            // F1-01: validate the CONNECT last will before touching
+            // session state, so an unusable will section rejects the bind
+            // with no session created (fail closed, like malformed meta).
+            let will = match will_from_bind(&req) {
+                Ok(will) => will,
+                Err(_) => {
+                    return session_binding_reply(frame, 0, false, 2u8, sessions.max_topic_alias());
+                }
+            };
             let (session, present) = sessions.get_or_create(&req.client_id, req.clean_start);
             // Connection != Session: pin this edge connection to the session
             // so Unbind can later verify ownership before detaching.
@@ -317,6 +326,10 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
             session.clear_aliases();
             session.set_inbound_alias_max(sessions.max_topic_alias());
             session.set_outbound_alias_max(req.client_alias_max);
+            // F1-01: the CONNECT last will rides the bind (edge forwards
+            // what CONNECT carried). Stored on the session where the
+            // disconnect decision lives; `None` clears a previous will.
+            session.set_last_will(will);
             (session.id.0, present, 0u8)
         }
         Err(_) => (0u64, false, 2u8),
@@ -685,18 +698,22 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
 /// Decode `BindConnection` metadata.
 ///
 /// Layout: `ClientIdLen:16be | ClientId | Flags:8 | Keepalive:16be`,
-/// optionally followed by a credentials section `UserLen:16be | Username
-/// | PassLen:16be | Password` (absent entirely when the client connects
-/// anonymously), optionally followed by a peer-address section
-/// `PeerLen:16be | PeerIp` carrying the client IP literal the edge saw
-/// on its socket (B1-03: drives `peerhost` / `peerhost_net` bans),
-/// optionally followed by a B4-05 alias section `ClientAliasMax:16be`
-/// carrying the client's receive limit (the kernel outbound bound; 0 or
-/// absent means the kernel never assigns an alias toward the client).
-/// Binds encoded before the peer/alias sections existed carry no
-/// trailing bytes and still decode with `peerhost` unset and alias
-/// maximum 0. The keepalive is framing-validated here; supervision lives
-/// on the edge.
+/// optionally followed by an F1-01 will section (present iff Flags bit 1
+/// is set) `WillQos:8 | WillRetain:8 | TopicLen:16be | Topic |
+/// PayloadLen:32be | Payload`, optionally followed by a credentials
+/// section `UserLen:16be | Username | PassLen:16be | Password` (absent
+/// entirely when the client connects anonymously), optionally followed by
+/// a peer-address section `PeerLen:16be | PeerIp` carrying the client IP
+/// literal the edge saw on its socket (B1-03: drives `peerhost` /
+/// `peerhost_net` bans), optionally followed by a B4-05 alias section
+/// `ClientAliasMax:16be` carrying the client's receive limit (the kernel
+/// outbound bound; 0 or absent means the kernel never assigns an alias
+/// toward the client).
+/// Binds encoded before the peer/alias/will sections existed carry no
+/// trailing bytes and still decode with `peerhost` unset, alias
+/// maximum 0 and no will. The keepalive is framing-validated here;
+/// supervision lives on the edge. Flags bit 0 is clean_start; Flags bit
+/// 1 is will-present (mirrors `indra_brokerlink:encode_bind_meta/7`).
 struct BindRequest {
     client_id: String,
     clean_start: bool,
@@ -706,6 +723,17 @@ struct BindRequest {
     peerhost: Option<String>,
     /// Client's Topic Alias Maximum from CONNECT (kernel outbound bound).
     client_alias_max: u16,
+    /// Last will from CONNECT, if the client registered one.
+    will: Option<BindWill>,
+}
+
+/// Last will as carried in the bind (validated into a session will by
+/// [`will_from_bind`]).
+struct BindWill {
+    topic: String,
+    payload: Bytes,
+    qos: u8,
+    retain: bool,
 }
 
 fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
@@ -720,7 +748,17 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     let flags = meta[2 + id_len];
     let keepalive_secs = u16::from_be_bytes([meta[3 + id_len], meta[4 + id_len]]);
     let client_id = std::str::from_utf8(id_bytes).map_err(|_| "client id not UTF-8")?;
-    let rest = &meta[5 + id_len..];
+    let mut rest = &meta[5 + id_len..];
+    // F1-01: the will section rides immediately after the keepalive when
+    // Flags bit 1 is set, ahead of credentials/peer/alias, so the
+    // remainder below parses exactly like a legacy bind.
+    let will = if flags & 0x02 != 0 {
+        let (parsed, tail) = decode_bind_will(rest)?;
+        rest = tail;
+        Some(parsed)
+    } else {
+        None
+    };
     // Preferred: exact legacy parse (no alias section).
     if let Ok(identity) = decode_bind_identity(rest) {
         return Ok(BindRequest {
@@ -731,6 +769,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             password: identity.password,
             peerhost: identity.peerhost,
             client_alias_max: 0,
+            will,
         });
     }
     // Otherwise the last two bytes may be the alias section: the prefix
@@ -748,10 +787,66 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
                 password: identity.password,
                 peerhost: identity.peerhost,
                 client_alias_max,
+                will,
             });
         }
     }
     Err("bind meta length mismatch")
+}
+
+/// Decode the F1-01 will section at the head of the bind tail:
+/// `WillQos:8 | WillRetain:8 | TopicLen:16be | Topic | PayloadLen:32be |
+/// Payload`. Returns the parsed will plus the unconsumed tail
+/// (credentials/peer/alias). Anything short or out of range is malformed
+/// (fail closed, never a guessed will).
+fn decode_bind_will(rest: &[u8]) -> Result<(BindWill, &[u8]), &'static str> {
+    if rest.len() < 8 {
+        return Err("bind will truncated");
+    }
+    let qos = rest[0];
+    let retain = rest[1];
+    if qos > 2 || retain > 1 {
+        return Err("bind will flags out of range");
+    }
+    let topic_len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
+    if topic_len == 0 || rest.len() < 4 + topic_len + 4 {
+        return Err("bind will topic truncated");
+    }
+    let topic = std::str::from_utf8(&rest[4..4 + topic_len]).map_err(|_| "will topic not UTF-8")?;
+    let base = 4 + topic_len;
+    let payload_len =
+        u32::from_be_bytes([rest[base], rest[base + 1], rest[base + 2], rest[base + 3]]) as usize;
+    if rest.len() < base + 4 + payload_len {
+        return Err("bind will payload truncated");
+    }
+    let payload = Bytes::copy_from_slice(&rest[base + 4..base + 4 + payload_len]);
+    Ok((
+        BindWill {
+            topic: topic.to_string(),
+            payload,
+            qos,
+            retain: retain != 0,
+        },
+        &rest[base + 4 + payload_len..],
+    ))
+}
+
+/// Validate a bind will into the session will: the topic must be a
+/// concrete publish topic (no wildcards) and the QoS a known level.
+/// `None` (CONNECT without a will) stays `None` (clears any previous).
+/// Fail closed: an unusable will rejects the bind, never a guessed topic.
+fn will_from_bind(req: &BindRequest) -> Result<Option<broker_session::StoredWill>, &'static str> {
+    let Some(will) = req.will.as_ref() else {
+        return Ok(None);
+    };
+    let topic = Topic::new(will.topic.clone()).map_err(|_| "will topic invalid")?;
+    let qos = QoS::try_from(will.qos).map_err(|_| "will qos invalid")?;
+    Ok(Some(broker_session::StoredWill {
+        topic,
+        qos,
+        retain: will.retain,
+        payload: will.payload.clone(),
+    }))
 }
 
 /// Credentials plus peer address decoded from the bind tail.
@@ -1877,6 +1972,39 @@ where
         OpCode::PubCompIn => {
             // D1-01 outbound completion: release the packet id.
             apply_qos2_pubcomp(&frame, shared);
+        }
+        OpCode::DisconnectIn => {
+            // F1-01 ungraceful close: detach, then publish the taken will
+            // once (no-op when the client registered none, or when a
+            // racing unbind already consumed it). Routed exactly like a
+            // normal publish fan-out below.
+            let deliveries = apply_disconnect(&frame, shared).await;
+            let mut enqueued = 0u64;
+            let mut enqueued_bytes = 0u64;
+            for (conn_id, routed) in deliveries {
+                let len = routed.total_frame_len() as u64;
+                if shared.conns.route(conn_id, routed) {
+                    enqueued += 1;
+                    enqueued_bytes += len;
+                }
+            }
+            shared.metrics.inc_messages_forwarded_by(enqueued);
+            shared.metrics.inc_publish_sent_by(enqueued);
+            shared.metrics.inc_delivered_by(enqueued);
+            shared.metrics.inc_bytes_sent_by(enqueued_bytes);
+            // Forget this transport's identities for the connection so a
+            // long-lived shard never accumulates one entry per bind ever.
+            // Each forgotten entry balances its bind's `inc_connections`
+            // here, leaving death to settle whatever remains.
+            let before = bound.len();
+            bound.retain(|(_, conn_id)| *conn_id != frame.header.conn_id);
+            for _ in 0..before - bound.len() {
+                let active = shared.metrics.dec_connections();
+                shared.stats.set_connections(active.max(0) as u64);
+            }
+            if before != bound.len() {
+                refresh_subscription_stats(shared);
+            }
         }
         OpCode::UnbindConnection => {
             apply_unbind(&frame, shared);
@@ -3577,8 +3705,18 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
 /// resubscribes) and its unacked QoS 1 inflight state; durable
 /// subscriptions and unacked downlinks survive for reconnect replay. The
 /// sweep touches only this session's own filters and runs off the hot path.
+///
+/// F1-01: a clean `DISCONNECT` (unbind) suppresses the last will. The
+/// stored will is taken and dropped, but only for the verified owner, so
+/// a racing teardown for a superseded conn_id never clears the fresh
+/// connection's will.
 fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
     if let Some(client_id) = decode_unbind_meta(&frame.metadata) {
+        if let Some(session) = shared.sessions.get(&client_id) {
+            if *session.conn_id.read() == Some(frame.header.conn_id) {
+                session.take_last_will();
+            }
+        }
         let swept = shared
             .sessions
             .unbind_connection(&client_id, frame.header.conn_id);
@@ -3588,6 +3726,97 @@ fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
         refresh_subscription_stats(shared);
     }
     shared.conns.unregister(frame.header.conn_id);
+}
+
+/// Decode a `DisconnectIn` (ungraceful close notice) into the client id.
+/// Same layout as `UnbindMeta` (`IdLen:16be | ClientId`); the opcode is
+/// what distinguishes a will-firing close from a will-suppressing one.
+fn decode_disconnect_meta(meta: &[u8]) -> Option<String> {
+    decode_unbind_meta(meta)
+}
+
+/// Handle one ungraceful close notice from the edge (F1-01): a socket
+/// that closed without `DISCONNECT` (TCP close/reset, keepalive expiry,
+/// protocol error). The edge detects the close; the session lives here,
+/// so the decision lives here too: detach exactly like an unbind, then
+/// publish the taken will once through the normal ingress pipeline
+/// (retained store, rules, fan-out, cluster forward), honouring its QoS
+/// and retain bit. Returns the will deliveries for the caller to route,
+/// mirroring [`apply_publish`].
+///
+/// Exactly-once: the will is atomically taken, so a racing unbind (clean
+/// close) or a second notice for the same connection observes `None`.
+/// Stale notices for a superseded conn_id are ignored entirely (no
+/// detach, no publish). Disconnect events only; never on the publish or
+/// delivery hot path.
+///
+/// TODO(parity): the will publish enforces bans and the publish ACL but
+/// skips the publish rate quota (a single disconnect signal is not a
+/// rate). Whether the reference authorizes the will at CONNECT time,
+/// at publish time, or not at all is still open; current choice fails
+/// closed on bans/ACL.
+async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, BrokerFrame)> {
+    let Some(client_id) = decode_disconnect_meta(&frame.metadata) else {
+        shared.conns.unregister(frame.header.conn_id);
+        return Vec::new();
+    };
+    let Some(session) = shared.sessions.get(&client_id) else {
+        shared.conns.unregister(frame.header.conn_id);
+        return Vec::new();
+    };
+    if *session.conn_id.read() != Some(frame.header.conn_id) {
+        return Vec::new();
+    }
+    // Capture the publish-time identity before detaching (the detach
+    // clears the binding the checks below read).
+    let username = session.username.read().clone();
+    let peerhost = session.peerhost.read().clone();
+    let will = session.take_last_will();
+    let swept = shared
+        .sessions
+        .unbind_connection(&client_id, frame.header.conn_id);
+    for filter in &swept {
+        shared.router.unsubscribe(filter, &client_id);
+    }
+    refresh_subscription_stats(shared);
+    shared.conns.unregister(frame.header.conn_id);
+    let Some(will) = will else {
+        return Vec::new();
+    };
+    info!(
+        "Publishing last will for {} on {}",
+        client_id,
+        will.topic.as_str()
+    );
+    // Bans and the publish ACL gate the will like any other publish from
+    // this client (fail closed); an empty will payload with retain set
+    // clears retained state through the shared pipeline, exactly like a
+    // normal retained clear.
+    if shared
+        .bans
+        .is_banned(&client_id, username.as_deref(), peerhost.as_deref())
+    {
+        return Vec::new();
+    }
+    if shared
+        .auth
+        .authorize_publish(&client_id, &will.topic)
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let deliveries = ingress_pipeline_with_publisher(
+        shared,
+        &will.topic,
+        will.qos,
+        will.retain,
+        &will.payload,
+        Some(client_id.as_str()),
+    )
+    .await;
+    forward_cluster(shared, &will.topic, will.qos, &will.payload).await;
+    deliveries
 }
 
 /// Release one unacknowledged QoS 1 downlink on the subscriber's PUBACK
@@ -5180,6 +5409,270 @@ mod tests {
         }
     }
 
+    /// B4-08: subscribe storm alongside steady publishes through the
+    /// broker. A steady subscriber on `b408/steady` must receive every
+    /// publish while churn tasks subscribe distinct
+    /// `b408/churn/<t>/<i>` filters through the real broker subscribe
+    /// ingress (`apply_subscribe` at `crates/broker-node/src/main.rs`,
+    /// driven by the subscribe event) and clean them up through the
+    /// kernel unsubscribe path. The steady path goes through the broker
+    /// ingress pipeline (`ingress_pipeline_with_publisher`, driven by
+    /// the publish delivery event), asserting 100% steady delivery plus
+    /// exact route, session-mirror, wildcard and shared-group agreement.
+    /// Before numbers for the same storm family live in
+    /// `crates/broker-router/src/lib.rs`
+    /// (`subscribe_storm_alongside_matches_keeps_semantics` baseline vs
+    /// CoW); this harness records the through-broker after numbers with
+    /// min/median/max across repeats. No time threshold is asserted so
+    /// the test is stable on loaded runners.
+    #[tokio::test]
+    async fn router_lock_contention_subscribe_storm_with_steady_publishes() {
+        use std::time::Instant;
+
+        const CHURN_TASKS: usize = 4;
+        const FILTERS_PER_TASK: usize = 25;
+        const STEADY_PUBLISHES: usize = 50;
+        const REPEATS: usize = 3;
+
+        async fn churn_subscribe_one(shared: &Shared, task: usize, i: usize) -> f64 {
+            let client = format!("b408-c{task}-{i}");
+            let conn = 9100 + task as u64 * 100 + i as u64;
+            let filter_str = format!("b408/churn/{task}/{i}");
+            // Bind before subscribe (production order): the session must
+            // exist so `apply_subscribe` can mirror the grant on it. A
+            // `get_or_create(true)` after the subscribe would replace the
+            // session and wipe the mirror.
+            let (session, _) = shared.sessions.get_or_create(&client, true);
+            *session.conn_id.write() = Some(conn);
+            let frame = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, &client, &[(filter_str.as_str(), 0)]),
+            );
+            let start = Instant::now();
+            let (reply, _) = apply_subscribe(&frame, shared).await;
+            let us = start.elapsed().as_secs_f64() * 1e6;
+            reply.expect("churn subscribe replies");
+            us
+        }
+
+        let mut delivery_rates: Vec<f64> = Vec::with_capacity(REPEATS);
+        let mut churn_rates: Vec<f64> = Vec::with_capacity(REPEATS);
+        let mut all_sub_us: Vec<f64> = Vec::new();
+        let mut all_pub_us: Vec<f64> = Vec::new();
+
+        for _ in 0..REPEATS {
+            let shared = test_shared();
+            // Steady subscriber through the broker subscribe path. Bind
+            // first so the subscribe mirror lands on this session (a
+            // clean-start create after the subscribe would wipe it).
+            let (session, _) = shared.sessions.get_or_create("b408-steady", true);
+            *session.conn_id.write() = Some(4081);
+            let steady_frame = subscribe_frame(
+                4081,
+                1,
+                encode_subscribe_meta(1, "b408-steady", &[("b408/steady", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&steady_frame, &shared).await;
+            reply.expect("steady subscribe replies");
+
+            let topic = Topic::new("b408/steady").unwrap();
+            let start = Instant::now();
+            // Churn runs as concurrent broker-ingress tasks while the
+            // main task publishes steadily: deliveries (readers) must
+            // never wait on subscribes (writers) longer than a snapshot
+            // load (`Router::root` via `load_full` in
+            // `crates/broker-router/src/lib.rs`).
+            let mut churn_handles = Vec::with_capacity(CHURN_TASKS);
+            for task in 0..CHURN_TASKS {
+                let shared = shared.clone();
+                churn_handles.push(tokio::spawn(async move {
+                    let mut lat = Vec::with_capacity(FILTERS_PER_TASK);
+                    for i in 0..FILTERS_PER_TASK {
+                        lat.push(churn_subscribe_one(&shared, task, i).await);
+                    }
+                    lat
+                }));
+            }
+            let mut publish_us = Vec::with_capacity(STEADY_PUBLISHES);
+            for i in 0..STEADY_PUBLISHES {
+                let one = Instant::now();
+                let got = publish_shared_once(&shared, &topic, Some("b408-pub"), &[i as u8]).await;
+                publish_us.push(one.elapsed().as_secs_f64() * 1e6);
+                assert_eq!(
+                    got,
+                    vec![4081],
+                    "steady publish {i} delivers exactly once under storm"
+                );
+            }
+            let mut sub_us: Vec<f64> = Vec::new();
+            for handle in churn_handles {
+                sub_us.extend(handle.await.expect("churn task joins"));
+            }
+            assert_eq!(
+                sub_us.len(),
+                CHURN_TASKS * FILTERS_PER_TASK,
+                "every churn subscribe reports latency"
+            );
+            let elapsed = start.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64().max(f64::EPSILON);
+            delivery_rates.push(STEADY_PUBLISHES as f64 / elapsed_secs);
+            let churn_ops = (CHURN_TASKS * FILTERS_PER_TASK) as f64;
+            churn_rates.push(churn_ops / elapsed_secs);
+            all_sub_us.extend_from_slice(&sub_us);
+            all_pub_us.extend_from_slice(&publish_us);
+
+            // Storm filters resolve through the broker, then are removed
+            // through the kernel unsubscribe path (no MQTT unsubscribe
+            // ingress exists; this mirrors `detach`).
+            for task in 0..CHURN_TASKS {
+                for i in 0..FILTERS_PER_TASK {
+                    let probe =
+                        Topic::new(format!("b408/churn/{task}/{i}")).expect("valid probe topic");
+                    let matched = shared.router.matches(&probe);
+                    assert_eq!(matched.len(), 1, "churn filter {task}/{i} resolves");
+                    assert_eq!(
+                        matched.iter().next().unwrap().client_id.as_ref(),
+                        format!("b408-c{task}-{i}")
+                    );
+                }
+            }
+            for task in 0..CHURN_TASKS {
+                for i in 0..FILTERS_PER_TASK {
+                    let filter =
+                        broker_protocol::TopicFilter::new(format!("b408/churn/{task}/{i}"))
+                            .expect("valid churn filter");
+                    shared
+                        .router
+                        .unsubscribe(&filter, &format!("b408-c{task}-{i}"));
+                    shared
+                        .sessions
+                        .remove_subscription(&format!("b408-c{task}-{i}"), &filter);
+                }
+            }
+            // Storm filters are gone; the steady route still resolves to
+            // exactly the steady client, and the session mirror agrees.
+            let steady = shared.router.matches(&topic);
+            assert_eq!(steady.len(), 1);
+            assert_eq!(
+                steady.iter().next().unwrap().client_id.as_ref(),
+                "b408-steady"
+            );
+            let probe = Topic::new("b408/churn/0/0").expect("valid probe topic");
+            assert!(
+                shared.router.matches(&probe).is_empty(),
+                "churn filters fully removed after storm"
+            );
+            let steady_session = shared
+                .sessions
+                .get("b408-steady")
+                .expect("steady session present");
+            assert!(
+                steady_session
+                    .subscriptions
+                    .read()
+                    .keys()
+                    .any(|f| f.as_str() == "b408/steady"),
+                "session mirror keeps the steady subscription"
+            );
+            // Wildcard levels still agree through the broker ingress.
+            // Bind first so the mirror survives (see steady note above).
+            let (wild_session, _) = shared.sessions.get_or_create("b408-wild", true);
+            *wild_session.conn_id.write() = Some(4082);
+            let wild_frame = subscribe_frame(
+                4082,
+                1,
+                encode_subscribe_meta(1, "b408-wild", &[("b408/+", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&wild_frame, &shared).await;
+            reply.expect("wildcard subscribe replies");
+            let wild = shared.router.matches(&topic);
+            assert_eq!(wild.len(), 2);
+            assert!(wild.iter().any(|s| s.client_id.as_ref() == "b408-wild"));
+            assert!(wild.iter().any(|s| s.client_id.as_ref() == "b408-steady"));
+            let wild_filter =
+                broker_protocol::TopicFilter::new("b408/+").expect("valid wild filter");
+            shared.router.unsubscribe(&wild_filter, "b408-wild");
+            shared
+                .sessions
+                .remove_subscription("b408-wild", &wild_filter);
+            let after = shared.router.matches(&topic);
+            assert_eq!(after.len(), 1);
+            assert_eq!(
+                after.iter().next().unwrap().client_id.as_ref(),
+                "b408-steady"
+            );
+            // Shared-group reduction still agrees through the broker.
+            for (conn, client) in [(4181u64, "b408-sg-a"), (4182, "b408-sg-b")] {
+                let (session, _) = shared.sessions.get_or_create(client, true);
+                *session.conn_id.write() = Some(conn);
+                let frame = subscribe_frame(
+                    conn,
+                    1,
+                    encode_subscribe_meta(1, client, &[("$share/b408sg/b408/sg", 0)]),
+                );
+                let (reply, _) = apply_subscribe(&frame, &shared).await;
+                reply.expect("shared subscribe replies");
+            }
+            let sg_topic = Topic::new("b408/sg").unwrap();
+            let sg_got = publish_shared_once(&shared, &sg_topic, Some("b408-pub"), b"x").await;
+            assert_eq!(sg_got.len(), 1, "shared group reduces to one member");
+            let sg_inner = broker_protocol::TopicFilter::new("b408/sg").expect("valid sg filter");
+            for client in ["b408-sg-a", "b408-sg-b"] {
+                shared.router.unsubscribe(&sg_inner, client);
+                shared.sessions.remove_subscription(client, &sg_inner);
+            }
+        }
+        delivery_rates.sort_by(|a, b| a.total_cmp(b));
+        churn_rates.sort_by(|a, b| a.total_cmp(b));
+        all_sub_us.sort_by(|a, b| a.total_cmp(b));
+        all_pub_us.sort_by(|a, b| a.total_cmp(b));
+        let churn_ops = (CHURN_TASKS * FILTERS_PER_TASK) as f64;
+        eprintln!(
+            "B4-08 broker storm: {STEADY_PUBLISHES} steady deliveries + {churn_ops:.0} broker-ingress subscribes per repeat; \
+            deliveries/s min={:.0} median={:.0} max={:.0}; churn subscribes/s min={:.0} median={:.0} max={:.0} \
+            (x {REPEATS} repeats)",
+            delivery_rates[0],
+            delivery_rates[REPEATS / 2],
+            delivery_rates[REPEATS - 1],
+            churn_rates[0],
+            churn_rates[REPEATS / 2],
+            churn_rates[REPEATS - 1],
+        );
+        let smin = all_sub_us[0];
+        let smed = all_sub_us[all_sub_us.len() / 2];
+        let smax = all_sub_us[all_sub_us.len() - 1];
+        eprintln!(
+            "B4-08 broker subscribe latency under storm: min={smin:.1}us median={smed:.1}us max={smax:.1}us \
+            ({} subscribes via apply_subscribe)",
+            all_sub_us.len(),
+        );
+        let pmin = all_pub_us[0];
+        let pmed = all_pub_us[all_pub_us.len() / 2];
+        let pmax = all_pub_us[all_pub_us.len() - 1];
+        eprintln!(
+            "B4-08 steady publish latency under storm: min={pmin:.1}us median={pmed:.1}us max={pmax:.1}us \
+            ({} publishes via ingress_pipeline_with_publisher)",
+            all_pub_us.len(),
+        );
+        assert!(
+            smin > 0.0 && smin.is_finite() && smax.is_finite(),
+            "broker storm must report positive finite subscribe latency"
+        );
+        assert!(
+            pmin > 0.0 && pmin.is_finite() && pmax.is_finite(),
+            "broker storm must report positive finite publish latency"
+        );
+        assert!(
+            delivery_rates[0] > 0.0 && delivery_rates[0].is_finite(),
+            "broker storm must report positive delivery throughput"
+        );
+        assert!(
+            churn_rates[0] > 0.0 && churn_rates[0].is_finite(),
+            "broker storm must report positive churn throughput"
+        );
+    }
+
     /// D1-03: an 8 KB payload fanned out to N subscribers must share one
     /// buffer instead of copying N times. Fails if any delivery or queued
     /// copy allocates its own 8 KB (e.g. via `to_vec` + `Bytes::from` per
@@ -6458,6 +6951,143 @@ mod tests {
             Bytes::new(),
         )
         .expect("valid unbind frame")
+    }
+
+    fn disconnect_frame(conn_id: u64, seq: u64, client_id: &str) -> BrokerFrame {
+        let mut meta = Vec::with_capacity(2 + client_id.len());
+        meta.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        meta.extend_from_slice(client_id.as_bytes());
+        BrokerFrame::new(
+            OpCode::DisconnectIn,
+            conn_id,
+            seq,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .expect("valid disconnect frame")
+    }
+
+    /// Encode `BindConnection` metadata with an F1-01 last will (test
+    /// mirror of the edge `encode_bind_meta/7` contract without
+    /// credentials, peer or alias sections): will-bit head, then
+    /// `WillQos:8 | WillRetain:8 | TopicLen:16be | Topic |
+    /// PayloadLen:32be | Payload`.
+    fn encode_bind_meta_with_will(
+        client_id: &str,
+        clean_start: bool,
+        keepalive: u16,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        retain: bool,
+    ) -> Bytes {
+        let id = client_id.as_bytes();
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+        meta.extend_from_slice(id);
+        meta.push(u8::from(clean_start) | 0x02);
+        meta.extend_from_slice(&keepalive.to_be_bytes());
+        meta.push(qos);
+        meta.push(u8::from(retain));
+        meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        meta.extend_from_slice(topic.as_bytes());
+        meta.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        meta.extend_from_slice(payload);
+        Bytes::from(meta)
+    }
+
+    /// F1-01: the last will fires on an ungraceful close, never after a
+    /// clean DISCONNECT, exactly once, honouring its QoS and retain bit.
+    /// Fails before the fix with no delivery at all (the will was never
+    /// captured and the close never reported). Drives connect, subscribe,
+    /// disconnect and delivery through the broker, never the store alone.
+    #[tokio::test]
+    async fn last_will_fires_on_disconnect_not_on_unbind() {
+        let shared = test_shared();
+        // Subscriber binds durably and subscribes QoS 1 to the will topic.
+        let sub_bind = bind_frame(301, 1, encode_bind_meta("will-sub", false, 60));
+        apply_bind(&sub_bind, &shared)
+            .await
+            .expect("sub bind replies");
+        let sub = subscribe_frame(
+            301,
+            2,
+            encode_subscribe_meta(11, "will-sub", &[("will/test", 1)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+
+        // Publisher connects with a QoS 1 retained will.
+        let pub_bind = bind_frame(
+            302,
+            1,
+            encode_bind_meta_with_will("will-pub", true, 5, "will/test", b"client-gone", 1, true),
+        );
+        apply_bind(&pub_bind, &shared)
+            .await
+            .expect("pub bind replies");
+        // The CONNECT event captured the will on the session.
+        assert!(
+            shared
+                .sessions
+                .get("will-pub")
+                .expect("session row")
+                .last_will
+                .read()
+                .is_some(),
+            "bind must capture the will"
+        );
+
+        // Ungraceful close: the will fires once with topic, payload, QoS
+        // and retain bit intact, routed to the live subscriber.
+        let deliveries = apply_disconnect(&disconnect_frame(302, 2, "will-pub"), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0, 301);
+        assert_eq!(deliveries[0].1.payload, Bytes::from_static(b"client-gone"));
+        let (topic, _, qos, retain) = decode_publish_meta_parts(&deliveries[0].1.metadata);
+        assert_eq!(topic, "will/test");
+        assert_eq!(qos, 1);
+        assert!(retain, "will retain bit must survive");
+        assert!(
+            !*shared
+                .sessions
+                .get("will-pub")
+                .expect("session row")
+                .connected
+                .read(),
+            "disconnect detaches the session"
+        );
+
+        // A second notice for the same dead connection publishes nothing.
+        let again = apply_disconnect(&disconnect_frame(302, 3, "will-pub"), &shared).await;
+        assert!(again.is_empty(), "will must publish exactly once");
+
+        // Reconnect with a will, then close cleanly: nothing fires, and a
+        // later stale notice still fires nothing (suppressed, then gone).
+        let rebind = bind_frame(
+            303,
+            1,
+            encode_bind_meta_with_will("will-pub", true, 5, "will/test", b"second", 0, false),
+        );
+        apply_bind(&rebind, &shared).await.expect("rebind replies");
+        apply_unbind(&unbind_frame(303, 2, "will-pub"), &shared);
+        let after_clean = apply_disconnect(&disconnect_frame(303, 3, "will-pub"), &shared).await;
+        assert!(
+            after_clean.is_empty(),
+            "clean DISCONNECT must suppress the will"
+        );
+
+        // The retained will from the ungraceful fire is stored for later
+        // subscribers, like any retained publish.
+        assert!(
+            shared
+                .retained
+                .get_retained(&Topic::new("will/test").unwrap())
+                .await
+                .expect("retained read")
+                .is_some(),
+            "retained will must be stored"
+        );
     }
 
     /// TK-04: a clean session leaves no subscriptions behind, so a later

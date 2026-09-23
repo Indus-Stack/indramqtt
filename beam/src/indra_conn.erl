@@ -72,6 +72,7 @@
 -define(SUBSCRIBE_IN, 16#0030).
 -define(SUBACK_OUT, 16#0031).
 -define(CONN_CLOSE, 16#0041).
+-define(DISCONNECT_IN, 16#0040).
 -define(DEFAULT_CONNECT_TIMEOUT_MS, 10000).
 %% Max client bytes buffered while the core is down; beyond this the
 %% connection fails closed instead of ballooning the edge.
@@ -175,9 +176,15 @@ init_shard(Sock, Opts, Shards) ->
              connect_timeout_ms => Timeout,
              buffer => <<>>,
              seq => 0,
-             pending => undefined,
-             client_id => undefined,
-             keepalive => 0,
+              pending => undefined,
+              client_id => undefined,
+              keepalive => 0,
+              %% F1-01 last will captured from CONNECT (undefined when
+              %% the client registered none). Forwarded in every bind
+              %% (including rebinds after a core restart) and reported
+              %% via DisconnectIn on ungraceful close; the kernel owns
+              %% the session and the publish decision.
+              will => undefined,
              session_id => undefined,
              subs_pending => #{},
              pubs_pending => #{},
@@ -624,6 +631,35 @@ arm_socket(#{sock := Sock, sockmod := Mod}) ->
 %% the stop-cause aggregates). Every `{stop, ...}' site in this module
 %% goes through here; stuffing the cause into any other return shape
 %% would leave deaths unattributed.
+%%
+%% F1-01: any stop that is not a clean client DISCONNECT
+%% (`client_disconnect', which already sent Unbind) nor a kernel-ordered
+%% close (`kernel_close', where the kernel already detached) reports an
+%% ungraceful close to the kernel via DisconnectIn first, so the stored
+%% last will fires. The guard needs only a binary client id (a session
+%% exists); handshake states have `undefined' and send nothing. The send
+%% is asynchronous (spawned): the socket closes without waiting for the
+%% kernel, so a slow or dead kernel never delays the stop (the 5 s
+%% subscribe call-timeout kill must stay a 5 s kill, not 5 s plus another
+%% 5 s for the notice). A dead kernel simply drops the notice.
+stop_with(#{client_id := ClientId, broker := Broker,
+            conn_id := ConnId, seq := Seq} = Data, Cause)
+  when is_binary(ClientId),
+       Cause =/= client_disconnect, Cause =/= kernel_close ->
+    case (catch indra_brokerlink:encode_disconnect_meta(ClientId)) of
+        <<_/binary>> = Meta ->
+            SpawnBroker = Broker,
+            SpawnConn = ConnId,
+            SpawnSeq = Seq + 1,
+            spawn(fun() ->
+                catch indra_brokerlink:send(SpawnBroker, ?DISCONNECT_IN,
+                                            SpawnConn, SpawnSeq, Meta, <<>>)
+            end),
+            ok;
+        _ ->
+            ok
+    end,
+    {stop, normal, Data#{stop_cause => Cause}};
 stop_with(Data, Cause) ->
     {stop, normal, Data#{stop_cause => Cause}}.
 
@@ -694,41 +730,108 @@ handle_connect_bytes(Buf, Data) ->
 handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq := Seq} = Data) ->
     case indra_mqtt_codec:decode_connect(Payload) of
         {ok, #{client_id := ClientId, clean_start := CleanStart, keepalive := Keepalive,
-               username := User, password := Pass}} ->
+               username := User, password := Pass, will_flag := WillFlag,
+               will_qos := WillQos, will_retain := WillRetain,
+               will_topic := WillTopic, will_payload := WillPayload}} ->
             %% The peer address rides the bind so the kernel can refuse
             %% address-banned clients (B1-03); a bind without it simply
             %% matches no address ban, never fails. B4-05: no alias
             %% section rides this bind (3.1.1 clients negotiate no
             %% maximum), so the kernel outbound bound stays 0 and
             %% deliveries toward them always carry the full topic.
-            Meta = indra_brokerlink:encode_bind_meta(ClientId, CleanStart, Keepalive,
-                                                     {User, Pass},
-                                                     peer_ip_opt(Data)),
-            case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
-                ok ->
-                    Pending = #{client_id => ClientId, keepalive => Keepalive},
-                    %% Stash bytes pipelined behind CONNECT; they drain once
-                    %% the handshake completes (see `drain_buffer`).
-                    {keep_state, Data#{seq => Seq + 1,
-                                       pending => Pending,
-                                       buffer => Rest}};
-                Other ->
-                    stop_with(Data, classify_send_error(Other))
+            %% F1-01: the CONNECT last will rides the bind when present;
+            %% the kernel stores it on the session and publishes it on an
+            %% ungraceful close only. A will topic carrying wildcards (or
+            %% an empty one) can never route, so the CONNECT fails closed
+            %% here instead of registering half a will.
+            case make_will(WillFlag, WillTopic, WillPayload, WillQos, WillRetain) of
+                {error, _} ->
+                    stop_with(Data, protocol_error);
+                {ok, Will} ->
+                    %% No will rides the legacy /5 encoding byte-for-byte;
+                    %% a will rides the /7 encoding (alias maximum 0:
+                    %% 3.1.1 clients negotiate no maximum).
+                    Meta = case Will of
+                        undefined ->
+                            (catch indra_brokerlink:encode_bind_meta(
+                                     ClientId, CleanStart, Keepalive,
+                                     {User, Pass},
+                                     peer_ip_opt(Data)));
+                        _ ->
+                            (catch indra_brokerlink:encode_bind_meta(
+                                     ClientId, CleanStart, Keepalive,
+                                     {User, Pass},
+                                     peer_ip_opt(Data), 0, Will))
+                    end,
+                    case Meta of
+                        <<_/binary>> ->
+                            case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION,
+                                                             ConnId, Seq + 1, Meta, <<>>) of
+                                ok ->
+                                    Pending = #{client_id => ClientId,
+                                                keepalive => Keepalive,
+                                                will => Will},
+                                    %% Stash bytes pipelined behind CONNECT; they drain once
+                                    %% the handshake completes (see `drain_buffer`).
+                                    {keep_state, Data#{seq => Seq + 1,
+                                                       pending => Pending,
+                                                       buffer => Rest}};
+                                Other ->
+                                    stop_with(Data, classify_send_error(Other))
+                            end;
+                        _ ->
+                            %% Will too large for the bind meta (or another
+                            %% encoding refusal): fail closed, no half bind.
+                            stop_with(Data, protocol_error)
+                    end
             end;
         {error, _Reason} ->
             stop_with(Data, protocol_error)
     end.
 
+%% @private Build the bind will from decoded CONNECT fields. `undefined'
+%% when the will flag is clear; otherwise the topic must be routable
+%% (non-empty, no wildcards) and the payload a binary (empty allowed).
+make_will(false, _, _, _, _) ->
+    {ok, undefined};
+make_will(true, Topic, Payload, QoS, Retain)
+  when is_binary(Topic), is_binary(Payload),
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       (Retain =:= true orelse Retain =:= false),
+       byte_size(Topic) >= 1 ->
+    case binary:match(Topic, [<<"+">>, <<"#">>]) of
+        nomatch ->
+            {ok, #{topic => Topic, payload => Payload,
+                   qos => QoS, retain => Retain}};
+        _ ->
+            {error, invalid_will_topic}
+    end;
+make_will(_, _, _, _, _) ->
+    {error, invalid_will_topic}.
+
 %% @private Re-send the pending bind to a replacement broker (core flap
 %% mid-handshake). Drops back to waiting on failure.
 resend_bind(#{broker := Broker, conn_id := ConnId, seq := Seq,
-              pending := #{client_id := ClientId, keepalive := Keepalive}} = Data) ->
-    Meta = indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
-                                             {undefined, undefined},
-                                             peer_ip_opt(Data)),
-    case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
-        ok ->
-            {keep_state, Data#{seq => Seq + 1}};
+              pending := #{client_id := ClientId, keepalive := Keepalive} = Pending} = Data) ->
+    Will = maps:get(will, Pending, undefined),
+    Meta = case Will of
+        undefined ->
+            (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
+                                                     {undefined, undefined},
+                                                     peer_ip_opt(Data)));
+        _ ->
+            (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
+                                                     {undefined, undefined},
+                                                     peer_ip_opt(Data), 0, Will))
+    end,
+    case Meta of
+        <<_/binary>> ->
+            case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
+                ok ->
+                    {keep_state, Data#{seq => Seq + 1}};
+                _ ->
+                    {keep_state, Data}
+            end;
         _ ->
             {keep_state, Data}
     end;
@@ -779,7 +882,8 @@ handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
                                                         keepalive => 0}),
                     Data1 = Data#{session_id => SessionId,
                                   client_id => maps:get(client_id, Pending, <<>>),
-                                  keepalive => maps:get(keepalive, Pending, 0)},
+                                  keepalive => maps:get(keepalive, Pending, 0),
+                                  will => maps:get(will, Pending, undefined)},
                     {next_state, connected, Data1,
                      [keepalive_action(Data1), {next_event, internal, drain_buffer}]};
                 ok ->
@@ -802,23 +906,37 @@ handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
 %% @private Begin recovery: re-bind the session, always non-clean so a
 %% surviving core resumes (present=true, offline replay follows) while a
 %% fresh core simply recreates. Core-side tracking resets; the client
-%% buffer is preserved for the post-rebind drain.
+%% buffer is preserved for the post-rebind drain. The stored last will
+%% re-rides the rebind so a fresh core re-registers it.
 start_rebind(#{broker := Broker, conn_id := ConnId, seq := Seq,
                client_id := ClientId, keepalive := Keepalive} = Data)
   when is_binary(ClientId) ->
-    Meta = indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
-                                             {undefined, undefined},
-                                             peer_ip_opt(Data)),
-    case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
-        ok ->
-            {next_state, await_core, Data#{seq => Seq + 1,
-                                           subs_pending => #{},
-                                           pubs_pending => #{},
-                                           qos2_pending => #{},
-                                           quiet_subs => #{},
-                                           rebinding => true}};
+    Will = maps:get(will, Data, undefined),
+    Meta = case Will of
+        undefined ->
+            (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
+                                                     {undefined, undefined},
+                                                     peer_ip_opt(Data)));
         _ ->
-            %% Replacement core already gone: hold for the next sweep.
+            (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
+                                                     {undefined, undefined},
+                                                     peer_ip_opt(Data), 0, Will))
+    end,
+    case Meta of
+        <<_/binary>> ->
+            case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION, ConnId, Seq + 1, Meta, <<>>) of
+                ok ->
+                    {next_state, await_core, Data#{seq => Seq + 1,
+                                                   subs_pending => #{},
+                                                   pubs_pending => #{},
+                                                   qos2_pending => #{},
+                                                   quiet_subs => #{},
+                                                   rebinding => true}};
+                _ ->
+                    %% Replacement core already gone: hold for the next sweep.
+                    {next_state, await_core, Data#{rebinding => false}}
+            end;
+        _ ->
             {next_state, await_core, Data#{rebinding => false}}
     end;
 start_rebind(Data) ->

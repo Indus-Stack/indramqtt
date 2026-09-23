@@ -65,7 +65,9 @@
                          password := binary() | undefined,
                          will_flag := boolean(),
                          will_qos := 0..2,
-                         will_retain := boolean()}.
+                         will_retain := boolean(),
+                         will_topic := binary() | undefined,
+                         will_payload := binary() | undefined}.
 -type subscribe_map() :: #{packet_id := 1..65535,
                            subscriptions := [{binary(), 0..2}]}.
 -type publish_map() :: #{topic := binary(),
@@ -473,7 +475,7 @@ decode_connect_flags(Flags, Keepalive, Payload) ->
             case skip_connect_string(Payload) of
                 {ok, ClientId, Rest} ->
                     case take_connect_options(Rest, WillFlag, Username, Password) of
-                        {ok, User, Pass} ->
+                        {ok, User, Pass, WillTopic, WillPayload} ->
                             {ok, #{protocol_name => <<"MQTT">>,
                                    protocol_level => 4,
                                    clean_start => CleanStart,
@@ -485,7 +487,9 @@ decode_connect_flags(Flags, Keepalive, Payload) ->
                                    password => Pass,
                                    will_flag => WillFlag,
                                    will_qos => WillQos,
-                                   will_retain => WillRetain}};
+                                   will_retain => WillRetain,
+                                   will_topic => WillTopic,
+                                   will_payload => WillPayload}};
                         {error, _} = Err ->
                             Err
                     end;
@@ -503,23 +507,26 @@ skip_connect_string(<<Len:16/big, Rest/binary>>) ->
 skip_connect_string(_) ->
     {error, truncated_connect}.
 
-%% @private Take optional CONNECT fields, capturing username/password
-%% values (will topic/message stay opaque to the edge). Username and
-%% password come back as `undefined` when their flags are clear.
+%% @private Take optional CONNECT fields, capturing the will topic and
+%% message when the will flag is set (forwarded to the kernel in the
+%% bind; the kernel owns the session and the publish decision) plus
+%% username/password values. Username and password come back as
+%% `undefined' when their flags are clear; will topic and payload come
+%% back as `undefined' when the will flag is clear.
 take_connect_options(Rest, false, false, false) ->
     case Rest of
-        <<>> -> {ok, undefined, undefined};
+        <<>> -> {ok, undefined, undefined, undefined, undefined};
         _ -> {error, trailing_connect_bytes}
     end;
 take_connect_options(Rest, WillFlag, Username, Password) ->
     case take_optional_string(Rest, WillFlag) of
-        {ok, _, Rest1} ->
+        {ok, WillTopic, Rest1} ->
             case take_optional_string(Rest1, WillFlag) of
-                {ok, _, Rest2} ->
+                {ok, WillPayload, Rest2} ->
                     case take_optional_string(Rest2, Username) of
                         {ok, User, Rest3} ->
                             case take_optional_string(Rest3, Password) of
-                                {ok, Pass, <<>>} -> {ok, User, Pass};
+                                {ok, Pass, <<>>} -> {ok, User, Pass, WillTopic, WillPayload};
                                 {ok, _, _} -> {error, trailing_connect_bytes};
                                 Err -> Err
                             end;

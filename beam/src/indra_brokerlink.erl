@@ -51,6 +51,7 @@
          encode_bind_meta/4,
          encode_bind_meta/5,
          encode_bind_meta/6,
+         encode_bind_meta/7,
          decode_bind_meta/1,
          encode_session_binding_meta/3,
          encode_session_binding_meta/4,
@@ -75,8 +76,10 @@
          decode_pubrel_meta/1,
          encode_pubcomp_meta/1,
          decode_pubcomp_meta/1,
-         encode_unbind_meta/1,
-         decode_unbind_meta/1]).
+          encode_unbind_meta/1,
+          decode_unbind_meta/1,
+          encode_disconnect_meta/1,
+          decode_disconnect_meta/1]).
 
 %% BrokerLink metadata contract (egress stage 1: edge -> kernel Credit).
 %% Snapshot layout `UsedFrames:32be | UsedBytes:32be' (mirrored by the
@@ -350,7 +353,11 @@ is_known_opcode(_) -> false.
                        username := binary() | undefined,
                        password := binary() | undefined,
                        peerhost := binary() | undefined,
-                       client_alias_max := 0..65535}.
+                       client_alias_max := 0..65535,
+                       will_topic := binary() | undefined,
+                       will_payload := binary() | undefined,
+                       will_qos := 0..2,
+                       will_retain := boolean()}.
 -type session_binding_meta() :: #{session_id := non_neg_integer(),
                                   session_present := boolean(),
                                   return_code := 0..255,
@@ -361,10 +368,32 @@ is_known_opcode(_) -> false.
 encode_bind_meta(ClientId, CleanStart, Keepalive)
   when is_binary(ClientId), is_boolean(CleanStart),
        is_integer(Keepalive), Keepalive >= 0, Keepalive =< 65535 ->
-    Flags = case CleanStart of true -> 1; false -> 0 end,
+    encode_head(ClientId, CleanStart, Keepalive, false).
+
+%% @private Encode the fixed bind head. Flags bit 0 is clean_start;
+%% Flags bit 1 marks a following F1-01 will section (see
+%% {@link encode_bind_meta/7}).
+encode_head(ClientId, CleanStart, Keepalive, WillPresent)
+  when is_binary(ClientId), is_boolean(CleanStart),
+       is_integer(Keepalive), Keepalive >= 0, Keepalive =< 65535,
+       is_boolean(WillPresent) ->
+    Flags = (case CleanStart of true -> 1; false -> 0 end)
+        bor (case WillPresent of true -> 2; false -> 0 end),
     IdLen = byte_size(ClientId),
     true = (IdLen =< 65535) orelse erlang:error(badarg),
     <<IdLen:16/big, ClientId/binary, Flags:8, Keepalive:16/big>>.
+
+%% @private Encode the optional credentials tail (empty for anonymous).
+encode_creds_bin({undefined, undefined}) ->
+    <<>>;
+encode_creds_bin({User, Pass})
+  when is_binary(User), is_binary(Pass) ->
+    true = (byte_size(User) =< 65535) orelse erlang:error(badarg),
+    true = (byte_size(Pass) =< 65535) orelse erlang:error(badarg),
+    <<(byte_size(User)):16/big, User/binary,
+      (byte_size(Pass)):16/big, Pass/binary>>;
+encode_creds_bin(_) ->
+    erlang:error(badarg).
 
 %% @doc Encode BindConnection metadata with credentials. Pass
 %% `{undefined, undefined}` (or use {@link encode_bind_meta/3}) for
@@ -376,11 +405,8 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, {undefined, undefined}) ->
     encode_bind_meta(ClientId, CleanStart, Keepalive);
 encode_bind_meta(ClientId, CleanStart, Keepalive, {User, Pass})
   when is_binary(User), is_binary(Pass) ->
-    Base = encode_bind_meta(ClientId, CleanStart, Keepalive),
-    true = (byte_size(User) =< 65535) orelse erlang:error(badarg),
-    true = (byte_size(Pass) =< 65535) orelse erlang:error(badarg),
-    <<Base/binary, (byte_size(User)):16/big, User/binary,
-      (byte_size(Pass)):16/big, Pass/binary>>;
+    <<(encode_head(ClientId, CleanStart, Keepalive, false))/binary,
+      (encode_creds_bin({User, Pass}))/binary>>;
 encode_bind_meta(_, _, _, _) ->
     erlang:error(badarg).
 
@@ -396,12 +422,20 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, undefined) ->
     encode_bind_meta(ClientId, CleanStart, Keepalive, Creds);
 encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp)
   when is_binary(PeerIp) ->
-    Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds),
+    <<(encode_bind_meta(ClientId, CleanStart, Keepalive, Creds))/binary,
+      (encode_peer_bin(PeerIp))/binary>>;
+encode_bind_meta(_, _, _, _, _) ->
+    erlang:error(badarg).
+
+%% @private Encode the optional peer-address tail (empty when undefined).
+encode_peer_bin(undefined) ->
+    <<>>;
+encode_peer_bin(PeerIp) when is_binary(PeerIp) ->
     true = (byte_size(PeerIp) > 0) orelse erlang:error(badarg),
     true = (byte_size(PeerIp) =< 65535) orelse erlang:error(badarg),
     true = is_peer_ip(PeerIp) orelse erlang:error(badarg),
-    <<Base/binary, (byte_size(PeerIp)):16/big, PeerIp/binary>>;
-encode_bind_meta(_, _, _, _, _) ->
+    <<(byte_size(PeerIp)):16/big, PeerIp/binary>>;
+encode_peer_bin(_) ->
     erlang:error(badarg).
 
 %% @doc Encode BindConnection metadata with credentials, peer address
@@ -418,6 +452,53 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax)
     Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer),
     <<Base/binary, ClientAliasMax:16/big>>.
 
+%% @doc Encode BindConnection metadata with credentials, peer address,
+%% alias maximum and the CONNECT last will (F1-01). `Will' is
+%% `undefined' (no will, encodes exactly like {@link encode_bind_meta/6})
+%% or `#{topic := binary(), payload := binary(), qos := 0..2,
+%% retain := boolean()}'. The will section rides immediately after the
+%% keepalive (Flags bit 1 set) and ahead of credentials/peer/alias, so
+%% the remainder parses exactly like a legacy bind. Bound: the will
+%% topic (1..65535 bytes) plus payload must fit the 65535-byte
+%% BrokerLink meta cap; larger wills are rejected at encode time (fail
+%% closed, the connection closes instead of registering half a will).
+-spec encode_bind_meta(binary(), boolean(), 0..65535,
+                       {binary() | undefined, binary() | undefined},
+                       binary() | undefined, 0..65535,
+                       undefined | map()) -> binary().
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax, undefined)
+  when is_integer(ClientAliasMax),
+       ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
+    encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax);
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax,
+                 #{topic := Topic, payload := Payload, qos := QoS, retain := Retain})
+  when is_integer(ClientAliasMax),
+       ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
+    <<(encode_head(ClientId, CleanStart, Keepalive, true))/binary,
+      (encode_will_bin(Topic, Payload, QoS, Retain))/binary,
+      (encode_creds_bin(Creds))/binary,
+      (encode_peer_bin(Peer))/binary,
+      ClientAliasMax:16/big>>;
+encode_bind_meta(_, _, _, _, _, _, _) ->
+    erlang:error(badarg).
+
+%% @private Encode one will section: `WillQos:8 | WillRetain:8 |
+%% TopicLen:16be | Topic | PayloadLen:32be | Payload'.
+encode_will_bin(Topic, Payload, QoS, Retain)
+  when is_binary(Topic), is_binary(Payload),
+       (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+       (Retain =:= true orelse Retain =:= false orelse
+        Retain =:= 0 orelse Retain =:= 1) ->
+    R = case Retain of true -> 1; 1 -> 1; _ -> 0 end,
+    TopicLen = byte_size(Topic),
+    PayloadLen = byte_size(Payload),
+    true = (TopicLen >= 1 andalso TopicLen =< 65535) orelse erlang:error(badarg),
+    true = (PayloadLen =< 16#FFFFFFFF) orelse erlang:error(badarg),
+    <<QoS:8, R:8, TopicLen:16/big, Topic/binary,
+      PayloadLen:32/big, Payload/binary>>;
+encode_will_bin(_, _, _, _) ->
+    erlang:error(badarg).
+
 %% @private True when the binary is an IP literal (v4 or v6).
 is_peer_ip(PeerIp) when is_binary(PeerIp) ->
     case catch inet:parse_address(binary_to_list(PeerIp)) of
@@ -428,10 +509,11 @@ is_peer_ip(_) ->
     false.
 
 %% @doc Decode BindConnection metadata, including the optional
-%% trailing B4-05 `ClientAliasMax:16be' alias section (absent means 0).
-%% A trailing section that is neither valid credentials/peer bytes nor
-%% credentials/peer bytes plus the 2-byte alias section is malformed
-%% (fail closed, never a guessed identity).
+%% trailing B4-05 `ClientAliasMax:16be' alias section (absent means 0)
+%% and the optional F1-01 will section after the keepalive (Flags bit 1;
+%% absent means no will). A trailing section that is neither valid
+%% credentials/peer bytes nor credentials/peer bytes plus the 2-byte
+%% alias section is malformed (fail closed, never a guessed identity).
 -spec decode_bind_meta(binary()) -> {ok, bind_meta()} | {error, term()}.
 decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
     case decode_bind_body(Rest, IdLen) of
@@ -458,27 +540,49 @@ decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
 decode_bind_meta(_) ->
     {error, malformed_bind_meta}.
 
-%% @private Decode the bind body without any alias section.
+%% @private Decode the bind body without any alias section. When Flags
+%% bit 1 is set, an F1-01 will section (`WillQos:8 | WillRetain:8 |
+%% TopicLen:16be | Topic | PayloadLen:32be | Payload') rides immediately
+%% after the keepalive and ahead of credentials/peer bytes; the remainder
+%% then parses exactly like a legacy bind.
 decode_bind_body(Rest, IdLen) ->
     case Rest of
         <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big>> ->
-            {ok, #{client_id => ClientId,
-                   clean_start => (Flags band 16#01) =:= 16#01,
-                   keepalive => Keepalive,
-                   username => undefined,
-                   password => undefined,
-                   peerhost => undefined,
-                   client_alias_max => 0}};
-        <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big, Tail/binary>> ->
-            case decode_bind_creds(Tail) of
-                {ok, User, Pass, Peer} ->
+            case Flags band 16#02 of
+                0 ->
                     {ok, #{client_id => ClientId,
                            clean_start => (Flags band 16#01) =:= 16#01,
                            keepalive => Keepalive,
-                           username => User,
-                           password => Pass,
-                           peerhost => Peer,
-                           client_alias_max => 0}};
+                           username => undefined,
+                           password => undefined,
+                           peerhost => undefined,
+                           client_alias_max => 0,
+                           will_topic => undefined,
+                           will_payload => undefined,
+                           will_qos => 0,
+                           will_retain => false}};
+                _ ->
+                    {error, malformed_bind_meta}
+            end;
+        <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big, Tail/binary>> ->
+            case decode_will_section(Tail, Flags) of
+                {ok, Will, CredsTail} ->
+                    case decode_bind_creds(CredsTail) of
+                        {ok, User, Pass, Peer} ->
+                            {ok, #{client_id => ClientId,
+                                   clean_start => (Flags band 16#01) =:= 16#01,
+                                   keepalive => Keepalive,
+                                   username => User,
+                                   password => Pass,
+                                   peerhost => Peer,
+                                   client_alias_max => 0,
+                                   will_topic => maps:get(topic, Will),
+                                   will_payload => maps:get(payload, Will),
+                                   will_qos => maps:get(qos, Will),
+                                   will_retain => maps:get(retain, Will)}};
+                        {error, _} = Err ->
+                            Err
+                    end;
                 {error, _} = Err ->
                     Err
             end;
@@ -486,12 +590,54 @@ decode_bind_body(Rest, IdLen) ->
             {error, malformed_bind_meta}
     end.
 
+%% @private Decode the optional will section at the head of the bind
+%% tail. Flags bit 1 clear means no section (`undefined' will fields,
+%% whole tail is credentials). Flags bit 1 set means the section must be
+%% present and well-formed: QoS 0..2, retain 0 | 1, non-empty topic,
+%% payload length satisfied. Anything else is malformed (fail closed,
+%% never a guessed will).
+decode_will_section(Tail, Flags) ->
+    case Flags band 16#02 of
+        0 ->
+            {ok, #{topic => undefined,
+                   payload => undefined,
+                   qos => 0,
+                   retain => false}, Tail};
+        _ ->
+            case Tail of
+                <<QoS:8, Retain:8, TopicLen:16/big, Rest/binary>>
+                  when QoS =< 2, (Retain =:= 0 orelse Retain =:= 1) ->
+                    case Rest of
+                        <<Topic:TopicLen/binary, PayloadLen:32/big, Rest2/binary>>
+                          when TopicLen > 0 ->
+                            case Rest2 of
+                                <<Payload:PayloadLen/binary, CredsTail/binary>> ->
+                                    {ok, #{topic => Topic,
+                                           payload => Payload,
+                                           qos => QoS,
+                                           retain => Retain =:= 1},
+                                     CredsTail};
+                                _ ->
+                                    {error, malformed_bind_meta}
+                            end;
+                        _ ->
+                            {error, malformed_bind_meta}
+                    end;
+                _ ->
+                    {error, malformed_bind_meta}
+            end
+    end.
+
 %% @private Decode the trailing sections after the fixed bind header:
 %% a credentials section, optionally followed by a peer-address
 %% section; or, for an anonymous bind from a peer-aware edge, just the
 %% peer section. A trailing section that is neither valid credentials
 %% nor a valid peer address is malformed, exactly as trailing garbage
-%% was before the peer section existed.
+%% was before the peer section existed. An empty tail is anonymous with
+%% no peer (mirrors the kernel `decode_bind_identity` empty case; the
+%% F1-01 will section leaves exactly this tail for anonymous binds).
+decode_bind_creds(<<>>) ->
+    {ok, undefined, undefined, undefined};
 decode_bind_creds(<<ULen:16/big, Rest/binary>>) ->
     case Rest of
         <<User:ULen/binary, PLen:16/big, PassRest/binary>> ->
@@ -796,6 +942,19 @@ decode_unbind_meta(<<IdLen:16/big, Rest/binary>>) ->
     end;
 decode_unbind_meta(_) ->
     {error, malformed_unbind_meta}.
+
+%% @doc Encode DisconnectIn metadata (F1-01 ungraceful close notice:
+%% client identity). Same layout as UnbindConnection metadata
+%% (`IdLen:16be | ClientId'); the opcode is what tells the kernel to
+%% publish the stored last will instead of suppressing it.
+-spec encode_disconnect_meta(binary()) -> binary().
+encode_disconnect_meta(ClientId) when is_binary(ClientId) ->
+    encode_unbind_meta(ClientId).
+
+%% @doc Decode DisconnectIn metadata (same layout as UnbindConnection).
+-spec decode_disconnect_meta(binary()) -> {ok, #{client_id := binary()}} | {error, term()}.
+decode_disconnect_meta(Meta) ->
+    decode_unbind_meta(Meta).
 
 %% @doc Encode ConnClose metadata (always empty; W0-24 contract).
 -spec encode_connclose_meta() -> binary().

@@ -733,6 +733,7 @@ name = "broker-router"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "arc-swap",
  "broker-observability",
  "broker-protocol",
  "brokerlink",
