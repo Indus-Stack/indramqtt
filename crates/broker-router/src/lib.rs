@@ -86,6 +86,153 @@ pub fn split_shared_filter(filter: &TopicFilter) -> Option<(Option<Arc<str>>, To
 /// iteration order is unspecified (assert on membership, not order).
 pub type SubscriptionSet = AHashSet<Subscription>;
 
+/// Maximum ordered topic-rewrite rules held by one router (B4-04).
+///
+/// Each rule is one precompiled regex plus a short replacement string
+/// (tens of KB worst case per rule), so 64 caps the table in the low
+/// hundreds of KB. Rationale: deployments carry tens of rules at most;
+/// past 64 the configuration is almost certainly generated in a loop,
+/// and rejecting it fail-closed protects the per-message evaluation
+/// budget below. Set once on the config plane; the publish path only
+/// takes a read lock over the table.
+pub const MAX_REWRITE_RULES: usize = 64;
+
+/// Maximum bytes of one rewrite input or output (B4-04).
+///
+/// Matches the on-the-wire topic length field (u16), so any concrete
+/// topic or filter that can reach the router fits, and no replacement
+/// can grow a name past what the protocol can carry. Inputs past this
+/// length fail closed to no-rewrite with the budget counter bumped;
+/// replacements that would exceed it fail the same way, never truncating.
+pub const MAX_REWRITE_LEN: usize = u16::MAX as usize;
+
+/// Per-direction scope of one rewrite rule (B4-04): publish ingress,
+/// subscribe filters, or both. Stored per rule and honoured in
+/// configuration order; a rule never fires outside its scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RewriteScope {
+    /// Fire on publish topics and subscribe filters alike.
+    #[default]
+    Both,
+    /// Fire on publish topics only.
+    Publish,
+    /// Fire on subscribe filters only.
+    Subscribe,
+}
+
+/// Documented scope names accepted by [`RewriteScope::parse`].
+pub const VALID_REWRITE_SCOPES: &[&str] = &["publish", "subscribe", "both"];
+
+/// Errors for topic-rewrite configuration (B4-04). Every variant names
+/// the value at fault; the table is unchanged when configuration fails.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RewriteRuleError {
+    /// More rules than [`MAX_REWRITE_RULES`].
+    #[error("too many topic-rewrite rules (cap {0}) (field `rules`)")]
+    TooManyRules(usize),
+    /// The pattern does not compile.
+    #[error(
+        "invalid topic-rewrite pattern {0:?}: not a valid regular expression (field `pattern`)"
+    )]
+    InvalidPattern(String),
+    /// The pattern was empty.
+    #[error("topic-rewrite pattern must not be empty (field `pattern`)")]
+    EmptyPattern,
+    /// The replacement alone already exceeds [`MAX_REWRITE_LEN`].
+    #[error("topic-rewrite replacement exceeds {0} bytes (field `replacement`)")]
+    ReplacementTooLong(usize),
+}
+
+impl RewriteScope {
+    /// Parse a documented scope name (case-insensitive, trimmed).
+    /// Unknown names return `None` so callers fail closed instead of
+    /// guessing a direction.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "publish" | "pub" => Some(Self::Publish),
+            "subscribe" | "sub" => Some(Self::Subscribe),
+            "both" | "all" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Canonical documented name for this scope.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Publish => "publish",
+            Self::Subscribe => "subscribe",
+        }
+    }
+
+    /// True when this rule fires on the publish path.
+    #[must_use]
+    pub fn applies_to_publish(self) -> bool {
+        matches!(self, Self::Publish | Self::Both)
+    }
+
+    /// True when this rule fires on the subscribe path.
+    #[must_use]
+    pub fn applies_to_subscribe(self) -> bool {
+        matches!(self, Self::Subscribe | Self::Both)
+    }
+}
+
+/// One topic-rewrite rule as configured (B4-04): a regex pattern with a
+/// capture-group replacement (`$1`, `${name}`) plus the direction it
+/// fires in. Compiled once by [`Router::set_rewrite_rules`]; the
+/// per-message path never compiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteRuleConfig {
+    /// Regular expression matched against the whole topic or filter.
+    pub pattern: String,
+    /// Replacement with `$1`-style capture references.
+    pub replacement: String,
+    /// Direction this rule fires in.
+    pub scope: RewriteScope,
+}
+
+impl RewriteRuleConfig {
+    /// Build one rule. Empty patterns are rejected later by
+    /// [`Router::set_rewrite_rules`] with [`RewriteRuleError::EmptyPattern`].
+    pub fn new(
+        pattern: impl Into<String>,
+        replacement: impl Into<String>,
+        scope: RewriteScope,
+    ) -> Self {
+        Self {
+            pattern: pattern.into(),
+            replacement: replacement.into(),
+            scope,
+        }
+    }
+}
+
+/// One compiled rewrite rule: the configured strings plus the regex
+/// built once at configuration time. The match path borrows these;
+/// nothing here is rebuilt per message.
+#[derive(Debug)]
+struct CompiledRewriteRule {
+    scope: RewriteScope,
+    replacement: String,
+    regex: regex::Regex,
+}
+
+/// Snapshot of the rewrite counters for operators and tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RewriteStats {
+    /// Rules currently installed (configuration order = evaluation order).
+    pub rules: usize,
+    /// Messages rewritten (first matching rule applied).
+    pub rewritten: u64,
+    /// Messages that matched nothing and passed through unchanged.
+    pub passthrough: u64,
+    /// Messages left unchanged because an input or output exceeded
+    /// [`MAX_REWRITE_LEN`] (fail closed, never stalled or truncated).
+    pub budget_exceeded: u64,
+}
+
 /// Per-group shared-subscription dispatch strategy (B4-02).
 ///
 /// Documented names (read from group configuration, never invented per
@@ -316,6 +463,20 @@ pub struct Router {
     /// from the subscription trie so management list reads never block
     /// the routing path and publishes only take a short write.
     known_topics: RwLock<AHashSet<Arc<str>>>,
+    /// Ordered compiled rewrite rules (B4-04). Written once per
+    /// configuration change under a write lock; the publish and
+    /// subscribe paths take only a short read lock and evaluate at most
+    /// this many precompiled regexes in order, first match wins.
+    /// Bounded by [`MAX_REWRITE_RULES`].
+    rewrite_rules: RwLock<Vec<CompiledRewriteRule>>,
+    /// Rewrite outcomes (B4-04). Relaxed atomics bumped on the match
+    /// path; no lock, no allocation.
+    rewrite_rewritten: AtomicU64,
+    /// Messages that matched no rule and passed through unchanged.
+    rewrite_passthrough: AtomicU64,
+    /// Inputs or outputs past [`MAX_REWRITE_LEN`], left unchanged
+    /// (fail closed, never truncated).
+    rewrite_budget_exceeded: AtomicU64,
 }
 
 impl Default for Router {
@@ -343,6 +504,10 @@ impl Router {
             sticky: RwLock::new(AHashMap::new()),
             random_seed: std::sync::atomic::AtomicU64::new(seed),
             known_topics: RwLock::new(AHashSet::new()),
+            rewrite_rules: RwLock::new(Vec::new()),
+            rewrite_rewritten: AtomicU64::new(0),
+            rewrite_passthrough: AtomicU64::new(0),
+            rewrite_budget_exceeded: AtomicU64::new(0),
         }
     }
 
@@ -394,6 +559,138 @@ impl Router {
     /// hook for tests and operators).
     pub fn shared_strategy_count(&self) -> usize {
         self.strategies.read().len()
+    }
+
+    /// Install the ordered rewrite table (B4-04, config plane). Every
+    /// pattern compiles here, once; the per-message path never compiles.
+    /// The table swaps atomically under one write lock: readers always
+    /// see the old or the new table, never a mix. Rejects fail closed
+    /// with the table unchanged: too many rules, an empty pattern, an
+    /// uncompilable pattern, or a replacement already past
+    /// [`MAX_REWRITE_LEN`].
+    pub fn set_rewrite_rules(
+        &self,
+        configs: Vec<RewriteRuleConfig>,
+    ) -> Result<(), RewriteRuleError> {
+        if configs.len() > MAX_REWRITE_RULES {
+            return Err(RewriteRuleError::TooManyRules(MAX_REWRITE_RULES));
+        }
+        let mut compiled = Vec::with_capacity(configs.len());
+        for config in &configs {
+            if config.pattern.is_empty() {
+                return Err(RewriteRuleError::EmptyPattern);
+            }
+            if config.replacement.len() > MAX_REWRITE_LEN {
+                return Err(RewriteRuleError::ReplacementTooLong(MAX_REWRITE_LEN));
+            }
+            let regex = regex::Regex::new(&config.pattern)
+                .map_err(|_| RewriteRuleError::InvalidPattern(config.pattern.clone()))?;
+            compiled.push(CompiledRewriteRule {
+                scope: config.scope,
+                replacement: config.replacement.clone(),
+                regex,
+            });
+        }
+        *self.rewrite_rules.write() = compiled;
+        Ok(())
+    }
+
+    /// Drop every rewrite rule (config plane). Delivery passes through
+    /// unchanged afterwards; counters keep their values.
+    pub fn clear_rewrite_rules(&self) {
+        self.rewrite_rules.write().clear();
+    }
+
+    /// Number of installed rewrite rules in evaluation order.
+    pub fn rewrite_rule_count(&self) -> usize {
+        self.rewrite_rules.read().len()
+    }
+
+    /// Copy the rewrite counters in one call for operators and tests.
+    pub fn rewrite_stats(&self) -> RewriteStats {
+        RewriteStats {
+            rules: self.rewrite_rules.read().len(),
+            rewritten: self.rewrite_rewritten.load(Ordering::Relaxed),
+            passthrough: self.rewrite_passthrough.load(Ordering::Relaxed),
+            budget_exceeded: self.rewrite_budget_exceeded.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Rewrite one publish topic (B4-04). Evaluates publish/both rules
+    /// in configuration order; the first regex that matches wins and
+    /// its capture-group replacement is returned. `None` means deliver
+    /// unchanged (no rules, no match, system prefix, or budget failure).
+    ///
+    /// Called by the publish ingress event before auth, retained state,
+    /// rules and fan-out observe the topic, so every downstream stage
+    /// sees the rewritten name.
+    pub fn rewrite_publish(&self, topic: &str) -> Option<String> {
+        self.rewrite_for(topic, true)
+    }
+
+    /// Rewrite one subscribe filter (B4-04). Same ordered first-match
+    /// rule, restricted to subscribe/both rules. `None` means subscribe
+    /// with the filter unchanged.
+    ///
+    /// Called by the subscribe event before validation and group
+    /// splitting observe the filter, so the router, the session mirror
+    /// and retained replay all see the rewritten filter.
+    pub fn rewrite_subscribe(&self, filter: &str) -> Option<String> {
+        self.rewrite_for(filter, false)
+    }
+
+    /// Shared ordered evaluation for both directions. Per-message cost:
+    /// one short read lock, at most one `is_match` probe per installed
+    /// rule (at most [`MAX_REWRITE_RULES`], linear-time engine in the
+    /// input length, early exit on the first match), plus a single
+    /// bounded replacement allocation (at most [`MAX_REWRITE_LEN`]
+    /// bytes) on a hit. No compilation, no unbounded allocation, no
+    /// waiting: an over-long input or output fails closed to `None`
+    /// with the budget counter bumped.
+    fn rewrite_for(&self, input: &str, is_publish: bool) -> Option<String> {
+        if input.len() > MAX_REWRITE_LEN {
+            self.rewrite_budget_exceeded.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if input.is_empty() {
+            self.rewrite_passthrough.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // TODO(parity): should system-prefixed names (`$...`, covering
+        // delayed markers and shared-subscription requests) be rewritable?
+        // Neither this rulebook nor the task spec decides; current choice
+        // is the conservative one (leave them untouched) so rewrite rules
+        // can never change delayed or shared-subscription semantics.
+        if input.starts_with('$') {
+            self.rewrite_passthrough.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let rules = self.rewrite_rules.read();
+        for rule in rules.iter() {
+            let in_scope = if is_publish {
+                rule.scope.applies_to_publish()
+            } else {
+                rule.scope.applies_to_subscribe()
+            };
+            if !in_scope {
+                continue;
+            }
+            if !rule.regex.is_match(input) {
+                continue;
+            }
+            let out = rule.regex.replace(input, rule.replacement.as_str());
+            if out.len() > MAX_REWRITE_LEN {
+                drop(rules);
+                self.rewrite_budget_exceeded.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            drop(rules);
+            self.rewrite_rewritten.fetch_add(1, Ordering::Relaxed);
+            return Some(out.into_owned());
+        }
+        drop(rules);
+        self.rewrite_passthrough.fetch_add(1, Ordering::Relaxed);
+        None
     }
 
     /// Remember one concrete publish topic for the management topic
@@ -1430,6 +1727,163 @@ mod tests {
         let guaranteed = rx.try_recv().expect("QoS 1 via guaranteed mailbox");
         assert_eq!(guaranteed.payload[0], 99);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rewrite_publish_capture_group_rewrites_and_miss_passes_through() {
+        let router = Router::new();
+        router
+            .set_rewrite_rules(vec![RewriteRuleConfig::new(
+                "^sensors/(.*)$",
+                "devices/$1",
+                RewriteScope::Publish,
+            )])
+            .expect("valid rule installs");
+        // Fails before the B4-04 implementation: no rewrite existed, so
+        // the topic passed through unchanged.
+        assert_eq!(
+            router.rewrite_publish("sensors/temp"),
+            Some("devices/temp".to_string())
+        );
+        assert_eq!(router.rewrite_publish("other/temp"), None);
+        let stats = router.rewrite_stats();
+        assert_eq!(stats.rules, 1);
+        assert_eq!(stats.rewritten, 1);
+        assert_eq!(stats.passthrough, 1);
+        assert_eq!(stats.budget_exceeded, 0);
+    }
+
+    #[test]
+    fn rewrite_scopes_fire_only_in_their_direction() {
+        let router = Router::new();
+        router
+            .set_rewrite_rules(vec![
+                RewriteRuleConfig::new("^p/(.*)$", "pub/$1", RewriteScope::Publish),
+                RewriteRuleConfig::new("^s/(.*)$", "sub/$1", RewriteScope::Subscribe),
+                RewriteRuleConfig::new("^b/(.*)$", "both/$1", RewriteScope::Both),
+            ])
+            .expect("valid rules install");
+        // Publish-scoped rule fires on publish, never on subscribe.
+        assert_eq!(router.rewrite_publish("p/a"), Some("pub/a".to_string()));
+        assert_eq!(router.rewrite_subscribe("p/a"), None);
+        // Subscribe-scoped rule fires on subscribe, never on publish.
+        assert_eq!(router.rewrite_subscribe("s/a"), Some("sub/a".to_string()));
+        assert_eq!(router.rewrite_publish("s/a"), None);
+        // Both-scoped rule fires in either direction.
+        assert_eq!(router.rewrite_publish("b/a"), Some("both/a".to_string()));
+        assert_eq!(router.rewrite_subscribe("b/a"), Some("both/a".to_string()));
+        let stats = router.rewrite_stats();
+        assert_eq!(stats.rewritten, 4);
+        assert_eq!(stats.passthrough, 2);
+    }
+
+    #[test]
+    fn rewrite_first_match_wins_in_configuration_order() {
+        let router = Router::new();
+        router
+            .set_rewrite_rules(vec![
+                RewriteRuleConfig::new("^(.*)$", "first/$1", RewriteScope::Both),
+                RewriteRuleConfig::new("^(.*)$", "second/$1", RewriteScope::Both),
+            ])
+            .expect("valid rules install");
+        assert_eq!(router.rewrite_publish("a/b"), Some("first/a/b".to_string()));
+        assert_eq!(
+            router.rewrite_subscribe("a/b"),
+            Some("first/a/b".to_string())
+        );
+        // Reversing the configuration reverses the winner.
+        router
+            .set_rewrite_rules(vec![
+                RewriteRuleConfig::new("^(.*)$", "second/$1", RewriteScope::Both),
+                RewriteRuleConfig::new("^(.*)$", "first/$1", RewriteScope::Both),
+            ])
+            .expect("reinstall works");
+        assert_eq!(
+            router.rewrite_publish("a/b"),
+            Some("second/a/b".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_rule_count_bound_rejects_fail_closed() {
+        assert_eq!(super::MAX_REWRITE_RULES, 64);
+        let router = Router::new();
+        let too_many: Vec<RewriteRuleConfig> = (0..(super::MAX_REWRITE_RULES + 1))
+            .map(|i| {
+                RewriteRuleConfig::new(format!("^overflow{i}/(.*)$"), "x/$1", RewriteScope::Both)
+            })
+            .collect();
+        let err = router
+            .set_rewrite_rules(too_many)
+            .expect_err("over-cap install must fail");
+        assert!(matches!(err, RewriteRuleError::TooManyRules(64)));
+        // Rejected install leaves the table unchanged (fail closed).
+        assert_eq!(router.rewrite_rule_count(), 0);
+        assert_eq!(router.rewrite_publish("overflow0/a"), None);
+
+        // Bad patterns also fail closed at configuration time.
+        assert!(matches!(
+            router.set_rewrite_rules(vec![RewriteRuleConfig::new(
+                "(unclosed",
+                "x",
+                RewriteScope::Both
+            )]),
+            Err(RewriteRuleError::InvalidPattern(_))
+        ));
+        assert!(matches!(
+            router.set_rewrite_rules(vec![RewriteRuleConfig::new("", "x", RewriteScope::Both)]),
+            Err(RewriteRuleError::EmptyPattern)
+        ));
+        assert_eq!(router.rewrite_rule_count(), 0);
+    }
+
+    #[test]
+    fn rewrite_budget_fails_closed_to_no_rewrite_with_counter() {
+        let router = Router::new();
+        // An input past the length bound never rewrites: counted, never
+        // stalled or truncated.
+        let huge = "t".repeat(super::MAX_REWRITE_LEN + 1);
+        assert_eq!(router.rewrite_publish(&huge), None);
+        assert_eq!(router.rewrite_stats().budget_exceeded, 1);
+        assert_eq!(router.rewrite_stats().rewritten, 0);
+        // A replacement that alone exceeds the bound is rejected at
+        // configuration time (fail closed, table unchanged).
+        let long_replacement = "r".repeat(super::MAX_REWRITE_LEN + 1);
+        assert!(matches!(
+            router.set_rewrite_rules(vec![RewriteRuleConfig::new(
+                "^(.*)$",
+                long_replacement,
+                RewriteScope::Both
+            )]),
+            Err(RewriteRuleError::ReplacementTooLong(_))
+        ));
+        assert_eq!(router.rewrite_rule_count(), 0);
+        // System-prefixed names pass through untouched so rewrite rules
+        // can never change delayed or shared-subscription semantics.
+        router
+            .set_rewrite_rules(vec![RewriteRuleConfig::new(
+                "^(.*)$",
+                "rewritten/$1",
+                RewriteScope::Both,
+            )])
+            .expect("catch-all installs");
+        assert_eq!(router.rewrite_publish("$delayed/5/a/b"), None);
+        assert_eq!(router.rewrite_subscribe("$share/g/a/b"), None);
+    }
+
+    #[test]
+    fn rewrite_scope_parse_vectors() {
+        assert_eq!(RewriteScope::parse("publish"), Some(RewriteScope::Publish));
+        assert_eq!(
+            RewriteScope::parse("subscribe"),
+            Some(RewriteScope::Subscribe)
+        );
+        assert_eq!(RewriteScope::parse("both"), Some(RewriteScope::Both));
+        assert_eq!(RewriteScope::parse("nope"), None);
+        assert_eq!(RewriteScope::default(), RewriteScope::Both);
+        assert_eq!(RewriteScope::Publish.as_str(), "publish");
+        assert_eq!(RewriteScope::Subscribe.as_str(), "subscribe");
+        assert_eq!(RewriteScope::Both.as_str(), "both");
     }
 }
 
