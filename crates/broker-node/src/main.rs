@@ -21,8 +21,11 @@ use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
 use clap::Parser;
+use delayed::{DelayedEntry, DelayedScheduler, DEFAULT_MAX_DELAYED_SECS, DELAYED_TICK_MS};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod delayed;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tracing::{debug, info, warn};
@@ -235,6 +238,15 @@ struct Args {
     /// under 128 bytes, so the default holds under 128 KiB.
     #[arg(long, default_value_t = broker_auth::REPLAY_MAX_ENTRIES)]
     kerberos_replay_max: usize,
+
+    /// Upper bound for `$delayed` deferrals in seconds (B4-03). Past it
+    /// the request is dropped with a warning instead of pinning a wheel
+    /// slot and a file row indefinitely. Default one day: longer
+    /// deferrals pin memory for no realistic device schedule, and the
+    /// previous per-message sleep used the same one-day ceiling so
+    /// existing publishers see the same limit.
+    #[arg(long, default_value_t = DEFAULT_MAX_DELAYED_SECS)]
+    delayed_max_secs: u64,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -920,6 +932,18 @@ struct Shared {
     /// every publish through a bounded channel drained off the hot path.
     /// One `Arc` clone at boot; the hook never blocks delivery.
     stream_journal: Option<Arc<StreamJournalHandle>>,
+    /// Delayed-publish scheduler (B4-03): one shared hierarchical timer
+    /// wheel plus the file-backed pending log behind it. The publish
+    /// event records here before the publisher is acknowledged; a single
+    /// background driver ticks the wheel and delivers due entries through
+    /// the normal ingress pipeline. One `Arc` clone at boot; the publish
+    /// path pays one atomic load, one bounded file append and one short
+    /// wheel-lock insert, while cascading and file rewrites stay in the
+    /// driver task. Measured before/after rates print in
+    /// `delayed_delivery_workload_timings`. Bounded by the pending cap
+    /// and the per-message
+    /// payload cap documented in `delayed.rs`.
+    delayed: Arc<DelayedScheduler>,
 }
 
 impl Shared {
@@ -1002,8 +1026,79 @@ impl Shared {
             coap: Arc::new(CoapGatewayHandler::new()),
             coap_socket: None,
             stream_journal: None,
+            delayed: Arc::new(DelayedScheduler::new()),
         }
     }
+
+    /// Start the single delayed-delivery driver task for this node. The
+    /// first caller wins (the scheduler's claim bit); later callers are
+    /// no-ops so connection tasks can call this freely without spawning
+    /// a driver per connection. The driver ticks every 100 ms off the
+    /// delivery path and routes due entries through the normal ingress
+    /// pipeline.
+    fn spawn_delayed_driver(&self) {
+        if !self.delayed.claim_driver() {
+            return;
+        }
+        let shared = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(DELAYED_TICK_MS)).await;
+                let due = shared.delayed.tick_due();
+                if due.is_empty() {
+                    continue;
+                }
+                let mut fired_ids = Vec::with_capacity(due.len());
+                for entry in due {
+                    fired_ids.push(entry.id);
+                    deliver_delayed_entry(&shared, entry).await;
+                }
+                shared.delayed.remove_ids(&fired_ids);
+            }
+        });
+    }
+}
+
+/// Deliver one due delayed entry through the same ingress pipeline an
+/// immediate publish takes (retained store, rules, fan-out, cluster
+/// forward), then count it. Runs in the delayed driver task, never on
+/// the live publish or deliver path.
+async fn deliver_delayed_entry(shared: &Shared, entry: DelayedEntry) {
+    let Ok(topic) = Topic::new(entry.topic.clone()) else {
+        shared.delayed.note_malformed();
+        warn!("Dropping delayed entry with bad inner topic");
+        return;
+    };
+    let Ok(qos) = QoS::try_from(entry.qos) else {
+        shared.delayed.note_malformed();
+        warn!("Dropping delayed entry with bad QoS");
+        return;
+    };
+    let payload = Bytes::from(entry.payload.clone());
+    let deliveries = ingress_pipeline_with_publisher(
+        shared,
+        &topic,
+        qos,
+        entry.retain,
+        &payload,
+        entry.publisher.as_deref(),
+    )
+    .await;
+    let mut enqueued = 0u64;
+    let mut enqueued_bytes = 0u64;
+    for (conn_id, routed) in deliveries {
+        let len = routed.total_frame_len() as u64;
+        if shared.conns.route(conn_id, routed) {
+            enqueued += 1;
+            enqueued_bytes += len;
+        }
+    }
+    shared.metrics.inc_messages_forwarded_by(enqueued);
+    shared.metrics.inc_publish_sent_by(enqueued);
+    shared.metrics.inc_delivered_by(enqueued);
+    shared.metrics.inc_bytes_sent_by(enqueued_bytes);
+    forward_cluster(shared, &topic, qos, &payload).await;
+    shared.delayed.note_delivered();
 }
 
 /// Defaults-only registry for fresh `Shared` state (tests and pre-boot).
@@ -2072,7 +2167,17 @@ async fn apply_publish(
     };
     let topic = match Topic::new(topic_str.clone()) {
         Ok(topic) => topic,
-        Err(_) => return (None, Vec::new()),
+        Err(_) => {
+            // A `$delayed/<secs>/<inner>` marker whose inner topic carries
+            // wildcards fails the outer concrete-topic check before the
+            // delayed path is reached. Count it as a malformed delayed
+            // drop (fail closed, never queued) so the counter observes it.
+            if strip_delayed_prefix(&topic_str).is_some() {
+                shared.delayed.note_malformed();
+                warn!("Dropping delayed publish with bad inner topic");
+            }
+            return (None, Vec::new());
+        }
     };
     let qos = match QoS::try_from(qos_raw) {
         Ok(qos) => qos,
@@ -2188,13 +2293,14 @@ async fn apply_publish(
     (ack, deliveries)
 }
 
-/// Upper bound for `$delayed` deferrals: beyond a day the request is
-/// dropped with a warning instead of pinning a task indefinitely.
-const MAX_DELAYED_SECS: u64 = 86_400;
-
 /// Handle a `$delayed/<secs>/<topic>` publish: immediate ack, deferred
-/// pipeline. An unparseable inner topic or an over-limit delay drops the
-/// message (it could never be delivered correctly).
+/// pipeline through the shared timer wheel. An unparseable inner topic,
+/// an over-limit delay, an oversized payload or a full backlog drops the
+/// message with a warning and a counter (it could never be delivered
+/// correctly). The entry is recorded in the wheel and in
+/// `<data-dir>/delayed.jsonl` (see `delayed.rs`) before the ack is
+/// returned, so the publisher is never stalled past the timer and a
+/// restart keeps the entry on schedule.
 async fn apply_delayed_publish(
     frame: &BrokerFrame,
     shared: &Shared,
@@ -2207,23 +2313,17 @@ async fn apply_delayed_publish(
     let inner_topic = match Topic::new(inner.to_string()) {
         Ok(topic) => topic,
         Err(e) => {
+            shared.delayed.note_malformed();
             warn!("Dropping delayed publish with bad inner topic: {}", e);
             return (None, Vec::new());
         }
     };
-    if delay_secs > MAX_DELAYED_SECS {
-        warn!(
-            "Dropping delayed publish: {}s exceeds the {}s cap",
-            delay_secs, MAX_DELAYED_SECS
-        );
-        return (None, Vec::new());
-    }
-    let ack = if qos == QoS::AtLeastOnce {
-        pub_ack_reply(frame, packet_id, 0)
-    } else {
-        None
-    };
     if delay_secs == 0 {
+        let ack = if qos == QoS::AtLeastOnce {
+            pub_ack_reply(frame, packet_id, 0)
+        } else {
+            None
+        };
         // B4-02: delayed delivery keeps the publisher when the session
         // still exists so `hash_clientid` stays stable across the defer.
         let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
@@ -2239,39 +2339,47 @@ async fn apply_delayed_publish(
         forward_cluster(shared, &inner_topic, qos, &frame.payload).await;
         return (ack, deliveries);
     }
-    let shared = shared.clone();
-    let payload = frame.payload.clone();
-    let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        let deliveries = ingress_pipeline_with_publisher(
-            &shared,
-            &inner_topic,
-            qos,
-            retain,
-            &payload,
-            publisher.as_deref(),
-        )
-        .await;
-        // Outcome counting, like the immediate path: only live
-        // mailboxes count as delivered; drops are already counted
-        // inside `ConnTable::route`.
-        let mut enqueued = 0u64;
-        let mut enqueued_bytes = 0u64;
-        for (conn_id, routed) in deliveries {
-            let len = routed.total_frame_len() as u64;
-            if shared.conns.route(conn_id, routed) {
-                enqueued += 1;
-                enqueued_bytes += len;
-            }
+    // TODO(parity): a backlog-full, oversized or over-limit drop returns
+    // no ack, so a QoS 1 publisher retries and may worsen the overload.
+    // The alternative (ack a message that was never queued) lies about
+    // acceptance. The rulebook does not decide this case; current choice
+    // fails closed.
+    let max_secs = shared.delayed.max_secs();
+    if delay_secs > max_secs {
+        warn!(
+            "Dropping delayed publish: {}s exceeds the {}s cap",
+            delay_secs, max_secs
+        );
+    }
+    let now_ms = broker_storage::now_ms();
+    let entry = DelayedEntry {
+        id: shared.delayed.next_id(),
+        deliver_at_ms: now_ms.saturating_add(delay_secs.saturating_mul(1_000)),
+        topic: inner.to_string(),
+        qos: qos as u8,
+        retain,
+        payload: frame.payload.to_vec(),
+        publisher: shared.sessions.client_id_for_conn(frame.header.conn_id),
+    };
+    match shared.delayed.persist_and_schedule(entry, delay_secs) {
+        Ok(()) => {
+            let ack = if qos == QoS::AtLeastOnce {
+                pub_ack_reply(frame, packet_id, 0)
+            } else {
+                None
+            };
+            (ack, Vec::new())
         }
-        shared.metrics.inc_messages_forwarded_by(enqueued);
-        shared.metrics.inc_publish_sent_by(enqueued);
-        shared.metrics.inc_delivered_by(enqueued);
-        shared.metrics.inc_bytes_sent_by(enqueued_bytes);
-        forward_cluster(&shared, &inner_topic, qos, &payload).await;
-    });
-    (ack, Vec::new())
+        Err(e) => {
+            // The scheduler already bumped the matching drop counter
+            // (over-limit, oversized, backlog-full or file error); warn
+            // here so the drop is visible in the log like before.
+            if delay_secs <= max_secs {
+                warn!("Dropping delayed publish: {:?}", e);
+            }
+            (None, Vec::new())
+        }
+    }
 }
 
 /// QoS 2 inbound first phase (D1-01): store the publish against the
@@ -2343,17 +2451,13 @@ async fn apply_qos2_pubrel(
         None => return (qos2_reply(OpCode::PubCompOut, frame, packet_id), Vec::new()),
     };
     // Delayed targets defer everything except the PUBCOMP: the publisher
-    // must not stall past the timer.
+    // must not stall past the timer. The entry is recorded on the shared
+    // wheel and in `<data-dir>/delayed.jsonl` before the PUBCOMP is
+    // returned; the driver delivers it through the normal pipeline.
     if let Some((delay_secs, inner)) = strip_delayed_prefix(stored.topic.as_str()) {
         let comp = qos2_reply(OpCode::PubCompOut, frame, packet_id);
-        if delay_secs > MAX_DELAYED_SECS {
-            warn!(
-                "Dropping delayed QoS 2 publish: {}s exceeds the {}s cap",
-                delay_secs, MAX_DELAYED_SECS
-            );
-            return (comp, Vec::new());
-        }
         let Ok(inner_topic) = Topic::new(inner.to_string()) else {
+            shared.delayed.note_malformed();
             warn!("Dropping delayed QoS 2 publish with bad inner topic");
             return (comp, Vec::new());
         };
@@ -2372,36 +2476,30 @@ async fn apply_qos2_pubrel(
             forward_cluster(shared, &inner_topic, QoS::ExactlyOnce, &stored.payload).await;
             return (comp, deliveries);
         }
-        let shared_clone = shared.clone();
-        let payload = stored.payload.clone();
-        let retain = stored.retain;
-        let publisher = client_id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-            let deliveries = ingress_pipeline_with_publisher(
-                &shared_clone,
-                &inner_topic,
-                QoS::ExactlyOnce,
-                retain,
-                &payload,
-                Some(publisher.as_str()),
-            )
-            .await;
-            let mut enqueued = 0u64;
-            let mut enqueued_bytes = 0u64;
-            for (conn_id, routed) in deliveries {
-                let len = routed.total_frame_len() as u64;
-                if shared_clone.conns.route(conn_id, routed) {
-                    enqueued += 1;
-                    enqueued_bytes += len;
-                }
+        let max_secs = shared.delayed.max_secs();
+        if delay_secs > max_secs {
+            warn!(
+                "Dropping delayed QoS 2 publish: {}s exceeds the {}s cap",
+                delay_secs, max_secs
+            );
+        }
+        let entry = DelayedEntry {
+            id: shared.delayed.next_id(),
+            deliver_at_ms: broker_storage::now_ms()
+                .saturating_add(delay_secs.saturating_mul(1_000)),
+            topic: inner.to_string(),
+            qos: QoS::ExactlyOnce as u8,
+            retain: stored.retain,
+            payload: stored.payload.to_vec(),
+            publisher: Some(client_id.clone()),
+        };
+        if let Err(e) = shared.delayed.persist_and_schedule(entry, delay_secs) {
+            // The scheduler already bumped the matching drop counter;
+            // warn here so the drop is visible in the log like before.
+            if delay_secs <= max_secs {
+                warn!("Dropping delayed QoS 2 publish: {:?}", e);
             }
-            shared_clone.metrics.inc_messages_forwarded_by(enqueued);
-            shared_clone.metrics.inc_publish_sent_by(enqueued);
-            shared_clone.metrics.inc_delivered_by(enqueued);
-            shared_clone.metrics.inc_bytes_sent_by(enqueued_bytes);
-            forward_cluster(&shared_clone, &inner_topic, QoS::ExactlyOnce, &payload).await;
-        });
+        }
         return (comp, Vec::new());
     }
     // B4-02: QoS 2 second phase hashes the original publisher id.
@@ -3424,6 +3522,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // file is a fatal boot error naming the file and the field, never a
     // silent boot with defaults.
     shared.config = Arc::new(load_data_dir_registry(&args.data_dir)?);
+    // Delayed publishes (B4-03): apply the configured delay bound, point
+    // the wheel at the kernel data dir, reload pending entries, then
+    // start the single driver task. Torn or expired rows are discarded
+    // with a counter and never served. One atomic store plus one file
+    // read at boot; the publish path pays one atomic load, one bounded
+    // file append and one short wheel-lock insert afterwards.
+    shared.delayed.set_max_secs(args.delayed_max_secs);
+    shared.delayed.set_persist_dir(args.data_dir.clone());
+    let (delayed_loaded, delayed_torn, delayed_expired) = shared.delayed.load();
+    if delayed_loaded > 0 || delayed_torn > 0 || delayed_expired > 0 {
+        info!(
+            "Delayed backlog reloaded: {} pending, {} torn discarded, {} expired discarded",
+            delayed_loaded, delayed_torn, delayed_expired
+        );
+    }
+    shared.spawn_delayed_driver();
     // MQTT users/ACLs: seed the shared `MemoryAuth` in place (the same
     // instance `serve_api` hands to `ApiState`), so the BrokerLink plane
     // enforces persisted credentials from the first accepted connection.
@@ -7637,6 +7751,9 @@ mod tests {
         );
         let (reply, _) = apply_subscribe(&sub, shared).await;
         reply.expect("subscribe replies");
+        // The single shared driver serves the wheel; without it nothing
+        // fires (one task per node, never one task per message).
+        shared.spawn_delayed_driver();
         let (meta, payload) = encode_publish_meta("$delayed/1/alerts", 0, 0, false, b"later");
         let ack = apply_publish(&publish_frame(952, 1, meta, payload), shared).await;
         (rx, ack.0)
@@ -7690,11 +7807,24 @@ mod tests {
         assert!(ack.is_none());
         assert!(deliveries.is_empty());
 
-        // Absurd delays are dropped, not scheduled.
+        // Absurd delays are dropped, not scheduled, and counted.
+        let over_before = shared.delayed.dropped_over_limit();
         let (meta, payload) = encode_publish_meta("$delayed/99999999/t", 0, 0, false, b"x");
         let (ack, deliveries) = apply_publish(&publish_frame(953, 2, meta, payload), &shared).await;
         assert!(ack.is_none());
         assert!(deliveries.is_empty());
+        assert_eq!(shared.delayed.dropped_over_limit(), over_before + 1);
+        assert!(shared.delayed.is_empty());
+
+        // An inner topic that is not a servable concrete topic is
+        // dropped with a warning and a counter, never queued.
+        let malformed_before = shared.delayed.dropped_malformed();
+        let (meta, payload) = encode_publish_meta("$delayed/1/#/x", 0, 0, false, b"x");
+        let (ack, deliveries) = apply_publish(&publish_frame(953, 3, meta, payload), &shared).await;
+        assert!(ack.is_none());
+        assert!(deliveries.is_empty());
+        assert_eq!(shared.delayed.dropped_malformed(), malformed_before + 1);
+        assert!(shared.delayed.is_empty());
 
         // Delayed markers are not subscribable.
         let sub = subscribe_frame(
@@ -7708,8 +7838,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_publish_survives_restart_from_same_dir() {
+        // Persistence lives behind the wheel in `<data-dir>/delayed.jsonl`
+        // (written by `DelayedScheduler::persist_and_schedule` in
+        // `delayed.rs`, consulted by `DelayedScheduler::load`): the
+        // publish event drives the write, the boot path drives the
+        // reload, and the driver delivers on schedule afterwards.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("scratch data dir");
+        let data_dir = dir.to_str().expect("temp path is UTF-8").to_string();
+
+        // First incarnation: publish through the broker but never start
+        // its driver, so the entry stays pending in the file.
+        let pending = {
+            let shared = test_shared();
+            shared.delayed.set_persist_dir(&data_dir);
+            assert_eq!(shared.delayed.load(), (0, 0, 0));
+            let (meta, payload) =
+                encode_publish_meta("$delayed/2/restart/alerts", 0, 0, false, b"restart-me");
+            let (ack, deliveries) =
+                apply_publish(&publish_frame(957, 1, meta, payload), &shared).await;
+            assert!(ack.is_none());
+            assert!(deliveries.is_empty());
+            assert_eq!(shared.delayed.len(), 1);
+            assert!(
+                dir.join("delayed.jsonl").is_file(),
+                "the publish event must persist before ack"
+            );
+            shared.delayed.scheduled_count()
+        };
+        assert_eq!(pending, 1);
+
+        // Second incarnation from the same directory: reload, subscribe,
+        // then deliver on schedule through the broker.
+        let shared = test_shared();
+        shared.delayed.set_persist_dir(&data_dir);
+        let (loaded, torn, expired) = shared.delayed.load();
+        assert_eq!(loaded, 1);
+        assert_eq!((torn, expired), (0, 0));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        shared.conns.register(958, tx);
+        shared.conns.set_client_label(958, "restart-sub");
+        let (session, _) = shared.sessions.get_or_create("restart-sub", true);
+        *session.conn_id.write() = Some(958);
+        let sub = subscribe_frame(
+            958,
+            1,
+            encode_subscribe_meta(1, "restart-sub", &[("restart/alerts", 0)]),
+        );
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        shared.spawn_delayed_driver();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let routed = loop {
+            if let Some(frame) = shared.conns.pop_qos0(958) {
+                break frame;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("restarted node must still deliver on schedule");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(routed.header.opcode, OpCode::PublishOut);
+        let (topic, _, _, _) = decode_publish_meta_parts(&routed.metadata);
+        assert_eq!(topic, "restart/alerts");
+        assert_eq!(routed.payload, Bytes::from_static(b"restart-me"));
+        assert_eq!(shared.delayed.delivered_count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn delayed_publish_end_to_end_over_tcp() {
         let shared = Shared::new();
+        shared.spawn_delayed_driver();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
@@ -7755,6 +7955,140 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_delivery_workload_timings() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // B4-03 delayed-delivery workload before/after numbers (spec
+        // Done-when bullet 5, RULEBOOK hot-path row): measured through the
+        // broker publish event (`apply_publish`), not just the wheel.
+        // BEFORE is the steady-state immediate publish-to-delivery loop
+        // (no wheel lock, no file append, no fsync): its rate is the
+        // pre-change baseline. AFTER is the delayed-schedule loop through
+        // `$delayed` (one file_lock hold, one bounded append plus fsync,
+        // two short wheel-lock holds, one payload copy). Both print
+        // msgs/sec and avg ns/msg into the gate output with no threshold
+        // assert; counts are CI sample sizes, not SLOs. On-time behaviour
+        // (requested vs actual delay) and pending memory (wheel depth,
+        // persisted file bytes) print alongside. Publish-path cost prose
+        // lives in `delayed.rs`; this test is the measured numbers behind
+        // it.
+        let shared = test_shared();
+        let (tx_base, _rx_base) = tokio::sync::mpsc::unbounded_channel();
+        shared.conns.register(971, tx_base);
+        shared.conns.set_client_label(971, "wload-base");
+        let (session_base, _) = shared.sessions.get_or_create("wload-base", true);
+        *session_base.conn_id.write() = Some(971);
+        let sub = subscribe_frame(
+            971,
+            1,
+            encode_subscribe_meta(1, "wload-base", &[("wload/base", 0)]),
+        );
+        apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+
+        // BEFORE: immediate publish-to-delivery, no delayed work.
+        let steady_iters = 200usize;
+        let steady_start = Instant::now();
+        for i in 0..steady_iters {
+            let (meta, payload) = encode_publish_meta("wload/base", 0, 0, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(970, 1000 + i as u64, meta, payload), &shared).await;
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            let got = shared.conns.pop_qos0(971).expect("live downlink arrived");
+            black_box(got);
+        }
+        let steady_elapsed = steady_start.elapsed();
+        let steady_rate = steady_iters as f64 / steady_elapsed.as_secs_f64();
+        let steady_avg_ns = steady_elapsed.as_nanos() as f64 / steady_iters as f64;
+        println!(
+            "delayed broker workload immediate baseline (before): {steady_rate:.0} msgs/sec, avg {steady_avg_ns:.1} ns/msg ({steady_iters} apply_publish rounds in {steady_elapsed:?})"
+        );
+
+        // AFTER: delayed schedule through the broker with persistence.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("scratch data dir");
+        let data_dir = dir.to_str().expect("temp path is UTF-8").to_string();
+        shared.delayed.set_persist_dir(&data_dir);
+        assert_eq!(shared.delayed.load(), (0, 0, 0));
+        let payload_bytes = b"x".len();
+        let delayed_iters = 200usize;
+        let delayed_start = Instant::now();
+        for i in 0..delayed_iters {
+            let (meta, payload) =
+                encode_publish_meta("$delayed/60/wload/delayed", 0, 0, false, b"x");
+            let (ack, deliveries) =
+                apply_publish(&publish_frame(970, 5000 + i as u64, meta, payload), &shared).await;
+            black_box(ack);
+            assert!(deliveries.is_empty(), "delayed schedule defers delivery");
+        }
+        let delayed_elapsed = delayed_start.elapsed();
+        assert_eq!(shared.delayed.len(), delayed_iters);
+        let delayed_rate = delayed_iters as f64 / delayed_elapsed.as_secs_f64();
+        let delayed_avg_ns = delayed_elapsed.as_nanos() as f64 / delayed_iters as f64;
+        let file_bytes = std::fs::metadata(dir.join("delayed.jsonl"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let estimated_payload_bytes = (delayed_iters * payload_bytes) as u64;
+        println!(
+            "delayed broker schedule workload (wheel plus file append, after): {delayed_rate:.0} msgs/sec, avg {delayed_avg_ns:.1} ns/msg ({delayed_iters} apply_publish rounds in {delayed_elapsed:?})"
+        );
+        println!(
+            "delayed pending memory: wheel depth {delayed_iters} entries, persisted file {file_bytes} bytes, estimated payload {estimated_payload_bytes} bytes ({delayed_iters} entries)"
+        );
+
+        // On-time behaviour: short-delay batch through the broker driver.
+        let otime = test_shared();
+        let (tx_ot, _rx_ot) = tokio::sync::mpsc::unbounded_channel();
+        otime.conns.register(972, tx_ot);
+        otime.conns.set_client_label(972, "wload-ontime");
+        let (session_ot, _) = otime.sessions.get_or_create("wload-ontime", true);
+        *session_ot.conn_id.write() = Some(972);
+        let sub = subscribe_frame(
+            972,
+            1,
+            encode_subscribe_meta(1, "wload-ontime", &[("wload/ontime", 0)]),
+        );
+        apply_subscribe(&sub, &otime).await.0.expect("subscribe");
+        otime.spawn_delayed_driver();
+        let ontime_count = 5usize;
+        let ontime_start = Instant::now();
+        for i in 0..ontime_count {
+            let (meta, payload) = encode_publish_meta("$delayed/1/wload/ontime", 0, 0, false, b"y");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(973, 9000 + i as u64, meta, payload), &otime).await;
+            assert!(deliveries.is_empty(), "delayed schedule defers delivery");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut received = 0usize;
+        while received < ontime_count {
+            if otime.conns.pop_qos0(972).is_some() {
+                received += 1;
+                continue;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let ontime_elapsed = ontime_start.elapsed();
+        let ontime_ms = ontime_elapsed.as_millis() as u64;
+        // Requested 1000 ms plus one 100 ms tick of firing slack: late
+        // only past that window; early only before the delay.
+        let ontime_ok = received == ontime_count && (900..=8_000).contains(&ontime_ms);
+        println!(
+            "delayed on-time delivery: {received}/{ontime_count} delivered in {ontime_elapsed:?} (requested 1000 ms, on_time={ontime_ok})"
+        );
+        assert_eq!(received, ontime_count, "short-delay batch must fire");
+        assert!(
+            ontime_ms >= 900,
+            "delivery must honor the 1s delay (got {ontime_elapsed:?})"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
