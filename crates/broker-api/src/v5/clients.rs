@@ -925,18 +925,23 @@ fn build_publish_deliveries(
                     _ => {
                         if !session.clean_start {
                             let before = session.offline_len();
-                            session.push_offline(broker_session::QueuedMessage {
+                            let queued = session.push_offline(broker_session::QueuedMessage {
                                 topic: topic.clone(),
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
                                 retain,
                                 payload: payload.clone(),
                                 publish_at_ms: None,
                             });
-                            let evicted = (before + 1).saturating_sub(session.offline_len());
-                            if evicted > 0 {
-                                state.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                            // Fail closed: a false return means the durable
+                            // append failed and nothing was queued, so neither
+                            // the queued count nor eviction math advances.
+                            if queued {
+                                let evicted = (before + 1).saturating_sub(session.offline_len());
+                                if evicted > 0 {
+                                    state.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                                }
+                                offline_queued += 1;
                             }
-                            offline_queued += 1;
                         } else {
                             state.metrics.inc_detached_clean_dropped();
                         }
@@ -1103,6 +1108,7 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
         let qos_raw = u8::from(qos);
         let topic_str = topic.as_str();
         let mut frames = Vec::new();
+        let mut offline_failed = false;
         for sub in self.router.matches(&topic) {
             let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
             match self.sessions.get(sub.client_id.as_ref()) {
@@ -1159,16 +1165,25 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
                         _ => {
                             if !session.clean_start {
                                 let before = session.offline_len();
-                                session.push_offline(broker_session::QueuedMessage {
+                                let queued = session.push_offline(broker_session::QueuedMessage {
                                     topic: topic.clone(),
                                     qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
                                     retain,
                                     payload: payload.clone(),
                                     publish_at_ms: None,
                                 });
-                                let evicted = (before + 1).saturating_sub(session.offline_len());
-                                if evicted > 0 {
-                                    self.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                                // Fail closed: a false return means the
+                                // durable append failed and nothing was
+                                // queued, so no eviction is counted and the
+                                // republish reports failure below.
+                                if queued {
+                                    let evicted =
+                                        (before + 1).saturating_sub(session.offline_len());
+                                    if evicted > 0 {
+                                        self.metrics.inc_offline_queue_evicted_by(evicted as u64);
+                                    }
+                                } else {
+                                    offline_failed = true;
                                 }
                             } else {
                                 self.metrics.inc_detached_clean_dropped();
@@ -1210,6 +1225,15 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
         self.metrics.inc_publish_sent_by(enqueued);
         self.metrics.inc_delivered_by(enqueued);
         self.metrics.inc_bytes_sent_by(enqueued_bytes);
+        // Fail closed like the kernel publish path: a detached durable
+        // buffer that lost its stable copy reports failure so the rule
+        // counters mark the republish failed (and an MQTT ingress caller
+        // withholds its ack via the persist-failed snapshot and retries).
+        if offline_failed {
+            return Err(broker_rules::RuleEngineError::Execution(
+                "offline queue persist failed; nothing queued".to_string(),
+            ));
+        }
         Ok(())
     }
 }

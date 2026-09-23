@@ -9,7 +9,7 @@ use broker_cluster::{
 use broker_config::{ConfigError, ConfigRegistry};
 use broker_gateway::coap::{CoapCode, CoapGatewayHandler, CoapMessage};
 use broker_observability::{Metrics, NodeReadiness, StatsStore};
-use broker_protocol::{QoS, Topic, TopicFilter};
+use broker_protocol::{v5 as protocol_v5, QoS, Topic, TopicFilter};
 use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{
@@ -17,6 +17,7 @@ use broker_session::{
     SessionManager,
 };
 use broker_storage::stream::{DurableStreamStore, StreamConfig};
+use broker_storage::OfflineQueueStore;
 use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
@@ -153,6 +154,18 @@ struct Args {
     #[arg(long, default_value = "")]
     stream_dir: String,
 
+    /// Rule ingress spill directory (B4-07). Empty (the default) keeps
+    /// today's memory-only `DropOldest` rule input: no new work, no new
+    /// files. Set to a dedicated directory (e.g. `<data-dir>/rule-spill`)
+    /// to build the rule engine with the `SpillToDisk` backpressure
+    /// policy instead: overflow rule-ingress events append to a bounded
+    /// on-disk buffer (1 MiB segments, 64 MiB total) and replay in order
+    /// once the pressure eases, surviving a restart. A directory that
+    /// cannot be opened fails boot loudly rather than silently running
+    /// memory-only.
+    #[arg(long, default_value = "")]
+    rule_spill_dir: String,
+
     /// Directory server URL for LDAP authentication (B2-01). Empty (the
     /// default) disables LDAP: CONNECT falls back to the local user
     /// store only. Set to `ldap://host:port` or `ldaps://host:port` to
@@ -247,6 +260,14 @@ struct Args {
     /// existing publishers see the same limit.
     #[arg(long, default_value_t = DEFAULT_MAX_DELAYED_SECS)]
     delayed_max_secs: u64,
+
+    /// Inbound topic-alias maximum advertised in CONNACK (B4-05, T-92):
+    /// the largest alias a client may use when publishing. Default 10
+    /// covers typical small-device alias use while capping
+    /// per-connection alias memory near 10 topic strings; 0 disables
+    /// inbound aliases (alias-carrying publishes are rejected).
+    #[arg(long, default_value_t = broker_session::DEFAULT_TOPIC_ALIAS_MAXIMUM)]
+    topic_alias_maximum: u16,
 }
 
 /// Map an inbound frame to its synchronous reply, if any.
@@ -255,10 +276,12 @@ struct Args {
 /// * `Ping` is answered immediately with a `Pong` carrying the identical
 ///   `conn_id` and `sequence_no`.
 /// * `BindConnection` metadata is `ClientIdLen:16be | ClientId (UTF-8)
-///   | Flags:8 (bit 0 = clean_start) | Keepalive:16be`. The canonical
-///   session is resolved via `SessionManager::get_or_create` and answered
-///   with `SessionBinding` metadata `SessionId:64be | Present:8
-///   | ReturnCode:8` (RC 0 = accepted, 2 = identifier rejected).
+///   | Flags:8 (bit 0 = clean_start) | Keepalive:16be`, optionally
+///   followed by credentials, a peer section and the B4-05 trailing
+///   `ClientAliasMax:16be`. The canonical session is resolved via
+///   `SessionManager::get_or_create` and answered with `SessionBinding`
+///   metadata `SessionId:64be | Present:8 | ReturnCode:8 |
+///   TopicAliasMaximum:16be` (RC 0 = accepted, 2 = identifier rejected).
 ///   Replies always mirror the request `conn_id` and `sequence_no`.
 /// * All other opcodes have no synchronous reply yet and return `None`.
 fn reply_for_frame(frame: &BrokerFrame, sessions: &SessionManager) -> Option<BrokerFrame> {
@@ -287,25 +310,45 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
             // Indexed (PERF-04): keeps conn_id -> client_id O(1).
             sessions.bind_session(&session, frame.header.conn_id);
             *session.keepalive_secs.write() = req.keepalive_secs;
+            // B4-05: a new connection renegotiates aliases. The inbound
+            // bound is the manager default (advertised below in CONNACK);
+            // the outbound bound is the client's CONNECT maximum (0 when
+            // the bind carries none). Tables start empty.
+            session.clear_aliases();
+            session.set_inbound_alias_max(sessions.max_topic_alias());
+            session.set_outbound_alias_max(req.client_alias_max);
             (session.id.0, present, 0u8)
         }
         Err(_) => (0u64, false, 2u8),
     };
 
-    session_binding_reply(frame, session_id, present, return_code)
+    session_binding_reply(
+        frame,
+        session_id,
+        present,
+        return_code,
+        sessions.max_topic_alias(),
+    )
 }
 
 /// Build one `SessionBinding` reply frame.
+///
+/// Metadata is `SessionId:64be | Present:8 | ReturnCode:8 |
+/// TopicAliasMaximum:16be` (B4-05): the trailing alias maximum is the
+/// kernel inbound bound advertised for CONNACK negotiation. Always 12
+/// bytes; the edge accepts 10-byte (pre-alias) bindings as maximum 0.
 fn session_binding_reply(
     frame: &BrokerFrame,
     session_id: u64,
     present: bool,
     return_code: u8,
+    alias_max: u16,
 ) -> BrokerFrame {
-    let mut meta = Vec::with_capacity(10);
+    let mut meta = Vec::with_capacity(12);
     meta.extend_from_slice(&session_id.to_be_bytes());
     meta.push(u8::from(present));
     meta.push(return_code);
+    meta.extend_from_slice(&alias_max.to_be_bytes());
 
     BrokerFrame::new(
         OpCode::SessionBinding,
@@ -329,6 +372,10 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // second verify). CONNECT-only, never on the delivery path.
     let mut kerberos_principal: Option<String> = None;
     let mut kerberos_role: Option<String> = None;
+    // B4-05: the CONNACK-negotiated inbound alias bound rides every
+    // `SessionBinding` reply, including refusals, so the client always
+    // learns it on the CONNECT event.
+    let alias_max = shared.sessions.max_topic_alias();
     if let Ok(req) = decode_bind_meta(&frame.metadata) {
         // B1-03: banned identities never reach the session. Checked
         // before credentials and quotas so a banned client is refused
@@ -342,7 +389,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             req.peerhost.as_deref(),
         ) {
             shared.metrics.inc_auth_failures();
-            return Some(session_binding_reply(frame, 0, false, 0x8A));
+            return Some(session_binding_reply(frame, 0, false, 0x8A, alias_max));
         }
         if req.username.is_none() {
             // A non-empty user store always wins over `--allow-anonymous`:
@@ -354,7 +401,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
             if shared.auth.user_count() > 0 || shared.ldap.is_some() || kerberos_enabled {
                 shared.metrics.inc_auth_failures();
-                return Some(session_binding_reply(frame, 0, false, 0x87));
+                return Some(session_binding_reply(frame, 0, false, 0x87, alias_max));
             }
         } else {
             let password = req.password.as_deref();
@@ -388,11 +435,11 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 } else if kerberos_enabled && looks_kerberos {
                     let Some(kerberos) = shared.kerberos.as_ref() else {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     };
                     let Some(token) = password else {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     };
                     match kerberos.verify_token(&req.client_id, token) {
                         Ok(verified) => {
@@ -418,7 +465,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         }
                         Err(_) => {
                             shared.metrics.inc_auth_failures();
-                            return Some(session_binding_reply(frame, 0, false, 0x86));
+                            return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                         }
                     }
                 } else if let Some(ldap) = shared.ldap.as_ref() {
@@ -430,7 +477,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         via_ldap = true;
                     } else {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
                 } else {
                     // No LDAP and (no enabled Kerberos or a non-Kerberos
@@ -439,19 +486,19 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     // password is not an open-mode accept.
                     if kerberos_enabled {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86));
+                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 }
             } else if kerberos_enabled && looks_kerberos {
                 let Some(kerberos) = shared.kerberos.as_ref() else {
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86));
+                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 };
                 let Some(token) = password else {
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86));
+                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 };
                 match kerberos.verify_token(&req.client_id, token) {
                     Ok(verified) => {
@@ -474,7 +521,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     }
                     Err(_) => {
                         shared.metrics.inc_auth_failures();
-                        return Some(session_binding_reply(frame, 0, false, 0x86));
+                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
                 }
             } else if let Some(ldap) = shared.ldap.as_ref() {
@@ -486,13 +533,13 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     via_ldap = true;
                 } else {
                     shared.metrics.inc_auth_failures();
-                    return Some(session_binding_reply(frame, 0, false, 0x86));
+                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 }
             } else if kerberos_enabled {
                 // Enabled Kerberos disables the open mode: a credentialed
                 // CONNECT without a Kerberos token fails closed.
                 shared.metrics.inc_auth_failures();
-                return Some(session_binding_reply(frame, 0, false, 0x86));
+                return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
             } else {
                 // Open broker: no users, no directory, no enabled Kerberos.
                 // Fall through to the session resolution below (rc 0).
@@ -529,7 +576,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         .and_then(|quotas| quotas.max_connections)
                 };
                 if !shared.sessions.acquire_connection_slot(username, max) {
-                    return Some(session_binding_reply(frame, 0, false, 0x8B));
+                    return Some(session_binding_reply(frame, 0, false, 0x8B, alias_max));
                 }
             }
         }
@@ -582,11 +629,13 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
 
 /// Whether a `SessionBinding` reply accepted the connection.
 ///
-/// The reply metadata is `SessionId:64be | Present:8 | ReturnCode:8`;
-/// only return code 0 proceeds to the auto-subscribe hook. Malformed
-/// replies never trigger subscriptions.
+/// The reply metadata is `SessionId:64be | Present:8 | ReturnCode:8`
+/// plus the B4-05 trailing `TopicAliasMaximum:16be` (12 bytes total;
+/// 10-byte pre-alias replies still count with maximum 0); only return
+/// code 0 proceeds to the auto-subscribe hook. Malformed replies never
+/// trigger subscriptions.
 fn is_binding_accepted(reply: &BrokerFrame) -> bool {
-    reply.metadata.len() == 10 && reply.metadata[9] == 0
+    (reply.metadata.len() == 10 || reply.metadata.len() == 12) && reply.metadata[9] == 0
 }
 
 /// Subscribe one freshly bound connection to the configured
@@ -640,10 +689,14 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
 /// | PassLen:16be | Password` (absent entirely when the client connects
 /// anonymously), optionally followed by a peer-address section
 /// `PeerLen:16be | PeerIp` carrying the client IP literal the edge saw
-/// on its socket (B1-03: drives `peerhost` / `peerhost_net` bans).
-/// Binds encoded before the peer section existed carry no trailing bytes
-/// and still decode with `peerhost` unset. The keepalive is
-/// framing-validated here; supervision lives on the edge.
+/// on its socket (B1-03: drives `peerhost` / `peerhost_net` bans),
+/// optionally followed by a B4-05 alias section `ClientAliasMax:16be`
+/// carrying the client's receive limit (the kernel outbound bound; 0 or
+/// absent means the kernel never assigns an alias toward the client).
+/// Binds encoded before the peer/alias sections existed carry no
+/// trailing bytes and still decode with `peerhost` unset and alias
+/// maximum 0. The keepalive is framing-validated here; supervision lives
+/// on the edge.
 struct BindRequest {
     client_id: String,
     clean_start: bool,
@@ -651,6 +704,8 @@ struct BindRequest {
     username: Option<String>,
     password: Option<Vec<u8>>,
     peerhost: Option<String>,
+    /// Client's Topic Alias Maximum from CONNECT (kernel outbound bound).
+    client_alias_max: u16,
 }
 
 fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
@@ -666,15 +721,37 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     let keepalive_secs = u16::from_be_bytes([meta[3 + id_len], meta[4 + id_len]]);
     let client_id = std::str::from_utf8(id_bytes).map_err(|_| "client id not UTF-8")?;
     let rest = &meta[5 + id_len..];
-    let identity = decode_bind_identity(rest)?;
-    Ok(BindRequest {
-        client_id: client_id.to_string(),
-        clean_start: flags & 0x01 != 0,
-        keepalive_secs,
-        username: identity.username,
-        password: identity.password,
-        peerhost: identity.peerhost,
-    })
+    // Preferred: exact legacy parse (no alias section).
+    if let Ok(identity) = decode_bind_identity(rest) {
+        return Ok(BindRequest {
+            client_id: client_id.to_string(),
+            clean_start: flags & 0x01 != 0,
+            keepalive_secs,
+            username: identity.username,
+            password: identity.password,
+            peerhost: identity.peerhost,
+            client_alias_max: 0,
+        });
+    }
+    // Otherwise the last two bytes may be the alias section: the prefix
+    // must parse exactly as a legacy bind or the whole frame is malformed
+    // (fail closed, never a guessed identity).
+    if rest.len() >= 2 {
+        let (prefix, suffix) = rest.split_at(rest.len() - 2);
+        if let Ok(identity) = decode_bind_identity(prefix) {
+            let client_alias_max = u16::from_be_bytes([suffix[0], suffix[1]]);
+            return Ok(BindRequest {
+                client_id: client_id.to_string(),
+                clean_start: flags & 0x01 != 0,
+                keepalive_secs,
+                username: identity.username,
+                password: identity.password,
+                peerhost: identity.peerhost,
+                client_alias_max,
+            });
+        }
+    }
+    Err("bind meta length mismatch")
 }
 
 /// Credentials plus peer address decoded from the bind tail.
@@ -953,6 +1030,12 @@ impl Shared {
         let conns = Arc::new(ConnTable::default());
         let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::DropOldest));
         let metrics = Arc::new(Metrics::new());
+        // Rule spill accounting (B4-07): mirror the ingress queue's
+        // spill, replay, drop and recovery counters into the node
+        // metrics so disk-backpressure behaviour is visible on the
+        // existing observability path. Memory-only inputs count only
+        // refusals, so the attach is a no-op otherwise.
+        engine.set_metrics(&metrics);
         // PERF-10: attach drop accounting to the delivery table so
         // `ConnTable::route` counts unknown-conn and dead-mailbox drops
         // exactly where it discards them.
@@ -1057,6 +1140,28 @@ impl Shared {
             }
         });
     }
+}
+
+/// Rule spill pressure-ease driver (B4-07): the prod `next_event` caller
+/// beside tests. Pends on the spill-backed input queue and acknowledges
+/// durability copies in order after bursts ease (each pop counts a replay
+/// via the input). Copies were already executed inline by
+/// `dispatch_ingress`, so the driver drops them; crash survivors on disk
+/// are likewise already-executed (pushed after the match) and safe to
+/// ack. Runs off the publish path; memory-only engines never spawn it.
+fn spawn_rule_spill_driver(engine: Arc<RuleEngine>) {
+    tokio::spawn(async move {
+        loop {
+            // `next_event` holds the channel lock only across the wait,
+            // never across disk I/O, so this task never stalls publish.
+            let next = engine.input().next_event().await;
+            if next.is_none() {
+                // Channel closed: input is gone, driver exits.
+                break;
+            }
+            // Durability ack: drop, replay already counted inside.
+        }
+    });
 }
 
 /// Deliver one due delayed entry through the same ingress pipeline an
@@ -2090,6 +2195,7 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
                 2,
                 held.retain,
                 true,
+                0, // B4-05: replays carry the full topic with no alias
                 &held.payload,
             ) {
                 let len = routed.total_frame_len() as u64;
@@ -2100,7 +2206,15 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
             }
         }
     }
-    for queued in session.drain_offline() {
+    // B4-06 SLOP-1: drain retained, delete/rewrite only after confirmed
+    // route. The file survives a crash mid-replay (at-least-once); entries
+    // that never reach the new mailbox are re-queued by
+    // `confirm_offline_consumed` instead of being dropped. Unroutable
+    // frames are already counted inside `ConnTable::route`
+    // (`unknown_conn_dropped` / `dead_mailbox_dropped`).
+    let retained = session.take_offline_retained();
+    let mut unrouted: Vec<QueuedMessage> = Vec::new();
+    for queued in retained {
         let downlink_id = if queued.qos == QoS::AtMostOnce {
             0u16
         } else {
@@ -2114,16 +2228,30 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
         meta.push(u8::from(queued.qos));
         meta.push(u8::from(queued.retain));
         meta.push(0u8);
-        if let Ok(routed) = BrokerFrame::new(
+        let routed = match BrokerFrame::new(
             OpCode::PublishOut,
             frame.header.conn_id,
             0, // stamped per-destination by ConnTable::route
             Bytes::from(meta),
             queued.payload.clone(),
         ) {
+            Ok(routed) => routed,
+            Err(_) => {
+                unrouted.push(queued);
+                continue;
+            }
+        };
+        // Only replays that reached the live mailbox count; a dead
+        // mailbox is already counted inside `ConnTable::route`, never
+        // a delivery.
+        let len = routed.total_frame_len() as u64;
+        if shared.conns.route(frame.header.conn_id, routed) {
             // QoS 2 offline replays become live QoS 2 downlinks needing
-            // PUBREC/PUBCOMP, so track them (QoS 1 offline replays keep
-            // their existing untracked behaviour).
+            // PUBREC/PUBCOMP, so track them only after the route is
+            // confirmed (QoS 1 offline replays keep their existing
+            // untracked behaviour). Tracking a frame that never reached
+            // the mailbox would leak an unacked entry while the message
+            // is also re-queued below.
             if queued.qos == QoS::ExactlyOnce && downlink_id != 0 {
                 let tracked = session.track_qos2_outbound(Qos2OutboundEntry {
                     packet_id: downlink_id,
@@ -2136,16 +2264,13 @@ async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
                     shared.metrics.inc_inflight_dropped();
                 }
             }
-            // Only replays that reached the live mailbox count; a dead
-            // mailbox is already counted inside `ConnTable::route`, never
-            // a delivery.
-            let len = routed.total_frame_len() as u64;
-            if shared.conns.route(frame.header.conn_id, routed) {
-                replayed_bytes += len;
-                replayed += 1;
-            }
+            replayed_bytes += len;
+            replayed += 1;
+        } else {
+            unrouted.push(queued);
         }
     }
+    session.confirm_offline_consumed(unrouted);
     shared.metrics.inc_publish_sent_by(replayed as u64);
     shared.metrics.inc_delivered_by(replayed as u64);
     shared.metrics.inc_bytes_sent_by(replayed_bytes);
@@ -2171,9 +2296,38 @@ async fn apply_publish(
     shared: &Shared,
 ) -> (Option<BrokerFrame>, Vec<(u64, BrokerFrame)>) {
     shared.metrics.inc_publish_received();
-    let (raw_topic_str, packet_id, qos_raw, retain) = match decode_publish_meta(&frame.metadata) {
-        Some(parts) => parts,
-        None => return (None, Vec::new()),
+    let (raw_topic_str, packet_id, qos_raw, retain, alias) =
+        match decode_publish_meta(&frame.metadata) {
+            Some(parts) => parts,
+            None => return (None, Vec::new()),
+        };
+    // B4-05 inbound topic aliases: resolve the effective topic before any
+    // other stage observes it. Alias 0 is the fast path (no lock, no
+    // table touch). Otherwise the kernel inbound table (written here on
+    // the PUBLISH event) maps the alias: a publish carrying both topic
+    // and alias registers the mapping, an empty-topic publish resolves
+    // it. An alias above the negotiated maximum, or an unregistered
+    // alias, is rejected with reason code 0x94 (Topic Alias Invalid) on
+    // QoS 1; QoS 0 drops silently and QoS 2 gets no PUBREC so the
+    // publisher retries instead of observing a false completion.
+    //
+    // TODO(parity): QoS 2 has no reason-code channel on the current
+    // 2-byte PubRecOut meta, so a rejected QoS 2 alias cannot carry
+    // 0x94 yet; the rulebook does not decide this case and the current
+    // choice fails closed (no PUBREC, publisher retries).
+    let raw_topic_str = if alias == 0 {
+        raw_topic_str
+    } else {
+        match resolve_inbound_alias_topic(shared, frame.header.conn_id, &raw_topic_str, alias) {
+            InboundAliasOutcome::Topic(topic) => topic,
+            InboundAliasOutcome::Reject => {
+                let ack = match qos_raw {
+                    1 => pub_ack_reply(frame, packet_id, protocol_v5::REASON_TOPIC_ALIAS_INVALID),
+                    _ => None,
+                };
+                return (ack, Vec::new());
+            }
+        }
     };
     // B4-04 ordered regex topic rewriting (publish scope): the first
     // matching publish/both rule wins and every stage below (auth,
@@ -2292,11 +2446,18 @@ async fn apply_publish(
             .await;
     }
 
-    let ack = if qos == QoS::AtLeastOnce {
-        pub_ack_reply(frame, packet_id, 0)
-    } else {
-        None
-    };
+    // B4-06 fail-closed: snapshot the durable offline persist-failure
+    // counter so a detached-queue write that fails inside the pipeline
+    // below withholds the QoS 1 ack (publisher retries) instead of acking
+    // a non-durable write. The store counts every append/rewrite failure;
+    // a rise across the pipeline means this publish lost at least one
+    // detached durable copy, which was also dropped from memory (see
+    // `push_offline_with_limit`). Over-withholding under concurrency (a
+    // racing publish failed instead) only retries, never loses.
+    // TODO(parity): should the withheld ack carry a 5.x error code instead
+    // of no ack at all? The rulebook does not decide the wire shape; no
+    // ack (publisher retries) is the conservative choice.
+    let offline_persist_failed_before = shared.sessions.offline_store().map(|s| s.persist_failed());
 
     // B4-02: resolve the publisher once for the shared `hash_clientid`
     // strategy. `None` (unknown session) hashes the empty string in the
@@ -2312,6 +2473,24 @@ async fn apply_publish(
     )
     .await;
     forward_cluster(shared, &topic, qos, &frame.payload).await;
+
+    let ack = if qos == QoS::AtLeastOnce {
+        let persist_failed = offline_persist_failed_before.is_some_and(|before| {
+            shared
+                .sessions
+                .offline_store()
+                .map(|s| s.persist_failed() > before)
+                .unwrap_or(false)
+        });
+        if persist_failed {
+            warn!("Offline queue persist failed: withholding QoS 1 ack so the publisher retries");
+            None
+        } else {
+            pub_ack_reply(frame, packet_id, 0)
+        }
+    } else {
+        None
+    };
 
     (ack, deliveries)
 }
@@ -2342,11 +2521,12 @@ async fn apply_delayed_publish(
         }
     };
     if delay_secs == 0 {
-        let ack = if qos == QoS::AtLeastOnce {
-            pub_ack_reply(frame, packet_id, 0)
-        } else {
-            None
-        };
+        // B4-06 fail-closed: same persist-failed snapshot/withhold as the
+        // immediate QoS 1 path below. The deferred pipeline can buffer for
+        // detached durable sessions; acking before it would confirm a
+        // non-durable write.
+        let offline_persist_failed_before =
+            shared.sessions.offline_store().map(|s| s.persist_failed());
         // B4-02: delayed delivery keeps the publisher when the session
         // still exists so `hash_clientid` stays stable across the defer.
         let publisher = shared.sessions.client_id_for_conn(frame.header.conn_id);
@@ -2360,6 +2540,25 @@ async fn apply_delayed_publish(
         )
         .await;
         forward_cluster(shared, &inner_topic, qos, &frame.payload).await;
+        let ack = if qos == QoS::AtLeastOnce {
+            let persist_failed = offline_persist_failed_before.is_some_and(|before| {
+                shared
+                    .sessions
+                    .offline_store()
+                    .map(|s| s.persist_failed() > before)
+                    .unwrap_or(false)
+            });
+            if persist_failed {
+                warn!(
+                    "Offline queue persist failed: withholding delayed QoS 1 ack so the publisher retries"
+                );
+                None
+            } else {
+                pub_ack_reply(frame, packet_id, 0)
+            }
+        } else {
+            None
+        };
         return (ack, deliveries);
     }
     // TODO(parity): a backlog-full, oversized or over-limit drop returns
@@ -2473,6 +2672,12 @@ async fn apply_qos2_pubrel(
         Some(stored) => stored,
         None => return (qos2_reply(OpCode::PubCompOut, frame, packet_id), Vec::new()),
     };
+    // B4-06 fail-closed: snapshot the durable offline persist-failure
+    // counter so a detached-queue write that fails inside the pipeline
+    // below withholds the PUBCOMP (the publisher retries PUBREL) instead
+    // of confirming a non-durable write. Mirrors the QoS 1 ack withhold;
+    // over-withholding under concurrency only retries, never loses.
+    let offline_persist_failed_before = shared.sessions.offline_store().map(|s| s.persist_failed());
     // Delayed targets defer everything except the PUBCOMP: the publisher
     // must not stall past the timer. The entry is recorded on the shared
     // wheel and in `<data-dir>/delayed.jsonl` before the PUBCOMP is
@@ -2497,6 +2702,32 @@ async fn apply_qos2_pubrel(
             )
             .await;
             forward_cluster(shared, &inner_topic, QoS::ExactlyOnce, &stored.payload).await;
+            let persist_failed = offline_persist_failed_before.is_some_and(|before| {
+                shared
+                    .sessions
+                    .offline_store()
+                    .map(|s| s.persist_failed() > before)
+                    .unwrap_or(false)
+            });
+            if persist_failed {
+                warn!(
+                    "Offline queue persist failed: withholding QoS 2 PUBCOMP so the publisher retries"
+                );
+                // Restore the taken entry so the retried PUBREL re-routes
+                // instead of hitting the unknown-id fast path. The
+                // original delayed topic is kept so the retry defers again.
+                // Cloned (failure path only): avoids moving `stored` while
+                // the delayed prefix borrow is live.
+                let _ = session.store_qos2_inbound(
+                    packet_id,
+                    Qos2InboundEntry {
+                        topic: stored.topic.clone(),
+                        retain: stored.retain,
+                        payload: stored.payload.clone(),
+                    },
+                );
+                return (None, deliveries);
+            }
             return (comp, deliveries);
         }
         let max_secs = shared.delayed.max_secs();
@@ -2536,6 +2767,20 @@ async fn apply_qos2_pubrel(
     )
     .await;
     forward_cluster(shared, &stored.topic, QoS::ExactlyOnce, &stored.payload).await;
+    let persist_failed = offline_persist_failed_before.is_some_and(|before| {
+        shared
+            .sessions
+            .offline_store()
+            .map(|s| s.persist_failed() > before)
+            .unwrap_or(false)
+    });
+    if persist_failed {
+        warn!("Offline queue persist failed: withholding QoS 2 PUBCOMP so the publisher retries");
+        // Restore the taken entry so the retried PUBREL re-routes instead
+        // of hitting the unknown-id fast path.
+        let _ = session.store_qos2_inbound(packet_id, stored);
+        return (None, deliveries);
+    }
     (qos2_reply(OpCode::PubCompOut, frame, packet_id), deliveries)
 }
 
@@ -3102,12 +3347,27 @@ fn build_downlink_frames_with_publisher(
                                 metrics.inc_inflight_dropped();
                             }
                         }
-                        if let Some(frame) = encode_publish_out(
+                        // B4-05 outbound aliases: assign (or reuse) one
+                        // alias for this topic when the subscriber
+                        // negotiated a maximum. Read-first (one read lock
+                        // plus a bounded scan, no allocation) so repeat
+                        // deliveries reuse without a write; only the first
+                        // delivery of a new topic takes the write lock.
+                        // Max 0 skips the table with one atomic load.
+                        // Driven by the delivery event. The alias rides in
+                        // the downlink meta next to the full topic.
+                        let alias = session
+                            .outbound_alias_for(topic_str)
+                            .or_else(|| session.assign_outbound_alias(topic))
+                            .unwrap_or(0);
+                        if let Some(frame) = encode_publish_out_with_dup(
                             conn_id,
                             topic_str,
                             downlink_id,
                             effective,
                             retain,
+                            false,
+                            alias,
                             &shared,
                         ) {
                             deliveries.push((conn_id, frame));
@@ -3118,19 +3378,28 @@ fn build_downlink_frames_with_publisher(
                         // sessions buffer for replay, clean ones drop.
                         if !session.clean_start {
                             // Hook only: the eviction itself stays
-                            // inside `push_offline`; count what the
-                            // push displaced.
+                            // inside `push_offline_with_limit` under the
+                            // manager's configured cap; count what the
+                            // push displaced. A `false` return means the
+                            // durable write failed and nothing was queued
+                            // (fail closed, ack withheld upstream), so no
+                            // eviction is counted for that drop.
                             let before = session.offline_len();
-                            session.push_offline(QueuedMessage {
-                                topic: topic.clone(),
-                                qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
-                                retain,
-                                payload: shared.clone(),
-                                publish_at_ms: None,
-                            });
-                            let evicted = (before + 1).saturating_sub(session.offline_len());
-                            if evicted > 0 {
-                                metrics.inc_offline_queue_evicted_by(evicted as u64);
+                            let queued = session.push_offline_with_limit(
+                                QueuedMessage {
+                                    topic: topic.clone(),
+                                    qos: QoS::try_from(effective).unwrap_or(QoS::AtMostOnce),
+                                    retain,
+                                    payload: shared.clone(),
+                                    publish_at_ms: None,
+                                },
+                                sessions.max_offline_queue(),
+                            );
+                            if queued {
+                                let evicted = (before + 1).saturating_sub(session.offline_len());
+                                if evicted > 0 {
+                                    metrics.inc_offline_queue_evicted_by(evicted as u64);
+                                }
                             }
                         } else {
                             metrics.inc_detached_clean_dropped();
@@ -3210,12 +3479,21 @@ fn encode_publish_out(
     retain: bool,
     payload: &Bytes,
 ) -> Option<BrokerFrame> {
-    encode_publish_out_with_dup(conn_id, topic, packet_id, qos, retain, false, payload)
+    encode_publish_out_with_dup(conn_id, topic, packet_id, qos, retain, false, 0, payload)
 }
 
 /// Encode one `PublishOut` frame with explicit DUP (replays set DUP=1,
 /// fresh deliveries DUP=0). Sequence is stamped later per-destination by
-/// `ConnTable::route`.
+/// `ConnTable::route`. `alias` is the B4-05 outbound alias (0 = full
+/// topic, no alias); the topic itself always travels in full so a
+/// pre-alias edge still delivers correctly while the alias rides along
+/// for alias-aware edges.
+///
+/// TODO(parity): sending the full topic alongside the alias costs the
+/// bytes the alias is meant to save on the socket. Once the edge speaks
+/// the alias property on the wire, repeat deliveries should carry the
+/// empty topic with the alias instead.
+#[allow(clippy::too_many_arguments)]
 fn encode_publish_out_with_dup(
     conn_id: u64,
     topic: &str,
@@ -3223,15 +3501,17 @@ fn encode_publish_out_with_dup(
     qos: u8,
     retain: bool,
     dup: bool,
+    alias: u16,
     payload: &Bytes,
 ) -> Option<BrokerFrame> {
-    let mut meta = Vec::with_capacity(2 + topic.len() + 2 + 3);
+    let mut meta = Vec::with_capacity(2 + topic.len() + 2 + 3 + 2);
     meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
     meta.extend_from_slice(topic.as_bytes());
     meta.extend_from_slice(&packet_id.to_be_bytes());
     meta.push(qos);
     meta.push(u8::from(retain));
     meta.push(u8::from(dup));
+    meta.extend_from_slice(&alias.to_be_bytes());
     BrokerFrame::new(
         OpCode::PublishOut,
         conn_id,
@@ -3398,23 +3678,121 @@ fn decode_subscribe_meta(meta: &[u8]) -> Option<SubscribeMeta> {
     Some((packet_id, client_id, subs))
 }
 
-/// Decode `PublishMeta` into `(topic, packet_id, qos, retain)`.
-fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, u8, bool)> {
-    if meta.len() < 2 + 1 + 2 + 3 {
+/// Decode `PublishMeta` into `(topic, packet_id, qos, retain, alias)`.
+///
+/// Layout: `TopicLen:16be | Topic | PacketId:16be | QoS:8 | Retain:8 |
+/// Dup:8`, optionally followed by the B4-05 alias section `Alias:16be`
+/// (0 or absent = no alias). A zero-length topic is accepted only when
+/// an alias is carried (alias-by-reference); otherwise the topic must be
+/// non-empty as before. Pre-alias encodings decode with alias 0.
+fn decode_publish_meta(meta: &[u8]) -> Option<(String, u16, u8, bool, u16)> {
+    if meta.len() < 2 + 2 + 3 {
         return None;
     }
     let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-    if topic_len == 0 || meta.len() != 2 + topic_len + 2 + 3 {
+    let old_len = 2 + topic_len + 2 + 3;
+    let new_len = old_len + 2;
+    if meta.len() != old_len && meta.len() != new_len {
         return None;
     }
-    let topic = std::str::from_utf8(&meta[2..2 + topic_len])
-        .ok()?
-        .to_string();
+    if meta.len() < 2 + topic_len + 2 + 3 {
+        return None;
+    }
+    let topic = if topic_len == 0 {
+        String::new()
+    } else {
+        std::str::from_utf8(&meta[2..2 + topic_len])
+            .ok()?
+            .to_string()
+    };
     let base = 2 + topic_len;
     let packet_id = u16::from_be_bytes([meta[base], meta[base + 1]]);
     let qos = meta[base + 2];
     let retain = meta[base + 3] != 0;
-    Some((topic, packet_id, qos, retain))
+    let alias = if meta.len() == new_len {
+        u16::from_be_bytes([meta[base + 5], meta[base + 6]])
+    } else {
+        0
+    };
+    if topic_len == 0 && alias == 0 {
+        return None;
+    }
+    Some((topic, packet_id, qos, retain, alias))
+}
+
+/// Outcome of one inbound alias resolution (B4-05).
+enum InboundAliasOutcome {
+    /// Effective topic to route.
+    Topic(String),
+    /// The alias is unusable: the caller rejects with 0x94 (or drops).
+    Reject,
+}
+
+/// Resolve one inbound alias use to its effective topic.
+///
+/// * topic present (`raw` non-empty): validate the concrete topic, then
+///   register `alias -> topic` on the publisher session (overwrites).
+/// * topic absent (`raw` empty): resolve a previously registered alias.
+/// * unknown connection, alias 0 handled by the caller, alias above the
+///   session maximum, or unknown alias: `Reject` (fail closed).
+///
+/// PUBLISH event only; the session table write is one bounded index
+/// store under a single write lock.
+fn resolve_inbound_alias_topic(
+    shared: &Shared,
+    conn_id: u64,
+    raw: &str,
+    alias: u16,
+) -> InboundAliasOutcome {
+    let client_id = match shared.sessions.client_id_for_conn(conn_id) {
+        Some(client_id) => client_id,
+        None => return InboundAliasOutcome::Reject,
+    };
+    let session = match shared.sessions.get(&client_id) {
+        Some(session) => session,
+        None => return InboundAliasOutcome::Reject,
+    };
+    let max = session.inbound_alias_max();
+    if max == 0 || alias == 0 || alias > max {
+        return InboundAliasOutcome::Reject;
+    }
+    if !raw.is_empty() {
+        // Concrete topics never carry wildcards; validate before storing
+        // so the table only ever holds routable names.
+        let Ok(topic) = Topic::new(raw.to_string()) else {
+            return InboundAliasOutcome::Reject;
+        };
+        match session.register_inbound_alias(alias, topic.clone()) {
+            Ok(()) => InboundAliasOutcome::Topic(topic.as_str().to_string()),
+            Err(_) => InboundAliasOutcome::Reject,
+        }
+    } else {
+        match session.resolve_inbound_alias(alias) {
+            Some(topic) => InboundAliasOutcome::Topic(topic.as_str().to_string()),
+            None => InboundAliasOutcome::Reject,
+        }
+    }
+}
+
+/// Read the outbound alias out of a `PublishOut` downlink frame.
+/// Pre-alias frames (old length) read as alias 0. Read by the edge on
+/// delivery and by the B4-05 tests; the kernel write path never reads
+/// it back, hence the allowance on non-test builds.
+#[allow(dead_code)]
+fn decode_publish_out_alias(meta: &[u8]) -> Option<u16> {
+    if meta.len() < 7 {
+        return None;
+    }
+    let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+    let old_len = 2 + topic_len + 2 + 3;
+    if meta.len() == old_len {
+        return Some(0);
+    }
+    if meta.len() == old_len + 2 {
+        let base = 2 + topic_len;
+        return Some(u16::from_be_bytes([meta[base + 5], meta[base + 6]]));
+    }
+    None
 }
 
 /// Decode `UnbindMeta` into the client id.
@@ -3540,6 +3918,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sessions
         .set_max_qos1_inflight(args.qos1_inflight_window);
     shared.sessions.set_max_qos1_spill(args.qos1_spill);
+    // B4-05: apply the configured inbound topic-alias bound to the
+    // session manager before any edge binds. One atomic store at boot;
+    // future sessions inherit it at creation and advertise it in CONNACK.
+    shared
+        .sessions
+        .set_max_topic_alias(args.topic_alias_maximum);
     // Config registry: create the data dir when missing, then load
     // `state.toml` (missing file yields validated defaults). A corrupt
     // file is a fatal boot error naming the file and the field, never a
@@ -3561,15 +3945,113 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     shared.spawn_delayed_driver();
+    // Offline queue durability (B4-06): back every detached durable
+    // session's queue with `<data-dir>/offline`, then rebuild the
+    // in-memory index from it so a restart replays instead of losing the
+    // backlog. Torn tails are truncated with a counter and never served.
+    // Boot-time only: one directory scan plus one file read per queued
+    // client. Afterwards the publish path pays file I/O solely for
+    // detached durable matches (see `broker-session`); live fan-out pays
+    // nothing. An unreadable directory fails boot loudly rather than
+    // silently losing the backlog.
+    {
+        let offline_dir = std::path::Path::new(&args.data_dir).join("offline");
+        match OfflineQueueStore::open(&offline_dir) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                shared.sessions.set_offline_store(store);
+                let stats = shared.sessions.restore_offline_queues();
+                if stats.messages > 0 || stats.torn > 0 || stats.capped_dropped > 0 {
+                    info!(
+                        "Offline backlog reloaded: {} messages for {} clients, {} torn discarded, {} capped dropped",
+                        stats.messages, stats.clients, stats.torn, stats.capped_dropped
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot open offline queue store {}: {e}",
+                    offline_dir.display()
+                )
+                .into());
+            }
+        }
+    }
     // MQTT users/ACLs: seed the shared `MemoryAuth` in place (the same
     // instance `serve_api` hands to `ApiState`), so the BrokerLink plane
     // enforces persisted credentials from the first accepted connection.
     shared.auth.seed_from_registry(&shared.config);
+    // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
+    // the rules seed so the restored rules land in the engine that will
+    // serve them. Empty keeps today's memory-only `DropOldest` input.
+    // A directory that cannot be opened fails boot loudly rather than
+    // silently running without disk backing.
+    if !args.rule_spill_dir.is_empty() {
+        match RuleEngine::new_with_spill(1024, args.rule_spill_dir.as_str()) {
+            Ok(engine) => {
+                engine.set_metrics(&shared.metrics);
+                // B4-07 boot wiring: carry the live broker sink onto the
+                // replacement engine (cf. `Shared::new` installing it at
+                // construction) so window-flush republish keeps serving;
+                // without this the flush sink stays `None` and republish
+                // actions drop. Re-create the three factory preseeds so the
+                // spill engine serves exactly what the memory engine would
+                // before the registry seed below replaces both.
+                engine.set_broker_sink(shared.sink.clone());
+                let _ = engine.create_rule(
+                    "factory-telemetry-to-kafka".to_string(),
+                    TopicFilter::new("sensors/+/telemetry").unwrap(),
+                    Some("SELECT payload.temperature as temp, payload.pressure as pressure, clientid FROM \"sensors/+/telemetry\" WHERE payload.temperature > 25".to_string()),
+                    true,
+                    vec![broker_rules::RuleAction::ForwardConnector {
+                        connector_id: "kafka:kafka-prod".to_string(),
+                    }],
+                );
+                let _ = engine.create_rule(
+                    "critical-alerts-to-webhook".to_string(),
+                    TopicFilter::new("sensors/+/alerts").unwrap(),
+                    Some("SELECT payload.level as alert_level, payload.msg as message, clientid FROM \"sensors/+/alerts\" WHERE payload.level = 'CRITICAL'".to_string()),
+                    true,
+                    vec![broker_rules::RuleAction::ForwardConnector {
+                        connector_id: "http:webhook-alerts".to_string(),
+                    }],
+                );
+                let _ = engine.create_rule(
+                    "telemetry-to-postgres".to_string(),
+                    TopicFilter::new("sensors/+/telemetry").unwrap(),
+                    Some(
+                        "SELECT payload.temperature as temp, clientid FROM \"sensors/+/telemetry\""
+                            .to_string(),
+                    ),
+                    true,
+                    vec![broker_rules::RuleAction::ForwardConnector {
+                        connector_id: "pgsql:postgres-analytics".to_string(),
+                    }],
+                );
+                info!("Rule spill buffer enabled in {}", args.rule_spill_dir);
+                shared.engine = Arc::new(engine);
+            }
+            Err(e) => {
+                return Err(
+                    format!("cannot open rule spill dir {}: {e}", args.rule_spill_dir).into(),
+                );
+            }
+        }
+    }
     // Rules (W0-22): replay the persisted snapshot through the same
     // validated create path as `RuleEngine::create_rule`. An empty
     // snapshot yields today's empty behaviour (no rules); an invalid
     // stored rule fails boot loudly, never skipped silently.
     shared.engine.seed_from_registry(&shared.config)?;
+    // Rule spill drain (B4-07): when a spill directory is configured,
+    // start the single pressure-ease replay driver. It pends on
+    // `input().next_event()` (the prod caller beside tests), draining
+    // durability copies in order after bursts ease; each pop counts a
+    // replay, keeping spill visible and the disk bounded. Memory-only
+    // engines spawn nothing, so steady state pays nothing.
+    if shared.engine.input().spill_enabled() {
+        spawn_rule_spill_driver(shared.engine.clone());
+    }
     // Durable stream journal (B1-07): opt-in via `--stream-dir`. Empty
     // leaves `stream_journal` as `None` so the publish hook is one branch
     // and benchmarks see no new disk work. A corrupt stream directory
@@ -3935,10 +4417,39 @@ mod tests {
     }
 
     /// Decode `SessionBinding` metadata into `(session_id, present, rc)`.
+    /// Accepts 10-byte (pre-alias) and 12-byte (B4-05 with the trailing
+    /// Topic Alias Maximum) encodings.
     fn decode_session_binding_meta(meta: &[u8]) -> (u64, bool, u8) {
-        assert_eq!(meta.len(), 10, "SessionBinding meta must be 10 bytes");
+        assert!(
+            meta.len() == 10 || meta.len() == 12,
+            "SessionBinding meta must be 10 or 12 bytes, got {}",
+            meta.len()
+        );
         let session_id = u64::from_be_bytes(meta[0..8].try_into().unwrap());
         (session_id, meta[8] != 0, meta[9])
+    }
+
+    /// Decode the B4-05 Topic Alias Maximum out of a `SessionBinding`
+    /// reply (0 for pre-alias 10-byte encodings).
+    fn decode_session_binding_alias_max(meta: &[u8]) -> u16 {
+        match meta.len() {
+            10 => 0,
+            12 => u16::from_be_bytes([meta[10], meta[11]]),
+            len => panic!("SessionBinding meta must be 10 or 12 bytes, got {len}"),
+        }
+    }
+
+    /// Encode `BindConnection` metadata with a B4-05 client alias maximum
+    /// (test mirror of the extended BEAM `encode_bind_meta/6` contract).
+    fn encode_bind_meta_with_alias(
+        client_id: &str,
+        clean_start: bool,
+        keepalive: u16,
+        client_alias_max: u16,
+    ) -> Bytes {
+        let mut meta = encode_bind_meta(client_id, clean_start, keepalive).to_vec();
+        meta.extend_from_slice(&client_alias_max.to_be_bytes());
+        Bytes::from(meta)
     }
 
     fn bind_frame(conn_id: u64, seq: u64, meta: Bytes) -> BrokerFrame {
@@ -3980,6 +4491,8 @@ mod tests {
     }
 
     /// Encode `PublishMeta` (test mirror of the BEAM contract).
+    /// Pre-alias encoding (no trailing alias section, decodes as alias
+    /// 0); kept to prove old-length frames still route.
     fn encode_publish_meta(
         topic: &str,
         packet_id: u16,
@@ -3997,11 +4510,43 @@ mod tests {
         (Bytes::from(meta), Bytes::from(payload.to_vec()))
     }
 
+    /// Encode `PublishMeta` with a B4-05 topic alias (test mirror of the
+    /// extended BEAM `encode_publish_meta/6` contract). An empty topic
+    /// with a nonzero alias encodes alias-by-reference.
+    fn encode_publish_meta_with_alias(
+        topic: &str,
+        packet_id: u16,
+        qos: u8,
+        retain: bool,
+        alias: u16,
+        payload: &[u8],
+    ) -> (Bytes, Bytes) {
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        meta.extend_from_slice(topic.as_bytes());
+        meta.extend_from_slice(&packet_id.to_be_bytes());
+        meta.push(qos);
+        meta.push(u8::from(retain));
+        meta.push(0u8);
+        meta.extend_from_slice(&alias.to_be_bytes());
+        (Bytes::from(meta), Bytes::from(payload.to_vec()))
+    }
+
+    /// Decode the B4-05 alias out of a `PublishOut` downlink frame (0 for
+    /// pre-alias encodings).
+    fn decode_publish_out_alias(meta: &[u8]) -> u16 {
+        super::decode_publish_out_alias(meta).expect("downlink meta decodes")
+    }
+
     fn decode_publish_meta_parts(meta: &[u8]) -> (String, u16, u8, bool) {
         let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-        let topic = std::str::from_utf8(&meta[2..2 + topic_len])
-            .unwrap()
-            .to_string();
+        let topic = if topic_len == 0 {
+            String::new()
+        } else {
+            std::str::from_utf8(&meta[2..2 + topic_len])
+                .unwrap()
+                .to_string()
+        };
         let base = 2 + topic_len;
         let packet_id = u16::from_be_bytes([meta[base], meta[base + 1]]);
         (topic, packet_id, meta[base + 2], meta[base + 3] != 0)
@@ -4080,9 +4625,11 @@ mod tests {
     fn downlink_offline_eviction_counts_drop_only() {
         // PERF-10: pushing into a full offline queue keeps the queueing
         // itself unchanged (oldest evicted, length capped) and bumps
-        // exactly the eviction counter.
+        // exactly the eviction counter. Uses an explicit 1024 cap so the
+        // seeding via `push_offline` (capped at `MAX_OFFLINE_QUEUE`) and
+        // the delivery path via the manager cap agree.
         let router = Router::new();
-        let sessions = SessionManager::new();
+        let sessions = SessionManager::new_with_limits(Some(MAX_OFFLINE_QUEUE));
         let metrics = Metrics::new();
         let filter = TopicFilter::new("jobs/backlog").unwrap();
         router.subscribe(&filter, Subscription::new("durable-1", 78, QoS::AtMostOnce));
@@ -5513,6 +6060,337 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn topic_alias_conack_carries_configured_maximum() {
+        // Done-when 1: negotiate a maximum through the broker (CONNECT ->
+        // bind, CONNACK <- SessionBinding) and assert CONNACK carries it.
+        let shared = test_shared();
+        shared.sessions.set_max_topic_alias(7);
+        let bind = bind_frame(81, 1, encode_bind_meta("alias-neg-1", true, 60));
+        let reply = reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        assert_eq!(reply.header.opcode, OpCode::SessionBinding);
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        assert!(!present);
+        assert_eq!(
+            decode_session_binding_alias_max(&reply.metadata),
+            7,
+            "CONNACK carries the configured maximum"
+        );
+        let session = shared.sessions.get("alias-neg-1").expect("session known");
+        assert_eq!(session.inbound_alias_max(), 7);
+        // The client's own maximum rides the bind: the kernel outbound
+        // bound follows it.
+        let bind2 = bind_frame(
+            82,
+            1,
+            encode_bind_meta_with_alias("alias-neg-2", true, 60, 5),
+        );
+        reply_for_frame(&bind2, &shared.sessions).expect("bind replies");
+        let session2 = shared.sessions.get("alias-neg-2").expect("session known");
+        assert_eq!(session2.outbound_alias_max(), 5);
+        assert_eq!(session2.inbound_alias_max(), 7);
+    }
+
+    #[tokio::test]
+    async fn topic_alias_inbound_alias_delivers_correct_topic() {
+        // Done-when 2 (inbound): publish through the broker using an alias
+        // and assert the subscriber receives the correct topic.
+        let shared = test_shared();
+        let sub_bind = bind_frame(91, 1, encode_bind_meta("alias-sub-1", false, 60));
+        reply_for_frame(&sub_bind, &shared.sessions).expect("sub binds");
+        let sub = subscribe_frame(
+            91,
+            2,
+            encode_subscribe_meta(5, "alias-sub-1", &[("sensors/#", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (tx91, _rx91) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(91, tx91);
+
+        let pub_bind = bind_frame(92, 1, encode_bind_meta("alias-pub-1", false, 60));
+        reply_for_frame(&pub_bind, &shared.sessions).expect("pub binds");
+        // First publish carries topic + alias 3: registers the mapping.
+        let (meta, payload) =
+            encode_publish_meta_with_alias("sensors/temp", 0, 0, false, 3, b"21.5");
+        let (_, deliveries) = apply_publish(&publish_frame(92, 10, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        for (conn_id, frame) in deliveries {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        // QoS 0 downlinks ride the bounded per-subscriber backlog
+        // (`ConnTable::route` enqueues), never the guaranteed mailbox.
+        let got = shared.conns.pop_qos0(91).expect("downlink arrived");
+        let (topic, _, _, _) = decode_publish_meta_parts(&got.metadata);
+        assert_eq!(topic, "sensors/temp");
+        assert_eq!(got.payload, Bytes::from_static(b"21.5"));
+        // Second publish carries the empty topic + alias 3: resolves it.
+        let (meta2, payload2) = encode_publish_meta_with_alias("", 0, 0, false, 3, b"22.5");
+        let (_, deliveries2) =
+            apply_publish(&publish_frame(92, 11, meta2, payload2), &shared).await;
+        assert_eq!(deliveries2.len(), 1);
+        for (conn_id, frame) in deliveries2 {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        let got2 = shared.conns.pop_qos0(91).expect("aliased downlink arrived");
+        let (topic2, _, _, _) = decode_publish_meta_parts(&got2.metadata);
+        assert_eq!(
+            topic2, "sensors/temp",
+            "alias resolves to the correct topic"
+        );
+        assert_eq!(got2.payload, Bytes::from_static(b"22.5"));
+    }
+
+    #[tokio::test]
+    async fn topic_alias_outbound_assignment_reused_and_bounded() {
+        // Done-when 2 (outbound) + 4: deliveries on a connection that
+        // negotiated a maximum carry aliases; the table is bounded by the
+        // maximum and reused rather than grown per message.
+        let shared = test_shared();
+        let sub_bind = bind_frame(
+            101,
+            1,
+            encode_bind_meta_with_alias("alias-out-sub", false, 60, 2),
+        );
+        reply_for_frame(&sub_bind, &shared.sessions).expect("sub binds");
+        let sub = subscribe_frame(
+            101,
+            2,
+            encode_subscribe_meta(5, "alias-out-sub", &[("sensors/#", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (tx101, _rx101) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(101, tx101);
+        let pub_bind = bind_frame(102, 1, encode_bind_meta("alias-out-pub", false, 60));
+        reply_for_frame(&pub_bind, &shared.sessions).expect("pub binds");
+
+        // Publish three distinct topics past the maximum of 2.
+        let mut aliases = Vec::new();
+        for (i, topic) in ["sensors/a", "sensors/b", "sensors/c"]
+            .into_iter()
+            .enumerate()
+        {
+            let (meta, payload) = encode_publish_meta(topic, 0, 0, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(102, 100 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1);
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            // QoS 0 downlinks ride the bounded backlog, not the mailbox.
+            let got = shared.conns.pop_qos0(101).expect("downlink arrived");
+            let (got_topic, _, _, _) = decode_publish_meta_parts(&got.metadata);
+            assert_eq!(got_topic, topic, "full topic still delivered");
+            aliases.push(decode_publish_out_alias(&got.metadata));
+        }
+        assert_eq!(aliases[0], 1, "first topic claims alias 1");
+        assert_eq!(aliases[1], 2, "second topic claims alias 2");
+        assert_eq!(
+            aliases[2], 0,
+            "past the bound the full topic is sent with alias 0"
+        );
+        let session = shared.sessions.get("alias-out-sub").expect("session known");
+        assert_eq!(
+            session.outbound_alias_len(),
+            2,
+            "table bounded by the maximum"
+        );
+        // Repeat: the first topic reuses alias 1 instead of growing.
+        let (meta, payload) = encode_publish_meta("sensors/a", 0, 0, false, b"y");
+        let (_, deliveries) = apply_publish(&publish_frame(102, 200, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        for (conn_id, frame) in deliveries {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        let got = shared.conns.pop_qos0(101).expect("downlink arrived");
+        assert_eq!(decode_publish_out_alias(&got.metadata), 1, "alias reused");
+        assert_eq!(session.outbound_alias_len(), 2, "no growth per message");
+    }
+
+    #[tokio::test]
+    async fn topic_alias_above_maximum_rejected_with_correct_code() {
+        // Done-when 3: an alias above the negotiated maximum is rejected
+        // with the correct reason code (0x94).
+        let shared = test_shared();
+        let pub_bind = bind_frame(111, 1, encode_bind_meta("alias-rej-pub", false, 60));
+        reply_for_frame(&pub_bind, &shared.sessions).expect("pub binds");
+        let sub_bind = bind_frame(112, 1, encode_bind_meta("alias-rej-sub", false, 60));
+        reply_for_frame(&sub_bind, &shared.sessions).expect("sub binds");
+        let sub = subscribe_frame(
+            112,
+            2,
+            encode_subscribe_meta(5, "alias-rej-sub", &[("sensors/#", 1)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (tx112, mut rx112) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(112, tx112);
+
+        let max = shared.sessions.max_topic_alias();
+        assert!(max > 0, "test needs aliases enabled");
+        // QoS 1 publish with alias above the maximum: PUBACK 0x94, no
+        // delivery.
+        let (meta, payload) =
+            encode_publish_meta_with_alias("sensors/temp", 7, 1, false, max + 1, b"x");
+        let (ack, deliveries) =
+            apply_publish(&publish_frame(111, 50, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 answers");
+        assert_eq!(ack.header.opcode, OpCode::PubAckOut);
+        assert_eq!(
+            ack.metadata[2],
+            protocol_v5::REASON_TOPIC_ALIAS_INVALID,
+            "rejection carries the correct reason code"
+        );
+        assert!(deliveries.is_empty(), "rejected publish routes nowhere");
+        assert!(rx112.try_recv().is_err(), "subscriber sees nothing");
+        // Alias within range but never registered: still 0x94.
+        let (meta2, payload2) = encode_publish_meta_with_alias("", 8, 1, false, max.max(1), b"y");
+        let (ack2, deliveries2) =
+            apply_publish(&publish_frame(111, 51, meta2, payload2), &shared).await;
+        let ack2 = ack2.expect("QoS 1 answers");
+        assert_eq!(ack2.metadata[2], protocol_v5::REASON_TOPIC_ALIAS_INVALID);
+        assert!(deliveries2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn topic_alias_state_per_connection_and_bounded() {
+        // Done-when 4: alias state is per-connection and bounded.
+        let shared = test_shared();
+        shared.sessions.set_max_topic_alias(4);
+        for (conn, client) in [(121u64, "alias-iso-1"), (122u64, "alias-iso-2")] {
+            let bind = bind_frame(conn, 1, encode_bind_meta(client, true, 60));
+            reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        }
+        // Same alias number, different topics, different connections.
+        for (conn, seq, topic) in [(121u64, 10u64, "iso/one"), (122u64, 11u64, "iso/two")] {
+            let (meta, payload) = encode_publish_meta_with_alias(topic, 0, 0, false, 1, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(conn, seq, meta, payload), &shared).await;
+            assert!(deliveries.is_empty(), "no subscribers yet");
+        }
+        let first = shared.sessions.get("alias-iso-1").expect("session known");
+        let second = shared.sessions.get("alias-iso-2").expect("session known");
+        assert_eq!(first.resolve_inbound_alias(1).unwrap().as_str(), "iso/one");
+        assert_eq!(second.resolve_inbound_alias(1).unwrap().as_str(), "iso/two");
+        assert!(first.inbound_alias_len() <= 4);
+        assert!(second.inbound_alias_len() <= 4);
+        // Fill to the bound: further aliases are rejected, never stored.
+        for alias in 2..=4u16 {
+            let (meta, payload) =
+                encode_publish_meta_with_alias("iso/fill", 0, 0, false, alias, b"x");
+            let (_, deliveries) = apply_publish(
+                &publish_frame(121, 20 + u64::from(alias), meta, payload),
+                &shared,
+            )
+            .await;
+            assert!(deliveries.is_empty());
+        }
+        assert_eq!(
+            first.inbound_alias_len(),
+            4,
+            "table holds at most the maximum"
+        );
+        let (meta, payload) = encode_publish_meta_with_alias("iso/over", 0, 0, false, 5, b"x");
+        let (_, deliveries) = apply_publish(&publish_frame(121, 99, meta, payload), &shared).await;
+        assert!(deliveries.is_empty(), "alias past the bound is refused");
+        assert_eq!(
+            first.inbound_alias_len(),
+            4,
+            "refused alias is never stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_alias_delivery_workload_timings() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        // Done-when 6: before/after publish-to-deliver numbers with
+        // aliases on and off, measured through the broker, not invented.
+        // BEFORE is plain delivery (no alias negotiated anywhere, so both
+        // the inbound fast path and the outbound skip cost one branch
+        // each). AFTER enables the maximum on both directions and routes
+        // every publish through alias registration plus aliased delivery.
+        // Both print msgs/sec and avg ns/msg into the gate output with no
+        // threshold assert; counts are CI sample sizes, not SLOs.
+        // Per-message bound: at most `max` alias entries per direction
+        // (default 10 topics), each one shared handle plus topic bytes.
+        let shared = test_shared();
+        let sub_bind = bind_frame(131, 1, encode_bind_meta("alias-time-sub", false, 60));
+        reply_for_frame(&sub_bind, &shared.sessions).expect("sub binds");
+        let sub = subscribe_frame(
+            131,
+            2,
+            encode_subscribe_meta(5, "alias-time-sub", &[("time/#", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (tx131, _rx131) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(131, tx131);
+        let pub_bind = bind_frame(132, 1, encode_bind_meta("alias-time-pub", false, 60));
+        reply_for_frame(&pub_bind, &shared.sessions).expect("pub binds");
+
+        let iters = 300usize;
+        let off_start = Instant::now();
+        for i in 0..iters {
+            let (meta, payload) = encode_publish_meta("time/off", 0, 0, false, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(132, 1000 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1);
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            // QoS 0 downlinks ride the bounded backlog, not the mailbox.
+            let got = shared.conns.pop_qos0(131).expect("downlink arrived");
+            black_box(got);
+        }
+        let off_elapsed = off_start.elapsed();
+        let off_rate = iters as f64 / off_elapsed.as_secs_f64();
+        let off_avg_ns = off_elapsed.as_nanos() as f64 / iters as f64;
+        println!(
+            "alias broker delivery workload aliases-off (before): {off_rate:.0} msgs/sec, avg {off_avg_ns:.1} ns/msg ({iters} apply_publish rounds in {off_elapsed:?})"
+        );
+
+        // Renegotiate with aliases: publisher registers alias 1 once,
+        // then every publish resolves it; the subscriber negotiated a
+        // maximum so deliveries carry assigned aliases.
+        let sub_session = shared.sessions.get("alias-time-sub").expect("sub known");
+        sub_session.set_outbound_alias_max(10);
+        let (meta, payload) = encode_publish_meta_with_alias("time/on", 0, 0, false, 1, b"x");
+        let (_, deliveries) =
+            apply_publish(&publish_frame(132, 2000, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        for (conn_id, frame) in deliveries {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+        shared
+            .conns
+            .pop_qos0(131)
+            .expect("registration downlink arrived");
+        let on_start = Instant::now();
+        for i in 0..iters {
+            let (meta, payload) = encode_publish_meta_with_alias("", 0, 0, false, 1, b"x");
+            let (_, deliveries) =
+                apply_publish(&publish_frame(132, 3000 + i as u64, meta, payload), &shared).await;
+            assert_eq!(deliveries.len(), 1);
+            for (conn_id, frame) in deliveries {
+                let _ = shared.conns.route(conn_id, frame);
+            }
+            let got = shared
+                .conns
+                .pop_qos0(131)
+                .expect("aliased downlink arrived");
+            black_box(got);
+        }
+        let on_elapsed = on_start.elapsed();
+        let on_rate = iters as f64 / on_elapsed.as_secs_f64();
+        let on_avg_ns = on_elapsed.as_nanos() as f64 / iters as f64;
+        println!(
+            "alias broker delivery workload aliases-on (after): {on_rate:.0} msgs/sec, avg {on_avg_ns:.1} ns/msg ({iters} aliased apply_publish rounds in {on_elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
     async fn publish_qos0_needs_no_ack() {
         let shared = test_shared();
         let (meta, payload) = encode_publish_meta("t", 0, 0, false, b"x");
@@ -6091,6 +6969,365 @@ mod tests {
         assert_ne!(packet_id, 0, "replayed QoS 1 needs a fresh packet id");
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn offline_queue_survives_restart_through_broker() {
+        // B4-06: buffer through the broker, recreate the node from the
+        // same directory, reconnect, and assert every queued message
+        // redelivers in order. The buffering write runs inside
+        // `push_offline_with_limit` on the disconnect-buffer event
+        // (`build_downlink_frames`, detached durable branch); the reload
+        // runs at boot (`restore_offline_queues`); the handoff runs on
+        // the reconnect-replay event (`replay_offline`).
+        let dir = unique_data_dir();
+        let offline_dir = dir.join("offline");
+        {
+            let shared = test_shared();
+            shared.sessions.set_offline_store(Arc::new(
+                OfflineQueueStore::open(&offline_dir).expect("open offline store"),
+            ));
+            let bind = bind_frame(61, 1, encode_bind_meta("rest-sub", false, 60));
+            reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+            let sub = subscribe_frame(
+                61,
+                2,
+                encode_subscribe_meta(5, "rest-sub", &[("job/queue", 1)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+            // Detach without a clean disconnect: the session stays durable.
+            let mut unbind_meta = vec![0x00u8, 0x08u8];
+            unbind_meta.extend_from_slice(b"rest-sub");
+            let unbind = BrokerFrame::new(
+                OpCode::UnbindConnection,
+                61,
+                4,
+                Bytes::from(unbind_meta),
+                Bytes::new(),
+            )
+            .expect("valid unbind frame");
+            apply_unbind(&unbind, &shared);
+            // Five QoS 1 publishes buffer while detached. Each `await`
+            // returns after the durable append: the publisher's ack is
+            // only observed once the entry has reached stable storage.
+            for i in 0..5u8 {
+                let (meta, payload) = encode_publish_meta("job/queue", 9, 1, false, &[i]);
+                let (ack, _) = apply_publish(
+                    &publish_frame(62, u64::from(i) + 10, meta, payload),
+                    &shared,
+                )
+                .await;
+                ack.expect("QoS 1 publisher is acked");
+            }
+            let session = shared.sessions.get("rest-sub").expect("session known");
+            assert_eq!(session.offline_len(), 5);
+        }
+        // Recreate the node from the same directory: the backlog rebuilds
+        // detached, oldest first.
+        let shared = test_shared();
+        shared.sessions.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&offline_dir).expect("reopen offline store"),
+        ));
+        let stats = shared.sessions.restore_offline_queues();
+        assert_eq!(stats.messages, 5);
+        assert_eq!(stats.clients, 1);
+        assert_eq!(stats.torn, 0);
+        assert_eq!(stats.capped_dropped, 0);
+        let session = shared.sessions.get("rest-sub").expect("restored session");
+        assert!(!*session.connected.read());
+        assert_eq!(session.offline_len(), 5);
+        // Reconnect on a new connection: every queued message replays.
+        let rebind = bind_frame(63, 1, encode_bind_meta("rest-sub", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+        let replayed = replay_offline(&rebind, &shared).await;
+        assert_eq!(replayed, 5);
+        for i in 0..5u8 {
+            let frame = rx63.try_recv().expect("replay reached the new mailbox");
+            assert_eq!(frame.payload, Bytes::from(vec![i]));
+            let (topic, _, qos, _) = decode_publish_meta_parts(&frame.metadata);
+            assert_eq!(topic, "job/queue");
+            assert_eq!(qos, 1);
+        }
+        assert!(rx63.try_recv().is_err());
+        // The drain deleted the queue file: a further restart replays nothing.
+        assert!(shared
+            .sessions
+            .offline_store()
+            .expect("store installed")
+            .client_ids()
+            .is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn offline_queue_durable_drop_policy_holds_and_counts() {
+        // B4-06: the configurable drop policy (oldest dropped past the
+        // cap, counted drops) still holds with the durable store
+        // installed, and the survivors are what a restart reloads.
+        let dir = unique_data_dir();
+        let offline_dir = dir.join("offline");
+        let sessions = Arc::new(SessionManager::new_with_limits(Some(3)));
+        sessions.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&offline_dir).expect("open offline store"),
+        ));
+        let router = Router::new();
+        let metrics = Metrics::new();
+        let filter = TopicFilter::new("jobs/backlog").unwrap();
+        router.subscribe(
+            &filter,
+            Subscription::new("durable-tiny", 78, QoS::AtMostOnce),
+        );
+        let (session, _) = sessions.get_or_create("durable-tiny", false);
+        *session.connected.write() = false;
+        *session.conn_id.write() = None;
+        let topic = Topic::new("jobs/backlog").unwrap();
+        for i in 0..5u8 {
+            let deliveries = build_downlink_frames(
+                &router,
+                &sessions,
+                &metrics,
+                &topic,
+                QoS::AtMostOnce,
+                false,
+                &Bytes::from(vec![i]),
+            );
+            assert!(deliveries.is_empty());
+        }
+        assert_eq!(session.offline_len(), 3);
+        assert_eq!(metrics.offline_queue_evicted(), 2);
+        // A fresh node on the same directory reloads the newest three.
+        let fresh = SessionManager::new_with_limits(Some(3));
+        fresh.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&offline_dir).expect("reopen offline store"),
+        ));
+        let stats = fresh.restore_offline_queues();
+        assert_eq!(stats.messages, 3);
+        assert_eq!(stats.capped_dropped, 0);
+        let restored = fresh.get("durable-tiny").expect("restored session");
+        let drained = restored.drain_offline();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0].payload, Bytes::from(vec![2u8]));
+        assert_eq!(drained[2].payload, Bytes::from(vec![4u8]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn offline_queue_torn_tail_discarded_and_counted() {
+        // B4-06: a torn tail on recovery is discarded with a counter and
+        // never served; everything before it still replays in order.
+        let dir = unique_data_dir();
+        let offline_dir = dir.join("offline");
+        {
+            let shared = test_shared();
+            shared.sessions.set_offline_store(Arc::new(
+                OfflineQueueStore::open(&offline_dir).expect("open offline store"),
+            ));
+            let bind = bind_frame(61, 1, encode_bind_meta("torn-sub", false, 60));
+            reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+            let sub = subscribe_frame(
+                61,
+                2,
+                encode_subscribe_meta(5, "torn-sub", &[("torn/topic", 1)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+            let mut unbind_meta = vec![0x00u8, 0x08u8];
+            unbind_meta.extend_from_slice(b"torn-sub");
+            let unbind = BrokerFrame::new(
+                OpCode::UnbindConnection,
+                61,
+                4,
+                Bytes::from(unbind_meta),
+                Bytes::new(),
+            )
+            .expect("valid unbind frame");
+            apply_unbind(&unbind, &shared);
+            for i in 0..5u8 {
+                let (meta, payload) = encode_publish_meta("torn/topic", 9, 1, false, &[i]);
+                let _ = apply_publish(
+                    &publish_frame(62, u64::from(i) + 20, meta, payload),
+                    &shared,
+                )
+                .await;
+            }
+            assert_eq!(
+                shared
+                    .sessions
+                    .get("torn-sub")
+                    .expect("session")
+                    .offline_len(),
+                5
+            );
+        }
+        // Tear the tail: cut the last bytes of the single queue file so
+        // the final frame loses its checksum.
+        let mut logs = Vec::new();
+        for entry in std::fs::read_dir(&offline_dir).expect("list offline dir") {
+            let entry = entry.expect("dir entry");
+            if entry.path().extension().and_then(|ext| ext.to_str()) == Some("log") {
+                logs.push(entry.path());
+            }
+        }
+        assert_eq!(logs.len(), 1, "one queue file must exist");
+        let len = std::fs::metadata(&logs[0]).expect("queue file size").len();
+        assert!(len > 16);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&logs[0])
+            .expect("open queue file")
+            .set_len(len - 6)
+            .expect("tear the tail");
+        // Recreate the node: the torn frame is gone and counted, the four
+        // survivors replay in order.
+        let shared = test_shared();
+        let store = Arc::new(OfflineQueueStore::open(&offline_dir).expect("reopen store"));
+        shared.sessions.set_offline_store(store.clone());
+        let stats = shared.sessions.restore_offline_queues();
+        assert_eq!(stats.torn, 1);
+        assert_eq!(store.recovery_torn(), 1);
+        assert_eq!(stats.messages, 4);
+        let rebind = bind_frame(63, 1, encode_bind_meta("torn-sub", false, 60));
+        reply_for_frame(&rebind, &shared.sessions).expect("rebind replies");
+        let (tx63, mut rx63) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(63, tx63);
+        assert_eq!(replay_offline(&rebind, &shared).await, 4);
+        for i in 0..4u8 {
+            let frame = rx63.try_recv().expect("survivor replayed");
+            assert_eq!(frame.payload, Bytes::from(vec![i]));
+        }
+        assert!(rx63.try_recv().is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn offline_durable_reconnect_workload_timings() {
+        // B4-06 timing record: the disconnect-reconnect workload before
+        // (memory-only buffering, the pre-change path) and after (durable
+        // append plus fsync per buffered message), plus restore and
+        // reconnect-replay rates. Live fan-out to connected sessions takes
+        // no new work in either case: files are touched only for detached
+        // durable matches. Every section prints its measured rate into
+        // the gate output with no threshold assert; counts are CI sample
+        // sizes, not SLOs.
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let topic = Topic::new("wload/q").unwrap();
+        let payload = Bytes::from_static(b"x");
+        let filter = TopicFilter::new("wload/q").unwrap();
+
+        // BEFORE: memory-only disconnect buffering.
+        let router = Router::new();
+        router.subscribe(&filter, Subscription::new("wload-mem", 81, QoS::AtMostOnce));
+        let sessions = SessionManager::new_with_limits(None);
+        let metrics = Metrics::new();
+        let (session, _) = sessions.get_or_create("wload-mem", false);
+        *session.connected.write() = false;
+        *session.conn_id.write() = None;
+        let iters = 2_000usize;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let deliveries = build_downlink_frames(
+                &router,
+                &sessions,
+                &metrics,
+                &topic,
+                QoS::AtMostOnce,
+                false,
+                black_box(&payload),
+            );
+            assert!(deliveries.is_empty());
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(session.offline_len(), iters);
+        let rate = iters as f64 / elapsed.as_secs_f64();
+        let avg_ns = elapsed.as_nanos() as f64 / iters as f64;
+        println!(
+            "offline buffer memory-only disconnect-buffer (before): {rate:.0} msgs/sec, avg {avg_ns:.1} ns/msg ({iters} buffered in {elapsed:?})"
+        );
+        let start = Instant::now();
+        let drained = session.drain_offline();
+        let elapsed = start.elapsed();
+        assert_eq!(drained.len(), iters);
+        let rate = iters as f64 / elapsed.as_secs_f64();
+        let avg_ns = elapsed.as_nanos() as f64 / iters as f64;
+        println!(
+            "offline drain memory-only (before): {rate:.0} msgs/sec, avg {avg_ns:.1} ns/msg ({iters} drained in {elapsed:?})"
+        );
+
+        // AFTER: durable disconnect buffering (fsync per append).
+        let dir = unique_data_dir();
+        let offline_dir = dir.join("offline");
+        let router2 = Router::new();
+        router2.subscribe(
+            &filter,
+            Subscription::new("wload-disk", 82, QoS::AtMostOnce),
+        );
+        let sessions2 = SessionManager::new_with_limits(None);
+        sessions2.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&offline_dir).expect("open offline store"),
+        ));
+        let metrics2 = Metrics::new();
+        let (session2, _) = sessions2.get_or_create("wload-disk", false);
+        *session2.connected.write() = false;
+        *session2.conn_id.write() = None;
+        let disk_iters = 200usize;
+        let start = Instant::now();
+        for _ in 0..disk_iters {
+            let deliveries = build_downlink_frames(
+                &router2,
+                &sessions2,
+                &metrics2,
+                &topic,
+                QoS::AtMostOnce,
+                false,
+                black_box(&payload),
+            );
+            assert!(deliveries.is_empty());
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(session2.offline_len(), disk_iters);
+        let rate = disk_iters as f64 / elapsed.as_secs_f64();
+        let avg_us = elapsed.as_micros() as f64 / disk_iters as f64;
+        println!(
+            "offline buffer durable fsync-per-append (after): {rate:.0} msgs/sec, avg {avg_us:.1} us/msg ({disk_iters} buffered in {elapsed:?})"
+        );
+
+        // Reconnect half on a fresh node from the same directory: restore
+        // rate, then rebind plus replay rate onto a live mailbox.
+        let shared3 = test_shared();
+        shared3.sessions.set_offline_store(Arc::new(
+            OfflineQueueStore::open(&offline_dir).expect("reopen offline store"),
+        ));
+        let start = Instant::now();
+        let stats = shared3.sessions.restore_offline_queues();
+        let elapsed = start.elapsed();
+        assert_eq!(stats.messages, disk_iters);
+        let rate = disk_iters as f64 / elapsed.as_secs_f64();
+        println!(
+            "offline restore from disk: {rate:.0} msgs/sec ({disk_iters} rebuilt in {elapsed:?})"
+        );
+        let rebind = bind_frame(83, 1, encode_bind_meta("wload-disk", false, 60));
+        let rebind_start = Instant::now();
+        reply_for_frame(&rebind, &shared3.sessions).expect("rebind replies");
+        let (tx83, _rx83) = unbounded_channel::<BrokerFrame>();
+        shared3.conns.register(83, tx83);
+        let replayed = replay_offline(&rebind, &shared3).await;
+        let rebind_elapsed = rebind_start.elapsed();
+        assert_eq!(replayed, disk_iters);
+        let rate = disk_iters as f64 / rebind_elapsed.as_secs_f64();
+        let avg_us = rebind_elapsed.as_micros() as f64 / disk_iters as f64;
+        println!(
+            "offline reconnect rebind-plus-replay: {rate:.0} msgs/sec, avg {avg_us:.1} us/msg ({disk_iters} replayed in {rebind_elapsed:?})"
+        );
+        // QoS 0 replays ride the bounded backlog, not the mailbox.
+        for _ in 0..disk_iters {
+            black_box(shared3.conns.pop_qos0(83).expect("replay arrived"));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -8960,6 +10197,87 @@ mod tests {
                 .payload,
             Bytes::from_static(b"journalled-bytes")
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// B4-07 Done-when-1: fill the in-memory rule queue through the broker
+    /// path, spill to disk rather than erroring, replay in order.
+    ///
+    /// Publishes via `ingress_pipeline` (the same connect/publish/deliver
+    /// path MQTT takes, never a direct store call). Each ingress mirrors
+    /// a durability copy through `RuleEngine::dispatch_ingress` into the
+    /// bounded input queue behind `push`/`try_push` (writes
+    /// `crates/broker-rules/src/spill.rs:580` `SpillLog::spill`, replays
+    /// `crates/broker-rules/src/spill.rs:637` `SpillLog::replay_one`,
+    /// driven by the rule-ingress event). Capacity 2 plus four publishes
+    /// yields two memory enqueues and two disk spills; draining via
+    /// `next_event` (the pressure-ease consumer, also driven by the
+    /// broker spill task in prod) returns memory first, then disk, oldest
+    /// first. Live rule matching still runs inline during the same
+    /// publishes.
+    #[tokio::test]
+    async fn rule_spill_broker_path_spills_and_replays_in_order() {
+        let dir = {
+            static SLOT: AtomicU64 = AtomicU64::new(0);
+            let slot = SLOT.fetch_add(1, Ordering::SeqCst);
+            std::env::temp_dir().join(format!(
+                "indramqtt-rule-spill-broker-{}-{slot}",
+                std::process::id()
+            ))
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        let mut shared = Shared::new();
+        let spill_engine = RuleEngine::new_with_spill(2, dir.clone()).expect("spill engine opens");
+        spill_engine.set_metrics(&shared.metrics);
+        spill_engine.set_broker_sink(shared.sink.clone());
+        shared.engine = Arc::new(spill_engine);
+        shared
+            .engine
+            .create_rule(
+                "spill-broker-probe".to_string(),
+                TopicFilter::new("spill/+").unwrap(),
+                None,
+                true,
+                vec![broker_rules::RuleAction::Log],
+            )
+            .expect("rule creates");
+        let topic = Topic::new("spill/probe").unwrap();
+        for payload in [
+            Bytes::from_static(b"one"),
+            Bytes::from_static(b"two"),
+            Bytes::from_static(b"three"),
+            Bytes::from_static(b"four"),
+        ] {
+            // Real broker ingress, not `engine.input().push`.
+            let _ = ingress_pipeline(&shared, &topic, QoS::AtMostOnce, false, &payload).await;
+        }
+        let stats = shared.engine.spill_stats();
+        assert_eq!(stats.spilled, 2, "overflow spills, never errors: {stats:?}");
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(shared.engine.input().spill_backlog_len(), 2);
+        for want in [
+            Bytes::from_static(b"one"),
+            Bytes::from_static(b"two"),
+            Bytes::from_static(b"three"),
+            Bytes::from_static(b"four"),
+        ] {
+            let event = shared
+                .engine
+                .input()
+                .next_event()
+                .await
+                .expect("replay delivers in order");
+            assert_eq!(event.payload, want);
+        }
+        let stats = shared.engine.spill_stats();
+        assert_eq!(stats.spilled, 2);
+        assert_eq!(stats.replayed, 2);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(shared.engine.input().spill_backlog_len(), 0);
+        assert_eq!(shared.metrics.rule_spill_spilled(), 2);
+        assert_eq!(shared.metrics.rule_spill_replayed(), 2);
+        assert_eq!(shared.metrics.rule_spill_dropped(), 0);
+        shared.engine.input().sync_spill().expect("sync");
         std::fs::remove_dir_all(&dir).ok();
     }
     #[test]

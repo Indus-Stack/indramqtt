@@ -416,7 +416,8 @@ pub const DEFAULT_QOS0_BACKLOG: usize = 1_000;
 
 /// True when `frame` is a QoS 0 `PublishOut` (the only sheddable shape).
 /// Parses the `PublishOut` meta `TopicLen:16be | Topic | PacketId:16be |
-/// QoS:8 | Retain:8 | Dup:8`; anything unparseable is not QoS 0 so a
+/// QoS:8 | Retain:8 | Dup:8`, optionally followed by the B4-05 alias
+/// section `Alias:16be`; anything unparseable is not QoS 0 so a
 /// malformed frame can never trigger a shed of guaranteed traffic.
 pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
     if frame.header.opcode != OpCode::PublishOut {
@@ -427,7 +428,8 @@ pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
         return false;
     }
     let topic_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
-    if meta.len() != 2 + topic_len + 5 {
+    let old_len = 2 + topic_len + 5;
+    if meta.len() != old_len && meta.len() != old_len + 2 {
         return false;
     }
     meta[2 + topic_len + 2] == 0

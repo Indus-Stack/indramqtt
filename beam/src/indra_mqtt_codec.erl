@@ -26,8 +26,28 @@
          packet_type_atom/1,
          packet_type_code/1]).
 
+%% Topic-alias property helpers (B4-05, CONNECT/CONNACK/PUBLISH only).
+%% The edge speaks 3.1.1 on the wire (see decode_connect/1): these
+%% helpers frame the alias properties the kernel negotiates so both
+%% sides share one layout. Table ownership: the kernel session holds
+%% both tables; CONNECT writes the two maxima, PUBLISH writes inbound
+%% entries, delivery writes outbound entries.
+-export([encode_alias_maximum/1,
+         decode_alias_maximum/1,
+         encode_topic_alias/1,
+         decode_topic_alias/1,
+         alias_in_range/2]).
+
 -define(MAX_REMAINING, 268435455).
 -define(MAX_TOPIC_LEN, 65535).
+%% Property identifiers (CONNECT/CONNACK/PUBLISH properties).
+-define(ALIAS_MAXIMUM_PROPERTY_ID, 34).
+%% Property identifier for the PUBLISH alias property.
+-define(TOPIC_ALIAS_PROPERTY_ID, 35).
+%% Reason code rejecting an unusable alias.
+-define(REASON_TOPIC_ALIAS_INVALID, 16#94).
+%% Largest alias value the wire format carries (u16, minus 0).
+-define(MAX_TOPIC_ALIAS, 65535).
 
 -type packet_map() :: #{type := 1..14,
                         type_atom := atom(),
@@ -53,6 +73,7 @@
                          qos := 0..2,
                          retain := boolean(),
                          dup := boolean(),
+                         alias := 0..65535,
                          payload := binary()}.
 
 %%====================================================================
@@ -283,6 +304,40 @@ encode_pubcomp(PacketId)
   when is_integer(PacketId), PacketId >= 1, PacketId =< 65535 ->
     <<16#70, 16#02, PacketId:16/big>>.
 
+%% @doc Encode a Topic Alias Maximum property value (u16, big-endian).
+-spec encode_alias_maximum(0..65535) -> binary().
+encode_alias_maximum(Max)
+  when is_integer(Max), Max >= 0, Max =< ?MAX_TOPIC_ALIAS ->
+    <<Max:16/big>>.
+
+%% @doc Decode a Topic Alias Maximum property value.
+-spec decode_alias_maximum(binary()) -> {ok, 0..65535} | {error, term()}.
+decode_alias_maximum(<<Max:16/big>>) ->
+    {ok, Max};
+decode_alias_maximum(_) ->
+    {error, malformed_alias_maximum}.
+
+%% @doc Encode a PUBLISH Topic Alias property value (u16, big-endian).
+-spec encode_topic_alias(0..65535) -> binary().
+encode_topic_alias(Alias)
+  when is_integer(Alias), Alias >= 0, Alias =< ?MAX_TOPIC_ALIAS ->
+    <<Alias:16/big>>.
+
+%% @doc Decode a PUBLISH Topic Alias property value.
+-spec decode_topic_alias(binary()) -> {ok, 0..65535} | {error, term()}.
+decode_topic_alias(<<Alias:16/big>>) ->
+    {ok, Alias};
+decode_topic_alias(_) ->
+    {error, malformed_topic_alias}.
+
+%% @doc True when Alias may be used under Max (1..=Max, Max > 0).
+-spec alias_in_range(0..65535, 0..65535) -> boolean().
+alias_in_range(0, _) -> false;
+alias_in_range(_, 0) -> false;
+alias_in_range(Alias, Max)
+  when is_integer(Alias), is_integer(Max) ->
+    Alias =< Max.
+
 %% @doc Map a 4-bit packet type code to its atom name.
 -spec packet_type_atom(0..15) -> atom().
 packet_type_atom(1) -> connect;
@@ -371,11 +426,15 @@ validate_suback_codes([C | Rest]) when C >= 0, C =< 2 -> validate_suback_codes(R
 validate_suback_codes(_) -> erlang:error(badarg).
 
 decode_publish_tail(0, Topic, Dup, Retain, AppPayload) ->
+    %% B4-05: the 3.1.1 wire carries no alias property yet, so the edge
+    %% always reports alias 0 here. Wire properties are TODO(parity): the
+    %% kernel inbound table only sees alias 0 from this edge until then.
     {ok, #{topic => Topic,
            packet_id => 0,
            qos => 0,
            retain => Retain,
            dup => Dup,
+           alias => 0,
            payload => AppPayload}};
 decode_publish_tail(Qos, Topic, Dup, Retain, Tail) ->
     case Tail of
@@ -385,6 +444,7 @@ decode_publish_tail(Qos, Topic, Dup, Retain, Tail) ->
                    qos => Qos,
                    retain => Retain,
                    dup => Dup,
+                   alias => 0,
                    payload => AppPayload}};
         _ ->
             {error, malformed_publish_packet_id}

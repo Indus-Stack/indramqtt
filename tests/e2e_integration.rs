@@ -1037,8 +1037,14 @@ fn shard_encode_bind(client_id: &str, clean_start: bool, keepalive: u16) -> byte
 }
 
 /// Decode `SessionBinding` metadata into `(session_id, present, rc)`.
+/// Accepts 10-byte (pre-alias) and 12-byte (B4-05 with trailing Topic
+/// Alias Maximum) encodings.
 fn shard_decode_binding(meta: &[u8]) -> (u64, bool, u8) {
-    assert_eq!(meta.len(), 10, "SessionBinding meta must be 10 bytes");
+    assert!(
+        meta.len() == 10 || meta.len() == 12,
+        "SessionBinding meta must be 10 bytes, got {}",
+        meta.len()
+    );
     let session_id = u64::from_be_bytes(meta[0..8].try_into().unwrap());
     (session_id, meta[8] != 0, meta[9])
 }

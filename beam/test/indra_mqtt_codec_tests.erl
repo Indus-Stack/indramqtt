@@ -502,3 +502,38 @@ connack_return_code_maps_kernel_reason_codes_test() ->
     ?assertEqual(4, indra_mqtt_codec:connack_return_code(16#86)),
     ?assertEqual(5, indra_mqtt_codec:connack_return_code(16#87)),
     ?assertEqual(3, indra_mqtt_codec:connack_return_code(16#8B)).
+
+alias_property_helpers_roundtrip_test() ->
+    %% Topic Alias Maximum property values round-trip (B4-05).
+    lists:foreach(fun(Max) ->
+                          ?assertEqual({ok, Max},
+                                       indra_mqtt_codec:decode_alias_maximum(
+                                         indra_mqtt_codec:encode_alias_maximum(Max)))
+                  end, [0, 1, 10, 65535]),
+    ?assertEqual({error, malformed_alias_maximum},
+                 indra_mqtt_codec:decode_alias_maximum(<<0>>)),
+    %% Topic Alias property values round-trip.
+    lists:foreach(fun(Alias) ->
+                          ?assertEqual({ok, Alias},
+                                       indra_mqtt_codec:decode_topic_alias(
+                                         indra_mqtt_codec:encode_topic_alias(Alias)))
+                  end, [0, 1, 7, 65535]),
+    ?assertEqual({error, malformed_topic_alias},
+                 indra_mqtt_codec:decode_topic_alias(<<>>)).
+
+alias_in_range_rejects_zero_and_over_max_test() ->
+    ?assertEqual(false, indra_mqtt_codec:alias_in_range(0, 10)),
+    ?assertEqual(false, indra_mqtt_codec:alias_in_range(1, 0)),
+    ?assertEqual(false, indra_mqtt_codec:alias_in_range(11, 10)),
+    ?assertEqual(true, indra_mqtt_codec:alias_in_range(1, 10)),
+    ?assertEqual(true, indra_mqtt_codec:alias_in_range(10, 10)).
+
+decode_publish_reports_zero_alias_test() ->
+    %% The 3.1.1 wire carries no alias property yet, so the edge always
+    %% reports alias 0 (B4-05 tables only see alias 0 from this edge).
+    Body = <<0, 1, "t", "hi">>,
+    Bin = <<16#30, (byte_size(Body)), Body/binary>>,
+    {ok, Pkt, <<>>} = indra_mqtt_codec:decode_packet(Bin),
+    {ok, Pub} = indra_mqtt_codec:decode_publish(maps:get(payload, Pkt),
+                                                maps:get(flags, Pkt)),
+    ?assertEqual(0, maps:get(alias, Pub)).

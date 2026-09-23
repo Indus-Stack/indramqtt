@@ -697,7 +697,10 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
                username := User, password := Pass}} ->
             %% The peer address rides the bind so the kernel can refuse
             %% address-banned clients (B1-03); a bind without it simply
-            %% matches no address ban, never fails.
+            %% matches no address ban, never fails. B4-05: no alias
+            %% section rides this bind (3.1.1 clients negotiate no
+            %% maximum), so the kernel outbound bound stays 0 and
+            %% deliveries toward them always carry the full topic.
             Meta = indra_brokerlink:encode_bind_meta(ClientId, CleanStart, Keepalive,
                                                      {User, Pass},
                                                      peer_ip_opt(Data)),
@@ -761,6 +764,10 @@ peer_ip(_, _) ->
 
 handle_session_binding(Meta, #{sock := Sock, sockmod := Mod} = Data) ->
     case indra_brokerlink:decode_session_binding_meta(Meta) of
+        %% B4-05: the binding carries the kernel alias maximum for
+        %% CONNACK negotiation, but the 3.1.1 CONNACK has no property
+        %% channel for it, so the edge answers without it (fail closed:
+        %% the client never sends aliases it was never told about).
         {ok, #{session_id := SessionId,
                session_present := Present,
                return_code := RC}} ->
@@ -980,10 +987,17 @@ handle_subscribe_packet(Payload, Data) ->
 handle_publish_packet(Payload, Flags, Data) ->
     case indra_mqtt_codec:decode_publish(Payload, Flags) of
         {ok, #{topic := Topic, packet_id := PacketId, qos := QoS,
-               retain := Retain, dup := Dup, payload := AppPayload}} ->
+               retain := Retain, dup := Dup, payload := AppPayload} = Pub} ->
             #{broker := Broker, conn_id := ConnId, seq := Seq,
               pubs_pending := Pending, qos2_pending := Qos2Pending} = Data,
-            Meta = indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup),
+            %% B4-05: the 3.1.1 wire carries no alias yet (the codec
+            %% reports alias 0; TODO(parity): wire v5 properties on the
+            %% socket are still open), so the kernel inbound table only
+            %% sees alias 0 from this edge until then. Forward whatever
+            %% the codec reports via the /6 form.
+            Alias = maps:get(alias, Pub, 0),
+            Meta = indra_brokerlink:encode_publish_meta(Topic, PacketId, QoS, Retain, Dup,
+                                                        Alias),
             case catch indra_brokerlink:send(Broker, ?PUBLISH_IN, ConnId, Seq + 1, Meta, AppPayload) of
                 ok when QoS =:= 1 ->
                     {ok, Data#{seq => Seq + 1,

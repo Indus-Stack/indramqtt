@@ -752,6 +752,7 @@ dependencies = [
  "base64 0.22.1",
  "broker-config",
  "broker-connectors",
+ "broker-observability",
  "broker-protocol",
  "bytes",
  "parking_lot",
@@ -771,6 +772,7 @@ name = "broker-session"
 version = "0.1.0"
 dependencies = [
  "broker-protocol",
+ "broker-storage",
  "bytes",
  "parking_lot",
  "serde",

@@ -388,6 +388,70 @@ unbind_meta_roundtrip_test() ->
                  indra_brokerlink:decode_unbind_meta(<<0, 4, "ab">>)).
 
 %%====================================================================
+%% Topic-alias metadata contracts (B4-05)
+%%====================================================================
+
+bind_meta_alias_roundtrip_test() ->
+    %% The /6 form appends the client's receive limit; the kernel
+    %% outbound table is bounded by it.
+    Meta = indra_brokerlink:encode_bind_meta(<<"dev-1">>, true, 60,
+                                            {undefined, undefined},
+                                            undefined, 10),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(Meta),
+    ?assertEqual(<<"dev-1">>, maps:get(client_id, Dec)),
+    ?assertEqual(10, maps:get(client_alias_max, Dec)),
+    ?assertEqual(undefined, maps:get(peerhost, Dec)),
+    %% With credentials and a peer address the alias still trails last.
+    Full = indra_brokerlink:encode_bind_meta(<<"dev-1">>, true, 60,
+                                            {<<"alice">>, <<"s3cret">>},
+                                            <<"192.0.2.10">>, 7),
+    {ok, FDec} = indra_brokerlink:decode_bind_meta(Full),
+    ?assertEqual(<<"alice">>, maps:get(username, FDec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, FDec)),
+    ?assertEqual(7, maps:get(client_alias_max, FDec)),
+    %% Legacy binds without the section decode with maximum 0.
+    {ok, LDec} = indra_brokerlink:decode_bind_meta(
+                   indra_brokerlink:encode_bind_meta(<<"dev-l">>, true, 60)),
+    ?assertEqual(0, maps:get(client_alias_max, LDec)).
+
+session_binding_alias_roundtrip_test() ->
+    %% The /4 form carries the kernel inbound bound for CONNACK
+    %% negotiation; the /3 form decodes with maximum 0.
+    Meta = indra_brokerlink:encode_session_binding_meta(99, true, 0, 10),
+    ?assertEqual(12, byte_size(Meta)),
+    {ok, Dec} = indra_brokerlink:decode_session_binding_meta(Meta),
+    ?assertEqual(99, maps:get(session_id, Dec)),
+    ?assertEqual(true, maps:get(session_present, Dec)),
+    ?assertEqual(0, maps:get(return_code, Dec)),
+    ?assertEqual(10, maps:get(alias_max, Dec)),
+    Legacy = indra_brokerlink:encode_session_binding_meta(99, false, 2),
+    {ok, LDec} = indra_brokerlink:decode_session_binding_meta(Legacy),
+    ?assertEqual(0, maps:get(alias_max, LDec)).
+
+publish_meta_alias_roundtrip_test() ->
+    %% The /6 form appends the alias; the /5 form decodes with alias 0.
+    Meta = indra_brokerlink:encode_publish_meta(<<"sport/tennis">>, 42, 1, true, false, 3),
+    {ok, Dec} = indra_brokerlink:decode_publish_meta(Meta),
+    ?assertEqual(<<"sport/tennis">>, maps:get(topic, Dec)),
+    ?assertEqual(42, maps:get(packet_id, Dec)),
+    ?assertEqual(3, maps:get(alias, Dec)),
+    %% Alias-by-reference: an empty topic with a nonzero alias decodes.
+    Ref = indra_brokerlink:encode_publish_meta(<<>>, 0, 0, false, false, 3),
+    {ok, RDec} = indra_brokerlink:decode_publish_meta(Ref),
+    ?assertEqual(<<>>, maps:get(topic, RDec)),
+    ?assertEqual(3, maps:get(alias, RDec)),
+    %% Legacy metas without the section decode with alias 0.
+    {ok, LDec} = indra_brokerlink:decode_publish_meta(
+                   indra_brokerlink:encode_publish_meta(<<"t">>, 0, 0, false, false)),
+    ?assertEqual(0, maps:get(alias, LDec)),
+    %% An empty topic without an alias stays malformed, and an empty
+    %% topic is rejected at encode time without one.
+    ?assertEqual({error, malformed_publish_meta},
+                 indra_brokerlink:decode_publish_meta(<<0, 0, 0, 0, 0, 0, 0>>)),
+    ?assertError(badarg,
+                 indra_brokerlink:encode_publish_meta(<<>>, 0, 0, false, false)).
+
+%%====================================================================
 %% Inbound dispatch through the connection registry (Sprint 3)
 %%====================================================================
 

@@ -40,19 +40,32 @@
          int_to_opcode/1]).
 
 %% BrokerLink metadata contracts (Sprint 2: connection handshake).
+%% B4-05 alias sections: the bind may carry a trailing
+%% `ClientAliasMax:16be' (the client's receive limit, bounding the
+%% kernel outbound table; absent means 0, never assign), and the session
+%% binding always carries a trailing `AliasMax:16be' (the kernel inbound
+%% bound advertised for CONNACK negotiation). Table ownership: the
+%% kernel session holds both tables; CONNECT writes the two maxima,
+%% PUBLISH writes inbound entries, delivery writes outbound entries.
 -export([encode_bind_meta/3,
          encode_bind_meta/4,
          encode_bind_meta/5,
+         encode_bind_meta/6,
          decode_bind_meta/1,
          encode_session_binding_meta/3,
+         encode_session_binding_meta/4,
          decode_session_binding_meta/1]).
 
 %% BrokerLink metadata contracts (Sprint 3: messaging loop).
+%% B4-05: publish meta may carry a trailing `Alias:16be' (0 or absent =
+%% no alias). An empty topic is accepted only with a nonzero alias
+%% (alias-by-reference).
 -export([encode_subscribe_meta/3,
          decode_subscribe_meta/1,
          encode_suback_meta/2,
          decode_suback_meta/1,
          encode_publish_meta/5,
+         encode_publish_meta/6,
          decode_publish_meta/1,
          encode_puback_meta/2,
          decode_puback_meta/1,
@@ -336,10 +349,12 @@ is_known_opcode(_) -> false.
                        keepalive := 0..65535,
                        username := binary() | undefined,
                        password := binary() | undefined,
-                       peerhost := binary() | undefined}.
+                       peerhost := binary() | undefined,
+                       client_alias_max := 0..65535}.
 -type session_binding_meta() :: #{session_id := non_neg_integer(),
                                   session_present := boolean(),
-                                  return_code := 0..255}.
+                                  return_code := 0..255,
+                                  alias_max := 0..65535}.
 
 %% @doc Encode BindConnection metadata for the given client parameters.
 -spec encode_bind_meta(binary(), boolean(), 0..65535) -> binary().
@@ -389,6 +404,20 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp)
 encode_bind_meta(_, _, _, _, _) ->
     erlang:error(badarg).
 
+%% @doc Encode BindConnection metadata with credentials, peer address
+%% and the client's Topic Alias Maximum (B4-05). The alias maximum is
+%% the client's receive limit bounding the kernel outbound table; 0 (or
+%% the /5 encoding without it) means the kernel never assigns an alias
+%% toward the client.
+-spec encode_bind_meta(binary(), boolean(), 0..65535,
+                       {binary() | undefined, binary() | undefined},
+                       binary() | undefined, 0..65535) -> binary().
+encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax)
+  when is_integer(ClientAliasMax),
+       ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
+    Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer),
+    <<Base/binary, ClientAliasMax:16/big>>.
+
 %% @private True when the binary is an IP literal (v4 or v6).
 is_peer_ip(PeerIp) when is_binary(PeerIp) ->
     case catch inet:parse_address(binary_to_list(PeerIp)) of
@@ -398,9 +427,39 @@ is_peer_ip(PeerIp) when is_binary(PeerIp) ->
 is_peer_ip(_) ->
     false.
 
-%% @doc Decode BindConnection metadata.
+%% @doc Decode BindConnection metadata, including the optional
+%% trailing B4-05 `ClientAliasMax:16be' alias section (absent means 0).
+%% A trailing section that is neither valid credentials/peer bytes nor
+%% credentials/peer bytes plus the 2-byte alias section is malformed
+%% (fail closed, never a guessed identity).
 -spec decode_bind_meta(binary()) -> {ok, bind_meta()} | {error, term()}.
 decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
+    case decode_bind_body(Rest, IdLen) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, _} ->
+            %% The last two bytes may be the alias section: the prefix
+            %% must decode exactly as a legacy bind.
+            Size = byte_size(Rest),
+            case Size >= 2 of
+                true ->
+                    PrefixSize = Size - 2,
+                    <<Prefix:PrefixSize/binary, AliasMax:16/big>> = Rest,
+                    case decode_bind_body(Prefix, IdLen) of
+                        {ok, Got} ->
+                            {ok, Got#{client_alias_max => AliasMax}};
+                        {error, _} = Err ->
+                            Err
+                    end;
+                false ->
+                    {error, malformed_bind_meta}
+            end
+    end;
+decode_bind_meta(_) ->
+    {error, malformed_bind_meta}.
+
+%% @private Decode the bind body without any alias section.
+decode_bind_body(Rest, IdLen) ->
     case Rest of
         <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big>> ->
             {ok, #{client_id => ClientId,
@@ -408,7 +467,8 @@ decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
                    keepalive => Keepalive,
                    username => undefined,
                    password => undefined,
-                   peerhost => undefined}};
+                   peerhost => undefined,
+                   client_alias_max => 0}};
         <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big, Tail/binary>> ->
             case decode_bind_creds(Tail) of
                 {ok, User, Pass, Peer} ->
@@ -417,15 +477,14 @@ decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
                            keepalive => Keepalive,
                            username => User,
                            password => Pass,
-                           peerhost => Peer}};
+                           peerhost => Peer,
+                           client_alias_max => 0}};
                 {error, _} = Err ->
                     Err
             end;
         _ ->
             {error, malformed_bind_meta}
-    end;
-decode_bind_meta(_) ->
-    {error, malformed_bind_meta}.
+    end.
 
 %% @private Decode the trailing sections after the fixed bind header:
 %% a credentials section, optionally followed by a peer-address
@@ -475,7 +534,8 @@ decode_peer_section(<<PLen:16/big, Rest/binary>>) ->
 decode_peer_section(_) ->
     error.
 
-%% @doc Encode SessionBinding metadata for the given session outcome.
+%% @doc Encode SessionBinding metadata for the given session outcome
+%% (pre-alias 10-byte form; decodes with alias maximum 0).
 -spec encode_session_binding_meta(non_neg_integer(), boolean(), 0..255) -> binary().
 encode_session_binding_meta(SessionId, SessionPresent, ReturnCode)
   when is_integer(SessionId), SessionId >= 0, SessionId =< 16#FFFFFFFFFFFFFFFF,
@@ -484,20 +544,41 @@ encode_session_binding_meta(SessionId, SessionPresent, ReturnCode)
     Present = case SessionPresent of true -> 1; false -> 0 end,
     <<SessionId:64/big, Present:8, ReturnCode:8>>.
 
-%% @doc Decode SessionBinding metadata.
+%% @doc Encode SessionBinding metadata with the B4-05 Topic Alias
+%% Maximum (12-byte form). The kernel always sends this form; the edge
+%% accepts both.
+-spec encode_session_binding_meta(non_neg_integer(), boolean(), 0..255, 0..65535) -> binary().
+encode_session_binding_meta(SessionId, SessionPresent, ReturnCode, AliasMax)
+  when is_integer(SessionId), SessionId >= 0, SessionId =< 16#FFFFFFFFFFFFFFFF,
+       is_boolean(SessionPresent),
+       is_integer(ReturnCode), ReturnCode >= 0, ReturnCode =< 255,
+       is_integer(AliasMax), AliasMax >= 0, AliasMax =< 65535 ->
+    Present = case SessionPresent of true -> 1; false -> 0 end,
+    <<SessionId:64/big, Present:8, ReturnCode:8, AliasMax:16/big>>.
+
+%% @doc Decode SessionBinding metadata (10-byte pre-alias form decodes
+%% with alias maximum 0, 12-byte form carries it).
 -spec decode_session_binding_meta(binary()) ->
     {ok, session_binding_meta()} | {error, term()}.
 decode_session_binding_meta(<<SessionId:64/big, Present:8, RC:8>>) ->
-    case Present of
-        0 -> {ok, #{session_id => SessionId,
-                    session_present => false,
-                    return_code => RC}};
-        1 -> {ok, #{session_id => SessionId,
-                    session_present => true,
-                    return_code => RC}};
-        _ -> {error, malformed_session_binding_meta}
-    end;
+    decode_session_present(SessionId, Present, RC, 0);
+decode_session_binding_meta(<<SessionId:64/big, Present:8, RC:8, AliasMax:16/big>>) ->
+    decode_session_present(SessionId, Present, RC, AliasMax);
 decode_session_binding_meta(_) ->
+    {error, malformed_session_binding_meta}.
+
+%% @private Share the Present-bit validation between both encodings.
+decode_session_present(SessionId, 0, RC, AliasMax) ->
+    {ok, #{session_id => SessionId,
+            session_present => false,
+            return_code => RC,
+            alias_max => AliasMax}};
+decode_session_present(SessionId, 1, RC, AliasMax) ->
+    {ok, #{session_id => SessionId,
+            session_present => true,
+            return_code => RC,
+            alias_max => AliasMax}};
+decode_session_present(_, _, _, _) ->
     {error, malformed_session_binding_meta}.
 
 %%====================================================================
@@ -540,7 +621,8 @@ decode_session_binding_meta(_) ->
                           packet_id := 0..65535,
                           qos := 0..2,
                           retain := boolean(),
-                          dup := boolean()}.
+                          dup := boolean(),
+                          alias := 0..65535}.
 -type puback_meta() :: #{packet_id := 1..65535,
                          return_code := 0..255}.
 
@@ -591,28 +673,54 @@ decode_suback_meta(_) ->
     {error, malformed_suback_meta}.
 
 %% @doc Encode PublishMeta (both PublishIn and PublishOut directions).
+%% Pre-alias form (no trailing alias section, decodes as alias 0).
 -spec encode_publish_meta(binary(), 0..65535, 0..2, boolean(), boolean()) -> binary().
-encode_publish_meta(Topic, PacketId, QoS, Retain, Dup)
-  when is_binary(Topic), byte_size(Topic) >= 1,
+encode_publish_meta(Topic, PacketId, QoS, Retain, Dup) ->
+    encode_publish_meta(Topic, PacketId, QoS, Retain, Dup, 0).
+
+%% @doc Encode PublishMeta with a B4-05 topic alias (0 = no alias). An
+%% empty topic is accepted only with a nonzero alias
+%% (alias-by-reference). The topic itself always travels in full next to
+%% the alias so a pre-alias peer still delivers correctly.
+-spec encode_publish_meta(binary(), 0..65535, 0..2, boolean(), boolean(), 0..65535) -> binary().
+encode_publish_meta(Topic, PacketId, QoS, Retain, Dup, Alias)
+  when is_binary(Topic),
        is_integer(PacketId), PacketId >= 0, PacketId =< 65535,
        (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
-       is_boolean(Retain), is_boolean(Dup) ->
+       is_boolean(Retain), is_boolean(Dup),
+       is_integer(Alias), Alias >= 0, Alias =< 65535 ->
+    true = (byte_size(Topic) >= 1 orelse Alias =/= 0) orelse erlang:error(badarg),
     R = case Retain of true -> 1; false -> 0 end,
     D = case Dup of true -> 1; false -> 0 end,
-    <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big, QoS:8, R:8, D:8>>.
+    <<(byte_size(Topic)):16/big, Topic/binary, PacketId:16/big, QoS:8, R:8, D:8,
+      Alias:16/big>>.
 
-%% @doc Decode PublishMeta.
+%% @doc Decode PublishMeta (pre-alias form decodes with alias 0, B4-05
+%% form carries the trailing alias; an empty topic is accepted only with
+%% a nonzero alias).
 -spec decode_publish_meta(binary()) -> {ok, publish_meta()} | {error, term()}.
-decode_publish_meta(<<TopicLen:16/big, Rest/binary>>) when TopicLen > 0 ->
+decode_publish_meta(<<TopicLen:16/big, Rest/binary>>) ->
     case Rest of
         <<Topic:TopicLen/binary, PacketId:16/big, QoS:8, R:8, D:8>>
           when (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
-               (R =:= 0 orelse R =:= 1), (D =:= 0 orelse D =:= 1) ->
+               (R =:= 0 orelse R =:= 1), (D =:= 0 orelse D =:= 1),
+               (TopicLen > 0) ->
             {ok, #{topic => Topic,
                    packet_id => PacketId,
                    qos => QoS,
                    retain => R =:= 1,
-                   dup => D =:= 1}};
+                   dup => D =:= 1,
+                   alias => 0}};
+        <<Topic:TopicLen/binary, PacketId:16/big, QoS:8, R:8, D:8, Alias:16/big>>
+          when (QoS =:= 0 orelse QoS =:= 1 orelse QoS =:= 2),
+               (R =:= 0 orelse R =:= 1), (D =:= 0 orelse D =:= 1),
+               (TopicLen > 0 orelse Alias =/= 0) ->
+            {ok, #{topic => Topic,
+                   packet_id => PacketId,
+                   qos => QoS,
+                   retain => R =:= 1,
+                   dup => D =:= 1,
+                   alias => Alias}};
         _ ->
             {error, malformed_publish_meta}
     end;

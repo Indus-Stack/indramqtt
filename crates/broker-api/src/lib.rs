@@ -156,6 +156,12 @@ impl ApiState {
         if let Err(error) = engine.seed_from_registry(&config) {
             panic!("invalid stored rules snapshot: {error}");
         }
+        // Rule spill accounting (B4-07): mirror the shared engine's
+        // ingress spill counters into these metrics. First attach wins,
+        // so a kernel-shared engine keeps the kernel's mirror while
+        // standalone engines report here; memory-only inputs only ever
+        // count refusals.
+        engine.set_metrics(&metrics);
         // Boot replay (W0-23): merge the persisted connectors into the
         // v5 store and re-register every live sink through the same path
         // `create_connector` uses. An empty snapshot is a no-op (today's
