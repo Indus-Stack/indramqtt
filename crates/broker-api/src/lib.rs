@@ -3098,6 +3098,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_authz_cache_read_clear_round_trip() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Connect through the broker: the console CONNECT creates the
+        // session, so the cache starts life empty. An empty cache reads
+        // as an empty list.
+        let mut subscriber = WsClient::connect(server.port).await;
+        subscriber
+            .send_bin(&mqtt_connect("w2-01-cache-1", None, None))
+            .await;
+        let connack = subscriber.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // Populate through normal authorized activity through the broker:
+        // a console SUBSCRIBE (real subscribe authorization) plus a
+        // console PUBLISH from a second connection (real publish
+        // authorization) that delivers to the subscriber.
+        subscriber
+            .send_bin(&mqtt_subscribe(7, &[("conf/authz/1", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+        let mut publisher = WsClient::connect(server.port).await;
+        publisher
+            .send_bin(&mqtt_connect("w2-01-cache-2", None, None))
+            .await;
+        let connack = publisher.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        publisher
+            .send_bin(&mqtt_publish("conf/authz/1", 0, 0, b"hi"))
+            .await;
+        // Deliver proves the publish rode the broker route path.
+        let delivery = subscriber.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+
+        // Read-hit shape: each decision present with per-entry fields.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        let subscribe = entries
+            .iter()
+            .find(|e| e["topic"] == json!("conf/authz/1"))
+            .expect("subscribe decision present");
+        assert_eq!(subscribe["access"]["action_type"], json!("subscribe"));
+        assert_eq!(subscribe["result"], json!("allow"));
+        assert!(subscribe["updated_time"].is_number());
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-01-cache-2/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        let publish = entries
+            .iter()
+            .find(|e| e["topic"] == json!("conf/authz/1"))
+            .expect("publish decision present");
+        assert_eq!(publish["access"]["action_type"], json!("publish"));
+        assert_eq!(publish["result"], json!("allow"));
+        assert!(publish["updated_time"].is_number());
+
+        // Unknown query keys are ignored, not a 400.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w2-01-cache-1/authorization/cache?unknown_param=1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("list").len(), 1);
+
+        // Clear evicts; the next read is empty. Clearing again still
+        // succeeds (204).
+        let (status, _) = server
+            .delete_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, _) = server
+            .delete_auth("/api/v5/clients/w2-01-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // Unknown client ids are 404 with the documented error shape.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/no-such-client/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+        assert!(body["message"].is_string());
+        let (status, body) = server
+            .delete_auth("/api/v5/clients/no-such-client/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+        assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
     async fn banned_create_list_clear_round_trip() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;

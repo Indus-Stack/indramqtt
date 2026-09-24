@@ -2593,9 +2593,22 @@ async fn apply_subscribe(
             .await
             .is_err()
         {
+            // Per-client decision cache (W2-01): record the denial so the
+            // management read observes it. One bounded per-session insert
+            // on the subscribe authorization event only; delivery never
+            // touches this lock.
+            if let Some(session) = shared.sessions.get(&client_id) {
+                session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, false);
+            }
             // MQTT 5 style "Not Authorized"; registers nothing.
             codes.push(0x87);
             continue;
+        }
+        // Per-client decision cache (W2-01): record the grant alongside
+        // the session mirror below. Same bounded per-session insert, same
+        // event; delivery never touches this lock.
+        if let Some(session) = shared.sessions.get(&client_id) {
+            session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, true);
         }
         shared.router.subscribe(
             &filter,
@@ -3013,7 +3026,8 @@ async fn apply_publish(
         // lock that returns after a length check when no bans exist, one
         // short scan otherwise (QoS 1 timings before/after are in the
         // B1-03 report). Denied publishes die exactly like ACL denials.
-        let (username, peerhost) = match shared.sessions.get(&publisher) {
+        let session_opt = shared.sessions.get(&publisher);
+        let (username, peerhost) = match session_opt.as_ref() {
             Some(session) => (
                 session.username.read().clone(),
                 session.peerhost.read().clone(),
@@ -3031,12 +3045,19 @@ async fn apply_publish(
             };
             return (ack, Vec::new());
         }
-        if shared
+        let allowed = shared
             .auth
             .authorize_publish(&publisher, &topic)
             .await
-            .is_err()
-        {
+            .is_ok();
+        // Per-client decision cache (W2-01): record the publish decision
+        // so the management read observes edge publishers. One bounded
+        // per-session insert on the publish authorization event only;
+        // delivery never touches this lock.
+        if let Some(session) = session_opt.as_ref() {
+            session.record_authz_decision("publish", topic.as_str(), qos_raw, retain, allowed);
+        }
+        if !allowed {
             let ack = match qos {
                 QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
                 QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
@@ -4341,12 +4362,22 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     {
         return Vec::new();
     }
-    if shared
+    // Per-client decision cache (W2-01): record the will-publish decision
+    // like any other publish from this client. Same bounded per-session
+    // insert; delivery never touches this lock.
+    let will_allowed = shared
         .auth
         .authorize_publish(&client_id, &will.topic)
         .await
-        .is_err()
-    {
+        .is_ok();
+    session.record_authz_decision(
+        "publish",
+        will.topic.as_str(),
+        u8::from(will.qos),
+        will.retain,
+        will_allowed,
+    );
+    if !will_allowed {
         return Vec::new();
     }
     let deliveries = ingress_pipeline_with_publisher(

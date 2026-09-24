@@ -571,8 +571,32 @@ async fn handle_subscribe(
                     .await
                     .is_err()
                 {
+                    // Per-client decision cache (W2-01): record the denial
+                    // for the management read. Bounded per-session insert
+                    // on the console subscribe event only.
+                    if let Some(session) = state.sessions.get(&sess.client_id) {
+                        session.record_authz_decision(
+                            "subscribe",
+                            filter.as_str(),
+                            sub.qos,
+                            false,
+                            false,
+                        );
+                    }
                     0x87
                 } else {
+                    // Per-client decision cache (W2-01): record the grant
+                    // alongside the session mirror below. Same bounded
+                    // insert, same event.
+                    if let Some(session) = state.sessions.get(&sess.client_id) {
+                        session.record_authz_decision(
+                            "subscribe",
+                            filter.as_str(),
+                            sub.qos,
+                            false,
+                            true,
+                        );
+                    }
                     let qos = QoS::try_from(sub.qos).expect("validated above");
                     state.router.subscribe(
                         &filter,
@@ -627,12 +651,26 @@ async fn handle_publish(
         return Ok(());
     }
     let topic = Topic::new(publish.topic.clone()).map_err(|_| ())?;
-    if state
+    // Per-client decision cache (W2-01): record the console publish
+    // decision for the management read. One bounded per-session insert
+    // on the console publish event only; delivery never touches it.
+    let publish_allowed = state
         .auth
         .authorize_publish(&sess.client_id, &topic)
         .await
-        .is_err()
-    {
+        .is_ok();
+    if let Some(session) = state.sessions.get(&sess.client_id) {
+        // Console publishes never carry retain (no retain flag on the
+        // console path), so the entry records `retain = false`.
+        session.record_authz_decision(
+            "publish",
+            topic.as_str(),
+            u8::from(publish.qos),
+            false,
+            publish_allowed,
+        );
+    }
+    if !publish_allowed {
         if publish.qos == QoS::AtLeastOnce {
             send_bin(socket, encode_puback(publish.packet_id)).await;
         }

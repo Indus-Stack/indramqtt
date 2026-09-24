@@ -729,6 +729,73 @@ pub async fn get_client_mqueue(
         .into_response()
 }
 
+/// Per-client authorization decision cache read (W2-01, C01-10).
+///
+/// Renders the decisions recorded on the session by the publish and
+/// subscribe authorization events as a bare list (no paging): each entry
+/// carries `access` (`action_type`, `qos`, `retain`), `topic`, `result`
+/// (`allow` or `deny`) and `updated_time` (millis since the Unix epoch).
+/// An empty cache returns `[]`, not an error; unknown client ids return
+/// the documented not-found shape. Unknown query keys are ignored: the
+/// handler takes no paging params so extra keys never become a 400.
+/// Management-plane read only: one short lock on the per-session cache,
+/// which the delivery fan-out path never touches.
+// TODO(parity): is the empty-cache shape a bare list or an envelope, and
+// does a disconnected-but-known session read as empty or as 404? The
+// rulebook does not decide the disconnected policy; current choice follows
+// the neighbouring per-client reads (known session returns, unknown 404).
+pub async fn get_client_authz_cache(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+    Query(_ignored): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let session = match state.sessions.get(&client_id) {
+        Some(session) => session,
+        None => {
+            return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+        }
+    };
+    // Bounded snapshot over real state: at most
+    // `MAX_AUTHZ_DECISIONS_PER_CLIENT` (1024) small entries, oldest first.
+    let data: Vec<serde_json::Value> = session
+        .authz_cache_snapshot()
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "access": {
+                    "action_type": entry.action,
+                    "qos": entry.qos,
+                    "retain": entry.retain,
+                },
+                "topic": entry.topic,
+                "result": if entry.allow { "allow" } else { "deny" },
+                "updated_time": entry.updated_ms,
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(data)).into_response()
+}
+
+/// Per-client authorization decision cache clear (W2-01, C01-09).
+///
+/// Evicts every cached decision for the client so a subsequent read shows
+/// empty; clearing an already-empty cache still succeeds (204). Unknown
+/// client ids return the documented not-found shape. A background map
+/// removal only: no work on the publish or deliver path.
+pub async fn clear_client_authz_cache(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+) -> Response {
+    let session = match state.sessions.get(&client_id) {
+        Some(session) => session,
+        None => {
+            return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+        }
+    };
+    session.clear_authz_cache();
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// Global subscription list as a bare array (W1-14).
 ///
 /// Reads the session-mirror index via

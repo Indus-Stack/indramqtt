@@ -161,6 +161,10 @@ pub fn protected_router() -> Router<ApiState> {
             get(clients::get_client_mqueue),
         )
         .route(
+            "/clients/:clientid/authorization/cache",
+            get(clients::get_client_authz_cache).delete(clients::clear_client_authz_cache),
+        )
+        .route(
             "/clients/:clientid/inflight_messages",
             get(clients::get_client_inflight),
         )

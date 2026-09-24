@@ -211,6 +211,12 @@ pub struct Session {
     /// `None` means the session predates timestamp recording; API reads
     /// must omit the field rather than substituting anything.
     pub connected_at_ms: RwLock<Option<u64>>,
+    /// Per-client authorization decision cache for the management read
+    /// (W2-01). Written on the publish/subscribe authorization event,
+    /// read and cleared from the management plane only. The delivery
+    /// fan-out path never touches this lock. Bounded by
+    /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] with oldest-first eviction.
+    pub authz_cache: RwLock<VecDeque<AuthzDecision>>,
     next_packet_id: AtomicU16,
 }
 
@@ -237,6 +243,27 @@ pub struct QueuedMessage {
     /// `None` means the entry predates timestamp recording; API reads
     /// must omit the field rather than substituting anything.
     pub publish_at_ms: Option<u64>,
+}
+
+/// One cached authorization decision for the per-client decision-cache
+/// read (W2-01). `action` is `publish` or `subscribe`; `topic` is the
+/// concrete publish topic or the subscription filter as requested;
+/// `qos` is the publish QoS (or the granted QoS for subscribes);
+/// `retain` is the publish retain flag (always false for subscribes);
+/// `allow` is the decision; `updated_ms` is millis since the Unix epoch
+/// recorded where the decision is written.
+// TODO(parity): should subscribe decisions be cached at all, and if so
+// with which `qos`/`retain` semantics? The rulebook does not decide the
+// subscribe-cache shape; current choice records both with the granted QoS
+// and `retain = false` so management reads observe every grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthzDecision {
+    pub action: String,
+    pub topic: String,
+    pub qos: u8,
+    pub retain: bool,
+    pub allow: bool,
+    pub updated_ms: u64,
 }
 
 /// One QoS 1 downlink held from the moment it is written toward a
@@ -358,6 +385,15 @@ pub struct Qos2OutboundEntry {
     pub rec_received: bool,
 }
 
+/// Maximum cached authorization decisions per client for the
+/// per-client decision-cache read (W2-01). Rationale: caps per-client
+/// cache memory near 1024 small entries (topic string plus a few bytes)
+/// so one chatty client cannot balloon the node, while holding a working
+/// set of recent publish topics; the oldest entry is evicted past the cap
+/// (LRU). The cache is enabled by default as a bounded map, never an
+/// unbounded list.
+pub const MAX_AUTHZ_DECISIONS_PER_CLIENT: usize = 1024;
+
 /// Maximum buffered messages per detached session; beyond this the
 /// oldest entry drops so one dead client cannot balloon the node.
 pub const MAX_OFFLINE_QUEUE: usize = 1024;
@@ -434,6 +470,7 @@ impl Session {
             username: RwLock::new(None),
             peerhost: RwLock::new(None),
             connected_at_ms: RwLock::new(Some(now_ms())),
+            authz_cache: RwLock::new(VecDeque::new()),
             next_packet_id: AtomicU16::new(1),
         }
     }
@@ -881,6 +918,58 @@ impl Session {
         for slot in self.outbound_aliases.write().iter_mut() {
             *slot = None;
         }
+    }
+
+    /// Record one authorization decision for the per-client decision-cache
+    /// read (W2-01). `action` is `publish` or `subscribe`; `topic` is the
+    /// concrete topic or filter; `qos`/`retain` ride with the entry so the
+    /// management read can render them without consulting the hot path.
+    /// A repeat of the same `(action, topic, qos, retain)` refreshes the
+    /// decision and recency instead of duplicating; past
+    /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] the oldest entry is evicted.
+    /// Called on the publish/subscribe authorization event only; the
+    /// delivery fan-out path never touches this lock, and management
+    /// reads take only this per-session lock.
+    pub fn record_authz_decision(
+        &self,
+        action: &str,
+        topic: &str,
+        qos: u8,
+        retain: bool,
+        allow: bool,
+    ) {
+        let mut cache = self.authz_cache.write();
+        if let Some(pos) = cache.iter().position(|e| {
+            e.action == action && e.topic == topic && e.qos == qos && e.retain == retain
+        }) {
+            cache.remove(pos);
+        }
+        cache.push_back(AuthzDecision {
+            action: action.to_string(),
+            topic: topic.to_string(),
+            qos,
+            retain,
+            allow,
+            updated_ms: now_ms(),
+        });
+        while cache.len() > MAX_AUTHZ_DECISIONS_PER_CLIENT {
+            cache.pop_front();
+        }
+    }
+
+    /// Ordered snapshot of cached authorization decisions, oldest first.
+    /// Management-plane read only; clones at most
+    /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] small entries under one short
+    /// lock and never touches the delivery path.
+    pub fn authz_cache_snapshot(&self) -> Vec<AuthzDecision> {
+        self.authz_cache.read().iter().cloned().collect()
+    }
+
+    /// Evict every cached authorization decision for this client.
+    /// Management-plane only (the clear route); a background map removal
+    /// that never runs on the publish or deliver path.
+    pub fn clear_authz_cache(&self) {
+        self.authz_cache.write().clear();
     }
 
     /// Buffer one message for later replay, evicting the oldest entry
