@@ -71,6 +71,14 @@ pub fn protected_router() -> Router<ApiState> {
                 .put(authn_chain::put_authn_entry)
                 .delete(authn_chain::delete_authn_entry),
         )
+        // Authentication (AuthN) position move: bounds-checked splice of
+        // one entry to a zero-based position on the real chain store.
+        // Management-plane only; the CONNECT path reads a lock-free
+        // snapshot and publish/deliver never touch this store.
+        .route(
+            "/authentication/:id/position/:position",
+            put(authn_chain::move_authn_position),
+        )
         // Authentication (AuthN) per-id status: liveness plus live
         // counters over the real chain entry. Management-plane only; the
         // CONNECT path attributes one verdict per connect and

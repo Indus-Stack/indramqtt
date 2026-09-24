@@ -116,6 +116,17 @@ pub enum ChainRemoveError {
     /// The registry commit or atomic save failed after validation.
     Persist(String),
 }
+
+/// Why [`AuthnChain::move_to_position`] refused a move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainMoveError {
+    /// No stored entry carries the requested `id`.
+    NotFound,
+    /// The position lies outside `0..len` (message names the valid range).
+    OutOfRange(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
 /// Per-authenticator live counters behind fixed-width atomics.
 ///
 /// One record per chain id: `total` counts every CONNECT verdict attributed
@@ -675,6 +686,65 @@ impl AuthnChain {
                 .map_err(|e| ChainRemoveError::Persist(e.to_string()))?;
         }
         Ok(removed)
+    }
+
+    /// Move the entry stored under `id` to zero-based `position`.
+    ///
+    /// Bounds-checked splice: `position` must lie in `0..len`, otherwise
+    /// the move is refused with `OutOfRange` and nothing is applied.
+    /// Unknown ids fail with `NotFound` and apply nothing. Moving to the
+    /// entry's current index is a no-op success. On success the stored
+    /// order, the lock-free CONNECT snapshot and the persisted registry
+    /// all move together, and the new order is returned.
+    /// Management-plane only: one short write lock per request; the
+    /// CONNECT path keeps reading its lock-free snapshot and
+    /// publish/deliver never touch this store.
+    // TODO(parity): is the position a zero-based index or one of the
+    // `front`/`rear`/`before:<id>`/`after:<id>` keywords? The rulebook
+    // does not decide the exact position vocabulary; the current choice
+    // implements the task's stated zero-based index assumption until the
+    // checker pins it.
+    pub fn move_to_position(
+        &self,
+        id: &str,
+        position: usize,
+    ) -> Result<Vec<AuthnEntry>, ChainMoveError> {
+        let _guard = self.save_lock.lock();
+        let (reordered, conf, moved) = {
+            let mut current = self.inner.write();
+            let Some(from) = current.iter().position(|e| e.id == id) else {
+                return Err(ChainMoveError::NotFound);
+            };
+            if position >= current.len() {
+                return Err(ChainMoveError::OutOfRange(format!(
+                    "position {position} is out of range for a chain of {} entries (valid 0..{})",
+                    current.len(),
+                    current.len().saturating_sub(1),
+                )));
+            }
+            if from == position {
+                return Ok(current.clone());
+            }
+            let entry = current.remove(from);
+            current.insert(position, entry);
+            let next = current.clone();
+            let conf = export_conf(&next);
+            conf.validate()
+                .map_err(|e| ChainMoveError::Persist(e.to_string()))?;
+            self.snapshot.store(Arc::new(next.clone()));
+            (next, conf, true)
+        };
+        if moved {
+            if let Some(registry) = self.registry.read().clone() {
+                registry
+                    .commit_authn_chain(conf)
+                    .map_err(|e| ChainMoveError::Persist(e.to_string()))?;
+                registry
+                    .save()
+                    .map_err(|e| ChainMoveError::Persist(e.to_string()))?;
+            }
+        }
+        Ok(reordered)
     }
 
     /// Number of stored entries.

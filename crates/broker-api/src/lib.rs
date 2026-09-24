@@ -5150,6 +5150,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authn_position_move_round_trip_rejects_out_of_range_and_persists() {
+        // Position-move through the broker management plane on the real
+        // chain store: create three entries, move the last to position 0,
+        // then list expecting the new order; an out-of-range position is
+        // rejected with the documented shape and moves nothing. Unknown
+        // ids miss with 404, malformed positions fail with 400, and the
+        // new order survives a restart. Management-plane only: one short
+        // write lock per move; the CONNECT path keeps reading its
+        // lock-free snapshot and publish/deliver never touch this store.
+        // Before this task the route itself was missing (bare 404).
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for backend in ["built_in_database", "mysql", "redis"] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/authentication",
+                    json!({"mechanism": "password_based", "backend": backend}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201, "create {backend}");
+        }
+
+        // Move the last entry to the front; the response reports the new
+        // order as a bare JSON array.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/password_based:redis/position/0",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let reported: Vec<String> = body
+            .as_array()
+            .expect("move reports the new order as an array")
+            .iter()
+            .map(|entry| {
+                entry["id"]
+                    .as_str()
+                    .expect("order entry carries an id")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            vec![
+                "password_based:redis".to_string(),
+                "password_based:built_in_database".to_string(),
+                "password_based:mysql".to_string(),
+            ]
+        );
+        // List reflects the same new order.
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let listed: Vec<String> = body["data"]
+            .as_array()
+            .expect("chain list is paged")
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("id").to_string())
+            .collect();
+        assert_eq!(listed, reported);
+
+        // An out-of-range position is a client error and moves nothing.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/password_based:redis/position/99",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let unchanged: Vec<String> = body["data"]
+            .as_array()
+            .expect("chain list")
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("id").to_string())
+            .collect();
+        assert_eq!(unchanged, reported);
+
+        // Unknown ids miss with the documented shape and move nothing.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/password_based:nowhere/position/0",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+
+        // Malformed positions are client errors and move nothing.
+        for bad in ["front", "-1", "1.5"] {
+            let (status, body) = server
+                .send(
+                    "PUT",
+                    &format!("/api/v5/authentication/password_based:redis/position/{bad}"),
+                    None,
+                    Some(&token),
+                )
+                .await;
+            assert_eq!(status, 400, "position {bad} must be rejected");
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let unchanged: Vec<String> = body["data"]
+            .as_array()
+            .expect("chain list")
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("id").to_string())
+            .collect();
+        assert_eq!(unchanged, reported);
+
+        // Persistence through the config registry: the moved order
+        // survives a rebuild from the same data dir.
+        let dir = unique_data_dir("authn-position");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        for backend in ["built_in_database", "mysql", "redis"] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/authentication",
+                    json!({"mechanism": "password_based", "backend": backend}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201, "persist case create {backend}");
+        }
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/password_based:redis/position/0",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let listed: Vec<String> = body["data"]
+            .as_array()
+            .expect("reloaded chain list")
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("id").to_string())
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                "password_based:redis".to_string(),
+                "password_based:built_in_database".to_string(),
+                "password_based:mysql".to_string(),
+            ]
+        );
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn authn_status_reports_live_counters_through_connect() {
         // Status over the real chain entry plus live CONNECT verdicts:
         // create one built-in entry, read the documented fields at zero,
