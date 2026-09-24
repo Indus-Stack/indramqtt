@@ -123,7 +123,9 @@ pub fn protected_router() -> Router<ApiState> {
         )
         .route(
             "/authentication/:id/users/:user_id",
-            put(auth::update_authn_user).delete(auth::delete_authn_user),
+            get(auth::get_authn_user)
+                .put(auth::update_authn_user)
+                .delete(auth::delete_authn_user),
         )
         .route(
             "/authentication/:id/import_users",

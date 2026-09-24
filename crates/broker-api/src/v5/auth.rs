@@ -900,20 +900,104 @@ fn parse_authn_user_body(value: &serde_json::Value) -> Result<(String, String), 
     Ok((user_id.to_string(), password.to_string()))
 }
 
-#[derive(Deserialize)]
-pub struct UpdateAuthnUserReq {
-    pub password: String,
+/// `GET /authentication/{id}/users/{user_id}`: read one user record.
+///
+/// Returns the stored `user_id` without credential secrets, or 404 with
+/// the documented `{code, message}` shape when either the authenticator
+/// id or the user id is unknown; a known non-built-in backend fails with
+/// `BAD_REQUEST` (stored-only backends never execute). The route is not
+/// paged. Passwords are write-only and never rendered.
+/// Management-plane only: at most two short read locks per request (chain
+/// entry plus user-map presence); the CONNECT path keeps reading under
+/// its own short locks (`MemoryAuth::authenticate` in
+/// `crates/broker-auth/src/lib.rs`, driven by CONNECT in
+/// `crates/broker-node/src/main.rs`) and publish/deliver never touch
+/// this store.
+// TODO(parity): which per-user fields beyond `user_id` does the detail
+// require (superuser flag, creation time)? The rulebook does not decide
+// the exact record shape; fields the broker does not track are omitted
+// rather than invented.
+pub async fn get_authn_user(
+    State(state): State<ApiState>,
+    Path((id, user_id)): Path<(String, String)>,
+) -> Response {
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
+    if !state.auth.has_user(&user_id) {
+        return ApiError::NotFound(format!("user {user_id:?} not found")).into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "user_id": user_id
+        })),
+    )
+        .into_response()
 }
 
+/// `PUT /authentication/{id}/users/{user_id}`: replace one user's credential.
+///
+/// The body must be a JSON object with a non-empty string `password`
+/// (at most [`MAX_PASSWORD_BYTES`] bytes); anything else fails with
+/// `BAD_REQUEST` in the documented `{code, message}` shape and applies
+/// nothing. Unknown authenticator ids and unknown user ids both fail
+/// with `NOT_FOUND` and create nothing; a known non-built-in backend
+/// fails with `BAD_REQUEST`. On success returns 200 with the stored
+/// `user_id` (never the password). The password is hashed under the
+/// configured policy before storing; plaintext never persists. The write
+/// persists across a restart through the config registry. The route is
+/// not paged.
+/// Management-plane only: one short existence check plus the user-map
+/// write lock (plus the registry save lock on persist); the CONNECT path
+/// keeps reading under short read locks and publish/deliver never touch
+/// this store. The map is bounded by [`MAX_AUTHN_USERS`] (100,000
+/// entries: each entry holds a verifier plus map overhead, so an
+/// unbounded map lets one management batch exhaust the kernel); an
+/// update replaces in place and never grows the map toward the cap.
 pub async fn update_authn_user(
     State(state): State<ApiState>,
-    Path((_id, user_id)): Path<(String, String)>,
-    Json(req): Json<UpdateAuthnUserReq>,
+    Path((id, user_id)): Path<(String, String)>,
+    body: Bytes,
 ) -> Response {
-    if let Err(error) = state
-        .auth
-        .add_user(user_id.clone(), req.password.as_bytes())
-    {
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid user body: {e}")).into_response();
+        }
+    };
+    let password = match parse_authn_password_body(&value) {
+        Ok(password) => password,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    if !state.auth.has_user(&user_id) {
+        return ApiError::NotFound(format!("user {user_id:?} not found")).into_response();
+    }
+    if let Err(error) = state.auth.add_user(user_id.clone(), password.as_bytes()) {
+        // Pre-validation above already rejected every client-side shape,
+        // so only the hashing/oversize failures stay client errors here;
+        // anything else is a persist failure and must never be silent.
+        let message = error.to_string();
+        if message.contains("exceeds") || message.contains("cannot be hashed") {
+            return ApiError::BadRequest(message).into_response();
+        }
         return mqtt_persist_error(error);
     }
     (
@@ -923,6 +1007,30 @@ pub async fn update_authn_user(
         })),
     )
         .into_response()
+}
+
+/// Validate an update-user body into its new password.
+///
+/// The body must be a JSON object with a non-empty string `password`
+/// field within bounds. Extra fields are ignored so future record
+/// fields degrade to the same update instead of a 400.
+fn parse_authn_password_body(value: &serde_json::Value) -> Result<String, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "user body must be a JSON object".to_string())?;
+    let password = obj
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `password` is required".to_string())?;
+    if password.is_empty() {
+        return Err("field `password` must not be empty".to_string());
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(format!(
+            "field `password` exceeds {MAX_PASSWORD_BYTES} bytes"
+        ));
+    }
+    Ok(password.to_string())
 }
 
 /// `DELETE /authentication/{id}/users/{user_id}`: remove one user.
@@ -1553,5 +1661,156 @@ mod authn_users_tests {
         // The rulebook does not decide the exact code; the current choice
         // is 400 (stored-only backends never execute) until the checker
         // pins it.
+    }
+
+    #[tokio::test]
+    async fn detail_read_update_round_trip_through_connect_path() {
+        // Fails before W2-12: the detail read had no route (404 on every
+        // hit) and the update ignored the authenticator id, created
+        // unknown users and accepted bodies without validation.
+        let state = standalone_state();
+
+        let (status, _, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                body(serde_json::json!({"user_id": "w212-detail", "password": "DetailSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Read hits with the documented fields and no secrets.
+        let (status, fetched, raw) = parts(
+            get_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-detail".to_string())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched["user_id"], serde_json::json!("w212-detail"));
+        assert!(
+            fetched.get("password").is_none(),
+            "detail renders no password"
+        );
+        assert!(
+            fetched.get("password_hash").is_none(),
+            "detail renders no hash"
+        );
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("DetailSecret1!"),
+            "detail body carries no plaintext"
+        );
+
+        // Read misses are 404s with the documented shape, at both levels.
+        let (status, missing, _) = parts(
+            get_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-ghost".to_string())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        let (status, missing, _) = parts(
+            get_authn_user(
+                State(state.clone()),
+                Path((
+                    "password_based:nowhere".to_string(),
+                    "w212-detail".to_string(),
+                )),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+
+        // Update replaces the credential: the old secret stops working on
+        // the CONNECT path and the new one authenticates.
+        let (status, updated, _) = parts(
+            update_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-detail".to_string())),
+                body(serde_json::json!({"password": "DetailSecret2!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["user_id"], serde_json::json!("w212-detail"));
+        assert!(
+            updated.get("password").is_none(),
+            "update renders no password"
+        );
+        state
+            .auth
+            .authenticate("w212-client", Some("w212-detail"), Some(b"DetailSecret2!"))
+            .await
+            .expect("new credential authenticates on the CONNECT path");
+        assert!(
+            state
+                .auth
+                .authenticate("w212-client", Some("w212-detail"), Some(b"DetailSecret1!"))
+                .await
+                .is_err(),
+            "old credential fails closed after the update"
+        );
+
+        // Invalid updates are client errors and apply nothing: the current
+        // credential keeps working.
+        let (status, rejected, _) = parts(
+            update_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-detail".to_string())),
+                body(serde_json::json!({"user_id": "w212-detail"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejected["code"], serde_json::json!("BAD_REQUEST"));
+        state
+            .auth
+            .authenticate("w212-client", Some("w212-detail"), Some(b"DetailSecret2!"))
+            .await
+            .expect("rejected update applies nothing");
+
+        // Updating an unknown user creates nothing and returns 404.
+        let (status, missing, _) = parts(
+            update_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w212-ghost".to_string())),
+                body(serde_json::json!({"password": "GhostSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(
+            !state.auth.has_user("w212-ghost"),
+            "unknown update creates nothing"
+        );
+
+        // Unknown authenticator ids are 404s on both detail routes.
+        let (status, missing, _) = parts(
+            update_authn_user(
+                State(state.clone()),
+                Path((
+                    "password_based:nowhere".to_string(),
+                    "w212-detail".to_string(),
+                )),
+                body(serde_json::json!({"password": "DetailSecret3!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
     }
 }
