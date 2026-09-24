@@ -1205,8 +1205,15 @@ fn parse_import_batch(value: &serde_json::Value) -> Result<Vec<(String, String)>
 
 pub async fn list_authz_rules(
     State(state): State<ApiState>,
-    Path(_type): Path<String>,
+    Path(source_type): Path<String>,
 ) -> Response {
+    // Unknown source types are 404 with the documented shape; they never
+    // serve the built-in table (W2-17, C04-10: unknown types referenced
+    // elsewhere return 404). Known types keep today's behaviour.
+    if !broker_config::is_known_authz_source_type(&source_type) {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    }
     let rules = state.auth.acl_rules();
     let data: Vec<_> = rules
         .into_iter()
@@ -1251,9 +1258,15 @@ pub struct CreateAuthzRuleReq {
 
 pub async fn create_authz_rule(
     State(state): State<ApiState>,
-    Path(_type): Path<String>,
+    Path(source_type): Path<String>,
     Json(req): Json<CreateAuthzRuleReq>,
 ) -> Response {
+    // Unknown source types are 404 with the documented shape; they never
+    // write the built-in table. Known types keep today's behaviour.
+    if !broker_config::is_known_authz_source_type(&source_type) {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    }
     let client_pattern = req.clientid.unwrap_or_else(|| "*".to_string());
     let action = match AclAction::parse(&req.action) {
         Some(a) => a,
@@ -1272,8 +1285,14 @@ pub async fn create_authz_rule(
 
 pub async fn delete_authz_rule(
     State(state): State<ApiState>,
-    Path((_type, index)): Path<(String, usize)>,
+    Path((source_type, index)): Path<(String, usize)>,
 ) -> Response {
+    // Unknown source types are 404 with the documented shape; they never
+    // touch the built-in table. Known types keep today's behaviour.
+    if !broker_config::is_known_authz_source_type(&source_type) {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    }
     match state.auth.remove_rule(index) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),

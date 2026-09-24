@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use broker_auth::{
     Authenticator, AuthnChain, AuthnSettingsStore, Authorizer, AuthzNodeCache, AuthzSettingsStore,
-    DbAuthSet, DbAuthSetConfig, JwksAuthenticator, JwksConfig, KerberosAuthenticator,
-    KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth, NodeAuthCache, WebhookAuth,
-    WebhookConfig,
+    AuthzSourceRegistry, DbAuthSet, DbAuthSetConfig, JwksAuthenticator, JwksConfig,
+    KerberosAuthenticator, KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth,
+    NodeAuthCache, WebhookAuth, WebhookConfig,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
@@ -1956,6 +1956,14 @@ struct Shared {
     /// lock-free snapshot per request; publish and deliver never touch
     /// it. Enforcement lands with the rule-table tasks.
     authz_settings: Arc<AuthzSettingsStore>,
+    /// Ordered authorization source registry for W2-17: shared with the
+    /// management API so validated registry writes are visible to reads
+    /// without a restart. One `Arc` clone at boot; the kernel boot path
+    /// seeds it from the registry and management reads take one bounded
+    /// snapshot per request; publish and deliver never touch its write
+    /// lock. The built-in rule table it fronts (`MemoryAuth`) is
+    /// consulted by the publish and subscribe authorization events.
+    authz_sources: Arc<AuthzSourceRegistry>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -2189,6 +2197,7 @@ impl Shared {
             authn_settings,
             authz_node_cache: Arc::new(AuthzNodeCache::new()),
             authz_settings: Arc::new(AuthzSettingsStore::new()),
+            authz_sources: Arc::new(AuthzSourceRegistry::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -5539,6 +5548,12 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // ran inside `ApiState::new`; sharing replaces that fresh instance
     // with the kernel's so no second copy diverges.
     state.authz_settings = shared.authz_settings.clone();
+    // Share the authorization source registry (W2-17) so validated
+    // management writes are visible to reads without a restart. One
+    // `Arc` clone; management-plane only, never on the delivery path.
+    // Seeding already ran inside `ApiState::new`; sharing replaces that
+    // fresh instance with the kernel's so no second copy diverges.
+    state.authz_sources = shared.authz_sources.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -5709,6 +5724,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Enforcement lands with the rule-table tasks; the store itself is
     // management-plane only.
     shared.authz_settings.seed_from_registry(&shared.config);
+    // Authorization source registry (W2-17): seed the shared registry in
+    // place (the same instance `serve_api` shares with `ApiState`), so
+    // management reads observe the persisted sources from the first
+    // connection. Defaults yield the built-in database source.
+    shared.authz_sources.seed_from_registry(&shared.config);
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.

@@ -10,6 +10,7 @@ pub mod authz_cache;
 pub mod authz_node_cache;
 pub mod authz_node_status;
 pub mod authz_settings;
+pub mod authz_sources;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
@@ -173,6 +174,23 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/authorization/settings",
             get(authz_settings::get_authz_settings).put(authz_settings::put_authz_settings),
+        )
+        // Authorization (AuthZ / ACL) source registry plus the built-in
+        // catch-all clear (W2-17, C04-08..C04-10): ordered list with the
+        // standard page envelope, single-source register with
+        // validate-all-before-apply, and a clear that empties the
+        // built-in rule table. Management-plane only; publish and deliver
+        // never touch the registry (the built-in rule consult stays on
+        // the publish/subscribe path).
+        .route(
+            "/authorization/sources",
+            get(authz_sources::list_authz_sources).post(authz_sources::create_authz_source),
+        )
+        .route(
+            "/authorization/sources/built_in_database/rules",
+            get(authz_sources::list_built_in_rules)
+                .post(authz_sources::create_built_in_rule)
+                .delete(authz_sources::clear_built_in_rules),
         )
         // Authorization (AuthZ / ACL) rules
         .route(

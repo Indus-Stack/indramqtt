@@ -173,6 +173,19 @@ pub struct ApiState {
     /// rule-table tasks once they land. Publish and deliver never touch
     /// this store.
     pub authz_settings: Arc<broker_auth::AuthzSettingsStore>,
+    /// Ordered authorization source registry for `GET/POST
+    /// /api/v5/authorization/sources` (W2-17): bounded ordered list with
+    /// registry persistence plus a lock-free read snapshot. The routes
+    /// read one bounded snapshot per request; the kernel boot path seeds
+    /// the same instance from the registry
+    /// (`crates/broker-node/src/main.rs`, boot seeding); the built-in
+    /// catch-all clear empties the live rule table in `MemoryAuth`
+    /// (`crates/broker-auth/src/lib.rs`, `MemoryAuth::clear_rules`),
+    /// which the publish and subscribe authorization events consult
+    /// (`crates/broker-node/src/main.rs`, publish and subscribe
+    /// handling). Publish and deliver never touch this registry's write
+    /// lock.
+    pub authz_sources: Arc<broker_auth::AuthzSourceRegistry>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -243,6 +256,11 @@ impl ApiState {
         // decisions without a restart. Enforcement lands with the
         // rule-table tasks; the store itself is management-plane only.
         let authz_settings = Arc::new(broker_auth::AuthzSettingsStore::from_registry(&config));
+        // Boot seeding (W2-17): route the loaded authorization source
+        // registry into a shared registry so management reads observe
+        // the persisted sources from the first connection. Defaults
+        // yield the built-in database source.
+        let authz_sources = Arc::new(broker_auth::AuthzSourceRegistry::from_registry(&config));
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -286,6 +304,7 @@ impl ApiState {
             authn_settings,
             authz_node_cache,
             authz_settings,
+            authz_sources,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -343,6 +362,7 @@ impl ApiState {
             authn_settings,
             authz_node_cache: Arc::new(broker_auth::AuthzNodeCache::new()),
             authz_settings: Arc::new(broker_auth::AuthzSettingsStore::new()),
+            authz_sources: Arc::new(broker_auth::AuthzSourceRegistry::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -5072,10 +5092,10 @@ mod tests {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
-        for (method, path) in [
-            ("GET", "/api/v5/authentication/x"),
-            ("GET", "/api/v5/authorization/sources"),
-        ] {
+        // `GET /authorization/sources` is intentionally absent here: it
+        // was re-added on the real source registry by W2-17 (C04-08), so
+        // it answers 200 and is covered by the registry round-trip tests.
+        for (method, path) in [("GET", "/api/v5/authentication/x")] {
             let (status, _) = server
                 .request_raw(&format!(
                     "{method} {path} HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
@@ -5083,6 +5103,152 @@ mod tests {
                 .await;
             assert_eq!(status, 404, "{method} {path} must be gone");
         }
+    }
+
+    #[tokio::test]
+    async fn authz_sources_list_create_clear_round_trip() {
+        // Source registry plus list/create routes and the built-in
+        // catch-all clear (W2-17, C04-08..C04-10) through the broker:
+        // default list holds only the built-in source, create registers
+        // one stored-only source, duplicates are rejected, and the
+        // catch-all empties the built-in rule table. Before this task
+        // every route here was missing (bare 404).
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Default registry: only the built-in database source, empty
+        // collection shape (data plus meta), never an error.
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/sources", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["data"],
+            json!([{"type": "built_in_database", "enable": true}])
+        );
+        assert_eq!(body["meta"]["count"], json!(1));
+
+        // Register one stored-only source; only the built-in executes,
+        // the new entry is stored and reported without a live claim.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/authorization/sources",
+                json!({"type": "file", "config": {"path": "/etc/authz/rules.conf"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["type"], json!("file"));
+        assert_eq!(created["enable"], json!(true));
+
+        // List again: the entry is present in stored order.
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/sources", &token)
+            .await;
+        assert_eq!(status, 200);
+        let types: Vec<_> = body["data"]
+            .as_array()
+            .expect("data is a list")
+            .iter()
+            .map(|row| row["type"].clone())
+            .collect();
+        assert_eq!(types, vec![json!("built_in_database"), json!("file")]);
+        assert_eq!(body["meta"]["count"], json!(2));
+
+        // Re-creating the same type is a clean duplicate rejection, never
+        // a silent merge.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authorization/sources",
+                json!({"type": "file"}),
+                &token,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "duplicate source must be rejected, got: {body}"
+        );
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+
+        // Unknown source types are 404 with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authorization/sources",
+                json!({"type": "nowhere"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404, "unknown source type must be 404, got: {body}");
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // The catch-all clear reports success even with rules present.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules",
+                json!({"action": "publish", "topic": "w217/#", "permission": "deny"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        // Clearing again still succeeds.
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn authz_sources_survive_restart() {
+        // Registry persistence across a restart through the config
+        // registry: register through the broker, reload the same data
+        // dir in a fresh server, and read the sources back.
+        let dir = unique_data_dir("authz-sources");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authorization/sources",
+                json!({"type": "redis"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/sources", &token)
+            .await;
+        assert_eq!(status, 200);
+        let types: Vec<_> = body["data"]
+            .as_array()
+            .expect("data is a list")
+            .iter()
+            .map(|row| row["type"].clone())
+            .collect();
+        assert_eq!(types, vec![json!("built_in_database"), json!("redis")]);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

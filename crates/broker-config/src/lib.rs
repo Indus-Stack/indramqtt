@@ -1211,6 +1211,139 @@ impl AuthnChainConf {
     }
 }
 
+/// Upper bound for stored authorization sources. Writes past this size
+/// are rejected instead of growing the list without limit. Reason: the
+/// management plane snapshots the whole registry per request and the
+/// decision path scans at most the capped entries, so the registry must
+/// stay small and bounded; 8 covers the documented backend families with
+/// headroom while keeping per-request clones cheap.
+// TODO(parity): is 8 the documented source cap, or does the spec allow
+// more entries? The rulebook does not decide the exact bound; 8 is the
+// conservative choice until the conformance checker pins it.
+pub const MAX_AUTHZ_SOURCES: usize = 8;
+
+/// Authorization source types the kernel can store. Only
+/// `built_in_database` executes in the parity waves; every other type's
+/// config is stored and reported, never claimed as live. The set covers
+/// the password, JWT, LDAP, HTTP, Redis, SQL, Mongo and file families
+/// named for the authorization registries.
+// TODO(parity): which source types does the spec document (file versus
+// mongo versus mongodb spellings, jwt versus libs)? The rulebook does not
+// decide the exact set; the current choice mirrors the authenticator
+// backend families until the checker pins it.
+pub const KNOWN_AUTHZ_SOURCE_TYPES: &[&str] = &[
+    "built_in_database",
+    "mysql",
+    "postgresql",
+    "mongodb",
+    "redis",
+    "http",
+    "jwt",
+    "scram",
+    "ldap",
+    "file",
+];
+
+/// Returns true for an authorization source type the kernel can store.
+#[must_use]
+pub fn is_known_authz_source_type(source_type: &str) -> bool {
+    KNOWN_AUTHZ_SOURCE_TYPES.contains(&source_type)
+}
+
+/// One authorization source: the registry slot the management API lists
+/// and creates. `source_type` is the registry key (for example
+/// `built_in_database`); `enable` selects whether the slot participates;
+/// `config` carries the backend-specific fields as a JSON document (may
+/// be empty for the built-in database). Only `built_in_database`
+/// executes in the parity waves; every other type's config is stored and
+/// reported, never claimed as live.
+// TODO(parity): which per-source fields does the spec require beyond
+// type/enable (status, order, ...)? The rulebook does not decide the
+// exact shape; fields the broker cannot supply are omitted rather than
+// invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AuthzSourceEntry {
+    /// Registry key; must name a known source type (field `type`) and be
+    /// unique within the root.
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// Whether the slot participates (missing entries from
+    /// pre-persistence files load as `true`, the historical behaviour).
+    #[serde(default = "default_authz_source_enabled")]
+    pub enable: bool,
+    /// Opaque backend configuration as a JSON document; may be empty.
+    #[serde(default)]
+    pub config: String,
+}
+
+/// Serde default for a missing source enable flag: historical entries
+/// predate the flag and were always enabled.
+fn default_authz_source_enabled() -> bool {
+    true
+}
+
+/// Root: ordered authorization source registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthzSourcesConf {
+    #[serde(default = "default_authz_sources")]
+    pub sources: Vec<AuthzSourceEntry>,
+}
+
+/// Default registry: only the built-in database source. Reason: the
+/// built-in database is the one backend that executes, so a fresh broker
+/// authorizes against its local rule table without operator setup; every
+/// other backend is opt-in stored configuration, never silently live.
+fn default_authz_sources() -> Vec<AuthzSourceEntry> {
+    vec![AuthzSourceEntry {
+        source_type: "built_in_database".to_string(),
+        enable: true,
+        config: String::new(),
+    }]
+}
+
+impl Default for AuthzSourcesConf {
+    fn default() -> Self {
+        Self {
+            sources: default_authz_sources(),
+        }
+    }
+}
+
+impl AuthzSourcesConf {
+    /// Validates source types (non-empty, known, unique) and the registry
+    /// length cap.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.sources.len() > MAX_AUTHZ_SOURCES {
+            return Err(ConfigError::Invalid(format!(
+                "authz_sources.sources holds {} entries, at most {} (field `sources`)",
+                self.sources.len(),
+                MAX_AUTHZ_SOURCES
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.sources.len());
+        for (index, entry) in self.sources.iter().enumerate() {
+            if entry.source_type.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "authz_sources.sources[{index}].type must not be empty (field `type`)"
+                )));
+            }
+            if !is_known_authz_source_type(&entry.source_type) {
+                return Err(ConfigError::Invalid(format!(
+                    "authz_sources.sources[{index}].type {:?} is unknown (field `type`)",
+                    entry.source_type
+                )));
+            }
+            if !seen.insert(entry.source_type.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "authz_sources.sources[{index}].type {:?} is duplicated (field `type`)",
+                    entry.source_type
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The full validated configuration: all roots in one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FullSnapshot {
@@ -1232,6 +1365,8 @@ pub struct FullSnapshot {
     pub authz_node_cache: AuthzNodeCacheConf,
     #[serde(default)]
     pub authz_settings: AuthzSettingsConf,
+    #[serde(default)]
+    pub authz_sources: AuthzSourcesConf,
 }
 
 impl FullSnapshot {
@@ -1246,6 +1381,7 @@ impl FullSnapshot {
         self.authn_settings.validate()?;
         self.authz_node_cache.validate()?;
         self.authz_settings.validate()?;
+        self.authz_sources.validate()?;
         Ok(())
     }
 }
@@ -1271,6 +1407,8 @@ pub enum ConfigRoot {
     AuthzNodeCache(AuthzNodeCacheConf),
     /// Validated global authorization settings root.
     AuthzSettings(AuthzSettingsConf),
+    /// Validated authorization source registry root.
+    AuthzSources(AuthzSourcesConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1356,6 +1494,7 @@ impl ConfigRegistry {
             ConfigRoot::AuthnSettings(conf) => self.commit_authn_settings(conf),
             ConfigRoot::AuthzNodeCache(conf) => self.commit_authz_node_cache(conf),
             ConfigRoot::AuthzSettings(conf) => self.commit_authz_settings(conf),
+            ConfigRoot::AuthzSources(conf) => self.commit_authz_sources(conf),
         }
     }
 
@@ -1453,6 +1592,17 @@ impl ConfigRegistry {
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.authz_settings = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Commits a validated authorization source registry.
+    pub fn commit_authz_sources(&self, conf: AuthzSourcesConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.authz_sources = conf.clone();
             next
         });
         Ok(())
@@ -1568,6 +1718,7 @@ mod tests {
             authn_settings: AuthnSettingsConf::default(),
             authz_node_cache: AuthzNodeCacheConf::default(),
             authz_settings: AuthzSettingsConf::default(),
+            authz_sources: AuthzSourcesConf::default(),
         }
     }
 
@@ -1672,6 +1823,58 @@ mod tests {
         AuthzSettingsCacheConf::default()
             .validate()
             .expect("documented cache defaults validate");
+    }
+
+    #[test]
+    fn authz_sources_defaults_match_documented_shape() {
+        // Default registry: only the built-in database source (W2-17).
+        let defaults = AuthzSourcesConf::default();
+        assert_eq!(defaults.sources.len(), 1);
+        assert_eq!(defaults.sources[0].source_type, "built_in_database");
+        assert!(defaults.sources[0].enable);
+        defaults.validate().expect("documented defaults validate");
+        assert!(is_known_authz_source_type("built_in_database"));
+        assert!(!is_known_authz_source_type("nowhere"));
+    }
+
+    #[test]
+    fn authz_sources_validation_rejects_bad_fields() {
+        let good = AuthzSourcesConf::default();
+        assert!(good.validate().is_ok());
+        // Unknown type.
+        let mut bad = good.clone();
+        bad.sources.push(AuthzSourceEntry {
+            source_type: "nowhere".to_string(),
+            enable: true,
+            config: String::new(),
+        });
+        assert!(bad.validate().is_err());
+        // Duplicate type.
+        let mut bad = good.clone();
+        bad.sources.push(AuthzSourceEntry {
+            source_type: "built_in_database".to_string(),
+            enable: true,
+            config: String::new(),
+        });
+        assert!(bad.validate().is_err());
+        // Empty type.
+        let mut bad = good.clone();
+        bad.sources.push(AuthzSourceEntry {
+            source_type: "  ".to_string(),
+            enable: true,
+            config: String::new(),
+        });
+        assert!(bad.validate().is_err());
+        // Over the cap.
+        let mut bad = AuthzSourcesConf { sources: vec![] };
+        for source_type in KNOWN_AUTHZ_SOURCE_TYPES.iter().take(MAX_AUTHZ_SOURCES + 1) {
+            bad.sources.push(AuthzSourceEntry {
+                source_type: source_type.to_string(),
+                enable: true,
+                config: String::new(),
+            });
+        }
+        assert!(bad.validate().is_err());
     }
 
     #[test]
