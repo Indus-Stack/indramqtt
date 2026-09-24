@@ -206,18 +206,31 @@ pub fn protected_router() -> Router<ApiState> {
                 .delete(authz_sources::clear_catch_all_rules),
         )
         // Authorization (AuthZ / ACL) built-in per-client rule table
-        // (W2-19, C04-14..C04-16): paged list, single-rule add with
-        // duplicate rejection, and a per-id delete that removes every
-        // rule for one client id. Management-plane only; publish and
-        // deliver never touch the registry (the built-in rule consult
-        // stays on the publish/subscribe path).
+        // (W2-19, C04-14..C04-16; W2-20, C04-17/C04-18): paged list,
+        // single-rule add with duplicate rejection, per-id detail read,
+        // whole-set replace with validate-all-before-apply, and a per-id
+        // delete that removes every rule for one client id.
+        // Management-plane only; publish and deliver never touch the
+        // registry (the built-in rule consult stays on the
+        // publish/subscribe path).
         .route(
             "/authorization/sources/built_in_database/rules/clients",
             get(authz_clients::list_client_rules).post(authz_clients::create_client_rule),
         )
         .route(
             "/authorization/sources/built_in_database/rules/clients/:clientid",
-            delete(authz_clients::delete_client_rules),
+            get(authz_clients::get_client_rules)
+                .put(authz_clients::replace_client_rules)
+                .delete(authz_clients::delete_client_rules),
+        )
+        // Authorization (AuthZ / ACL) built-in per-user rule list (W2-20,
+        // C04-19): paged `data` plus `meta` over the shared built-in
+        // table. Management-plane only; publish and deliver never touch
+        // the registry (the built-in rule consult stays on the
+        // publish/subscribe path).
+        .route(
+            "/authorization/sources/built_in_database/rules/users",
+            get(authz_clients::list_user_rules),
         )
         // Authorization (AuthZ / ACL) rules
         .route(

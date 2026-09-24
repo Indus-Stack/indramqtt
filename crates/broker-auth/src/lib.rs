@@ -388,8 +388,9 @@ pub const MAX_AUTHN_USERNAME_LEN: usize = 256;
 // fields the broker cannot supply.
 pub const MAX_AUTHZ_CATCH_ALL_RULES: usize = 128;
 /// Bound on per-client authorization rules (the built-in rule table behind
-/// `GET/POST /authorization/sources/built_in_database/rules/clients` and
-/// `DELETE .../rules/clients/{clientid}`, filtered to client-scoped
+/// `GET/POST /authorization/sources/built_in_database/rules/clients`,
+/// `GET/PUT/DELETE .../rules/clients/{clientid}` and
+/// `GET .../rules/users`, filtered to client-scoped
 /// entries). Reason: the management plane snapshots the whole rule list
 /// per request and the publish/subscribe decision scans it linearly under
 /// a short read lock, so the list must stay bounded; 100,000 entries cover
@@ -1188,6 +1189,132 @@ impl MemoryAuth {
             self.persist()?;
         }
         Ok(removed)
+    }
+
+    /// Replace every rule scoped to `clientid` with `rules` (first match
+    /// wins within the client's set, in the given order).
+    ///
+    /// Validate-all-before-apply: the client id must be non-empty (at most
+    /// [`MAX_AUTHZ_CLIENTID_LEN`] bytes) and must name a concrete client
+    /// (the catch-all `*` belongs to the `/rules/all` table, never here);
+    /// every entry must carry that same client id, a non-empty topic that
+    /// parses as an MQTT filter, and a known action. A batch with two
+    /// entries for the same topic scope (same topic and action) is
+    /// rejected as [`ClientRuleError::Duplicate`] instead of merging, and
+    /// a replacement that would push the table past
+    /// [`MAX_AUTHZ_CLIENT_RULES`] entries fails with
+    /// [`ClientRuleError::Full`]. Any violation rejects the whole write
+    /// and the stored set is unchanged. Writing an unknown client id
+    /// creates its set; writing an empty list clears it. Persists through
+    /// the registry when one is attached, so the set survives a kernel
+    /// restart.
+    ///
+    /// Management-plane only: topic validation runs before the lock, then
+    /// one short rule-table write lock per request (plus the registry
+    /// save lock on persist); the publish and subscribe authorization
+    /// consults keep reading under short read locks and never take this
+    /// lock beyond their check.
+    // TODO(parity): does the documented replace accept a bare array body
+    // alongside the `{"rules": [...]}` object, and must per-entry key
+    // fields match the path id or are they ignored? The rulebook does not
+    // decide either; the current choice requires the object shape and
+    // rejects key mismatches fail-closed until the checker pins it.
+    pub fn replace_client_rules(
+        &self,
+        clientid: &str,
+        rules: Vec<AclRule>,
+    ) -> std::result::Result<(), ClientRuleError> {
+        if clientid.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must not be empty".to_string(),
+            ));
+        }
+        if clientid.len() > MAX_AUTHZ_CLIENTID_LEN {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `clientid` {clientid:?} exceeds {MAX_AUTHZ_CLIENTID_LEN} bytes",
+            )));
+        }
+        if clientid == "*" {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must name a concrete client, not the catch-all (field `clientid`)".to_string(),
+            ));
+        }
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.client_pattern != clientid {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].clientid {:?} does not match {clientid:?} (field `clientid`)",
+                    rule.client_pattern
+                )));
+            }
+            if rule.topic_pattern.trim().is_empty() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic must not be empty (field `topic`)"
+                )));
+            }
+            if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic {:?} is not a valid filter (field `topic`)",
+                    rule.topic_pattern
+                )));
+            }
+        }
+        {
+            let mut seen: std::collections::HashSet<(&str, &str)> =
+                std::collections::HashSet::with_capacity(rules.len());
+            for rule in &rules {
+                let scope = (
+                    rule.topic_pattern.as_str(),
+                    match rule.action {
+                        AclAction::Publish => "publish",
+                        AclAction::Subscribe => "subscribe",
+                        AclAction::All => "all",
+                    },
+                );
+                if !seen.insert(scope) {
+                    return Err(ClientRuleError::Duplicate);
+                }
+            }
+        }
+        {
+            let mut table = self.rules.write();
+            let others = table
+                .iter()
+                .filter(|stored| stored.client_pattern != clientid)
+                .count();
+            if others + rules.len() > MAX_AUTHZ_CLIENT_RULES {
+                return Err(ClientRuleError::Full);
+            }
+            table.retain(|stored| stored.client_pattern != clientid);
+            table.extend(rules);
+        }
+        self.persist()
+            .map_err(|e| ClientRuleError::Persist(e.to_string()))
+    }
+
+    /// Ordered snapshot of the per-user rule index: every stored rule
+    /// scoped to a concrete id (the catch-all `*` entries belong to the
+    /// `/rules/all` table and are excluded here), in stored evaluation
+    /// order. This is the same shared built-in table the per-client index
+    /// reads: client and user entries share one first-match-wins list, so
+    /// a rule written for id `X` reads back under both the client key
+    /// `X` and the username `X`. Management-plane read only: clones at
+    /// most the capped list under one short read lock; the publish and
+    /// subscribe authorization consults keep reading under their own
+    /// short locks.
+    // TODO(parity): are the per-client and per-user tables separate
+    // stores (a client rule invisible to the user listing and vice
+    // versa), or one shared table keyed by id as implemented here? The
+    // rulebook does not decide the namespace split; the current choice
+    // shares the W2-19 table so every stored rule stays live on the
+    // publish/subscribe decision path until the checker pins it.
+    pub fn all_user_rules(&self) -> Vec<AclRule> {
+        self.all_client_rules()
+    }
+
+    /// Ordered snapshot of one username's rules. Exact id match only,
+    /// like [`MemoryAuth::client_rules`]. Management-plane read only.
+    pub fn user_rules(&self, username: &str) -> Vec<AclRule> {
+        self.client_rules(username)
     }
 
     fn check(
