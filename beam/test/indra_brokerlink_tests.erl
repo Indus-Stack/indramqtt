@@ -414,6 +414,104 @@ bind_meta_alias_roundtrip_test() ->
                    indra_brokerlink:encode_bind_meta(<<"dev-l">>, true, 60)),
     ?assertEqual(0, maps:get(client_alias_max, LDec)).
 
+bind_meta_alias_peer_variants_test() ->
+    %% Every bind variant with and without the peer section, including
+    %% with the B4-05 alias section present (FX-01: the edge always sends
+    %% /6, so the kernel must see the peer on alias-carrying binds).
+    %% /3 anonymous, no peer, no alias.
+    {ok, D3} = indra_brokerlink:decode_bind_meta(
+                 indra_brokerlink:encode_bind_meta(<<"v3">>, true, 60)),
+    ?assertEqual(undefined, maps:get(peerhost, D3)),
+    ?assertEqual(0, maps:get(client_alias_max, D3)),
+    %% /4 credentials, no peer, no alias.
+    {ok, D4} = indra_brokerlink:decode_bind_meta(
+                 indra_brokerlink:encode_bind_meta(<<"v4">>, true, 60,
+                                                  {<<"u">>, <<"p">>})),
+    ?assertEqual(<<"u">>, maps:get(username, D4)),
+    ?assertEqual(undefined, maps:get(peerhost, D4)),
+    ?assertEqual(0, maps:get(client_alias_max, D4)),
+    %% /5 anonymous plus peer, no alias.
+    {ok, D5a} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v5a">>, true, 60,
+                                                   {undefined, undefined},
+                                                   <<"127.0.0.1">>)),
+    ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, D5a)),
+    ?assertEqual(0, maps:get(client_alias_max, D5a)),
+    %% /5 credentials plus peer, no alias.
+    {ok, D5c} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v5c">>, true, 60,
+                                                   {<<"u">>, <<"p">>},
+                                                   <<"192.0.2.10">>)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, D5c)),
+    %% /6 anonymous, no peer, with alias.
+    {ok, D6a} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v6a">>, true, 60,
+                                                   {undefined, undefined},
+                                                   undefined, 10)),
+    ?assertEqual(undefined, maps:get(peerhost, D6a)),
+    ?assertEqual(10, maps:get(client_alias_max, D6a)),
+    %% /6 credentials, no peer, with alias.
+    {ok, D6c} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v6c">>, true, 60,
+                                                   {<<"u">>, <<"p">>},
+                                                   undefined, 10)),
+    ?assertEqual(undefined, maps:get(peerhost, D6c)),
+    ?assertEqual(10, maps:get(client_alias_max, D6c)),
+    %% FX-01 regression: anonymous plus peer plus alias 0 (what a 3.1.1
+    %% edge always sends) must keep the peer, never decode it as a
+    %% username with an empty password.
+    {ok, D6ap0} = indra_brokerlink:decode_bind_meta(
+                    indra_brokerlink:encode_bind_meta(<<"v6ap0">>, true, 60,
+                                                     {undefined, undefined},
+                                                     <<"127.0.0.1">>, 0)),
+    ?assertEqual(undefined, maps:get(username, D6ap0)),
+    ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, D6ap0)),
+    ?assertEqual(0, maps:get(client_alias_max, D6ap0)),
+    %% Anonymous plus peer plus nonzero alias.
+    {ok, D6ap} = indra_brokerlink:decode_bind_meta(
+                   indra_brokerlink:encode_bind_meta(<<"v6ap">>, false, 30,
+                                                    {undefined, undefined},
+                                                    <<"2001:db8::1">>, 9)),
+    ?assertEqual(<<"2001:db8::1">>, maps:get(peerhost, D6ap)),
+    ?assertEqual(9, maps:get(client_alias_max, D6ap)),
+    %% Credentials plus peer plus alias 0 and nonzero.
+    {ok, D6cp0} = indra_brokerlink:decode_bind_meta(
+                    indra_brokerlink:encode_bind_meta(<<"v6cp0">>, true, 60,
+                                                     {<<"u">>, <<"p">>},
+                                                     <<"192.0.2.10">>, 0)),
+    ?assertEqual(<<"u">>, maps:get(username, D6cp0)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, D6cp0)),
+    ?assertEqual(0, maps:get(client_alias_max, D6cp0)),
+    {ok, D6cp} = indra_brokerlink:decode_bind_meta(
+                   indra_brokerlink:encode_bind_meta(<<"v6cp">>, true, 60,
+                                                    {<<"u">>, <<"p">>},
+                                                    <<"192.0.2.10">>, 7)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, D6cp)),
+    ?assertEqual(7, maps:get(client_alias_max, D6cp)),
+    %% /7 will variants keep the peer with the alias present.
+    Will = #{topic => <<"will/test">>, payload => <<"bye">>,
+             qos => 0, retain => false},
+    {ok, D7a} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v7a">>, true, 5,
+                                                   {undefined, undefined},
+                                                   <<"127.0.0.1">>, 0, Will)),
+    ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, D7a)),
+    ?assertEqual(0, maps:get(client_alias_max, D7a)),
+    ?assertEqual(<<"will/test">>, maps:get(will_topic, D7a)),
+    {ok, D7c} = indra_brokerlink:decode_bind_meta(
+                  indra_brokerlink:encode_bind_meta(<<"v7c">>, false, 60,
+                                                   {<<"u">>, <<"p">>},
+                                                   <<"192.0.2.10">>, 7, Will)),
+    ?assertEqual(<<"u">>, maps:get(username, D7c)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, D7c)),
+    ?assertEqual(7, maps:get(client_alias_max, D7c)),
+    %% A bind without the peer section still decodes with the peer unset.
+    {ok, DNoPeer} = indra_brokerlink:decode_bind_meta(
+                      indra_brokerlink:encode_bind_meta(<<"vnp">>, true, 60,
+                                                       {<<"u">>, <<"p">>},
+                                                       undefined, 0)),
+    ?assertEqual(undefined, maps:get(peerhost, DNoPeer)).
+
 %%====================================================================
 %% Last-will bind section (F1-01)
 %%====================================================================

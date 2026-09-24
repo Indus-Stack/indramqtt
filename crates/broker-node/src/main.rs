@@ -923,11 +923,13 @@ struct BindIdentity {
 
 /// Decode the optional trailing credentials and peer-address sections:
 /// empty means anonymous with no peer address; otherwise a credentials
-/// section `UserLen | Username | PassLen | Password`, optionally followed
-/// by a peer section `PeerLen:16be | PeerIp` (an IP literal). An anonymous
-/// bind from a peer-aware edge carries only the peer section. A trailing
-/// section that is neither valid credentials nor a valid peer address is
-/// malformed, exactly as trailing garbage was before the peer section.
+/// section `UserLen | Username | PassLen | Password` (password non-empty,
+/// mirroring the edge `decode_bind_creds' `PLen > 0' guard), optionally
+/// followed by a peer section `PeerLen:16be | PeerIp` (an IP literal). An
+/// anonymous bind from a peer-aware edge carries only the peer section. A
+/// trailing section that is neither valid credentials nor a valid peer
+/// address is malformed, exactly as trailing garbage was before the peer
+/// section.
 fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
     if rest.is_empty() {
         return Ok(BindIdentity {
@@ -956,6 +958,19 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
     let base = 2 + user_len;
     let pass_len = u16::from_be_bytes([rest[base], rest[base + 1]]) as usize;
     if rest.len() < base + 2 + pass_len {
+        return Err("bind credentials truncated");
+    }
+    // B4-05 alias collision: an anonymous peer section plus the trailing
+    // `ClientAliasMax:16be' of 0 is byte-identical to credentials with the
+    // peer literal as username and an empty password (`PeerLen|Peer|0x0000'
+    // == `ULen|User|PLen=0'). The edge never encodes an empty password
+    // (`decode_bind_creds' requires `PLen > 0', a username without a
+    // password is rejected at encode time), so an empty `pass_len' here
+    // can only be that collision: fail this parse so the caller strips the
+    // alias section and retries as an anonymous peer bind. Fail closed:
+    // the peer address is never mistaken for a username, so address bans
+    // still match on every alias-carrying bind the edge sends.
+    if pass_len == 0 {
         return Err("bind credentials truncated");
     }
     let password = rest[base + 2..base + 2 + pass_len].to_vec();
@@ -10536,6 +10551,15 @@ mod tests {
         Bytes::from(meta)
     }
 
+    /// Test mirror of the B4-05 trailing alias section: append
+    /// `ClientAliasMax:16be` to any encoded bind (mirrors the edge
+    /// `encode_bind_meta/6` tail, which always trails last).
+    fn encode_bind_meta_alias(base: Bytes, alias_max: u16) -> Bytes {
+        let mut meta = base.to_vec();
+        meta.extend_from_slice(&protocol_v5::encode_alias_maximum(alias_max));
+        Bytes::from(meta)
+    }
+
     fn ban_entry(as_type: &str, who: &str, until: &str) -> broker_api::v5::banned::BanEntry {
         broker_api::v5::banned::BanEntry {
             as_type: as_type.to_string(),
@@ -10576,6 +10600,101 @@ mod tests {
         let mut garbage = encode_bind_meta("dev-g", true, 60).to_vec();
         garbage.extend_from_slice(b"not-a-section");
         assert!(decode_bind_meta(&Bytes::from(garbage)).is_err());
+    }
+
+    #[test]
+    fn bind_meta_alias_peer_variants_round_trip() {
+        // Every bind variant the edge sends (/3-/7) with and without the
+        // peer section, including with the B4-05 alias section present.
+        // Anonymous /3 plus alias decodes with no peer and the maximum.
+        let req = decode_bind_meta(&encode_bind_meta_alias(
+            encode_bind_meta("a-anon", true, 60),
+            10,
+        ))
+        .expect("anon alias decodes");
+        assert!(req.username.is_none());
+        assert!(req.peerhost.is_none());
+        assert_eq!(req.client_alias_max, 10);
+        // Credentialed /4 plus alias decodes with no peer and the maximum.
+        let req = decode_bind_meta(&encode_bind_meta_alias(
+            encode_bind_meta_creds("a-creds", true, 60, "u", b"p"),
+            7,
+        ))
+        .expect("creds alias decodes");
+        assert_eq!(req.username.as_deref(), Some("u"));
+        assert!(req.peerhost.is_none());
+        assert_eq!(req.client_alias_max, 7);
+        // FX-01 regression: anonymous /5 peer plus the /6 alias of 0 (what
+        // a 3.1.1 edge always sends) is byte-identical to credentials with
+        // the peer literal as username and an empty password. It must
+        // decode as anonymous with the peer set, never as a username, or
+        // peerhost bans stop matching.
+        let meta = encode_bind_meta_alias(
+            encode_bind_meta_peer(encode_bind_meta("a-peer0", true, 60), "127.0.0.1"),
+            0,
+        );
+        let req = decode_bind_meta(&meta).expect("anon peer alias-0 decodes");
+        assert!(req.username.is_none());
+        assert!(req.password.is_none());
+        assert_eq!(req.peerhost.as_deref(), Some("127.0.0.1"));
+        assert_eq!(req.client_alias_max, 0);
+        // Same with a nonzero alias and an IPv6 literal.
+        let meta = encode_bind_meta_alias(
+            encode_bind_meta_peer(encode_bind_meta("a-peer6", false, 30), "2001:db8::1"),
+            9,
+        );
+        let req = decode_bind_meta(&meta).expect("anon peer alias decodes");
+        assert!(req.username.is_none());
+        assert_eq!(req.peerhost.as_deref(), Some("2001:db8::1"));
+        assert_eq!(req.client_alias_max, 9);
+        // Credentialed peer plus alias decodes with both sections.
+        for alias in [0u16, 7u16] {
+            let meta = encode_bind_meta_alias(
+                encode_bind_meta_peer(
+                    encode_bind_meta_creds("a-full", true, 60, "alice", b"pw"),
+                    "192.0.2.10",
+                ),
+                alias,
+            );
+            let req = decode_bind_meta(&meta).expect("creds peer alias decodes");
+            assert_eq!(req.username.as_deref(), Some("alice"));
+            assert_eq!(req.password, Some(b"pw".to_vec()));
+            assert_eq!(req.peerhost.as_deref(), Some("192.0.2.10"));
+            assert_eq!(req.client_alias_max, alias);
+        }
+        // Will plus peer plus alias (/7 full form) keeps the peer.
+        let mut will_base =
+            encode_bind_meta_with_will("a-will", true, 5, "will/test", b"bye", 0, false).to_vec();
+        will_base.extend_from_slice(&(5u16).to_be_bytes());
+        will_base.extend_from_slice(b"alice");
+        will_base.extend_from_slice(&(2u16).to_be_bytes());
+        will_base.extend_from_slice(b"pw");
+        will_base.extend_from_slice(&(10u16).to_be_bytes());
+        will_base.extend_from_slice(b"192.0.2.10");
+        will_base.extend_from_slice(&protocol_v5::encode_alias_maximum(3));
+        let req = decode_bind_meta(&Bytes::from(will_base)).expect("will peer alias decodes");
+        assert_eq!(req.username.as_deref(), Some("alice"));
+        assert_eq!(req.peerhost.as_deref(), Some("192.0.2.10"));
+        assert_eq!(req.client_alias_max, 3);
+        assert!(req.will.is_some());
+        // Anonymous will plus peer plus alias-0 keeps the peer.
+        let mut anon_will =
+            encode_bind_meta_with_will("a-will-a", true, 5, "will/test", b"bye", 0, false).to_vec();
+        anon_will.extend_from_slice(&(10u16).to_be_bytes());
+        anon_will.extend_from_slice(b"192.0.2.10");
+        anon_will.extend_from_slice(&protocol_v5::encode_alias_maximum(0));
+        let req = decode_bind_meta(&Bytes::from(anon_will)).expect("anon will peer decodes");
+        assert!(req.username.is_none());
+        assert_eq!(req.peerhost.as_deref(), Some("192.0.2.10"));
+        assert_eq!(req.client_alias_max, 0);
+        // An empty password is never valid credentials (mirrors the edge
+        // `PLen > 0' guard): the collision above stays malformed as
+        // credentials rather than a guessed identity.
+        let mut empty_pw = encode_bind_meta("e-empty", true, 60).to_vec();
+        empty_pw.extend_from_slice(&(1u16).to_be_bytes());
+        empty_pw.extend_from_slice(b"u");
+        empty_pw.extend_from_slice(&(0u16).to_be_bytes());
+        assert!(decode_bind_meta(&Bytes::from(empty_pw)).is_err());
     }
 
     #[tokio::test]
@@ -10677,6 +10796,103 @@ mod tests {
             .expect("bind replies");
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
         assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn ban_refuses_banned_peerhost_with_alias_on_connect() {
+        // FX-01: the edge always appends the B4-05 alias section (0 for
+        // 3.1.1), so every bind below carries peer plus alias exactly as
+        // `indra_brokerlink:encode_bind_meta/6` sends it. Drives the
+        // CONNECT event through the broker, never the store alone.
+        let shared = test_shared();
+        shared
+            .bans
+            .insert(ban_entry("peerhost", "127.0.0.1", "infinity"))
+            .expect("ban insert");
+        shared
+            .bans
+            .insert(ban_entry("peerhost_net", "198.51.100.0/24", "infinity"))
+            .expect("ban insert");
+
+        // Exact address ban refuses an anonymous client from that address.
+        let meta = encode_bind_meta_alias(
+            encode_bind_meta_peer(encode_bind_meta("edge-client", true, 60), "127.0.0.1"),
+            0,
+        );
+        let reply = apply_bind(&bind_frame(91, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8A, "banned peer address must yield return code 0x8A");
+        assert!(!present);
+        assert!(shared.sessions.get("edge-client").is_none());
+
+        // CIDR ban refuses an address inside the network.
+        let meta = encode_bind_meta_alias(
+            encode_bind_meta_peer(encode_bind_meta("net-client", true, 60), "198.51.100.9"),
+            0,
+        );
+        let reply = apply_bind(&bind_frame(92, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8A, "CIDR-banned peer must yield return code 0x8A");
+
+        // A peer-host ban on a different address does not refuse it.
+        let meta = encode_bind_meta_alias(
+            encode_bind_meta_peer(encode_bind_meta("edge-client", true, 60), "192.0.2.45"),
+            0,
+        );
+        let reply = apply_bind(&bind_frame(93, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+
+        // Once the ban is removed the same client connects.
+        assert!(shared.bans.remove("peerhost", "127.0.0.1"));
+        let meta = encode_bind_meta_alias(
+            encode_bind_meta_peer(encode_bind_meta("edge-client", true, 60), "127.0.0.1"),
+            0,
+        );
+        let reply = apply_bind(&bind_frame(94, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn ban_refuses_banned_peerhost_over_tcp() {
+        // Same CONNECT event as above but over a real BrokerLink transport,
+        // the way the edge reaches the kernel: a banned peer is refused
+        // with 0x8A and creates no session.
+        let shared = test_shared();
+        shared
+            .bans
+            .insert(ban_entry("peerhost", "127.0.0.1", "infinity"))
+            .expect("ban insert");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_connection(stream, shared).await.expect("handle");
+        });
+
+        let io = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let client = FramedTransport::new(io);
+        let meta = encode_bind_meta_alias(
+            encode_bind_meta_peer(encode_bind_meta("tcp-client", true, 60), "127.0.0.1"),
+            0,
+        );
+        client.send(bind_frame(95, 1, meta)).await.expect("bind");
+        let reply = client.recv().await.expect("recv binding");
+        assert_eq!(reply.header.opcode, OpCode::SessionBinding);
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8A);
+        assert!(!present);
+
+        server.abort();
     }
 
     #[tokio::test]

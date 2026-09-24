@@ -693,6 +693,62 @@ connect_forwards_will_in_bind_test() ->
         teardown(LSock, Mock, Client, Conn)
     end.
 
+%% @doc FX-01: every CONNECT bind carries the peer address and the B4-05
+%% alias section, so the kernel ban check sees the client IP. A real MQTT
+%% client connects over loopback through the edge to the mock kernel; the
+%% test asserts the bind decodes with peer 127.0.0.1, with and without
+%% credentials and with a will.
+connect_bind_carries_peer_and_alias_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5012}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet(<<"dev-peer">>, true, 60)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"dev-peer">>, maps:get(client_id, Bind)),
+        ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, Bind)),
+        ?assertEqual(0, maps:get(client_alias_max, Bind)),
+        Binding = indra_brokerlink:encode_session_binding_meta(9, false, 0),
+        ok = indra_conn:broker_frame(Conn, #{opcode => 16#0011}, Binding, <<>>),
+        ?assertEqual(<<16#20, 16#02, 16#00, 16#00>>,
+                     recv_exact(Client, 4)),
+        ?assertMatch({connected, _}, sys:get_state(Conn))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+connect_bind_carries_peer_with_creds_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5013}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_creds(<<"dev-peer-c">>,
+                                                      <<"alice">>, <<"s3cret">>)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"alice">>, maps:get(username, Bind)),
+        ?assertEqual(<<"s3cret">>, maps:get(password, Bind)),
+        ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, Bind)),
+        ?assertEqual(0, maps:get(client_alias_max, Bind))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
+connect_bind_carries_peer_with_will_test() ->
+    {LSock, Port, Mock, Client, Conn} = setup([{conn_id, 5014}]),
+    _ = Port,
+    try
+        ok = gen_tcp:send(Client, connect_packet_will(<<"dev-peer-w">>,
+                                                      <<"will/test">>,
+                                                      <<"gone">>)),
+        [Sent] = wait_frames(Mock, 1),
+        {ok, Bind} = indra_brokerlink:decode_bind_meta(maps:get(meta, Sent)),
+        ?assertEqual(<<"will/test">>, maps:get(will_topic, Bind)),
+        ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, Bind)),
+        ?assertEqual(0, maps:get(client_alias_max, Bind))
+    after
+        teardown(LSock, Mock, Client, Conn)
+    end.
+
 %% @doc Ungraceful close (TCP drops without DISCONNECT) reports
 %% DisconnectIn so the kernel publishes the stored will (F1-01).
 ungraceful_close_reports_disconnect_in_test() ->
