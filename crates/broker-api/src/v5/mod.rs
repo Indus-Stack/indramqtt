@@ -309,6 +309,12 @@ pub fn protected_router() -> Router<ApiState> {
                 .put(api_keys::update_api_key)
                 .delete(api_keys::delete_api_key),
         )
+        // Fixed API-key scope catalogue (W2-27, C05-06): static list
+        // served from the registry shared with key create/update
+        // validation. Management-plane only; publish and deliver never
+        // touch it. The route is not paged and takes no parameters;
+        // unknown query parameters are ignored.
+        .route("/api_key_scopes", get(api_keys::list_api_key_scopes))
         // Live Monitoring & Rates
         .route("/metrics", get(monitoring::get_metrics))
         .route(

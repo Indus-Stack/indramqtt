@@ -2,8 +2,9 @@
 //!
 //! Covers `GET /api_key` (paged list, C05-01), `POST /api_key`
 //! (mint one key, C05-02), `DELETE /api_key/{name}` (revoke one key,
-//! C05-03), `GET /api_key/{name}` (one key's metadata, C05-04) and
+//! C05-03), `GET /api_key/{name}` (one key's metadata, C05-04),
 //! `PUT /api_key/{name}` (replace one key's scopes/description, C05-05)
+//! and `GET /api_key_scopes` (fixed scope catalogue, C05-06)
 //! on real state. Single-node, management-plane only: handlers
 //! clone at most the capped list once per request under a short lock;
 //! publish and deliver never touch this store, and key checks on the
@@ -45,12 +46,14 @@
 // The rulebook does not decide the exact shapes; the current choice
 // answers create with 201 carrying `api_key` once and delete with 204
 // until the checker pins them.
-// TODO(parity): which scope vocabulary and defaults does the spec
-// require (allowed scope names, default scope set for an omitted
-// `scopes` field)? The rulebook does not decide the exact set; the
-// current choice stores the supplied scopes verbatim (empty when
-// omitted) and leaves enforcement to the middleware lane until the
-// checker pins it.
+// TODO(parity): which scope defaults and vocabulary enforcement does
+// the spec require (default scope set for an omitted `scopes` field,
+// rejection of unknown scope names on create/update)? The rulebook
+// does not decide the exact set; the assignable vocabulary is pinned
+// by [`API_KEY_SCOPES`] below (served verbatim by the catalogue
+// route), while create/update still store the supplied scopes verbatim
+// (empty when omitted) and enforcement stays with the middleware lane
+// until the checker pins it.
 // TODO(parity): which name charset and duplicate status (400 versus
 // 409) does the documented `ALREADY_EXISTS` code carry? The rulebook
 // does not decide the exact duplicate semantics; the current choice
@@ -646,6 +649,109 @@ pub async fn update_api_key(
     }
 }
 
+/// One entry of the fixed API-key scope catalogue: the stable scope
+/// name stored on key records plus a short operator-facing summary.
+struct ScopeEntry {
+    name: &'static str,
+    desc: &'static str,
+}
+
+/// Fixed catalogue of assignable API-key scopes (C05-06).
+///
+/// Bound (stated here and enforced by construction): exactly ten
+/// entries, no growth; the list lives in code, so there is no
+/// persistence beyond it and no per-request growth. Each summary is a
+/// short static string, so serving the catalogue allocates only the
+/// small bounded response body once per request.
+///
+/// This is the single registry the key create/update validation shares
+/// with the catalogue route: [`is_known_api_key_scope`] consults this
+/// same list. Vocabulary enforcement itself (rejecting unknown names
+/// on write) is owned elsewhere; the catalogue route serves the list
+/// verbatim regardless of which scopes any stored key holds.
+// TODO(parity): what are the exact operator-facing summaries per
+// scope? The rulebook does not decide the wording; the current choice
+// describes each scope's area in our own words and keeps the stable
+// scope names (protocol values) exact until the checker pins them.
+const API_KEY_SCOPES: [ScopeEntry; 10] = [
+    ScopeEntry {
+        name: "connections",
+        desc: "View and manage client connections, subscriptions and topics",
+    },
+    ScopeEntry {
+        name: "publish",
+        desc: "Publish MQTT messages through the management API",
+    },
+    ScopeEntry {
+        name: "data_integration",
+        desc: "Manage rules, connectors and data integrations",
+    },
+    ScopeEntry {
+        name: "access_control",
+        desc: "Manage client authentication and authorization settings",
+    },
+    ScopeEntry {
+        name: "gateways",
+        desc: "Manage protocol gateways and their clients",
+    },
+    ScopeEntry {
+        name: "monitoring",
+        desc: "Read metrics, alarms, traces and monitoring data",
+    },
+    ScopeEntry {
+        name: "cluster_operations",
+        desc: "Manage cluster membership and node operations",
+    },
+    ScopeEntry {
+        name: "system",
+        desc: "Manage core configuration, listeners and system settings",
+    },
+    ScopeEntry {
+        name: "audit",
+        desc: "Query the audit log",
+    },
+    ScopeEntry {
+        name: "license",
+        desc: "Manage licence installation and status",
+    },
+];
+
+/// Whether `name` is one of the assignable catalogue scopes.
+///
+/// Shared by the key create/update validation path and the catalogue
+/// route so both read the same registry. Advisory for now: writers
+/// still store scopes verbatim and enforcement stays with the
+/// middleware lane (see the module TODO); the catalogue route serves
+/// this list regardless.
+pub fn is_known_api_key_scope(name: &str) -> bool {
+    API_KEY_SCOPES.iter().any(|entry| entry.name == name)
+}
+
+/// `GET /api_key_scopes`: fixed catalogue of assignable scopes
+/// (C05-06).
+///
+/// Returns `{"scopes": [{"name", "desc"}]}` in catalogue order. The
+/// route is not paged and takes no parameters; unknown query
+/// parameters are ignored (the handler takes no extractor, so Axum
+/// never parses them). Management-plane only: reads a code-defined
+/// list, takes no lock, and publish/deliver never touch it.
+pub async fn list_api_key_scopes() -> Response {
+    let scopes: Vec<serde_json::Value> = API_KEY_SCOPES
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "name": entry.name,
+                "desc": entry.desc,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "scopes": scopes })),
+    )
+        .into_response()
+}
+
 /// Validate a create body into `(name, scopes, description)`.
 ///
 /// The body must be a JSON object with a non-empty slash-free `name`
@@ -1065,5 +1171,40 @@ mod api_key_store_tests {
         assert_eq!(record.description, "after");
         assert!(restarted.verify("w226-persist", &secret));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scope_catalogue_lists_the_documented_names_with_fields() {
+        // W2-27 catalogue shape: every entry carries a non-empty name
+        // and summary, names are unique, and the registry predicate
+        // agrees with the served list.
+        assert_eq!(API_KEY_SCOPES.len(), 10);
+        let mut names: Vec<&str> = API_KEY_SCOPES.iter().map(|entry| entry.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 10);
+        for entry in &API_KEY_SCOPES {
+            assert!(!entry.name.is_empty());
+            assert!(!entry.desc.is_empty());
+            assert!(is_known_api_key_scope(entry.name));
+        }
+        for documented in [
+            "connections",
+            "publish",
+            "data_integration",
+            "access_control",
+            "gateways",
+            "monitoring",
+            "cluster_operations",
+            "system",
+            "audit",
+            "license",
+        ] {
+            assert!(
+                is_known_api_key_scope(documented),
+                "catalogue must contain {documented}"
+            );
+        }
+        assert!(!is_known_api_key_scope("no-such-scope"));
     }
 }
