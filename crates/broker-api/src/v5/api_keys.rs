@@ -1,8 +1,10 @@
 //! Management API key records for the v5 management API.
 //!
 //! Covers `GET /api_key` (paged list, C05-01), `POST /api_key`
-//! (mint one key, C05-02) and `DELETE /api_key/{name}` (revoke one key,
-//! C05-03) on real state. Single-node, management-plane only: handlers
+//! (mint one key, C05-02), `DELETE /api_key/{name}` (revoke one key,
+//! C05-03), `GET /api_key/{name}` (one key's metadata, C05-04) and
+//! `PUT /api_key/{name}` (replace one key's scopes/description, C05-05)
+//! on real state. Single-node, management-plane only: handlers
 //! clone at most the capped list once per request under a short lock;
 //! publish and deliver never touch this store, and key checks on the
 //! management plane use constant-time comparison off the hot path (see
@@ -23,6 +25,14 @@
 //! through the config registry) and the plaintext appears only in the
 //! create response, exactly once. Listing never renders secrets or
 //! hashes, only metadata.
+// TODO(parity): which expiry/enabled fields do the single-key read
+// render and the update accept? The rulebook does not decide the exact
+// record shape and the broker tracks neither field, so the current
+// choice omits fields the broker cannot supply (never a constant
+// standing in for a measurement): the read renders
+// name/scopes/description/created_at only, and the update replaces
+// scopes/description only, ignoring any other supplied fields
+// consistently with the create path's extra-fields-ignored rule.
 // TODO(parity): which per-key fields plus list envelope does the spec
 // require (bare list versus data/meta, expiry/enabled/status fields)?
 // The rulebook does not decide the exact shape; the current choice
@@ -285,6 +295,56 @@ impl ApiKeyStore {
         Ok(true)
     }
 
+    /// Read one key's metadata row. Returns a clone under a short read
+    /// lock, or `None` when nothing is stored under `name`.
+    pub fn get(&self, name: &str) -> Option<ApiKeyRecord> {
+        self.inner
+            .read()
+            .expect("api-key store lock")
+            .get(name)
+            .cloned()
+    }
+
+    /// Replace one key's scopes and description in place. `None` fields
+    /// keep the stored value; `Some` fields must already be validated
+    /// (same caps as minting) and replace verbatim. Unknown names fail
+    /// with [`ApiKeyUpdateError::NotFound`] and create nothing; the
+    /// secret hash and mint time are never rotated here. Persists
+    /// through the registry when one is attached; a commit or save
+    /// failure restores the previous record and surfaces as
+    /// [`ApiKeyUpdateError::Persist`] so the loss is never silent.
+    pub fn update(
+        &self,
+        name: &str,
+        scopes: Option<Vec<String>>,
+        description: Option<String>,
+    ) -> Result<ApiKeyRecord, ApiKeyUpdateError> {
+        let previous = {
+            let mut map = self.inner.write().expect("api-key store lock");
+            let Some(record) = map.get_mut(name) else {
+                return Err(ApiKeyUpdateError::NotFound);
+            };
+            let previous = record.clone();
+            if let Some(scopes) = scopes {
+                record.scopes = scopes;
+            }
+            if let Some(description) = description {
+                record.description = description;
+            }
+            previous
+        };
+        if let Err(reason) = self.persist() {
+            // Restore the previous row so memory stays consistent with
+            // what persisted; the failure is never silent.
+            self.inner
+                .write()
+                .expect("api-key store lock")
+                .insert(name.to_string(), previous);
+            return Err(ApiKeyUpdateError::Persist(reason));
+        }
+        self.get(name).ok_or(ApiKeyUpdateError::NotFound)
+    }
+
     /// Export the current contents as a validated config root, sorted by
     /// name so the persisted file is deterministic.
     fn export_conf(&self) -> ApiKeysConf {
@@ -338,6 +398,17 @@ pub enum ApiKeyInsertError {
     Full,
     /// The in-memory insert applied but the registry commit or atomic
     /// save failed. Handlers map this to HTTP 500; it is never silent.
+    Persist(String),
+}
+
+/// Why [`ApiKeyStore::update`] refused a replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeyUpdateError {
+    /// Nothing is stored under the name; nothing was created.
+    NotFound,
+    /// The in-memory replace applied but the registry commit or atomic
+    /// save failed (the previous row was restored). Handlers map this
+    /// to HTTP 500; it is never silent.
     Persist(String),
 }
 
@@ -511,6 +582,70 @@ pub async fn delete_api_key(State(state): State<ApiState>, Path(name): Path<Stri
     }
 }
 
+/// `GET /api_key/{name}`: read one key's metadata (C05-04).
+///
+/// Returns the stored metadata row without any secret material; the
+/// secret and its hash never render. An unknown name reports
+/// `NOT_FOUND` in the documented `{code, message}` shape. The route is
+/// not paged.
+/// Management-plane only: one short read lock per request; publish and
+/// deliver never touch this store.
+pub async fn get_api_key(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
+    match state.api_keys.get(&name) {
+        Some(record) => (StatusCode::OK, Json(record.to_json())).into_response(),
+        None => ApiError::NotFound(format!("api key {name:?} not found")).into_response(),
+    }
+}
+
+/// `PUT /api_key/{name}`: replace one key's scopes/description
+/// (C05-05).
+///
+/// The body must be a JSON object; `scopes` (when present and non-null)
+/// replaces the scope set verbatim under the same caps as minting, and
+/// `description` (or its `desc` alias; `description` wins when both are
+/// present, when present as a string) replaces the description verbatim.
+/// Omitted fields keep the stored value; a `null` `scopes` keeps the
+/// stored set. Every supplied field is validated before anything is
+/// applied: bad values fail with `BAD_REQUEST` and apply nothing. An
+/// unknown name fails with `NOT_FOUND` and creates nothing. On success
+/// returns 200 with the stored metadata row (never the secret). The
+/// secret hash and mint time are never rotated here. The write persists
+/// across a restart through the config registry. The route is not paged.
+/// Management-plane only: one short write lock per request (plus the
+/// registry save lock on persist); publish and deliver never touch this
+/// store. An update replaces in place and never grows the map toward
+/// [`MAX_API_KEYS`].
+pub async fn update_api_key(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid api-key body: {error}")).into_response();
+        }
+    };
+    let (scopes, description) = match parse_update_request(&value) {
+        Ok(parsed) => parsed,
+        Err(message) => return ApiError::BadRequest(message).into_response(),
+    };
+    match state.api_keys.update(&name, scopes, description) {
+        Ok(record) => (StatusCode::OK, Json(record.to_json())).into_response(),
+        Err(ApiKeyUpdateError::NotFound) => {
+            ApiError::NotFound(format!("api key {name:?} not found")).into_response()
+        }
+        Err(ApiKeyUpdateError::Persist(message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": message,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Validate a create body into `(name, scopes, description)`.
 ///
 /// The body must be a JSON object with a non-empty slash-free `name`
@@ -578,6 +713,73 @@ fn parse_create_request(
         return Err("field `description` is too long".to_string());
     }
     Ok((name.to_string(), scopes, description))
+}
+
+/// Validate an update body into `(scopes, description)` replaces.
+///
+/// The body must be a JSON object. `scopes` (when present and non-null)
+/// must be an array of non-empty strings within the same caps as
+/// minting; a `null` or absent `scopes` keeps the stored set.
+/// `description` (or its `desc` alias; `description` wins when both are
+/// present, when present as a string) must be a string within
+/// [`MAX_DESCRIPTION_LEN`] bytes; an absent pair keeps the stored text.
+/// A `name` field, when present, is ignored: the path is the authority
+/// and a body name can never rename or fork the record. Any other extra
+/// fields are ignored so future record fields degrade to the same
+/// replace instead of a 400 (see the expiry TODO at the top of this
+/// file: fields the broker does not track are omitted, never invented).
+/// Every supplied field is checked before returning, so a caller that
+/// applies the result changes nothing on error.
+fn parse_update_request(
+    value: &serde_json::Value,
+) -> Result<(Option<Vec<String>>, Option<String>), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "api-key body must be a JSON object".to_string())?;
+    let scopes = match obj.get("scopes") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(items)) => {
+            if items.len() > broker_config::MAX_API_KEY_SCOPES {
+                return Err(format!(
+                    "field `scopes` holds {} entries, at most {}",
+                    items.len(),
+                    broker_config::MAX_API_KEY_SCOPES
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let scope = item
+                    .as_str()
+                    .ok_or_else(|| format!("field `scopes[{index}]` must be a string"))?;
+                if scope.trim().is_empty() || scope.len() > broker_config::MAX_API_KEY_SCOPE_LEN {
+                    return Err(format!("field `scopes[{index}]` is invalid"));
+                }
+                out.push(scope.to_string());
+            }
+            Some(out)
+        }
+        Some(_) => return Err("field `scopes` must be an array of strings".to_string()),
+    };
+    let description = match obj.get("description") {
+        Some(serde_json::Value::String(text)) => {
+            if text.len() > MAX_DESCRIPTION_LEN {
+                return Err("field `description` is too long".to_string());
+            }
+            Some(text.clone())
+        }
+        Some(_) => return Err("field `description` must be a string".to_string()),
+        None => match obj.get("desc") {
+            Some(serde_json::Value::String(text)) => {
+                if text.len() > MAX_DESCRIPTION_LEN {
+                    return Err("field `desc` is too long".to_string());
+                }
+                Some(text.clone())
+            }
+            Some(_) => return Err("field `desc` must be a string".to_string()),
+            None => None,
+        },
+    };
+    Ok((scopes, description))
 }
 
 #[cfg(test)]
@@ -708,6 +910,160 @@ mod api_key_store_tests {
         assert!(!restarted.verify("w225-persist", &secret));
         let reloaded = ConfigRegistry::load(&dir).expect("registry reloads again");
         assert!(reloaded.snapshot().api_keys.keys.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detail_get_returns_metadata_without_secrets_and_misses() {
+        // W2-26 store read: hit renders metadata without secret
+        // material, miss reads as absent.
+        let store = empty_store();
+        assert!(store.get("w226-missing").is_none());
+        let (_, secret) = store
+            .create(
+                "w226-key".to_string(),
+                vec!["all".to_string()],
+                "ops".to_string(),
+            )
+            .expect("mint succeeds");
+        let record = store.get("w226-key").expect("hit reads");
+        assert_eq!(record.name, "w226-key");
+        assert_eq!(record.scopes, vec!["all".to_string()]);
+        let row = record.to_json();
+        assert_eq!(row["name"], serde_json::json!("w226-key"));
+        assert!(row.get("api_key").is_none());
+        assert!(row.get("secret").is_none());
+        assert!(row.get("key_hash").is_none());
+        assert!(store.verify("w226-key", &secret));
+    }
+
+    #[test]
+    fn detail_update_replaces_scopes_and_description() {
+        // W2-26 store replace: scopes/description swap, the secret hash
+        // and mint time never rotate, unknown names create nothing.
+        let store = empty_store();
+        assert_eq!(
+            store.update("w226-missing", Some(vec!["all".to_string()]), None,),
+            Err(ApiKeyUpdateError::NotFound)
+        );
+        assert!(store.get("w226-missing").is_none());
+        let (before, secret) = store
+            .create(
+                "w226-key".to_string(),
+                vec!["all".to_string()],
+                "before".to_string(),
+            )
+            .expect("mint succeeds");
+        let updated = store
+            .update(
+                "w226-key",
+                Some(vec!["read".to_string(), "write".to_string()]),
+                Some("after".to_string()),
+            )
+            .expect("update succeeds");
+        assert_eq!(
+            updated.scopes,
+            vec!["read".to_string(), "write".to_string()]
+        );
+        assert_eq!(updated.description, "after");
+        // Secret and mint time are untouched by the replace.
+        assert!(store.verify("w226-key", &secret));
+        assert_eq!(updated.created_at, before.created_at);
+        let row = updated.to_json();
+        assert!(row.get("api_key").is_none());
+        assert!(row.get("key_hash").is_none());
+        // `None` fields keep the stored value.
+        let kept = store
+            .update("w226-key", None, None)
+            .expect("empty update keeps");
+        assert_eq!(kept.scopes, updated.scopes);
+        assert_eq!(kept.description, updated.description);
+    }
+
+    #[test]
+    fn detail_update_bodies_are_fully_validated() {
+        for body in [
+            serde_json::json!([]),
+            serde_json::json!({"scopes": "all"}),
+            serde_json::json!({"scopes": [""]}),
+            serde_json::json!({"scopes": [42]}),
+            serde_json::json!({"description": 42}),
+            serde_json::json!({"desc": 42}),
+        ] {
+            assert!(
+                parse_update_request(&body).is_err(),
+                "body {body} must be rejected"
+            );
+        }
+        // Omitted fields keep; null scopes keeps; extra fields degrade.
+        assert_eq!(
+            parse_update_request(&serde_json::json!({})),
+            Ok((None, None))
+        );
+        assert_eq!(
+            parse_update_request(&serde_json::json!({"scopes": serde_json::Value::Null})),
+            Ok((None, None))
+        );
+        assert!(parse_update_request(
+            &serde_json::json!({"scopes": ["all"], "expiry": "tomorrow"})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn detail_update_rejects_bad_values_without_applying() {
+        // Validate-all-before-apply at the store edge: a bad body never
+        // reaches the map, so the stored row is untouched.
+        let store = empty_store();
+        store
+            .create(
+                "w226-key".to_string(),
+                vec!["all".to_string()],
+                "before".to_string(),
+            )
+            .expect("mint succeeds");
+        assert!(parse_update_request(&serde_json::json!({"scopes": [""]})).is_err());
+        let record = store.get("w226-key").expect("row survives");
+        assert_eq!(record.scopes, vec!["all".to_string()]);
+        assert_eq!(record.description, "before");
+    }
+
+    #[test]
+    fn detail_update_persists_across_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-apikeys-w226-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("registry loads"));
+        let store = ApiKeyStore::from_registry(&registry);
+        let (_, secret) = store
+            .create(
+                "w226-persist".to_string(),
+                vec!["all".to_string()],
+                "before".to_string(),
+            )
+            .expect("mint succeeds");
+        store
+            .update(
+                "w226-persist",
+                Some(vec!["read".to_string()]),
+                Some("after".to_string()),
+            )
+            .expect("update succeeds");
+        // A restart re-seed observes the replaced row and the same
+        // secret still verifies (updates never rotate secrets).
+        let restarted = ApiKeyStore::from_registry(&Arc::new(
+            ConfigRegistry::load(&dir).expect("registry reloads"),
+        ));
+        let record = restarted.get("w226-persist").expect("row survives");
+        assert_eq!(record.scopes, vec!["read".to_string()]);
+        assert_eq!(record.description, "after");
+        assert!(restarted.verify("w226-persist", &secret));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

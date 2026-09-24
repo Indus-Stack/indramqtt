@@ -292,17 +292,23 @@ pub fn protected_router() -> Router<ApiState> {
             "/authorization/sources/:type/rules/:index",
             delete(auth::delete_authz_rule),
         )
-        // API keys (W2-25, C05-01..C05-03): paged metadata list,
-        // mint-with-single-secret-return and revoke with 404s on real
-        // state. Management-plane only; key checks use constant-time
-        // comparison off the hot path and publish/deliver never touch
-        // this store. Bearer/Basic enforcement itself is owned
-        // elsewhere; this task only manages the key records.
+        // API keys (W2-25, C05-01..C05-03; W2-26, C05-04/C05-05):
+        // paged metadata list, mint-with-single-secret-return, revoke
+        // with 404s, plus single-key metadata read and scopes/description
+        // replace with 404s, all on real state. Management-plane only; key
+        // checks use constant-time comparison off the hot path and
+        // publish/deliver never touch this store. Bearer/Basic enforcement
+        // itself is owned elsewhere; this task only manages the key records.
         .route(
             "/api_key",
             get(api_keys::list_api_keys).post(api_keys::create_api_key),
         )
-        .route("/api_key/:name", delete(api_keys::delete_api_key))
+        .route(
+            "/api_key/:name",
+            get(api_keys::get_api_key)
+                .put(api_keys::update_api_key)
+                .delete(api_keys::delete_api_key),
+        )
         // Live Monitoring & Rates
         .route("/metrics", get(monitoring::get_metrics))
         .route(

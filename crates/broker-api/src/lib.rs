@@ -187,7 +187,7 @@ pub struct ApiState {
     /// lock.
     pub authz_sources: Arc<broker_auth::AuthzSourceRegistry>,
     /// Management API key directory for `GET/POST /api/v5/api_key` and
-    /// `DELETE /api/v5/api_key/{name}` (W2-25): bounded name-keyed map
+    /// `GET/PUT/DELETE /api/v5/api_key/{name}` (W2-25, W2-26): bounded name-keyed map
     /// with registry persistence. The routes read one bounded snapshot
     /// per request; the kernel boot path seeds the same instance from
     /// the registry (`crates/broker-node/src/main.rs`, boot seeding and
@@ -9756,6 +9756,163 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server.get_auth("/api/v5/api_key", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["data"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn api_key_detail_read_update_round_trip_and_miss_404() {
+        // W2-26 failing test: mint a key, read it expecting metadata
+        // without the secret, update scopes/description and read back,
+        // read/update unknown expecting 404, invalid updates rejected
+        // without applying. Before: both detail routes 404.
+        // Broker-through: every step goes through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), not only
+        // through the store; the store unit tests cover hashing and the
+        // management-plane verify off the hot path, never publish or
+        // deliver.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Mint one key through the broker.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/api_key",
+                json!({"name": "w226-broker-key", "scopes": ["all"], "description": "before"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Read it back: metadata only, never the secret.
+        let (status, body) = server
+            .get_auth("/api/v5/api_key/w226-broker-key", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["name"], json!("w226-broker-key"));
+        assert_eq!(body["scopes"], json!(["all"]));
+        assert_eq!(body["description"], json!("before"));
+        assert!(body.get("api_key").is_none());
+        assert!(body.get("secret").is_none());
+        assert!(body.get("key_hash").is_none());
+
+        // Unknown names 404 with the documented shape and create nothing.
+        let (status, missing) = server
+            .get_auth("/api/v5/api_key/w226-no-such-key", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(missing["code"], json!("NOT_FOUND"));
+        let (status, missing) = server
+            .put_auth(
+                "/api/v5/api_key/w226-no-such-key",
+                json!({"scopes": ["read"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(missing["code"], json!("NOT_FOUND"));
+        let (status, _) = server
+            .get_auth("/api/v5/api_key/w226-no-such-key", &token)
+            .await;
+        assert_eq!(status, 404);
+
+        // Update scopes/description and read back the replace.
+        let (status, updated) = server
+            .put_auth(
+                "/api/v5/api_key/w226-broker-key",
+                json!({"scopes": ["read", "write"], "description": "after"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(updated["name"], json!("w226-broker-key"));
+        assert_eq!(updated["scopes"], json!(["read", "write"]));
+        assert_eq!(updated["description"], json!("after"));
+        assert!(updated.get("api_key").is_none());
+        assert!(updated.get("key_hash").is_none());
+        let (status, reread) = server
+            .get_auth("/api/v5/api_key/w226-broker-key", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(reread["scopes"], json!(["read", "write"]));
+        assert_eq!(reread["description"], json!("after"));
+
+        // Bad values are client errors and apply nothing.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/api_key/w226-broker-key",
+                json!({"scopes": [""]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        let (status, reread) = server
+            .get_auth("/api/v5/api_key/w226-broker-key", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(reread["scopes"], json!(["read", "write"]));
+
+        // Revocation still removes the detail row.
+        let (status, _) = server
+            .delete_auth("/api/v5/api_key/w226-broker-key", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, missing) = server
+            .get_auth("/api/v5/api_key/w226-broker-key", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(missing["code"], json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn api_key_detail_update_survives_restart() {
+        // Persistence through the broker: PUT through the management
+        // API, reload the same data dir in a fresh server, and read the
+        // replaced row back. Secrets stay hashed at rest, so the update
+        // never needs the secret.
+        let dir = unique_data_dir("apikey-detail");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/api_key",
+                json!({"name": "w226-persist", "scopes": ["all"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/api_key/w226-persist",
+                json!({"scopes": ["read"], "description": "kept"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The admin password persisted too, so the rebooted node logs in
+        // with the changed password (`login_as_admin` only fits fresh
+        // servers still on the default password).
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth("/api/v5/api_key/w226-persist", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["scopes"], json!(["read"]));
+        assert_eq!(body["description"], json!("kept"));
+        assert!(body.get("api_key").is_none());
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
