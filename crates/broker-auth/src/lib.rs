@@ -1,10 +1,21 @@
 pub mod chain;
+pub mod jwks;
+/// Shared JWKS test fixtures for B5-02 (T-95): the RSA signing-key minter
+/// and the loopback HTTPS JWKS server, single-sourced here and reused by
+/// the `broker-auth` authenticator tests and (via `#[path]` include) the
+/// `broker-node` CONNECT tests. Test-only: compiled into the test harness
+/// only, never into production binaries.
+#[cfg(test)]
+pub mod jwks_test_support;
 pub mod kerberos;
 pub mod ldap;
 pub mod node_cache;
 pub mod settings;
 
 pub use chain::{AuthnChain, AuthnEntry, ChainInsertError, ChainReorderError};
+pub use jwks::{
+    JwksAuthenticator, JwksConfig, VerifiedJwt, JWKS_CACHE_MAX_KEYS, JWKS_DEFAULT_DOCUMENT_CAP,
+};
 pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 pub use node_cache::NodeAuthCache;

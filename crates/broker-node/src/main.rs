@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use broker_auth::{
-    Authenticator, AuthnChain, AuthnSettingsStore, Authorizer, KerberosAuthenticator,
-    KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth, NodeAuthCache,
+    Authenticator, AuthnChain, AuthnSettingsStore, Authorizer, JwksAuthenticator, JwksConfig,
+    KerberosAuthenticator, KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth,
+    NodeAuthCache,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
@@ -27,6 +28,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod delayed;
+/// Shared JWKS fixtures (B5-02): single-sourced in
+/// `crates/broker-auth/src/jwks_test_support.rs` (test-only in both crates),
+/// included here with `#[path]` so there is one copy of the
+/// RSA/`CompatRng`/base64/PEM/server logic without shipping test material
+/// in the production `broker-auth` library.
+#[cfg(test)]
+#[path = "../../broker-auth/src/jwks_test_support.rs"]
+mod jwks_test_support;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tracing::{debug, info, warn};
@@ -252,6 +261,77 @@ struct Args {
     #[arg(long, default_value_t = broker_auth::REPLAY_MAX_ENTRIES)]
     kerberos_replay_max: usize,
 
+    /// JWKS endpoint URL for JWT authentication (B5-02). Empty (the
+    /// default) disables JWT: CONNECT falls back to the local user store
+    /// (plus LDAP/Kerberos when configured). Set to an `https://` URL
+    /// serving a `{"keys": [...]}` document to verify JWT-bearer clients
+    /// at CONNECT (signature by `kid`, expiry, issuer, audience). A
+    /// configured endpoint disables the anonymous open mode like a
+    /// directory does, and any endpoint outage fails closed.
+    #[arg(long, default_value = "")]
+    jwks_url: String,
+
+    /// Expected JWT issuer (`iss` claim). Empty skips the issuer check
+    /// (signature plus expiry only); set it in production so a token
+    /// minted for another service is refused.
+    #[arg(long, default_value = "")]
+    jwks_issuer: String,
+
+    /// Expected JWT audience (`aud` claim). Empty skips the audience
+    /// check; set it in production for the same reason as the issuer.
+    #[arg(long, default_value = "")]
+    jwks_audience: String,
+
+    /// JWKS background refresh period in seconds (default 300: rotation
+    /// propagates within five minutes; fast rotation is covered by the
+    /// unknown-`kid` trigger, so the period only bounds TTL staleness).
+    /// Clamped to 1..86400 at use.
+    #[arg(long, default_value_t = 300)]
+    jwks_refresh_period_secs: u64,
+
+    /// JWKS fetch timeout in milliseconds (default 5000, clamped
+    /// 100..60000): slow-endpoint tolerant while keeping a stalled
+    /// accept bounded. Matches the directory 5 s ceiling.
+    #[arg(long, default_value_t = 5000)]
+    jwks_fetch_timeout_ms: u64,
+
+    /// JWKS on-demand (unknown-`kid`) refresh timeout in milliseconds
+    /// (default 5000, clamped 100..60000): covers one fetch plus the
+    /// singleflight cache-poll window for a CONNECT with a fresh key.
+    #[arg(long, default_value_t = 5000)]
+    jwks_refresh_timeout_ms: u64,
+
+    /// JWKS key-cache bound in entries (default 32, clamped 1..256):
+    /// JWKS documents carry a handful of rotation keys, so 32 entries
+    /// of about 2 KiB cap CONNECT-only key memory near 64 KiB. Past the
+    /// bound the key set is sorted by `kid` and truncated to the bound,
+    /// so the same document always caches the same keys.
+    #[arg(long, default_value_t = broker_auth::JWKS_CACHE_MAX_KEYS)]
+    jwks_cache_max_keys: usize,
+
+    /// JWKS cache entry TTL in seconds (default 300, clamped 1..86400):
+    /// equals the refresh period so the background task keeps entries
+    /// fresh; expired entries force an on-demand refresh (fail closed).
+    #[arg(long, default_value_t = 300)]
+    jwks_cache_ttl_secs: u64,
+
+    /// JWT clock-skew allowance in seconds for `exp`/`nbf` (default 60,
+    /// clamped 0..3600): tolerates a minute of issuer/broker drift
+    /// without accepting clearly expired tokens.
+    #[arg(long, default_value_t = 60)]
+    jwks_clock_skew_secs: u64,
+
+    /// Path to a PEM CA certificate for private JWKS issuers. Empty
+    /// uses the platform trust store.
+    #[arg(long, default_value = "")]
+    jwks_ca_cert: String,
+
+    /// Skip TLS verification for the JWKS endpoint (loopback tests
+    /// only, never production: without it any network peer could serve
+    /// a forged key set).
+    #[arg(long)]
+    jwks_insecure_skip_verify: bool,
+
     /// Upper bound for `$delayed` deferrals in seconds (B4-03). Past it
     /// the request is dropped with a warning instead of pinning a wheel
     /// slot and a file row indefinitely. Default one day: longer
@@ -390,6 +470,57 @@ fn session_binding_reply(
     .expect("SessionBinding reply within size bounds")
 }
 
+/// Verify one JWT-shaped password against the live JWKS endpoint (B5-02).
+///
+/// Shared by both CONNECT arms (populated and empty local store) so the
+/// endpoint stays the authority either way: real HTTPS fetch by `kid`,
+/// never a bypass. Any endpoint problem fails closed. Returns the
+/// verified subject (`None` when the token carries no `sub`) on success;
+/// every failure increments the auth-failure metric and returns `Err`,
+/// and the caller replies `0x86` with no session. CONNECT-only, never on
+/// the delivery path.
+async fn verify_jwks_connect(
+    shared: &Shared,
+    client_id: &str,
+    password: Option<&[u8]>,
+) -> Result<Option<String>, ()> {
+    let Some(jwks) = shared.jwks.as_ref() else {
+        shared.metrics.inc_auth_failures();
+        return Err(());
+    };
+    let Some(token_bytes) = password else {
+        shared.metrics.inc_auth_failures();
+        return Err(());
+    };
+    let Ok(token) = std::str::from_utf8(token_bytes) else {
+        shared.metrics.inc_auth_failures();
+        return Err(());
+    };
+    match jwks.verify_token(client_id, token).await {
+        Ok(verified) => {
+            // Wire every verified field live: subject, issuer, key id and
+            // expiry (the token itself is never logged). Audit-logged for
+            // SSO traceability; CONNECT-only.
+            tracing::info!(
+                subject = %verified.subject,
+                issuer = %verified.issuer,
+                key_id = %verified.key_id,
+                expires_at = verified.expires_at,
+                "JWT CONNECT accepted"
+            );
+            if verified.subject.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(verified.subject))
+            }
+        }
+        Err(_) => {
+            shared.metrics.inc_auth_failures();
+            Err(())
+        }
+    }
+}
+
 /// Authenticated bind for the live path: credentialed requests verify
 /// against the auth store first (failure short-circuits to return code
 /// `0x86`, bad username/password, with no session created), then the
@@ -402,6 +533,10 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
     // second verify). CONNECT-only, never on the delivery path.
     let mut kerberos_principal: Option<String> = None;
     let mut kerberos_role: Option<String> = None;
+    // B5-02: verified JWT subject for this CONNECT. Set inside the auth
+    // block on JWKS success and read by the ownership stamp below.
+    // CONNECT-only, never on the delivery path.
+    let mut jwks_subject: Option<String> = None;
     // B4-05: the CONNACK-negotiated inbound alias bound rides every
     // `SessionBinding` reply, including refusals, so the client always
     // learns it on the CONNECT event.
@@ -458,11 +593,16 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             // A non-empty user store always wins over `--allow-anonymous`:
             // unauthenticated clients are rejected whenever users exist.
             // A configured directory does the same: anonymous never
-            // authenticates against LDAP or Kerberos. The flag only opens
-            // the broker while the store is empty and no directory or
-            // enabled Kerberos mechanism is configured.
+            // authenticates against LDAP, Kerberos or JWKS. The flag only
+            // opens the broker while the store is empty and no directory,
+            // enabled Kerberos mechanism or JWKS endpoint is configured.
             let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
-            if shared.auth.user_count() > 0 || shared.ldap.is_some() || kerberos_enabled {
+            let jwks_enabled = shared.jwks.as_ref().is_some_and(|j| j.is_enabled());
+            if shared.auth.user_count() > 0
+                || shared.ldap.is_some()
+                || kerberos_enabled
+                || jwks_enabled
+            {
                 shared.metrics.inc_auth_failures();
                 return Some(session_binding_reply(frame, 0, false, 0x87, alias_max));
             }
@@ -485,8 +625,11 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
             let looks_kerberos =
                 password.is_some_and(|p| !p.is_empty() && (p[0] == 0x60 || p[0] == 0x6E));
+            let jwks_enabled = shared.jwks.as_ref().is_some_and(|j| j.is_enabled());
+            let looks_jwt = password.is_some_and(JwksAuthenticator::looks_like_jwt);
             let mut via_ldap = false;
             let mut via_kerberos = false;
+            let mut via_jwks = false;
             if local_has_users {
                 let local_ok = shared
                     .auth
@@ -495,6 +638,19 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     .is_ok();
                 if local_ok {
                     // Local credential accepted; quotas apply below.
+                } else if jwks_enabled && looks_jwt {
+                    // B5-02: JWT-shaped passwords verify against the live
+                    // JWKS endpoint when configured; success carries the
+                    // verified subject for the ownership stamp below.
+                    match verify_jwks_connect(shared, &req.client_id, password).await {
+                        Ok(subject) => {
+                            via_jwks = true;
+                            jwks_subject = subject;
+                        }
+                        Err(()) => {
+                            return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                        }
+                    }
                 } else if kerberos_enabled && looks_kerberos {
                     let Some(kerberos) = shared.kerberos.as_ref() else {
                         shared.metrics.inc_auth_failures();
@@ -554,6 +710,19 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     shared.metrics.inc_auth_failures();
                     return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 }
+            } else if jwks_enabled && looks_jwt {
+                // B5-02: same JWKS verification as above for the empty
+                // local store: the endpoint is the authority, so a
+                // JWT-shaped password never falls through to open mode.
+                match verify_jwks_connect(shared, &req.client_id, password).await {
+                    Ok(subject) => {
+                        via_jwks = true;
+                        jwks_subject = subject;
+                    }
+                    Err(()) => {
+                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                    }
+                }
             } else if kerberos_enabled && looks_kerberos {
                 let Some(kerberos) = shared.kerberos.as_ref() else {
                     shared.metrics.inc_auth_failures();
@@ -603,14 +772,28 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 // CONNECT without a Kerberos token fails closed.
                 shared.metrics.inc_auth_failures();
                 return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+            } else if jwks_enabled {
+                // B5-02: a configured JWKS endpoint disables the open mode
+                // like a directory does. A non-JWT password with no other
+                // mechanism configured fails closed instead of
+                // open-accepting: nothing unverified is ever granted.
+                shared.metrics.inc_auth_failures();
+                return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
             } else {
-                // Open broker: no users, no directory, no enabled Kerberos.
-                // Fall through to the session resolution below (rc 0).
+                // Open broker: no users, no directory, no enabled Kerberos
+                // or JWKS. Fall through to the session resolution below
+                // (rc 0).
             }
             // Effective identity for quotas and takeover: the verified
-            // Kerberos principal when present, else the MQTT username.
-            let effective_username: Option<String> =
-                kerberos_principal.clone().or_else(|| req.username.clone());
+            // Kerberos principal when present, the verified JWT subject
+            // for JWT CONNECTs carrying one, else the MQTT username.
+            // TODO(parity): whether a scope/role claim should drive ACLs
+            // is open; JWT claims drive no authorisation today.
+            let effective_username: Option<String> = if via_jwks {
+                jwks_subject.clone().or_else(|| req.username.clone())
+            } else {
+                kerberos_principal.clone().or_else(|| req.username.clone())
+            };
             // Takeover pre-release: a live session for this client means
             // the previous holder was orphaned by this very bind.
             let already_live = shared
@@ -630,7 +813,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 // every Kerberos CONNECT sets a role alongside the
                 // principal, and non-Kerberos CONNECTs set neither.
                 debug_assert!(via_kerberos == kerberos_role.is_some());
-                let max = if via_ldap || via_kerberos {
+                let max = if via_ldap || via_kerberos || via_jwks {
                     None
                 } else {
                     shared
@@ -680,6 +863,10 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
         if let Some(session) = shared.sessions.get(&req.client_id) {
             if let Some(principal) = &kerberos_principal {
                 *session.username.write() = Some(principal.clone());
+            } else if let Some(subject) = &jwks_subject {
+                // B5-02: JWT CONNECTs stamp the verified subject (the
+                // username string is unverified protocol metadata).
+                *session.username.write() = Some(subject.clone());
             } else if let Some(username) = &req.username {
                 *session.username.write() = Some(username.clone());
             }
@@ -1468,6 +1655,13 @@ struct Shared {
     /// never accepts tokens. One `Arc` clone at boot; CONNECT-only (one
     /// bounded replay-cache lock, never on the delivery path).
     kerberos: Option<Arc<KerberosAuthenticator>>,
+    /// JWKS authenticator for B5-02 (`None` disables JWT). Consulted at
+    /// CONNECT for JWT-shaped passwords when the local store refuses; an
+    /// unreachable or invalid endpoint fails closed with 0x86. One `Arc`
+    /// clone at boot; CONNECT-only (one bounded cache read plus one
+    /// signature verification on a hit, one singleflight fetch on a key
+    /// miss, never on the delivery path).
+    jwks: Option<Arc<JwksAuthenticator>>,
     allow_anonymous: bool,
     /// Kernel-owned configuration registry: loaded from `--data-dir` at
     /// boot; validated defaults in tests and before boot wiring runs.
@@ -1668,6 +1862,7 @@ impl Shared {
             authn_settings,
             ldap: None,
             kerberos: None,
+            jwks: None,
             allow_anonymous: false,
             config: defaults_registry(),
             node_id: "indra-node-1".to_string(),
@@ -5212,6 +5407,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.kerberos_service_principal
         );
         shared.kerberos = Some(Arc::new(KerberosAuthenticator::new(kerberos_config)));
+    }
+    // JWT authentication (B5-02): opt-in via `--jwks-url`. Empty leaves
+    // `jwks` as `None` so CONNECT pays one `is_some` branch and
+    // benchmarks see no new work. When set, CONNECT verifies JWT-shaped
+    // passwords against the live endpoint (signature by `kid`, expiry,
+    // issuer, audience); unknown `kid`s trigger one singleflight refresh
+    // and any endpoint outage fails closed. The background task keeps the
+    // bounded key cache fresh without a restart.
+    if !args.jwks_url.is_empty() {
+        if !args.jwks_url.starts_with("https://") {
+            return Err(format!(
+                "invalid --jwks-url {}: must start with https:// (field `jwks_url`)",
+                args.jwks_url
+            )
+            .into());
+        }
+        let jwks_config = JwksConfig {
+            jwks_url: args.jwks_url.clone(),
+            issuer: args.jwks_issuer.clone(),
+            audience: args.jwks_audience.clone(),
+            refresh_period_secs: args.jwks_refresh_period_secs,
+            fetch_timeout_ms: args.jwks_fetch_timeout_ms,
+            refresh_timeout_ms: args.jwks_refresh_timeout_ms,
+            cache_max_keys: args.jwks_cache_max_keys,
+            cache_ttl_secs: args.jwks_cache_ttl_secs,
+            max_document_bytes: broker_auth::JWKS_DEFAULT_DOCUMENT_CAP,
+            clock_skew_secs: args.jwks_clock_skew_secs,
+            tls_verify: !args.jwks_insecure_skip_verify,
+            ca_cert_path: if args.jwks_ca_cert.is_empty() {
+                None
+            } else {
+                Some(args.jwks_ca_cert.clone())
+            },
+        };
+        info!("JWT authentication enabled for {}", args.jwks_url);
+        let jwks = Arc::new(JwksAuthenticator::new(jwks_config));
+        jwks.spawn_background_refresh();
+        shared.jwks = Some(jwks);
     }
 
     // Licensing lifecycle (B2-04): trusted keys are configuration loaded at
@@ -10176,6 +10409,445 @@ mod tests {
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
         assert_eq!(rc, 0x86, "directory outage must fail closed with 0x86");
         assert!(down_shared.sessions.get("ldap-down").is_none());
+    }
+
+    /// Shared JWKS fixtures (B5-02): see the crate-root `#[path]` include of
+    /// `crates/broker-auth/src/jwks_test_support.rs` above.
+    use crate::jwks_test_support::{
+        TestJwksServer as JwksTestServer, TestSigningKey as JwksSigningKey,
+    };
+
+    /// JWKS-enabled broker state for the CONNECT tests: endpoint plus
+    /// issuer/audience pinned, short timeouts so outage legs stay fast.
+    fn jwks_test_shared(url: String) -> Shared {
+        let mut shared = test_shared();
+        let config = JwksConfig {
+            jwks_url: url,
+            issuer: "https://issuer.example".to_string(),
+            audience: "indra-mqtt".to_string(),
+            refresh_period_secs: 60,
+            fetch_timeout_ms: 3_000,
+            refresh_timeout_ms: 3_000,
+            cache_max_keys: 32,
+            cache_ttl_secs: 60,
+            max_document_bytes: broker_auth::JWKS_DEFAULT_DOCUMENT_CAP,
+            clock_skew_secs: 60,
+            // Loopback fixture only: production endpoints keep TLS on.
+            tls_verify: false,
+            ca_cert_path: None,
+        };
+        shared.jwks = Some(Arc::new(JwksAuthenticator::new(config)));
+        shared
+    }
+
+    /// B5-02: JWT CONNECT through the broker plus publish and deliver.
+    ///
+    /// A valid token against the live loopback HTTPS endpoint is accepted
+    /// (rc 0, real session, username stamped with the verified subject),
+    /// then a publish through `apply_publish` reaches a subscriber bound
+    /// on the same broker: connect, publish and deliver with a JWT
+    /// identity, never through the store alone.
+    #[tokio::test]
+    async fn jwks_bind_through_broker_connect() {
+        let signing = JwksSigningKey::generate("conn-key-a");
+        let server = JwksTestServer::start(vec![signing.jwk_json()]).await;
+        let shared = jwks_test_shared(server.url());
+        let token = signing.mint("https://issuer.example", "indra-mqtt", 3600, false);
+
+        let frame = bind_frame(
+            101,
+            1,
+            encode_bind_meta_creds("jwt-device-1", true, 60, "jwt-user", token.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "valid JWT CONNECT must be accepted");
+        let session = shared
+            .sessions
+            .get("jwt-device-1")
+            .expect("session created");
+        assert_eq!(
+            session.username.read().as_deref(),
+            Some("device-1"),
+            "username stamps the verified subject"
+        );
+
+        // Publish and deliver with the JWT identity on the same broker.
+        let sub = subscribe_frame(
+            101,
+            2,
+            encode_subscribe_meta(7, "jwt-device-1", &[("jwt/topic", 0)]),
+        );
+        let (sub_reply, _) = apply_subscribe(&sub, &shared).await;
+        sub_reply.expect("subscribe replies");
+        let (tx101, _rx101) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(101, tx101);
+        let (meta, payload) = encode_publish_meta("jwt/topic", 1, 0, false, b"hello-jwt");
+        let publish = publish_frame(102, 3, meta, payload);
+        let (_, deliveries) = apply_publish(&publish, &shared).await;
+        assert_eq!(deliveries.len(), 1, "one live delivery expected");
+        route_publish_out_deliveries(&shared, &publish, deliveries);
+        // QoS 0 downlinks ride the bounded backlog, not the mailbox.
+        let got = shared.conns.pop_qos0(101).expect("downlink arrived");
+        assert_eq!(got.payload.as_ref(), b"hello-jwt");
+    }
+
+    /// B5-02: key rotation without a restart, plus unknown-`kid` refusal.
+    ///
+    /// Rotates the endpoint's keys mid-test: a token signed with the new
+    /// key verifies with no restart (unknown-`kid` refresh), the old
+    /// token is refused once its kid leaves the document, and a token
+    /// naming a never-served kid is refused.
+    #[tokio::test]
+    async fn jwks_rotation_without_restart_and_unknown_kid_refused() {
+        let first = JwksSigningKey::generate("rot-key-a");
+        let server = JwksTestServer::start(vec![first.jwk_json()]).await;
+        let shared = jwks_test_shared(server.url());
+        let before = first.mint("https://issuer.example", "indra-mqtt", 3600, false);
+        let frame = bind_frame(
+            111,
+            1,
+            encode_bind_meta_creds("jwt-rot-1", true, 60, "u", before.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(decode_session_binding_meta(&reply.metadata).2, 0);
+
+        let second = JwksSigningKey::generate("rot-key-b");
+        server.rotate(vec![second.jwk_json()]);
+        let after = second.mint("https://issuer.example", "indra-mqtt", 3600, false);
+        let frame = bind_frame(
+            112,
+            1,
+            encode_bind_meta_creds("jwt-rot-2", true, 60, "u", after.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0,
+            "rotated key must verify without a restart"
+        );
+
+        let frame = bind_frame(
+            113,
+            1,
+            encode_bind_meta_creds("jwt-rot-3", true, 60, "u", before.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0x86,
+            "retired kid must be refused"
+        );
+
+        let stranger = JwksSigningKey::generate("rot-key-zzz");
+        let unknown = stranger.mint("https://issuer.example", "indra-mqtt", 3600, false);
+        let frame = bind_frame(
+            114,
+            1,
+            encode_bind_meta_creds("jwt-rot-4", true, 60, "u", unknown.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0x86,
+            "unknown kid must be refused"
+        );
+        assert!(shared.sessions.get("jwt-rot-4").is_none());
+    }
+
+    /// B5-02: claim and signature refusals through the broker CONNECT.
+    ///
+    /// Expired tokens, wrong audience, wrong issuer and bad signatures
+    /// are all refused with 0x86 and create no session. A configured JWKS
+    /// endpoint also closes the open mode: non-JWT passwords and
+    /// anonymous CONNECTs are refused (0x86 and 0x87).
+    #[tokio::test]
+    async fn jwks_claim_and_signature_refusals() {
+        let signing = JwksSigningKey::generate("ref-key-a");
+        let server = JwksTestServer::start(vec![signing.jwk_json()]).await;
+        let shared = jwks_test_shared(server.url());
+
+        for (label, token) in [
+            (
+                "expired",
+                // 300 s in the past: well past the 60 s clock-skew leeway.
+                signing.mint("https://issuer.example", "indra-mqtt", -300, false),
+            ),
+            (
+                "wrong-audience",
+                signing.mint("https://issuer.example", "other-service", 3600, false),
+            ),
+            (
+                "wrong-issuer",
+                signing.mint("https://other.example", "indra-mqtt", 3600, false),
+            ),
+            (
+                "bad-signature",
+                signing.mint("https://issuer.example", "indra-mqtt", 3600, true),
+            ),
+        ] {
+            let frame = bind_frame(
+                121,
+                1,
+                encode_bind_meta_creds("jwt-ref", true, 60, "u", token.as_bytes()),
+            );
+            let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+            assert_eq!(
+                decode_session_binding_meta(&reply.metadata).2,
+                0x86,
+                "{label} token must be refused"
+            );
+        }
+        assert!(shared.sessions.get("jwt-ref").is_none());
+
+        // Non-JWT password with JWKS-only configured: fail closed, never
+        // open-accepted.
+        let frame = bind_frame(
+            122,
+            1,
+            encode_bind_meta_creds("jwt-plain", true, 60, "u", b"password"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0x86,
+            "non-JWT password must fail closed while JWKS is configured"
+        );
+
+        // Anonymous while JWKS is configured: refused with 0x87.
+        let frame = bind_frame(123, 1, encode_bind_meta("jwt-anon", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0x87,
+            "anonymous must be refused while JWKS is configured"
+        );
+    }
+
+    /// B5-02: unreachable JWKS endpoint fails closed through the broker.
+    ///
+    /// A verifier pointed at a dead loopback port refuses CONNECT with
+    /// 0x86 and creates no session: access is denied, never granted.
+    #[tokio::test]
+    async fn jwks_unreachable_endpoint_fails_closed() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral port");
+        let closed_addr = closed.local_addr().expect("local addr");
+        drop(closed);
+        let mut shared = test_shared();
+        let config = JwksConfig {
+            jwks_url: format!("https://{closed_addr}/jwks.json"),
+            issuer: "https://issuer.example".to_string(),
+            audience: "indra-mqtt".to_string(),
+            refresh_period_secs: 60,
+            fetch_timeout_ms: 1_000,
+            refresh_timeout_ms: 1_000,
+            cache_max_keys: 32,
+            cache_ttl_secs: 60,
+            max_document_bytes: broker_auth::JWKS_DEFAULT_DOCUMENT_CAP,
+            clock_skew_secs: 60,
+            tls_verify: false,
+            ca_cert_path: None,
+        };
+        shared.jwks = Some(Arc::new(JwksAuthenticator::new(config)));
+        let signing = JwksSigningKey::generate("down-key-a");
+        let token = signing.mint("https://issuer.example", "indra-mqtt", 3600, false);
+        let frame = bind_frame(
+            131,
+            1,
+            encode_bind_meta_creds("jwt-down", true, 60, "u", token.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "JWKS outage must fail closed with 0x86");
+        assert!(shared.sessions.get("jwt-down").is_none());
+    }
+
+    /// B5-02 qualification probe (QUAL-NONE): the full JWKS matrix through
+    /// the broker CONNECT path plus publish and deliver.
+    ///
+    /// Self-contained on loopback (no vendor server product exists): it
+    /// mints its own key sets, serves them from a test-owned HTTPS
+    /// endpoint with rotation and outage faults, and drives every leg
+    /// through `apply_bind` (the kernel CONNECT entry point the edge
+    /// uses), then publishes through the JWT identity. Exact counts only:
+    /// 3 valid CONNECTs accepted, exactly 1 live delivery carrying the
+    /// exact payload, rotation accepted without a restart with the retired
+    /// and unknown kids refused, 4 claim/signature refusals, outage
+    /// refused fail-closed, recovery accepted. Setup failures panic
+    /// (`expect`); the test never skips or returns early. `#[ignore]` so
+    /// only the pipeline's qualification run picks it up explicitly.
+    #[tokio::test]
+    #[ignore]
+    async fn test_qualify_jwks_connect_publish_deliver() {
+        // Valid tokens against the live endpoint: exactly 3 CONNECTs
+        // accepted through the broker.
+        let signing = JwksSigningKey::generate("qual-key-a");
+        let server = JwksTestServer::start(vec![signing.jwk_json()]).await;
+        let shared = jwks_test_shared(server.url());
+        let mut accepted = 0u32;
+        for (conn_id, client_id) in [
+            (201u64, "jwt-qual-1"),
+            (202, "jwt-qual-2"),
+            (203, "jwt-qual-3"),
+        ] {
+            let token = signing.mint("https://issuer.example", "indra-mqtt", 3600, false);
+            let frame = bind_frame(
+                conn_id,
+                1,
+                encode_bind_meta_creds(client_id, true, 60, "qual-user", token.as_bytes()),
+            );
+            let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+            if decode_session_binding_meta(&reply.metadata).2 == 0 {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 3, "exactly 3 valid JWT CONNECTs must be accepted");
+
+        // Publish and deliver with the JWT identity on the same broker:
+        // exactly one live delivery carrying the exact payload.
+        let sub = subscribe_frame(
+            201,
+            2,
+            encode_subscribe_meta(7, "jwt-qual-1", &[("qual/topic", 0)]),
+        );
+        let (sub_reply, _) = apply_subscribe(&sub, &shared).await;
+        sub_reply.expect("subscribe replies");
+        let (tx201, _rx201) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(201, tx201);
+        let (meta, payload) = encode_publish_meta("qual/topic", 1, 0, false, b"hello-qual");
+        let publish = publish_frame(202, 3, meta, payload);
+        let (_, deliveries) = apply_publish(&publish, &shared).await;
+        assert_eq!(deliveries.len(), 1, "exactly one live delivery expected");
+        route_publish_out_deliveries(&shared, &publish, deliveries);
+        // QoS 0 downlinks ride the bounded backlog, not the mailbox.
+        let got = shared.conns.pop_qos0(201).expect("downlink arrived");
+        assert_eq!(got.payload.as_ref(), b"hello-qual");
+
+        // Rotate the endpoint mid-test: the new kid verifies with no
+        // restart (unknown-`kid` refresh), which also evicts the retired
+        // kid from the cache, so the old token and a never-served kid are
+        // both refused.
+        let second = JwksSigningKey::generate("qual-key-b");
+        server.rotate(vec![second.jwk_json()]);
+        let after = second.mint("https://issuer.example", "indra-mqtt", 3600, false);
+        let frame = bind_frame(
+            211,
+            1,
+            encode_bind_meta_creds("jwt-qual-4", true, 60, "u", after.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0,
+            "rotated key must verify without a restart"
+        );
+        let before = signing.mint("https://issuer.example", "indra-mqtt", 3600, false);
+        let frame = bind_frame(
+            212,
+            1,
+            encode_bind_meta_creds("jwt-qual-5", true, 60, "u", before.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0x86,
+            "retired kid must be refused"
+        );
+        let stranger = JwksSigningKey::generate("qual-key-zzz");
+        let unknown = stranger.mint("https://issuer.example", "indra-mqtt", 3600, false);
+        let frame = bind_frame(
+            213,
+            1,
+            encode_bind_meta_creds("jwt-qual-6", true, 60, "u", unknown.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0x86,
+            "unknown kid must be refused"
+        );
+
+        // Claim and signature refusals through the broker: exactly 4
+        // refusals, no session created. The endpoint still serves key-b,
+        // so refusals blame the claim, not the setup.
+        let mut refused = 0u32;
+        for token in [
+            // 300 s in the past: well past the 60 s clock-skew leeway.
+            second.mint("https://issuer.example", "indra-mqtt", -300, false),
+            second.mint("https://issuer.example", "other-service", 3600, false),
+            second.mint("https://other.example", "indra-mqtt", 3600, false),
+            second.mint("https://issuer.example", "indra-mqtt", 3600, true),
+        ] {
+            let frame = bind_frame(
+                221,
+                1,
+                encode_bind_meta_creds("jwt-qual-claim", true, 60, "u", token.as_bytes()),
+            );
+            let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+            if decode_session_binding_meta(&reply.metadata).2 == 0x86 {
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, 4, "all 4 bad-claim tokens must be refused");
+        assert!(shared.sessions.get("jwt-qual-claim").is_none());
+
+        // Outage: a verifier pointed at a dead loopback port refuses
+        // CONNECT fail-closed and creates no session.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral port");
+        let closed_addr = closed.local_addr().expect("local addr");
+        drop(closed);
+        let mut down_shared = test_shared();
+        let down_config = JwksConfig {
+            jwks_url: format!("https://{closed_addr}/jwks.json"),
+            issuer: "https://issuer.example".to_string(),
+            audience: "indra-mqtt".to_string(),
+            refresh_period_secs: 60,
+            fetch_timeout_ms: 1_000,
+            refresh_timeout_ms: 1_000,
+            cache_max_keys: 32,
+            cache_ttl_secs: 60,
+            max_document_bytes: broker_auth::JWKS_DEFAULT_DOCUMENT_CAP,
+            clock_skew_secs: 60,
+            tls_verify: false,
+            ca_cert_path: None,
+        };
+        down_shared.jwks = Some(Arc::new(JwksAuthenticator::new(down_config)));
+        let down_signing = JwksSigningKey::generate("qual-down-a");
+        let down_token = down_signing.mint("https://issuer.example", "indra-mqtt", 3600, false);
+        let frame = bind_frame(
+            231,
+            1,
+            encode_bind_meta_creds("jwt-qual-down", true, 60, "u", down_token.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &down_shared)
+            .await
+            .expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0x86,
+            "JWKS outage must fail closed with 0x86"
+        );
+        assert!(down_shared.sessions.get("jwt-qual-down").is_none());
+
+        // Recovery: a verifier against the healed endpoint accepts again
+        // with no restart.
+        let healed = jwks_test_shared(server.url());
+        let token = second.mint("https://issuer.example", "indra-mqtt", 3600, false);
+        let frame = bind_frame(
+            241,
+            1,
+            encode_bind_meta_creds("jwt-qual-healed", true, 60, "u", token.as_bytes()),
+        );
+        let reply = apply_bind(&frame, &healed).await.expect("bind replies");
+        assert_eq!(
+            decode_session_binding_meta(&reply.metadata).2,
+            0,
+            "healed endpoint must accept"
+        );
     }
 
     /// B2-02: Kerberos authentication through the broker CONNECT path.

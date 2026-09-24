@@ -22,6 +22,8 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
 ldap3 = "0.12"
 native-tls = "0.2"
 kerberos-parser = "0.9"
@@ -37,3 +39,21 @@ time = "0.3"
 tokio = { workspace = true }
 yamldap = "0.2"
 tempfile = "3"
+# Test-only (B5-02 JWKS fixtures and `jwks_connect_bench` HTTPS server):
+# the shared `jwks_test_support` module is `#[cfg(test)]`, and the bench
+# file mirrors it inline, so these never ship in production binaries. All
+# are maintained crates on permissive licences already used in the workspace.
+rsa = { workspace = true }
+rustls = { version = "0.23.45" }
+tokio-rustls = { version = "0.26" }
+rustls-pemfile = { version = "1" }
+
+[features]
+default = ["jwks-bench"]
+# Bench selector for `tests/jwks_connect_bench.rs` (B5-02): the gates run
+# that file on the task's base commit (with only the file copied in, where
+# the JWKS types do not exist) and on the tree. The JWKS legs compile under
+# this feature; without it the file falls back to the base CONNECT
+# credential check under the same `BENCH` metric names. Empty: library code
+# is unconditional, this only selects the benchmark body.
+jwks-bench = []
