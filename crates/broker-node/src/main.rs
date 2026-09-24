@@ -5404,7 +5404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broker_auth::{AclAction, AclRule};
+    use broker_auth::{AclAction, AclRule, PasswordAlgorithm, PasswordHashPolicy};
     use broker_session::MAX_OFFLINE_QUEUE;
 
     /// Unique scratch data dir under the OS temp dir (no dev-dependency).
@@ -9926,6 +9926,102 @@ mod tests {
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
         assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn password_hashing_migrated_credential_binds_end_to_end() {
+        // B5-01: CONNECT with a valid migrated credential succeeds through
+        // the real listener and kernel, and a wrong password is refused
+        // with 0x86. No fake auth channel: real TCP plus
+        // `handle_connection`, the same entry point the edge uses. The
+        // legacy SHA-256 entry migrates to the default (Argon2id) on its
+        // first successful login. Hashing is local computation
+        // (QUAL-NONE: no external server).
+        let shared = test_shared();
+        shared.auth.set_policy(PasswordHashPolicy::for_tests());
+        shared
+            .auth
+            .add_user_with_algorithm("migr", b"migr-secret", PasswordAlgorithm::Sha256Legacy)
+            .expect("memory-only persist cannot fail");
+        shared
+            .auth
+            .add_user("fast", b"fast-secret")
+            .expect("memory-only persist cannot fail");
+        assert_eq!(
+            shared
+                .auth
+                .verifier_string("migr")
+                .expect("legacy stored")
+                .len(),
+            64,
+            "legacy verifier is 64 hex chars before migration"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server_shared = shared.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let owned = server_shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, owned).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        async fn bind_rc(
+            addr: std::net::SocketAddr,
+            conn_id: u64,
+            client_id: &str,
+            username: &str,
+            password: &[u8],
+        ) -> u8 {
+            let io = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect client");
+            let client = FramedTransport::new(io);
+            client
+                .send(bind_frame(
+                    conn_id,
+                    1,
+                    encode_bind_meta_creds(client_id, true, 60, username, password),
+                ))
+                .await
+                .expect("bind");
+            let reply = client.recv().await.expect("recv binding");
+            assert_eq!(reply.header.opcode, OpCode::SessionBinding);
+            decode_session_binding_meta(&reply.metadata).2
+        }
+
+        // Valid legacy credential binds and migrates to the default.
+        assert_eq!(
+            bind_rc(addr, 911, "migr-1", "migr", b"migr-secret").await,
+            0
+        );
+        let migrated = shared.auth.verifier_string("migr").expect("migrated");
+        assert!(
+            migrated.starts_with("$argon2id$"),
+            "legacy entry must migrate to Argon2id, got {migrated}"
+        );
+        // Wrong password for the migrated entry is refused.
+        assert_eq!(
+            bind_rc(addr, 912, "migr-2", "migr", b"wrong-secret").await,
+            0x86
+        );
+        // Valid default-algorithm credential binds.
+        assert_eq!(
+            bind_rc(addr, 913, "fast-1", "fast", b"fast-secret").await,
+            0
+        );
+        // Wrong password is refused.
+        assert_eq!(
+            bind_rc(addr, 914, "fast-2", "fast", b"wrong-secret").await,
+            0x86
+        );
+
+        server.abort();
     }
 
     /// B2-01: directory authentication through the broker CONNECT path.
