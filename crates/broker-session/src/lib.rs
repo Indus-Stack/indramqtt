@@ -217,6 +217,23 @@ pub struct Session {
     /// fan-out path never touches this lock. Bounded by
     /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] with oldest-first eviction.
     pub authz_cache: RwLock<VecDeque<AuthzDecision>>,
+    /// Node-cache health counters for the status read (W2-15): cumulative
+    /// hits (repeat decision refreshed in place), misses (new decision
+    /// recorded) and inserts (new entries added) since boot. Three fixed
+    /// `u64`s per session (24 bytes): the set never grows, and resets or
+    /// evictions leave them untouched (cumulative, memory-only, never
+    /// persisted). Incremented under the `authz_cache` write lock the
+    /// authorize event already holds, with relaxed atomics: no new lock,
+    /// no allocation, no unbounded work on the publish path, and the
+    /// status read loads them lock-free.
+    // TODO(parity): should a global or per-client clear zero these
+    // counters, and should a disabled node policy stop the increments?
+    // The rulebook does not decide the reset or disabled semantics; the
+    // current choice keeps them cumulative and always counting so the
+    // status observes every decision, until the checker pins it.
+    authz_cache_hits: AtomicU64,
+    authz_cache_misses: AtomicU64,
+    authz_cache_inserts: AtomicU64,
     next_packet_id: AtomicU16,
 }
 
@@ -264,6 +281,29 @@ pub struct AuthzDecision {
     pub retain: bool,
     pub allow: bool,
     pub updated_ms: u64,
+}
+
+/// Cumulative per-session node-cache health counters (W2-15): hits
+/// (repeat decisions refreshed in place), misses (new decisions) and
+/// inserts (new entries) since boot. Fixed three-`u64` set per session;
+/// memory-only, never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthzCacheCounters {
+    pub hits: u64,
+    pub misses: u64,
+    pub inserts: u64,
+}
+
+/// Node-wide authorization cache health rolled up across every live
+/// session (W2-15): live entry count plus the summed cumulative
+/// hit/miss/insert counters. Computed live on the management plane;
+/// memory-only, never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthzNodeStats {
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub inserts: u64,
 }
 
 /// One QoS 1 downlink held from the moment it is written toward a
@@ -478,6 +518,9 @@ impl Session {
             peerhost: RwLock::new(None),
             connected_at_ms: RwLock::new(Some(now_ms())),
             authz_cache: RwLock::new(VecDeque::new()),
+            authz_cache_hits: AtomicU64::new(0),
+            authz_cache_misses: AtomicU64::new(0),
+            authz_cache_inserts: AtomicU64::new(0),
             next_packet_id: AtomicU16::new(1),
         }
     }
@@ -940,11 +983,16 @@ impl Session {
     /// concrete topic or filter; `qos`/`retain` ride with the entry so the
     /// management read can render them without consulting the hot path.
     /// A repeat of the same `(action, topic, qos, retain)` refreshes the
-    /// decision and recency instead of duplicating; past
-    /// [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] the oldest entry is evicted.
-    /// Called on the publish/subscribe authorization event only; the
-    /// delivery fan-out path never touches this lock, and management
-    /// reads take only this per-session lock.
+    /// decision and recency instead of duplicating (counted as a node-cache
+    /// hit for the W2-15 status read; a refreshed verdict with a changed
+    /// `allow` still counts as a hit because the lookup found an entry,
+    /// and the stored verdict is replaced); a new key is a miss plus one
+    /// insert. Past [`MAX_AUTHZ_DECISIONS_PER_CLIENT`] the oldest entry is
+    /// evicted. Called on the publish/subscribe authorization event only;
+    /// the delivery fan-out path never touches this lock, and management
+    /// reads take only this per-session lock. The counter increments are
+    /// two relaxed atomic adds under the already-held write lock: no new
+    /// lock, allocation or unbounded work on the publish path.
     pub fn record_authz_decision(
         &self,
         action: &str,
@@ -958,6 +1006,10 @@ impl Session {
             e.action == action && e.topic == topic && e.qos == qos && e.retain == retain
         }) {
             cache.remove(pos);
+            self.authz_cache_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.authz_cache_misses.fetch_add(1, Ordering::Relaxed);
+            self.authz_cache_inserts.fetch_add(1, Ordering::Relaxed);
         }
         cache.push_back(AuthzDecision {
             action: action.to_string(),
@@ -969,6 +1021,17 @@ impl Session {
         });
         while cache.len() > MAX_AUTHZ_DECISIONS_PER_CLIENT {
             cache.pop_front();
+        }
+    }
+
+    /// Cumulative node-cache health counters for this session (W2-15):
+    /// `(hits, misses, inserts)` since boot. Lock-free relaxed loads;
+    /// management-plane only.
+    pub fn authz_cache_counters(&self) -> AuthzCacheCounters {
+        AuthzCacheCounters {
+            hits: self.authz_cache_hits.load(Ordering::Relaxed),
+            misses: self.authz_cache_misses.load(Ordering::Relaxed),
+            inserts: self.authz_cache_inserts.load(Ordering::Relaxed),
         }
     }
 
@@ -1741,6 +1804,31 @@ impl SessionManager {
             cache.clear();
         }
         evicted
+    }
+
+    /// Node-wide authorization cache health for the status read (W2-15,
+    /// `GET /authorization/node_cache/status`): live entry count summed
+    /// over every session plus the summed cumulative hit/miss/insert
+    /// counters.
+    ///
+    /// Management-plane only: clones one `Arc` per live session under a
+    /// single short map read, then takes each per-session cache read lock
+    /// for its length and lock-free atomic loads for the counters; the
+    /// publish and deliver paths never call this. Sums saturate instead
+    /// of wrapping, and the snapshot is one pass over the live sessions.
+    pub fn authz_node_stats(&self) -> AuthzNodeStats {
+        let sessions: Vec<Arc<Session>> = self.sessions.read().values().cloned().collect();
+        let mut stats = AuthzNodeStats::default();
+        for session in sessions {
+            stats.entries = stats
+                .entries
+                .saturating_add(session.authz_cache.read().len() as u64);
+            let counters = session.authz_cache_counters();
+            stats.hits = stats.hits.saturating_add(counters.hits);
+            stats.misses = stats.misses.saturating_add(counters.misses);
+            stats.inserts = stats.inserts.saturating_add(counters.inserts);
+        }
+        stats
     }
 
     /// Track one granted subscription on the session (mirrors the router).

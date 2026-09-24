@@ -3638,6 +3638,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authz_node_cache_status_reports_live_counters() {
+        // Node-cache status (W2-15, C04-05) through the broker: the status
+        // reads the live policy (enabled flag, entry cap from the W2-14
+        // config) plus the live entry count and cumulative hit/miss
+        // counters rolled up across the per-session decision caches
+        // (`crates/broker-session/src/lib.rs`,
+        // `SessionManager::authz_node_stats`, driven by the publish and
+        // subscribe authorization events). Before this task the route
+        // itself was missing (bare 404). Management-plane only; publish
+        // and deliver never touch the status read beyond the
+        // already-held per-session write lock with relaxed atomic adds.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty node reads as zero entries and zero counters with the
+        // live bounds, never an error.
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], json!(true));
+        assert_eq!(body["metrics"]["hits"]["value"], json!(0));
+        assert_eq!(body["metrics"]["misses"]["value"], json!(0));
+        assert_eq!(body["metrics"]["inserts"]["value"], json!(0));
+        assert_eq!(body["metrics"]["count"], json!(0));
+        assert_eq!(body["metrics"]["max_count"], json!(50_000));
+        assert_eq!(body["node_metrics"].as_array().expect("rows").len(), 1);
+        assert_eq!(
+            body["node_metrics"][0]["metrics"], body["metrics"],
+            "node row mirrors the aggregate"
+        );
+
+        // Populate through normal authorized activity through the broker:
+        // a console SUBSCRIBE (real subscribe authorization) plus a
+        // console PUBLISH from a second connection (real publish
+        // authorization) that delivers to the subscriber.
+        let mut subscriber = WsClient::connect(server.port).await;
+        subscriber
+            .send_bin(&mqtt_connect("w2-15-cache-1", None, None))
+            .await;
+        let connack = subscriber.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        subscriber
+            .send_bin(&mqtt_subscribe(7, &[("w2-15/topic", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+        let mut publisher = WsClient::connect(server.port).await;
+        publisher
+            .send_bin(&mqtt_connect("w2-15-cache-2", None, None))
+            .await;
+        let connack = publisher.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        publisher
+            .send_bin(&mqtt_publish("w2-15/topic", 0, 0, b"hi"))
+            .await;
+        // Deliver proves the publish rode the broker route path.
+        let delivery = subscriber.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+
+        // Two new decisions moved the miss/insert counters and the entry
+        // count; every counter field is numeric.
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], json!(true));
+        assert_eq!(body["metrics"]["misses"]["value"], json!(2));
+        assert_eq!(body["metrics"]["inserts"]["value"], json!(2));
+        assert_eq!(body["metrics"]["hits"]["value"], json!(0));
+        assert_eq!(body["metrics"]["count"], json!(2));
+        assert_eq!(body["metrics"]["max_count"], json!(50_000));
+
+        // Repeating the same authorized publish refreshes the cached
+        // decision in place: one hit, entries unchanged.
+        publisher
+            .send_bin(&mqtt_publish("w2-15/topic", 0, 0, b"again"))
+            .await;
+        let delivery = subscriber.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["hits"]["value"], json!(1));
+        assert_eq!(body["metrics"]["misses"]["value"], json!(2));
+        assert_eq!(body["metrics"]["inserts"]["value"], json!(2));
+        assert_eq!(body["metrics"]["count"], json!(2));
+
+        // Unknown query keys are ignored, not a 400.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/node_cache/status?unknown_param=1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["count"], json!(2));
+    }
+
+    #[tokio::test]
     async fn banned_create_list_clear_round_trip() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;

@@ -8,6 +8,7 @@ pub mod authn_settings;
 pub mod authn_status;
 pub mod authz_cache;
 pub mod authz_node_cache;
+pub mod authz_node_status;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
@@ -154,6 +155,15 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/authorization/node_cache/reset",
             post(authz_node_cache::reset_authz_node_cache),
+        )
+        // Authorization (AuthZ / ACL) node-cache status (W2-15, C04-05):
+        // live health over the real policy plus the per-session decision
+        // state: enabled flag, entry count, hit/miss/insert counters and
+        // bounds. Management-plane only; publish and deliver never touch
+        // it.
+        .route(
+            "/authorization/node_cache/status",
+            get(authz_node_status::get_authz_node_cache_status),
         )
         // Authorization (AuthZ / ACL) rules
         .route(
