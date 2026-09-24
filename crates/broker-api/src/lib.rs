@@ -5252,6 +5252,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authz_catch_all_rules_round_trip() {
+        // Built-in catch-all table plus the three `/all` routes on real
+        // state (W2-18, C04-11..C04-13) through the broker: write two
+        // catch-all rules, read expecting both; delete and read expecting
+        // empty. Before this task all three routes were missing (bare
+        // 404). The written allow is live on the publish path
+        // (`MemoryAuth::authorize_publish` in
+        // `crates/broker-auth/src/lib.rs`, consulted by the publish event
+        // in `crates/broker-node/src/main.rs`).
+        use broker_auth::Authorizer;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty reads as an empty collection, never an error; not paged.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/all",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rules"], json!([]));
+
+        // Replace with two rules; success is 204 with no body.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/all",
+                json!({"rules": [
+                    {"topic": "w218/http/alpha/#", "permission": "allow", "action": "publish"},
+                    {"topic": "w218/http/beta/#", "permission": "deny", "action": "subscribe"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+
+        // Read back: both entries with the documented per-rule fields.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/all",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let rules = body["rules"].as_array().expect("rules array").clone();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["topic"], json!("w218/http/alpha/#"));
+        assert_eq!(rules[0]["permission"], json!("allow"));
+        assert_eq!(rules[0]["action"], json!("publish"));
+        assert_eq!(rules[1]["topic"], json!("w218/http/beta/#"));
+        assert_eq!(rules[1]["permission"], json!("deny"));
+        assert_eq!(rules[1]["action"], json!("subscribe"));
+
+        // The stored allow is live on the broker publish path.
+        let topic = broker_protocol::Topic::new("w218/http/alpha/data").expect("topic parses");
+        state
+            .auth
+            .authorize_publish("any-client", &topic)
+            .await
+            .expect("catch-all allow opens the publish path");
+
+        // An invalid replace is a client error and applies nothing.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/all",
+                json!({"rules": [
+                    {"topic": "w218/http/ok/#", "permission": "allow", "action": "publish"},
+                    {"topic": "", "permission": "allow", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/all",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rules"].as_array().expect("rules array").len(), 2);
+
+        // Delete clears the list and reports success; clearing empty
+        // still succeeds.
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/all",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/all",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rules"], json!([]));
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/all",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn authn_chain_list_create_round_trip() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;

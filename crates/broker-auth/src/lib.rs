@@ -371,6 +371,22 @@ pub const MAX_IMPORT_BATCH: usize = 10_000;
 /// cannot balloon either; 256 bytes cover service names with headroom
 /// while bounding map and file growth.
 pub const MAX_AUTHN_USERNAME_LEN: usize = 256;
+/// Bound on catch-all authorization rules (the built-in rule table behind
+/// `GET/POST/DELETE /authorization/sources/built_in_database/rules/all`).
+/// Reason: the management plane snapshots the whole list per request and
+/// the publish/subscribe decision scans it linearly under a short read
+/// lock, so the list must stay small and bounded; 128 covers fleet
+/// provisioning while keeping per-request clones and per-decision scans
+/// cheap. Writes past the cap are rejected instead of growing without
+/// limit. Default is the empty list (deny unless a rule allows, per
+/// documented semantics: with zero rules everything is allowed until the
+/// first rule is written, then first-match-wins with unmatched denied).
+// TODO(parity): is 128 the documented catch-all cap, and which additional
+// per-rule match fields (qos, retain, patterns) does the spec require?
+// The rulebook does not decide the exact bound or field set; the current
+// choice keeps the modelled topic/permission/action triple and omits
+// fields the broker cannot supply.
+pub const MAX_AUTHZ_CATCH_ALL_RULES: usize = 128;
 
 /// Bulk-import result: atomic counts for the documented result shape.
 /// A successful import applies every entry, so `total == success` and the
@@ -935,6 +951,53 @@ impl MemoryAuth {
     /// Ordered snapshot of the ACL for management display.
     pub fn acl_rules(&self) -> Vec<AclRule> {
         self.rules.read().clone()
+    }
+
+    /// Replace the whole catch-all rule table (first match wins).
+    ///
+    /// Validate-all-before-apply: the length cap and every entry are
+    /// checked before anything becomes visible, so a bad batch applies
+    /// nothing. Entries must carry a non-empty client pattern and a
+    /// non-empty topic filter that parses as an MQTT filter; unknown
+    /// shapes fail closed instead of widening into an allow. Persists
+    /// through the registry when one is attached, so the list survives a
+    /// kernel restart.
+    ///
+    /// Management-plane only: one short write lock per request (plus the
+    /// registry save lock on persist); the publish and subscribe
+    /// authorization consults keep reading under short read locks and
+    /// never take this lock beyond their check.
+    pub fn replace_rules(
+        &self,
+        rules: Vec<AclRule>,
+    ) -> std::result::Result<(), broker_config::ConfigError> {
+        if rules.len() > MAX_AUTHZ_CATCH_ALL_RULES {
+            return Err(broker_config::ConfigError::Invalid(format!(
+                "mqtt_users.acls holds {} entries, at most {} (field `rules`)",
+                rules.len(),
+                MAX_AUTHZ_CATCH_ALL_RULES
+            )));
+        }
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.client_pattern.trim().is_empty() {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.acls[{index}].username must not be empty (field `username`)"
+                )));
+            }
+            if rule.topic_pattern.trim().is_empty() {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.acls[{index}].topic must not be empty (field `topic`)"
+                )));
+            }
+            if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.acls[{index}].topic {:?} is not a valid filter (field `topic`)",
+                    rule.topic_pattern
+                )));
+            }
+        }
+        *self.rules.write() = rules;
+        self.persist()
     }
 
     /// Drop every ACL rule. Persists through the registry when one is

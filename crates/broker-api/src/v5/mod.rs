@@ -192,6 +192,18 @@ pub fn protected_router() -> Router<ApiState> {
                 .post(authz_sources::create_built_in_rule)
                 .delete(authz_sources::clear_built_in_rules),
         )
+        // Authorization (AuthZ / ACL) built-in catch-all table (W2-18,
+        // C04-11..C04-13): unpaged read, whole-list replace with
+        // validate-all-before-apply, and a clear that empties the same
+        // live rule table. Management-plane only; publish and deliver
+        // never touch the registry (the built-in rule consult stays on
+        // the publish/subscribe path).
+        .route(
+            "/authorization/sources/built_in_database/rules/all",
+            get(authz_sources::list_catch_all_rules)
+                .post(authz_sources::replace_catch_all_rules)
+                .delete(authz_sources::clear_catch_all_rules),
+        )
         // Authorization (AuthZ / ACL) rules
         .route(
             "/authorization/sources/:type/rules",
