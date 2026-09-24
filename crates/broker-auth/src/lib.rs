@@ -387,6 +387,41 @@ pub const MAX_AUTHN_USERNAME_LEN: usize = 256;
 // choice keeps the modelled topic/permission/action triple and omits
 // fields the broker cannot supply.
 pub const MAX_AUTHZ_CATCH_ALL_RULES: usize = 128;
+/// Bound on per-client authorization rules (the built-in rule table behind
+/// `GET/POST /authorization/sources/built_in_database/rules/clients` and
+/// `DELETE .../rules/clients/{clientid}`, filtered to client-scoped
+/// entries). Reason: the management plane snapshots the whole rule list
+/// per request and the publish/subscribe decision scans it linearly under
+/// a short read lock, so the list must stay bounded; 100,000 entries cover
+/// fleet provisioning while keeping per-request clones paged and
+/// per-decision scans cheap. Writes past the cap are rejected instead of
+/// growing without limit. Default is the empty list (with zero rules
+/// everything is allowed until the first rule is written, then
+/// first-match-wins with unmatched denied).
+// TODO(parity): is 100000 the documented per-client cap, and which
+// additional per-rule match fields does the spec require? The rulebook
+// does not decide the exact bound or field set; the current choice keeps
+// the modelled clientid/topic/permission/action shape and omits fields
+// the broker cannot supply.
+pub const MAX_AUTHZ_CLIENT_RULES: usize = 100_000;
+/// Longest accepted per-client rule `clientid`. Reason: ids ride the
+/// per-decision scan and the persisted snapshot, so one entry cannot
+/// balloon either; 256 bytes cover service names with headroom while
+/// bounding map and file growth.
+pub const MAX_AUTHZ_CLIENTID_LEN: usize = 256;
+
+/// Why [`MemoryAuth::add_client_rule`] refused an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientRuleError {
+    /// A rule for the same client id and topic scope is already stored.
+    Duplicate,
+    /// The table holds [`MAX_AUTHZ_CLIENT_RULES`] entries.
+    Full,
+    /// The entry failed validation (message names the field).
+    Invalid(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
 
 /// Bulk-import result: atomic counts for the documented result shape.
 /// A successful import applies every entry, so `total == success` and the
@@ -1026,6 +1061,133 @@ impl MemoryAuth {
         } else {
             Ok(false)
         }
+    }
+
+    /// Ordered snapshot of the per-client rule index: every stored rule
+    /// scoped to a concrete client id (the catch-all `*` entries belong
+    /// to the `/rules/all` table and are excluded here), in stored
+    /// evaluation order. Management-plane read only: clones at most the
+    /// capped list under one short read lock; the publish and subscribe
+    /// authorization consults keep reading under their own short locks.
+    // TODO(parity): does the documented per-client listing include the
+    // catch-all `*` entries or only client-scoped ones? The rulebook does
+    // not decide the exact membership; the current choice lists only
+    // client-scoped entries until the checker pins it.
+    pub fn all_client_rules(&self) -> Vec<AclRule> {
+        self.rules
+            .read()
+            .iter()
+            .filter(|rule| rule.client_pattern != "*")
+            .cloned()
+            .collect()
+    }
+
+    /// Ordered snapshot of one client's rules (`None` never: an empty
+    /// client reads as an empty list; callers map empty to 404 where the
+    /// documented shape requires it). Exact id match only: wildcard
+    /// patterns belong to their literal spelling, never to the clients
+    /// they could match. Management-plane read only.
+    pub fn client_rules(&self, clientid: &str) -> Vec<AclRule> {
+        self.rules
+            .read()
+            .iter()
+            .filter(|rule| rule.client_pattern == clientid)
+            .cloned()
+            .collect()
+    }
+
+    /// Append one client-scoped rule (first match wins).
+    ///
+    /// Validate-before-apply: the client id must be non-empty (at most
+    /// [`MAX_AUTHZ_CLIENTID_LEN`] bytes) and must name a concrete client
+    /// (the catch-all `*` belongs to the `/rules/all` table, never here);
+    /// the topic must be non-empty and parse as an MQTT filter. A rule
+    /// for the same client id and topic scope (same client id, topic and
+    /// action; permission is not part of the scope) is rejected as
+    /// [`ClientRuleError::Duplicate`] instead of merging, and a table
+    /// that already holds [`MAX_AUTHZ_CLIENT_RULES`] entries fails with
+    /// [`ClientRuleError::Full`]. Persists through the registry when one
+    /// is attached, so entries survive a kernel restart.
+    ///
+    /// Management-plane only: one short rule-table write lock per request
+    /// (plus the registry save lock on persist); the publish and
+    /// subscribe authorization consults keep reading under short read
+    /// locks and never take this lock beyond their check.
+    // TODO(parity): is the duplicate scope (clientid, topic, action), or
+    // does permission participate, or is topic alone the scope? The
+    // rulebook does not decide the exact scope; the current choice treats
+    // the same client, topic and action as the same scope (a second
+    // permission for that scope would silently shadow, never merge).
+    pub fn add_client_rule(&self, rule: AclRule) -> std::result::Result<(), ClientRuleError> {
+        if rule.client_pattern.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must not be empty".to_string(),
+            ));
+        }
+        if rule.client_pattern.len() > MAX_AUTHZ_CLIENTID_LEN {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `clientid` {:?} exceeds {MAX_AUTHZ_CLIENTID_LEN} bytes",
+                rule.client_pattern
+            )));
+        }
+        if rule.client_pattern == "*" {
+            return Err(ClientRuleError::Invalid(
+                "field `clientid` must name a concrete client, not the catch-all (field `clientid`)".to_string(),
+            ));
+        }
+        if rule.topic_pattern.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `topic` must not be empty".to_string(),
+            ));
+        }
+        if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `topic` {:?} is not a valid filter",
+                rule.topic_pattern
+            )));
+        }
+        {
+            let mut rules = self.rules.write();
+            if rules.iter().any(|stored| {
+                stored.client_pattern == rule.client_pattern
+                    && stored.topic_pattern == rule.topic_pattern
+                    && stored.action == rule.action
+            }) {
+                return Err(ClientRuleError::Duplicate);
+            }
+            if rules.len() >= MAX_AUTHZ_CLIENT_RULES {
+                return Err(ClientRuleError::Full);
+            }
+            rules.push(rule);
+        }
+        self.persist()
+            .map_err(|e| ClientRuleError::Persist(e.to_string()))
+    }
+
+    /// Remove every rule scoped to `clientid` (true when at least one
+    /// entry was removed; false when none exist and nothing was
+    /// persisted). The catch-all `*` belongs to the `/rules/all` table
+    /// and is never removed here: asking for it reports false so the
+    /// caller answers 404 instead of emptying another table. Persists
+    /// through the registry when one is attached.
+    /// Management-plane only: one short rule-table write lock per request
+    /// (plus the registry save lock on persist).
+    pub fn remove_client_rules(
+        &self,
+        clientid: &str,
+    ) -> std::result::Result<bool, broker_config::ConfigError> {
+        if clientid == "*" {
+            return Ok(false);
+        }
+        let mut rules = self.rules.write();
+        let before = rules.len();
+        rules.retain(|rule| rule.client_pattern != clientid);
+        let removed = rules.len() != before;
+        drop(rules);
+        if removed {
+            self.persist()?;
+        }
+        Ok(removed)
     }
 
     fn check(

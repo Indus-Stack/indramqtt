@@ -7,6 +7,7 @@ pub mod authn_chain;
 pub mod authn_settings;
 pub mod authn_status;
 pub mod authz_cache;
+pub mod authz_clients;
 pub mod authz_node_cache;
 pub mod authz_node_status;
 pub mod authz_settings;
@@ -203,6 +204,20 @@ pub fn protected_router() -> Router<ApiState> {
             get(authz_sources::list_catch_all_rules)
                 .post(authz_sources::replace_catch_all_rules)
                 .delete(authz_sources::clear_catch_all_rules),
+        )
+        // Authorization (AuthZ / ACL) built-in per-client rule table
+        // (W2-19, C04-14..C04-16): paged list, single-rule add with
+        // duplicate rejection, and a per-id delete that removes every
+        // rule for one client id. Management-plane only; publish and
+        // deliver never touch the registry (the built-in rule consult
+        // stays on the publish/subscribe path).
+        .route(
+            "/authorization/sources/built_in_database/rules/clients",
+            get(authz_clients::list_client_rules).post(authz_clients::create_client_rule),
+        )
+        .route(
+            "/authorization/sources/built_in_database/rules/clients/:clientid",
+            delete(authz_clients::delete_client_rules),
         )
         // Authorization (AuthZ / ACL) rules
         .route(
