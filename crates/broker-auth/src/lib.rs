@@ -1,4 +1,5 @@
 pub mod chain;
+pub mod db;
 pub mod jwks;
 /// Shared JWKS test fixtures for B5-02 (T-95): the RSA signing-key minter
 /// and the loopback HTTPS JWKS server, single-sourced here and reused by
@@ -13,6 +14,12 @@ pub mod node_cache;
 pub mod settings;
 
 pub use chain::{AuthnChain, AuthnEntry, ChainInsertError, ChainReorderError};
+pub use db::{
+    DbAuthSet, DbAuthSetConfig, DbSourceSettings, MongoAuth, MongoAuthConfig, MysqlAuth,
+    MysqlAuthConfig, PostgresAuth, PostgresAuthConfig, RedisAuth, RedisAuthConfig,
+    DEFAULT_CACHE_MAX_ENTRIES, DEFAULT_CACHE_TTL_SECS, DEFAULT_CONNECT_TIMEOUT_MS,
+    DEFAULT_POOL_SIZE, DEFAULT_READ_TIMEOUT_MS,
+};
 pub use jwks::{
     JwksAuthenticator, JwksConfig, VerifiedJwt, JWKS_CACHE_MAX_KEYS, JWKS_DEFAULT_DOCUMENT_CAP,
 };
@@ -669,6 +676,13 @@ impl MemoryAuth {
 
     pub fn user_count(&self) -> usize {
         self.users.read().len()
+    }
+
+    /// Whether `username` has a local record (one read lock, no
+    /// allocation). The publish path uses this to decide between the
+    /// local ACL and the database ACL without cloning the user list.
+    pub fn has_user(&self, username: &str) -> bool {
+        self.users.read().contains_key(username)
     }
 
     /// Attach quota bounds to an existing user (`Ok(false)` when

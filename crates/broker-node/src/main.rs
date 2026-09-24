@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use broker_auth::{
-    Authenticator, AuthnChain, AuthnSettingsStore, Authorizer, JwksAuthenticator, JwksConfig,
-    KerberosAuthenticator, KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth,
-    NodeAuthCache,
+    Authenticator, AuthnChain, AuthnSettingsStore, Authorizer, DbAuthSet, DbAuthSetConfig,
+    JwksAuthenticator, JwksConfig, KerberosAuthenticator, KerberosConfig, LdapAuthenticator,
+    LdapConfig, MemoryAuth, NodeAuthCache,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
@@ -331,6 +331,59 @@ struct Args {
     /// a forged key set).
     #[arg(long)]
     jwks_insecure_skip_verify: bool,
+    /// PostgreSQL URL for database authentication (B5-03). Empty (the
+    /// default) disables the PostgreSQL source: CONNECT pays one
+    /// `is_some` branch. Set to `postgresql://user:pass@host:port/db`
+    /// to enable credential and ACL lookups at CONNECT and on the
+    /// publish path. An unreachable database fails closed.
+    #[arg(long, default_value = "")]
+    dbauth_postgres_url: String,
+
+    /// MySQL URL for database authentication (B5-03). Empty disables
+    /// the MySQL source. Set to `mysql://user:pass@host:port/db`.
+    #[arg(long, default_value = "")]
+    dbauth_mysql_url: String,
+
+    /// Redis URL for database authentication (B5-03). Empty disables
+    /// the Redis source. Set to `redis://:pass@host:port/db`.
+    #[arg(long, default_value = "")]
+    dbauth_redis_url: String,
+
+    /// MongoDB URL for database authentication (B5-03). Empty disables
+    /// the MongoDB source. Set to
+    /// `mongodb://user:pass@host:port/db?authSource=admin`.
+    #[arg(long, default_value = "")]
+    dbauth_mongodb_url: String,
+
+    /// Bound on concurrent database operations per source (B5-03,
+    /// default 8: enough for CONNECT bursts, small enough to never
+    /// overwhelm the database; a slow database exhausts permits and
+    /// fails closed instead of stalling accepts).
+    #[arg(long, default_value_t = broker_auth::DEFAULT_POOL_SIZE)]
+    dbauth_pool_size: usize,
+
+    /// Database connect timeout in milliseconds (B5-03, default 3000:
+    /// covers TCP connect plus container-start jitter while failing
+    /// closed fast enough to not stall accepts).
+    #[arg(long, default_value_t = broker_auth::DEFAULT_CONNECT_TIMEOUT_MS)]
+    dbauth_connect_timeout_ms: u64,
+
+    /// Database per-operation timeout in milliseconds (B5-03, default
+    /// 3000: covers one lookup round-trip).
+    #[arg(long, default_value_t = broker_auth::DEFAULT_READ_TIMEOUT_MS)]
+    dbauth_read_timeout_ms: u64,
+
+    /// Database verdict-cache bound in entries per source and kind
+    /// (B5-03, default 1024: under one megabyte total; evicts oldest
+    /// first).
+    #[arg(long, default_value_t = broker_auth::DEFAULT_CACHE_MAX_ENTRIES)]
+    dbauth_cache_size: usize,
+
+    /// Database verdict-cache TTL in seconds (B5-03, default 60: bounds
+    /// a stale ACL after a change to one minute; lower for faster
+    /// revocation).
+    #[arg(long, default_value_t = broker_auth::DEFAULT_CACHE_TTL_SECS)]
+    dbauth_cache_ttl_secs: u64,
 
     /// Upper bound for `$delayed` deferrals in seconds (B4-03). Past it
     /// the request is dropped with a warning instead of pinning a wheel
@@ -592,16 +645,19 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
         if req.username.is_none() {
             // A non-empty user store always wins over `--allow-anonymous`:
             // unauthenticated clients are rejected whenever users exist.
-            // A configured directory does the same: anonymous never
-            // authenticates against LDAP, Kerberos or JWKS. The flag only
-            // opens the broker while the store is empty and no directory,
-            // enabled Kerberos mechanism or JWKS endpoint is configured.
+            // A configured directory, database or JWT endpoint does the same: anonymous
+            // never authenticates against LDAP, Kerberos, JWKS or a database.
+            // The flag only opens the broker while the store is empty and
+            // no directory, database, enabled Kerberos mechanism or JWKS endpoint
+            // is configured.
             let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
             let jwks_enabled = shared.jwks.as_ref().is_some_and(|j| j.is_enabled());
+            let db_configured = shared.db_auth.as_ref().is_some_and(|d| d.is_configured());
             if shared.auth.user_count() > 0
                 || shared.ldap.is_some()
                 || kerberos_enabled
                 || jwks_enabled
+                || db_configured
             {
                 shared.metrics.inc_auth_failures();
                 return Some(session_binding_reply(frame, 0, false, 0x87, alias_max));
@@ -630,6 +686,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             let mut via_ldap = false;
             let mut via_kerberos = false;
             let mut via_jwks = false;
+            let mut via_db = false;
             if local_has_users {
                 let local_ok = shared
                     .auth
@@ -698,11 +755,25 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         shared.metrics.inc_auth_failures();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
+                } else if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+                    // B5-03: database sources after the directory. A
+                    // database outage fails closed with a clear log line
+                    // inside the source and never grants access.
+                    if db
+                        .authenticate(&req.client_id, req.username.as_deref(), password)
+                        .await
+                        .is_ok()
+                    {
+                        via_db = true;
+                    } else {
+                        shared.metrics.inc_auth_failures();
+                        return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                    }
                 } else {
-                    // No LDAP and (no enabled Kerberos or a non-Kerberos
-                    // password): with local users present the failure is
-                    // final. When Kerberos is enabled a non-Kerberos
-                    // password is not an open-mode accept.
+                    // No LDAP, no database, and (no enabled Kerberos or a
+                    // non-Kerberos password): with local users present the
+                    // failure is final. When Kerberos is enabled a
+                    // non-Kerberos password is not an open-mode accept.
                     if kerberos_enabled {
                         shared.metrics.inc_auth_failures();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
@@ -767,6 +838,21 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     shared.metrics.inc_auth_failures();
                     return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 }
+            } else if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+                // B5-03: a configured database disables the open mode
+                // like LDAP does: every credentialed CONNECT goes through
+                // the databases unless a local user matches (none exist
+                // here). An outage fails closed, never an accept.
+                if db
+                    .authenticate(&req.client_id, req.username.as_deref(), password)
+                    .await
+                    .is_ok()
+                {
+                    via_db = true;
+                } else {
+                    shared.metrics.inc_auth_failures();
+                    return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+                }
             } else if kerberos_enabled {
                 // Enabled Kerberos disables the open mode: a credentialed
                 // CONNECT without a Kerberos token fails closed.
@@ -780,7 +866,7 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 shared.metrics.inc_auth_failures();
                 return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
             } else {
-                // Open broker: no users, no directory, no enabled Kerberos
+                // Open broker: no users, no directory, no database, no enabled Kerberos
                 // or JWKS. Fall through to the session resolution below
                 // (rc 0).
             }
@@ -807,13 +893,13 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 }
             }
             if let Some(username) = &effective_username {
-                // Directory and Kerberos users have no local quotas:
-                // unlimited. The invariant below reads the live role so
-                // `VerifiedKerberos::role` is wired, not test-only:
-                // every Kerberos CONNECT sets a role alongside the
-                // principal, and non-Kerberos CONNECTs set neither.
+                // Directory, database and Kerberos users have no local
+                // quotas: unlimited. The invariant below reads the live
+                // role so `VerifiedKerberos::role` is wired, not
+                // test-only: every Kerberos CONNECT sets a role alongside
+                // the principal, and non-Kerberos CONNECTs set neither.
                 debug_assert!(via_kerberos == kerberos_role.is_some());
-                let max = if via_ldap || via_kerberos || via_jwks {
+                let max = if via_ldap || via_kerberos || via_jwks || via_db {
                     None
                 } else {
                     shared
@@ -1662,6 +1748,13 @@ struct Shared {
     /// signature verification on a hit, one singleflight fetch on a key
     /// miss, never on the delivery path).
     jwks: Option<Arc<JwksAuthenticator>>,
+    /// Database authentication set for B5-03 (`None` disables every
+    /// database source). Consulted at CONNECT when the local store (plus
+    /// LDAP/Kerberos) refuses, and on the publish/subscribe path for
+    /// users with no local record. One `Arc` clone at boot; CONNECT and
+    /// cache-miss lookups take a semaphore permit, cache hits take one
+    /// short cache lock.
+    db_auth: Option<Arc<DbAuthSet>>,
     allow_anonymous: bool,
     /// Kernel-owned configuration registry: loaded from `--data-dir` at
     /// boot; validated defaults in tests and before boot wiring runs.
@@ -1863,6 +1956,7 @@ impl Shared {
             ldap: None,
             kerberos: None,
             jwks: None,
+            db_auth: None,
             allow_anonymous: false,
             config: defaults_registry(),
             node_id: "indra-node-1".to_string(),
@@ -2899,6 +2993,23 @@ async fn apply_subscribe(
             codes.push(0x87);
             continue;
         }
+        // B5-03: database ACLs for users with no local record (same key
+        // rule as the publish path: session username, else client id).
+        // A database outage fails closed like a local denial.
+        if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+            let username = shared
+                .sessions
+                .get(&client_id)
+                .and_then(|s| s.username.read().clone());
+            let is_local = username.as_deref().is_some_and(|u| shared.auth.has_user(u));
+            if !is_local {
+                let key = username.as_deref().unwrap_or(&client_id);
+                if db.authorize_subscribe(key, &filter).await.is_err() {
+                    codes.push(0x87);
+                    continue;
+                }
+            }
+        }
         // B4-08 bound: a new entry past MAX_SUBSCRIPTIONS is denied fail
         // closed (existing delivery proceeds); report MQTT 5 0x97 Quota
         // Exceeded — the same code the broker uses for publish rate quota
@@ -3372,6 +3483,31 @@ async fn apply_publish(
                 QoS::AtMostOnce => None,
             };
             return (ack, Vec::new());
+        }
+        // B5-03: database ACLs for users with no local record. Local
+        // users are decided by the check above; everyone else consults
+        // the databases when configured (one `is_some` branch when not).
+        // The lookup key is the session username (stamped at CONNECT),
+        // falling back to the client id when the session carries none.
+        // A database outage fails closed like a local denial. The
+        // `has_user` probe is one read lock with no allocation, off the
+        // fan-out locks. The database leg is bounded: one short cache lock
+        // plus one small key allocation on a hit, one semaphore permit
+        // (pool_size bound, default 8) plus one DB round-trip consulting at
+        // most MAX_ACL_ROWS rows on a miss.
+        if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+            let is_local = username.as_deref().is_some_and(|u| shared.auth.has_user(u));
+            if !is_local {
+                let key = username.as_deref().unwrap_or(&publisher);
+                if db.authorize_publish(key, &topic).await.is_err() {
+                    let ack = match qos {
+                        QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
+                        QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
+                        QoS::AtMostOnce => None,
+                    };
+                    return (ack, Vec::new());
+                }
+            }
         }
     }
 
@@ -4694,6 +4830,17 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     if !will_allowed {
         return Vec::new();
     }
+    // B5-03: database ACLs gate the will like any other publish from a
+    // user with no local record (session username, else client id).
+    if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+        let is_local = username.as_deref().is_some_and(|u| shared.auth.has_user(u));
+        if !is_local {
+            let key = username.as_deref().unwrap_or(&client_id);
+            if db.authorize_publish(key, &will.topic).await.is_err() {
+                return Vec::new();
+            }
+        }
+    }
     let deliveries = ingress_pipeline_with_publisher(
         shared,
         &will.topic,
@@ -5445,6 +5592,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let jwks = Arc::new(JwksAuthenticator::new(jwks_config));
         jwks.spawn_background_refresh();
         shared.jwks = Some(jwks);
+    }
+    // Database authentication (B5-03): opt-in per `--dbauth-*-url`. All
+    // empty leaves `db_auth` as `None` so CONNECT pays one `is_some`
+    // branch and benchmarks see no new work. When any URL is set,
+    // CONNECT consults the local store (plus LDAP/Kerberos) first, then
+    // the databases; a database outage fails closed.
+    if !args.dbauth_postgres_url.is_empty()
+        || !args.dbauth_mysql_url.is_empty()
+        || !args.dbauth_redis_url.is_empty()
+        || !args.dbauth_mongodb_url.is_empty()
+    {
+        let db_config = DbAuthSetConfig {
+            postgres_url: args.dbauth_postgres_url.clone(),
+            mysql_url: args.dbauth_mysql_url.clone(),
+            redis_url: args.dbauth_redis_url.clone(),
+            mongodb_url: args.dbauth_mongodb_url.clone(),
+            pool_size: args.dbauth_pool_size,
+            connect_timeout_ms: args.dbauth_connect_timeout_ms,
+            read_timeout_ms: args.dbauth_read_timeout_ms,
+            cache_max_entries: args.dbauth_cache_size,
+            cache_ttl_secs: args.dbauth_cache_ttl_secs,
+        };
+        let db_set = DbAuthSet::new(&db_config);
+        info!(
+            "Database authentication enabled (pool {} per source)",
+            db_set.pool_size()
+        );
+        shared.db_auth = Some(Arc::new(db_set));
     }
 
     // Licensing lifecycle (B2-04): trusted keys are configuration loaded at
@@ -10847,6 +11022,65 @@ mod tests {
             decode_session_binding_meta(&reply.metadata).2,
             0,
             "healed endpoint must accept"
+        );
+    }
+
+    /// B5-03: database authentication through the broker CONNECT and
+    /// publish paths.
+    ///
+    /// A database source pointed at a closed loopback port (no server)
+    /// fails closed through `apply_bind` (0x86, no session) and through
+    /// the publish authorizer, and anonymous CONNECT is refused while
+    /// any database source is configured. This proves the broker calls
+    /// the lookup on both paths; real-server seeding and verdicts live
+    /// in the qualification tests in `broker-auth`.
+    #[tokio::test]
+    async fn db_auth_unreachable_fails_closed_through_broker() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral port");
+        let closed_addr = closed.local_addr().expect("local addr");
+        drop(closed);
+        let db_config = DbAuthSetConfig {
+            postgres_url: format!("postgresql://qual:qualpass1@{closed_addr}/qual"),
+            mysql_url: String::new(),
+            redis_url: String::new(),
+            mongodb_url: String::new(),
+            pool_size: 2,
+            connect_timeout_ms: 500,
+            read_timeout_ms: 500,
+            cache_max_entries: 16,
+            cache_ttl_secs: 60,
+        };
+        let mut shared = test_shared();
+        shared.db_auth = Some(std::sync::Arc::new(DbAuthSet::new(&db_config)));
+
+        // Credentialed CONNECT against the unreachable database: 0x86.
+        let frame = bind_frame(
+            201,
+            1,
+            encode_bind_meta_creds("db-device-1", true, 60, "qualuser", b"qual-pass-1"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x86, "database outage must fail closed with 0x86");
+        assert!(shared.sessions.get("db-device-1").is_none());
+
+        // Anonymous while a database is configured: 0x87.
+        let frame = bind_frame(202, 1, encode_bind_meta("db-anon", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(
+            rc, 0x87,
+            "anonymous must be refused while a database is configured"
+        );
+
+        // Publish through the database authorizer fails closed too.
+        let db = shared.db_auth.as_ref().expect("database configured");
+        let topic = Topic::new("qual/allowed".to_string()).expect("valid topic");
+        assert!(
+            db.authorize_publish("qualuser", &topic).await.is_err(),
+            "unreachable database must refuse publish"
         );
     }
 

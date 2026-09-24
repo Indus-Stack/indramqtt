@@ -9,6 +9,7 @@ repository.workspace = true
 broker-protocol = { workspace = true }
 broker-config = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 parking_lot = { workspace = true }
 arc-swap = { workspace = true }
 base64 = { workspace = true }
@@ -34,6 +35,10 @@ picky-krb = "0.12"
 picky-asn1 = { version = "0.10", features = ["time_conversion"] }
 picky-asn1-der = "0.5"
 time = "0.3"
+tokio-postgres = { version = "0.7" }
+mysql_async = { version = "0.35" }
+redis = { version = "0.27", features = ["tokio-comp"] }
+mongodb = { version = "3", default-features = false, features = ["bson-3", "compat-3-3-0", "openssl-tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
