@@ -89,7 +89,9 @@ pub fn protected_router() -> Router<ApiState> {
             "/authentication/settings",
             get(authn_settings::get_authn_settings).put(authn_settings::put_authn_settings),
         )
-        // Authentication (AuthN) built-in-database users
+        // Authentication (AuthN) built-in-database users plus bulk
+        // import. Management-plane only; CONNECT reads the live user map
+        // under short read locks and publish/deliver never touch it.
         .route(
             "/authentication/:id/users",
             get(auth::list_authn_users).post(auth::create_authn_user),
@@ -97,6 +99,10 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/authentication/:id/users/:user_id",
             put(auth::update_authn_user).delete(auth::delete_authn_user),
+        )
+        .route(
+            "/authentication/:id/import_users",
+            post(auth::import_authn_users),
         )
         // Authorization (AuthZ / ACL) rules
         .route(

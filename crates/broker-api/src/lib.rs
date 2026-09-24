@@ -1739,6 +1739,7 @@ async fn get_metrics(State(state): State<ApiState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use broker_auth::Authenticator;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -8211,6 +8212,245 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let data = body["data"].as_array().expect("data is a list");
         assert_eq!(data.len(), 1);
         assert_eq!(data[0], json!({"user_id": "mqtt-alice"}));
+    }
+
+    #[tokio::test]
+    async fn authn_import_users_batch_round_trip_rejects_bad_and_duplicate() {
+        // W2-07 failing test: import two users to a fresh authenticator,
+        // list expecting both; re-import one duplicate expecting clean
+        // rejection with the store intact. Before: 404 (no route).
+        // Management-plane only: the import locks only the user map
+        // (`crates/broker-auth/src/lib.rs`, `MemoryAuth::import_users`);
+        // the broker event driving it is the management POST, and CONNECT
+        // consults the same map
+        // (`crates/broker-node/src/main.rs`, CONNECT handling).
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/import_users",
+                json!([
+                    {"user_id": "w2-07-a", "password": "Imp0rt-a!"},
+                    {"user_id": "w2-07-b", "password": "Imp0rt-b!"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(2));
+        assert_eq!(body["success"], json!(2));
+
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert!(data.contains(&json!({"user_id": "w2-07-a"})));
+        assert!(data.contains(&json!({"user_id": "w2-07-b"})));
+
+        // The imported credentials authenticate through the broker state:
+        // `MemoryAuth::authenticate` accepts the new password and refuses
+        // a wrong one (the same call the kernel CONNECT path makes).
+        assert!(state
+            .auth
+            .authenticate("w2-07-c1", Some("w2-07-a"), Some(b"Imp0rt-a!"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate("w2-07-c1", Some("w2-07-a"), Some(b"wrong"))
+            .await
+            .is_err());
+
+        // Re-import with one duplicate: clean rejection, store intact.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/import_users",
+                json!([
+                    {"user_id": "w2-07-b", "password": "Imp0rt-b!"},
+                    {"user_id": "w2-07-c", "password": "Imp0rt-c!"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert!(body["message"].is_string());
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        assert!(!data.contains(&json!({"user_id": "w2-07-c"})));
+
+        // Duplicate within the batch is rejected the same way.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/import_users",
+                json!([
+                    {"user_id": "w2-07-d", "password": "Imp0rt-d!"},
+                    {"user_id": "w2-07-d", "password": "Imp0rt-d!"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+
+        // Malformed batches are client errors with the documented shape
+        // and apply nothing.
+        for bad in [
+            json!([]),
+            json!([{"user_id": "w2-07-e"}]),
+            json!([{"user_id": "", "password": "Imp0rt-e!"}]),
+            json!([{"user_id": "w2-07-e", "password": ""}]),
+            json!({"not-users": []}),
+        ] {
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/authentication/password_based:built_in_database/import_users",
+                    bad,
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+        }
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data").len(), 2);
+
+        // Unknown authenticator ids are 404 with the documented code,
+        // not an empty body.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:nowhere/import_users",
+                json!([{"user_id": "w2-07-x", "password": "Imp0rt-x!"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+
+        // Non-built-in backends cannot be imported into the built-in map.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:mysql/import_users",
+                json!([{"user_id": "w2-07-y", "password": "Imp0rt-y!"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn authn_imported_users_connect_and_persist() {
+        // Imported users persist across a restart and authenticate a real
+        // broker CONNECT through the console path (connect, not only the
+        // store): the imported credential gets CONNACK 0 over the live
+        // WebSocket console, a wrong password does not.
+        let dir = unique_data_dir("authn-import");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/import_users",
+                json!([
+                    {"user_id": "w2-07-persist", "password": "Persist1!"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        let mut ok = WsClient::connect(server.port).await;
+        ok.send_bin(&mqtt_connect(
+            "w2-07-persist-ok",
+            Some("w2-07-persist"),
+            Some(b"Persist1!"),
+        ))
+        .await;
+        let connack = ok.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        drop(ok);
+
+        let mut bad = WsClient::connect(server.port).await;
+        bad.send_bin(&mqtt_connect(
+            "w2-07-persist-bad",
+            Some("w2-07-persist"),
+            Some(b"wrong"),
+        ))
+        .await;
+        let connack = bad.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_ne!(connack[3], 0);
+        drop(bad);
+        drop(server);
+        drop(registry);
+
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert!(data.contains(&json!({"user_id": "w2-07-persist"})));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

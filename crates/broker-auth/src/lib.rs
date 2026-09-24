@@ -348,6 +348,46 @@ pub const MAX_BCRYPT_PASSWORD_BYTES: usize = 72;
 /// (Argon2id) is well under 300 bytes; 2 KiB rejects a corrupt state file
 /// without unbounded allocation while leaving headroom for future params.
 pub const MAX_STORED_VERIFIER_BYTES: usize = 2048;
+/// Bound on users per authenticator (the built-in user map). Reason: each
+/// entry holds a verifier plus map overhead, so an unbounded map lets one
+/// management batch exhaust the kernel; 100,000 entries cover fleet
+/// provisioning while keeping list reads paged and per-CONNECT lookups
+/// cheap. Default is the empty map (open broker until users exist).
+pub const MAX_AUTHN_USERS: usize = 100_000;
+/// Bound on one import batch. Reason: the request body plus the validated
+/// batch already hold every entry once each; 10,000 entries keep one
+/// management request's hashing and memory bounded while large fleets
+/// import in repeated batches.
+pub const MAX_IMPORT_BATCH: usize = 10_000;
+/// Longest accepted authenticator username (`user_id`). Reason: usernames
+/// ride the per-CONNECT lookup and the persisted snapshot, so one entry
+/// cannot balloon either; 256 bytes cover service names with headroom
+/// while bounding map and file growth.
+pub const MAX_AUTHN_USERNAME_LEN: usize = 256;
+
+/// Bulk-import result: atomic counts for the documented result shape.
+/// A successful import applies every entry, so `total == success` and the
+/// remaining buckets are zero; any failure applies nothing and surfaces
+/// as [`ImportUsersError`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub total: usize,
+    pub success: usize,
+}
+
+/// Why [`MemoryAuth::import_users`] refused a batch without applying it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportUsersError {
+    /// An entry failed shape validation (message names the field).
+    Malformed(String),
+    /// A `user_id` appears twice in the batch or already exists.
+    Duplicate(String),
+    /// The batch is too large or would exceed [`MAX_AUTHN_USERS`].
+    TooMany(String),
+    /// The registry commit or atomic save failed after the in-memory
+    /// apply (the import stays in memory; the next restart reloads disk).
+    Persist(String),
+}
 
 /// Hashing policy for new credentials and migrations. Every field is
 /// operator-configurable via [`MemoryAuth::set_policy`]; the defaults
@@ -657,6 +697,157 @@ impl MemoryAuth {
             users.insert(username, UserEntry { verifier, quotas });
         }
         self.persist()
+    }
+
+    /// Bulk import: validate-all-before-apply over the live user map.
+    ///
+    /// Every entry is a `(username, password)` pair with a plaintext
+    /// password that is hashed here under the configured default
+    /// algorithm (same policy as [`MemoryAuth::add_user`]).
+    ///
+    /// Validate-all-before-apply: usernames must be non-empty (at most
+    /// [`MAX_AUTHN_USERNAME_LEN`] bytes) and unique within the batch,
+    /// passwords must be non-empty and at most [`MAX_PASSWORD_BYTES`]
+    /// bytes, the batch must be non-empty and at most
+    /// [`MAX_IMPORT_BATCH`] entries, no entry may collide with the
+    /// existing map, and the batch must fit under [`MAX_AUTHN_USERS`].
+    /// Any violation rejects the whole batch with [`ImportUsersError`]
+    /// and applies nothing, so a bad batch can never partially corrupt
+    /// the store. A duplicate within the batch or against the existing
+    /// map is an error (never a silent overwrite or merge).
+    // TODO(parity): is a duplicate an error or an overwrite/merge, and
+    // does the documented result count overrides versus fail the batch?
+    // The rulebook does not decide the exact duplicate semantics; the
+    // current choice rejects the whole batch as the conservative
+    // fail-closed answer until the checker pins it.
+    ///
+    /// On success every user is inserted under a single write lock and
+    /// persisted once through the registry, so the import survives a
+    /// kernel restart. Management-plane only: takes only the user-map
+    /// write lock (plus the registry save lock inside [`MemoryAuth::persist`]);
+    /// the CONNECT path keeps reading under short read locks and
+    /// publish/deliver never touch this store.
+    ///
+    /// The caller holds at most the validated batch (one `(username,
+    /// verifier)` pair per entry) plus the request body itself; no
+    /// second full copy of the batch is built.
+    pub fn import_users(
+        &self,
+        users: Vec<(String, Vec<u8>)>,
+    ) -> std::result::Result<ImportSummary, ImportUsersError> {
+        if users.is_empty() {
+            return Err(ImportUsersError::Malformed(
+                "user batch must not be empty".to_string(),
+            ));
+        }
+        if users.len() > MAX_IMPORT_BATCH {
+            return Err(ImportUsersError::TooMany(format!(
+                "user batch of {} exceeds {MAX_IMPORT_BATCH} entries",
+                users.len()
+            )));
+        }
+        // Validate shape before any hashing: non-empty usernames and
+        // passwords within bounds, no duplicate within the batch.
+        {
+            let mut seen = std::collections::HashSet::with_capacity(users.len());
+            for (username, password) in &users {
+                if username.trim().is_empty() {
+                    return Err(ImportUsersError::Malformed(
+                        "user batch entry `user_id` must not be empty".to_string(),
+                    ));
+                }
+                if username.len() > MAX_AUTHN_USERNAME_LEN {
+                    return Err(ImportUsersError::Malformed(format!(
+                        "user batch entry `user_id` {username:?} exceeds {MAX_AUTHN_USERNAME_LEN} bytes"
+                    )));
+                }
+                if password.is_empty() {
+                    return Err(ImportUsersError::Malformed(format!(
+                        "user batch entry for {username:?} has an empty password (field `password`)"
+                    )));
+                }
+                if password.len() > MAX_PASSWORD_BYTES {
+                    return Err(ImportUsersError::Malformed(format!(
+                        "user batch entry for {username:?} exceeds {MAX_PASSWORD_BYTES} bytes (field `password`)"
+                    )));
+                }
+                if !seen.insert(username.clone()) {
+                    return Err(ImportUsersError::Duplicate(format!(
+                        "user batch entry `user_id` {username:?} is duplicated"
+                    )));
+                }
+            }
+        }
+        // Fail fast against the existing map under a short read lock
+        // before paying for hashing; the write-lock section below
+        // re-checks so a concurrent import cannot slip in between.
+        {
+            let existing = self.users.read();
+            for (username, _) in &users {
+                if existing.contains_key(username) {
+                    return Err(ImportUsersError::Duplicate(format!(
+                        "user {username:?} already exists"
+                    )));
+                }
+            }
+            if existing.len() + users.len() > MAX_AUTHN_USERS {
+                return Err(ImportUsersError::TooMany(format!(
+                    "import of {} users would exceed the per-authenticator cap of {MAX_AUTHN_USERS}",
+                    users.len()
+                )));
+            }
+        }
+        // Hash outside the write lock (management-plane cost only; the
+        // CONNECT path never waits on it), one verifier per entry.
+        let policy = self.policy();
+        let algorithm = policy.default_algorithm;
+        let mut hashed: Vec<(String, PasswordVerifier)> = Vec::with_capacity(users.len());
+        for (username, password) in &users {
+            match hash_password_for_policy(&policy, password, algorithm) {
+                Some(verifier) => hashed.push((username.clone(), verifier)),
+                None => {
+                    return Err(ImportUsersError::Malformed(format!(
+                        "user batch entry for {username:?} cannot be hashed with {algorithm:?} (field `password`)"
+                    )));
+                }
+            }
+        }
+        // Single atomic apply under one write lock: re-check duplicates
+        // and the cap so concurrent imports cannot interleave into a
+        // partial apply, then insert all and persist once.
+        {
+            let mut map = self.users.write();
+            for (username, _) in &hashed {
+                if map.contains_key(username) {
+                    return Err(ImportUsersError::Duplicate(format!(
+                        "user {username:?} already exists"
+                    )));
+                }
+            }
+            if map.len() + hashed.len() > MAX_AUTHN_USERS {
+                return Err(ImportUsersError::TooMany(format!(
+                    "import of {} users would exceed the per-authenticator cap of {MAX_AUTHN_USERS}",
+                    hashed.len()
+                )));
+            }
+            for (username, verifier) in hashed {
+                map.insert(
+                    username,
+                    UserEntry {
+                        verifier,
+                        quotas: UserQuotas::default(),
+                    },
+                );
+            }
+        }
+        if let Err(error) = self.persist() {
+            return Err(ImportUsersError::Persist(error.to_string()));
+        }
+        let total = users.len();
+        Ok(ImportSummary {
+            total,
+            success: total,
+        })
     }
 
     /// Stored verifier encoding for a user (`None` when unknown). Test and
