@@ -1,0 +1,449 @@
+//! Ordered authenticator chain for the management API.
+//!
+//! Covers the chain behind `GET /authentication` (ordered list) and
+//! `POST /authentication` (append one entry). Single-node,
+//! management-plane only: publishes and deliveries never touch this
+//! store; the CONNECT path reads one lock-free snapshot per connect to
+//! decide whether the built-in database may execute, and never takes
+//! the chain write lock.
+//!
+//! Store bounds (both stated here and enforced below):
+//! - at most [`broker_config::MAX_AUTHN_CHAIN_ENTRIES`] entries (8:
+//!   the CONNECT path snapshots the whole chain once per connect, so the
+//!   chain must stay small and bounded; 8 covers the documented backend
+//!   families with headroom while keeping per-connect clones cheap);
+//!   creates past the cap are rejected instead of growing without limit;
+//! - `id`/`mechanism`/`backend` are capped at 256 chars and the stored
+//!   backend config at 8 KiB of JSON, so one entry cannot balloon memory;
+//! - reads clone at most the capped list once per request under a short
+//!   lock; the CONNECT hook clones one `Arc` snapshot lock-free and scans
+//!   at most the capped entries without taking the write lock.
+//!
+//! Only the built-in database executes in the parity waves; every other
+//! backend's config is stored and reported, never claimed as live. A
+//! non-empty chain with no enabled built-in entry fails closed at
+//! CONNECT (no live backend can execute); an empty chain preserves
+//! today's behaviour (open broker or local users).
+// TODO(parity): is 8 the documented chain cap, and which
+// mechanism/backend pairs plus per-entry fields does the spec require?
+// The rulebook does not decide the exact set; the current choice accepts
+// the password/JWT/LDAP/HTTP/Redis/SQL/Mongo/file families and reports
+// id/mechanism/backend/enable only, omitting status fields the broker
+// cannot supply.
+
+use broker_config::{
+    is_known_authn_backend, is_known_authn_mechanism, AuthnChainConf, AuthnEntry as ConfEntry,
+    ConfigRegistry, MAX_AUTHN_CHAIN_ENTRIES,
+};
+use std::sync::Arc;
+
+/// Longest accepted `id`/`mechanism`/`backend` value (256 chars).
+/// Reason (measured cost): the CONNECT path clones the whole chain snapshot
+/// once per connect, so each entry's keys must stay small; the longest
+/// documented `{mechanism}:{backend}` id is under 64 chars, and 256 gives
+/// headroom while bounding the snapshot to at most 8 entries of short keys.
+const MAX_ID_LEN: usize = 256;
+/// Longest accepted backend-config JSON document (8 KiB).
+/// Reason (measured cost): configs ride the per-connect snapshot clone, so
+/// one entry cannot balloon memory; 8 KiB caps the worst-case snapshot at
+/// 8 entries x 8 KiB = 64 KiB, keeping per-connect clones cheap, and larger
+/// documents are rejected instead of growing without limit.
+const MAX_CONFIG_LEN: usize = 8192;
+
+/// One ordered chain slot: the chain key plus its credential mechanism,
+/// credential store, enable flag and opaque backend config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthnEntry {
+    pub id: String,
+    pub mechanism: String,
+    pub backend: String,
+    pub enable: bool,
+    pub config: serde_json::Value,
+}
+
+/// Why [`AuthnChain::insert`] refused an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainInsertError {
+    /// The `id` is already stored.
+    Duplicate,
+    /// The store holds [`MAX_AUTHN_CHAIN_ENTRIES`] entries.
+    Full,
+    /// The entry failed validation (message names the field).
+    Invalid(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
+
+/// Ordered authenticator chain behind one short lock plus a lock-free
+/// read snapshot for the CONNECT path.
+///
+/// Management writes take the write lock, replace the stored order and
+/// publish a fresh snapshot; the CONNECT hook loads the snapshot
+/// without taking the write lock and never blocks on a management
+/// write beyond one `Arc` swap. Publish and deliver never touch either.
+pub struct AuthnChain {
+    inner: parking_lot::RwLock<Vec<AuthnEntry>>,
+    snapshot: arc_swap::ArcSwap<Vec<AuthnEntry>>,
+    registry: parking_lot::RwLock<Option<Arc<ConfigRegistry>>>,
+    save_lock: parking_lot::Mutex<()>,
+}
+
+impl AuthnChain {
+    /// Empty chain (today's empty behaviour: open broker or local users).
+    pub fn new() -> Self {
+        Self {
+            inner: parking_lot::RwLock::new(Vec::new()),
+            snapshot: arc_swap::ArcSwap::from(Arc::new(Vec::new())),
+            registry: parking_lot::RwLock::new(None),
+            save_lock: parking_lot::Mutex::new(()),
+        }
+    }
+
+    /// Seed from a validated snapshot root. Memory-only.
+    pub fn from_snapshot(conf: &AuthnChainConf) -> Self {
+        let chain = Self::new();
+        chain.seed_from_snapshot(conf);
+        chain
+    }
+
+    /// Seed from the registry's current snapshot and persist every later
+    /// mutation back through it. Kernel boot path; an empty snapshot
+    /// yields today's empty behaviour.
+    pub fn from_registry(registry: &Arc<ConfigRegistry>) -> Self {
+        let chain = Self::from_snapshot(&registry.snapshot().authn_chain);
+        *chain.registry.write() = Some(Arc::clone(registry));
+        chain
+    }
+
+    /// Attach the registry and replace the current contents with its
+    /// snapshot, in place on the same instance.
+    pub fn seed_from_registry(&self, registry: &Arc<ConfigRegistry>) {
+        self.seed_from_snapshot(&registry.snapshot().authn_chain);
+        *self.registry.write() = Some(Arc::clone(registry));
+    }
+
+    fn seed_from_snapshot(&self, conf: &AuthnChainConf) {
+        let entries = conf
+            .authenticators
+            .iter()
+            .filter_map(|e| conf_to_entry(e).ok())
+            .collect::<Vec<_>>();
+        *self.inner.write() = entries.clone();
+        self.snapshot.store(Arc::new(entries));
+    }
+
+    /// Ordered snapshot of the chain in stored order. Management-plane
+    /// read only; clones at most the capped list under one short lock.
+    pub fn list(&self) -> Vec<AuthnEntry> {
+        self.inner.read().clone()
+    }
+
+    /// Lock-free snapshot for the CONNECT path: one `Arc` load, no write
+    /// lock, at most the capped entries to scan. Publish and deliver
+    /// never call this.
+    pub fn snapshot(&self) -> Arc<Vec<AuthnEntry>> {
+        self.snapshot.load_full()
+    }
+
+    /// Whether the built-in database may execute for this snapshot: true
+    /// when the chain is empty (today's behaviour) or holds at least one
+    /// enabled `built_in_database` slot; false when the chain is
+    /// non-empty with no enabled built-in slot (no live backend, fail
+    /// closed). Consulted by the broker on CONNECT only.
+    pub fn built_in_available(&self) -> bool {
+        let snap = self.snapshot.load();
+        if snap.is_empty() {
+            return true;
+        }
+        snap.iter()
+            .any(|e| e.backend == "built_in_database" && e.enable)
+    }
+
+    /// Append one entry. Fails cleanly on duplicate `id` (caller maps to
+    /// `ALREADY_EXISTS`), a full chain (caller maps to `BAD_REQUEST`)
+    /// or an invalid entry (caller maps to `BAD_REQUEST`). Validated
+    /// all-before-apply: the candidate root is validated before it can
+    /// become visible, so invalid state is never observable. Persists
+    /// through the registry when one is attached; a commit or save
+    /// failure surfaces as [`ChainInsertError::Persist`] and the
+    /// in-memory update stays (commit precedes the atomic save, mirroring
+    /// the credential store).
+    pub fn insert(&self, entry: AuthnEntry) -> Result<AuthnEntry, ChainInsertError> {
+        validate_entry(&entry)?;
+        let _guard = self.save_lock.lock();
+        let conf = {
+            let mut current = self.inner.write();
+            if current.iter().any(|e| e.id == entry.id) {
+                return Err(ChainInsertError::Duplicate);
+            }
+            if current.len() >= MAX_AUTHN_CHAIN_ENTRIES {
+                return Err(ChainInsertError::Full);
+            }
+            let mut next = current.clone();
+            next.push(entry.clone());
+            let conf = export_conf(&next);
+            conf.validate()
+                .map_err(|e| ChainInsertError::Invalid(e.to_string()))?;
+            current.push(entry.clone());
+            self.snapshot.store(Arc::new(current.clone()));
+            conf
+        };
+        if let Some(registry) = self.registry.read().clone() {
+            registry
+                .commit_authn_chain(conf)
+                .map_err(|e| ChainInsertError::Persist(e.to_string()))?;
+            registry
+                .save()
+                .map_err(|e| ChainInsertError::Persist(e.to_string()))?;
+        }
+        Ok(entry)
+    }
+
+    /// Number of stored entries.
+    pub fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+
+    /// Whether the chain holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().is_empty()
+    }
+}
+
+impl Default for AuthnChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn validate_entry(entry: &AuthnEntry) -> Result<(), ChainInsertError> {
+    if entry.id.trim().is_empty() {
+        return Err(ChainInsertError::Invalid(
+            "field `id` must not be empty".to_string(),
+        ));
+    }
+    if entry.id.len() > MAX_ID_LEN {
+        return Err(ChainInsertError::Invalid(
+            "field `id` is too long".to_string(),
+        ));
+    }
+    if entry.mechanism.trim().is_empty() {
+        return Err(ChainInsertError::Invalid(
+            "field `mechanism` must not be empty".to_string(),
+        ));
+    }
+    if entry.mechanism.len() > MAX_ID_LEN {
+        return Err(ChainInsertError::Invalid(
+            "field `mechanism` is too long".to_string(),
+        ));
+    }
+    if !is_known_authn_mechanism(&entry.mechanism) {
+        return Err(ChainInsertError::Invalid(format!(
+            "field `mechanism` {:?} is unknown",
+            entry.mechanism
+        )));
+    }
+    if entry.backend.trim().is_empty() {
+        return Err(ChainInsertError::Invalid(
+            "field `backend` must not be empty".to_string(),
+        ));
+    }
+    if entry.backend.len() > MAX_ID_LEN {
+        return Err(ChainInsertError::Invalid(
+            "field `backend` is too long".to_string(),
+        ));
+    }
+    if !is_known_authn_backend(&entry.backend) {
+        return Err(ChainInsertError::Invalid(format!(
+            "field `backend` {:?} is unknown",
+            entry.backend
+        )));
+    }
+    if let Some((head, _)) = entry.id.split_once(':') {
+        if head != entry.mechanism {
+            return Err(ChainInsertError::Invalid(format!(
+                "field `id` {:?} must start with its mechanism {:?}",
+                entry.id, entry.mechanism
+            )));
+        }
+    }
+    let rendered = entry.config.to_string();
+    if rendered.len() > MAX_CONFIG_LEN {
+        return Err(ChainInsertError::Invalid(
+            "field `config` is too large".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn export_conf(entries: &[AuthnEntry]) -> AuthnChainConf {
+    AuthnChainConf {
+        authenticators: entries
+            .iter()
+            .map(|e| ConfEntry {
+                id: e.id.clone(),
+                mechanism: e.mechanism.clone(),
+                backend: e.backend.clone(),
+                enable: e.enable,
+                config: if e.config.is_null() {
+                    String::new()
+                } else {
+                    e.config.to_string()
+                },
+            })
+            .collect(),
+    }
+}
+
+fn conf_to_entry(conf: &ConfEntry) -> Result<AuthnEntry, ()> {
+    let config = if conf.config.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&conf.config).map_err(|_| ())?
+    };
+    Ok(AuthnEntry {
+        id: conf.id.clone(),
+        mechanism: conf.mechanism.clone(),
+        backend: conf.backend.clone(),
+        enable: conf.enable,
+        config,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, backend: &str) -> AuthnEntry {
+        let mechanism = id
+            .split_once(':')
+            .map(|(m, _)| m)
+            .unwrap_or("password_based");
+        AuthnEntry {
+            id: id.to_string(),
+            mechanism: mechanism.to_string(),
+            backend: backend.to_string(),
+            enable: true,
+            config: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn empty_chain_reports_no_entries_and_allows_built_in() {
+        let chain = AuthnChain::new();
+        assert!(chain.is_empty());
+        assert_eq!(chain.len(), 0);
+        assert_eq!(chain.list(), Vec::new());
+        assert!(chain.built_in_available());
+        assert!(chain.snapshot().is_empty());
+    }
+
+    #[test]
+    fn insert_appends_in_order_and_rejects_duplicates() {
+        let chain = AuthnChain::new();
+        chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "built_in_database",
+            ))
+            .expect("first insert");
+        assert!(chain.built_in_available());
+        let dup = chain.insert(entry(
+            "password_based:built_in_database",
+            "built_in_database",
+        ));
+        assert_eq!(dup, Err(ChainInsertError::Duplicate));
+        chain
+            .insert(entry("password_based:mysql", "mysql"))
+            .expect("second insert");
+        let ids: Vec<_> = chain.list().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:built_in_database".to_string(),
+                "password_based:mysql".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn non_built_in_only_chain_requires_fail_closed() {
+        let chain = AuthnChain::new();
+        chain
+            .insert(entry("password_based:mysql", "mysql"))
+            .expect("mysql insert");
+        assert!(
+            !chain.built_in_available(),
+            "no live backend can execute without an enabled built-in slot"
+        );
+    }
+
+    #[test]
+    fn insert_rejects_unknown_backend_and_mismatched_id() {
+        let chain = AuthnChain::new();
+        let bad_backend = AuthnEntry {
+            id: "password_based:nope".to_string(),
+            mechanism: "password_based".to_string(),
+            backend: "nope".to_string(),
+            enable: true,
+            config: serde_json::Value::Null,
+        };
+        assert!(matches!(
+            chain.insert(bad_backend),
+            Err(ChainInsertError::Invalid(_))
+        ));
+        let mismatched = AuthnEntry {
+            id: "jwt:built_in_database".to_string(),
+            mechanism: "password_based".to_string(),
+            backend: "built_in_database".to_string(),
+            enable: true,
+            config: serde_json::Value::Null,
+        };
+        assert!(matches!(
+            chain.insert(mismatched),
+            Err(ChainInsertError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn insert_enforces_chain_cap() {
+        let chain = AuthnChain::new();
+        for n in 0..MAX_AUTHN_CHAIN_ENTRIES {
+            // Distinct ids sharing one known backend keep the test on the
+            // cap (not on backend validation).
+            let mut e = entry("password_based:mysql", "mysql");
+            e.id = format!("password_based:mysql-{n}");
+            chain.insert(e).expect("fill to cap");
+        }
+        assert_eq!(chain.len(), MAX_AUTHN_CHAIN_ENTRIES);
+        let mut overflow = entry("password_based:overflow", "mysql");
+        overflow.id = "password_based:mysql-overflow".to_string();
+        assert_eq!(chain.insert(overflow), Err(ChainInsertError::Full));
+    }
+
+    #[test]
+    fn chain_survives_registry_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "authn-chain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads"));
+        let chain = AuthnChain::from_registry(&registry);
+        chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "built_in_database",
+            ))
+            .expect("persist built-in");
+        assert!(dir.join(broker_config::STATE_FILE_NAME).is_file());
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("data dir reloads"));
+        let restarted = AuthnChain::from_registry(&reloaded);
+        let ids: Vec<_> = restarted.list().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids, vec!["password_based:built_in_database".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

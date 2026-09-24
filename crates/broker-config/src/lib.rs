@@ -97,6 +97,49 @@ pub fn is_known_acl_action(action: &str) -> bool {
     )
 }
 
+/// Upper bound for stored authenticator-chain entries. Writes past this
+/// size are rejected instead of growing the list without limit. Reason:
+/// the CONNECT path snapshots the whole chain once per connect, so the
+/// chain must stay small and bounded; 8 covers the documented backend
+/// families with headroom while keeping per-connect clones cheap.
+// TODO(parity): is 8 the documented chain cap, or does the spec allow
+// more entries? The rulebook does not decide the exact bound; 8 is the
+// conservative choice until the conformance checker pins it.
+pub const MAX_AUTHN_CHAIN_ENTRIES: usize = 8;
+
+/// Authenticator backends the kernel can store. Only `built_in_database`
+/// executes in the parity waves; every other backend's config is stored
+/// and reported, never claimed as live. The set covers the password, JWT,
+/// LDAP, HTTP, Redis, SQL, Mongo and file families named for the
+/// authenticator registries.
+pub const KNOWN_AUTHN_BACKENDS: &[&str] = &[
+    "built_in_database",
+    "mysql",
+    "postgresql",
+    "mongodb",
+    "redis",
+    "http",
+    "jwt",
+    "scram",
+    "ldap",
+    "file",
+];
+
+/// Returns true for an authenticator backend the kernel can store.
+#[must_use]
+pub fn is_known_authn_backend(backend: &str) -> bool {
+    KNOWN_AUTHN_BACKENDS.contains(&backend)
+}
+
+/// Credential mechanisms the authenticator chain addresses.
+pub const KNOWN_AUTHN_MECHANISMS: &[&str] = &["password_based", "jwt", "scram"];
+
+/// Returns true for an authenticator mechanism the kernel can store.
+#[must_use]
+pub fn is_known_authn_mechanism(mechanism: &str) -> bool {
+    KNOWN_AUTHN_MECHANISMS.contains(&mechanism)
+}
+
 /// Errors produced by validation, loading and saving configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -483,6 +526,109 @@ impl ConnectorsConf {
     }
 }
 
+/// One authenticator-chain entry: the ordered chain slot the
+/// management API lists and creates. `id` is the chain key (by
+/// convention `{mechanism}:{backend}`, e.g.
+/// `password_based:built_in_database`); `mechanism` names the credential
+/// mechanism; `backend` names the credential store; `enable` selects
+/// whether the slot participates; `config` carries the backend-specific
+/// fields as a JSON document (may be empty for the built-in database).
+/// Only `built_in_database` executes in the parity waves; every other
+/// backend's config is stored and reported, never claimed as live.
+// TODO(parity): which per-entry fields does the spec require beyond
+// id/mechanism/backend/enable (status, user_id_type, ...)? The rulebook
+// does not decide the exact shape; fields the broker cannot supply are
+// omitted rather than invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AuthnEntry {
+    /// Chain key; must be non-empty and unique within the root.
+    pub id: String,
+    /// Credential mechanism; must name a known mechanism (field `mechanism`).
+    pub mechanism: String,
+    /// Credential store; must name a known backend (field `backend`).
+    pub backend: String,
+    /// Whether the slot participates (missing entries from
+    /// pre-persistence files load as `true`, the historical behaviour).
+    #[serde(default = "default_authn_enabled")]
+    pub enable: bool,
+    /// Opaque backend configuration as a JSON document; may be empty.
+    #[serde(default)]
+    pub config: String,
+}
+
+/// Serde default for a missing authenticator enable flag: historical
+/// entries predate the flag and were always enabled.
+fn default_authn_enabled() -> bool {
+    true
+}
+
+/// Root: ordered authenticator chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AuthnChainConf {
+    #[serde(default)]
+    pub authenticators: Vec<AuthnEntry>,
+}
+
+impl AuthnChainConf {
+    /// Validates ids (non-empty, unique), mechanisms and backends
+    /// (known), the chain length cap, and the id/mechanism consistency
+    /// for colon-form ids.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.authenticators.len() > MAX_AUTHN_CHAIN_ENTRIES {
+            return Err(ConfigError::Invalid(format!(
+                "authn_chain.authenticators holds {} entries, at most {} (field `authenticators`)",
+                self.authenticators.len(),
+                MAX_AUTHN_CHAIN_ENTRIES
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.authenticators.len());
+        for (index, entry) in self.authenticators.iter().enumerate() {
+            if entry.id.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "authn_chain.authenticators[{index}].id must not be empty (field `id`)"
+                )));
+            }
+            if entry.mechanism.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "authn_chain.authenticators[{index}].mechanism must not be empty (field `mechanism`)"
+                )));
+            }
+            if !is_known_authn_mechanism(&entry.mechanism) {
+                return Err(ConfigError::Invalid(format!(
+                    "authn_chain.authenticators[{index}].mechanism {:?} is unknown (field `mechanism`)",
+                    entry.mechanism
+                )));
+            }
+            if entry.backend.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "authn_chain.authenticators[{index}].backend must not be empty (field `backend`)"
+                )));
+            }
+            if !is_known_authn_backend(&entry.backend) {
+                return Err(ConfigError::Invalid(format!(
+                    "authn_chain.authenticators[{index}].backend {:?} is unknown (field `backend`)",
+                    entry.backend
+                )));
+            }
+            if let Some((head, _)) = entry.id.split_once(':') {
+                if head != entry.mechanism {
+                    return Err(ConfigError::Invalid(format!(
+                        "authn_chain.authenticators[{index}].id {:?} must start with its mechanism {:?} (field `id`)",
+                        entry.id, entry.mechanism
+                    )));
+                }
+            }
+            if !seen.insert(entry.id.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "authn_chain.authenticators[{index}].id {:?} is duplicated (field `id`)",
+                    entry.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The full validated configuration: all roots in one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FullSnapshot {
@@ -494,6 +640,8 @@ pub struct FullSnapshot {
     pub rules: RulesConf,
     #[serde(default)]
     pub connectors: ConnectorsConf,
+    #[serde(default)]
+    pub authn_chain: AuthnChainConf,
 }
 
 impl FullSnapshot {
@@ -503,6 +651,7 @@ impl FullSnapshot {
         self.mqtt_users.validate()?;
         self.rules.validate()?;
         self.connectors.validate()?;
+        self.authn_chain.validate()?;
         Ok(())
     }
 }
@@ -518,6 +667,8 @@ pub enum ConfigRoot {
     Rules(RulesConf),
     /// Validated connectors root.
     Connectors(ConnectorsConf),
+    /// Validated authenticator-chain root.
+    AuthnChain(AuthnChainConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -598,6 +749,7 @@ impl ConfigRegistry {
             ConfigRoot::MqttUsers(conf) => self.commit_mqtt_users(conf),
             ConfigRoot::Rules(conf) => self.commit_rules(conf),
             ConfigRoot::Connectors(conf) => self.commit_connectors(conf),
+            ConfigRoot::AuthnChain(conf) => self.commit_authn_chain(conf),
         }
     }
 
@@ -640,6 +792,17 @@ impl ConfigRegistry {
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.connectors = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Commits a validated authenticator-chain root.
+    pub fn commit_authn_chain(&self, conf: AuthnChainConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.authn_chain = conf.clone();
             next
         });
         Ok(())
@@ -750,6 +913,7 @@ mod tests {
                     config: "mysql://root:pw@127.0.0.1:3306/db".to_string(),
                 }],
             },
+            authn_chain: AuthnChainConf::default(),
         }
     }
 

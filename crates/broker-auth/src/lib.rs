@@ -1,6 +1,8 @@
+pub mod chain;
 pub mod kerberos;
 pub mod ldap;
 
+pub use chain::{AuthnChain, AuthnEntry, ChainInsertError};
 pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 

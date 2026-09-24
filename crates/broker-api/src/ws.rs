@@ -461,6 +461,15 @@ async fn handle_packet(
         // First packet must be CONNECT.
         (true, 1) => {
             let conn = decode_connect(payload, flags).ok_or(())?;
+            // W2-02: authenticator-chain consult. Loads one lock-free
+            // snapshot per connect and never takes the chain write lock;
+            // publish and deliver never touch this store. A non-empty
+            // chain with no enabled built-in slot fails closed (no live
+            // backend can execute), mirroring the BrokerLink bind path.
+            if !state.authn_chain.built_in_available() {
+                send_bin(socket, encode_connack(false, 0x86)).await;
+                return Err(());
+            }
             // A non-empty user store always wins: unauthenticated console
             // clients are rejected whenever users exist, exactly like the
             // BrokerLink bind path (0x87, not authorized).

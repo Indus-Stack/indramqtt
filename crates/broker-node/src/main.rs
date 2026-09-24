@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use broker_auth::{
-    Authenticator, Authorizer, KerberosAuthenticator, KerberosConfig, LdapAuthenticator,
-    LdapConfig, MemoryAuth,
+    Authenticator, AuthnChain, Authorizer, KerberosAuthenticator, KerberosConfig,
+    LdapAuthenticator, LdapConfig, MemoryAuth,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
@@ -420,6 +420,26 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
         ) {
             shared.metrics.inc_auth_failures();
             return Some(session_binding_reply(frame, 0, false, 0x8A, alias_max));
+        }
+        // W2-02: authenticator-chain consult. Loads one lock-free
+        // snapshot per connect and never takes the chain write lock;
+        // publish and deliver never touch this store. An empty chain
+        // preserves today's behaviour. A non-empty chain with no enabled
+        // built-in slot fails closed (no live backend can execute):
+        // anonymous and credentialed CONNECTs are refused with no session
+        // created. Only the built-in database executes; other backends
+        // are stored and reported, never claimed as live.
+        // TODO(parity): which CONNACK code does the spec require for a
+        // chain with no live backend? The rulebook does not decide the
+        // code; 0x86 (bad credentials) is the conservative fail-closed
+        // choice until the checker pins it.
+        if !shared.authn_chain.built_in_available() {
+            tracing::warn!(
+                client_id = %req.client_id,
+                "authentication chain has no live backend: refusing CONNECT"
+            );
+            shared.metrics.inc_auth_failures();
+            return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
         }
         if req.username.is_none() {
             // A non-empty user store always wins over `--allow-anonymous`:
@@ -1375,6 +1395,12 @@ struct Shared {
     /// touched on the per-message path.
     readiness: Arc<NodeReadiness>,
     auth: Arc<MemoryAuth>,
+    /// Ordered authenticator chain for W2-02: shared with the management
+    /// API so validated chain writes are visible to the CONNECT consult
+    /// without a restart. One `Arc` clone at boot; CONNECT loads one
+    /// lock-free snapshot per connect and never takes the chain write
+    /// lock; publish and deliver never touch it.
+    authn_chain: Arc<AuthnChain>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -1568,6 +1594,7 @@ impl Shared {
             stats,
             readiness,
             auth: Arc::new(MemoryAuth::new()),
+            authn_chain: Arc::new(AuthnChain::new()),
             ldap: None,
             kerberos: None,
             allow_anonymous: false,
@@ -4715,6 +4742,13 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // are enforced by the connect and publish checks without a restart.
     // One Arc clone; checks take a short read lock, never a write.
     state.bans = shared.bans.clone();
+    // Share the authenticator chain (W2-02) so validated management
+    // writes are visible to the CONNECT consult without a restart. One
+    // `Arc` clone; CONNECT loads one lock-free snapshot per connect and
+    // never takes the chain write lock; publish and deliver never touch
+    // it. Seeding already ran inside `ApiState::new`; sharing replaces
+    // that fresh instance with the kernel's so no second copy diverges.
+    state.authn_chain = shared.authn_chain.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -4851,6 +4885,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // instance `serve_api` hands to `ApiState`), so the BrokerLink plane
     // enforces persisted credentials from the first accepted connection.
     shared.auth.seed_from_registry(&shared.config);
+    // Authenticator chain (W2-02): seed the shared chain in place (the
+    // same instance `serve_api` shares with `ApiState`), so the CONNECT
+    // consult enforces the persisted chain from the first connection.
+    // An empty snapshot is a no-op (today's empty behaviour).
+    shared.authn_chain.seed_from_registry(&shared.config);
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.
