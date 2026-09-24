@@ -1,7 +1,9 @@
 //! Ordered authenticator chain for the v5 management API.
 //!
-//! Covers `GET /authentication` (ordered list) and
-//! `POST /authentication` (append one entry) on the real chain store.
+//! Covers `GET /authentication` (ordered list),
+//! `POST /authentication` (append one entry) and
+//! `PUT /authentication/order` (replace the whole order) on the real
+//! chain store.
 //! Single-node, management-plane only: handlers clone at most the capped
 //! list once per request under a short lock; the CONNECT path reads one
 //! lock-free snapshot per connect and never takes the chain write lock,
@@ -27,7 +29,7 @@ use bytes::Bytes;
 use crate::errors::ApiError;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
-use broker_auth::{AuthnEntry, ChainInsertError};
+use broker_auth::{AuthnEntry, ChainInsertError, ChainReorderError};
 
 /// `GET /authentication`: ordered page (`data` plus `meta`). An empty
 /// chain reads as an empty page, never an error. Malformed
@@ -81,6 +83,83 @@ pub async fn create_authn_chain(State(state): State<ApiState>, body: Bytes) -> R
         )
             .into_response(),
     }
+}
+
+/// `PUT /authentication/order`: replace the whole chain order with the
+/// supplied ordered id list (`[{"id": "..."}, ...]`).
+///
+/// Validates the full list before applying: a partial list (stored ids
+/// omitted), an unknown id, a duplicate id or a malformed body applies
+/// nothing and fails with `BAD_REQUEST` in the documented `{code,
+/// message}` shape. On success returns 204 with no body. The order
+/// persists across a restart through the config registry.
+/// Management-plane only: one short write lock per request; the CONNECT
+/// path keeps reading its lock-free snapshot and publish/deliver never
+/// touch this store.
+pub async fn replace_authn_order(State(state): State<ApiState>, body: Bytes) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid authentication order body: {e}"))
+                .into_response();
+        }
+    };
+    let ids = match parse_order_request(&value) {
+        Ok(ids) => ids,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    match state.authn_chain.reorder(ids) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(ChainReorderError::Invalid(msg)) => ApiError::BadRequest(msg).into_response(),
+        Err(ChainReorderError::Unknown(unknown)) => ApiError::BadRequest(format!(
+            "unknown authenticator id(s): {}",
+            unknown.join(", ")
+        ))
+        .into_response(),
+        Err(ChainReorderError::Incomplete(missing)) => ApiError::BadRequest(format!(
+            "order omits stored authenticator id(s): {}",
+            missing.join(", ")
+        ))
+        .into_response(),
+        Err(ChainReorderError::Duplicate(msg)) => ApiError::BadRequest(msg).into_response(),
+        Err(ChainReorderError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist authenticator chain: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Validate an order body into the ordered id list.
+///
+/// The body must be a JSON array with at least the stored entries
+/// covered; every element must be an object carrying a non-empty string
+/// `id`. Extra keys on elements are ignored so future fields degrade to
+/// the same reorder instead of a 400.
+fn parse_order_request(value: &serde_json::Value) -> Result<Vec<String>, String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| "authentication order must be a JSON array".to_string())?;
+    let mut ids = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| format!("authentication order[{index}] must be an object"))?;
+        let id = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("authentication order[{index}].id is required"))?;
+        if id.trim().is_empty() {
+            return Err(format!(
+                "authentication order[{index}].id must not be empty"
+            ));
+        }
+        ids.push(id.to_string());
+    }
+    Ok(ids)
 }
 
 fn render_entry(entry: &AuthnEntry) -> serde_json::Value {

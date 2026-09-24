@@ -51,10 +51,17 @@ pub fn protected_router() -> Router<ApiState> {
             "/users/:username/change_pwd",
             put(auth::change_user_password).post(auth::change_user_password),
         )
-        // Authentication (AuthN) chain: ordered list plus append.
+        // Authentication (AuthN) chain: ordered list plus append, plus
+        // whole-order replacement. Management-plane only; the CONNECT
+        // path reads a lock-free snapshot and publish/deliver never
+        // touch this store.
         .route(
             "/authentication",
             get(authn_chain::list_authn_chain).post(authn_chain::create_authn_chain),
+        )
+        .route(
+            "/authentication/order",
+            put(authn_chain::replace_authn_order),
         )
         // Authentication (AuthN) node cache: status read plus reset that
         // actually evicts entries. Management-plane only; the CONNECT

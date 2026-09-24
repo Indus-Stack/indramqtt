@@ -4737,6 +4737,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authn_chain_order_replace_round_trip_and_rejects_unknown() {
+        // Order-replace through the broker: create two entries, set an
+        // explicit order, list expecting the new order; an unknown id
+        // and a partial list are rejected with no change applied.
+        // Management-plane only; publish and deliver never touch this
+        // store, and the CONNECT path keeps reading its lock-free
+        // snapshot.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Explicit order applies: mysql first.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([{"id": "password_based:mysql"}, {"id": "password_based:built_in_database"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], json!("password_based:mysql"));
+        assert_eq!(data[1]["id"], json!("password_based:built_in_database"));
+
+        // Unknown ids are rejected with the documented shape and apply
+        // nothing.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([
+                    {"id": "password_based:mysql"},
+                    {"id": "password_based:built_in_database"},
+                    {"id": "password_based:nowhere"},
+                ]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data[0]["id"], json!("password_based:mysql"));
+        assert_eq!(data[1]["id"], json!("password_based:built_in_database"));
+
+        // Partial lists are rejected with no change applied.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([{"id": "password_based:mysql"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], json!("password_based:mysql"));
+
+        // Malformed bodies are client errors with the documented shape.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([{"not-id": "password_based:mysql"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Order persists across a restart through the config registry.
+        let dir = unique_data_dir("authn-order");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/order",
+                json!([{"id": "password_based:mysql"}, {"id": "password_based:built_in_database"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], json!("password_based:mysql"));
+        assert_eq!(data[1]["id"], json!("password_based:built_in_database"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn authn_node_cache_status_reset_round_trip() {
         // Status over real state plus a reset that actually evicts:
         // read the documented fields, populate the cache through

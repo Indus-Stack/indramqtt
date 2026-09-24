@@ -1,7 +1,8 @@
 //! Ordered authenticator chain for the management API.
 //!
-//! Covers the chain behind `GET /authentication` (ordered list) and
-//! `POST /authentication` (append one entry). Single-node,
+//! Covers the chain behind `GET /authentication` (ordered list),
+//! `POST /authentication` (append one entry) and
+//! `PUT /authentication/order` (replace the whole order). Single-node,
 //! management-plane only: publishes and deliveries never touch this
 //! store; the CONNECT path reads one lock-free snapshot per connect to
 //! decide whether the built-in database may execute, and never takes
@@ -70,6 +71,22 @@ pub enum ChainInsertError {
     Full,
     /// The entry failed validation (message names the field).
     Invalid(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
+
+/// Why [`AuthnChain::reorder`] refused a new order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainReorderError {
+    /// The body failed structural validation (message names the problem).
+    Invalid(String),
+    /// One or more supplied ids are not stored (lists the unknown ids).
+    Unknown(Vec<String>),
+    /// The order omits stored ids, so applying it would drop entries
+    /// (lists the missing ids).
+    Incomplete(Vec<String>),
+    /// The order names the same id twice.
+    Duplicate(String),
     /// The registry commit or atomic save failed after validation.
     Persist(String),
 }
@@ -197,6 +214,94 @@ impl AuthnChain {
                 .map_err(|e| ChainInsertError::Persist(e.to_string()))?;
         }
         Ok(entry)
+    }
+
+    /// Replace the whole chain order with the supplied ordered id list.
+    ///
+    /// Validate-all-before-apply: the full list is checked (non-empty
+    /// ids, no duplicates, every id stored, no stored id omitted) before
+    /// anything becomes visible, so a partial or unknown-id list applies
+    /// nothing. On success the stored order, the lock-free CONNECT
+    /// snapshot and the persisted registry all move together.
+    /// Management-plane only: takes the write lock once per request;
+    /// the CONNECT path keeps reading the lock-free snapshot and
+    /// publish/deliver never touch this store.
+    pub fn reorder(&self, ids: Vec<String>) -> Result<(), ChainReorderError> {
+        for id in &ids {
+            if id.trim().is_empty() {
+                return Err(ChainReorderError::Invalid(
+                    "field `id` must not be empty".to_string(),
+                ));
+            }
+            if id.len() > MAX_ID_LEN {
+                return Err(ChainReorderError::Invalid(
+                    "field `id` is too long".to_string(),
+                ));
+            }
+        }
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        for id in &ids {
+            if !seen.insert(id.clone()) {
+                return Err(ChainReorderError::Duplicate(format!(
+                    "order names id {id:?} more than once"
+                )));
+            }
+        }
+        let _guard = self.save_lock.lock();
+        let reordered = {
+            let current = self.inner.read();
+            let unknown: Vec<String> = ids
+                .iter()
+                .filter(|id| !current.iter().any(|e| &e.id == *id))
+                .cloned()
+                .collect();
+            let missing: Vec<String> = current
+                .iter()
+                .filter(|e| !ids.contains(&e.id))
+                .map(|e| e.id.clone())
+                .collect();
+            if !unknown.is_empty() && !missing.is_empty() {
+                return Err(ChainReorderError::Invalid(format!(
+                    "unknown authenticator id(s): {}; order omits stored id(s): {}",
+                    unknown.join(", "),
+                    missing.join(", "),
+                )));
+            }
+            if !unknown.is_empty() {
+                return Err(ChainReorderError::Unknown(unknown));
+            }
+            if !missing.is_empty() {
+                return Err(ChainReorderError::Incomplete(missing));
+            }
+            let mut next = Vec::with_capacity(current.len());
+            for id in &ids {
+                let entry = current
+                    .iter()
+                    .find(|e| &e.id == id)
+                    .cloned()
+                    .expect("ids validated against current chain");
+                next.push(entry);
+            }
+            let conf = export_conf(&next);
+            conf.validate()
+                .map_err(|e| ChainReorderError::Invalid(e.to_string()))?;
+            next
+        };
+        let conf = export_conf(&reordered);
+        {
+            let mut current = self.inner.write();
+            *current = reordered.clone();
+            self.snapshot.store(Arc::new(reordered));
+        }
+        if let Some(registry) = self.registry.read().clone() {
+            registry
+                .commit_authn_chain(conf)
+                .map_err(|e| ChainReorderError::Persist(e.to_string()))?;
+            registry
+                .save()
+                .map_err(|e| ChainReorderError::Persist(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Number of stored entries.
@@ -444,6 +549,129 @@ mod tests {
         let restarted = AuthnChain::from_registry(&reloaded);
         let ids: Vec<_> = restarted.list().iter().map(|e| e.id.clone()).collect();
         assert_eq!(ids, vec!["password_based:built_in_database".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reorder_replaces_order_and_rejects_unknown_or_partial_without_applying() {
+        let chain = AuthnChain::new();
+        chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "built_in_database",
+            ))
+            .expect("first insert");
+        chain
+            .insert(entry("password_based:mysql", "mysql"))
+            .expect("second insert");
+        chain
+            .reorder(vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string(),
+            ])
+            .expect("explicit order applies");
+        let ids: Vec<_> = chain.list().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string()
+            ]
+        );
+        // Snapshot moves with the store: the CONNECT path reads the new
+        // sequence without taking the write lock.
+        let snap: Vec<_> = chain.snapshot().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids, snap);
+
+        // Unknown ids are rejected and apply nothing.
+        let err = chain
+            .reorder(vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string(),
+                "password_based:nowhere".to_string(),
+            ])
+            .expect_err("unknown id must be rejected");
+        assert!(matches!(err, ChainReorderError::Unknown(_)));
+        let ids: Vec<_> = chain.list().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string()
+            ]
+        );
+
+        // Partial lists are rejected and apply nothing.
+        let err = chain
+            .reorder(vec!["password_based:mysql".to_string()])
+            .expect_err("partial list must be rejected");
+        assert!(matches!(err, ChainReorderError::Incomplete(_)));
+        let ids: Vec<_> = chain.list().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string()
+            ]
+        );
+
+        // Duplicates are rejected and apply nothing.
+        let err = chain
+            .reorder(vec![
+                "password_based:mysql".to_string(),
+                "password_based:mysql".to_string(),
+            ])
+            .expect_err("duplicate id must be rejected");
+        assert!(matches!(err, ChainReorderError::Duplicate(_)));
+        let ids: Vec<_> = chain.list().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_persists_across_registry_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "authn-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads"));
+        let chain = AuthnChain::from_registry(&registry);
+        chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "built_in_database",
+            ))
+            .expect("persist built-in");
+        chain
+            .insert(entry("password_based:mysql", "mysql"))
+            .expect("persist mysql");
+        chain
+            .reorder(vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string(),
+            ])
+            .expect("reorder persists");
+        drop(chain);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("data dir reloads"));
+        let restarted = AuthnChain::from_registry(&reloaded);
+        let ids: Vec<_> = restarted.list().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string()
+            ]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
