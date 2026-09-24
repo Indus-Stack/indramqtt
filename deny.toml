@@ -27,6 +27,9 @@ exceptions = [
     { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-core" },
     { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-sql" },
     { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-conf" },
+    # Keccak hash via the MongoDB driver. CC0-1.0 is a public-domain
+    # dedication with no conditions; scoped to this crate alone.
+    { allow = ["CC0-1.0"], crate = "tiny-keccak" },
 ]
 
 [licenses.private]
