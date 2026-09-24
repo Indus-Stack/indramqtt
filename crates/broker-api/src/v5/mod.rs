@@ -224,13 +224,19 @@ pub fn protected_router() -> Router<ApiState> {
                 .delete(authz_clients::delete_client_rules),
         )
         // Authorization (AuthZ / ACL) built-in per-user rule list (W2-20,
-        // C04-19): paged `data` plus `meta` over the shared built-in
-        // table. Management-plane only; publish and deliver never touch
-        // the registry (the built-in rule consult stays on the
-        // publish/subscribe path).
+        // C04-19) plus per-user add and per-username read/delete (W2-21,
+        // C04-20..C04-22): paged `data` plus `meta` over the shared
+        // built-in table, single-rule add with duplicate rejection, and
+        // per-username detail read plus whole-set delete. Management-plane
+        // only; publish and deliver never touch the registry (the built-in
+        // rule consult stays on the publish/subscribe path).
         .route(
             "/authorization/sources/built_in_database/rules/users",
-            get(authz_clients::list_user_rules),
+            get(authz_clients::list_user_rules).post(authz_clients::create_user_rule),
+        )
+        .route(
+            "/authorization/sources/built_in_database/rules/users/:username",
+            get(authz_clients::get_user_rules).delete(authz_clients::delete_user_rules),
         )
         // Authorization (AuthZ / ACL) rules
         .route(
