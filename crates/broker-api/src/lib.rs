@@ -5311,6 +5311,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authn_metrics_reset_zeroes_live_counters_through_connect() {
+        // Reset over the real chain entry plus live CONNECT verdicts:
+        // create one built-in entry and a user, move success/failed
+        // through real console CONNECTs through the broker, reset, then
+        // read zeroed counters back through status. Counters resume from
+        // zero on the next authentication. Unknown ids miss with the
+        // documented shape, not an empty body. Management-plane only for
+        // the reset; publish and deliver never touch these counters.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Before this task the route itself was missing (bare 404 with
+        // no JSON verdict).
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/authentication/password_based:nowhere/metrics/reset",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                json!({"user_id": "w2-09-user", "password": "W2-09-pass!"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // One success and one failure through the broker move the live
+        // counters.
+        let mut good = WsClient::connect(server.port).await;
+        good.send_bin(&mqtt_connect(
+            "w2-09-good",
+            Some("w2-09-user"),
+            Some(b"W2-09-pass!"),
+        ))
+        .await;
+        let connack = good.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        let mut bad = WsClient::connect(server.port).await;
+        bad.send_bin(&mqtt_connect(
+            "w2-09-bad",
+            Some("w2-09-user"),
+            Some(b"wrong-pass"),
+        ))
+        .await;
+        let connack = bad.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0x86);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/status",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["success"], json!(1));
+        assert_eq!(body["metrics"]["failed"], json!(1));
+        assert_eq!(body["metrics"]["total"], json!(2));
+
+        // Reset zeroes every counter; the next status read reports zeros.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/authentication/password_based:built_in_database/metrics/reset",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/status",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["success"], json!(0));
+        assert_eq!(body["metrics"]["failed"], json!(0));
+        assert_eq!(body["metrics"]["nomatch"], json!(0));
+        assert_eq!(body["metrics"]["total"], json!(0));
+
+        // Counters resume from zero: one more success through the broker
+        // counts up from zero, and a message still flows while the reset
+        // path stays off publish and deliver.
+        let mut again = WsClient::connect(server.port).await;
+        again
+            .send_bin(&mqtt_connect(
+                "w2-09-again",
+                Some("w2-09-user"),
+                Some(b"W2-09-pass!"),
+            ))
+            .await;
+        let connack = again.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        again.send_bin(&mqtt_subscribe(7, &[("w2-09/t", 1)])).await;
+        let suback = again.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        again
+            .send_bin(&mqtt_publish("w2-09/t", 42, 1, b"hi-w2-09"))
+            .await;
+        let puback = again.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/status",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["success"], json!(1));
+        assert_eq!(body["metrics"]["failed"], json!(0));
+        assert_eq!(body["metrics"]["total"], json!(1));
+    }
+
+    #[tokio::test]
     async fn authn_node_cache_status_reset_round_trip() {
         // Status over real state plus a reset that actually evicts:
         // read the documented fields, populate the cache through

@@ -79,6 +79,14 @@ pub fn protected_router() -> Router<ApiState> {
             "/authentication/:id/status",
             get(authn_status::get_authn_status),
         )
+        // Authentication (AuthN) per-id metrics reset: zeroes the live
+        // atomic counters for one authenticator. Management-plane only;
+        // increments stay lock-free atomics and publish/deliver never
+        // touch these counters.
+        .route(
+            "/authentication/:id/metrics/reset",
+            post(authn_status::reset_authn_metrics),
+        )
         // Authentication (AuthN) node cache: status read plus reset that
         // actually evicts entries. Management-plane only; the CONNECT
         // path records successes, publish and deliver never touch it.

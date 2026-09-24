@@ -170,6 +170,16 @@ impl AuthnCounters {
         self.nomatch.fetch_add(1, Ordering::Relaxed);
         self.total.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Zero every counter. Lock-free atomic stores; the CONNECT path keeps
+    /// incrementing with lock-free adds and publish/deliver never touch
+    /// these counters.
+    fn reset(&self) {
+        self.success.store(0, Ordering::Relaxed);
+        self.failed.store(0, Ordering::Relaxed);
+        self.nomatch.store(0, Ordering::Relaxed);
+        self.total.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Ordered authenticator chain behind one short lock plus a lock-free
@@ -448,6 +458,33 @@ impl AuthnChain {
         if let Some(counters) = self.counters.read().get(id).cloned() {
             counters.record_failed();
         }
+    }
+
+    /// Zero the live counters for one authenticator id.
+    ///
+    /// Returns `false` when `id` names no stored chain entry, so the
+    /// caller can answer 404 instead of resetting nothing; unknown ids
+    /// never create a counter record (no accumulation). A stored entry
+    /// whose counter record is missing (seeded before counters landed)
+    /// is ensured at zero. Management-plane only: one short read lock
+    /// to clone the counter `Arc` plus lock-free atomic stores; the
+    /// CONNECT path keeps incrementing concurrently and publish/deliver
+    /// never call this. The reset itself does not persist: only the
+    /// zeroed counter values remain, and the next CONNECT verdict counts
+    /// up from zero.
+    pub fn reset_counters(&self, id: &str) -> bool {
+        if self.get(id).is_none() {
+            return false;
+        }
+        if let Some(counters) = self.counters.read().get(id).cloned() {
+            counters.reset();
+        } else {
+            self.counters
+                .write()
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(AuthnCounters::default()));
+        }
+        true
     }
 
     /// Record one CONNECT the built-in entry did not decide (another

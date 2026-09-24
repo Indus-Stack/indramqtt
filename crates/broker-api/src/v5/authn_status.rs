@@ -95,6 +95,32 @@ pub async fn get_authn_status(
         .into_response()
 }
 
+/// `POST /authentication/{id}/metrics/reset`: zero the live counters for
+/// one authenticator.
+///
+/// Resets the per-authenticator counters to zero and reports success
+/// (204, no body). Resetting an unknown id fails with `NOT_FOUND` in the
+/// documented `{code, message}` shape, not an empty body. Counters resume
+/// from zero on the next authentication; the reset itself does not
+/// persist beyond the counter values. Management-plane only: one short
+/// chain read plus lock-free atomic stores; increments stay lock-free
+/// atomics and publish and deliver never touch these counters. The
+/// counter set is fixed (success/failed/nomatch/total per chain id, at
+/// most the chain cap of records), so a reset never grows anything.
+// TODO(parity): does the spec report success as an empty 204 or as a 200
+// with a body? The rulebook does not decide the exact success shape; the
+// current choice answers 204 with no body, mirroring the sibling rule
+// and node-cache resets, until the checker pins it.
+pub async fn reset_authn_metrics(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Response {
+    if !state.authn_chain.reset_counters(&id) {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// Honest single-node liveness for one chain entry.
 ///
 /// An enabled built-in entry executes locally, so it reads as connected.
@@ -145,6 +171,71 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
         assert!(body["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn reset_zeroes_live_counters_and_unknown_is_404() {
+        let state = standalone_state();
+        let stored = state
+            .authn_chain
+            .insert(broker_auth::AuthnEntry {
+                id: "password_based:built_in_database".to_string(),
+                mechanism: "password_based".to_string(),
+                backend: "built_in_database".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("insert");
+        state.authn_chain.record_success(&stored.id);
+        state.authn_chain.record_failed(&stored.id);
+        state.authn_chain.record_nomatch(&stored.id);
+
+        // Unknown ids miss with the documented shape, not an empty body.
+        // Before this task the route itself was missing (bare 404).
+        let (status, body) = response_parts(
+            reset_authn_metrics(
+                State(state.clone()),
+                Path("password_based:nowhere".to_string()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+
+        // Reset reports success with no body; the next status read is zero.
+        let response = reset_authn_metrics(State(state.clone()), Path(stored.id.clone())).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let (status, body) = response_parts(
+            get_authn_status(
+                State(state.clone()),
+                Path(stored.id.clone()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["metrics"]["success"], serde_json::json!(0));
+        assert_eq!(body["metrics"]["failed"], serde_json::json!(0));
+        assert_eq!(body["metrics"]["nomatch"], serde_json::json!(0));
+        assert_eq!(body["metrics"]["total"], serde_json::json!(0));
+
+        // Counters resume from zero on the next verdict.
+        state.authn_chain.record_failed(&stored.id);
+        let (status, body) = response_parts(
+            get_authn_status(
+                State(state),
+                Path(stored.id.clone()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["metrics"]["failed"], serde_json::json!(1));
+        assert_eq!(body["metrics"]["total"], serde_json::json!(1));
     }
 
     #[tokio::test]
