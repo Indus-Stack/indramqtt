@@ -12,6 +12,7 @@ pub mod kerberos;
 pub mod ldap;
 pub mod node_cache;
 pub mod settings;
+pub mod webhook;
 
 pub use chain::{AuthnChain, AuthnEntry, ChainInsertError, ChainReorderError};
 pub use db::{
@@ -27,6 +28,11 @@ pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 pub use node_cache::NodeAuthCache;
 pub use settings::{AuthnSettingsStore, SettingsSubscriber, SettingsUpdateError};
+pub use webhook::{
+    WebhookAuth, WebhookConfig, WEBHOOK_BREAKER_RESET_MS, WEBHOOK_BREAKER_THRESHOLD,
+    WEBHOOK_CACHE_MAX_ENTRIES, WEBHOOK_CACHE_TTL_SECS, WEBHOOK_POOL_SIZE,
+    WEBHOOK_REQUEST_TIMEOUT_MS,
+};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier as _, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
