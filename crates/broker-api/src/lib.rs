@@ -4925,6 +4925,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authn_entry_read_update_delete_round_trip() {
+        // Per-id read/update/delete through the broker management plane
+        // on the real chain store: create two entries, read one back,
+        // update with a valid body and read again, delete then read 404,
+        // delete unknown 404, invalid updates rejected without applying,
+        // deleting the last entry refused, and delete-then-recreate of
+        // the same id works. Management-plane only; the CONNECT path
+        // keeps reading its lock-free snapshot and publish/deliver never
+        // touch this store.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Read one entry by id; the shape carries only the stored slot
+        // fields, never invented measurements.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("password_based:mysql"));
+        assert_eq!(body["mechanism"], json!("password_based"));
+        assert_eq!(body["backend"], json!("mysql"));
+        assert_eq!(body["enable"], json!(true));
+        let obj = body.as_object().expect("entry is an object");
+        for key in obj.keys() {
+            assert!(
+                ["id", "mechanism", "backend", "enable", "config"].contains(&key.as_str()),
+                "unexpected field {key} in chain entry"
+            );
+        }
+
+        // Unknown ids miss with the documented shape.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:nowhere", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+
+        // Valid update replaces and reads back.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/password_based:mysql",
+                json!({"enable": false, "config": {"pool_size": 4}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("password_based:mysql"));
+        assert_eq!(body["enable"], json!(false));
+        assert_eq!(body["config"], json!({"pool_size": 4}));
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        assert_eq!(body["config"], json!({"pool_size": 4}));
+
+        // Invalid updates are client errors and apply nothing.
+        for bad in [
+            json!({"backend": "nope"}),
+            json!({"mechanism": "nope"}),
+            json!({"enable": "yes"}),
+            json!({"config": "yes"}),
+            json!({"id": "password_based:other"}),
+            json!([1, 2]),
+        ] {
+            let (status, body) = server
+                .put_auth("/api/v5/authentication/password_based:mysql", bad, &token)
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+        }
+        // Unknown ids fail updates with 404 even for valid bodies.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/password_based:nowhere",
+                json!({"enable": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["backend"], json!("mysql"));
+        assert_eq!(body["enable"], json!(false));
+
+        // Delete removes and reports; the deleted id reads 404 after.
+        let (status, _) = server
+            .delete_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Deleting an unknown id is 404.
+        let (status, body) = server
+            .delete_auth("/api/v5/authentication/password_based:nowhere", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Deleting then re-creating the same id works (no tombstone).
+        let (status, recreated) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(recreated["id"], json!("password_based:mysql"));
+
+        // Deleting the last remaining entry is refused instead of
+        // leaving authentication open.
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authentication/password_based:built_in_database",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .delete_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("password_based:mysql"));
+    }
+
+    #[tokio::test]
+    async fn authn_entry_update_delete_persist_across_restart() {
+        // Per-id update/delete persist through the config registry: a
+        // validated update and a removal survive a rebuild from the same
+        // data dir. Management-plane only; publish and deliver never
+        // touch this store.
+        let dir = unique_data_dir("authn-entry");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/password_based:mysql",
+                json!({"enable": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, _) = server
+            .delete_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("password_based:built_in_database"));
+        let (status, _) = server
+            .get_auth("/api/v5/authentication/password_based:mysql", &token)
+            .await;
+        assert_eq!(status, 404);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn authn_node_cache_status_reset_round_trip() {
         // Status over real state plus a reset that actually evicts:
         // read the documented fields, populate the cache through

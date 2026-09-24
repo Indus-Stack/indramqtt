@@ -64,6 +64,12 @@ pub fn protected_router() -> Router<ApiState> {
             "/authentication/order",
             put(authn_chain::replace_authn_order),
         )
+        .route(
+            "/authentication/:id",
+            get(authn_chain::get_authn_entry)
+                .put(authn_chain::put_authn_entry)
+                .delete(authn_chain::delete_authn_entry),
+        )
         // Authentication (AuthN) node cache: status read plus reset that
         // actually evicts entries. Management-plane only; the CONNECT
         // path records successes, publish and deliver never touch it.

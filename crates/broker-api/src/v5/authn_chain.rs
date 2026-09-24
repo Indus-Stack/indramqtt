@@ -1,8 +1,11 @@
 //! Ordered authenticator chain for the v5 management API.
 //!
 //! Covers `GET /authentication` (ordered list),
-//! `POST /authentication` (append one entry) and
-//! `PUT /authentication/order` (replace the whole order) on the real
+//! `POST /authentication` (append one entry),
+//! `PUT /authentication/order` (replace the whole order) and the per-id
+//! `GET /authentication/{id}` (read one entry),
+//! `PUT /authentication/{id}` (replace one entry) and
+//! `DELETE /authentication/{id}` (remove one entry) on the real
 //! chain store.
 //! Single-node, management-plane only: handlers clone at most the capped
 //! list once per request under a short lock; the CONNECT path reads one
@@ -29,7 +32,9 @@ use bytes::Bytes;
 use crate::errors::ApiError;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
-use broker_auth::{AuthnEntry, ChainInsertError, ChainReorderError};
+use broker_auth::{
+    AuthnEntry, ChainInsertError, ChainRemoveError, ChainReorderError, ChainUpdateError,
+};
 
 /// `GET /authentication`: ordered page (`data` plus `meta`). An empty
 /// chain reads as an empty page, never an error. Malformed
@@ -133,6 +138,113 @@ pub async fn replace_authn_order(State(state): State<ApiState>, body: Bytes) -> 
     }
 }
 
+/// `GET /authentication/{id}`: one chain entry by id.
+///
+/// Returns the stored entry with 200. Unknown ids fail with `NOT_FOUND`
+/// in the documented `{code, message}` shape. The route is not paged.
+/// Management-plane only: clones at most one entry under a short lock;
+/// the CONNECT path keeps reading its lock-free snapshot and
+/// publish/deliver never touch this store.
+pub async fn get_authn_entry(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.authn_chain.get(&id) {
+        Some(entry) => (StatusCode::OK, Json(render_entry(&entry))).into_response(),
+        None => ApiError::NotFound(format!("authenticator {id:?} not found")).into_response(),
+    }
+}
+
+/// `PUT /authentication/{id}`: replace the entry stored under `id`.
+///
+/// The whole replacement is validated before anything is applied: one
+/// bad field rejects the entire write with `BAD_REQUEST` and leaves the
+/// stored entry untouched. Unknown ids fail with `NOT_FOUND`. A body
+/// `id` that differs from the path id is rejected. Omitted
+/// `mechanism`/`backend`/`enable`/`config` keep their stored values, so
+/// a body carrying only the fields to change still replaces after full
+/// validation. On success returns 200 with the stored entry. The write
+/// persists across a restart through the config registry.
+/// Management-plane only: one short write lock per request; the CONNECT
+/// path keeps reading its lock-free snapshot and publish/deliver never
+/// touch this store.
+// TODO(parity): may the update rename the entry or change its
+// mechanism/backend, or is only the config/enable pair mutable? The
+// rulebook does not decide the exact PUT field set; the current choice
+// replaces the whole entry in place (same `id`) after full validation
+// until the checker pins the shape.
+pub async fn put_authn_entry(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid authentication body: {e}"))
+                .into_response();
+        }
+    };
+    let Some(existing) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    let entry = match parse_update_request(&value, &id, &existing) {
+        Ok(e) => e,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    match state.authn_chain.update(&id, entry) {
+        Ok(stored) => (StatusCode::OK, Json(render_entry(&stored))).into_response(),
+        Err(ChainUpdateError::NotFound) => {
+            ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
+        }
+        Err(ChainUpdateError::Invalid(msg)) => ApiError::BadRequest(msg).into_response(),
+        Err(ChainUpdateError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist authenticator chain: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /authentication/{id}`: remove one chain entry.
+///
+/// Unknown ids fail with `NOT_FOUND` in the documented `{code,
+/// message}` shape and apply nothing. Deleting the last remaining entry
+/// is refused with `BAD_REQUEST` instead of leaving authentication open
+/// (an empty chain preserves today's open behaviour). The freed `id`
+/// may be re-created. On success returns 204 with no body. The removal
+/// persists across a restart through the config registry.
+/// Management-plane only: one short write lock per request; the CONNECT
+/// path keeps reading its lock-free snapshot and publish/deliver never
+/// touch this store.
+// TODO(parity): is "last" the last entry of any kind, or the last
+// enabled entry / last live backend? The rulebook does not decide the
+// exact refusal set; the current choice refuses deleting the sole
+// remaining entry (any kind) as the conservative fail-closed answer
+// until the checker pins it.
+pub async fn delete_authn_entry(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match state.authn_chain.remove(&id) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(ChainRemoveError::NotFound) => {
+            ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
+        }
+        Err(ChainRemoveError::Last(msg)) => ApiError::BadRequest(msg).into_response(),
+        Err(ChainRemoveError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist authenticator chain: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
 /// Validate an order body into the ordered id list.
 ///
 /// The body must be a JSON array with at least the stored entries
@@ -263,6 +375,113 @@ fn parse_chain_request(value: &serde_json::Value) -> Result<AuthnEntry, String> 
         id,
         mechanism: mechanism.to_string(),
         backend: backend.to_string(),
+        enable,
+        config,
+    })
+}
+
+/// Validate an update body into a chain entry keeping `path_id`.
+///
+/// The body must be a JSON object. A body `id` that differs from the
+/// path id is rejected. Omitted `mechanism`/`backend`/`enable` keep
+/// their stored values; supplied values must be non-empty and name
+/// known values. Backend config rides either as a nested `config`
+/// object or as extra top-level fields; when neither is present the
+/// stored config is kept.
+fn parse_update_request(
+    value: &serde_json::Value,
+    path_id: &str,
+    existing: &AuthnEntry,
+) -> Result<AuthnEntry, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "authentication entry must be a JSON object".to_string())?;
+    if let Some(v) = obj.get("id") {
+        if v.is_null() {
+            // Explicit null keeps the path id.
+        } else {
+            let raw = v
+                .as_str()
+                .ok_or_else(|| "field `id` must be a string".to_string())?;
+            if raw != path_id {
+                return Err("field `id` must match the path id".to_string());
+            }
+        }
+    }
+    let mechanism = match obj.get("mechanism") {
+        None | Some(serde_json::Value::Null) => existing.mechanism.clone(),
+        Some(v) => {
+            let raw = v
+                .as_str()
+                .ok_or_else(|| "field `mechanism` must be a string".to_string())?;
+            if raw.trim().is_empty() {
+                return Err("field `mechanism` must not be empty".to_string());
+            }
+            if !broker_config::is_known_authn_mechanism(raw) {
+                return Err(format!("field `mechanism` {raw:?} is unknown"));
+            }
+            raw.to_string()
+        }
+    };
+    let backend = match obj.get("backend") {
+        None | Some(serde_json::Value::Null) => existing.backend.clone(),
+        Some(v) => {
+            let raw = v
+                .as_str()
+                .ok_or_else(|| "field `backend` must be a string".to_string())?;
+            if raw.trim().is_empty() {
+                return Err("field `backend` must not be empty".to_string());
+            }
+            if !broker_config::is_known_authn_backend(raw) {
+                return Err(format!("field `backend` {raw:?} is unknown"));
+            }
+            raw.to_string()
+        }
+    };
+    if let Some((head, _)) = path_id.split_once(':') {
+        if head != mechanism {
+            return Err(format!(
+                "field `id` {path_id:?} must start with its mechanism {mechanism:?}"
+            ));
+        }
+    }
+    let enable = match obj.get("enable") {
+        None | Some(serde_json::Value::Null) => existing.enable,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(_) => return Err("field `enable` must be a boolean".to_string()),
+    };
+    let config = match obj.get("config") {
+        Some(v) if !v.is_null() => {
+            if !v.is_object() {
+                return Err("field `config` must be an object".to_string());
+            }
+            if v.as_object().is_some_and(|m| m.is_empty()) {
+                serde_json::Value::Null
+            } else {
+                v.clone()
+            }
+        }
+        _ => {
+            let mut extra = serde_json::Map::new();
+            for (key, val) in obj {
+                if !matches!(
+                    key.as_str(),
+                    "id" | "mechanism" | "backend" | "enable" | "config"
+                ) {
+                    extra.insert(key.clone(), val.clone());
+                }
+            }
+            if extra.is_empty() {
+                existing.config.clone()
+            } else {
+                serde_json::Value::Object(extra)
+            }
+        }
+    };
+    Ok(AuthnEntry {
+        id: path_id.to_string(),
+        mechanism,
+        backend,
         enable,
         config,
     })

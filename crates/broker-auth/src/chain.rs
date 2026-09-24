@@ -91,6 +91,29 @@ pub enum ChainReorderError {
     Persist(String),
 }
 
+/// Why [`AuthnChain::update`] refused a replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainUpdateError {
+    /// No stored entry carries the requested `id`.
+    NotFound,
+    /// The replacement failed validation (message names the field).
+    Invalid(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
+
+/// Why [`AuthnChain::remove`] refused a delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainRemoveError {
+    /// No stored entry carries the requested `id`.
+    NotFound,
+    /// Deleting the last remaining entry would leave authentication open
+    /// (empty chain preserves today's open behaviour), so the delete is
+    /// refused instead of opening the broker.
+    Last(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
 /// Ordered authenticator chain behind one short lock plus a lock-free
 /// read snapshot for the CONNECT path.
 ///
@@ -302,6 +325,117 @@ impl AuthnChain {
                 .map_err(|e| ChainReorderError::Persist(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// One entry by `id` (`None` when unknown). Management-plane read
+    /// only; clones at most one entry under a short lock.
+    pub fn get(&self, id: &str) -> Option<AuthnEntry> {
+        self.inner.read().iter().find(|e| e.id == id).cloned()
+    }
+
+    /// Replace the entry stored under `id` with `entry` (whose `id` must
+    /// equal `id`).
+    ///
+    /// Validate-all-before-apply: the candidate is validated before
+    /// anything becomes visible, so a bad replacement applies nothing.
+    /// The stored position is preserved. On success the entry, the
+    /// lock-free CONNECT snapshot and the persisted registry all move
+    /// together. Management-plane only: one short write lock per
+    /// request; the CONNECT path keeps reading its lock-free snapshot
+    /// and publish/deliver never touch this store.
+    // TODO(parity): may the update rename the entry or change its
+    // mechanism/backend, or is only the config/enable pair mutable? The
+    // rulebook does not decide the exact PUT field set; the current
+    // choice replaces the whole entry in place (same `id`) after full
+    // validation until the checker pins the shape.
+    pub fn update(&self, id: &str, entry: AuthnEntry) -> Result<AuthnEntry, ChainUpdateError> {
+        if entry.id != id {
+            return Err(ChainUpdateError::Invalid(
+                "field `id` must match the path id".to_string(),
+            ));
+        }
+        validate_entry(&entry).map_err(|e| match e {
+            ChainInsertError::Invalid(msg) => ChainUpdateError::Invalid(msg),
+            ChainInsertError::Duplicate => {
+                ChainUpdateError::Invalid("field `id` is duplicated".to_string())
+            }
+            ChainInsertError::Full => {
+                ChainUpdateError::Invalid("authenticator chain is full".to_string())
+            }
+            ChainInsertError::Persist(msg) => ChainUpdateError::Persist(msg),
+        })?;
+        let _guard = self.save_lock.lock();
+        let updated = {
+            let mut current = self.inner.write();
+            let Some(pos) = current.iter().position(|e| e.id == id) else {
+                return Err(ChainUpdateError::NotFound);
+            };
+            let mut next = current.clone();
+            next[pos] = entry.clone();
+            let conf = export_conf(&next);
+            conf.validate()
+                .map_err(|e| ChainUpdateError::Invalid(e.to_string()))?;
+            *current = next.clone();
+            self.snapshot.store(Arc::new(next));
+            conf
+        };
+        if let Some(registry) = self.registry.read().clone() {
+            registry
+                .commit_authn_chain(updated)
+                .map_err(|e| ChainUpdateError::Persist(e.to_string()))?;
+            registry
+                .save()
+                .map_err(|e| ChainUpdateError::Persist(e.to_string()))?;
+        }
+        Ok(entry)
+    }
+
+    /// Remove the entry stored under `id`, returning it.
+    ///
+    /// Validate-all-before-apply: unknown ids fail with `NotFound` and
+    /// apply nothing. Deleting the last remaining entry is refused with
+    /// `Last` instead of leaving authentication open (an empty chain
+    /// preserves today's open behaviour). On success the stored order,
+    /// the lock-free CONNECT snapshot and the persisted registry all
+    /// move together, and the freed `id` may be re-created.
+    /// Management-plane only: one short write lock per request; the
+    /// CONNECT path keeps reading its lock-free snapshot and
+    /// publish/deliver never touch this store.
+    // TODO(parity): is "last" the last entry of any kind, or the last
+    // enabled entry / last live backend? The rulebook does not decide
+    // the exact refusal set; the current choice refuses deleting the
+    // sole remaining entry (any kind) as the conservative fail-closed
+    // answer until the checker pins it.
+    pub fn remove(&self, id: &str) -> Result<AuthnEntry, ChainRemoveError> {
+        let _guard = self.save_lock.lock();
+        let (removed, conf) = {
+            let mut current = self.inner.write();
+            let Some(pos) = current.iter().position(|e| e.id == id) else {
+                return Err(ChainRemoveError::NotFound);
+            };
+            if current.len() == 1 {
+                return Err(ChainRemoveError::Last(
+                    "cannot delete the last authenticator: authentication must not be left open"
+                        .to_string(),
+                ));
+            }
+            let removed = current.remove(pos);
+            let next = current.clone();
+            let conf = export_conf(&next);
+            conf.validate()
+                .map_err(|e| ChainRemoveError::Persist(e.to_string()))?;
+            self.snapshot.store(Arc::new(next));
+            (removed, conf)
+        };
+        if let Some(registry) = self.registry.read().clone() {
+            registry
+                .commit_authn_chain(conf)
+                .map_err(|e| ChainRemoveError::Persist(e.to_string()))?;
+            registry
+                .save()
+                .map_err(|e| ChainRemoveError::Persist(e.to_string()))?;
+        }
+        Ok(removed)
     }
 
     /// Number of stored entries.
@@ -672,6 +806,130 @@ mod tests {
                 "password_based:built_in_database".to_string()
             ]
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_update_remove_round_trip_with_validate_all_before_apply() {
+        let chain = AuthnChain::new();
+        chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "built_in_database",
+            ))
+            .expect("first insert");
+        chain
+            .insert(entry("password_based:mysql", "mysql"))
+            .expect("second insert");
+
+        // Read one entry by id; unknown ids miss.
+        let found = chain.get("password_based:mysql").expect("hit");
+        assert_eq!(found.backend, "mysql");
+        assert!(chain.get("password_based:nowhere").is_none());
+
+        // Update replaces in place after full validation and keeps order.
+        let mut next = found.clone();
+        next.enable = false;
+        next.config = serde_json::json!({"pool_size": 4});
+        let stored = chain
+            .update("password_based:mysql", next)
+            .expect("valid update applies");
+        assert!(!stored.enable);
+        let reread = chain.get("password_based:mysql").expect("reread");
+        assert!(!reread.enable);
+        assert_eq!(reread.config, serde_json::json!({"pool_size": 4}));
+        let ids: Vec<_> = chain.list().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:built_in_database".to_string(),
+                "password_based:mysql".to_string()
+            ]
+        );
+        // Snapshot moves with the store.
+        let snap: Vec<_> = chain.snapshot().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids, snap);
+
+        // Bad replacements are rejected and apply nothing.
+        let mut bad = reread.clone();
+        bad.backend = "nope".to_string();
+        assert!(matches!(
+            chain.update("password_based:mysql", bad),
+            Err(ChainUpdateError::Invalid(_))
+        ));
+        let reread = chain.get("password_based:mysql").expect("unchanged");
+        assert_eq!(reread.backend, "mysql");
+        assert!(matches!(
+            chain.update(
+                "password_based:nowhere",
+                entry("password_based:nowhere", "mysql")
+            ),
+            Err(ChainUpdateError::NotFound)
+        ));
+
+        // Delete removes and reports; unknown ids miss; the freed id may
+        // be re-created.
+        let removed = chain.remove("password_based:mysql").expect("delete hit");
+        assert_eq!(removed.id, "password_based:mysql");
+        assert!(chain.get("password_based:mysql").is_none());
+        assert!(matches!(
+            chain.remove("password_based:nowhere"),
+            Err(ChainRemoveError::NotFound)
+        ));
+        chain
+            .insert(entry("password_based:mysql", "mysql"))
+            .expect("re-create after delete works");
+        assert!(chain.get("password_based:mysql").is_some());
+    }
+
+    #[test]
+    fn remove_last_entry_is_refused_and_update_remove_persist() {
+        let chain = AuthnChain::new();
+        chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "built_in_database",
+            ))
+            .expect("single insert");
+        assert!(matches!(
+            chain.remove("password_based:built_in_database"),
+            Err(ChainRemoveError::Last(_))
+        ));
+        assert!(chain.get("password_based:built_in_database").is_some());
+
+        let dir = std::env::temp_dir().join(format!(
+            "authn-entry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads"));
+        let chain = AuthnChain::from_registry(&registry);
+        chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "built_in_database",
+            ))
+            .expect("persist built-in");
+        chain
+            .insert(entry("password_based:mysql", "mysql"))
+            .expect("persist mysql");
+        let mut next = chain.get("password_based:mysql").expect("hit");
+        next.enable = false;
+        chain
+            .update("password_based:mysql", next)
+            .expect("update persists");
+        chain
+            .remove("password_based:mysql")
+            .expect("delete persists");
+        drop(chain);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("data dir reloads"));
+        let restarted = AuthnChain::from_registry(&reloaded);
+        let ids: Vec<_> = restarted.list().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids, vec!["password_based:built_in_database".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
