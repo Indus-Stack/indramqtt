@@ -164,6 +164,15 @@ pub struct ApiState {
     /// `SessionManager::clear_all_authz_caches`). Publish and deliver
     /// never touch this store.
     pub authz_node_cache: Arc<broker_auth::AuthzNodeCache>,
+    /// Global authorization settings for `GET/PUT
+    /// /api/v5/authorization/settings` (W2-16): single validated struct
+    /// with registry persistence. The routes read one snapshot per
+    /// request; the kernel boot path seeds the same instance from the
+    /// registry (`crates/broker-node/src/main.rs`, boot seeding); the
+    /// stored `no_match`/`deny_action` values are consulted by the
+    /// rule-table tasks once they land. Publish and deliver never touch
+    /// this store.
+    pub authz_settings: Arc<broker_auth::AuthzSettingsStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -229,6 +238,11 @@ impl ApiState {
         // observe the persisted policy without a restart. Cached verdicts
         // always start empty (memory-only, per-session).
         let authz_node_cache = Arc::new(broker_auth::AuthzNodeCache::from_registry(&config));
+        // Boot seeding (W2-16): route the loaded authorization settings
+        // into a shared store so management reads observe the persisted
+        // decisions without a restart. Enforcement lands with the
+        // rule-table tasks; the store itself is management-plane only.
+        let authz_settings = Arc::new(broker_auth::AuthzSettingsStore::from_registry(&config));
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -271,6 +285,7 @@ impl ApiState {
             authn_node_cache,
             authn_settings,
             authz_node_cache,
+            authz_settings,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -327,6 +342,7 @@ impl ApiState {
             authn_node_cache,
             authn_settings,
             authz_node_cache: Arc::new(broker_auth::AuthzNodeCache::new()),
+            authz_settings: Arc::new(broker_auth::AuthzSettingsStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -5059,7 +5075,6 @@ mod tests {
         for (method, path) in [
             ("GET", "/api/v5/authentication/x"),
             ("GET", "/api/v5/authorization/sources"),
-            ("GET", "/api/v5/authorization/settings"),
         ] {
             let (status, _) = server
                 .request_raw(&format!(
@@ -6314,6 +6329,174 @@ mod tests {
         assert_eq!(body["ignore_backend_failures"], json!(true));
         assert_eq!(body["node_cache"]["max_count"], json!(5000));
         assert_eq!(body["builtin_record_count_refresh_interval"], json!("30m"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn authz_settings_round_trip_rejection_and_restart() {
+        // Settings round trip through the broker (W2-16, C04-06/07):
+        // GET defaults, PUT a full valid update answering 200 with the
+        // stored settings, GET expecting the update; a
+        // subscribe/publish/deliver flow proves publish and deliver never
+        // touch this store. Invalid PUTs are rejected with no change;
+        // partial bodies reset missing fields to defaults. Settings
+        // persist across a restart via the registry. Before this task
+        // both routes were 404.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Defaults read back with the documented fields.
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["no_match"], json!("deny"));
+        assert_eq!(body["deny_action"], json!("ignore"));
+        assert_eq!(body["cache"]["enable"], json!(true));
+        assert_eq!(body["cache"]["max_size"], json!(32));
+        assert_eq!(body["cache"]["ttl"], json!("1m"));
+        assert_eq!(body["cache"]["excludes"], json!([]));
+        assert_eq!(body["include_mountpoint"], json!(true));
+        assert_eq!(body["ignore_backend_failures"], json!(false));
+
+        // Full valid replace through the broker: the write answers 200
+        // with the stored settings.
+        let (status, answered) = server
+            .put_auth(
+                "/api/v5/authorization/settings",
+                json!({
+                    "no_match": "allow",
+                    "deny_action": "disconnect",
+                    "cache": {
+                        "enable": false,
+                        "max_size": 64,
+                        "ttl": "60s",
+                        "excludes": ["nocache/#"],
+                    },
+                    "include_mountpoint": false,
+                    "ignore_backend_failures": true,
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(answered["no_match"], json!("allow"));
+        assert_eq!(answered["deny_action"], json!("disconnect"));
+        assert_eq!(answered["cache"]["max_size"], json!(64));
+        assert_eq!(answered["cache"]["excludes"], json!(["nocache/#"]));
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, answered, "the write answers what the read reports");
+
+        // A subscribe/publish/deliver flow still works: publish and
+        // deliver never touch this store.
+        let mut sub = WsClient::connect(server.port).await;
+        sub.send_bin(&mqtt_connect("w2-16-sub", None, None)).await;
+        let connack = sub.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        sub.send_bin(&mqtt_subscribe(7, &[("w2-16/t", 1)])).await;
+        let suback = sub.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        let mut publ = WsClient::connect(server.port).await;
+        publ.send_bin(&mqtt_connect("w2-16-pub", None, None)).await;
+        let connack = publ.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
+        publ.send_bin(&mqtt_publish("w2-16/t", 42, 1, b"hi-w2-16"))
+            .await;
+        let puback = publ.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let delivery = sub.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+        assert!(delivery.ends_with(b"hi-w2-16"));
+
+        // Unknown and out-of-range fields are rejected fail-closed with
+        // no change applied.
+        for bad in [
+            json!({"no_match": "sometimes"}),
+            json!({"deny_action": "log"}),
+            json!({"cache": {"max_size": 0}}),
+            json!({"cache": {"max_size": 2_000_000}}),
+            json!({"cache": {"ttl": "soon"}}),
+            json!({"cache": {"excludes": [""]}}),
+            json!({"no_match": "deny", "bogus": 1}),
+            json!({"cache": {"max_size": 64, "bogus": true}}),
+        ] {
+            let (status, body) = server
+                .put_auth("/api/v5/authorization/settings", bad, &token)
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+        }
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, answered, "failed writes must not apply");
+
+        // Partial bodies replace: missing fields reset to defaults.
+        let (status, answered) = server
+            .put_auth(
+                "/api/v5/authorization/settings",
+                json!({"no_match": "deny"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(answered["no_match"], json!("deny"));
+        assert_eq!(answered["deny_action"], json!("ignore"));
+        assert_eq!(answered["cache"]["max_size"], json!(32));
+        assert_eq!(answered["cache"]["excludes"], json!([]));
+
+        // Persistence across a restart through the config registry.
+        let dir = unique_data_dir("authz-settings");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/settings",
+                json!({
+                    "no_match": "allow",
+                    "deny_action": "disconnect",
+                    "cache": {
+                        "enable": false,
+                        "max_size": 64,
+                        "ttl": "60s",
+                        "excludes": ["nocache/#"],
+                    },
+                    "include_mountpoint": false,
+                    "ignore_backend_failures": true,
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["no_match"], json!("allow"));
+        assert_eq!(body["deny_action"], json!("disconnect"));
+        assert_eq!(body["cache"]["max_size"], json!(64));
+        assert_eq!(body["cache"]["excludes"], json!(["nocache/#"]));
+        assert_eq!(body["ignore_backend_failures"], json!(true));
         drop(server);
         std::fs::remove_dir_all(&dir).ok();
     }

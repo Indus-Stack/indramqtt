@@ -9,6 +9,7 @@ pub mod authn_status;
 pub mod authz_cache;
 pub mod authz_node_cache;
 pub mod authz_node_status;
+pub mod authz_settings;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
@@ -164,6 +165,14 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/authorization/node_cache/status",
             get(authz_node_status::get_authz_node_cache_status),
+        )
+        // Authorization (AuthZ / ACL) global settings (W2-16, C04-06/07):
+        // validated replace with documented defaults filled, persisted
+        // via the config registry. Management-plane only; publish and
+        // deliver never touch it.
+        .route(
+            "/authorization/settings",
+            get(authz_settings::get_authz_settings).put(authz_settings::put_authz_settings),
         )
         // Authorization (AuthZ / ACL) rules
         .route(

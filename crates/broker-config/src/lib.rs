@@ -882,6 +882,184 @@ impl AuthzNodeCacheConf {
     }
 }
 
+/// Default authorization decision when no rule matches (`deny`).
+/// Reason: the documented default; unmatched publishes and subscribes
+/// stay refused until an explicit rule allows them (fail closed).
+fn default_authz_settings_no_match() -> String {
+    "deny".to_string()
+}
+
+/// Default action on an explicit deny (`ignore`). Reason: the documented
+/// default; a denied publish is dropped while the connection stays up, so
+/// one bad topic cannot tear down a fleet device.
+fn default_authz_settings_deny_action() -> String {
+    "ignore".to_string()
+}
+
+/// Default decision-cache enable flag (true). Reason: the documented
+/// default; caching repeated verdicts keeps re-authorization cheap while
+/// the TTL below bounds staleness.
+fn default_authz_settings_cache_enabled() -> bool {
+    true
+}
+
+/// Default decision-cache entry cap (32 entries). Reason: the documented
+/// default; the cache holds one small verdict per recently authorized
+/// (action, topic) pattern, so 32 covers a device's working set while
+/// keeping the settings snapshot cheap (one short swap per request).
+pub const DEFAULT_AUTHZ_SETTINGS_CACHE_MAX_SIZE: usize = 32;
+/// Upper bound for the decision-cache entry cap (1 048 576 entries).
+/// Reason: the documented range cap; larger values are rejected instead
+/// of growing without limit.
+pub const MAX_AUTHZ_SETTINGS_CACHE_MAX_SIZE: usize = 1_048_576;
+
+/// Default decision-cache entry TTL (`1m`). Reason: cached verdicts must
+/// expire quickly so a rule change takes effect; one minute bounds
+/// staleness while keeping repeated authorizations cheap.
+fn default_authz_settings_cache_ttl() -> String {
+    "1m".to_string()
+}
+
+/// Bound on decision-cache topic-pattern exclusions (1024 entries).
+/// Reason: each entry is one topic-pattern exclusion held in the snapshot
+/// cloned per management read; 1024 covers per-pattern opt-outs with
+/// headroom while bounding snapshot growth. Default is the empty list
+/// (every verdict cacheable).
+pub const MAX_AUTHZ_SETTINGS_EXCLUDES: usize = 1024;
+
+/// Default mountpoint inclusion (true). Reason: the current default
+/// security profile's default; topics render with their mountpoint prefix
+/// unless the operator opts out.
+// TODO(parity): is the documented default profile-dependent (false under
+// one profile, true under another), and does this broker even carry that
+// profile? The rulebook does not decide the profile default; the current
+// choice keeps the current default profile's value until the checker pins
+// it.
+fn default_authz_settings_include_mountpoint() -> bool {
+    true
+}
+
+/// Decision-cache half of the global authorization settings: the enabled
+/// flag, entry cap, TTL and topic-pattern exclusions. Stored, validated
+/// and reported; enforcement on the authorize path lands with the rule
+/// tables (decision evaluation is a sibling task, never this one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzSettingsCacheConf {
+    /// Whether authorization verdicts are cached (default true).
+    #[serde(default = "default_authz_settings_cache_enabled")]
+    pub enable: bool,
+    /// Entry cap (default 32, at most 1 048 576).
+    #[serde(default = "default_authz_settings_cache_max_size")]
+    pub max_size: usize,
+    /// Cached verdict TTL (default `1m`).
+    #[serde(default = "default_authz_settings_cache_ttl")]
+    pub ttl: String,
+    /// Topic patterns excluded from caching (default empty).
+    #[serde(default)]
+    pub excludes: Vec<String>,
+}
+
+fn default_authz_settings_cache_max_size() -> usize {
+    DEFAULT_AUTHZ_SETTINGS_CACHE_MAX_SIZE
+}
+
+impl Default for AuthzSettingsCacheConf {
+    fn default() -> Self {
+        Self {
+            enable: default_authz_settings_cache_enabled(),
+            max_size: default_authz_settings_cache_max_size(),
+            ttl: default_authz_settings_cache_ttl(),
+            excludes: Vec::new(),
+        }
+    }
+}
+
+impl AuthzSettingsCacheConf {
+    /// Validates the entry cap, the TTL and every exclusion pattern.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_size == 0 || self.max_size > MAX_AUTHZ_SETTINGS_CACHE_MAX_SIZE {
+            return Err(ConfigError::Invalid(format!(
+                "authz_settings.cache.max_size holds {}, must be 1..={} (field `max_size`)",
+                self.max_size, MAX_AUTHZ_SETTINGS_CACHE_MAX_SIZE
+            )));
+        }
+        validate_settings_duration("authz_settings.cache.ttl", &self.ttl)?;
+        if self.excludes.len() > MAX_AUTHZ_SETTINGS_EXCLUDES {
+            return Err(ConfigError::Invalid(format!(
+                "authz_settings.cache.excludes holds {} entries, at most {} (field `excludes`)",
+                self.excludes.len(),
+                MAX_AUTHZ_SETTINGS_EXCLUDES
+            )));
+        }
+        for (index, pattern) in self.excludes.iter().enumerate() {
+            if pattern.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "authz_settings.cache.excludes[{index}] must not be empty (field `excludes`)"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Global authorization settings root: the no-match decision, the
+/// deny action, the decision-cache half, the mountpoint flag and the
+/// backend-failure flag. Unknown fields are rejected (fail closed);
+/// missing fields load as their documented defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzSettingsConf {
+    /// Decision when no rule matches: `allow` or `deny` (default `deny`).
+    #[serde(default = "default_authz_settings_no_match")]
+    pub no_match: String,
+    /// Action on an explicit deny: `ignore` or `disconnect` (default
+    /// `ignore`).
+    #[serde(default = "default_authz_settings_deny_action")]
+    pub deny_action: String,
+    /// Decision-cache half (defaults stated on the struct).
+    #[serde(default)]
+    pub cache: AuthzSettingsCacheConf,
+    /// Whether topics render with their mountpoint prefix (default true).
+    #[serde(default = "default_authz_settings_include_mountpoint")]
+    pub include_mountpoint: bool,
+    /// Whether a backend outage is ignored (default false, fail closed).
+    #[serde(default)]
+    pub ignore_backend_failures: bool,
+}
+
+impl Default for AuthzSettingsConf {
+    fn default() -> Self {
+        Self {
+            no_match: default_authz_settings_no_match(),
+            deny_action: default_authz_settings_deny_action(),
+            cache: AuthzSettingsCacheConf::default(),
+            include_mountpoint: default_authz_settings_include_mountpoint(),
+            ignore_backend_failures: false,
+        }
+    }
+}
+
+impl AuthzSettingsConf {
+    /// Validates every field; the first bad field names itself.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.no_match != "allow" && self.no_match != "deny" {
+            return Err(ConfigError::Invalid(format!(
+                "authz_settings.no_match holds {:?}, must be `allow` or `deny` (field `no_match`)",
+                self.no_match
+            )));
+        }
+        if self.deny_action != "ignore" && self.deny_action != "disconnect" {
+            return Err(ConfigError::Invalid(format!(
+                "authz_settings.deny_action holds {:?}, must be `ignore` or `disconnect` (field `deny_action`)",
+                self.deny_action
+            )));
+        }
+        self.cache.validate()?;
+        Ok(())
+    }
+}
+
 /// Durations are `<n>ms|s|m|h|d` (integer or float count, no spaces).
 fn validate_settings_duration(field: &str, text: &str) -> Result<(), ConfigError> {
     if parse_settings_duration_to_ms(text).is_none() {
@@ -1052,6 +1230,8 @@ pub struct FullSnapshot {
     pub authn_settings: AuthnSettingsConf,
     #[serde(default)]
     pub authz_node_cache: AuthzNodeCacheConf,
+    #[serde(default)]
+    pub authz_settings: AuthzSettingsConf,
 }
 
 impl FullSnapshot {
@@ -1065,6 +1245,7 @@ impl FullSnapshot {
         self.authn_node_cache.validate()?;
         self.authn_settings.validate()?;
         self.authz_node_cache.validate()?;
+        self.authz_settings.validate()?;
         Ok(())
     }
 }
@@ -1088,6 +1269,8 @@ pub enum ConfigRoot {
     AuthnSettings(AuthnSettingsConf),
     /// Validated node authorization cache config root.
     AuthzNodeCache(AuthzNodeCacheConf),
+    /// Validated global authorization settings root.
+    AuthzSettings(AuthzSettingsConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1172,6 +1355,7 @@ impl ConfigRegistry {
             ConfigRoot::AuthnNodeCache(conf) => self.commit_authn_node_cache(conf),
             ConfigRoot::AuthnSettings(conf) => self.commit_authn_settings(conf),
             ConfigRoot::AuthzNodeCache(conf) => self.commit_authz_node_cache(conf),
+            ConfigRoot::AuthzSettings(conf) => self.commit_authz_settings(conf),
         }
     }
 
@@ -1258,6 +1442,17 @@ impl ConfigRegistry {
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.authz_node_cache = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Commits validated global authorization settings.
+    pub fn commit_authz_settings(&self, conf: AuthzSettingsConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.authz_settings = conf.clone();
             next
         });
         Ok(())
@@ -1372,6 +1567,7 @@ mod tests {
             authn_node_cache: AuthnNodeCacheConf::default(),
             authn_settings: AuthnSettingsConf::default(),
             authz_node_cache: AuthzNodeCacheConf::default(),
+            authz_settings: AuthzSettingsConf::default(),
         }
     }
 
@@ -1455,6 +1651,80 @@ mod tests {
             text.contains("not-a-connector"),
             "error must name the value, got: {text}"
         );
+    }
+
+    #[test]
+    fn authz_settings_defaults_match_documented_shape() {
+        let defaults = AuthzSettingsConf::default();
+        assert_eq!(defaults.no_match, "deny");
+        assert_eq!(defaults.deny_action, "ignore");
+        assert!(defaults.cache.enable);
+        assert_eq!(
+            defaults.cache.max_size,
+            DEFAULT_AUTHZ_SETTINGS_CACHE_MAX_SIZE
+        );
+        assert_eq!(defaults.cache.max_size, 32);
+        assert_eq!(defaults.cache.ttl, "1m");
+        assert!(defaults.cache.excludes.is_empty());
+        assert!(defaults.include_mountpoint);
+        assert!(!defaults.ignore_backend_failures);
+        defaults.validate().expect("documented defaults validate");
+        AuthzSettingsCacheConf::default()
+            .validate()
+            .expect("documented cache defaults validate");
+    }
+
+    #[test]
+    fn authz_settings_validation_rejects_bad_fields() {
+        let good = AuthzSettingsConf::default();
+        for bad in [
+            AuthzSettingsConf {
+                no_match: "sometimes".to_string(),
+                ..good.clone()
+            },
+            AuthzSettingsConf {
+                no_match: "DENY".to_string(),
+                ..good.clone()
+            },
+            AuthzSettingsConf {
+                deny_action: "log".to_string(),
+                ..good.clone()
+            },
+            AuthzSettingsConf {
+                cache: AuthzSettingsCacheConf {
+                    max_size: 0,
+                    ..good.cache.clone()
+                },
+                ..good.clone()
+            },
+            AuthzSettingsConf {
+                cache: AuthzSettingsCacheConf {
+                    max_size: MAX_AUTHZ_SETTINGS_CACHE_MAX_SIZE + 1,
+                    ..good.cache.clone()
+                },
+                ..good.clone()
+            },
+            AuthzSettingsConf {
+                cache: AuthzSettingsCacheConf {
+                    ttl: "soon".to_string(),
+                    ..good.cache.clone()
+                },
+                ..good.clone()
+            },
+            AuthzSettingsConf {
+                cache: AuthzSettingsCacheConf {
+                    excludes: vec![String::new()],
+                    ..good.cache.clone()
+                },
+                ..good.clone()
+            },
+        ] {
+            let err = bad.validate().expect_err("bad settings must fail");
+            assert!(
+                err.to_string().contains("authz_settings"),
+                "error must name the root, got: {err}"
+            );
+        }
     }
 
     #[test]
