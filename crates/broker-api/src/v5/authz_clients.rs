@@ -7,7 +7,8 @@
 //! set), `PUT .../rules/clients/{clientid}` (replace one client's set),
 //! `GET .../rules/users` (paged user-scoped list),
 //! `POST .../rules/users` (add one user-scoped rule),
-//! `GET .../rules/users/{username}` (read one user's set) and
+//! `GET .../rules/users/{username}` (read one user's set),
+//! `PUT .../rules/users/{username}` (replace one user's set) and
 //! `DELETE .../rules/users/{username}` (remove every rule for one
 //! username) over the live built-in rule table (`MemoryAuth` in
 //! `crates/broker-auth/src/lib.rs`, consulted by the publish event in
@@ -713,6 +714,171 @@ pub async fn delete_user_rules(
         )
             .into_response(),
     }
+}
+
+/// `PUT /authorization/sources/built_in_database/rules/users/{username}`:
+/// replace one username's rule set.
+///
+/// The body must be an object carrying the replacement under `rules`
+/// (`{"rules": [...]}`); anything else fails with `BAD_REQUEST` and
+/// applies nothing. Every entry is validated before anything becomes
+/// visible (validate-all-before-apply): each must carry a non-empty
+/// `topic` that parses as an MQTT filter, a `permission` of
+/// `allow`/`deny` and an `action` of `publish`/`subscribe`/`all`; a
+/// per-entry key field (`username`, `user_id` or `clientid`) when
+/// present must name the path username, as must a top-level `username`
+/// (or `user_id`) when present. A bad entry fails the whole write with
+/// `BAD_REQUEST` and the stored set is unchanged, as does a duplicate
+/// scope within the batch (`ALREADY_EXISTS`) or a replacement that would
+/// overflow the table cap (`BAD_REQUEST`). Writing an unknown username
+/// creates its set (create-on-write); writing an empty list clears it.
+/// On success the replacement persists across a restart through the
+/// config registry and answers 204 with no body. The write lands in the
+/// same shared built-in table the per-client index reads, so it is live
+/// on the publish/subscribe decision path.
+///
+/// Management-plane only: topic validation runs before the lock, then
+/// one short rule-table write lock per request (plus the registry save
+/// lock on persist); the publish and subscribe authorization consults
+/// keep reading under short read locks.
+// TODO(parity): does the documented replace require a top-level
+// `username` matching the path id, accept a bare array body, or ignore
+// key fields? The rulebook does not decide the exact envelope; the
+// current choice requires the object shape and rejects key mismatches
+// fail-closed until the checker pins it.
+pub async fn replace_user_rules(
+    State(state): State<ApiState>,
+    Path(username): Path<String>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid user rule set body: {e}"))
+                .into_response();
+        }
+    };
+    let rules = match parse_user_replace_body(&value, &username) {
+        Ok(rules) => rules,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    match state.auth.replace_user_rules(&username, rules) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(ClientRuleError::Duplicate) => {
+            ApiError::AlreadyExists("user rule already exists".to_string()).into_response()
+        }
+        Err(ClientRuleError::Full) => {
+            ApiError::BadRequest("user rule table is full".to_string()).into_response()
+        }
+        Err(ClientRuleError::Invalid(msg)) => ApiError::BadRequest(msg).into_response(),
+        Err(ClientRuleError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist user authorization rules: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Validate a per-user replace body into ordered [`AclRule`]s keyed by
+/// the path username.
+///
+/// Required shape: an object with a `rules` array. Each entry must be an
+/// object with string `topic` (non-empty, valid MQTT filter), string
+/// `permission` (`allow`/`deny`, case-insensitive) and string `action`
+/// (`publish`/`subscribe`/`all`, case-insensitive). A per-entry key
+/// field (`username`, `user_id` or `clientid`) is optional; when present
+/// it must name the path username, otherwise the whole write is rejected
+/// fail-closed. A top-level `username` (or `user_id`) is optional; when
+/// present it must likewise name the path username. Every other extra
+/// field is ignored so future match fields degrade to the same replace
+/// instead of a 400.
+fn parse_user_replace_body(
+    value: &serde_json::Value,
+    username: &str,
+) -> Result<Vec<AclRule>, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "user rule set body must be an object with a `rules` array".to_string())?;
+    if let Some(key) = obj.get("username").or(obj.get("user_id")) {
+        match key.as_str() {
+            Some(name) if name == username => {}
+            _ => {
+                return Err(format!(
+                    "user rule set username must name {username:?} (field `username`)"
+                ));
+            }
+        }
+    }
+    let items = obj
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "user rule set body must carry an array under `rules`".to_string())?;
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let entry = item
+            .as_object()
+            .ok_or_else(|| format!("user rules[{index}] must be an object (field `rules`)"))?;
+        if let Some(key) = entry
+            .get("username")
+            .or(entry.get("user_id"))
+            .or(entry.get("clientid"))
+        {
+            match key.as_str() {
+                Some(name) if name == username => {}
+                _ => {
+                    return Err(format!(
+                        "user rules[{index}].username must name {username:?} (field `username`)"
+                    ));
+                }
+            }
+        }
+        let topic = entry
+            .get("topic")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("user rules[{index}].topic is required (field `topic`)"))?;
+        if topic.trim().is_empty() {
+            return Err(format!(
+                "user rules[{index}].topic must not be empty (field `topic`)"
+            ));
+        }
+        if broker_protocol::TopicFilter::new(topic.to_string()).is_err() {
+            return Err(format!(
+                "user rules[{index}].topic {topic:?} is not a valid filter (field `topic`)"
+            ));
+        }
+        let permission = entry
+            .get("permission")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                format!("user rules[{index}].permission is required (field `permission`)")
+            })?;
+        let allow = match permission.to_ascii_lowercase().as_str() {
+            "allow" => true,
+            "deny" => false,
+            _ => {
+                return Err(format!(
+                    "user rules[{index}].permission {permission:?} is unknown (field `permission`)"
+                ));
+            }
+        };
+        let action_raw = entry
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("user rules[{index}].action is required (field `action`)"))?;
+        let action = AclAction::parse(action_raw).ok_or_else(|| {
+            format!("user rules[{index}].action {action_raw:?} is unknown (field `action`)")
+        })?;
+        out.push(AclRule::new(
+            username.to_string(),
+            action,
+            topic.to_string(),
+            allow,
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1516,6 +1682,221 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].topic_pattern, "w221/persist/#");
         let client_view = restarted.client_rules("w221-persist");
+        assert_eq!(client_view.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn user_set(entries: serde_json::Value) -> Bytes {
+        body(serde_json::json!({ "rules": entries }))
+    }
+
+    async fn put_user_detail(
+        state: &ApiState,
+        username: &str,
+        payload: Bytes,
+    ) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        parts(replace_user_rules(State(state.clone()), Path(username.to_string()), payload).await)
+            .await
+    }
+
+    #[tokio::test]
+    async fn user_replace_read_round_trip_rejects_bad_without_change_through_broker() {
+        // The task's failing test: before this task the per-user replace
+        // route was missing (bare 404). Seed a user set, replace it and
+        // read back; replace with an invalid rule expecting rejection
+        // with no change. Goes through the broker decision path, not only
+        // the store: the written allow is observed on
+        // `authorize_publish` (consulted by the publish event in
+        // `crates/broker-node/src/main.rs`).
+        let state = standalone_state();
+
+        // Unknown usernames read as 404 with the documented shape.
+        let (status, missing, _) = get_user_detail(&state, "w222-a").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(missing["message"].is_string());
+
+        // Writing an unknown username creates its set (create-on-write).
+        let (status, _, raw) = put_user_detail(
+            &state,
+            "w222-a",
+            user_set(serde_json::json!([
+                {"topic": "w222/a/#", "permission": "allow", "action": "publish"},
+                {"topic": "w222/b/#", "permission": "deny", "action": "subscribe"},
+            ])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "replace answers 204 with no body");
+
+        let (status, detail, _) = get_user_detail(&state, "w222-a").await;
+        assert_eq!(status, StatusCode::OK);
+        let rules = detail["rules"].as_array().expect("rules array").clone();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["username"], serde_json::json!("w222-a"));
+        assert_eq!(rules[0]["topic"], serde_json::json!("w222/a/#"));
+        assert_eq!(rules[0]["permission"], serde_json::json!("allow"));
+        assert_eq!(rules[0]["action"], serde_json::json!("publish"));
+        assert_eq!(rules[1]["permission"], serde_json::json!("deny"));
+        assert_eq!(rules[1]["action"], serde_json::json!("subscribe"));
+
+        // The stored allow is live on the publish path for that user.
+        let topic = broker_protocol::Topic::new("w222/a/data").expect("topic parses");
+        state
+            .auth
+            .authorize_publish("w222-a", &topic)
+            .await
+            .expect("user allow opens the publish path for its user");
+        assert!(
+            state
+                .auth
+                .authorize_publish("w222-b", &topic)
+                .await
+                .is_err(),
+            "unmatched users stay denied once a rule exists"
+        );
+
+        // Every bad batch is a client error and the stored set is
+        // unchanged: bad filter, unknown permission, unknown action,
+        // missing fields, duplicate scope, per-entry key mismatch,
+        // top-level key mismatch, wrong envelope.
+        let bad_bodies = [
+            user_set(serde_json::json!([
+                {"topic": "w222/ok/#", "permission": "allow", "action": "publish"},
+                {"topic": "", "permission": "allow", "action": "publish"},
+            ])),
+            user_set(serde_json::json!([
+                {"topic": "w222/ok/#", "permission": "maybe", "action": "publish"},
+            ])),
+            user_set(serde_json::json!([
+                {"topic": "w222/ok/#", "permission": "allow", "action": "forward"},
+            ])),
+            user_set(serde_json::json!([
+                {"permission": "allow", "action": "publish"},
+            ])),
+            user_set(serde_json::json!([
+                {"topic": "w222/bad/#/x", "permission": "allow", "action": "publish"},
+            ])),
+            user_set(serde_json::json!([
+                {"topic": "w222/dup/#", "permission": "allow", "action": "publish"},
+                {"topic": "w222/dup/#", "permission": "deny", "action": "publish"},
+            ])),
+            user_set(serde_json::json!([
+                {"username": "w222-other", "topic": "w222/ok/#", "permission": "allow", "action": "publish"},
+            ])),
+            body(serde_json::json!({
+                "username": "w222-other",
+                "rules": [{"topic": "w222/ok/#", "permission": "allow", "action": "publish"}],
+            })),
+            body(serde_json::json!([])),
+            body(serde_json::json!({"nope": []})),
+        ];
+        for bad in bad_bodies {
+            let (status, err, _) = put_user_detail(&state, "w222-a", bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "batch must be rejected");
+            assert!(
+                err["code"] == serde_json::json!("BAD_REQUEST")
+                    || err["code"] == serde_json::json!("ALREADY_EXISTS"),
+                "rejection carries a documented code, got {err}"
+            );
+        }
+        let (status, detail, _) = get_user_detail(&state, "w222-a").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["rules"].as_array().expect("rules array").len(), 2);
+
+        // A matching per-entry key and a matching top-level username are
+        // accepted; replacing with an empty list clears the set so the
+        // next read is a 404 again.
+        let (status, _, _) = put_user_detail(
+            &state,
+            "w222-a",
+            body(serde_json::json!({
+                "username": "w222-a",
+                "rules": [
+                    {"username": "w222-a", "topic": "w222/kept/#", "permission": "allow", "action": "all"},
+                ],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, detail, _) = get_user_detail(&state, "w222-a").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["rules"].as_array().expect("rules array").len(), 1);
+
+        let (status, _, _) =
+            put_user_detail(&state, "w222-a", user_set(serde_json::json!([]))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, missing, _) = get_user_detail(&state, "w222-a").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn user_replace_star_never_touches_the_catch_all_table() {
+        // The catch-all `*` belongs to the `/rules/all` table: a replace
+        // naming it is refused, never a wipe of another table.
+        let state = standalone_state();
+        state
+            .auth
+            .add_rule(AclRule::new("*", AclAction::Publish, "w222/catch/#", true))
+            .expect("catch-all applies");
+
+        let (status, err, _) = put_user_detail(
+            &state,
+            "*",
+            user_set(serde_json::json!([
+                {"topic": "w222/ok/#", "permission": "allow", "action": "publish"},
+            ])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(
+            !state.auth.acl_rules().is_empty(),
+            "catch-all entries survive a per-user replace for `*`"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_replace_bound_and_persistence_verified() {
+        // Bound: the shared per-user cap is stated and finite.
+        assert_eq!(broker_auth::MAX_AUTHZ_USER_RULES, 100_000);
+
+        // Persistence: a replace through a registry-backed table survives
+        // a reload of the same data dir, for both the user and the client
+        // view of the shared table.
+        let dir = std::env::temp_dir().join(format!(
+            "authz-user-replace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("fresh dir loads"),
+        );
+        let auth = std::sync::Arc::new(broker_auth::MemoryAuth::from_registry(&registry));
+        auth.replace_user_rules(
+            "w222-persist",
+            vec![broker_auth::AclRule::new(
+                "w222-persist",
+                broker_auth::AclAction::Subscribe,
+                "w222/persist/#",
+                false,
+            )],
+        )
+        .expect("registry-backed replace applies");
+        assert!(dir.join(broker_config::STATE_FILE_NAME).is_file());
+        drop(auth);
+        drop(registry);
+        let reloaded =
+            std::sync::Arc::new(broker_config::ConfigRegistry::load(&dir).expect("dir reloads"));
+        let restarted = broker_auth::MemoryAuth::from_registry(&reloaded);
+        let rules = restarted.user_rules("w222-persist");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].topic_pattern, "w222/persist/#");
+        let client_view = restarted.client_rules("w222-persist");
         assert_eq!(client_view.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }

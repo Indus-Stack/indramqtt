@@ -19,7 +19,9 @@ pub mod webhook;
 
 pub use authz_node_cache::{AuthzCacheUpdateError, AuthzNodeCache};
 pub use authz_settings::{AuthzSettingsStore, AuthzSettingsUpdateError};
-pub use authz_sources::{AuthzSourceEntry, AuthzSourceRegistry, SourceInsertError};
+pub use authz_sources::{
+    AuthzSourceEntry, AuthzSourceRegistry, SourceInsertError, SourceRemoveError, SourceReorderError,
+};
 pub use chain::{
     AuthnChain, AuthnCounterSnapshot, AuthnEntry, ChainInsertError, ChainMoveError,
     ChainRemoveError, ChainReorderError, ChainUpdateError,
@@ -1434,6 +1436,109 @@ impl MemoryAuth {
             self.persist()?;
         }
         Ok(removed)
+    }
+
+    /// Replace every rule scoped to `username` with `rules` (first match
+    /// wins within the user's set, in the given order).
+    ///
+    /// Validate-all-before-apply: the username must be non-empty (at most
+    /// [`MAX_AUTHZ_USERNAME_LEN`] bytes) and must name a concrete user
+    /// (the catch-all `*` belongs to the `/rules/all` table, never here);
+    /// every entry must carry that same username, a non-empty topic that
+    /// parses as an MQTT filter, and a known action. A batch with two
+    /// entries for the same topic scope (same topic and action) is
+    /// rejected as [`ClientRuleError::Duplicate`] instead of merging, and
+    /// a replacement that would push the table past
+    /// [`MAX_AUTHZ_USER_RULES`] entries fails with
+    /// [`ClientRuleError::Full`]. Any violation rejects the whole write
+    /// and the stored set is unchanged. Writing an unknown username
+    /// creates its set (create-on-write); writing an empty list clears it.
+    /// Persists through the registry when one is attached, so the set
+    /// survives a kernel restart. The write lands in the same shared
+    /// built-in table the per-client index reads, so it is live on the
+    /// publish/subscribe decision path.
+    ///
+    /// Management-plane only: topic validation runs before the lock, then
+    /// one short rule-table write lock per request (plus the registry
+    /// save lock on persist); the publish and subscribe authorization
+    /// consults keep reading under short read locks and never take this
+    /// lock beyond their check.
+    // TODO(parity): does the documented replace accept a bare array body
+    // alongside the `{"rules": [...]}` object, and must per-entry key
+    // fields match the path id or are they ignored? The rulebook does not
+    // decide either; the current choice requires the object shape and
+    // rejects key mismatches fail-closed until the checker pins it.
+    pub fn replace_user_rules(
+        &self,
+        username: &str,
+        rules: Vec<AclRule>,
+    ) -> std::result::Result<(), ClientRuleError> {
+        if username.trim().is_empty() {
+            return Err(ClientRuleError::Invalid(
+                "field `username` must not be empty".to_string(),
+            ));
+        }
+        if username.len() > MAX_AUTHZ_USERNAME_LEN {
+            return Err(ClientRuleError::Invalid(format!(
+                "field `username` {username:?} exceeds {MAX_AUTHZ_USERNAME_LEN} bytes",
+            )));
+        }
+        if username == "*" {
+            return Err(ClientRuleError::Invalid(
+                "field `username` must name a concrete user, not the catch-all (field `username`)"
+                    .to_string(),
+            ));
+        }
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.client_pattern != username {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].username {:?} does not match {username:?} (field `username`)",
+                    rule.client_pattern
+                )));
+            }
+            if rule.topic_pattern.trim().is_empty() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic must not be empty (field `topic`)"
+                )));
+            }
+            if TopicFilter::new(rule.topic_pattern.clone()).is_err() {
+                return Err(ClientRuleError::Invalid(format!(
+                    "rules[{index}].topic {:?} is not a valid filter (field `topic`)",
+                    rule.topic_pattern
+                )));
+            }
+        }
+        {
+            let mut seen: std::collections::HashSet<(&str, &str)> =
+                std::collections::HashSet::with_capacity(rules.len());
+            for rule in &rules {
+                let scope = (
+                    rule.topic_pattern.as_str(),
+                    match rule.action {
+                        AclAction::Publish => "publish",
+                        AclAction::Subscribe => "subscribe",
+                        AclAction::All => "all",
+                    },
+                );
+                if !seen.insert(scope) {
+                    return Err(ClientRuleError::Duplicate);
+                }
+            }
+        }
+        {
+            let mut table = self.rules.write();
+            let others = table
+                .iter()
+                .filter(|stored| stored.client_pattern != username)
+                .count();
+            if others + rules.len() > MAX_AUTHZ_USER_RULES {
+                return Err(ClientRuleError::Full);
+            }
+            table.retain(|stored| stored.client_pattern != username);
+            table.extend(rules);
+        }
+        self.persist()
+            .map_err(|e| ClientRuleError::Persist(e.to_string()))
     }
 
     fn check(

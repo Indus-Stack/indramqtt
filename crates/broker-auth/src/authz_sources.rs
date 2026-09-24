@@ -83,6 +83,35 @@ pub struct AuthzSourceRegistry {
     save_lock: parking_lot::Mutex<()>,
 }
 
+/// Why [`AuthzSourceRegistry::reorder`] refused a new order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceReorderError {
+    /// The body failed structural validation (message names the problem).
+    Invalid(String),
+    /// One or more supplied types are not stored (lists the unknown types).
+    Unknown(Vec<String>),
+    /// The order omits stored types, so applying it would drop entries
+    /// (lists the missing types).
+    Incomplete(Vec<String>),
+    /// The order names the same type twice.
+    Duplicate(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
+
+/// Why [`AuthzSourceRegistry::remove`] refused a delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceRemoveError {
+    /// No stored source carries the requested `type`.
+    NotFound,
+    /// Deleting the last remaining source would leave authorization open
+    /// (an empty registry authorizes nothing explicitly), so the delete
+    /// is refused instead of opening the broker.
+    Last(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
+
 impl AuthzSourceRegistry {
     /// Default registry: only the built-in database source (the one
     /// backend that executes, so a fresh broker authorizes against its
@@ -209,6 +238,147 @@ impl AuthzSourceRegistry {
                 .map_err(|e| SourceInsertError::Persist(e.to_string()))?;
         }
         Ok(entry)
+    }
+
+    /// Replace the whole source evaluation order with the supplied
+    /// ordered type list.
+    ///
+    /// Validate-all-before-apply: the full list is checked (non-empty
+    /// known types, no duplicates, every type stored, no stored type
+    /// omitted) before anything becomes visible, so a partial or
+    /// unknown-type list applies nothing. On success the stored order,
+    /// the lock-free snapshot and the persisted registry all move
+    /// together. Management-plane only: takes the write lock once per
+    /// request; the publish and subscribe consults read the built-in
+    /// rule table, never this registry, and publish/deliver never touch
+    /// this store.
+    // TODO(parity): is the documented order body a bare array of
+    // `{"type": ...}` objects (as implemented here, mirroring the
+    // sibling authenticator order), an array of bare type strings, or an
+    // object carrying the list? The rulebook does not decide the exact
+    // envelope; the current choice mirrors the sibling order until the
+    // checker pins it.
+    pub fn reorder(&self, types: Vec<String>) -> Result<(), SourceReorderError> {
+        for source_type in &types {
+            if source_type.trim().is_empty() {
+                return Err(SourceReorderError::Invalid(
+                    "field `type` must not be empty".to_string(),
+                ));
+            }
+            if !is_known_authz_source_type(source_type) {
+                return Err(SourceReorderError::Unknown(vec![source_type.clone()]));
+            }
+        }
+        let mut seen = std::collections::HashSet::with_capacity(types.len());
+        for source_type in &types {
+            if !seen.insert(source_type.clone()) {
+                return Err(SourceReorderError::Duplicate(format!(
+                    "order names type {source_type:?} more than once"
+                )));
+            }
+        }
+        let _guard = self.save_lock.lock();
+        let reordered = {
+            let current = self.inner.read();
+            let unknown: Vec<String> = types
+                .iter()
+                .filter(|t| !current.iter().any(|e| &e.source_type == *t))
+                .cloned()
+                .collect();
+            let missing: Vec<String> = current
+                .iter()
+                .filter(|e| !types.contains(&e.source_type))
+                .map(|e| e.source_type.clone())
+                .collect();
+            if !unknown.is_empty() && !missing.is_empty() {
+                return Err(SourceReorderError::Invalid(format!(
+                    "unknown authorization source type(s): {}; order omits stored type(s): {}",
+                    unknown.join(", "),
+                    missing.join(", "),
+                )));
+            }
+            if !unknown.is_empty() {
+                return Err(SourceReorderError::Unknown(unknown));
+            }
+            if !missing.is_empty() {
+                return Err(SourceReorderError::Incomplete(missing));
+            }
+            let mut next = Vec::with_capacity(current.len());
+            for source_type in &types {
+                let entry = current
+                    .iter()
+                    .find(|e| &e.source_type == source_type)
+                    .cloned()
+                    .expect("types validated against current registry");
+                next.push(entry);
+            }
+            let conf = export_conf(&next);
+            conf.validate()
+                .map_err(|e| SourceReorderError::Invalid(e.to_string()))?;
+            next
+        };
+        let conf = export_conf(&reordered);
+        {
+            let mut current = self.inner.write();
+            *current = reordered.clone();
+            self.snapshot.store(Arc::new(reordered));
+        }
+        if let Some(registry) = self.registry.read().clone() {
+            registry
+                .commit_authz_sources(conf)
+                .map_err(|e| SourceReorderError::Persist(e.to_string()))?;
+            registry
+                .save()
+                .map_err(|e| SourceReorderError::Persist(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Remove the source stored under `type`, returning it.
+    ///
+    /// Validate-all-before-apply: unknown types fail with `NotFound` and
+    /// apply nothing. Deleting the last remaining source is refused with
+    /// `Last` instead of leaving authorization open. On success the
+    /// stored order, the lock-free snapshot and the persisted registry
+    /// all move together, and the freed `type` may be re-created.
+    /// Management-plane only: one short write lock per request (plus the
+    /// registry save lock on persist); the publish and subscribe
+    /// consults read the built-in rule table, never this registry.
+    // TODO(parity): is "last" the last entry of any kind, or the last
+    // enabled entry / last live backend? The rulebook does not decide
+    // the exact refusal set; the current choice refuses deleting the
+    // sole remaining entry (any kind) as the conservative fail-closed
+    // answer until the checker pins it.
+    pub fn remove(&self, source_type: &str) -> Result<AuthzSourceEntry, SourceRemoveError> {
+        let _guard = self.save_lock.lock();
+        let (removed, conf) = {
+            let mut current = self.inner.write();
+            let Some(pos) = current.iter().position(|e| e.source_type == source_type) else {
+                return Err(SourceRemoveError::NotFound);
+            };
+            if current.len() == 1 {
+                return Err(SourceRemoveError::Last(
+                    "cannot delete the last authorization source: authorization must not be left open"
+                        .to_string(),
+                ));
+            }
+            let removed = current.remove(pos);
+            let next = current.clone();
+            let conf = export_conf(&next);
+            conf.validate()
+                .map_err(|e| SourceRemoveError::Persist(e.to_string()))?;
+            self.snapshot.store(Arc::new(next));
+            (removed, conf)
+        };
+        if let Some(registry) = self.registry.read().clone() {
+            registry
+                .commit_authz_sources(conf)
+                .map_err(|e| SourceRemoveError::Persist(e.to_string()))?;
+            registry
+                .save()
+                .map_err(|e| SourceRemoveError::Persist(e.to_string()))?;
+        }
+        Ok(removed)
     }
 
     /// Number of stored entries.
@@ -425,5 +595,103 @@ mod tests {
             vec!["built_in_database".to_string(), "file".to_string()]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn order(types: &[&str]) -> Vec<String> {
+        types.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn stored_order(registry: &AuthzSourceRegistry) -> Vec<String> {
+        registry
+            .list()
+            .iter()
+            .map(|e| e.source_type.clone())
+            .collect()
+    }
+
+    #[test]
+    fn reorder_swaps_evaluation_order_and_rejects_bad_without_change() {
+        let registry = AuthzSourceRegistry::new();
+        registry.insert(entry("file")).expect("file insert");
+        assert_eq!(
+            stored_order(&registry),
+            vec!["built_in_database".to_string(), "file".to_string()]
+        );
+
+        registry
+            .reorder(order(&["file", "built_in_database"]))
+            .expect("reorder applies");
+        assert_eq!(
+            stored_order(&registry),
+            vec!["file".to_string(), "built_in_database".to_string()]
+        );
+        // The lock-free snapshot moves with the store.
+        let snap: Vec<_> = registry
+            .snapshot()
+            .iter()
+            .map(|e| e.source_type.clone())
+            .collect();
+        assert_eq!(snap, stored_order(&registry));
+
+        // Unknown types, partial lists, duplicates and malformed bodies
+        // apply nothing.
+        assert!(matches!(
+            registry.reorder(order(&["file", "nowhere"])),
+            Err(SourceReorderError::Unknown(_))
+        ));
+        assert!(matches!(
+            registry.reorder(order(&["nowhere"])),
+            Err(SourceReorderError::Unknown(_))
+        ));
+        assert!(matches!(
+            registry.reorder(order(&["file"])),
+            Err(SourceReorderError::Incomplete(_))
+        ));
+        assert!(matches!(
+            registry.reorder(order(&["file", "file", "built_in_database"])),
+            Err(SourceReorderError::Duplicate(_))
+        ));
+        assert!(matches!(
+            registry.reorder(order(&["", "file"])),
+            Err(SourceReorderError::Invalid(_))
+        ));
+        assert_eq!(
+            stored_order(&registry),
+            vec!["file".to_string(), "built_in_database".to_string()]
+        );
+    }
+
+    #[test]
+    fn remove_deletes_one_source_and_refuses_the_last() {
+        let registry = AuthzSourceRegistry::new();
+        registry.insert(entry("file")).expect("file insert");
+
+        let removed = registry.remove("file").expect("delete applies");
+        assert_eq!(removed.source_type, "file");
+        assert_eq!(
+            stored_order(&registry),
+            vec!["built_in_database".to_string()]
+        );
+        // The lock-free snapshot moves with the store.
+        assert_eq!(registry.snapshot().len(), 1);
+
+        // Unknown types are a miss and apply nothing.
+        assert_eq!(registry.remove("nowhere"), Err(SourceRemoveError::NotFound));
+        assert_eq!(
+            stored_order(&registry),
+            vec!["built_in_database".to_string()]
+        );
+
+        // Deleting the last live source is refused instead of leaving
+        // authorization open.
+        assert!(matches!(
+            registry.remove("built_in_database"),
+            Err(SourceRemoveError::Last(_))
+        ));
+        assert_eq!(
+            stored_order(&registry),
+            vec!["built_in_database".to_string()]
+        );
+        assert!(registry.built_in_available());
     }
 }

@@ -469,6 +469,135 @@ pub async fn clear_catch_all_rules(State(state): State<ApiState>) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// `PUT /authorization/sources/order`: replace the whole source
+/// evaluation order with the supplied ordered type list.
+///
+/// The body must be a JSON array; every element must be an object
+/// carrying a non-empty string `type` naming a stored source. Extra keys
+/// on elements are ignored so future fields degrade to the same reorder
+/// instead of a 400. The full list is validated before anything becomes
+/// visible (validate-all-before-apply): an unknown type, a duplicate
+/// type, or a list omitting a stored type applies nothing and fails with
+/// `BAD_REQUEST` in the documented `{code, message}` shape. On success
+/// returns 204 with no body. The order persists across a restart through
+/// the config registry.
+/// Management-plane only: one short registry write lock per request
+/// (plus the registry save lock on persist); the publish and subscribe
+/// authorization consults read the built-in rule table, never this
+/// registry, and publish/deliver never touch this handler's lock.
+// TODO(parity): is the documented order body a bare array of
+// `{"type": ...}` objects (as implemented here, mirroring the sibling
+// authenticator order), an array of bare type strings, or an object
+// carrying the list? The rulebook does not decide the exact envelope;
+// the current choice mirrors the sibling order until the checker pins it.
+pub async fn replace_authz_order(State(state): State<ApiState>, body: Bytes) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid authorization order body: {e}"))
+                .into_response();
+        }
+    };
+    let types = match parse_order_request(&value) {
+        Ok(types) => types,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    match state.authz_sources.reorder(types) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(broker_auth::SourceReorderError::Invalid(msg)) => {
+            ApiError::BadRequest(msg).into_response()
+        }
+        Err(broker_auth::SourceReorderError::Unknown(unknown)) => ApiError::BadRequest(format!(
+            "unknown authorization source type(s): {}",
+            unknown.join(", ")
+        ))
+        .into_response(),
+        Err(broker_auth::SourceReorderError::Incomplete(missing)) => ApiError::BadRequest(format!(
+            "order omits stored authorization source type(s): {}",
+            missing.join(", ")
+        ))
+        .into_response(),
+        Err(broker_auth::SourceReorderError::Duplicate(msg)) => {
+            ApiError::BadRequest(msg).into_response()
+        }
+        Err(broker_auth::SourceReorderError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist authorization sources: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Validate an order body into the ordered type list.
+///
+/// The body must be a JSON array; every element must be an object
+/// carrying a non-empty string `type`. Extra keys on elements are
+/// ignored so future fields degrade to the same reorder instead of a
+/// 400.
+fn parse_order_request(value: &serde_json::Value) -> Result<Vec<String>, String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| "authorization order must be a JSON array".to_string())?;
+    let mut types = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| format!("authorization order[{index}] must be an object"))?;
+        let source_type = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("authorization order[{index}].type is required"))?;
+        if source_type.trim().is_empty() {
+            return Err(format!(
+                "authorization order[{index}].type must not be empty"
+            ));
+        }
+        types.push(source_type.to_string());
+    }
+    Ok(types)
+}
+
+/// `DELETE /authorization/sources/{type}`: remove one source.
+///
+/// Unknown types fail with `NOT_FOUND` in the documented `{code,
+/// message}` shape and apply nothing. Deleting the last remaining
+/// source is refused with `BAD_REQUEST` instead of leaving
+/// authorization open. On success returns 204 with no body. The removal
+/// persists across a restart through the config registry.
+/// Management-plane only: one short registry write lock per request
+/// (plus the registry save lock on persist); the publish and subscribe
+/// authorization consults read the built-in rule table, never this
+/// registry, and publish/deliver never touch this handler's lock.
+// TODO(parity): is "last" the last entry of any kind, or the last
+// enabled entry / last live backend? The rulebook does not decide the
+// exact refusal set; the current choice refuses deleting the sole
+// remaining entry (any kind) as the conservative fail-closed answer
+// until the checker pins it.
+pub async fn delete_authz_source(
+    State(state): State<ApiState>,
+    Path(source_type): Path<String>,
+) -> Response {
+    match state.authz_sources.remove(&source_type) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(broker_auth::SourceRemoveError::NotFound) => {
+            ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+                .into_response()
+        }
+        Err(broker_auth::SourceRemoveError::Last(msg)) => ApiError::BadRequest(msg).into_response(),
+        Err(broker_auth::SourceRemoveError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist authorization sources: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,6 +1003,199 @@ mod tests {
         let rules = restarted.acl_rules();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].topic_pattern, "w218/persist/#");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn order_body(types: &[&str]) -> Bytes {
+        body(
+            types
+                .iter()
+                .map(|t| serde_json::json!({"type": t}))
+                .collect::<Vec<_>>()
+                .into(),
+        )
+    }
+
+    async fn put_order(
+        state: &ApiState,
+        payload: Bytes,
+    ) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        parts(replace_authz_order(State(state.clone()), payload).await).await
+    }
+
+    async fn list_types(state: &ApiState) -> Vec<String> {
+        let (_, listed, _) =
+            parts(list_authz_sources(State(state.clone()), params(1, 100)).await).await;
+        listed["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|row| row["type"].as_str().expect("row has type").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn order_replace_round_trip_rejects_bad_without_change() {
+        // The task's failing test: before this task the order route was
+        // missing (bare 404). Register a second source, swap the whole
+        // evaluation order and read it back; a bad order naming an
+        // unknown type is rejected with the stored order unchanged.
+        // Management-plane only: publish and deliver never touch this
+        // registry (the built-in rule consult stays on the
+        // publish/subscribe path).
+        let state = standalone_state();
+        assert_eq!(
+            list_types(&state).await,
+            vec!["built_in_database".to_string()]
+        );
+
+        let (status, _, _) = parts(
+            create_authz_source(
+                State(state.clone()),
+                body(serde_json::json!({"type": "file"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _, raw) = put_order(&state, order_body(&["file", "built_in_database"])).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "reorder answers 204 with no body");
+        assert_eq!(
+            list_types(&state).await,
+            vec!["file".to_string(), "built_in_database".to_string()]
+        );
+
+        // Every bad order is a client error and the stored order is
+        // unchanged: unknown type, partial list, duplicate type, missing
+        // key, empty type, wrong envelope.
+        let bad_bodies = [
+            order_body(&["built_in_database", "nowhere"]),
+            order_body(&["nowhere"]),
+            order_body(&["built_in_database"]),
+            order_body(&["file", "file", "built_in_database"]),
+            order_body(&["file", "built_in_database", "built_in_database"]),
+            body(serde_json::json!([{"nope": "file"}, {"type": "built_in_database"}])),
+            body(serde_json::json!([{"type": ""}, {"type": "built_in_database"}])),
+            body(serde_json::json!({"type": "file"})),
+            body(serde_json::json!([])),
+        ];
+        for bad in bad_bodies {
+            let (status, err, _) = put_order(&state, bad.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "order must be rejected");
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(err["message"].is_string());
+        }
+        assert_eq!(
+            list_types(&state).await,
+            vec!["file".to_string(), "built_in_database".to_string()]
+        );
+
+        // Restoring the original order succeeds.
+        let (status, _, _) = put_order(&state, order_body(&["built_in_database", "file"])).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            list_types(&state).await,
+            vec!["built_in_database".to_string(), "file".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn source_delete_hit_miss_refuses_last() {
+        // The task's failing test: before this task the per-type delete
+        // was missing (bare 404). Delete a second source and read the
+        // list back; an unknown type is 404; deleting the last live
+        // source is refused instead of leaving authorization open.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_authz_source(
+                State(state.clone()),
+                body(serde_json::json!({"type": "file"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let response = delete_authz_source(State(state.clone()), Path("file".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            list_types(&state).await,
+            vec!["built_in_database".to_string()]
+        );
+
+        // Unknown types return 404 with the documented shape.
+        let (status, missing, _) =
+            parts(delete_authz_source(State(state.clone()), Path("nowhere".to_string())).await)
+                .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(missing["message"].is_string());
+
+        // Deleting the last live source is refused cleanly; the stored
+        // source is unchanged.
+        let (status, refused, _) = parts(
+            delete_authz_source(State(state.clone()), Path("built_in_database".to_string())).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(refused["message"].is_string());
+        assert_eq!(
+            list_types(&state).await,
+            vec!["built_in_database".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn order_and_delete_persist_across_restart() {
+        // Bound: the source cap is stated, finite, and enforced; the
+        // default registry holds only the built-in source.
+        assert_eq!(broker_config::MAX_AUTHZ_SOURCES, 8);
+        let fresh = standalone_state();
+        assert_eq!(
+            list_types(&fresh).await,
+            vec!["built_in_database".to_string()]
+        );
+
+        // Persistence: a reorder plus a delete through a registry-backed
+        // registry survive a reload of the same data dir in the new order.
+        let dir = std::env::temp_dir().join(format!(
+            "authz-order-delete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("fresh dir loads"),
+        );
+        let sources = broker_auth::AuthzSourceRegistry::from_registry(&registry);
+        sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("persist file");
+        sources
+            .reorder(vec!["file".to_string(), "built_in_database".to_string()])
+            .expect("persist reorder applies");
+        sources.remove("built_in_database").expect("delete applies");
+        assert!(dir.join(broker_config::STATE_FILE_NAME).is_file());
+        drop(sources);
+        drop(registry);
+        let reloaded =
+            std::sync::Arc::new(broker_config::ConfigRegistry::load(&dir).expect("dir reloads"));
+        let restarted = broker_auth::AuthzSourceRegistry::from_registry(&reloaded);
+        let ids: Vec<_> = restarted
+            .list()
+            .iter()
+            .map(|e| e.source_type.clone())
+            .collect();
+        assert_eq!(ids, vec!["file".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

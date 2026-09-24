@@ -5252,6 +5252,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authz_user_replace_order_delete_round_trip() {
+        // Per-user replace plus order-replace plus per-type delete on real
+        // state (W2-22, C04-23..C04-25) through the broker: seed a user
+        // set, replace it and read back; submit a bad order naming an
+        // unknown type expecting rejection; delete a second source then
+        // delete unknown expecting 404. Before this task all three routes
+        // were missing (bare 404). The written allow is live on the
+        // publish path (`MemoryAuth::authorize_publish` in
+        // `crates/broker-auth/src/lib.rs`, consulted by the publish event
+        // in `crates/broker-node/src/main.rs`).
+        use broker_auth::Authorizer;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Seed one user rule, then replace the whole set and read back.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/users",
+                json!({"username": "w222-http", "topic": "w222/http/old/#", "permission": "allow", "action": "publish"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/users/w222-http",
+                json!({"rules": [
+                    {"topic": "w222/http/a/#", "permission": "allow", "action": "publish"},
+                    {"topic": "w222/http/b/#", "permission": "deny", "action": "subscribe"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/users/w222-http",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let rules = body["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["username"], json!("w222-http"));
+        assert_eq!(rules[0]["topic"], json!("w222/http/a/#"));
+        assert_eq!(rules[1]["permission"], json!("deny"));
+
+        // The stored allow is live on the publish path for that user.
+        let topic = broker_protocol::Topic::new("w222/http/a/data").expect("topic parses");
+        state
+            .auth
+            .authorize_publish("w222-http", &topic)
+            .await
+            .expect("user allow opens the publish path for its user");
+
+        // A bad replace applies nothing: the stored set is unchanged.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/users/w222-http",
+                json!({"rules": [
+                    {"topic": "w222/http/ok/#", "permission": "allow", "action": "publish"},
+                    {"topic": "", "permission": "allow", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/users/w222-http",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rules"].as_array().expect("rules array").len(), 2);
+
+        // Register a second source, then a bad order naming an unknown
+        // type is rejected and the stored order is unchanged.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authorization/sources",
+                json!({"type": "file"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authorization/sources/order",
+                json!([{"type": "built_in_database"}, {"type": "nowhere"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/sources", &token)
+            .await;
+        assert_eq!(status, 200);
+        let types: Vec<_> = body["data"]
+            .as_array()
+            .expect("data is a list")
+            .iter()
+            .map(|row| row["type"].clone())
+            .collect();
+        assert_eq!(types, vec![json!("built_in_database"), json!("file")]);
+
+        // A valid order swaps the evaluation order and reads back swapped.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/order",
+                json!([{"type": "file"}, {"type": "built_in_database"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/sources", &token)
+            .await;
+        assert_eq!(status, 200);
+        let types: Vec<_> = body["data"]
+            .as_array()
+            .expect("data is a list")
+            .iter()
+            .map(|row| row["type"].clone())
+            .collect();
+        assert_eq!(types, vec![json!("file"), json!("built_in_database")]);
+
+        // Delete the second source, then an unknown type is 404.
+        let (status, _) = server
+            .delete_auth("/api/v5/authorization/sources/file", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/sources", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        let (status, body) = server
+            .delete_auth("/api/v5/authorization/sources/nowhere", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Deleting the last live source is refused instead of leaving
+        // authorization open.
+        let (status, body) = server
+            .delete_auth("/api/v5/authorization/sources/built_in_database", &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
     async fn authz_catch_all_rules_round_trip() {
         // Built-in catch-all table plus the three `/all` routes on real
         // state (W2-18, C04-11..C04-13) through the broker: write two

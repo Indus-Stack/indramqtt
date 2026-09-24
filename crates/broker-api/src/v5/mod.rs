@@ -224,21 +224,39 @@ pub fn protected_router() -> Router<ApiState> {
                 .delete(authz_clients::delete_client_rules),
         )
         // Authorization (AuthZ / ACL) built-in per-user rule list (W2-20,
-        // C04-19) plus per-user add and per-username read/delete (W2-21,
-        // C04-20..C04-22): paged `data` plus `meta` over the shared
-        // built-in table, single-rule add with duplicate rejection, and
-        // per-username detail read plus whole-set delete. Management-plane
-        // only; publish and deliver never touch the registry (the built-in
-        // rule consult stays on the publish/subscribe path).
+        // C04-19) plus per-user add, per-username read/replace/delete
+        // (W2-21, C04-20..C04-22; W2-22, C04-23): paged `data` plus `meta`
+        // over the shared built-in table, single-rule add with duplicate
+        // rejection, per-username detail read, whole-set replace with
+        // validate-all-before-apply, and whole-set delete.
+        // Management-plane only; publish and deliver never touch the
+        // registry (the built-in rule consult stays on the
+        // publish/subscribe path).
         .route(
             "/authorization/sources/built_in_database/rules/users",
             get(authz_clients::list_user_rules).post(authz_clients::create_user_rule),
         )
         .route(
             "/authorization/sources/built_in_database/rules/users/:username",
-            get(authz_clients::get_user_rules).delete(authz_clients::delete_user_rules),
+            get(authz_clients::get_user_rules)
+                .put(authz_clients::replace_user_rules)
+                .delete(authz_clients::delete_user_rules),
         )
-        // Authorization (AuthZ / ACL) rules
+        // Authorization (AuthZ / ACL) source evaluation order plus
+        // per-type delete (W2-22, C04-24/C04-25): whole-order replace
+        // with validate-all-before-apply, and a delete that removes one
+        // source while refusing to delete the last one. Management-plane
+        // only; publish and deliver never touch the registry (the
+        // built-in rule consult stays on the publish/subscribe path).
+        .route(
+            "/authorization/sources/order",
+            put(authz_sources::replace_authz_order),
+        )
+        .route(
+            "/authorization/sources/:type",
+            delete(authz_sources::delete_authz_source),
+        )
+        // Authorization (AuthZ / ACL) generic per-type rule helpers.
         .route(
             "/authorization/sources/:type/rules",
             get(auth::list_authz_rules).post(auth::create_authz_rule),
