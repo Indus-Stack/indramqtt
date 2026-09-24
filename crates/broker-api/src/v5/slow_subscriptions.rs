@@ -271,7 +271,14 @@ pub async fn clear_slow_subscriptions(State(state): State<ApiState>) -> Response
 }
 
 /// Default slow-subscription thresholds, matching the documented defaults.
-const DEFAULT_ENABLE: bool = false;
+/// `enable` defaults to true (FX-02): tracking runs under default
+/// settings so a subscriber whose ack latency exceeds `threshold` appears
+/// in `GET /slow_subscriptions` without a prior PUT. Reason: the
+/// documented behaviour lists slow subscribers out of the box; leaving
+/// the recorder disabled by default kept the list permanently empty
+/// under defaults. The egress hooks still gate on this flag atomically,
+/// so operators opt out with one PUT.
+const DEFAULT_ENABLE: bool = true;
 const DEFAULT_THRESHOLD: &str = "500ms";
 const DEFAULT_TOP_K_NUM: u32 = 10;
 const DEFAULT_EXPIRE_INTERVAL: &str = "300s";
@@ -414,9 +421,8 @@ impl SlowSubsSettingsStore {
     }
 
     /// Fast-path enable flag (one relaxed atomic load, no lock).
-    /// The egress hook gates recording on this: `enable=false` (the
-    /// default) records nothing, matching the hook being uninstalled
-    /// when disabled.
+    /// The egress hook gates recording on this: `enable=false` records
+    /// nothing, matching the hook being uninstalled when disabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
     }
@@ -868,7 +874,7 @@ mod tests {
         let (status, before) =
             response_parts(get_slow_subs_settings(State(state.clone())).await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(before["enable"], serde_json::json!(false));
+        assert_eq!(before["enable"], serde_json::json!(true));
         assert_eq!(before["threshold"], serde_json::json!("500ms"));
         assert_eq!(before["top_k_num"], serde_json::json!(10));
         assert_eq!(before["expire_interval"], serde_json::json!("300s"));

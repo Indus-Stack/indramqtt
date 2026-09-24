@@ -3019,6 +3019,7 @@ mod tests {
             qos: QoS::AtLeastOnce,
             retain: false,
             payload: bytes::Bytes::from_static(b"hello"),
+            enqueued_at: std::time::Instant::now(),
         }));
 
         let (status, body) = server
@@ -3058,6 +3059,7 @@ mod tests {
                 qos: QoS::AtLeastOnce,
                 retain: false,
                 payload: bytes::Bytes::from_static(b"x"),
+                enqueued_at: std::time::Instant::now(),
             }));
         }
 

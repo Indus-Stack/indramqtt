@@ -974,6 +974,7 @@ fn build_publish_deliveries(
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                 retain,
                                 payload: payload.clone(),
+                                enqueued_at: std::time::Instant::now(),
                             }) {
                                 broker_session::InflightTrackOutcome::Tracked => {}
                                 broker_session::InflightTrackOutcome::Spilled => {
@@ -1207,6 +1208,7 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
                                         qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                         retain,
                                         payload: payload.clone(),
+                                        enqueued_at: std::time::Instant::now(),
                                     },
                                 ) {
                                     broker_session::InflightTrackOutcome::Tracked => {}

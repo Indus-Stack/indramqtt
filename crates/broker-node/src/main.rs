@@ -1231,7 +1231,7 @@ fn maybe_note_slow_delivery(
     if shed_after <= shed_before {
         return;
     }
-    // Honour `enable=false` (the default): recording is gated on the
+    // Honour `enable=false`: recording is gated on the
     // flag the API exposes, read atomically with no lock.
     if !shared.slow_subs_settings.is_enabled() {
         return;
@@ -1318,7 +1318,7 @@ fn route_publish_out_deliveries(
     publish_in: &BrokerFrame,
     deliveries: Vec<(u64, BrokerFrame)>,
 ) {
-    // F1-03: disabled fast path (the default) routes exactly as before
+    // F1-03: disabled fast path routes exactly as before
     // the hook existed, plus one relaxed atomic load for the enable flag.
     if !shared.slow_subs_settings.is_enabled() {
         let mut enqueued = 0u64;
@@ -4117,6 +4117,12 @@ fn build_downlink_frames_with_publisher(
                                 qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
                                 retain,
                                 payload: shared.clone(),
+                                // FX-02: stamp delivery so the PUBACK event
+                                // can measure ack latency. One clock read
+                                // per QoS 1 delivery (no lock, no
+                                // allocation); the entry itself stays
+                                // bounded by the window+spill caps.
+                                enqueued_at: std::time::Instant::now(),
                             }) {
                                 InflightTrackOutcome::Tracked => {}
                                 InflightTrackOutcome::Spilled => {
@@ -4510,6 +4516,16 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
 /// (T-31). The edge reports the downlink packet id via `PubAckIn`;
 /// ownership resolves through the `conn_id -> client_id` index, so acks
 /// from a superseded connection never release a new incarnation's entry.
+///
+/// FX-02: the PUBACK event also drives slow-subscription recording. The
+/// held entry carries its delivery instant, so ack latency
+/// (`now - enqueued_at`) is the measured delivery time compared against
+/// the configured threshold. Slow acks hand one bounded record off
+/// through `slow_tx` (`try_send`, counted drop when full); prompt acks
+/// pay two relaxed atomic loads and return. Ack path only: the publish
+/// fast path never touches this.
+/// TODO(parity): QoS 2 PUBREC/PUBCOMP completions are not timed yet;
+/// should the second-phase latency record the same way?
 fn apply_puback(frame: &BrokerFrame, shared: &Shared) {
     let packet_id = match decode_puback_meta(&frame.metadata) {
         Some(packet_id) => packet_id,
@@ -4519,8 +4535,38 @@ fn apply_puback(frame: &BrokerFrame, shared: &Shared) {
         Some(client_id) => client_id,
         None => return,
     };
-    if let Some(session) = shared.sessions.get(&client_id) {
-        session.ack_inflight(packet_id);
+    let Some(session) = shared.sessions.get(&client_id) else {
+        return;
+    };
+    let Some(entry) = session.ack_inflight_timed(packet_id) else {
+        return;
+    };
+    // Honour `enable=false`: recording is gated on the flag the API
+    // exposes, read atomically with no lock.
+    if !shared.slow_subs_settings.is_enabled() {
+        return;
+    }
+    let elapsed_ms = entry
+        .enqueued_at
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    // Timespan is whole milliseconds: ceil sub-millisecond acks to 1 ms
+    // so a real ack never invents a zero latency.
+    let timespan_ms = elapsed_ms.max(1);
+    // Honour the configured threshold read atomically: latencies
+    // shorter than it acked promptly and are not slow.
+    if timespan_ms < shared.slow_subs_settings.threshold_ms() {
+        return;
+    }
+    let topic = truncate_to_chars(entry.topic.as_str(), SLOW_TOPIC_CAP_CHARS).to_string();
+    let record = SlowRecord {
+        conn_id: frame.header.conn_id,
+        topic,
+        timespan_ms,
+    };
+    if shared.slow_tx.try_send(record).is_err() {
+        shared.slow_dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -9451,6 +9497,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_qos1_ack_delay_records_under_defaults() {
+        // FX-02: a subscriber whose QoS 1 ack latency exceeds the
+        // configured threshold appears in `GET /slow_subscriptions`
+        // under default settings; a prompt acker does not. Goes through
+        // the broker (publish fan-out plus the PUBACK event), never
+        // through the store: nothing here calls `SlowSubsStore::record`
+        // directly.
+        use axum::extract::State;
+        let shared = Shared::new();
+        // Default settings drive this test: tracking enabled with the
+        // documented 500 ms threshold, so a slow ack records with no PUT.
+        assert!(
+            shared.slow_subs_settings.is_enabled(),
+            "slow tracking runs under default settings"
+        );
+        assert_eq!(
+            shared.slow_subs_settings.threshold_ms(),
+            500,
+            "default threshold is the documented 500ms"
+        );
+        shared.spawn_slow_recorder();
+
+        // Slow subscriber (QoS 1): live session bound to a live mailbox
+        // whose downlink is held before acking, so ack latency is real.
+        let (slow_session, _) = shared.sessions.get_or_create("slow-ack-1", true);
+        *slow_session.connected.write() = true;
+        *slow_session.conn_id.write() = Some(911);
+        shared.sessions.bind_session(&slow_session, 911);
+        let slow_filter = TopicFilter::new("slow/ack").expect("filter");
+        shared.router.subscribe(
+            &slow_filter,
+            Subscription {
+                client_id: "slow-ack-1".into(),
+                conn_id: 911,
+                qos: QoS::AtLeastOnce,
+                group: None,
+            },
+        );
+        let (slow_tx, _slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
+        shared.conns.register(911, slow_tx);
+        shared.conns.set_client_label(911, "slow-ack-1");
+
+        // Prompt subscriber (QoS 1) on its own topic.
+        let (fast_session, _) = shared.sessions.get_or_create("fast-ack-1", true);
+        *fast_session.connected.write() = true;
+        *fast_session.conn_id.write() = Some(912);
+        shared.sessions.bind_session(&fast_session, 912);
+        let fast_filter = TopicFilter::new("fast/ack").expect("filter");
+        shared.router.subscribe(
+            &fast_filter,
+            Subscription {
+                client_id: "fast-ack-1".into(),
+                conn_id: 912,
+                qos: QoS::AtLeastOnce,
+                group: None,
+            },
+        );
+        let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
+        shared.conns.register(912, fast_tx);
+        shared.conns.set_client_label(912, "fast-ack-1");
+
+        // Publisher bound to its connection.
+        let (pub_session, _) = shared.sessions.get_or_create("slow-ack-pub", true);
+        *pub_session.connected.write() = true;
+        *pub_session.conn_id.write() = Some(913);
+        shared.sessions.bind_session(&pub_session, 913);
+
+        // Publish one QoS 1 message per subscriber through the real
+        // publish path and route both fan-outs exactly as the live
+        // PublishIn branch does.
+        let (meta, payload) = encode_publish_meta("slow/ack", 1, 1, false, b"slow-payload");
+        let frame = publish_frame(913, 1, meta, payload);
+        let (_ack, deliveries) = apply_publish(&frame, &shared).await;
+        assert_eq!(deliveries.len(), 1, "slow publish must fan out once");
+        route_publish_out_deliveries(&shared, &frame, deliveries.clone());
+        let (_, slow_pid, _, _) = decode_publish_meta_parts(&deliveries[0].1.metadata);
+
+        let (meta, payload) = encode_publish_meta("fast/ack", 2, 1, false, b"fast-payload");
+        let frame = publish_frame(913, 2, meta, payload);
+        let (_ack, deliveries) = apply_publish(&frame, &shared).await;
+        assert_eq!(deliveries.len(), 1, "fast publish must fan out once");
+        route_publish_out_deliveries(&shared, &frame, deliveries.clone());
+        let (_, fast_pid, _, _) = decode_publish_meta_parts(&deliveries[0].1.metadata);
+
+        // Prompt subscriber acks at once through the broker PUBACK event:
+        // ~1 ms latency stays below the 500 ms threshold, so no record.
+        apply_puback(&puback_frame(912, 10, fast_pid), &shared);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            shared
+                .slow_subs
+                .list()
+                .iter()
+                .all(|entry| entry.clientid != "fast-ack-1"),
+            "a prompt acker must not appear"
+        );
+
+        // Slow subscriber delays its ack past the 500 ms threshold, then
+        // acks through the same broker PUBACK event.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        apply_puback(&puback_frame(911, 11, slow_pid), &shared);
+
+        // The recorder drains asynchronously: poll briefly for the row.
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = shared.slow_subs.list();
+            if rows
+                .iter()
+                .any(|entry| entry.clientid == "slow-ack-1" && entry.topic == "slow/ack")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let row = rows
+            .iter()
+            .find(|entry| entry.clientid == "slow-ack-1" && entry.topic == "slow/ack")
+            .expect("slow acker names the subscriber and topic");
+        assert!(
+            row.timespan >= shared.slow_subs_settings.threshold_ms(),
+            "timespan measures ack latency ({} ms) at or past the threshold ({} ms)",
+            row.timespan,
+            shared.slow_subs_settings.threshold_ms()
+        );
+        assert!(
+            shared
+                .slow_subs
+                .list()
+                .iter()
+                .all(|entry| entry.clientid != "fast-ack-1"),
+            "the prompt acker stays absent after the slow ack records"
+        );
+
+        // Same rows through the documented API shape.
+        let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let mut api_state = broker_api::ApiState::standalone(engine);
+        api_state.slow_subs = shared.slow_subs.clone();
+        api_state.slow_subs_settings = shared.slow_subs_settings.clone();
+        let response = broker_api::v5::slow_subscriptions::list_slow_subscriptions(
+            State(api_state),
+            broker_api::pagination::PageParams {
+                page: 1,
+                limit: 100,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("slow-subs body is small and readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("slow-subs body is JSON");
+        let data = body["data"].as_array().expect("data is a list");
+        let api_row = data
+            .iter()
+            .find(|row| row["clientid"] == serde_json::json!("slow-ack-1"))
+            .expect("GET /slow_subscriptions lists the slow subscriber");
+        assert_eq!(api_row["topic"], serde_json::json!("slow/ack"));
+        assert!(
+            api_row["timespan"].as_u64().unwrap_or(0) >= shared.slow_subs_settings.threshold_ms(),
+            "API timespan is at or above the threshold"
+        );
+        assert!(api_row["node"].is_string());
+        assert!(api_row["last_update_time"].is_number());
+        // The handoff-drop counter is observed, never write-only.
+        let _dropped = shared.slow_dropped_count();
+    }
+
+    #[tokio::test]
     async fn trace_capture_through_broker() {
         // F1-04 (T-74): create a topic trace through the management write,
         // publish through the real broker path, and read the capture through
@@ -9546,7 +9764,8 @@ mod tests {
         // F1-03 (T-73) QoS 1 before/after numbers (ticket Scope, rulebook
         // publish-path row): measured through the broker publish-to-deliver
         // event (`apply_publish` plus `route_publish_out_deliveries`), not
-        // invented. BEFORE is slow tracking disabled (the default): the
+        // invented. BEFORE is slow tracking disabled (explicit opt-out;
+        // FX-02 enables tracking by default): the
         // helper pays one relaxed atomic load plus the existing route loop.
         // AFTER enables tracking with no shed (live mailbox, nothing
         // dropped): the helper additionally snapshots the shed counter and
@@ -9555,6 +9774,8 @@ mod tests {
         // SLOs. Per-message bound: one delivery per publish, no new
         // buffering beyond the existing mailbox.
         let shared = Shared::new();
+        // FX-02 default is enabled; force the disabled BEFORE explicitly.
+        shared.slow_subs_settings.set_enabled(false);
         let bind = bind_frame(71, 1, encode_bind_meta("q1-slow-time", false, 60));
         reply_for_frame(&bind, &shared.sessions).expect("bind replies");
         let sub = subscribe_frame(

@@ -277,6 +277,13 @@ pub struct InflightMessage {
     pub qos: QoS,
     pub retain: bool,
     pub payload: Bytes,
+    /// Delivery instant for slow-subscriber ack latency (FX-02). Stamped
+    /// once when the downlink is built; read once on PUBACK to compute
+    /// `timespan`. One `Instant` per tracked entry, bounded by the
+    /// existing window (`max_inflight`) plus spill (`max_spill`) caps, so
+    /// no new unbounded state. Reason for `Instant` (monotonic) over
+    /// wall-clock: ack latency must not jump on clock adjustments.
+    pub enqueued_at: Instant,
 }
 
 /// Maximum unacknowledged QoS 1 downlinks held in the per-session
@@ -591,9 +598,17 @@ impl Session {
     /// oldest unacked downlinks and replay stays oldest-first. Ack path
     /// only: the publish fast path never takes both locks.
     pub fn ack_inflight(&self, packet_id: u16) -> bool {
+        self.ack_inflight_timed(packet_id).is_some()
+    }
+
+    /// Release one downlink on its PUBACK and return the held entry so the
+    /// caller can measure delivery-to-ack latency (FX-02). Same promotion
+    /// and lock order as [`Session::ack_inflight`]; `None` for stale ids.
+    /// Ack path only: the publish fast path never calls this.
+    pub fn ack_inflight_timed(&self, packet_id: u16) -> Option<InflightMessage> {
         let mut inflight = self.inflight.write();
         if let Some(pos) = inflight.iter().position(|m| m.packet_id == packet_id) {
-            inflight.remove(pos);
+            let entry = inflight.remove(pos).expect("position checked");
             // Promote the oldest spill so the window stays the oldest
             // entries. Nested `inflight` -> `inflight_spill` order matches
             // the documented lock order; no other path nests in reverse.
@@ -606,23 +621,23 @@ impl Session {
             // spill push only defers promotion to the next ack; replay
             // still covers window then spill oldest-first.
             if self.spill_count.load(Ordering::Relaxed) == 0 {
-                return true;
+                return Some(entry);
             }
             let promoted = self.inflight_spill.write().pop_front();
-            if let Some(entry) = promoted {
+            if let Some(promoted_entry) = promoted {
                 self.spill_count.fetch_sub(1, Ordering::Relaxed);
-                inflight.push_back(entry);
+                inflight.push_back(promoted_entry);
             }
-            return true;
+            return Some(entry);
         }
         drop(inflight);
         let mut spill = self.inflight_spill.write();
         if let Some(pos) = spill.iter().position(|m| m.packet_id == packet_id) {
-            spill.remove(pos);
+            let entry = spill.remove(pos).expect("position checked");
             self.spill_count.fetch_sub(1, Ordering::Relaxed);
-            return true;
+            return Some(entry);
         }
-        false
+        None
     }
 
     /// Ordered snapshot of unacked window downlinks for reconnect replay.
@@ -2349,6 +2364,7 @@ mod tests {
                 qos: broker_protocol::QoS::AtLeastOnce,
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
+                enqueued_at: Instant::now(),
             }
         }
 
@@ -2415,6 +2431,7 @@ mod tests {
                 qos: broker_protocol::QoS::AtLeastOnce,
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
+                enqueued_at: Instant::now(),
             }
         }
 
@@ -2490,6 +2507,7 @@ mod tests {
                 qos: broker_protocol::QoS::AtLeastOnce,
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
+                enqueued_at: Instant::now(),
             }
         }
 
@@ -2567,6 +2585,7 @@ mod tests {
             qos: broker_protocol::QoS::AtLeastOnce,
             retain: false,
             payload: payload.clone(),
+            enqueued_at: Instant::now(),
         };
 
         // BEFORE baseline (pre-B4-01 window-only entry point): the legacy
