@@ -41,7 +41,7 @@
 // stored or documented), until the checker pins it.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -837,6 +837,279 @@ pub async fn reset_authz_source_metrics(
             .into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /authorization/sources/{type}/move`: reposition one source
+/// within the evaluation order and report the new order.
+///
+/// The body must be a JSON object carrying the target under `position`
+/// (a non-negative integer index, a numeric string, or one of the
+/// `front`/`rear`/`before:<type>`/`after:<type>` keywords), or under
+/// `before`/`after` (a stored source type naming the anchor). The move
+/// is bounds-checked: an unknown path type fails with `NOT_FOUND` and
+/// moves nothing, and a bad position (missing key, unknown anchor, or
+/// an index at or past the registry length) fails with `BAD_REQUEST`
+/// and moves nothing. Moving to the entry's current position is a
+/// no-op success. On success returns 200 with the new ordered entries
+/// as a bare JSON array. The new order persists across a restart
+/// through the config registry.
+/// Management-plane only: one short registry write lock per request
+/// (plus the registry save lock on persist); the publish and subscribe
+/// authorization consults read the built-in rule table, never this
+/// registry, and publish/deliver never touch this handler's lock. A
+/// move never grows the list: at most the source cap of entries is
+/// reordered, and the counter set stays fixed.
+// TODO(parity): is the documented move body `{"position": ...}` with a
+// front/rear/before:/after: vocabulary, a `{"before": ...}` /
+// `{"after": ...}` anchor pair, or a numeric index only? The rulebook
+// does not decide the exact envelope; the current choice accepts all
+// three shapes until the checker pins it.
+// TODO(parity): does a successful move report the new order as a 200
+// bare list, a 200 data/meta page, or a 204 with no body? The rulebook
+// does not decide the exact success shape; the current choice answers
+// 200 with the bare ordered entries, mirroring the sibling move, until
+// the checker pins it.
+pub async fn move_authz_source(
+    State(state): State<ApiState>,
+    Path(source_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    if state.authz_sources.get(&source_type).is_none() {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid authorization move body: {e}"))
+                .into_response();
+        }
+    };
+    let order = state.authz_sources.list();
+    let position = match resolve_move_target(&value, &source_type, &order) {
+        Ok(position) => position,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    match state.authz_sources.relocate(&source_type, position) {
+        Ok(order) => {
+            let data: Vec<serde_json::Value> = order.iter().map(render_entry).collect();
+            (StatusCode::OK, Json(data)).into_response()
+        }
+        Err(broker_auth::SourceMoveError::NotFound) => {
+            ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+                .into_response()
+        }
+        Err(broker_auth::SourceMoveError::OutOfRange(msg)) => {
+            ApiError::BadRequest(msg).into_response()
+        }
+        Err(broker_auth::SourceMoveError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist authorization sources: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Resolve a move body into the zero-based target index for `moving`.
+///
+/// Accepted shapes (all equivalent): `{"position": <int>}`, `{"position":
+/// "<int>" | "front" | "rear" | "before:<type>" | "after:<type>"}`,
+/// `{"before": "<type>"}`, `{"after": "<type>"}`. Anchors must name a
+/// stored source type (naming the moving entry itself is a no-op for
+/// both `before` and `after`). Anything else is a
+/// client error describing the bad position; nothing is applied by this
+/// function itself.
+fn resolve_move_target(
+    value: &serde_json::Value,
+    moving: &str,
+    order: &[AuthzSourceEntry],
+) -> Result<usize, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "authorization move body must be a JSON object".to_string())?;
+    if let Some(before) = obj.get("before") {
+        let anchor = before
+            .as_str()
+            .ok_or_else(|| "field `before` must be a source type string".to_string())?;
+        if anchor.trim().is_empty() {
+            return Err("field `before` must not be empty".to_string());
+        }
+        if anchor == moving {
+            let pos = order
+                .iter()
+                .position(|e| e.source_type == moving)
+                .ok_or_else(|| format!("authorization source {moving:?} not found"))?;
+            return Ok(pos);
+        }
+        let anchor_pos = order
+            .iter()
+            .position(|e| e.source_type == anchor)
+            .ok_or_else(|| format!("move anchor {anchor:?} is unknown (field `before`)"))?;
+        let from = order
+            .iter()
+            .position(|e| e.source_type == moving)
+            .ok_or_else(|| format!("authorization source {moving:?} not found"))?;
+        // Removing the moving entry shifts a later anchor down by one.
+        if from < anchor_pos {
+            return Ok(anchor_pos - 1);
+        }
+        return Ok(anchor_pos);
+    }
+    if let Some(after) = obj.get("after") {
+        let anchor = after
+            .as_str()
+            .ok_or_else(|| "field `after` must be a source type string".to_string())?;
+        if anchor.trim().is_empty() {
+            return Err("field `after` must not be empty".to_string());
+        }
+        if anchor == moving {
+            let pos = order
+                .iter()
+                .position(|e| e.source_type == moving)
+                .ok_or_else(|| format!("authorization source {moving:?} not found"))?;
+            return Ok(pos);
+        }
+        let anchor_pos = order
+            .iter()
+            .position(|e| e.source_type == anchor)
+            .ok_or_else(|| format!("move anchor {anchor:?} is unknown (field `after`)"))?;
+        let from = order
+            .iter()
+            .position(|e| e.source_type == moving)
+            .ok_or_else(|| format!("authorization source {moving:?} not found"))?;
+        // Removing the moving entry shifts a later anchor down by one;
+        // the slot after the anchor is the target in final coordinates.
+        if from < anchor_pos {
+            return Ok(anchor_pos);
+        }
+        return Ok(anchor_pos + 1);
+    }
+    let raw = obj
+        .get("position")
+        .ok_or_else(|| "authorization move body must carry `position`".to_string())?;
+    if let Some(index) = raw.as_u64() {
+        let position = index as usize;
+        if position >= order.len() {
+            return Err(format!(
+                "position {position} is out of range for {} entries (valid 0..{})",
+                order.len(),
+                order.len().saturating_sub(1),
+            ));
+        }
+        return Ok(position);
+    }
+    if let Some(text) = raw.as_str() {
+        let trimmed = text.trim();
+        if let Ok(index) = trimmed.parse::<usize>() {
+            if index >= order.len() {
+                return Err(format!(
+                    "position {index} is out of range for {} entries (valid 0..{})",
+                    order.len(),
+                    order.len().saturating_sub(1),
+                ));
+            }
+            return Ok(index);
+        }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "front" | "first" | "top" | "begin" => return Ok(0),
+            "rear" | "last" | "end" | "bottom" => {
+                if order.is_empty() {
+                    return Err("authorization source registry is empty".to_string());
+                }
+                return Ok(order.len() - 1);
+            }
+            _ => {}
+        }
+        if let Some(anchor) = trimmed
+            .strip_prefix("before:")
+            .or_else(|| trimmed.strip_prefix("BEFORE:"))
+        {
+            let anchor = anchor.trim();
+            if anchor.is_empty() {
+                return Err("field `position` must not be empty".to_string());
+            }
+            return resolve_move_target(&serde_json::json!({"before": anchor}), moving, order);
+        }
+        if let Some(anchor) = trimmed
+            .strip_prefix("after:")
+            .or_else(|| trimmed.strip_prefix("AFTER:"))
+        {
+            let anchor = anchor.trim();
+            if anchor.is_empty() {
+                return Err("field `position` must not be empty".to_string());
+            }
+            return resolve_move_target(&serde_json::json!({"after": anchor}), moving, order);
+        }
+        return Err(format!(
+            "field `position` {text:?} is unknown: expected an index or front/rear/before:<type>/after:<type>"
+        ));
+    }
+    Err("field `position` must be an index or a position keyword".to_string())
+}
+
+/// `GET /authorization/sources/{type}/status`: liveness plus live
+/// counters for one source.
+///
+/// Returns 200 with the stored `type`/`enable`, the live `status` (and
+/// its single-node `node_status` row), the live counter-only `metrics`
+/// (and its single-node `node_metrics` row) and the empty `node_error`
+/// list. Unknown types fail with `NOT_FOUND` in the documented `{code,
+/// message}` shape. Unknown query keys are ignored: the route is not
+/// paged, so extra keys never become a 400. Status is live and does not
+/// persist (counters are memory-only and restart at zero); no outbound
+/// connection is opened to decide it.
+/// Management-plane read only: one short registry read plus lock-free
+/// atomic loads; publish and deliver never touch this store. The
+/// counter set is fixed (allow/deny/total per source type, at most the
+/// source cap of records).
+// TODO(parity): which status fields plus rate/resource shapes does the
+// spec require (rates, resource metrics, exact status vocabulary)? The
+// rulebook does not decide the exact shape; the current choice reports
+// the honest live subset the broker can supply (`type`, `enable`,
+// `status` plus single-node `node_status`, counter-only `metrics` plus
+// single-node `node_metrics`, empty `node_error`) and omits rate and
+// resource fields the broker does not track rather than standing a
+// constant in for a measurement.
+pub async fn get_authz_source_status(
+    State(state): State<ApiState>,
+    Path(source_type): Path<String>,
+    Query(_ignored): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(entry) = state.authz_sources.get(&source_type) else {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    };
+    let counters = state
+        .authz_sources
+        .counter_snapshot(&source_type)
+        .unwrap_or(broker_auth::AuthzSourceCounterSnapshot {
+            allow: 0,
+            deny: 0,
+            total: 0,
+        });
+    let status = live_status(&entry);
+    let node = state.node_id.clone();
+    let metrics = serde_json::json!({
+        "allow": counters.allow,
+        "deny": counters.deny,
+        "total": counters.total,
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "type": entry.source_type,
+            "enable": entry.enable,
+            "status": status,
+            "node_status": [{"node": node, "status": status}],
+            "metrics": metrics,
+            "node_metrics": [{"node": node, "metrics": metrics}],
+            "node_error": [],
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -1728,6 +2001,287 @@ mod tests {
             .map(|e| e.source_type.clone())
             .collect();
         assert_eq!(ids, vec!["file".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    async fn move_call(
+        state: &ApiState,
+        source_type: &str,
+        payload: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        parts(
+            move_authz_source(
+                State(state.clone()),
+                Path(source_type.to_string()),
+                body(payload),
+            )
+            .await,
+        )
+        .await
+    }
+
+    async fn status_call(
+        state: &ApiState,
+        source_type: &str,
+    ) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        parts(
+            get_authz_source_status(
+                State(state.clone()),
+                Path(source_type.to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn source_move_round_trip_and_status_shape_through_broker() {
+        // The task's failing test: before this task both routes were
+        // missing (bare 404). Create two sources, move the second before
+        // the first and list order expecting the change; read status
+        // expecting the documented fields. Goes through the broker, not
+        // only the store: the stored built-in source is observed on
+        // `authorize_publish` (consulted by the publish event in
+        // `crates/broker-node/src/main.rs`) while the move reports and
+        // the status reads the same stored sources.
+        let state = standalone_state();
+        for source_type in ["file", "http"] {
+            let (status, _, _) = parts(
+                create_authz_source(
+                    State(state.clone()),
+                    body(serde_json::json!({"type": source_type})),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "create {source_type}");
+        }
+        assert_eq!(
+            list_types(&state).await,
+            vec![
+                "built_in_database".to_string(),
+                "file".to_string(),
+                "http".to_string(),
+            ]
+        );
+
+        // Move the second stored source before the first via the anchor
+        // shape and expect the new order back.
+        let (status, moved, _) = move_call(
+            &state,
+            "file",
+            serde_json::json!({"before": "built_in_database"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let moved_types: Vec<String> = moved
+            .as_array()
+            .expect("move reports bare order array")
+            .iter()
+            .map(|row| row["type"].as_str().expect("row has type").to_string())
+            .collect();
+        assert_eq!(
+            moved_types,
+            vec![
+                "file".to_string(),
+                "built_in_database".to_string(),
+                "http".to_string(),
+            ]
+        );
+        assert_eq!(list_types(&state).await, moved_types);
+
+        // The numeric-index shape moves back; the keyword shape reaches
+        // the end of the list.
+        let (status, moved, _) =
+            move_call(&state, "file", serde_json::json!({"position": 1})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(moved[1]["type"], serde_json::json!("file"));
+        let (status, moved, _) = move_call(
+            &state,
+            "built_in_database",
+            serde_json::json!({"position": "front"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(moved[0]["type"], serde_json::json!("built_in_database"));
+
+        // Status carries the documented fields: identity plus liveness,
+        // health rows and counters.
+        let (status, shaped, _) = status_call(&state, "file").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(shaped["type"], serde_json::json!("file"));
+        assert_eq!(shaped["enable"], serde_json::json!(true));
+        assert_eq!(shaped["status"], serde_json::json!("disconnected"));
+        assert_eq!(
+            shaped["node_status"][0]["status"],
+            serde_json::json!("disconnected")
+        );
+        assert!(shaped["node_status"][0]["node"].is_string());
+        assert_eq!(shaped["metrics"]["allow"], serde_json::json!(0));
+        assert_eq!(shaped["metrics"]["deny"], serde_json::json!(0));
+        assert_eq!(shaped["metrics"]["total"], serde_json::json!(0));
+        assert_eq!(
+            shaped["node_metrics"][0]["metrics"]["total"],
+            shaped["metrics"]["total"]
+        );
+        assert_eq!(shaped["node_error"], serde_json::json!([]));
+
+        // The built-in entry executes locally, so it reads as connected.
+        let (status, builtin, _) = status_call(&state, "built_in_database").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(builtin["status"], serde_json::json!("connected"));
+
+        // Unknown query keys never become a 400 on the status read.
+        let (status, _, _) = parts(
+            get_authz_source_status(
+                State(state.clone()),
+                Path("file".to_string()),
+                Query(
+                    [("unknown_param".to_string(), "1".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The stored built-in source is live on the publish path: the
+        // empty table allows.
+        let topic = broker_protocol::Topic::new("w224/data").expect("topic parses");
+        state
+            .auth
+            .authorize_publish("any-client", &topic)
+            .await
+            .expect("empty table allows on the publish path");
+
+        // Counters move on explicit records and read back on status.
+        state.authz_sources.record_allow("file");
+        state.authz_sources.record_deny("file");
+        let (status, moved, _) = status_call(&state, "file").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(moved["metrics"]["allow"], serde_json::json!(1));
+        assert_eq!(moved["metrics"]["deny"], serde_json::json!(1));
+        assert_eq!(moved["metrics"]["total"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn source_move_rejects_bad_without_change_and_unknown_is_404() {
+        // Bounds-checked reorder: bad positions are client errors and
+        // move nothing; unknown types are 404 with the documented shape.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_authz_source(
+                State(state.clone()),
+                body(serde_json::json!({"type": "file"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let before = list_types(&state).await;
+
+        let bad_bodies = [
+            serde_json::json!({"position": 99}),
+            serde_json::json!({"position": "99"}),
+            serde_json::json!({"position": "middle"}),
+            serde_json::json!({"position": "before:nowhere"}),
+            serde_json::json!({"position": "after:nowhere"}),
+            serde_json::json!({"before": "nowhere"}),
+            serde_json::json!({"after": "nowhere"}),
+            serde_json::json!({"before": ""}),
+            serde_json::json!({"after": 7}),
+            serde_json::json!({"position": true}),
+            serde_json::json!({"elsewhere": "front"}),
+            serde_json::json!([]),
+        ];
+        for bad in bad_bodies {
+            let (status, err, _) = move_call(&state, "file", bad.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "body {bad} must be rejected"
+            );
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(err["message"].is_string());
+        }
+        assert_eq!(list_types(&state).await, before);
+
+        // Unknown types miss on both routes with the documented shape.
+        let (status, missing, _) =
+            move_call(&state, "nowhere", serde_json::json!({"position": "front"})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(missing["message"].is_string());
+        let (status, missing, _) = status_call(&state, "nowhere").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(missing["message"].is_string());
+        assert_eq!(list_types(&state).await, before);
+    }
+
+    #[tokio::test]
+    async fn source_move_persists_order_but_not_counters() {
+        // Bound: the source cap is stated, finite, and enforced; the
+        // counter set is fixed (allow/deny/total per type, at most the
+        // capped records).
+        assert_eq!(broker_config::MAX_AUTHZ_SOURCES, 8);
+
+        // Persistence: a move through a registry-backed registry survives
+        // a reload of the same data dir in the new order, while counters
+        // restart at zero.
+        let dir = std::env::temp_dir().join(format!(
+            "authz-source-move-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("fresh dir loads"),
+        );
+        let sources = broker_auth::AuthzSourceRegistry::from_registry(&registry);
+        sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("persist file");
+        sources.relocate("file", 0).expect("persist move applies");
+        sources.record_allow("file");
+        assert_eq!(
+            sources
+                .counter_snapshot("file")
+                .expect("counters move before restart")
+                .total,
+            1
+        );
+        assert!(dir.join(broker_config::STATE_FILE_NAME).is_file());
+        drop(sources);
+        drop(registry);
+        let reloaded =
+            std::sync::Arc::new(broker_config::ConfigRegistry::load(&dir).expect("dir reloads"));
+        let restarted = broker_auth::AuthzSourceRegistry::from_registry(&reloaded);
+        let ids: Vec<_> = restarted
+            .list()
+            .iter()
+            .map(|e| e.source_type.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["file".to_string(), "built_in_database".to_string()]
+        );
+        // Counters do not persist: the restarted source reads at zero.
+        let counters = restarted
+            .counter_snapshot("file")
+            .expect("counter record exists after restart");
+        assert_eq!(counters.allow, 0);
+        assert_eq!(counters.deny, 0);
+        assert_eq!(counters.total, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

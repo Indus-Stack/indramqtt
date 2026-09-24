@@ -268,6 +268,20 @@ pub fn protected_router() -> Router<ApiState> {
             "/authorization/sources/:type/metrics/reset",
             post(authz_sources::reset_authz_source_metrics),
         )
+        // Authorization (AuthZ / ACL) single-source move plus status
+        // (W2-24, C04-29/C04-30): bounds-checked reposition over the real
+        // registry reporting the new order, and a live liveness plus
+        // counter read over the real entry. Management-plane only;
+        // publish and deliver never touch the registry (the built-in
+        // rule consult stays on the publish/subscribe path).
+        .route(
+            "/authorization/sources/:type/move",
+            post(authz_sources::move_authz_source),
+        )
+        .route(
+            "/authorization/sources/:type/status",
+            get(authz_sources::get_authz_source_status),
+        )
         // Authorization (AuthZ / ACL) generic per-type rule helpers.
         .route(
             "/authorization/sources/:type/rules",

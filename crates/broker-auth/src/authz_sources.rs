@@ -113,6 +113,17 @@ pub enum SourceReorderError {
     Persist(String),
 }
 
+/// Why [`AuthzSourceRegistry::relocate`] refused a move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceMoveError {
+    /// No stored source carries the requested `type`.
+    NotFound,
+    /// The target position is outside the stored order.
+    OutOfRange(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
+
 /// Why [`AuthzSourceRegistry::remove`] refused a delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceRemoveError {
@@ -441,6 +452,62 @@ impl AuthzSourceRegistry {
                 .map_err(|e| SourceReorderError::Persist(e.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Move one stored source to a zero-based position and report the new
+    /// order.
+    ///
+    /// Unknown types fail with `NotFound` and apply nothing. A target at
+    /// or past the registry length fails with `OutOfRange` and moves
+    /// nothing. Moving to the entry's current index is a no-op success.
+    /// On success the stored order, the lock-free snapshot and the
+    /// persisted registry all move together, so the order persists across
+    /// a restart. Management-plane only: one short write lock per request
+    /// (plus the registry save lock on persist); the publish and
+    /// subscribe consults read the built-in rule table, never this
+    /// registry, and publish/deliver never touch this store. A move never
+    /// grows the list, it only reorders at most the capped entries.
+    pub fn relocate(
+        &self,
+        source_type: &str,
+        position: usize,
+    ) -> Result<Vec<AuthzSourceEntry>, SourceMoveError> {
+        let _guard = self.save_lock.lock();
+        let (reordered, conf, moved) = {
+            let mut current = self.inner.write();
+            let Some(from) = current.iter().position(|e| e.source_type == source_type) else {
+                return Err(SourceMoveError::NotFound);
+            };
+            if position >= current.len() {
+                return Err(SourceMoveError::OutOfRange(format!(
+                    "position {position} is out of range for {} entries (valid 0..{})",
+                    current.len(),
+                    current.len().saturating_sub(1),
+                )));
+            }
+            if from == position {
+                return Ok(current.clone());
+            }
+            let entry = current.remove(from);
+            current.insert(position, entry);
+            let next = current.clone();
+            let conf = export_conf(&next);
+            conf.validate()
+                .map_err(|e| SourceMoveError::Persist(e.to_string()))?;
+            self.snapshot.store(Arc::new(next.clone()));
+            (next, conf, true)
+        };
+        if moved {
+            if let Some(registry) = self.registry.read().clone() {
+                registry
+                    .commit_authz_sources(conf)
+                    .map_err(|e| SourceMoveError::Persist(e.to_string()))?;
+                registry
+                    .save()
+                    .map_err(|e| SourceMoveError::Persist(e.to_string()))?;
+            }
+        }
+        Ok(reordered)
     }
 
     /// Remove the source stored under `type`, returning it.
