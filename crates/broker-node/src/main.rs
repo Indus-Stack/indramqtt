@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use broker_auth::{
-    Authenticator, AuthnChain, AuthnSettingsStore, Authorizer, DbAuthSet, DbAuthSetConfig,
-    JwksAuthenticator, JwksConfig, KerberosAuthenticator, KerberosConfig, LdapAuthenticator,
-    LdapConfig, MemoryAuth, NodeAuthCache, WebhookAuth, WebhookConfig,
+    Authenticator, AuthnChain, AuthnSettingsStore, Authorizer, AuthzNodeCache, DbAuthSet,
+    DbAuthSetConfig, JwksAuthenticator, JwksConfig, KerberosAuthenticator, KerberosConfig,
+    LdapAuthenticator, LdapConfig, MemoryAuth, NodeAuthCache, WebhookAuth, WebhookConfig,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
@@ -1941,6 +1941,13 @@ struct Shared {
     /// CONNECT loads one lock-free snapshot per connect and never takes
     /// the settings write lock; publish and deliver never touch it.
     authn_settings: Arc<AuthnSettingsStore>,
+    /// Node authorization cache policy for W2-14: shared with the
+    /// management API so validated policy writes are visible to reads
+    /// without a restart. One `Arc` clone at boot; the kernel boot path
+    /// seeds it from the registry and management reads take one
+    /// lock-free snapshot per request; publish and deliver never touch
+    /// it. Cached verdicts stay per-session and memory-only.
+    authz_node_cache: Arc<AuthzNodeCache>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -2172,6 +2179,7 @@ impl Shared {
             authn_chain: Arc::new(AuthnChain::new()),
             authn_node_cache,
             authn_settings,
+            authz_node_cache: Arc::new(AuthzNodeCache::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -5510,6 +5518,12 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // replaces that fresh instance with the kernel's so no second copy
     // diverges.
     state.authn_settings = shared.authn_settings.clone();
+    // Share the authorization node-cache policy (W2-14) so validated
+    // management writes are visible to reads without a restart. One
+    // `Arc` clone; management-plane only, never on the delivery path.
+    // Seeding already ran inside `ApiState::new`; sharing replaces that
+    // fresh instance with the kernel's so no second copy diverges.
+    state.authz_node_cache = shared.authz_node_cache.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -5668,6 +5682,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .authn_node_cache
             .apply_settings(current.node_cache.enable, current.node_cache.max_count);
     }
+    // Authorization node-cache policy (W2-14): seed the shared store in
+    // place (the same instance `serve_api` shares with `ApiState`), so
+    // management reads observe the persisted policy from the first
+    // connection. Cached verdicts always start empty (memory-only,
+    // per-session).
+    shared.authz_node_cache.seed_from_registry(&shared.config);
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.

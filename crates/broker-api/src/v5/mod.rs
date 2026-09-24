@@ -7,6 +7,7 @@ pub mod authn_chain;
 pub mod authn_settings;
 pub mod authn_status;
 pub mod authz_cache;
+pub mod authz_node_cache;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
@@ -139,6 +140,20 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/authorization/cache",
             delete(authz_cache::clear_authz_cache),
+        )
+        // Authorization (AuthZ / ACL) node-cache config read/write plus
+        // node reset (W2-14, C04-02..C04-04): validated policy replace
+        // persisted via the config registry, and an eviction that clears
+        // every per-session decision entry on this node so subsequent
+        // decisions are recomputed. Management-plane only; publish and
+        // deliver never touch it.
+        .route(
+            "/authorization/node_cache",
+            get(authz_node_cache::get_authz_node_cache).put(authz_node_cache::put_authz_node_cache),
+        )
+        .route(
+            "/authorization/node_cache/reset",
+            post(authz_node_cache::reset_authz_node_cache),
         )
         // Authorization (AuthZ / ACL) rules
         .route(

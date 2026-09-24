@@ -767,6 +767,121 @@ impl AuthnSettingsConf {
     }
 }
 
+/// Default authorization node-cache entry cap (50 000 entries,
+/// LRU-evicted). Reason: the node cache holds one small verdict per
+/// recently authorized (action, topic) pair, so it must stay bounded;
+/// 50 000 entries cover a busy node's working set with headroom while
+/// keeping status snapshots and resets cheap (one short lock, at most
+/// the capped small entries).
+pub const DEFAULT_AUTHZ_NODE_CACHE_MAX: usize = 50_000;
+/// Upper bound for the authorization node-cache cap (1 000 000 entries).
+/// Reason: caps above this would let one node hold unbounded
+/// authorization state; larger values are rejected instead of growing
+/// without limit.
+pub const MAX_AUTHZ_NODE_CACHE_MAX: usize = 1_000_000;
+
+/// Default authorization node-cache entry TTL ("60s"). Reason: cached
+/// verdicts must expire quickly so an ACL change takes effect; one
+/// minute bounds staleness while keeping repeated authorizations cheap
+/// (mirrors the 60 s database verdict TTL).
+fn default_authz_node_cache_ttl() -> String {
+    "60s".to_string()
+}
+
+/// Default authorization node-cache cleanup interval ("60s"). Reason:
+/// expiry sweeps run on the same cadence as the TTL so expired entries
+/// do not linger past one TTL window.
+fn default_authz_node_cache_cleanup_interval() -> String {
+    "60s".to_string()
+}
+
+/// Default authorization node-cache statistics update interval ("5s").
+/// Reason: cache counters feed management status reads, so a few
+/// seconds keep the status fresh without waking the sweeper per request.
+fn default_authz_node_cache_stat_update_interval() -> String {
+    "5s".to_string()
+}
+
+/// Default authorization node-cache entry cap (50 000 entries). Reason:
+/// stated on [`DEFAULT_AUTHZ_NODE_CACHE_MAX`].
+fn default_authz_node_cache_max_count() -> usize {
+    DEFAULT_AUTHZ_NODE_CACHE_MAX
+}
+
+/// Default authorization node-cache memory cap ("100MB"). Reason:
+/// entries are small verdict records, so 100MB bounds the cache far
+/// above the entry-cap worst case while letting an operator raise it
+/// explicitly with `unlimited`.
+fn default_authz_node_cache_max_memory() -> String {
+    "100MB".to_string()
+}
+
+/// Node-level authorization decision-cache configuration. Only this
+/// validated struct persists via the registry; cached verdicts
+/// themselves are memory-only and never survive a restart.
+// TODO(parity): does the documented config accept an explicit
+// `unlimited` entry cap, and does the documented PUT merge missing
+// fields or reset them to defaults? The rulebook does not decide the
+// cap opt-in or the merge semantics; the current choice rejects
+// `unlimited` caps as the conservative bounded answer and replaces
+// missing fields with the defaults below (full replace).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzNodeCacheConf {
+    /// Whether authorization verdicts are cached on this node
+    /// (default true).
+    #[serde(default = "default_authn_node_cache_enabled")]
+    pub enable: bool,
+    /// Cached verdict TTL (default "60s").
+    #[serde(default = "default_authz_node_cache_ttl")]
+    pub cache_ttl: String,
+    /// Expired-entry sweep interval (default "60s").
+    #[serde(default = "default_authz_node_cache_cleanup_interval")]
+    pub cleanup_interval: String,
+    /// Statistics refresh interval (default "5s").
+    #[serde(default = "default_authz_node_cache_stat_update_interval")]
+    pub stat_update_interval: String,
+    /// Entry cap (default 50 000, at most 1 000 000).
+    #[serde(default = "default_authz_node_cache_max_count")]
+    pub max_count: usize,
+    /// Memory cap (default "100MB", or explicit `unlimited` opt-in).
+    #[serde(default = "default_authz_node_cache_max_memory")]
+    pub max_memory: String,
+}
+
+impl Default for AuthzNodeCacheConf {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            cache_ttl: default_authz_node_cache_ttl(),
+            cleanup_interval: default_authz_node_cache_cleanup_interval(),
+            stat_update_interval: default_authz_node_cache_stat_update_interval(),
+            max_count: default_authz_node_cache_max_count(),
+            max_memory: default_authz_node_cache_max_memory(),
+        }
+    }
+}
+
+impl AuthzNodeCacheConf {
+    /// Validates the entry cap and every duration/byte-size string.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_count == 0 || self.max_count > MAX_AUTHZ_NODE_CACHE_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "authz_node_cache.max_count holds {}, must be 1..={} (field `max_count`)",
+                self.max_count, MAX_AUTHZ_NODE_CACHE_MAX
+            )));
+        }
+        validate_settings_duration("authz_node_cache.cache_ttl", &self.cache_ttl)?;
+        validate_settings_duration("authz_node_cache.cleanup_interval", &self.cleanup_interval)?;
+        validate_settings_duration(
+            "authz_node_cache.stat_update_interval",
+            &self.stat_update_interval,
+        )?;
+        validate_settings_bytesize("authz_node_cache.max_memory", &self.max_memory)?;
+        Ok(())
+    }
+}
+
 /// Durations are `<n>ms|s|m|h|d` (integer or float count, no spaces).
 fn validate_settings_duration(field: &str, text: &str) -> Result<(), ConfigError> {
     if parse_settings_duration_to_ms(text).is_none() {
@@ -935,6 +1050,8 @@ pub struct FullSnapshot {
     pub authn_node_cache: AuthnNodeCacheConf,
     #[serde(default)]
     pub authn_settings: AuthnSettingsConf,
+    #[serde(default)]
+    pub authz_node_cache: AuthzNodeCacheConf,
 }
 
 impl FullSnapshot {
@@ -947,6 +1064,7 @@ impl FullSnapshot {
         self.authn_chain.validate()?;
         self.authn_node_cache.validate()?;
         self.authn_settings.validate()?;
+        self.authz_node_cache.validate()?;
         Ok(())
     }
 }
@@ -968,6 +1086,8 @@ pub enum ConfigRoot {
     AuthnNodeCache(AuthnNodeCacheConf),
     /// Validated global authentication settings root.
     AuthnSettings(AuthnSettingsConf),
+    /// Validated node authorization cache config root.
+    AuthzNodeCache(AuthzNodeCacheConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1051,6 +1171,7 @@ impl ConfigRegistry {
             ConfigRoot::AuthnChain(conf) => self.commit_authn_chain(conf),
             ConfigRoot::AuthnNodeCache(conf) => self.commit_authn_node_cache(conf),
             ConfigRoot::AuthnSettings(conf) => self.commit_authn_settings(conf),
+            ConfigRoot::AuthzNodeCache(conf) => self.commit_authz_node_cache(conf),
         }
     }
 
@@ -1126,6 +1247,17 @@ impl ConfigRegistry {
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.authn_settings = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Commits a validated node authorization cache config root.
+    pub fn commit_authz_node_cache(&self, conf: AuthzNodeCacheConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.authz_node_cache = conf.clone();
             next
         });
         Ok(())
@@ -1239,6 +1371,7 @@ mod tests {
             authn_chain: AuthnChainConf::default(),
             authn_node_cache: AuthnNodeCacheConf::default(),
             authn_settings: AuthnSettingsConf::default(),
+            authz_node_cache: AuthzNodeCacheConf::default(),
         }
     }
 

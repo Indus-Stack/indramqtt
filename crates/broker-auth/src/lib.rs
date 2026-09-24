@@ -1,3 +1,4 @@
+pub mod authz_node_cache;
 pub mod chain;
 pub mod db;
 pub mod jwks;
@@ -14,6 +15,7 @@ pub mod node_cache;
 pub mod settings;
 pub mod webhook;
 
+pub use authz_node_cache::{AuthzCacheUpdateError, AuthzNodeCache};
 pub use chain::{
     AuthnChain, AuthnCounterSnapshot, AuthnEntry, ChainInsertError, ChainMoveError,
     ChainRemoveError, ChainReorderError, ChainUpdateError,

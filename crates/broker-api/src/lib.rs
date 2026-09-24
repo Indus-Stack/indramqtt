@@ -152,6 +152,18 @@ pub struct ApiState {
     /// console CONNECT in `crates/broker-api/src/ws.rs`); publish and
     /// deliver never touch it.
     pub authn_settings: Arc<crate::v5::authn_settings::AuthnSettingsStore>,
+    /// Node authorization cache policy for `GET/PUT
+    /// /api/v5/authorization/node_cache` and `POST
+    /// /api/v5/authorization/node_cache/reset` (W2-14): single validated
+    /// struct with registry persistence. The routes read one snapshot
+    /// per request; the kernel boot path seeds the same instance from
+    /// the registry (`crates/broker-node/src/main.rs`, boot seeding);
+    /// the reset evicts every per-session decision entry recorded by
+    /// the publish and subscribe authorization events
+    /// (`crates/broker-session/src/lib.rs`,
+    /// `SessionManager::clear_all_authz_caches`). Publish and deliver
+    /// never touch this store.
+    pub authz_node_cache: Arc<broker_auth::AuthzNodeCache>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -212,6 +224,11 @@ impl ApiState {
         // The subscriber keeps the node cache's enabled flag and cap in
         // sync with the settings' cache half on every validated replace.
         let authn_settings = Arc::new(broker_auth::AuthnSettingsStore::from_registry(&config));
+        // Boot seeding (W2-14): route the loaded authorization
+        // node-cache policy into a shared store so management reads
+        // observe the persisted policy without a restart. Cached verdicts
+        // always start empty (memory-only, per-session).
+        let authz_node_cache = Arc::new(broker_auth::AuthzNodeCache::from_registry(&config));
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -253,6 +270,7 @@ impl ApiState {
             authn_chain,
             authn_node_cache,
             authn_settings,
+            authz_node_cache,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -308,6 +326,7 @@ impl ApiState {
             authn_chain: Arc::new(broker_auth::AuthnChain::new()),
             authn_node_cache,
             authn_settings,
+            authz_node_cache: Arc::new(broker_auth::AuthzNodeCache::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -3392,6 +3411,230 @@ mod tests {
             )
             .await;
         assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn authz_node_cache_config_reset_round_trip() {
+        // Node-cache config read/write plus reset (W2-14, C04-02..C04-04)
+        // through the broker: GET defaults, PUT a valid update and read
+        // it back, PUT invalid expecting rejection with no change, then
+        // authorized activity populates the node-cached decisions
+        // (per-session entries recorded by the publish and subscribe
+        // authorization events at `crates/broker-session/src/lib.rs`
+        // `Session::record_authz_decision`, driven from
+        // `crates/broker-node/src/main.rs`), the node reset evicts them,
+        // and the next authorized decision is recomputed. Management-plane
+        // only; publish and deliver never touch the policy store.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Defaults read back with the documented fields.
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/node_cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        assert_eq!(body["cache_ttl"], json!("60s"));
+        assert_eq!(body["cleanup_interval"], json!("60s"));
+        assert_eq!(body["stat_update_interval"], json!("5s"));
+        assert_eq!(body["max_count"], json!(50_000));
+        assert_eq!(body["max_memory"], json!("100MB"));
+
+        // Unknown query keys are ignored on the read, not a 400.
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/node_cache?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["max_count"], json!(50_000));
+
+        // Full valid replace through the broker.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/node_cache",
+                json!({
+                    "enable": true,
+                    "cache_ttl": "30s",
+                    "cleanup_interval": "60s",
+                    "stat_update_interval": "5s",
+                    "max_count": 5000,
+                    "max_memory": "100MB",
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/node_cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["cache_ttl"], json!("30s"));
+        assert_eq!(body["max_count"], json!(5000));
+
+        // Invalid writes are rejected with the documented shape and apply
+        // nothing.
+        for bad in [
+            json!({"enable": "yes"}),
+            json!({"cache_ttl": "soon"}),
+            json!({"max_count": 0}),
+            json!({"max_count": 2_000_000}),
+            json!({"max_count": "many"}),
+            json!({"max_memory": "huge"}),
+            json!({"enable": true, "bogus": 1}),
+        ] {
+            let (status, body) = server
+                .put_auth("/api/v5/authorization/node_cache", bad, &token)
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(body["message"].is_string());
+        }
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/node_cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["cache_ttl"], json!("30s"));
+        assert_eq!(body["max_count"], json!(5000));
+
+        // Resetting empty still succeeds (204).
+        let (status, _) = server
+            .post_auth("/api/v5/authorization/node_cache/reset", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // Populate through normal authorized activity through the broker:
+        // a console SUBSCRIBE (real subscribe authorization) plus a
+        // console PUBLISH from a second connection (real publish
+        // authorization) that delivers to the subscriber.
+        let mut subscriber = WsClient::connect(server.port).await;
+        subscriber
+            .send_bin(&mqtt_connect("w2-14-cache-1", None, None))
+            .await;
+        let connack = subscriber.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        subscriber
+            .send_bin(&mqtt_subscribe(7, &[("w2-14/topic", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+        let mut publisher = WsClient::connect(server.port).await;
+        publisher
+            .send_bin(&mqtt_connect("w2-14-cache-2", None, None))
+            .await;
+        let connack = publisher.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        publisher
+            .send_bin(&mqtt_publish("w2-14/topic", 0, 0, b"hi"))
+            .await;
+        // Deliver proves the publish rode the broker route path.
+        let delivery = subscriber.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+
+        // Both per-client caches hold their node-cached decision.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-14-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("cache is a list").len(), 1);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-14-cache-2/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("cache is a list").len(), 1);
+
+        // Node reset evicts every entry on this node.
+        let (status, _) = server
+            .post_auth("/api/v5/authorization/node_cache/reset", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-14-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-14-cache-2/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // The next authorized decision is recomputed (the cache
+        // repopulates on the next publish through the broker).
+        publisher
+            .send_bin(&mqtt_publish("w2-14/topic", 0, 0, b"again"))
+            .await;
+        let delivery = subscriber.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-14-cache-2/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("cache is a list").len(), 1);
+
+        // Resetting again still succeeds, and unknown query keys are
+        // ignored, not a 400.
+        let (status, _) = server
+            .post_auth("/api/v5/authorization/node_cache/reset", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/authorization/node_cache/reset?unknown_param=1",
+                Some(json!({})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn authz_node_cache_policy_survives_restart() {
+        // Policy persistence across a restart through the config
+        // registry: PUT through the broker, reload the same data dir in a
+        // fresh server, and read the policy back. Cached verdict entries
+        // are memory-only and do not cross the restart.
+        let dir = unique_data_dir("authz-node-cache");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/node_cache",
+                json!({
+                    "enable": true,
+                    "cache_ttl": "30s",
+                    "cleanup_interval": "60s",
+                    "stat_update_interval": "5s",
+                    "max_count": 5000,
+                    "max_memory": "100MB",
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth("/api/v5/authorization/node_cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["cache_ttl"], json!("30s"));
+        assert_eq!(body["max_count"], json!(5000));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
