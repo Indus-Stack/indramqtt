@@ -344,18 +344,25 @@ fn apply_single_subscribe(
         }
     };
     let (filter, qos, nl, rap, rh) = parse_subscribe_entry(entry)?;
-    state
-        .sessions
-        .add_subscription_with_options(client_id, filter.clone(), qos, nl, rap, rh);
-
     // Live connection owns the router copy; offline subscribes keep a
     // placeholder until a live re-subscribe replaces it (the trie holds
     // at most one `conn_id` per `(filter node, client_id)`).
     let conn_id = (*session.conn_id.read()).unwrap_or(1);
 
-    state
+    // B4-08 bound: a new entry past the subscription-table cap is denied
+    // fail closed with the documented quota error, registering nothing
+    // and changing no session state (no session mirror on failure).
+    let stored = state
         .router
         .subscribe(&filter, Subscription::new(client_id, conn_id, qos));
+    if !stored {
+        return Err(ApiError::TooManyRequests(
+            "subscription table full".to_string(),
+        ));
+    }
+    state
+        .sessions
+        .add_subscription_with_options(client_id, filter.clone(), qos, nl, rap, rh);
 
     Ok(serde_json::json!({
         "clientid": client_id,
@@ -1606,5 +1613,68 @@ mod tests {
             rendered.get("connected_at").is_none(),
             "sessions predating timestamp recording must omit connected_at: {rendered}"
         );
+    }
+
+    /// B4-08 bound: a full subscription table denies the management
+    /// subscribe fail closed with the documented quota error (never a
+    /// 200 with a success body) and changes no session state. Fills the
+    /// router to MAX_SUBSCRIPTIONS with three-level filters so each
+    /// path copy stays small.
+    #[tokio::test]
+    async fn quota_full_subscribe_returns_error_and_changes_no_session_state() {
+        let state = standalone_state();
+        let (session, _) = state.sessions.get_or_create("quota-client", true);
+        *session.conn_id.write() = Some(4242);
+        for i in 0..broker_router::MAX_SUBSCRIPTIONS {
+            let a = i / 10_000;
+            let b = (i / 100) % 100;
+            let c = i % 100;
+            let filter = TopicFilter::new(format!("quota/fill/{a}/{b:02}/{c:02}"))
+                .expect("valid fill filter");
+            assert!(
+                state.router.subscribe(
+                    &filter,
+                    Subscription::new(format!("fill-{i}"), i as u64, QoS::AtMostOnce)
+                ),
+                "fill subscribe {i} must succeed"
+            );
+        }
+
+        let entry = serde_json::json!({"topic": "quota/probe", "qos": 0});
+        let error = apply_single_subscribe(&state, "quota-client", &entry)
+            .expect_err("full table must fail, never succeed");
+        assert_eq!(error.code(), "TOO_MANY_REQUESTS");
+        assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The failed subscribe registers nothing: no session mirror, no
+        // router entry.
+        assert!(
+            state
+                .sessions
+                .get("quota-client")
+                .expect("session row")
+                .subscriptions
+                .read()
+                .keys()
+                .all(|f| f.as_str() != "quota/probe"),
+            "quota-denied subscribe must leave the session unchanged"
+        );
+        assert!(
+            state
+                .router
+                .matches(&Topic::new("quota/probe").expect("valid probe topic"))
+                .is_empty(),
+            "quota-denied subscribe must leave the router unchanged"
+        );
+
+        // The HTTP route reports the documented error, never a 200 with
+        // a success body.
+        let body = Bytes::from(serde_json::to_vec(&entry).expect("entry is JSON"));
+        let (status, rendered) = response_parts(
+            client_subscribe(State(state), Path("quota-client".to_string()), body).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rendered["code"], serde_json::json!("TOO_MANY_REQUESTS"));
     }
 }

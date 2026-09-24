@@ -732,7 +732,12 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
         let Ok(qos) = QoS::try_from(entry.qos) else {
             continue;
         };
-        shared.router.subscribe(
+        // B4-08 bound: a full subscription table denies the entry fail
+        // closed, exactly as `apply_subscribe` does. A denied auto
+        // subscription registers nothing (no session mirror) and counts
+        // nothing as applied, so a failed subscribe changes no session
+        // state.
+        let stored = shared.router.subscribe(
             &filter,
             Subscription {
                 client_id: client_id.into(),
@@ -741,6 +746,9 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
                 group: None,
             },
         );
+        if !stored {
+            continue;
+        }
         shared
             .sessions
             .add_subscription_with_options(client_id, filter, qos, entry.nl, entry.rap, entry.rh);
@@ -2618,6 +2626,8 @@ where
 /// (FilterLen:16be | Filter | QoS:8) * N`. Each granted code echoes the
 /// requested QoS; invalid filters and ACL denials are answered with
 /// `0x80` (not authorized) and `0x87` respectively and register nothing.
+/// A new entry past the router `MAX_SUBSCRIPTIONS` bound is denied with
+/// `0x97` Quota Exceeded and registers nothing.
 /// `$share/<group>/` prefixes are split before routing, ACL checks,
 /// retained fetch, and cluster announce so every downstream stage sees
 /// the plain inner filter. Retained deliveries carry `retain = true` at
@@ -2679,13 +2689,14 @@ async fn apply_subscribe(
             codes.push(0x87);
             continue;
         }
-        // Per-client decision cache (W2-01): record the grant alongside
-        // the session mirror below. Same bounded per-session insert, same
-        // event; delivery never touches this lock.
-        if let Some(session) = shared.sessions.get(&client_id) {
-            session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, true);
-        }
-        shared.router.subscribe(
+        // B4-08 bound: a new entry past MAX_SUBSCRIPTIONS is denied fail
+        // closed (existing delivery proceeds); report MQTT 5 0x97 Quota
+        // Exceeded — the same code the broker uses for publish rate quota
+        // — and register nothing (no session mirror, no grant, no announce,
+        // no retained replay), never success for a subscription with no store.
+        // TODO(parity): is 0x97 the observable reference behaviour for a
+        // subscription-table bound, or does it answer 0x80 Unspecified error?
+        let stored = shared.router.subscribe(
             &filter,
             Subscription {
                 client_id: client_id.clone().into(),
@@ -2694,6 +2705,18 @@ async fn apply_subscribe(
                 group,
             },
         );
+        if !stored {
+            codes.push(0x97);
+            continue;
+        }
+        // Per-client decision cache (W2-01): record the grant alongside
+        // the session mirror below. Same bounded per-session insert, same
+        // event; delivery never touches this lock. Recorded only after
+        // the router accepts the entry so a quota denial records
+        // nothing and changes no session state.
+        if let Some(session) = shared.sessions.get(&client_id) {
+            session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, true);
+        }
         // Mirror the grant on the session for observability (the router
         // stays the routing authority).
         shared
@@ -6181,12 +6204,12 @@ mod tests {
     /// ingress pipeline (`ingress_pipeline_with_publisher`, driven by
     /// the publish delivery event), asserting 100% steady delivery plus
     /// exact route, session-mirror, wildcard and shared-group agreement.
-    /// Before numbers for the same storm family live in
-    /// `crates/broker-router/src/lib.rs`
-    /// (`subscribe_storm_alongside_matches_keeps_semantics` baseline vs
-    /// CoW); this harness records the through-broker after numbers with
-    /// min/median/max across repeats. No time threshold is asserted so
-    /// the test is stable on loaded runners.
+    /// Storm coverage for the same workload family also runs at the
+    /// router level in `crates/broker-router/src/lib.rs`
+    /// (`subscribe_storm_alongside_matches_keeps_semantics`, baseline vs
+    /// CoW); this harness exercises the through-broker path, reporting
+    /// min/median/max across repeats to the gates log. No time
+    /// threshold is asserted so the test is stable on loaded runners.
     #[tokio::test]
     async fn router_lock_contention_subscribe_storm_with_steady_publishes() {
         use std::time::Instant;
@@ -6299,6 +6322,21 @@ mod tests {
                     );
                 }
             }
+            // Routing correctness under churn, through the broker
+            // delivery path: every message published after a churn
+            // subscribe completes reaches exactly that subscriber.
+            for task in 0..CHURN_TASKS {
+                for i in 0..FILTERS_PER_TASK {
+                    let probe =
+                        Topic::new(format!("b408/churn/{task}/{i}")).expect("valid probe topic");
+                    let got = publish_shared_once(&shared, &probe, Some("b408-pub"), b"x").await;
+                    assert_eq!(
+                        got,
+                        vec![9100 + task as u64 * 100 + i as u64],
+                        "churn subscriber {task}/{i} receives after its subscribe"
+                    );
+                }
+            }
             for task in 0..CHURN_TASKS {
                 for i in 0..FILTERS_PER_TASK {
                     let filter =
@@ -6325,6 +6363,20 @@ mod tests {
                 shared.router.matches(&probe).is_empty(),
                 "churn filters fully removed after storm"
             );
+            // And nothing reaches a churn subscriber after its
+            // unsubscribe completes: every churn topic goes silent
+            // through the broker delivery path.
+            for task in 0..CHURN_TASKS {
+                for i in 0..FILTERS_PER_TASK {
+                    let silent =
+                        Topic::new(format!("b408/churn/{task}/{i}")).expect("valid probe topic");
+                    let got = publish_shared_once(&shared, &silent, Some("b408-pub"), b"x").await;
+                    assert!(
+                        got.is_empty(),
+                        "churn topic {task}/{i} silent after unsubscribe, got {got:?}"
+                    );
+                }
+            }
             let steady_session = shared
                 .sessions
                 .get("b408-steady")
@@ -11483,6 +11535,67 @@ mod tests {
                 .keys()
                 .any(|f| f.as_str() == "cmd/w139-ph/z"),
             "placeholder must render per client"
+        );
+    }
+
+    /// B4-08 bound (ruling B4-08b.3): a full subscription table denies
+    /// the auto subscription fail closed, exactly as `apply_subscribe`
+    /// does: no session mirror, nothing counted as applied, router
+    /// silent. Fills to MAX_SUBSCRIPTIONS with three-level filters so
+    /// each copy-on-write path copy stays small.
+    #[tokio::test]
+    async fn auto_subscribe_quota_denied_changes_no_session_state() {
+        use axum::extract::State;
+        let shared = test_shared();
+        for i in 0..broker_router::MAX_SUBSCRIPTIONS {
+            let a = i / 10_000;
+            let b = (i / 100) % 100;
+            let c = i % 100;
+            let filter = TopicFilter::new(format!("quota/fill/{a}/{b:02}/{c:02}"))
+                .expect("valid fill filter");
+            assert!(
+                shared.router.subscribe(
+                    &filter,
+                    Subscription::new(format!("fill-{i}"), i as u64, QoS::AtMostOnce)
+                ),
+                "fill subscribe {i} must succeed"
+            );
+        }
+        let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let mut api_state = broker_api::ApiState::standalone(engine);
+        api_state.auto_subscribe = shared.auto_subscribe.clone();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!([
+                {"topic": "conf/auto/quota-denied", "qos": 1},
+            ]))
+            .expect("config is JSON"),
+        );
+        let resp =
+            broker_api::v5::auto_subscribe::put_auto_subscribe(State(api_state.clone()), body)
+                .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let (session, _) = shared.sessions.get_or_create("quota-auto", true);
+        *session.conn_id.write() = Some(9091);
+        apply_auto_subscribe(&shared, "quota-auto", None, 9091);
+
+        assert!(
+            session
+                .subscriptions
+                .read()
+                .keys()
+                .all(|f| f.as_str() != "conf/auto/quota-denied"),
+            "quota-denied auto subscribe must leave the session unchanged"
+        );
+        assert!(
+            shared
+                .router
+                .matches(&Topic::new("conf/auto/quota-denied").unwrap())
+                .is_empty(),
+            "quota-denied auto subscribe must leave the router unchanged"
         );
     }
 

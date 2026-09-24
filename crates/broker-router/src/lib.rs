@@ -376,15 +376,38 @@ struct StickyEntry {
 
 #[derive(Default, Clone)]
 struct TrieNode {
-    // Exact child path segments (shared, never cloned on match)
-    children: AHashMap<Arc<str>, TrieNode>,
-    // Single-level wildcard '+' child
-    single_wildcard: Option<Box<TrieNode>>,
+    // Exact child path segments. Children are `Arc`-shared so a writer's
+    // shallow `clone()` of a node shares every unchanged subtree and only
+    // the nodes on the mutated filter path are replaced (B4-08 path
+    // copy). Readers never clone here: the match walk borrows.
+    children: AHashMap<Arc<str>, Arc<TrieNode>>,
+    // Single-level wildcard '+' child, shared the same way.
+    single_wildcard: Option<Arc<TrieNode>>,
     // Multi-level wildcard '#' subscriptions at this level
     multi_wildcard_subs: SubscriptionSet,
     // Exact subscriptions attached at this terminal node
     exact_subs: SubscriptionSet,
 }
+
+/// Maximum live subscription entries held by one router trie (B4-08).
+///
+/// Each entry is one `Subscription` set slot (client id and group are
+/// shared `Arc<str>` pointers, so tens of bytes plus the set overhead),
+/// and each distinct filter path costs one node per level. At the cap the
+/// steady trie costs low tens of MB, and a writer's path copy clones only
+/// the nodes on one filter path (depth bounded by the filter byte length,
+/// one map clone per level sharing every unchanged child `Arc`), so the
+/// transient is one extra path, never a second whole trie.
+///
+/// Rationale: 100 000 matches [`MAX_KNOWN_TOPICS`] so the subscription
+/// trie shares one memory story with the existing topic index; the B4-08
+/// storm settles 10 000 subscriptions, so the cap leaves 10x headroom for
+/// that workload while keeping a subscribe storm from growing the trie
+/// without limit. Past the cap a new `(filter, client)` entry is denied
+/// (fail closed, delivery of existing subscriptions proceeds); a
+/// re-subscribe that replaces the same client's entry always succeeds and
+/// an unsubscribe always succeeds.
+pub const MAX_SUBSCRIPTIONS: usize = 100_000;
 
 /// Maximum concrete topics remembered by the topic index (W1-15).
 /// The list read snapshots at most this many names under a short lock,
@@ -441,6 +464,15 @@ pub fn is_qos0_publish_out(frame: &BrokerFrame) -> bool {
 /// groups never contend on the same lock. Each shard is bounded
 /// independently (see [`MAX_SHARED_GROUPS_PER_SHARD`]); the global table
 /// stays within [`MAX_SHARED_GROUPS`] by construction.
+///
+/// Rationale for 32: the pipeline runs the B4-08 storm on an 8-core host
+/// with 8 concurrent match threads (`NUM_READERS = 8` in
+/// `crates/broker-router/tests/contention_bench.rs`), so 32 shards is 4x
+/// the observed delivery parallelism and distinct groups rarely share a
+/// shard; a power of two keeps the FNV-1a modulo on the match path to one
+/// multiply-free mask-style remainder, and 32 shard headers cost only a
+/// few KB while each shard caps at 32 groups (1024 / 32) so per-shard
+/// eviction scans stay short.
 const NUM_GROUP_SHARDS: usize = 32;
 
 /// Per-shard cap implied by [`MAX_SHARED_GROUPS`] over
@@ -488,16 +520,25 @@ fn group_shard(group: &str) -> usize {
 }
 
 pub struct Router {
-    /// Copy-on-write subscription trie (B4-08). Readers load a snapshot
-    /// with one lock-free `ArcSwap` load and match without holding any
-    /// trie lock, so a subscribe storm never blocks the fan-out path;
-    /// the worst reader wait is a single pointer load plus a refcount
-    /// bump. Writers serialize on `trie_write`, clone the snapshot,
-    /// mutate the clone, and store it atomically. Steady state holds one
-    /// trie; transiently (inside one writer critical section) two.
+    /// Copy-on-write subscription trie (B4-08) with structural sharing.
+    /// Readers load a snapshot with one lock-free `ArcSwap` load and
+    /// match without holding any trie lock, so a subscribe storm never
+    /// blocks the fan-out path; the worst reader wait is a single pointer
+    /// load plus a refcount bump. Writers serialize on `trie_write`,
+    /// shallow-clone the snapshot (child subtrees stay shared `Arc`s),
+    /// copy only the nodes on the mutated filter path, and store the new
+    /// root atomically. Steady state holds one trie; transiently (inside
+    /// one writer critical section) the old root plus one new path whose
+    /// depth is bounded by the filter byte length. Live entries are
+    /// bounded by [`MAX_SUBSCRIPTIONS`].
     root: ArcSwap<TrieNode>,
     /// Serializes copy-on-write trie writers. Readers never take it.
     trie_write: Mutex<()>,
+    /// Live subscription entries in the trie, bounded by
+    /// [`MAX_SUBSCRIPTIONS`]. Updated only under `trie_write`, read
+    /// lock-free. A re-subscribe that replaces the same client's entry
+    /// does not change the count.
+    subscription_count: AtomicUsize,
     /// Round-robin cursors per shared-subscription group, sharded (B4-08).
     /// Keyed by group name alone so one group balances across all its
     /// filters. No global lock on the match path: each delivery touches
@@ -565,6 +606,7 @@ impl Router {
         Self {
             root: ArcSwap::from(Arc::new(TrieNode::default())),
             trie_write: Mutex::new(()),
+            subscription_count: AtomicUsize::new(0),
             rr_cursors: ShardedCursors::default(),
             strategies: ArcSwap::from(Arc::new(AHashMap::new())),
             strategy_write: Mutex::new(()),
@@ -656,6 +698,14 @@ impl Router {
             .iter()
             .map(|shard| shard.read().len())
             .sum()
+    }
+
+    /// Number of live subscription entries in the trie (operator/test
+    /// hook for the B4-08 bound check). Never exceeds
+    /// [`MAX_SUBSCRIPTIONS`]: new entries past the cap are denied while
+    /// replacements and removals always proceed.
+    pub fn subscription_count(&self) -> usize {
+        self.subscription_count.load(Ordering::Relaxed)
     }
 
     /// Install the ordered rewrite table (B4-04, config plane). Every
@@ -840,68 +890,182 @@ impl Router {
     }
 
     /// Subscribe event: insert `sub` at `filter` with copy-on-write
-    /// isolation (B4-08). The writer clones the current snapshot under
-    /// `trie_write`, mutates the clone, and swaps it into view; readers
-    /// holding the old snapshot finish against it without waiting.
-    /// Match semantics are unchanged (B4-02 strategies untouched).
-    /// Mutation-path cost only (never on the match path): one clone of
-    /// the live trie, O(subscriptions), so steady state holds one trie
-    /// and transiently two; per-subscribe latency is measured by
+    /// isolation and structural sharing (B4-08). The writer shallow-clones
+    /// the snapshot root under `trie_write` (unchanged subtrees stay shared
+    /// `Arc`s), copies only the nodes on the filter path, and swaps the new
+    /// root into view; readers holding the old snapshot finish against it
+    /// without waiting. Match semantics are unchanged (B4-02 strategies
+    /// untouched). Mutation-path cost only (never on the match path): one
+    /// shallow root clone plus one new node per filter level, each cloning
+    /// only its level's sibling map while sharing every unchanged child
+    /// `Arc`, so steady state holds one trie bounded by
+    /// [`MAX_SUBSCRIPTIONS`] and transiently the old root plus one new
+    /// path; per-subscribe latency is measured by
     /// `subscribe_storm_alongside_matches_keeps_semantics` (before and
-    /// after min/median/max) and stays off the publish/deliver path.
-    pub fn subscribe(&self, filter: &TopicFilter, sub: Subscription) {
+    /// after min/median/max) and stays off the publish/deliver path. New
+    /// entries past [`MAX_SUBSCRIPTIONS`] are denied (fail closed, existing
+    /// delivery proceeds, returns `false` so the caller never reports
+    /// success); replacing the same client's entry always succeeds and
+    /// returns `true`.
+    pub fn subscribe(&self, filter: &TopicFilter, sub: Subscription) -> bool {
         let _guard = self.trie_write.lock();
         let current = self.root.load_full();
-        let mut next = (*current).clone();
-        Self::insert_into(&mut next, filter, sub);
+        if !Self::terminal_contains(&current, filter, sub.client_id.as_ref())
+            && self.subscription_count.load(Ordering::Relaxed) >= MAX_SUBSCRIPTIONS
+        {
+            return false;
+        }
+        let levels: Vec<&str> = filter.as_str().split('/').collect();
+        let root_owned = (*current).clone();
+        let (next, added) = Self::insert_owned(root_owned, &levels, 0, sub);
+        if added {
+            self.subscription_count.fetch_add(1, Ordering::Relaxed);
+        }
         self.root.store(Arc::new(next));
+        true
     }
 
-    /// Insert helper operating on an owned trie clone. Same traversal as
-    /// before: `#` attaches at the current level, `+` descends the
-    /// single-wildcard child, other levels descend exact children, and a
-    /// re-subscribe from a new connection replaces the old copy.
-    fn insert_into(node: &mut TrieNode, filter: &TopicFilter, sub: Subscription) {
-        let mut curr = node;
-        // Peekable so the terminal level is known without collecting.
-        let mut levels = filter.as_str().split('/').peekable();
-
-        while let Some(level) = levels.next() {
-            if level == "#" {
-                // Re-subscribing from a new connection replaces the old copy.
-                curr.multi_wildcard_subs
-                    .retain(|s| s.client_id != sub.client_id);
-                curr.multi_wildcard_subs.insert(sub);
-                return;
-            } else if level == "+" {
-                if curr.single_wildcard.is_none() {
-                    curr.single_wildcard = Some(Box::new(TrieNode::default()));
-                }
-                curr = curr.single_wildcard.as_mut().unwrap();
-            } else {
-                curr = curr.children.entry(level.into()).or_default();
+    /// Insert helper with path copying on a shallow-cloned root. Only the
+    /// nodes on the filter path are replaced; every other child `Arc` is
+    /// shared with the previous snapshot. Same traversal as before: `#`
+    /// attaches at the current level, `+` descends the single-wildcard
+    /// child, other levels descend exact children, and a re-subscribe from
+    /// a new connection replaces the old copy. Returns the new node plus
+    /// whether a new `(filter, client)` entry was added (false for a
+    /// same-client replacement).
+    fn insert_owned(
+        mut node: TrieNode,
+        levels: &[&str],
+        pos: usize,
+        sub: Subscription,
+    ) -> (TrieNode, bool) {
+        let level = levels[pos];
+        let is_last = pos + 1 == levels.len();
+        if level == "#" {
+            let existed = node
+                .multi_wildcard_subs
+                .iter()
+                .any(|s| s.client_id == sub.client_id);
+            node.multi_wildcard_subs
+                .retain(|s| s.client_id != sub.client_id);
+            node.multi_wildcard_subs.insert(sub);
+            return (node, !existed);
+        }
+        if level == "+" {
+            if is_last {
+                let mut child = match node.single_wildcard.take() {
+                    Some(child) => (*child).clone(),
+                    None => TrieNode::default(),
+                };
+                let existed = child
+                    .exact_subs
+                    .iter()
+                    .any(|s| s.client_id == sub.client_id);
+                child.exact_subs.retain(|s| s.client_id != sub.client_id);
+                child.exact_subs.insert(sub);
+                node.single_wildcard = Some(Arc::new(child));
+                return (node, !existed);
             }
+            let mut child = match node.single_wildcard.take() {
+                Some(child) => (*child).clone(),
+                None => TrieNode::default(),
+            };
+            let (next_child, added) = Self::insert_owned(child, levels, pos + 1, sub);
+            child = next_child;
+            node.single_wildcard = Some(Arc::new(child));
+            return (node, added);
+        }
+        if is_last {
+            let mut child = match node.children.remove(level) {
+                Some(child) => (*child).clone(),
+                None => TrieNode::default(),
+            };
+            let existed = child
+                .exact_subs
+                .iter()
+                .any(|s| s.client_id == sub.client_id);
+            child.exact_subs.retain(|s| s.client_id != sub.client_id);
+            child.exact_subs.insert(sub);
+            node.children.insert(level.into(), Arc::new(child));
+            return (node, !existed);
+        }
+        let child = match node.children.remove(level) {
+            Some(child) => (*child).clone(),
+            None => TrieNode::default(),
+        };
+        let (next_child, added) = Self::insert_owned(child, levels, pos + 1, sub);
+        node.children.insert(level.into(), Arc::new(next_child));
+        (node, added)
+    }
 
-            if levels.peek().is_none() {
-                curr.exact_subs.retain(|s| s.client_id != sub.client_id);
-                curr.exact_subs.insert(sub);
-                return;
+    /// Probe the snapshot for a live `(filter, client)` entry: true when
+    /// the filter path exists and its terminal set already holds
+    /// `client_id`. Used to tell a same-client replacement (always
+    /// allowed) from a new entry (counted against [`MAX_SUBSCRIPTIONS`]),
+    /// and to skip no-op unsubscribes without copying.
+    fn terminal_contains(node: &TrieNode, filter: &TopicFilter, client_id: &str) -> bool {
+        let mut curr = node;
+        let levels: Vec<&str> = filter.as_str().split('/').collect();
+        for (pos, level) in levels.iter().enumerate() {
+            if *level == "#" {
+                return curr
+                    .multi_wildcard_subs
+                    .iter()
+                    .any(|s| s.client_id.as_ref() == client_id);
+            }
+            let is_last = pos + 1 == levels.len();
+            if *level == "+" {
+                match curr.single_wildcard.as_ref() {
+                    Some(child) => {
+                        if is_last {
+                            return child
+                                .exact_subs
+                                .iter()
+                                .any(|s| s.client_id.as_ref() == client_id);
+                        }
+                        curr = &**child;
+                    }
+                    None => return false,
+                }
+            } else {
+                match curr.children.get(*level) {
+                    Some(child) => {
+                        if is_last {
+                            return child
+                                .exact_subs
+                                .iter()
+                                .any(|s| s.client_id.as_ref() == client_id);
+                        }
+                        curr = &**child;
+                    }
+                    None => return false,
+                }
             }
         }
+        false
     }
 
     /// Unsubscribe event: remove `client_id` at `filter` with the same
-    /// copy-on-write discipline as [`Router::subscribe`]. A filter path
-    /// that does not exist returns without cloning or storing, so
-    /// no-op unsubscribes pay one lock-free snapshot load and no copy.
+    /// path-copying discipline as [`Router::subscribe`]. A filter path
+    /// without a live entry for `client_id` returns after one lock-free
+    /// snapshot load and one probe, with no copy and no store, so no-op
+    /// unsubscribes pay no allocation. A real removal copies only the
+    /// filter path, prunes nodes left empty, and decrements the
+    /// [`MAX_SUBSCRIPTIONS`] count.
     pub fn unsubscribe(&self, filter: &TopicFilter, client_id: &str) {
         let _guard = self.trie_write.lock();
         let current = self.root.load_full();
         if !Self::path_exists(&current, filter) {
             return;
         }
-        let mut next = (*current).clone();
-        if Self::remove_from(&mut next, filter, client_id) {
+        if !Self::terminal_contains(&current, filter, client_id) {
+            return;
+        }
+        let levels: Vec<&str> = filter.as_str().split('/').collect();
+        let root_owned = (*current).clone();
+        let (next, changed) = Self::remove_owned(root_owned, &levels, 0, client_id);
+        if changed {
+            self.subscription_count.fetch_sub(1, Ordering::Relaxed);
             self.root.store(Arc::new(next));
         }
     }
@@ -917,12 +1081,12 @@ impl Router {
                 return true;
             } else if level == "+" {
                 match curr.single_wildcard.as_ref() {
-                    Some(child) => curr = child,
+                    Some(child) => curr = child.as_ref(),
                     None => return false,
                 }
             } else {
                 match curr.children.get(level) {
-                    Some(child) => curr = child,
+                    Some(child) => curr = child.as_ref(),
                     None => return false,
                 }
             }
@@ -930,41 +1094,95 @@ impl Router {
         true
     }
 
-    /// Removal helper operating on an owned trie clone. Returns true when
-    /// a subscription entry was actually removed (the caller stores the
-    /// clone only then). Traversal mirrors [`Router::insert_into`].
-    fn remove_from(node: &mut TrieNode, filter: &TopicFilter, client_id: &str) -> bool {
-        let mut curr = node;
-        let mut levels = filter.as_str().split('/').peekable();
-        let mut changed = false;
+    /// True when a node holds no subscriptions and no children, so its
+    /// parent can drop the entry instead of keeping an empty branch. Keeps
+    /// trie memory bounded by live entries under [`MAX_SUBSCRIPTIONS`]
+    /// rather than by churn history.
+    fn is_empty_node(node: &TrieNode) -> bool {
+        node.exact_subs.is_empty()
+            && node.multi_wildcard_subs.is_empty()
+            && node.children.is_empty()
+            && node.single_wildcard.is_none()
+    }
 
-        while let Some(level) = levels.next() {
-            if level == "#" {
-                let before = curr.multi_wildcard_subs.len();
-                curr.multi_wildcard_subs
-                    .retain(|s| s.client_id.as_ref() != client_id);
-                changed = curr.multi_wildcard_subs.len() != before;
-                return changed;
-            } else if level == "+" {
-                if let Some(ref mut child) = curr.single_wildcard {
-                    curr = child;
-                } else {
-                    return false;
-                }
-            } else if let Some(child) = curr.children.get_mut(level) {
-                curr = child;
-            } else {
-                return false;
-            }
-
-            if levels.peek().is_none() {
-                let before = curr.exact_subs.len();
-                curr.exact_subs
-                    .retain(|s| s.client_id.as_ref() != client_id);
-                return curr.exact_subs.len() != before;
-            }
+    /// Removal helper with path copying on a shallow-cloned root. Returns
+    /// the new node plus whether an entry was actually removed (the caller
+    /// stores the clone only then). Empty branches are pruned so
+    /// subscribe/unsubscribe churn over rotating filters cannot grow the
+    /// trie without limit. Traversal mirrors [`Router::insert_owned`].
+    fn remove_owned(
+        mut node: TrieNode,
+        levels: &[&str],
+        pos: usize,
+        client_id: &str,
+    ) -> (TrieNode, bool) {
+        let level = levels[pos];
+        let is_last = pos + 1 == levels.len();
+        if level == "#" {
+            let before = node.multi_wildcard_subs.len();
+            node.multi_wildcard_subs
+                .retain(|s| s.client_id.as_ref() != client_id);
+            let changed = node.multi_wildcard_subs.len() != before;
+            return (node, changed);
         }
-        changed
+        if level == "+" {
+            let child = match node.single_wildcard.take() {
+                Some(child) => (*child).clone(),
+                None => return (node, false),
+            };
+            if is_last {
+                let before = child.exact_subs.len();
+                let mut child = child;
+                child
+                    .exact_subs
+                    .retain(|s| s.client_id.as_ref() != client_id);
+                if child.exact_subs.len() == before {
+                    node.single_wildcard = Some(Arc::new(child));
+                    return (node, false);
+                }
+                if !Self::is_empty_node(&child) {
+                    node.single_wildcard = Some(Arc::new(child));
+                }
+                return (node, true);
+            }
+            let (next_child, changed) = Self::remove_owned(child, levels, pos + 1, client_id);
+            if !changed {
+                node.single_wildcard = Some(Arc::new(next_child));
+                return (node, false);
+            }
+            if !Self::is_empty_node(&next_child) {
+                node.single_wildcard = Some(Arc::new(next_child));
+            }
+            return (node, true);
+        }
+        let child = match node.children.remove(level) {
+            Some(child) => (*child).clone(),
+            None => return (node, false),
+        };
+        if is_last {
+            let before = child.exact_subs.len();
+            let mut child = child;
+            child
+                .exact_subs
+                .retain(|s| s.client_id.as_ref() != client_id);
+            if child.exact_subs.len() == before {
+                node.children.insert(level.into(), Arc::new(child));
+                return (node, false);
+            }
+            if !Self::is_empty_node(&child) {
+                node.children.insert(level.into(), Arc::new(child));
+            }
+            return (node, true);
+        }
+        let (next_child, changed) = Self::remove_owned(child, levels, pos + 1, client_id);
+        if !changed {
+            node.children.insert(level.into(), Arc::new(next_child));
+            return (node, false);
+        }
+        if !Self::is_empty_node(&next_child) {
+            node.children.insert(level.into(), Arc::new(next_child));
+        }
+        (node, true)
     }
 
     pub fn matches(&self, topic: &Topic) -> SubscriptionSet {
@@ -1243,13 +1461,14 @@ mod tests {
     /// numbers). Wraps the current trie behind one global `RwLock`:
     /// subscribes take it for writing, matches take it for reading, so
     /// readers block on writers exactly as the old
-    /// `RwLock<TrieNode>` root did. Same traversal and same clone cost
-    /// as the CoW writer (conservative: the true old writer mutated
-    /// in place without a clone), so any measured match-throughput
-    /// gain understates the contention removed by the cutover.
+    /// `RwLock<TrieNode>` root did. Same traversal as the CoW writer plus
+    /// the global lock (not conservative: the true old writer mutated
+    /// in place without a clone, so this baseline pays a path copy the
+    /// old code never paid and any measured match-throughput gain
+    /// overstates the contention removed by the cutover).
     /// Driven by the same subscribe/unsubscribe and publish delivery
-    /// events as [`Router`]; used only to record the before numbers
-    /// the original cutover never measured (spec B4-08:53-60).
+    /// events as [`Router`]; the before side of the B4-08 storm
+    /// comparison (spec B4-08:53-60), reported through the gates log.
     struct SingleLockBaseline {
         inner: Router,
         lock: parking_lot::RwLock<()>,
@@ -1679,8 +1898,6 @@ mod tests {
             let start = Instant::now();
             std::thread::scope(|scope| {
                 for writer in 0..WRITERS {
-                    let matched_total = matched_total.clone();
-                    let _ = &matched_total;
                     scope.spawn(move || {
                         for i in 0..FILTERS_PER_WRITER {
                             subscribe(writer, i);

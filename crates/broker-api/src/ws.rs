@@ -611,20 +611,12 @@ async fn handle_subscribe(
                     }
                     0x87
                 } else {
-                    // Per-client decision cache (W2-01): record the grant
-                    // alongside the session mirror below. Same bounded
-                    // insert, same event.
-                    if let Some(session) = state.sessions.get(&sess.client_id) {
-                        session.record_authz_decision(
-                            "subscribe",
-                            filter.as_str(),
-                            sub.qos,
-                            false,
-                            true,
-                        );
-                    }
                     let qos = QoS::try_from(sub.qos).expect("validated above");
-                    state.router.subscribe(
+                    // B4-08 bound: a new entry past the subscription-table
+                    // cap is denied fail closed with 0x97 Quota Exceeded
+                    // (the same code the kernel subscribe path reports),
+                    // registering nothing and changing no session state.
+                    let stored = state.router.subscribe(
                         &filter,
                         Subscription {
                             client_id: sess.client_id.clone().into(),
@@ -633,11 +625,29 @@ async fn handle_subscribe(
                             group: None,
                         },
                     );
-                    state
-                        .sessions
-                        .add_subscription(&sess.client_id, filter.clone(), qos);
-                    sess.subscriptions.push(filter);
-                    sub.qos
+                    if !stored {
+                        0x97
+                    } else {
+                        // Per-client decision cache (W2-01): record the
+                        // grant alongside the session mirror below. Same
+                        // bounded insert, same event. Recorded only after
+                        // the router accepts the entry so a quota denial
+                        // records nothing.
+                        if let Some(session) = state.sessions.get(&sess.client_id) {
+                            session.record_authz_decision(
+                                "subscribe",
+                                filter.as_str(),
+                                sub.qos,
+                                false,
+                                true,
+                            );
+                        }
+                        state
+                            .sessions
+                            .add_subscription(&sess.client_id, filter.clone(), qos);
+                        sess.subscriptions.push(filter);
+                        sub.qos
+                    }
                 }
             }
             _ => 0x80,

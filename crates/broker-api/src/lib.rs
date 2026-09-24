@@ -1761,6 +1761,7 @@ mod tests {
     struct TestState {
         engine: Arc<RuleEngine>,
         sessions: Arc<SessionManager>,
+        router: Arc<SubscriptionRouter>,
         metrics: Arc<Metrics>,
         auth: Arc<MemoryAuth>,
         admin_users: Arc<crate::admin_users::AdminUsers>,
@@ -1790,7 +1791,7 @@ mod tests {
             let api_state = ApiState::new(
                 engine.clone(),
                 sessions.clone(),
-                sub_router,
+                sub_router.clone(),
                 metrics.clone(),
                 auth.clone(),
                 conns.clone(),
@@ -1801,6 +1802,7 @@ mod tests {
             let state = TestState {
                 engine: engine.clone(),
                 sessions: sessions.clone(),
+                router: sub_router.clone(),
                 metrics: metrics.clone(),
                 auth: auth.clone(),
                 admin_users: api_state.admin_users.clone(),
@@ -7649,6 +7651,70 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let suback = client.recv_msg().await.expect("suback");
         assert_eq!(mqtt_packet_type(&suback), 9);
         assert_eq!(&suback[4..], &[0x87], "denied filter must yield 0x87");
+    }
+
+    #[tokio::test]
+    async fn test_ws_subscribe_quota_denied_with_0x97() {
+        // B4-08 bound: a full subscription table denies the console
+        // subscribe fail closed with 0x97 Quota Exceeded and changes no
+        // session state. Fills the shared router to MAX_SUBSCRIPTIONS
+        // with three-level filters so each path copy stays small.
+        let (server, state) = TestServer::start().await;
+        for i in 0..broker_router::MAX_SUBSCRIPTIONS {
+            let a = i / 10_000;
+            let b = (i / 100) % 100;
+            let c = i % 100;
+            let filter = broker_protocol::TopicFilter::new(format!("quota/fill/{a}/{b:02}/{c:02}"))
+                .expect("valid fill filter");
+            assert!(
+                state.router.subscribe(
+                    &filter,
+                    broker_router::Subscription::new(
+                        format!("fill-{i}"),
+                        i as u64,
+                        broker_protocol::QoS::AtMostOnce
+                    )
+                ),
+                "fill subscribe {i} must succeed"
+            );
+        }
+
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("console-q", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
+
+        client
+            .send_bin(&mqtt_subscribe(9, &[("quota/probe", 0)]))
+            .await;
+        let suback = client.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(
+            &suback[4..],
+            &[0x97],
+            "quota denial must yield 0x97, not success"
+        );
+
+        // The failed subscribe registers nothing: no session mirror, no
+        // router entry.
+        let session = state.sessions.get("console-q").expect("session row");
+        assert!(
+            session
+                .subscriptions
+                .read()
+                .keys()
+                .all(|f| f.as_str() != "quota/probe"),
+            "quota-denied subscribe must leave the session unchanged"
+        );
+        assert!(
+            state
+                .router
+                .matches(&broker_protocol::Topic::new("quota/probe").expect("valid probe topic"))
+                .is_empty(),
+            "quota-denied subscribe must leave the router unchanged"
+        );
     }
 
     #[tokio::test]
