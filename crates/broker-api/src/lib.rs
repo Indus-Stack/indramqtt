@@ -8666,6 +8666,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     async fn authn_users_list_has_no_invented_fields() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
+        // W2-11: the user routes address one authenticator by id, so the
+        // entry must exist first (unknown ids are 404); same setup as the
+        // import test below.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
         let (status, created) = server
             .post_auth(
                 "/api/v5/authentication/password_based:built_in_database/users",

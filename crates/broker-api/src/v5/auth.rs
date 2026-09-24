@@ -9,7 +9,10 @@ use axum::{
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use broker_auth::{AclAction, AclRule, ImportUsersError};
+use broker_auth::{
+    AclAction, AclRule, ImportUsersError, MAX_AUTHN_USERNAME_LEN, MAX_AUTHN_USERS,
+    MAX_PASSWORD_BYTES,
+};
 use bytes::Bytes;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -19,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::admin_users::{AdminRole, AdminUserError};
 use crate::errors::ApiError;
+use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
 /// Token lifetime: 60 minutes.
@@ -723,56 +727,177 @@ pub async fn change_user_password(
 // Authentication (AuthN) built-in-database users (backed by `MemoryAuth`).
 // ---------------------------------------------------------------------------
 
-pub async fn list_authn_users(State(state): State<ApiState>, Path(_id): Path<String>) -> Response {
+/// `GET /authentication/{id}/users`: paged users of one authenticator.
+///
+/// Reads the live built-in user map (`MemoryAuth::usernames`, sorted) and
+/// slices the requested page with the shared [`PageParams`] helper
+/// (defaults `page=1`, `limit=100`, clamped to `1..=1000`; malformed
+/// values fall back to defaults, never 400). An empty map reads as an
+/// empty page, never an error. Unknown authenticator ids fail with
+/// `NOT_FOUND` in the documented `{code, message}` shape; a known id
+/// whose backend is not the built-in database fails with `BAD_REQUEST`
+/// (stored-only backends never execute). Passwords are write-only and
+/// never rendered: each row carries only `user_id`.
+/// Management-plane only: clones at most the sorted username list once
+/// per request under short read locks; the CONNECT path keeps reading
+/// under its own short locks (`MemoryAuth::authenticate` in
+/// `crates/broker-auth/src/lib.rs`, driven by CONNECT in
+/// `crates/broker-node/src/main.rs`) and publish/deliver never touch
+/// this store. The map is bounded by [`MAX_AUTHN_USERS`] (100,000
+/// entries: each entry holds a verifier plus map overhead, so an
+/// unbounded map lets one management batch exhaust the kernel; 100,000
+/// covers fleet provisioning while keeping list reads paged and
+/// per-CONNECT lookups cheap).
+// TODO(parity): which per-user fields beyond `user_id` does the listing
+// require (superuser flag, creation time)? The rulebook does not decide
+// the exact row shape; fields the broker does not track are omitted
+// rather than invented.
+pub async fn list_authn_users(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    params: PageParams,
+) -> Response {
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
     let names = state.auth.usernames();
-    let data: Vec<_> = names
-        .into_iter()
+    let total = names.len();
+    let page_items = paginate(&names, params.page, params.limit);
+    let data: Vec<_> = page_items
+        .iter()
         .map(|name| {
             serde_json::json!({
                 "user_id": name
             })
         })
         .collect();
-
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": {
-                "page": 1,
-                "limit": 50,
-                "count": data.len(),
-                "hasnext": false
-            }
+            "meta": meta_page(params.page, params.limit, total),
         })),
     )
         .into_response()
 }
 
-#[derive(Deserialize)]
-pub struct CreateAuthnUserReq {
-    pub user_id: String,
-    pub password: String,
-}
-
+/// `POST /authentication/{id}/users`: add one user to the live map.
+///
+/// The body must be a JSON object with non-empty string `user_id` (at
+/// most [`MAX_AUTHN_USERNAME_LEN`] bytes) and `password` (non-empty, at
+/// most [`MAX_PASSWORD_BYTES`] bytes); anything else fails with
+/// `BAD_REQUEST` in the documented `{code, message}` shape. A `user_id`
+/// that already exists fails with `ALREADY_EXISTS` instead of updating
+/// in place; a map that already holds [`MAX_AUTHN_USERS`] entries fails
+/// with `BAD_REQUEST`. Unknown authenticator ids fail with `NOT_FOUND`;
+/// a known non-built-in backend fails with `BAD_REQUEST`. On success
+/// returns 201 with the stored `user_id` (never the password). The
+/// password is hashed under the configured policy before storing;
+/// plaintext never persists. The write persists across a restart through
+/// the config registry.
+/// Management-plane only: one short existence check plus the user-map
+/// write lock (plus the registry save lock on persist); the CONNECT path
+/// keeps reading under short read locks and publish/deliver never touch
+/// this store.
+// TODO(parity): is a duplicate `user_id` rejected or an overwrite, and
+// which status (400 versus 409) does the documented `ALREADY_EXISTS`
+// code carry? The rulebook does not decide the exact duplicate
+// semantics; the current choice rejects with `ALREADY_EXISTS` (400 in
+// this tree's shared error mapping) until the checker pins it.
 pub async fn create_authn_user(
     State(state): State<ApiState>,
-    Path(_id): Path<String>,
-    Json(req): Json<CreateAuthnUserReq>,
+    Path(id): Path<String>,
+    body: Bytes,
 ) -> Response {
-    if let Err(error) = state
-        .auth
-        .add_user(req.user_id.clone(), req.password.as_bytes())
-    {
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid user body: {e}")).into_response();
+        }
+    };
+    let (user_id, password) = match parse_authn_user_body(&value) {
+        Ok(pair) => pair,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    if state.auth.has_user(&user_id) {
+        return ApiError::AlreadyExists(format!("user {user_id:?} already exists")).into_response();
+    }
+    if state.auth.user_count() >= MAX_AUTHN_USERS {
+        return ApiError::BadRequest(format!(
+            "user limit of {MAX_AUTHN_USERS} reached for authenticator {id:?}"
+        ))
+        .into_response();
+    }
+    if let Err(error) = state.auth.add_user(user_id.clone(), password.as_bytes()) {
+        // Pre-validation above already rejected every client-side shape,
+        // so only the hashing/oversize failures stay client errors here;
+        // anything else is a persist failure and must never be silent.
+        let message = error.to_string();
+        if message.contains("exceeds") || message.contains("cannot be hashed") {
+            return ApiError::BadRequest(message).into_response();
+        }
         return mqtt_persist_error(error);
     }
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
-            "user_id": req.user_id
+            "user_id": user_id
         })),
     )
         .into_response()
+}
+
+/// Validate a create-user body into `(user_id, password)`.
+///
+/// The body must be a JSON object with non-empty string `user_id` and
+/// `password` fields within their bounds. Extra fields are ignored so
+/// future record fields degrade to the same create instead of a 400.
+fn parse_authn_user_body(value: &serde_json::Value) -> Result<(String, String), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "user body must be a JSON object".to_string())?;
+    let user_id = obj
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `user_id` is required".to_string())?;
+    if user_id.trim().is_empty() {
+        return Err("field `user_id` must not be empty".to_string());
+    }
+    if user_id.len() > MAX_AUTHN_USERNAME_LEN {
+        return Err(format!(
+            "field `user_id` {user_id:?} exceeds {MAX_AUTHN_USERNAME_LEN} bytes"
+        ));
+    }
+    let password = obj
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `password` is required".to_string())?;
+    if password.is_empty() {
+        return Err("field `password` must not be empty".to_string());
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(format!(
+            "field `password` exceeds {MAX_PASSWORD_BYTES} bytes"
+        ));
+    }
+    Ok((user_id.to_string(), password.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -800,14 +925,36 @@ pub async fn update_authn_user(
         .into_response()
 }
 
+/// `DELETE /authentication/{id}/users/{user_id}`: remove one user.
+///
+/// Unknown authenticator ids and unknown user ids both fail with
+/// `NOT_FOUND` in the documented `{code, message}` shape and apply
+/// nothing; a known non-built-in backend fails with `BAD_REQUEST`. On
+/// success returns 204 with no body. The removal persists across a
+/// restart through the config registry.
+/// Management-plane only: one short user-map write lock per request
+/// (plus the registry save lock on persist); the CONNECT path keeps
+/// reading under short read locks and publish/deliver never touch this
+/// store.
 pub async fn delete_authn_user(
     State(state): State<ApiState>,
-    Path((_id, user_id)): Path<(String, String)>,
+    Path((id, user_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(error) = state.auth.remove_user(&user_id) {
-        return mqtt_persist_error(error);
+    let Some(entry) = state.authn_chain.get(&id) else {
+        return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
+    };
+    if entry.backend != "built_in_database" {
+        return ApiError::BadRequest(format!(
+            "authenticator {id:?} uses backend {:?}, which cannot serve the built-in user map",
+            entry.backend
+        ))
+        .into_response();
     }
-    StatusCode::NO_CONTENT.into_response()
+    match state.auth.remove_user(&user_id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => ApiError::NotFound(format!("user {user_id:?} not found")).into_response(),
+        Err(error) => mqtt_persist_error(error),
+    }
 }
 
 /// `POST /authentication/:id/import_users`: bulk import into the built-in
@@ -1023,5 +1170,388 @@ pub async fn delete_authz_rule(
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => mqtt_persist_error(error),
+    }
+}
+
+#[cfg(test)]
+mod authn_users_tests {
+    use super::*;
+    use broker_auth::{Authenticator, PasswordHashPolicy};
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    const CHAIN_ID: &str = "password_based:built_in_database";
+
+    fn standalone_state() -> ApiState {
+        let state = ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )));
+        // Fast hashing for tests only; production keeps the default policy.
+        state.auth.set_policy(PasswordHashPolicy::for_tests());
+        state
+            .authn_chain
+            .insert(broker_auth::AuthnEntry {
+                id: CHAIN_ID.to_string(),
+                mechanism: "password_based".to_string(),
+                backend: "built_in_database".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("chain entry inserts");
+        state
+    }
+
+    fn body(value: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    fn params(page: u32, limit: u32) -> PageParams {
+        PageParams { page, limit }
+    }
+
+    #[tokio::test]
+    async fn crud_lists_with_paging_rejects_duplicates_and_misses_404() {
+        // Before this task the list ignored paging (fixed page 1/limit 50),
+        // create updated in place instead of rejecting duplicates, and
+        // delete answered 204 even for unknown users.
+        let state = standalone_state();
+
+        for (user_id, password) in [("w211-alice", "AliceSecret1!"), ("w211-bob", "BobSecret1!")] {
+            let (status, created, _) = parts(
+                create_authn_user(
+                    State(state.clone()),
+                    Path(CHAIN_ID.to_string()),
+                    body(serde_json::json!({"user_id": user_id, "password": password})),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "create {user_id}");
+            assert_eq!(created["user_id"], serde_json::json!(user_id));
+            assert!(created.get("password").is_none(), "password never rendered");
+        }
+
+        // List carries both users with the standard page envelope.
+        let (status, listed, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["data"].as_array().expect("data array").len(), 2);
+        assert_eq!(listed["meta"]["page"], serde_json::json!(1));
+        assert_eq!(listed["meta"]["limit"], serde_json::json!(100));
+        assert_eq!(listed["meta"]["count"], serde_json::json!(2));
+        assert_eq!(listed["meta"]["hasnext"], serde_json::json!(false));
+        let ids: Vec<&str> = listed["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|row| row["user_id"].as_str().expect("row has user_id"))
+            .collect();
+        assert_eq!(ids, vec!["w211-alice", "w211-bob"]);
+
+        // Paging slices after sorting: page 2 with limit 1 holds the second user.
+        let (status, page2, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                params(2, 1),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page2["data"].as_array().expect("data").len(), 1);
+        assert_eq!(page2["data"][0]["user_id"], serde_json::json!("w211-bob"));
+        assert_eq!(page2["meta"]["count"], serde_json::json!(2));
+        assert_eq!(page2["meta"]["hasnext"], serde_json::json!(false));
+
+        // Re-creating an existing user is rejected, never an in-place update.
+        let (status, duplicate, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                body(serde_json::json!({"user_id": "w211-alice", "password": "Other1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
+        assert!(duplicate["message"].is_string());
+
+        // Malformed bodies are client errors.
+        let (status, malformed, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                body(serde_json::json!({"user_id": "w211-nopw"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(malformed["code"], serde_json::json!("BAD_REQUEST"));
+
+        // Delete one user; one is left.
+        let gone = delete_authn_user(
+            State(state.clone()),
+            Path((CHAIN_ID.to_string(), "w211-bob".to_string())),
+        )
+        .await;
+        assert_eq!(gone.status(), StatusCode::NO_CONTENT);
+        let (status, listed, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["data"].as_array().expect("data").len(), 1);
+        assert_eq!(
+            listed["data"][0]["user_id"],
+            serde_json::json!("w211-alice")
+        );
+
+        // Deleting an unknown user id is a 404 with the documented shape.
+        let (status, missing, _) = parts(
+            delete_authn_user(
+                State(state.clone()),
+                Path((CHAIN_ID.to_string(), "w211-ghost".to_string())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+
+        // Unknown authenticator ids are 404s on every route.
+        let (status, unknown, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path("password_based:nowhere".to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown["code"], serde_json::json!("NOT_FOUND"));
+        let (status, unknown, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path("password_based:nowhere".to_string()),
+                body(serde_json::json!({"user_id": "w211-x", "password": "X1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown["code"], serde_json::json!("NOT_FOUND"));
+        let (status, unknown, _) = parts(
+            delete_authn_user(
+                State(state.clone()),
+                Path((
+                    "password_based:nowhere".to_string(),
+                    "w211-alice".to_string(),
+                )),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown["code"], serde_json::json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn live_user_map_drives_the_connect_path() {
+        // Goes through the broker, not only the store: the created
+        // credential must authenticate on the CONNECT path
+        // (`MemoryAuth::authenticate`, driven by CONNECT in
+        // `crates/broker-node/src/main.rs`), and must stop working after
+        // the delete.
+        let state = standalone_state();
+        for (user_id, password) in [
+            ("w211-conn", "ConnSecret1!"),
+            // Keeper: the store is open while empty
+            // (`MemoryAuth::authenticate` allows everything with no users,
+            // and the broker only closes anonymous once users exist), so
+            // one user must remain for the deleted credential to fail
+            // closed below.
+            ("w211-keeper", "KeeperSecret1!"),
+        ] {
+            let (status, _, _) = parts(
+                create_authn_user(
+                    State(state.clone()),
+                    Path(CHAIN_ID.to_string()),
+                    body(serde_json::json!({"user_id": user_id, "password": password})),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "create {user_id}");
+        }
+
+        state
+            .auth
+            .authenticate("w211-client", Some("w211-conn"), Some(b"ConnSecret1!"))
+            .await
+            .expect("correct password authenticates on the CONNECT path");
+        assert!(
+            state
+                .auth
+                .authenticate("w211-client", Some("w211-conn"), Some(b"wrong"))
+                .await
+                .is_err(),
+            "wrong password fails closed"
+        );
+
+        let gone = delete_authn_user(
+            State(state.clone()),
+            Path((CHAIN_ID.to_string(), "w211-conn".to_string())),
+        )
+        .await;
+        assert_eq!(gone.status(), StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .auth
+                .authenticate("w211-client", Some("w211-conn"), Some(b"ConnSecret1!"))
+                .await
+                .is_err(),
+            "deleted user fails closed on the CONNECT path"
+        );
+        state
+            .auth
+            .authenticate("w211-client", Some("w211-keeper"), Some(b"KeeperSecret1!"))
+            .await
+            .expect("remaining user still authenticates on the CONNECT path");
+    }
+
+    #[tokio::test]
+    async fn passwords_are_hashed_never_rendered_and_survive_a_restart() {
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_authn_user(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                body(serde_json::json!({"user_id": "w211-hash", "password": "HashSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The stored verifier is a hash, never the plaintext.
+        let verifier = state
+            .auth
+            .verifier_string("w211-hash")
+            .expect("created user has a verifier");
+        assert!(
+            !verifier.contains("HashSecret1!"),
+            "no plaintext in the store"
+        );
+
+        // No list rendering carries password material.
+        let (_, listed, raw) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path(CHAIN_ID.to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert!(listed.get("password").is_none());
+        for row in listed["data"].as_array().expect("data array") {
+            assert!(row.get("password").is_none(), "row renders no password");
+            assert!(row.get("password_hash").is_none(), "row renders no hash");
+        }
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("HashSecret1!"),
+            "list body carries no plaintext"
+        );
+
+        // Persistence rides the config registry: a fresh registry load
+        // from the same directory still holds the user, so the credential
+        // survives a kernel restart.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-w211-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("scratch registry loads"),
+        );
+        let durable = broker_auth::MemoryAuth::from_registry(&registry);
+        durable.set_policy(PasswordHashPolicy::for_tests());
+        durable
+            .add_user("w211-kept", b"KeptSecret1!")
+            .expect("registry-backed add persists");
+        drop(durable);
+        let reloaded =
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart");
+        let found = reloaded
+            .snapshot()
+            .mqtt_users
+            .users
+            .iter()
+            .any(|u| u.username == "w211-kept");
+        assert!(found, "user persists across a restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn non_built_in_backend_is_rejected_not_executed() {
+        let state = standalone_state();
+        state
+            .authn_chain
+            .insert(broker_auth::AuthnEntry {
+                id: "password_based:mysql".to_string(),
+                mechanism: "password_based".to_string(),
+                backend: "mysql".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("non-built-in entry inserts");
+        let (status, rejected, _) = parts(
+            list_authn_users(
+                State(state.clone()),
+                Path("password_based:mysql".to_string()),
+                params(1, 100),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejected["code"], serde_json::json!("BAD_REQUEST"));
+        // TODO(parity): should non-built-in user routes be 400 or 404?
+        // The rulebook does not decide the exact code; the current choice
+        // is 400 (stored-only backends never execute) until the checker
+        // pins it.
     }
 }
