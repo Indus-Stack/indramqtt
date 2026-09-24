@@ -143,6 +143,15 @@ pub struct ApiState {
     /// console CONNECT in `crates/broker-api/src/ws.rs`); publish and
     /// deliver never touch it.
     pub authn_node_cache: Arc<broker_auth::NodeAuthCache>,
+    /// Global authentication settings for `GET/PUT
+    /// /api/v5/authentication/settings` (W2-05): single validated struct
+    /// with registry persistence plus a lock-free CONNECT snapshot. The
+    /// routes read one snapshot per request; the kernel CONNECT path
+    /// loads one lock-free snapshot per connect
+    /// (`crates/broker-node/src/main.rs`, CONNECT handling, plus the
+    /// console CONNECT in `crates/broker-api/src/ws.rs`); publish and
+    /// deliver never touch it.
+    pub authn_settings: Arc<crate::v5::authn_settings::AuthnSettingsStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -197,6 +206,23 @@ impl ApiState {
         // recorder observe the same enabled flag and cap without a
         // restart. Cached entries always start empty (memory-only).
         let authn_node_cache = Arc::new(broker_auth::NodeAuthCache::from_registry(&config));
+        // Boot seeding (W2-05): route the loaded authentication
+        // settings into a shared store so management reads and the
+        // CONNECT consult observe the same snapshot without a restart.
+        // The subscriber keeps the node cache's enabled flag and cap in
+        // sync with the settings' cache half on every validated replace.
+        let authn_settings = Arc::new(broker_auth::AuthnSettingsStore::from_registry(&config));
+        {
+            let cache = Arc::clone(&authn_node_cache);
+            authn_settings.set_subscriber(Arc::new(
+                move |next: &broker_config::AuthnSettingsConf| {
+                    cache.apply_settings(next.node_cache.enable, next.node_cache.max_count);
+                },
+            ));
+            let current = authn_settings.get();
+            authn_node_cache
+                .apply_settings(current.node_cache.enable, current.node_cache.max_count);
+        }
         Self {
             engine,
             sessions,
@@ -226,6 +252,7 @@ impl ApiState {
             licence: Arc::new(crate::licence::LicenceStore::new()),
             authn_chain,
             authn_node_cache,
+            authn_settings,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -238,6 +265,19 @@ impl ApiState {
     pub fn standalone(engine: Arc<RuleEngine>) -> Self {
         let (edge_tx, edge_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
         drop(edge_rx);
+        // Standalone settings store shares its subscriber with the very
+        // node-cache instance below, so validated replaces keep the
+        // cache's enabled flag and cap in sync without a restart.
+        let authn_node_cache = Arc::new(broker_auth::NodeAuthCache::new());
+        let authn_settings = Arc::new(broker_auth::AuthnSettingsStore::new());
+        {
+            let cache = Arc::clone(&authn_node_cache);
+            authn_settings.set_subscriber(Arc::new(
+                move |next: &broker_config::AuthnSettingsConf| {
+                    cache.apply_settings(next.node_cache.enable, next.node_cache.max_count);
+                },
+            ));
+        }
         Self {
             engine,
             sessions: Arc::new(SessionManager::new()),
@@ -266,7 +306,8 @@ impl ApiState {
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
             authn_chain: Arc::new(broker_auth::AuthnChain::new()),
-            authn_node_cache: Arc::new(broker_auth::NodeAuthCache::new()),
+            authn_node_cache,
+            authn_settings,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -4951,6 +4992,176 @@ mod tests {
             .post_auth("/api/v5/authentication/node_cache/reset", json!({}), &token)
             .await;
         assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn authn_settings_replace_round_trip_drives_connect_and_survives_restart() {
+        // Settings round trip through the broker: GET defaults, PUT a
+        // full valid update, GET expecting the update; a console CONNECT
+        // still succeeds (the settings consult never breaks the open
+        // broker) and a subscribe/publish/deliver flow proves publish
+        // and deliver never touch this store. An invalid PUT is rejected
+        // with no change; the node-cache subscriber keeps the status cap
+        // in sync. Settings persist across a restart via the registry.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Defaults read back with the documented fields.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ignore_backend_failures"], json!(false));
+        assert_eq!(body["node_cache"]["enable"], json!(true));
+        assert_eq!(body["node_cache"]["max_count"], json!(10000));
+        assert_eq!(body["builtin_record_count_refresh_interval"], json!("1h"));
+
+        // Full valid replace through the broker.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({
+                    "ignore_backend_failures": true,
+                    "node_cache": {
+                        "enable": true,
+                        "cache_ttl": "30s",
+                        "cleanup_interval": "1m",
+                        "stat_update_interval": "5s",
+                        "max_count": 5000,
+                        "max_memory": "100MB",
+                    },
+                    "builtin_record_count_refresh_interval": "30m",
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ignore_backend_failures"], json!(true));
+        assert_eq!(body["node_cache"]["max_count"], json!(5000));
+        assert_eq!(body["node_cache"]["cache_ttl"], json!("30s"));
+        assert_eq!(body["builtin_record_count_refresh_interval"], json!("30m"));
+
+        // The subscriber keeps the node-cache status cap in sync with
+        // the settings' cache half without a restart.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["max_count"], json!(5000));
+
+        // The CONNECT consult never breaks the open broker: a console
+        // CONNECT still succeeds, and a subscribe/publish/deliver flow
+        // proves publish and deliver never touch this store.
+        let mut sub = WsClient::connect(server.port).await;
+        sub.send_bin(&mqtt_connect("w2-05-sub", None, None)).await;
+        let connack = sub.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        sub.send_bin(&mqtt_subscribe(7, &[("w2-05/t", 1)])).await;
+        let suback = sub.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        let mut publ = WsClient::connect(server.port).await;
+        publ.send_bin(&mqtt_connect("w2-05-pub", None, None)).await;
+        let connack = publ.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
+        publ.send_bin(&mqtt_publish("w2-05/t", 42, 1, b"hi-w2-05"))
+            .await;
+        let puback = publ.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let delivery = sub.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+        assert!(delivery.ends_with(b"hi-w2-05"));
+
+        // Unknown fields are rejected fail-closed with no change applied.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({"ignore_backend_failures": true, "bogus": 1}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({"node_cache": {"max_count": 0}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["node_cache"]["max_count"], json!(5000));
+
+        // Partial bodies replace: missing fields reset to defaults.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({"ignore_backend_failures": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ignore_backend_failures"], json!(false));
+        assert_eq!(body["node_cache"]["max_count"], json!(10000));
+
+        // Persistence across a restart through the config registry.
+        let dir = unique_data_dir("authn-settings");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authentication/settings",
+                json!({
+                    "ignore_backend_failures": true,
+                    "node_cache": {
+                        "enable": true,
+                        "cache_ttl": "30s",
+                        "cleanup_interval": "1m",
+                        "stat_update_interval": "5s",
+                        "max_count": 5000,
+                        "max_memory": "100MB",
+                    },
+                    "builtin_record_count_refresh_interval": "30m",
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/settings", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ignore_backend_failures"], json!(true));
+        assert_eq!(body["node_cache"]["max_count"], json!(5000));
+        assert_eq!(body["builtin_record_count_refresh_interval"], json!("30m"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

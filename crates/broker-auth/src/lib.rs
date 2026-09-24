@@ -2,11 +2,13 @@ pub mod chain;
 pub mod kerberos;
 pub mod ldap;
 pub mod node_cache;
+pub mod settings;
 
 pub use chain::{AuthnChain, AuthnEntry, ChainInsertError, ChainReorderError};
 pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 pub use node_cache::NodeAuthCache;
+pub use settings::{AuthnSettingsStore, SettingsSubscriber, SettingsUpdateError};
 
 use async_trait::async_trait;
 use broker_config::{AclConf, ConfigRegistry, MqttUser, MqttUsersConf};

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use broker_auth::{
-    Authenticator, AuthnChain, Authorizer, KerberosAuthenticator, KerberosConfig,
-    LdapAuthenticator, LdapConfig, MemoryAuth, NodeAuthCache,
+    Authenticator, AuthnChain, AuthnSettingsStore, Authorizer, KerberosAuthenticator,
+    KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth, NodeAuthCache,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
@@ -440,6 +440,19 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             );
             shared.metrics.inc_auth_failures();
             return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
+        }
+        // W2-05: authentication-settings consult. Loads one lock-free
+        // snapshot per connect to observe the backend-failure flag and
+        // never takes the settings write lock; publish and deliver never
+        // touch this store. Only the built-in database executes: an
+        // outage still fails closed (deny access and log) even when the
+        // flag is set, until the checker pins the intended behaviour.
+        let ignore_backend_failures = shared.authn_settings.ignore_backend_failures();
+        if ignore_backend_failures {
+            tracing::debug!(
+                client_id = %req.client_id,
+                "ignore_backend_failures is set: CONNECT still fails closed on auth failure"
+            );
         }
         if req.username.is_none() {
             // A non-empty user store always wins over `--allow-anonymous`:
@@ -1415,6 +1428,12 @@ struct Shared {
     /// it. Entries are memory-only; the enabled flag and cap persist
     /// via the config registry.
     authn_node_cache: Arc<NodeAuthCache>,
+    /// Global authentication settings for W2-05: shared with the
+    /// management API so validated settings writes are visible to the
+    /// CONNECT consult without a restart. One `Arc` clone at boot;
+    /// CONNECT loads one lock-free snapshot per connect and never takes
+    /// the settings write lock; publish and deliver never touch it.
+    authn_settings: Arc<AuthnSettingsStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -1590,6 +1609,19 @@ impl Shared {
         );
         let (slow_tx, slow_rx) =
             tokio::sync::mpsc::channel::<SlowRecord>(SLOW_RECORD_CHANNEL_BOUND);
+        // W2-05: settings store shares its subscriber with the very node
+        // cache below, so validated settings replaces keep the cache's
+        // enabled flag and cap in sync without a restart.
+        let authn_node_cache = Arc::new(NodeAuthCache::new());
+        let authn_settings = Arc::new(AuthnSettingsStore::new());
+        {
+            let cache = Arc::clone(&authn_node_cache);
+            authn_settings.set_subscriber(Arc::new(
+                move |next: &broker_config::AuthnSettingsConf| {
+                    cache.apply_settings(next.node_cache.enable, next.node_cache.max_count);
+                },
+            ));
+        }
         Self {
             sessions,
             router,
@@ -1609,7 +1641,8 @@ impl Shared {
             readiness,
             auth: Arc::new(MemoryAuth::new()),
             authn_chain: Arc::new(AuthnChain::new()),
-            authn_node_cache: Arc::new(NodeAuthCache::new()),
+            authn_node_cache,
+            authn_settings,
             ldap: None,
             kerberos: None,
             allow_anonymous: false,
@@ -4772,6 +4805,14 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // sharing replaces that fresh instance with the kernel's so no
     // second copy diverges.
     state.authn_node_cache = shared.authn_node_cache.clone();
+    // Share the authentication settings (W2-05) so validated management
+    // writes are visible to the CONNECT consult without a restart. One
+    // `Arc` clone; CONNECT loads one lock-free snapshot per connect and
+    // never takes the settings write lock; publish and deliver never
+    // touch it. Seeding already ran inside `ApiState::new`; sharing
+    // replaces that fresh instance with the kernel's so no second copy
+    // diverges.
+    state.authn_settings = shared.authn_settings.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -4918,6 +4959,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // management reads observe the persisted enabled flag and cap from
     // the first connection. Entries always start empty (memory-only).
     shared.authn_node_cache.seed_from_registry(&shared.config);
+    // Authentication settings (W2-05): seed the shared store in place
+    // (the same instance `serve_api` shares with `ApiState`), so the
+    // CONNECT consult observes the persisted snapshot from the first
+    // connection, then re-apply the cache half so the node cache
+    // matches the persisted settings without waiting for a replace.
+    shared.authn_settings.seed_from_registry(&shared.config);
+    {
+        let current = shared.authn_settings.get();
+        shared
+            .authn_node_cache
+            .apply_settings(current.node_cache.enable, current.node_cache.max_count);
+    }
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.

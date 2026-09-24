@@ -4,6 +4,7 @@ pub mod alarms;
 pub mod auth;
 pub mod authn_cache;
 pub mod authn_chain;
+pub mod authn_settings;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
@@ -73,6 +74,14 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/authentication/node_cache/reset",
             post(authn_cache::node_cache_reset),
+        )
+        // Global authentication settings: validated full replace over
+        // the registry-backed store. Management-plane only; the CONNECT
+        // path reads a lock-free snapshot and publish/deliver never
+        // touch this store.
+        .route(
+            "/authentication/settings",
+            get(authn_settings::get_authn_settings).put(authn_settings::put_authn_settings),
         )
         // Authentication (AuthN) built-in-database users
         .route(

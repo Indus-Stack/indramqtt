@@ -470,6 +470,19 @@ async fn handle_packet(
                 send_bin(socket, encode_connack(false, 0x86)).await;
                 return Err(());
             }
+            // W2-05: authentication-settings consult. Loads one lock-free
+            // snapshot per connect to observe the backend-failure flag
+            // and never takes the settings write lock; publish and
+            // deliver never touch this store. Only the built-in database
+            // executes: an outage still fails closed (deny access and
+            // log) even when the flag is set, until the checker pins the
+            // intended behaviour.
+            if state.authn_settings.ignore_backend_failures() {
+                tracing::debug!(
+                    client_id = %conn.client_id,
+                    "ignore_backend_failures is set: console CONNECT still fails closed on auth failure"
+                );
+            }
             // A non-empty user store always wins: unauthenticated console
             // clients are rejected whenever users exist, exactly like the
             // BrokerLink bind path (0x87, not authorized).

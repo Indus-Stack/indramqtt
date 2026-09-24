@@ -617,6 +617,240 @@ impl AuthnNodeCacheConf {
     }
 }
 
+/// Default node-cache TTL inside authentication settings ("1m").
+/// Reason: cached CONNECT decisions must expire quickly so a credential
+/// change takes effect; one minute bounds staleness while keeping
+/// successful reconnects cheap.
+fn default_authn_settings_cache_ttl() -> String {
+    "1m".to_string()
+}
+
+/// Default node-cache cleanup interval inside authentication settings
+/// ("1m"). Reason: expiry sweeps run on the same cadence as the TTL so
+/// expired entries do not linger past one TTL window.
+fn default_authn_settings_cleanup_interval() -> String {
+    "1m".to_string()
+}
+
+/// Default node-cache statistics update interval ("5s"). Reason: cache
+/// counters feed management status reads, so a few seconds keep the
+/// status fresh without waking the sweeper per request.
+fn default_authn_settings_stat_update_interval() -> String {
+    "5s".to_string()
+}
+
+/// Default node-cache entry cap inside authentication settings (10 000
+/// entries). Reason: the settings snapshot is cloned once per CONNECT,
+/// so the cap must stay small and bounded; 10 000 covers ordinary nodes
+/// with headroom while keeping per-connect clones cheap.
+fn default_authn_settings_max_count() -> usize {
+    DEFAULT_AUTHN_NODE_CACHE_MAX
+}
+
+/// Default node-cache memory cap inside authentication settings
+/// ("100MB"). Reason: entries are small per-username records, so 100MB
+/// bounds the cache far above the entry-cap worst case while letting an
+/// operator raise it explicitly with `unlimited`.
+fn default_authn_settings_max_memory() -> String {
+    "100MB".to_string()
+}
+
+/// Default built-in record-count refresh interval ("1h"). Reason: the
+/// built-in database recounts its user records hourly so management
+/// status stays fresh without scanning on every request.
+fn default_authn_settings_refresh_interval() -> String {
+    "1h".to_string()
+}
+
+/// Node-cache half of the global authentication settings: the enabled
+/// flag, expiry cadences and bounds applied to the node auth cache.
+/// Only the enabled flag and the entry cap drive broker behaviour (via
+/// the settings subscriber); the cadences and memory cap are stored,
+/// validated and reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthnSettingsNodeCacheConf {
+    /// Whether successful CONNECT decisions are recorded (default true).
+    /// Accepts `enabled` as an alias for older documents.
+    #[serde(default = "default_authn_node_cache_enabled", alias = "enabled")]
+    pub enable: bool,
+    /// Cache entry TTL (default "1m").
+    #[serde(default = "default_authn_settings_cache_ttl")]
+    pub cache_ttl: String,
+    /// Expired-entry sweep interval (default "1m").
+    #[serde(default = "default_authn_settings_cleanup_interval")]
+    pub cleanup_interval: String,
+    /// Statistics refresh interval (default "5s").
+    #[serde(default = "default_authn_settings_stat_update_interval")]
+    pub stat_update_interval: String,
+    /// Entry cap (default 10 000, at most 1 000 000).
+    #[serde(default = "default_authn_settings_max_count")]
+    pub max_count: usize,
+    /// Memory cap (default "100MB", or explicit `unlimited` opt-in).
+    #[serde(default = "default_authn_settings_max_memory")]
+    pub max_memory: String,
+}
+
+impl Default for AuthnSettingsNodeCacheConf {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            cache_ttl: default_authn_settings_cache_ttl(),
+            cleanup_interval: default_authn_settings_cleanup_interval(),
+            stat_update_interval: default_authn_settings_stat_update_interval(),
+            max_count: default_authn_settings_max_count(),
+            max_memory: default_authn_settings_max_memory(),
+        }
+    }
+}
+
+impl AuthnSettingsNodeCacheConf {
+    /// Validates the entry cap and every duration/byte-size string.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_count == 0 || self.max_count > MAX_AUTHN_NODE_CACHE_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "authn_settings.node_cache.max_count holds {}, must be 1..={} (field `max_count`)",
+                self.max_count, MAX_AUTHN_NODE_CACHE_MAX
+            )));
+        }
+        validate_settings_duration("authn_settings.node_cache.cache_ttl", &self.cache_ttl)?;
+        validate_settings_duration(
+            "authn_settings.node_cache.cleanup_interval",
+            &self.cleanup_interval,
+        )?;
+        validate_settings_duration(
+            "authn_settings.node_cache.stat_update_interval",
+            &self.stat_update_interval,
+        )?;
+        validate_settings_bytesize("authn_settings.node_cache.max_memory", &self.max_memory)?;
+        Ok(())
+    }
+}
+
+/// Global authentication settings root: the backend-failure flag, the
+/// node-cache half and the built-in record-count refresh interval.
+/// Unknown fields are rejected (fail closed); missing fields load as
+/// their documented defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthnSettingsConf {
+    /// Whether a backend outage is ignored (default false, fail closed).
+    #[serde(default)]
+    pub ignore_backend_failures: bool,
+    /// Node-cache half (defaults stated on the struct).
+    #[serde(default)]
+    pub node_cache: AuthnSettingsNodeCacheConf,
+    /// Built-in record-count refresh interval (default "1h").
+    #[serde(default = "default_authn_settings_refresh_interval")]
+    pub builtin_record_count_refresh_interval: String,
+}
+
+impl Default for AuthnSettingsConf {
+    fn default() -> Self {
+        Self {
+            ignore_backend_failures: false,
+            node_cache: AuthnSettingsNodeCacheConf::default(),
+            builtin_record_count_refresh_interval: default_authn_settings_refresh_interval(),
+        }
+    }
+}
+
+impl AuthnSettingsConf {
+    /// Validates every field; the first bad field names itself.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.node_cache.validate()?;
+        validate_settings_duration(
+            "authn_settings.builtin_record_count_refresh_interval",
+            &self.builtin_record_count_refresh_interval,
+        )?;
+        Ok(())
+    }
+}
+
+/// Durations are `<n>ms|s|m|h|d` (integer or float count, no spaces).
+fn validate_settings_duration(field: &str, text: &str) -> Result<(), ConfigError> {
+    if parse_settings_duration_to_ms(text).is_none() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} holds {text:?}, must be a duration like `1m`, `5s` or `1h` (field `{}`)",
+            field.rsplit('.').next().unwrap_or(field)
+        )));
+    }
+    Ok(())
+}
+
+/// Byte sizes are `<n>[B|KB|MB|GB]` (case-insensitive, optional space), a
+/// plain positive integer string, or explicit `unlimited` opt-in.
+fn validate_settings_bytesize(field: &str, text: &str) -> Result<(), ConfigError> {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower == "unlimited" {
+        return Ok(());
+    }
+    match parse_settings_bytesize_to_bytes(text) {
+        Some(v) if v > 0 => Ok(()),
+        _ => Err(ConfigError::Invalid(format!(
+            "{field} holds {text:?}, must be a byte size like `100MB` or `unlimited` (field `{}`)",
+            field.rsplit('.').next().unwrap_or(field)
+        ))),
+    }
+}
+
+fn parse_settings_duration_to_ms(text: &str) -> Option<u64> {
+    let lower = text.trim().to_ascii_lowercase().replace(' ', "");
+    if lower.is_empty() {
+        return None;
+    }
+    let (num_part, mult): (&str, f64) = if lower.ends_with("ms") {
+        (&lower[..lower.len() - 2], 1.0)
+    } else if lower.ends_with('s') {
+        (&lower[..lower.len() - 1], 1000.0)
+    } else if lower.ends_with('m') {
+        (&lower[..lower.len() - 1], 60_000.0)
+    } else if lower.ends_with('h') {
+        (&lower[..lower.len() - 1], 3_600_000.0)
+    } else if lower.ends_with('d') {
+        (&lower[..lower.len() - 1], 86_400_000.0)
+    } else {
+        return None;
+    };
+    if num_part.is_empty() {
+        return None;
+    }
+    let num: f64 = num_part.parse().ok()?;
+    if num < 0.0 || !num.is_finite() {
+        return None;
+    }
+    Some((num * mult) as u64)
+}
+
+fn parse_settings_bytesize_to_bytes(text: &str) -> Option<u64> {
+    let lower = text.trim().to_ascii_lowercase().replace(' ', "");
+    if lower.is_empty() {
+        return None;
+    }
+    if let Ok(plain) = lower.parse::<u64>() {
+        return Some(plain);
+    }
+    let (num_part, mult) = lower
+        .strip_suffix("kb")
+        .map(|stripped| (stripped, 1024u64))
+        .or_else(|| {
+            lower
+                .strip_suffix("mb")
+                .map(|stripped| (stripped, 1024u64 * 1024))
+        })
+        .or_else(|| {
+            lower
+                .strip_suffix("gb")
+                .map(|stripped| (stripped, 1024u64 * 1024 * 1024))
+        })
+        .or_else(|| lower.strip_suffix('b').map(|stripped| (stripped, 1u64)))?;
+    let num: f64 = num_part.parse().ok()?;
+    if num < 0.0 {
+        return None;
+    }
+    Some((num * mult as f64) as u64)
+}
+
 /// Root: ordered authenticator chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AuthnChainConf {
@@ -699,6 +933,8 @@ pub struct FullSnapshot {
     pub authn_chain: AuthnChainConf,
     #[serde(default)]
     pub authn_node_cache: AuthnNodeCacheConf,
+    #[serde(default)]
+    pub authn_settings: AuthnSettingsConf,
 }
 
 impl FullSnapshot {
@@ -710,6 +946,7 @@ impl FullSnapshot {
         self.connectors.validate()?;
         self.authn_chain.validate()?;
         self.authn_node_cache.validate()?;
+        self.authn_settings.validate()?;
         Ok(())
     }
 }
@@ -729,6 +966,8 @@ pub enum ConfigRoot {
     AuthnChain(AuthnChainConf),
     /// Validated node authentication cache config root.
     AuthnNodeCache(AuthnNodeCacheConf),
+    /// Validated global authentication settings root.
+    AuthnSettings(AuthnSettingsConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -811,6 +1050,7 @@ impl ConfigRegistry {
             ConfigRoot::Connectors(conf) => self.commit_connectors(conf),
             ConfigRoot::AuthnChain(conf) => self.commit_authn_chain(conf),
             ConfigRoot::AuthnNodeCache(conf) => self.commit_authn_node_cache(conf),
+            ConfigRoot::AuthnSettings(conf) => self.commit_authn_settings(conf),
         }
     }
 
@@ -875,6 +1115,17 @@ impl ConfigRegistry {
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.authn_node_cache = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Commits validated global authentication settings.
+    pub fn commit_authn_settings(&self, conf: AuthnSettingsConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.authn_settings = conf.clone();
             next
         });
         Ok(())
@@ -987,6 +1238,7 @@ mod tests {
             },
             authn_chain: AuthnChainConf::default(),
             authn_node_cache: AuthnNodeCacheConf::default(),
+            authn_settings: AuthnSettingsConf::default(),
         }
     }
 

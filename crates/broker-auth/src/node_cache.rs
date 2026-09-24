@@ -148,6 +148,18 @@ impl NodeAuthCache {
         inner.order.push_back(username.to_string());
     }
 
+    /// Apply the settings subscriber's node-cache half (enabled flag and
+    /// entry cap) in place. Called after every validated settings
+    /// replace and once at boot so management writes are visible to the
+    /// CONNECT recorder without a restart. Cached entries are left alone
+    /// (only the flag and cap move). Management-plane only; the CONNECT
+    /// path keeps taking one short lock per success and publish/deliver
+    /// never touch this store.
+    pub fn apply_settings(&self, enable: bool, max_count: usize) {
+        *self.enabled.write() = enable;
+        *self.max_count.write() = max_count.clamp(1, broker_config::MAX_AUTHN_NODE_CACHE_MAX);
+    }
+
     /// Evict every cached entry. Evicting an already-empty cache still
     /// succeeds. Management-plane only: one short write lock; the
     /// CONNECT path never blocks on it beyond that lock, and publish
