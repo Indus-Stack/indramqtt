@@ -11,7 +11,9 @@ use broker_config::{ConfigError, ConfigRegistry};
 use broker_gateway::coap::{CoapCode, CoapGatewayHandler, CoapMessage};
 use broker_observability::{Metrics, NodeReadiness, StatsStore};
 use broker_protocol::{v5 as protocol_v5, QoS, Topic, TopicFilter};
-use broker_router::{split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription};
+use broker_router::{
+    is_qos0_publish_out, split_shared_filter, strip_delayed_prefix, ConnTable, Router, Subscription,
+};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{
     InflightMessage, InflightTrackOutcome, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage,
@@ -1467,22 +1469,38 @@ fn slow_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Note shed backpressure from one PublishIn fan-out and hand a slow
+/// Note slow backpressure from one PublishIn fan-out and hand a slow
 /// record off asynchronously when the measured delivery latency exceeds
-/// the threshold (F1-03, T-73).
+/// the threshold (F1-03, T-73; FX-03 extends it to QoS 0 backlogs).
 ///
 /// `shed_before`/`shed_after` are the `egress_qos0_shed` counter around
-/// the route loop; `topic_str` is the concrete publish topic,
-/// `conn_id` the first enqueued delivery's connection (the slow
-/// subscriber when a single subscriber floods) and `delivery_ms` the
-/// route-loop time just measured around the fan-out (the delivery time
-/// already spent routing this publish).
+/// the route loop; `backlog_depth` is the kernel QoS 0 queue length for
+/// `conn_id` just after this fan-out enqueued (`ConnTable::qos0_len`,
+/// one short shard lock plus one short queue lock, no allocation);
+/// `topic_str` is the concrete publish topic, `conn_id` the first
+/// enqueued delivery's connection (the slow subscriber when a single
+/// subscriber floods) and `delivery_ms` the route-loop time just
+/// measured around the fan-out (the delivery time already spent routing
+/// this publish).
 ///
-/// Fast path (no shed): two relaxed atomic loads happened in the caller
-/// to produce the counter pair; here one integer comparison and a return.
-/// No lock, no allocation, no clock read.
+/// A shed message is not a slow delivery: it never reached a mailbox
+/// and stays counted as dropped inside `ConnTable::route` (via
+/// `egress_qos0_shed`); the slow record names the backlogged
+/// subscriber-topic whose sustained backlog age (`burst_age_ms`, time
+/// the kernel backlog has persisted, which includes time deliveries
+/// spent queued) exceeds the threshold. `backlog_depth <= 1` means no
+/// queue ahead (just this message, or a race that already drained), so
+/// there is no queued time to measure and nothing is recorded.
+/// `backlog_depth > 1` without shed still holds queued deliveries whose
+/// whole-path time (ingress to delivery complete, approximated by the
+/// sustained-backlog age plus this fan-out's route time) is slow.
 ///
-/// Slow path (shed): one relaxed enable load, two relaxed atomic loads
+/// Fast path (no backlog: no shed and depth <= 1): two relaxed atomic
+/// loads happened in the caller to produce the counter pair, plus one
+/// integer comparison and a return here. No lock, no allocation, no
+/// clock read.
+///
+/// Slow path (backlog): one relaxed enable load, two relaxed atomic loads
 /// plus at most two relaxed stores for burst tracking, one wall-clock
 /// read, one relaxed threshold load plus one relaxed stats-type load,
 /// and at most one small topic clone plus a non-blocking `try_send`.
@@ -1492,6 +1510,10 @@ fn slow_now_ms() -> u64 {
 /// second phase, last-will, delayed-driver, CoAP and cluster fan-outs
 /// route through their own loops without a slow note. Should every
 /// egress loop share one `route_deliveries` helper so all of them record?
+/// TODO(parity): the kernel queue is the only backlog observed here;
+/// edge-side queueing past its dispatch bound sheds before the kernel
+/// can time it. Should an edge backpressure signal feed the same burst
+/// so edge-only stalls record with the same whole-path meaning?
 #[allow(clippy::too_many_arguments)]
 fn maybe_note_slow_delivery(
     shared: &Shared,
@@ -1499,9 +1521,11 @@ fn maybe_note_slow_delivery(
     conn_id: u64,
     shed_before: u64,
     shed_after: u64,
+    backlog_depth: usize,
     delivery_ms: u64,
 ) {
-    if shed_after <= shed_before {
+    let shed_happened = shed_after > shed_before;
+    if !shed_happened && backlog_depth <= 1 {
         return;
     }
     // Honour `enable=false`: recording is gated on the
@@ -1521,16 +1545,29 @@ fn maybe_note_slow_delivery(
     let burst_age_ms = now.saturating_sub(burst_start);
     // Delivery latency (`timespan`) selected by the configured
     // `stats_type`, read atomically: `whole` is ingress-to-complete
-    // approximated by the sustained-backpressure age plus this fan-out's
-    // route time, `internal` is the sustained-backpressure age (time the
-    // backlog has been shedding), and `response` is this fan-out's route
-    // time. All three ceil sub-millisecond sheds to 1 ms so the first
-    // shed of a burst never invents a zero latency.
+    // approximated by the sustained-backpressure age (which includes
+    // time deliveries spent queued behind the backlog) plus this
+    // fan-out's route time, `internal` is the sustained-backpressure
+    // age (time the backlog has persisted), and `response` is this
+    // fan-out's route time. A shed burst ceils sub-millisecond ages to
+    // 1 ms so the first shed of a burst (which proves the backlog is
+    // full) records under the 1 ms judge threshold; a non-full backlog
+    // (depth > 1, nothing shed) requires the measured age itself to
+    // reach the threshold so a single transient queueing never invents
+    // a slow subscriber.
     let stats_code = shared.slow_subs_settings.stats_type_code();
-    let timespan_ms = match stats_code {
-        broker_api::v5::slow_subscriptions::SLOW_STATS_RESPONSE => delivery_ms.max(1),
-        broker_api::v5::slow_subscriptions::SLOW_STATS_INTERNAL => burst_age_ms.max(1),
-        _ => burst_age_ms.max(delivery_ms).max(1),
+    let timespan_ms = if shed_happened {
+        match stats_code {
+            broker_api::v5::slow_subscriptions::SLOW_STATS_RESPONSE => delivery_ms.max(1),
+            broker_api::v5::slow_subscriptions::SLOW_STATS_INTERNAL => burst_age_ms.max(1),
+            _ => burst_age_ms.max(delivery_ms).max(1),
+        }
+    } else {
+        match stats_code {
+            broker_api::v5::slow_subscriptions::SLOW_STATS_RESPONSE => delivery_ms,
+            broker_api::v5::slow_subscriptions::SLOW_STATS_INTERNAL => burst_age_ms,
+            _ => burst_age_ms.max(delivery_ms),
+        }
     };
     // Honour the configured threshold (default 500 ms) read atomically:
     // latencies shorter than it are still shedding but not yet slow.
@@ -1557,7 +1594,7 @@ fn maybe_note_slow_delivery(
 /// on failure: returns `None` for malformed frames and for empty-topic
 /// alias-by-reference uses (the alias table lives behind a session lock;
 /// the hook skips those rather than inventing a topic).
-/// Called only on the shed (slow) path, so the returned clone never costs
+/// Called only on the backlog (slow) path, so the returned clone never costs
 /// the fast path an allocation.
 fn decode_publish_topic_for_slow(frame: &BrokerFrame) -> Option<String> {
     let meta = &frame.metadata;
@@ -1576,16 +1613,23 @@ fn decode_publish_topic_for_slow(frame: &BrokerFrame) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Route one PublishIn fan-out and note slow backpressure (F1-03, T-73).
+/// Route one PublishIn fan-out and note slow backpressure (F1-03, T-73;
+/// FX-03 extends the note to QoS 0 backlogs that have not shed yet).
 ///
 /// Shared by the live PublishIn path and the slow test so both exercise
-/// the same egress hook. When slow tracking is disabled (the default) the
-/// fast path pays one relaxed atomic load plus the existing route loop
-/// and counters: no shed snapshot, no clock, no lock, no allocation.
+/// the same egress hook. When slow tracking is disabled the fast path
+/// pays one relaxed atomic load plus the existing route loop and
+/// counters: no shed snapshot, no clock, no lock, no allocation.
 /// When enabled, the helper snapshots the QoS 0 shed counter (two relaxed
 /// atomic loads, no lock) and times the loop itself (the delivery time
 /// already spent routing this publish), then hands at most one slow
-/// record off asynchronously when this fan-out shed.
+/// record off asynchronously when this fan-out shed or left a backlog
+/// behind it. QoS 1/2 fan-outs skip the backlog read (their queue is the
+/// guaranteed mailbox, never the bounded QoS 0 backlog); QoS 0 reads one
+/// bounded backlog length (`qos0_len`: one short shard lock plus one
+/// short queue lock, no allocation) so the whole-path time includes time
+/// spent queued. Shed messages stay counted as dropped inside
+/// `ConnTable::route` and are never recorded as slow themselves.
 fn route_publish_out_deliveries(
     shared: &Shared,
     publish_in: &BrokerFrame,
@@ -1609,21 +1653,27 @@ fn route_publish_out_deliveries(
         shared.metrics.inc_bytes_sent_by(enqueued_bytes);
         return;
     }
-    // F1-03 enabled path: snapshot the QoS 0 shed counter around the
+    // FX-03 enabled path: snapshot the QoS 0 shed counter around the
     // route loop (two relaxed atomic loads, no lock) and time the loop
     // itself (the delivery time already spent) so the hook compares a
-    // measured latency. The slow note below runs only when this fan-out
-    // shed; the no-shed enabled path is integer comparisons plus the
-    // clock reads, with no lock and no allocation.
+    // measured latency. The slow note below runs when this fan-out shed
+    // (backlog full, oldest drop counted) or left more than one QoS 0
+    // frame queued behind it (backlog ahead, whose age includes queued
+    // time); a lone queued frame with no queue ahead records nothing.
+    // QoS 1/2 fan-outs pay no backlog read; QoS 0 pays one bounded
+    // `qos0_len` read. The slow path decodes the topic (one small clone)
+    // and `try_send`s at most one record.
     let shed_before = shared.metrics.egress_qos0_shed();
     let route_start = std::time::Instant::now();
     let mut enqueued = 0u64;
     let mut enqueued_bytes = 0u64;
     let mut first_conn_id = 0u64;
     let mut have_first = false;
+    let mut first_is_qos0 = false;
     for (conn_id, routed) in deliveries {
         if !have_first {
             first_conn_id = conn_id;
+            first_is_qos0 = is_qos0_publish_out(&routed);
             have_first = true;
         }
         let len = routed.total_frame_len() as u64;
@@ -1637,12 +1687,20 @@ fn route_publish_out_deliveries(
     shared.metrics.inc_publish_sent_by(enqueued);
     shared.metrics.inc_delivered_by(enqueued);
     shared.metrics.inc_bytes_sent_by(enqueued_bytes);
-    // F1-03: hand a slow record off asynchronously when this fan-out shed.
-    // Fast path (no shed) is integer comparisons; the slow path decodes
-    // the topic (one small clone) and `try_send`s at most one record.
+    // FX-03: hand a slow record off asynchronously on shed or backlog.
+    // Fast path (no shed, depth <= 1) is integer comparisons; the slow
+    // path decodes the topic (one small clone) and `try_send`s at most
+    // one record.
     if have_first {
         let shed_after = shared.metrics.egress_qos0_shed();
-        if shed_after > shed_before {
+        // QoS 1/2 never ride the bounded QoS 0 backlog: shed alone
+        // decides, with no backlog read and no new lock.
+        let backlog_depth = if first_is_qos0 {
+            shared.conns.qos0_len(first_conn_id)
+        } else {
+            0
+        };
+        if shed_after > shed_before || backlog_depth > 1 {
             if let Some(topic_str) = decode_publish_topic_for_slow(publish_in) {
                 maybe_note_slow_delivery(
                     shared,
@@ -1650,6 +1708,7 @@ fn route_publish_out_deliveries(
                     first_conn_id,
                     shed_before,
                     shed_after,
+                    backlog_depth,
                     delivery_ms,
                 );
             }
@@ -9902,6 +9961,150 @@ mod tests {
             broker_api::v5::slow_subscriptions::SLOW_STATS_WHOLE,
             "default stats_type is whole"
         );
+    }
+
+    #[tokio::test]
+    async fn slow_qos0_backlog_records_slow_not_prompt() {
+        // FX-03: what the judge scenario does, through the broker. Enable
+        // with a 1 ms threshold, hold a QoS 0 subscriber that stops
+        // reading behind a flood, and assert it is listed with a timespan
+        // at or above the threshold; a prompt subscriber that drains after
+        // every publish is not listed. Goes through the real publish path
+        // (authorisation, ingress pipeline, fan-out) and the shared egress
+        // helper, never through the store: nothing here calls
+        // `SlowSubsStore::record` directly. Shed messages stay counted as
+        // dropped (via `egress_qos0_shed`) and are never recorded as slow
+        // themselves; the sustained backlog is what records.
+        let shared = Shared::new();
+        // Small backlog so a short flood sheds deterministically: 8 holds
+        // a few small frames while a 32-message burst to an unread
+        // mailbox must shed oldest-first.
+        shared.conns.set_qos0_bound(8);
+        // The judge's sensitive threshold: whole-path time at or past
+        // 1 ms records, under the documented default `whole` statistics
+        // type (ingress to delivery complete, including queued time).
+        shared.slow_subs_settings.set_enabled(true);
+        assert!(shared.slow_subs_settings.set_threshold("1ms"));
+        assert_eq!(
+            shared.slow_subs_settings.stats_type_code(),
+            broker_api::v5::slow_subscriptions::SLOW_STATS_WHOLE,
+            "scenario runs under the default whole statistics type"
+        );
+        shared.spawn_slow_recorder();
+
+        // Slow subscriber: live session bound to a connection whose backlog
+        // is never drained, so the flood sheds and the backlog persists.
+        let (slow_session, _) = shared.sessions.get_or_create("slow-q0-1", true);
+        *slow_session.connected.write() = true;
+        *slow_session.conn_id.write() = Some(921);
+        shared.sessions.bind_session(&slow_session, 921);
+        let slow_filter = TopicFilter::new("slow/q0backlog").expect("filter");
+        shared.router.subscribe(
+            &slow_filter,
+            Subscription {
+                client_id: "slow-q0-1".into(),
+                conn_id: 921,
+                qos: QoS::AtMostOnce,
+                group: None,
+            },
+        );
+        let (slow_tx, slow_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
+        drop(slow_rx);
+        shared.conns.register(921, slow_tx);
+        shared.conns.set_client_label(921, "slow-q0-1");
+
+        // Prompt subscriber: live session on its own topic with a live
+        // mailbox that the test drains after every publish, so its kernel
+        // backlog never holds more than the just-enqueued frame.
+        let (fast_session, _) = shared.sessions.get_or_create("fast-q0-1", true);
+        *fast_session.connected.write() = true;
+        *fast_session.conn_id.write() = Some(922);
+        shared.sessions.bind_session(&fast_session, 922);
+        let fast_filter = TopicFilter::new("fast/q0backlog").expect("filter");
+        shared.router.subscribe(
+            &fast_filter,
+            Subscription {
+                client_id: "fast-q0-1".into(),
+                conn_id: 922,
+                qos: QoS::AtMostOnce,
+                group: None,
+            },
+        );
+        let (fast_tx, _fast_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
+        shared.conns.register(922, fast_tx);
+        shared.conns.set_client_label(922, "fast-q0-1");
+
+        // Publisher bound to its connection.
+        let (pub_session, _) = shared.sessions.get_or_create("slow-q0-pub", true);
+        *pub_session.connected.write() = true;
+        *pub_session.conn_id.write() = Some(923);
+        shared.sessions.bind_session(&pub_session, 923);
+
+        // Flood the slow subscriber past the bound without ever draining:
+        // every publish fans out once, and past the bound the oldest
+        // queued QoS 0 drops (counted, never recorded as slow).
+        for seq in 0..32u64 {
+            let (meta, payload) =
+                encode_publish_meta("slow/q0backlog", 0, 0, false, b"x-q0-backlog");
+            let frame = publish_frame(923, seq + 1, meta, payload);
+            let (_ack, deliveries) = apply_publish(&frame, &shared).await;
+            assert!(
+                !deliveries.is_empty(),
+                "slow flood publish must fan out to the slow subscriber"
+            );
+            route_publish_out_deliveries(&shared, &frame, deliveries);
+        }
+        assert!(
+            shared.metrics.egress_qos0_shed() > 0,
+            "slow flood must have shed QoS 0 (counted as dropped, never as slow)"
+        );
+
+        // A prompt subscriber receives a short burst on its own topic and
+        // drains after every publish, so its backlog never holds a queue
+        // ahead: nothing about it is slow.
+        for seq in 0..8u64 {
+            let (meta, payload) =
+                encode_publish_meta("fast/q0backlog", 0, 0, false, b"x-q0-prompt");
+            let frame = publish_frame(923, 100 + seq + 1, meta, payload);
+            let (_ack, deliveries) = apply_publish(&frame, &shared).await;
+            assert!(
+                !deliveries.is_empty(),
+                "prompt publish must fan out to the prompt subscriber"
+            );
+            route_publish_out_deliveries(&shared, &frame, deliveries);
+            // Prompt reading: drain whatever arrived so the next publish
+            // starts from an empty backlog.
+            while shared.conns.pop_qos0(922).is_some() {}
+        }
+
+        // The recorder drains asynchronously: poll briefly for the slow row.
+        let mut rows = Vec::new();
+        for _ in 0..200 {
+            rows = shared.slow_subs.list();
+            if rows
+                .iter()
+                .any(|entry| entry.clientid == "slow-q0-1" && entry.topic == "slow/q0backlog")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let row = rows
+            .iter()
+            .find(|entry| entry.clientid == "slow-q0-1" && entry.topic == "slow/q0backlog")
+            .expect("slow QoS 0 subscriber names the subscriber and topic");
+        assert!(
+            row.timespan >= shared.slow_subs_settings.threshold_ms(),
+            "timespan measures whole-path latency ({} ms) at or past the threshold ({} ms)",
+            row.timespan,
+            shared.slow_subs_settings.threshold_ms()
+        );
+        assert!(
+            rows.iter().all(|entry| entry.clientid != "fast-q0-1"),
+            "a prompt QoS 0 subscriber that drains must not appear"
+        );
+        // The handoff-drop counter is observed, never write-only.
+        let _dropped = shared.slow_dropped_count();
     }
 
     #[tokio::test]
