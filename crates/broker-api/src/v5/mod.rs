@@ -252,9 +252,21 @@ pub fn protected_router() -> Router<ApiState> {
             "/authorization/sources/order",
             put(authz_sources::replace_authz_order),
         )
+        // Authorization (AuthZ / ACL) single-source read, update and
+        // metrics reset (W2-23, C04-26..C04-28): per-type config plus
+        // live health, validated whole-entry replace, and a reset that
+        // zeroes the per-source atomic counters. Management-plane only;
+        // publish and deliver never touch the registry (the built-in
+        // rule consult stays on the publish/subscribe path).
         .route(
             "/authorization/sources/:type",
-            delete(authz_sources::delete_authz_source),
+            get(authz_sources::get_authz_source)
+                .put(authz_sources::put_authz_source)
+                .delete(authz_sources::delete_authz_source),
+        )
+        .route(
+            "/authorization/sources/:type/metrics/reset",
+            post(authz_sources::reset_authz_source_metrics),
         )
         // Authorization (AuthZ / ACL) generic per-type rule helpers.
         .route(

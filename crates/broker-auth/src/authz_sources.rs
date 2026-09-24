@@ -1,7 +1,11 @@
 //! Ordered authorization source registry for the management API.
 //!
 //! Covers the registry behind `GET /authorization/sources` (ordered list),
-//! `POST /authorization/sources` (register one source) and the built-in
+//! `POST /authorization/sources` (register one source),
+//! `GET /authorization/sources/:type` (one source's config and health),
+//! `PUT /authorization/sources/:type` (replace one source) and
+//! `POST /authorization/sources/:type/metrics/reset` (zero one source's
+//! live counters), plus the built-in
 //! catch-all clear (`DELETE
 //! /authorization/sources/built_in_database/rules`, which empties the
 //! built-in rule table). Single-node, management-plane only: handlers
@@ -38,6 +42,8 @@ use broker_config::{
     is_known_authz_source_type, AuthzSourceEntry as ConfEntry, AuthzSourcesConf, ConfigRegistry,
     MAX_AUTHZ_SOURCES,
 };
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Longest accepted backend-config JSON document (8 KiB).
@@ -76,11 +82,19 @@ pub enum SourceInsertError {
 /// publish a fresh snapshot; readers load the snapshot without taking
 /// the write lock and never block on a management write beyond one `Arc`
 /// swap. Publish and deliver never touch either.
+///
+/// Counter bound (stated here and enforced below): at most
+/// [`MAX_AUTHZ_SOURCES`] counter records (8: one per source `type`, so
+/// the map can never outgrow the registry); each record holds exactly
+/// three `AtomicU64` values and no list, queue or history ever
+/// accumulates. Counters are memory-only and reset to zero on seeding
+/// (health is computed live and never persists).
 pub struct AuthzSourceRegistry {
     inner: parking_lot::RwLock<Vec<AuthzSourceEntry>>,
     snapshot: arc_swap::ArcSwap<Vec<AuthzSourceEntry>>,
     registry: parking_lot::RwLock<Option<Arc<ConfigRegistry>>>,
     save_lock: parking_lot::Mutex<()>,
+    counters: parking_lot::RwLock<HashMap<String, Arc<AuthzSourceCounters>>>,
 }
 
 /// Why [`AuthzSourceRegistry::reorder`] refused a new order.
@@ -112,6 +126,76 @@ pub enum SourceRemoveError {
     Persist(String),
 }
 
+/// Why [`AuthzSourceRegistry::update`] refused a replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceUpdateError {
+    /// No stored source carries the requested `type`.
+    NotFound,
+    /// The replacement failed validation (message names the field).
+    Invalid(String),
+    /// The registry commit or atomic save failed after validation.
+    Persist(String),
+}
+
+/// Per-source live counters behind fixed-width atomics.
+///
+/// One record per source `type`: `total` counts every authorization
+/// verdict attributed to that type, split into `allow` (the source
+/// authorized) and `deny` (the source refused). All reads are lock-free
+/// atomic loads and all increments are lock-free atomic adds; the map
+/// itself is only looked up under one short read lock to clone the
+/// `Arc`. Counters are memory-only and restart at zero (configs persist
+/// across a restart through the config registry, counters do not).
+/// Management-plane only: publish and deliver never touch these
+/// counters, and no publish/subscribe consult increments them today.
+// TODO(parity): which counter keys plus which broker event attributes
+// them does the spec require (allow/deny split, per-decision versus
+// per-request)? The rulebook does not decide the exact set; the current
+// choice counts explicit record calls only, until the checker pins it.
+#[derive(Debug, Default)]
+pub struct AuthzSourceCounters {
+    allow: AtomicU64,
+    deny: AtomicU64,
+    total: AtomicU64,
+}
+
+/// Lock-free snapshot of one source's counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthzSourceCounterSnapshot {
+    pub allow: u64,
+    pub deny: u64,
+    pub total: u64,
+}
+
+impl AuthzSourceCounters {
+    fn snapshot(&self) -> AuthzSourceCounterSnapshot {
+        AuthzSourceCounterSnapshot {
+            allow: self.allow.load(Ordering::Relaxed),
+            deny: self.deny.load(Ordering::Relaxed),
+            total: self.total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_allow(&self) {
+        self.allow.fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_deny(&self) {
+        self.deny.fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Zero every counter. Lock-free atomic stores; recorders keep
+    /// incrementing with lock-free adds and publish/deliver never touch
+    /// these counters.
+    fn reset(&self) {
+        self.allow.store(0, Ordering::Relaxed);
+        self.deny.store(0, Ordering::Relaxed);
+        self.total.store(0, Ordering::Relaxed);
+    }
+}
+
 impl AuthzSourceRegistry {
     /// Default registry: only the built-in database source (the one
     /// backend that executes, so a fresh broker authorizes against its
@@ -128,6 +212,7 @@ impl AuthzSourceRegistry {
             snapshot: arc_swap::ArcSwap::from(Arc::new(Vec::new())),
             registry: parking_lot::RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
+            counters: parking_lot::RwLock::new(HashMap::new()),
         };
         registry.seed_from_snapshot(conf);
         registry
@@ -153,7 +238,15 @@ impl AuthzSourceRegistry {
             .filter_map(conf_to_entry)
             .collect::<Vec<_>>();
         *self.inner.write() = entries.clone();
-        self.snapshot.store(Arc::new(entries));
+        self.snapshot.store(Arc::new(entries.clone()));
+        // Counters never persist: a re-seed restarts every source at zero.
+        let mut counters = self.counters.write();
+        counters.clear();
+        for entry in &entries {
+            counters
+                .entry(entry.source_type.clone())
+                .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+        }
         *self.registry.write() = Some(Arc::clone(registry));
     }
 
@@ -164,7 +257,17 @@ impl AuthzSourceRegistry {
             .filter_map(conf_to_entry)
             .collect::<Vec<_>>();
         *self.inner.write() = entries.clone();
-        self.snapshot.store(Arc::new(entries));
+        self.snapshot.store(Arc::new(entries.clone()));
+        // Counters never persist: a restart (or re-seed) starts every
+        // source at zero. Bounded by the source cap: one record per
+        // seeded type, never more than MAX_AUTHZ_SOURCES entries.
+        let mut counters = self.counters.write();
+        counters.clear();
+        for entry in &entries {
+            counters
+                .entry(entry.source_type.clone())
+                .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+        }
     }
 
     /// Ordered snapshot of the registry in stored order. Management-plane
@@ -227,6 +330,12 @@ impl AuthzSourceRegistry {
                 .map_err(|e| SourceInsertError::Invalid(e.to_string()))?;
             current.push(entry.clone());
             self.snapshot.store(Arc::new(current.clone()));
+            // One bounded counter record per source type; a re-created
+            // type after a delete restarts at zero.
+            self.counters
+                .write()
+                .entry(entry.source_type.clone())
+                .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
             conf
         };
         if let Some(registry) = self.registry.read().clone() {
@@ -368,6 +477,7 @@ impl AuthzSourceRegistry {
             conf.validate()
                 .map_err(|e| SourceRemoveError::Persist(e.to_string()))?;
             self.snapshot.store(Arc::new(next));
+            self.counters.write().remove(source_type);
             (removed, conf)
         };
         if let Some(registry) = self.registry.read().clone() {
@@ -379,6 +489,136 @@ impl AuthzSourceRegistry {
                 .map_err(|e| SourceRemoveError::Persist(e.to_string()))?;
         }
         Ok(removed)
+    }
+
+    /// Replace the entry stored under `type` with `entry` (whose
+    /// `source_type` must equal `type`).
+    ///
+    /// Validate-all-before-apply: the candidate is validated before
+    /// anything becomes visible, so a bad replacement applies nothing.
+    /// The stored position is preserved. On success the entry, the
+    /// lock-free snapshot and the persisted registry all move together.
+    /// Counters survive config/enable replaces: they are live, not
+    /// config. Management-plane only: one short write lock per request
+    /// (plus the registry save lock on persist); the publish and
+    /// subscribe authorization consults read the built-in rule table,
+    /// never this registry, and publish/deliver never touch this store.
+    // TODO(parity): may the update rename the entry (change its `type`)
+    // or only replace the config/enable pair in place? The rulebook does
+    // not decide the exact PUT field set; the current choice replaces the
+    // whole entry in place (same `type`) after full validation until the
+    // checker pins the shape.
+    pub fn update(
+        &self,
+        source_type: &str,
+        entry: AuthzSourceEntry,
+    ) -> Result<AuthzSourceEntry, SourceUpdateError> {
+        if entry.source_type != source_type {
+            return Err(SourceUpdateError::Invalid(
+                "field `type` must match the path type".to_string(),
+            ));
+        }
+        validate_entry(&entry).map_err(|e| match e {
+            SourceInsertError::Invalid(msg) => SourceUpdateError::Invalid(msg),
+            SourceInsertError::Duplicate => {
+                SourceUpdateError::Invalid("field `type` is duplicated".to_string())
+            }
+            SourceInsertError::Full => {
+                SourceUpdateError::Invalid("authorization source registry is full".to_string())
+            }
+            SourceInsertError::Persist(msg) => SourceUpdateError::Persist(msg),
+        })?;
+        let _guard = self.save_lock.lock();
+        let updated = {
+            let mut current = self.inner.write();
+            let Some(pos) = current.iter().position(|e| e.source_type == source_type) else {
+                return Err(SourceUpdateError::NotFound);
+            };
+            let mut next = current.clone();
+            next[pos] = entry.clone();
+            let conf = export_conf(&next);
+            conf.validate()
+                .map_err(|e| SourceUpdateError::Invalid(e.to_string()))?;
+            *current = next.clone();
+            self.snapshot.store(Arc::new(next));
+            // Counters survive config/enable replaces: they are live, not
+            // config. Ensure the record exists for registries seeded
+            // before counters landed.
+            self.counters
+                .write()
+                .entry(source_type.to_string())
+                .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+            conf
+        };
+        if let Some(registry) = self.registry.read().clone() {
+            registry
+                .commit_authz_sources(updated)
+                .map_err(|e| SourceUpdateError::Persist(e.to_string()))?;
+            registry
+                .save()
+                .map_err(|e| SourceUpdateError::Persist(e.to_string()))?;
+        }
+        Ok(entry)
+    }
+
+    /// Live counters for one source `type` (`None` when unknown).
+    ///
+    /// Management-plane read only: lock-free atomic loads, no write lock,
+    /// no allocation beyond the returned copy. Publish and deliver never
+    /// call this.
+    pub fn counter_snapshot(&self, source_type: &str) -> Option<AuthzSourceCounterSnapshot> {
+        self.counters
+            .read()
+            .get(source_type)
+            .map(|counters| counters.snapshot())
+    }
+
+    /// Record one allow verdict for `type`.
+    ///
+    /// Management-plane only: one short read lock to clone the counter
+    /// `Arc` plus two lock-free atomic adds; unknown types apply nothing
+    /// (no accumulation). Publish and deliver never call this.
+    pub fn record_allow(&self, source_type: &str) {
+        if let Some(counters) = self.counters.read().get(source_type).cloned() {
+            counters.record_allow();
+        }
+    }
+
+    /// Record one deny verdict for `type`.
+    ///
+    /// Management-plane only: same cost and bounds as
+    /// [`AuthzSourceRegistry::record_allow`]. Publish and deliver never
+    /// call this.
+    pub fn record_deny(&self, source_type: &str) {
+        if let Some(counters) = self.counters.read().get(source_type).cloned() {
+            counters.record_deny();
+        }
+    }
+
+    /// Zero the live counters for one source `type`.
+    ///
+    /// Returns `false` when `type` names no stored source, so the caller
+    /// can answer 404 instead of resetting nothing; unknown types never
+    /// create a counter record (no accumulation). A stored entry whose
+    /// counter record is missing (seeded before counters landed) is
+    /// ensured at zero. Management-plane only: one short read lock to
+    /// clone the counter `Arc` plus lock-free atomic stores; recorders
+    /// keep incrementing concurrently and publish/deliver never call
+    /// this. The reset itself does not persist: only the zeroed counter
+    /// values remain, and the next verdict counts up from zero.
+    pub fn reset_counters(&self, source_type: &str) -> bool {
+        if self.get(source_type).is_none() {
+            return false;
+        }
+        if let Some(counters) = self.counters.read().get(source_type).cloned() {
+            counters.reset();
+        } else {
+            self.counters
+                .write()
+                .entry(source_type.to_string())
+                .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+        }
+        true
     }
 
     /// Number of stored entries.
@@ -693,5 +933,93 @@ mod tests {
             vec!["built_in_database".to_string()]
         );
         assert!(registry.built_in_available());
+    }
+
+    #[test]
+    fn update_replaces_in_place_and_counters_survive_until_reset() {
+        use super::SourceUpdateError;
+
+        let registry = AuthzSourceRegistry::new();
+        registry.insert(entry("file")).expect("file insert");
+        assert_eq!(
+            stored_order(&registry),
+            vec!["built_in_database".to_string(), "file".to_string()]
+        );
+
+        // Unknown types miss and a mismatched entry type is invalid;
+        // both apply nothing.
+        assert_eq!(
+            registry.update("http", entry("http")),
+            Err(SourceUpdateError::NotFound)
+        );
+        let mut mismatched = entry("http");
+        assert_eq!(
+            registry.update("file", mismatched.clone()),
+            Err(SourceUpdateError::Invalid(
+                "field `type` must match the path type".to_string()
+            ))
+        );
+        mismatched.source_type = "  ".to_string();
+        assert!(matches!(
+            registry.update("file", mismatched),
+            Err(SourceUpdateError::Invalid(_))
+        ));
+        assert_eq!(
+            stored_order(&registry),
+            vec!["built_in_database".to_string(), "file".to_string()]
+        );
+
+        // A valid replacement applies in place: the stored position is
+        // preserved and the snapshot moves with the store.
+        let updated = AuthzSourceEntry {
+            source_type: "file".to_string(),
+            enable: false,
+            config: serde_json::json!({"path": "/etc/authz/after.conf"}),
+        };
+        let stored = registry
+            .update("file", updated.clone())
+            .expect("update applies");
+        assert_eq!(stored, updated);
+        assert_eq!(
+            stored_order(&registry),
+            vec!["built_in_database".to_string(), "file".to_string()]
+        );
+        let snap: Vec<_> = registry
+            .snapshot()
+            .iter()
+            .map(|e| e.source_type.clone())
+            .collect();
+        assert_eq!(snap, stored_order(&registry));
+        let reread = registry.get("file").expect("updated entry reads back");
+        assert!(!reread.enable);
+        assert_eq!(
+            reread.config["path"],
+            serde_json::json!("/etc/authz/after.conf")
+        );
+
+        // Counters move on explicit records, survive a config replace,
+        // and zero on reset; unknown types move and reset nothing.
+        registry.record_allow("file");
+        registry.record_deny("file");
+        let moved = registry.counter_snapshot("file").expect("counters move");
+        assert_eq!(moved.allow, 1);
+        assert_eq!(moved.deny, 1);
+        assert_eq!(moved.total, 2);
+        registry
+            .update("file", updated.clone())
+            .expect("replace keeps counters");
+        let kept = registry.counter_snapshot("file").expect("counters survive");
+        assert_eq!(kept.total, 2);
+        registry.record_allow("nowhere");
+        assert!(registry.counter_snapshot("nowhere").is_none());
+        assert!(!registry.reset_counters("nowhere"));
+        assert!(registry.reset_counters("file"));
+        let zeroed = registry.counter_snapshot("file").expect("counters zero");
+        assert_eq!(zeroed.allow, 0);
+        assert_eq!(zeroed.deny, 0);
+        assert_eq!(zeroed.total, 0);
+        // Removing the type drops its counter record.
+        registry.remove("file").expect("delete applies");
+        assert!(registry.counter_snapshot("file").is_none());
     }
 }

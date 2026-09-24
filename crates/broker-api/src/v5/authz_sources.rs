@@ -1,7 +1,11 @@
 //! Authorization source registry for the v5 management API.
 //!
 //! Covers `GET /authorization/sources` (ordered page), `POST
-//! /authorization/sources` (register one source) and `DELETE
+//! /authorization/sources` (register one source), `GET
+//! /authorization/sources/:type` (one source's config and health),
+//! `PUT /authorization/sources/:type` (replace one source) and `POST
+//! /authorization/sources/:type/metrics/reset` (zero one source's
+//! counters), plus `DELETE
 //! /authorization/sources/built_in_database/rules` (clear every
 //! built-in rule) over the real [`broker_auth::AuthzSourceRegistry`]
 //! plus the live built-in rule table (`MemoryAuth` in
@@ -47,7 +51,7 @@ use bytes::Bytes;
 use crate::errors::ApiError;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
-use broker_auth::{AuthzSourceEntry, SourceInsertError};
+use broker_auth::{AuthzSourceEntry, SourceInsertError, SourceUpdateError};
 
 /// Render one stored source. Only stored fields are reported: `type`
 /// plus `enable`, with the backend `config` object when one is stored.
@@ -598,6 +602,243 @@ pub async fn delete_authz_source(
     }
 }
 
+/// Honest single-node liveness for one source entry.
+///
+/// An enabled built-in entry executes locally, so it reads as
+/// connected. Anything else (disabled, or a stored-only backend that
+/// never executes) reads as disconnected: no live backend serves it. No
+/// outbound connection is opened to decide this.
+fn live_status(entry: &AuthzSourceEntry) -> &'static str {
+    if entry.enable && entry.source_type == "built_in_database" {
+        "connected"
+    } else {
+        "disconnected"
+    }
+}
+
+/// Render one stored source with its live health and counters. Only
+/// stored fields are reported (`type` plus `enable`, with the backend
+/// `config` object when one is stored) plus the live `status` and the
+/// counter-only `metrics` (`allow`/`deny`/`total`, memory-only, zeroed
+/// on restart): health the broker does not measure (rates, resource
+/// fields) is omitted, never invented; non-built-in sources are stored
+/// configuration, never claimed as live.
+// TODO(parity): which per-source detail fields plus rate/status shapes
+// does the spec require? The rulebook does not decide the exact shape;
+// the current choice reports the honest live subset the broker can
+// supply (type/enable/config plus connected/disconnected status and
+// counter-only metrics) and omits rate and resource fields the broker
+// does not track rather than standing a constant in for a measurement.
+fn render_detail(
+    entry: &AuthzSourceEntry,
+    counters: broker_auth::AuthzSourceCounterSnapshot,
+) -> serde_json::Value {
+    let status = live_status(entry);
+    let mut value = serde_json::json!({
+        "type": entry.source_type,
+        "enable": entry.enable,
+        "status": status,
+        "metrics": {
+            "allow": counters.allow,
+            "deny": counters.deny,
+            "total": counters.total,
+        },
+    });
+    if !entry.config.is_null() {
+        value["config"] = entry.config.clone();
+    }
+    value
+}
+
+/// `GET /authorization/sources/{type}`: read one source's config and
+/// health by type.
+///
+/// Returns 200 with the stored `type`/`enable` (plus the backend
+/// `config` object when one is stored), the live `status` and the live
+/// counter-only `metrics`. Unknown types fail with `NOT_FOUND` in the
+/// documented `{code, message}` shape. Management-plane read only: one
+/// short registry read plus lock-free atomic loads; publish and deliver
+/// never touch this store.
+pub async fn get_authz_source(
+    State(state): State<ApiState>,
+    Path(source_type): Path<String>,
+) -> Response {
+    let Some(entry) = state.authz_sources.get(&source_type) else {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    };
+    let counters = state
+        .authz_sources
+        .counter_snapshot(&source_type)
+        .unwrap_or(broker_auth::AuthzSourceCounterSnapshot {
+            allow: 0,
+            deny: 0,
+            total: 0,
+        });
+    (StatusCode::OK, Json(render_detail(&entry, counters))).into_response()
+}
+
+/// `PUT /authorization/sources/{type}`: replace the source stored under
+/// `type`.
+///
+/// The whole replacement is validated before anything is applied: one
+/// bad field rejects the entire write with `BAD_REQUEST` and leaves the
+/// stored entry untouched. Unknown types fail with `NOT_FOUND`. A body
+/// `type` that differs from the path type is rejected. Omitted
+/// `enable`/`config` keep their stored values, so a body carrying only
+/// the fields to change still replaces after full validation. On
+/// success returns 200 with the stored entry (plus live health and
+/// counters). The write persists across a restart through the config
+/// registry (counters do not: they restart at zero).
+/// Management-plane only: one short write lock per request (plus the
+/// registry save lock on persist); the publish and subscribe
+/// authorization consults read the built-in rule table, never this
+/// registry, and publish/deliver never touch this handler's lock.
+// TODO(parity): may the update rename the entry (change its `type`) or
+// only replace the config/enable pair in place? The rulebook does not
+// decide the exact PUT field set; the current choice replaces the whole
+// entry in place (same `type`) after full validation until the checker
+// pins the shape.
+pub async fn put_authz_source(
+    State(state): State<ApiState>,
+    Path(source_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid authorization source body: {e}"))
+                .into_response();
+        }
+    };
+    let Some(existing) = state.authz_sources.get(&source_type) else {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    };
+    let entry = match parse_update_request(&value, &source_type, &existing) {
+        Ok(e) => e,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    match state.authz_sources.update(&source_type, entry) {
+        Ok(stored) => {
+            let counters = state
+                .authz_sources
+                .counter_snapshot(&source_type)
+                .unwrap_or(broker_auth::AuthzSourceCounterSnapshot {
+                    allow: 0,
+                    deny: 0,
+                    total: 0,
+                });
+            (StatusCode::OK, Json(render_detail(&stored, counters))).into_response()
+        }
+        Err(SourceUpdateError::NotFound) => {
+            ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+                .into_response()
+        }
+        Err(SourceUpdateError::Invalid(msg)) => ApiError::BadRequest(msg).into_response(),
+        Err(SourceUpdateError::Persist(msg)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist authorization sources: {msg}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Validate an update body into a source entry keeping `path_type`.
+///
+/// The body must be a JSON object. A body `type` that differs from the
+/// path type is rejected (explicit null keeps the path type). Omitted
+/// `enable` keeps the stored value; a supplied value must be a boolean.
+/// Backend config rides either as a nested `config` object (empty reads
+/// as no stored config) or as extra top-level fields besides the three
+/// known ones; when neither is present the stored config is kept.
+fn parse_update_request(
+    value: &serde_json::Value,
+    path_type: &str,
+    existing: &AuthzSourceEntry,
+) -> Result<AuthzSourceEntry, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "authorization source must be a JSON object".to_string())?;
+    if let Some(v) = obj.get("type") {
+        if v.is_null() {
+            // Explicit null keeps the path type.
+        } else {
+            let raw = v
+                .as_str()
+                .ok_or_else(|| "field `type` must be a string".to_string())?;
+            if raw != path_type {
+                return Err("field `type` must match the path type".to_string());
+            }
+        }
+    }
+    let enable = match obj.get("enable") {
+        None | Some(serde_json::Value::Null) => existing.enable,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(_) => return Err("field `enable` must be a boolean".to_string()),
+    };
+    let config = match obj.get("config") {
+        Some(v) if !v.is_null() => {
+            if !v.is_object() {
+                return Err("field `config` must be an object".to_string());
+            }
+            if v.as_object().is_some_and(|m| m.is_empty()) {
+                serde_json::Value::Null
+            } else {
+                v.clone()
+            }
+        }
+        _ => {
+            let mut extra = serde_json::Map::new();
+            for (key, val) in obj {
+                if !matches!(key.as_str(), "type" | "enable" | "config") {
+                    extra.insert(key.clone(), val.clone());
+                }
+            }
+            if extra.is_empty() {
+                existing.config.clone()
+            } else {
+                serde_json::Value::Object(extra)
+            }
+        }
+    };
+    Ok(AuthzSourceEntry {
+        source_type: path_type.to_string(),
+        enable,
+        config,
+    })
+}
+
+/// `POST /authorization/sources/{type}/metrics/reset`: zero the live
+/// counters for one source.
+///
+/// Resets the per-source counters to zero and reports success (204, no
+/// body). Resetting an unknown type fails with `NOT_FOUND` in the
+/// documented `{code, message}` shape, not an empty body. Counters
+/// resume from zero on the next verdict; the reset itself does not
+/// persist beyond the counter values. Management-plane only: one short
+/// registry read plus lock-free atomic stores; increments stay lock-free
+/// atomics and publish and deliver never touch these counters. The
+/// counter set is fixed (allow/deny/total per source type, at most the
+/// source cap of records), so a reset never grows anything.
+// TODO(parity): does the spec report success as an empty 204 or as a 200
+// with a body? The rulebook does not decide the exact success shape; the
+// current choice answers 204 with no body, mirroring the sibling rule,
+// node-cache and authenticator resets, until the checker pins it.
+pub async fn reset_authz_source_metrics(
+    State(state): State<ApiState>,
+    Path(source_type): Path<String>,
+) -> Response {
+    if !state.authz_sources.reset_counters(&source_type) {
+        return ApiError::NotFound(format!("authorization source {source_type:?} not found"))
+            .into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1146,6 +1387,297 @@ mod tests {
             list_types(&state).await,
             vec!["built_in_database".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn source_detail_read_update_reset_round_trip_through_broker() {
+        // The task's failing test: before this task the per-type read,
+        // update and metrics reset were missing (bare 404). Create a
+        // source, read it, update with a valid config and read back;
+        // move counters then reset and verify zeroed; an unknown type
+        // reads 404. Goes through the broker, not only the store: the
+        // stored built-in source is observed on `authorize_publish`
+        // (consulted by the publish event in
+        // `crates/broker-node/src/main.rs`) while the detail read
+        // reports the same stored source.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_authz_source(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "type": "file",
+                    "config": {"path": "/etc/authz/rules.conf"},
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Read hits with the stored config and live health; a
+        // stored-only backend never claims to be live.
+        let (status, detail, _) =
+            parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["type"], serde_json::json!("file"));
+        assert_eq!(detail["enable"], serde_json::json!(true));
+        assert_eq!(
+            detail["config"]["path"],
+            serde_json::json!("/etc/authz/rules.conf")
+        );
+        assert_eq!(detail["status"], serde_json::json!("disconnected"));
+        assert!(detail.get("status").is_some(), "health is reported");
+        assert_eq!(detail["metrics"]["allow"], serde_json::json!(0));
+        assert_eq!(detail["metrics"]["deny"], serde_json::json!(0));
+        assert_eq!(detail["metrics"]["total"], serde_json::json!(0));
+
+        // The built-in entry executes locally, so it reads as connected.
+        let (status, builtin, _) = parts(
+            get_authz_source(State(state.clone()), Path("built_in_database".to_string())).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(builtin["status"], serde_json::json!("connected"));
+
+        // The stored built-in source is live on the publish path: the
+        // empty table allows.
+        let topic = broker_protocol::Topic::new("w223/data").expect("topic parses");
+        state
+            .auth
+            .authorize_publish("any-client", &topic)
+            .await
+            .expect("empty table allows on the publish path");
+
+        // Update with a valid config and read back.
+        let (status, updated, _) = parts(
+            put_authz_source(
+                State(state.clone()),
+                Path("file".to_string()),
+                body(serde_json::json!({
+                    "enable": false,
+                    "config": {"path": "/etc/authz/other.conf"},
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["type"], serde_json::json!("file"));
+        assert_eq!(updated["enable"], serde_json::json!(false));
+        assert_eq!(
+            updated["config"]["path"],
+            serde_json::json!("/etc/authz/other.conf")
+        );
+        let (status, reread, _) =
+            parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reread["enable"], serde_json::json!(false));
+        assert_eq!(
+            reread["config"]["path"],
+            serde_json::json!("/etc/authz/other.conf")
+        );
+        assert_eq!(reread["status"], serde_json::json!("disconnected"));
+
+        // Move counters then reset and verify zeroed.
+        state.authz_sources.record_allow("file");
+        state.authz_sources.record_allow("file");
+        state.authz_sources.record_deny("file");
+        let (status, moved, _) =
+            parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(moved["metrics"]["allow"], serde_json::json!(2));
+        assert_eq!(moved["metrics"]["deny"], serde_json::json!(1));
+        assert_eq!(moved["metrics"]["total"], serde_json::json!(3));
+
+        let response =
+            reset_authz_source_metrics(State(state.clone()), Path("file".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let (status, zeroed, _) =
+            parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(zeroed["metrics"]["allow"], serde_json::json!(0));
+        assert_eq!(zeroed["metrics"]["deny"], serde_json::json!(0));
+        assert_eq!(zeroed["metrics"]["total"], serde_json::json!(0));
+
+        // Counters resume from zero on the next verdict.
+        state.authz_sources.record_deny("file");
+        let (status, resumed, _) =
+            parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(resumed["metrics"]["deny"], serde_json::json!(1));
+        assert_eq!(resumed["metrics"]["total"], serde_json::json!(1));
+
+        // Unknown types miss on all three routes with the documented
+        // shape.
+        let (status, missing, _) =
+            parts(get_authz_source(State(state.clone()), Path("nowhere".to_string())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(missing["message"].is_string());
+        let (status, missing, _) = parts(
+            put_authz_source(
+                State(state.clone()),
+                Path("nowhere".to_string()),
+                body(serde_json::json!({"enable": true})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(missing["message"].is_string());
+        let (status, missing, _) = parts(
+            reset_authz_source_metrics(State(state.clone()), Path("nowhere".to_string())).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(missing["message"].is_string());
+    }
+
+    #[tokio::test]
+    async fn source_detail_update_rejects_bad_and_applies_nothing() {
+        // Validate-all-before-apply: bad configs are client errors and
+        // the stored entry is unchanged.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_authz_source(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "type": "file",
+                    "config": {"path": "/etc/authz/keep.conf"},
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let bad_bodies = [
+            // A body `type` that differs from the path type is rejected.
+            serde_json::json!({"type": "http", "enable": true}),
+            serde_json::json!({"type": 7}),
+            serde_json::json!({"enable": "yes"}),
+            serde_json::json!({"config": "many"}),
+            serde_json::json!({"config": ["many"]}),
+            serde_json::json!([]),
+        ];
+        for bad in bad_bodies {
+            let (status, err, _) = parts(
+                put_authz_source(
+                    State(state.clone()),
+                    Path("file".to_string()),
+                    body(bad.clone()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "body {bad} must be rejected"
+            );
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(err["message"].is_string());
+        }
+
+        // The seeded entry is unchanged by every rejected write.
+        let (status, kept, _) =
+            parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kept["enable"], serde_json::json!(true));
+        assert_eq!(
+            kept["config"]["path"],
+            serde_json::json!("/etc/authz/keep.conf")
+        );
+
+        // A body carrying only the stored `type` is a no-op replace that
+        // keeps the stored values.
+        let (status, same, _) = parts(
+            put_authz_source(
+                State(state.clone()),
+                Path("file".to_string()),
+                body(serde_json::json!({"type": "file"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(same["enable"], serde_json::json!(true));
+        assert_eq!(
+            same["config"]["path"],
+            serde_json::json!("/etc/authz/keep.conf")
+        );
+    }
+
+    #[tokio::test]
+    async fn source_detail_update_persists_config_but_not_counters() {
+        // Bound: the source cap is stated, finite, and enforced; the
+        // counter set is fixed (allow/deny/total per type, at most the
+        // capped records).
+        assert_eq!(broker_config::MAX_AUTHZ_SOURCES, 8);
+
+        // Persistence: an update through a registry-backed registry
+        // survives a reload of the same data dir, while counters restart
+        // at zero.
+        let dir = std::env::temp_dir().join(format!(
+            "authz-source-detail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("fresh dir loads"),
+        );
+        let sources = broker_auth::AuthzSourceRegistry::from_registry(&registry);
+        sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: serde_json::json!({"path": "/etc/authz/before.conf"}),
+            })
+            .expect("persist file");
+        sources
+            .update(
+                "file",
+                broker_auth::AuthzSourceEntry {
+                    source_type: "file".to_string(),
+                    enable: false,
+                    config: serde_json::json!({"path": "/etc/authz/after.conf"}),
+                },
+            )
+            .expect("persist update applies");
+        sources.record_allow("file");
+        sources.record_deny("file");
+        assert_eq!(
+            sources
+                .counter_snapshot("file")
+                .expect("counters move before restart")
+                .total,
+            2
+        );
+        assert!(dir.join(broker_config::STATE_FILE_NAME).is_file());
+        drop(sources);
+        drop(registry);
+        let reloaded =
+            std::sync::Arc::new(broker_config::ConfigRegistry::load(&dir).expect("dir reloads"));
+        let restarted = broker_auth::AuthzSourceRegistry::from_registry(&reloaded);
+        let stored = restarted.get("file").expect("updated source persists");
+        assert!(!stored.enable);
+        assert_eq!(
+            stored.config["path"],
+            serde_json::json!("/etc/authz/after.conf")
+        );
+        // Counters do not persist: the restarted source reads at zero.
+        let counters = restarted
+            .counter_snapshot("file")
+            .expect("counter record exists after restart");
+        assert_eq!(counters.allow, 0);
+        assert_eq!(counters.deny, 0);
+        assert_eq!(counters.total, 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

@@ -20,7 +20,8 @@ pub mod webhook;
 pub use authz_node_cache::{AuthzCacheUpdateError, AuthzNodeCache};
 pub use authz_settings::{AuthzSettingsStore, AuthzSettingsUpdateError};
 pub use authz_sources::{
-    AuthzSourceEntry, AuthzSourceRegistry, SourceInsertError, SourceRemoveError, SourceReorderError,
+    AuthzSourceCounterSnapshot, AuthzSourceEntry, AuthzSourceRegistry, SourceInsertError,
+    SourceRemoveError, SourceReorderError, SourceUpdateError,
 };
 pub use chain::{
     AuthnChain, AuthnCounterSnapshot, AuthnEntry, ChainInsertError, ChainMoveError,
