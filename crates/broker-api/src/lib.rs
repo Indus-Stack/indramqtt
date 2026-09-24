@@ -3289,6 +3289,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authz_global_cache_clear_round_trip() {
+        // Global decision-cache clear (W2-13, C04-01) through the broker:
+        // authorized activity populates the per-session decision caches
+        // (consulted at `crates/broker-session/src/lib.rs`
+        // `Session::record_authz_decision`, driven by the publish and
+        // subscribe authorization events), the global clear evicts every
+        // entry cluster-wide on this node, and the next authorized
+        // decision is recomputed (the cache repopulates). Clearing an
+        // already-empty cache still succeeds. Management-plane only;
+        // publish and deliver never take the clear locks beyond the
+        // short per-session evictions.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty global clear still succeeds (204) before any activity.
+        let (status, _) = server
+            .delete_auth("/api/v5/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // Populate through normal authorized activity through the broker:
+        // a console SUBSCRIBE (real subscribe authorization) plus a
+        // console PUBLISH from a second connection (real publish
+        // authorization) that delivers to the subscriber.
+        let mut subscriber = WsClient::connect(server.port).await;
+        subscriber
+            .send_bin(&mqtt_connect("w2-13-cache-1", None, None))
+            .await;
+        let connack = subscriber.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        subscriber
+            .send_bin(&mqtt_subscribe(7, &[("w2-13/topic", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+        let mut publisher = WsClient::connect(server.port).await;
+        publisher
+            .send_bin(&mqtt_connect("w2-13-cache-2", None, None))
+            .await;
+        let connack = publisher.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        publisher
+            .send_bin(&mqtt_publish("w2-13/topic", 0, 0, b"hi"))
+            .await;
+        // Deliver proves the publish rode the broker route path.
+        let delivery = subscriber.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+
+        // Both per-client caches hold their decision.
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-13-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("cache is a list").len(), 1);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-13-cache-2/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("cache is a list").len(), 1);
+
+        // Global clear evicts every entry on this node.
+        let (status, _) = server
+            .delete_auth("/api/v5/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-13-cache-1/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-13-cache-2/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // The next authorized decision is recomputed (cache miss
+        // counted as a fresh entry on the next publish through the
+        // broker).
+        publisher
+            .send_bin(&mqtt_publish("w2-13/topic", 0, 0, b"again"))
+            .await;
+        let delivery = subscriber.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/w2-13-cache-2/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_array().expect("cache is a list").len(), 1);
+
+        // Unknown query keys are ignored, not a 400.
+        let (status, _) = server
+            .send(
+                "DELETE",
+                "/api/v5/authorization/cache?unknown_param=1",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn banned_create_list_clear_round_trip() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
@@ -4607,7 +4713,6 @@ mod tests {
             ("GET", "/api/v5/authentication/x"),
             ("GET", "/api/v5/authorization/sources"),
             ("GET", "/api/v5/authorization/settings"),
-            ("DELETE", "/api/v5/authorization/cache"),
         ] {
             let (status, _) = server
                 .request_raw(&format!(

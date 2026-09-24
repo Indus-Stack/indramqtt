@@ -6,6 +6,7 @@ pub mod authn_cache;
 pub mod authn_chain;
 pub mod authn_settings;
 pub mod authn_status;
+pub mod authz_cache;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
@@ -130,6 +131,14 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/authentication/:id/import_users",
             post(auth::import_authn_users),
+        )
+        // Authorization (AuthZ / ACL) decision-cache global clear
+        // (W2-13, C04-01): evicts every per-session decision entry on
+        // this node so subsequent decisions are recomputed.
+        // Management-plane only; publish and deliver never touch it.
+        .route(
+            "/authorization/cache",
+            delete(authz_cache::clear_authz_cache),
         )
         // Authorization (AuthZ / ACL) rules
         .route(

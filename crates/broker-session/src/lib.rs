@@ -1721,6 +1721,28 @@ impl SessionManager {
         })
     }
 
+    /// Evict every cached authorization decision on every session
+    /// (W2-13, `DELETE /authorization/cache`).
+    ///
+    /// Global clear: clones one `Arc` per live session under a single
+    /// short map read, then clears each per-session cache under its own
+    /// short lock. Returns the number of entries evicted across all
+    /// sessions. Management-plane only: the publish and deliver paths
+    /// never call this; eviction never blocks the message path beyond
+    /// those short per-session locks, and no new allocation rides the
+    /// hot path (the `Arc` list lives only for this call). Clearing an
+    /// already-empty cache still succeeds (returns zero).
+    pub fn clear_all_authz_caches(&self) -> usize {
+        let sessions: Vec<Arc<Session>> = self.sessions.read().values().cloned().collect();
+        let mut evicted = 0;
+        for session in sessions {
+            let mut cache = session.authz_cache.write();
+            evicted += cache.len();
+            cache.clear();
+        }
+        evicted
+    }
+
     /// Track one granted subscription on the session (mirrors the router).
     /// Legacy and live-MQTT callers only carry a QoS; the subscription
     /// options default to `nl = 0, rap = 0, rh = 0`.
