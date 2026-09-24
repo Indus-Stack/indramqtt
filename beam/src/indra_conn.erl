@@ -79,9 +79,10 @@
 -define(MAX_HOLD_BUFFER_BYTES, 1048576).
 
 -type conn_opt() :: {broker, pid() | [pid()]}
-                  | {conn_id, non_neg_integer()}
-                  | {connect_timeout_ms, pos_integer()}
-                  | {transport, tcp | ssl}.
+                   | {conn_id, non_neg_integer()}
+                   | {connect_timeout_ms, pos_integer()}
+                   | {psk_identity, binary()}
+                   | {transport, tcp | ssl}.
 
 %%====================================================================
 %% API
@@ -99,6 +100,12 @@
 %% fresh positive unique integer.</li>
 %% <li>{@code {connect_timeout_ms, Ms}} — first-packet deadline,
 %% default 10000.</li>
+%% <li>{@code {psk_identity, Id}} — TLS PSK identity the listener
+%% negotiated for this socket (B5-05). The conn maps it onto the bind
+%% username so the kernel authenticates and authorizes it like any
+%% other CONNECT identity; a CONNECT username that is neither absent
+%% nor identical fails the connection closed with no bind sent. Absent
+%% on plaintext and certificate connections (unchanged path).</li>
 %% <li>{@code {transport, tcp | ssl}} — socket driver; default
 %% {@code tcp}. Must match how the socket was accepted.</li>
 %% </ul>
@@ -163,8 +170,23 @@ init_shard(Sock, Opts, Shards) ->
     ConnId = proplists:get_value(conn_id, Opts,
                                  erlang:unique_integer([positive, monotonic])),
     Timeout = proplists:get_value(connect_timeout_ms, Opts,
-                                  ?DEFAULT_CONNECT_TIMEOUT_MS),
+                                   ?DEFAULT_CONNECT_TIMEOUT_MS),
     Transport = proplists:get_value(transport, Opts, tcp),
+    PskIdentity = proplists:get_value(psk_identity, Opts, undefined),
+    case PskIdentity of
+        undefined ->
+            init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, undefined);
+        PskIdentity when is_binary(PskIdentity) ->
+            init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, PskIdentity);
+        _ ->
+            {stop, {invalid_option, psk_identity}}
+    end.
+
+%% @private Build the initial connection state. `psk_identity' is the
+%% TLS PSK identity the listener negotiated (`undefined' on plaintext
+%% and certificate sockets); it is consulted at CONNECT time to map
+%% the bind username (see handle_connect_packet/3).
+init_shard_validated(Sock, Shards, ConnId, Timeout, Transport, PskIdentity) ->
     SockMod = case Transport of ssl -> ssl; _ -> gen_tcp end,
     Broker = pick_shard(ConnId, Shards),
     Data = #{sock => Sock,
@@ -173,10 +195,16 @@ init_shard(Sock, Opts, Shards) ->
              brokers => Shards,
              shard => shard_index(ConnId, length(Shards)),
              conn_id => ConnId,
-             connect_timeout_ms => Timeout,
-             buffer => <<>>,
-             seq => 0,
-              pending => undefined,
+              connect_timeout_ms => Timeout,
+              buffer => <<>>,
+              seq => 0,
+              %% B5-05 TLS PSK identity negotiated for this socket
+              %% (`undefined' on plaintext and certificate sockets).
+              %% Mapped onto the bind username at CONNECT time; the
+              %% kernel then authenticates and authorizes it like any
+              %% other CONNECT identity.
+              psk_identity => PskIdentity,
+               pending => undefined,
                client_id => undefined,
                keepalive => 0,
                %% F1-01 last will captured from CONNECT (undefined when
@@ -755,54 +783,89 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
             %% wildcards (or an empty one) can never route, so the
             %% CONNECT fails closed here instead of registering half
             %% a will.
+            %%
+            %% B5-05: on a PSK socket the mapped identity is the bind
+            %% username, so the kernel authenticates and authorizes it
+            %% like any other CONNECT identity (bans, users, quotas all
+            %% apply unchanged; the CONNECT password still rides along
+            %% for the kernel to verify). A CONNECT username that is
+            %% neither absent nor identical fails closed here with no
+            %% bind sent.
+            %% TODO(parity): the spec does not decide whether a
+            %% mismatched CONNECT username should close (current,
+            %% conservative) or be ignored in favour of the PSK
+            %% identity; confirm the intended policy.
             ProtoLevel = maps:get(protocol_level, Conn, 4),
             ClientAliasMax = maps:get(alias_max, Conn, 0),
-            case make_will(WillFlag, WillTopic, WillPayload, WillQos, WillRetain) of
+            case psk_username(maps:get(psk_identity, Data, undefined), User) of
                 {error, _} ->
                     stop_with(Data, protocol_error);
-                {ok, Will} ->
-                    %% No will rides the /6 encoding byte-for-byte;
-                    %% a will rides the /7 encoding (both carry the
-                    %% CONNECT alias maximum).
-                    Meta = case Will of
-                        undefined ->
-                            (catch indra_brokerlink:encode_bind_meta(
-                                     ClientId, CleanStart, Keepalive,
-                                     {User, Pass},
-                                     peer_ip_opt(Data), ClientAliasMax));
-                        _ ->
-                            (catch indra_brokerlink:encode_bind_meta(
-                                     ClientId, CleanStart, Keepalive,
-                                     {User, Pass},
-                                     peer_ip_opt(Data), ClientAliasMax, Will))
-                    end,
-                    case Meta of
-                        <<_/binary>> ->
-                            case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION,
-                                                             ConnId, Seq + 1, Meta, <<>>) of
-                                ok ->
-                                    Pending = #{client_id => ClientId,
-                                                keepalive => Keepalive,
-                                                will => Will,
-                                                proto_level => ProtoLevel,
-                                                client_alias_max => ClientAliasMax},
-                                    %% Stash bytes pipelined behind CONNECT; they drain once
-                                    %% the handshake completes (see `drain_buffer`).
-                                    {keep_state, Data#{seq => Seq + 1,
-                                                       pending => Pending,
-                                                       buffer => Rest}};
-                                Other ->
-                                    stop_with(Data, classify_send_error(Other))
-                            end;
-                        _ ->
-                            %% Will too large for the bind meta (or another
-                            %% encoding refusal): fail closed, no half bind.
-                            stop_with(Data, protocol_error)
+                {ok, MappedUser} ->
+                    case make_will(WillFlag, WillTopic, WillPayload, WillQos, WillRetain) of
+                        {error, _} ->
+                            stop_with(Data, protocol_error);
+                        {ok, Will} ->
+                            %% No will rides the /6 encoding byte-for-byte;
+                            %% a will rides the /7 encoding (both carry the
+                            %% CONNECT alias maximum).
+                            Meta = case Will of
+                                undefined ->
+                                    (catch indra_brokerlink:encode_bind_meta(
+                                             ClientId, CleanStart, Keepalive,
+                                             {MappedUser, Pass},
+                                             peer_ip_opt(Data), ClientAliasMax));
+                                _ ->
+                                    (catch indra_brokerlink:encode_bind_meta(
+                                             ClientId, CleanStart, Keepalive,
+                                             {MappedUser, Pass},
+                                             peer_ip_opt(Data), ClientAliasMax, Will))
+                            end,
+                            case Meta of
+                                <<_/binary>> ->
+                                    case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION,
+                                                                      ConnId, Seq + 1, Meta, <<>>) of
+                                        ok ->
+                                            Pending = #{client_id => ClientId,
+                                                        keepalive => Keepalive,
+                                                        will => Will,
+                                                        proto_level => ProtoLevel,
+                                                        client_alias_max => ClientAliasMax,
+                                                        username => MappedUser,
+                                                        password => Pass},
+                                            %% Stash bytes pipelined behind CONNECT; they drain once
+                                            %% the handshake completes (see `drain_buffer`).
+                                            {keep_state, Data#{seq => Seq + 1,
+                                                               pending => Pending,
+                                                               buffer => Rest}};
+                                        Other ->
+                                            stop_with(Data, classify_send_error(Other))
+                                    end;
+                                _ ->
+                                    %% Will too large for the bind meta (or another
+                                    %% encoding refusal): fail closed, no half bind.
+                                    stop_with(Data, protocol_error)
+                            end
                     end
             end;
         {error, _Reason} ->
             stop_with(Data, protocol_error)
     end.
+
+%% @private Map the TLS PSK identity onto the bind username (B5-05).
+%% Plaintext and certificate sockets carry `undefined' and keep the
+%% CONNECT username untouched. On a PSK socket an absent CONNECT
+%% username defaults to the identity and an identical one is accepted;
+%% anything else fails closed (no bind is sent, the socket closes).
+-spec psk_username(binary() | undefined, binary() | undefined) ->
+    {ok, binary() | undefined} | {error, psk_identity_mismatch}.
+psk_username(undefined, User) ->
+    {ok, User};
+psk_username(PskId, undefined) ->
+    {ok, PskId};
+psk_username(PskId, PskId) ->
+    {ok, PskId};
+psk_username(_, _) ->
+    {error, psk_identity_mismatch}.
 
 %% @private Build the bind will from decoded CONNECT fields. `undefined'
 %% when the will flag is clear; otherwise the topic must be routable
@@ -830,14 +893,16 @@ resend_bind(#{broker := Broker, conn_id := ConnId, seq := Seq,
                pending := #{client_id := ClientId, keepalive := Keepalive} = Pending} = Data) ->
     Will = maps:get(will, Pending, undefined),
     ClientAliasMax = maps:get(client_alias_max, Pending, 0),
+    Username = maps:get(username, Pending, undefined),
+    Password = maps:get(password, Pending, undefined),
     Meta = case Will of
         undefined ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
-                                                     {undefined, undefined},
+                                                     {Username, Password},
                                                      peer_ip_opt(Data), ClientAliasMax));
         _ ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
-                                                     {undefined, undefined},
+                                                     {Username, Password},
                                                      peer_ip_opt(Data), ClientAliasMax, Will))
     end,
     case Meta of
