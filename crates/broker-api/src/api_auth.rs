@@ -21,10 +21,11 @@ use crate::ApiState;
 /// Credentials presented on a management API request.
 ///
 /// The reference specification accepts `Authorization: Bearer <dashboard token>` and
-/// `Authorization: Basic <api_key:api_secret>` on `/api/v5`. There is no
-/// API key store yet, so Basic credentials never resolve; the single
-/// [`resolve_credentials`] function stays the one place that changes when
-/// the store lands.
+/// `Authorization: Basic <api_key:api_secret>` on `/api/v5`. Key records
+/// are managed by the `api_keys` store (`crate::v5::api_keys`, W2-25);
+/// Basic enforcement itself is owned elsewhere, so Basic credentials
+/// never resolve here yet. The single [`resolve_credentials`] function
+/// stays the one place that changes when enforcement lands.
 #[derive(Debug)]
 pub enum Credentials {
     Bearer(String),
@@ -60,9 +61,11 @@ pub fn parse_credentials(headers: &HeaderMap) -> Option<Credentials> {
 /// Resolve credentials to an authenticated identity.
 ///
 /// Bearer tokens go through the token store (fresh roles, tokens of
-/// deleted users revoked). Basic API keys have no store yet and always
-/// resolve to unknown. Keep all credential resolution here so the API key
-/// store plugs in later without touching routes or handlers.
+/// deleted users revoked). Basic API key checks against the key records
+/// (`crate::v5::api_keys::ApiKeyStore::verify`) are owned by the
+/// enforcement lane and always resolve to unknown here. Keep all
+/// credential resolution here so enforcement plugs in later without
+/// touching routes or handlers.
 pub fn resolve_credentials(state: &ApiState, headers: &HeaderMap) -> Option<TokenInfo> {
     authenticated_user(state, headers)
 }

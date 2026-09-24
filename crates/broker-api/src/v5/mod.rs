@@ -1,6 +1,7 @@
 //! v5 REST API compatibility router for IndraMQTT.
 
 pub mod alarms;
+pub mod api_keys;
 pub mod auth;
 pub mod authn_cache;
 pub mod authn_chain;
@@ -291,6 +292,17 @@ pub fn protected_router() -> Router<ApiState> {
             "/authorization/sources/:type/rules/:index",
             delete(auth::delete_authz_rule),
         )
+        // API keys (W2-25, C05-01..C05-03): paged metadata list,
+        // mint-with-single-secret-return and revoke with 404s on real
+        // state. Management-plane only; key checks use constant-time
+        // comparison off the hot path and publish/deliver never touch
+        // this store. Bearer/Basic enforcement itself is owned
+        // elsewhere; this task only manages the key records.
+        .route(
+            "/api_key",
+            get(api_keys::list_api_keys).post(api_keys::create_api_key),
+        )
+        .route("/api_key/:name", delete(api_keys::delete_api_key))
         // Live Monitoring & Rates
         .route("/metrics", get(monitoring::get_metrics))
         .route(

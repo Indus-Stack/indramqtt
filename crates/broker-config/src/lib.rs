@@ -1344,6 +1344,129 @@ impl AuthzSourcesConf {
     }
 }
 
+/// Upper bound for stored management API keys. Creates past this size
+/// are rejected instead of growing the map without limit. Reason: the
+/// management plane snapshots the whole key list per list request and
+/// each entry holds a hash plus metadata, so an unbounded map lets one
+/// management batch exhaust the kernel; 1024 covers operator and
+/// automation provisioning with headroom while keeping list reads paged
+/// and per-request clones cheap.
+// TODO(parity): is 1024 the documented key cap, or does the spec allow
+// more entries? The rulebook does not decide the exact bound; 1024 is
+// the conservative choice until the conformance checker pins it.
+pub const MAX_API_KEYS: usize = 1024;
+
+/// Longest accepted API key name (128 bytes). Reason: names are map keys
+/// cloned into every list snapshot and persisted per entry, so an
+/// unbounded name lets one record bloat each list read; 128 covers
+/// operator and automation naming with headroom while keeping
+/// per-request clones cheap.
+pub const MAX_API_KEY_NAME_LEN: usize = 128;
+
+/// Longest accepted per-scope token in an API key record (64 bytes).
+/// Reason: scopes are cloned into every list snapshot and persisted per
+/// entry, so an unbounded token lets one record bloat each list read;
+/// 64 covers dotted scope names with headroom while keeping per-request
+/// clones cheap.
+pub const MAX_API_KEY_SCOPE_LEN: usize = 64;
+
+/// Most scopes accepted on one API key record (32 entries). Reason: the
+/// scope list is cloned per list row and scanned per management-plane
+/// key check, so an unbounded list lets one record bloat reads and
+/// checks; 32 covers multi-scope automation with headroom while keeping
+/// rows small.
+pub const MAX_API_KEY_SCOPES: usize = 32;
+
+/// One stored management API key: the key name plus the secret hash.
+///
+/// `key_hash` holds the hex SHA-256 of the minted secret (never
+/// plaintext); the registry treats it as an opaque non-empty string.
+/// `scopes` carries the granted scope set verbatim; `description` is
+/// free-form operator text. `created_at` renders the mint time in the
+/// same UTC `+00:00` shape the ban list uses, or an empty string when
+/// the record predates the field.
+// TODO(parity): which per-key fields does the listing require beyond
+// name/scopes (expiry, enabled flag, creation time)? The rulebook does
+// not decide the exact record shape; fields the broker does not track
+// are omitted rather than invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ApiKeyEntry {
+    /// Key name; must be non-empty and unique within the root.
+    pub name: String,
+    /// Hex SHA-256 of the minted secret; must be non-empty.
+    pub key_hash: String,
+    /// Granted scope set (may be empty).
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Free-form description shown by the key list.
+    #[serde(default)]
+    pub description: String,
+    /// Mint time (`YYYY-MM-DDTHH:MM:SS+00:00`) or empty when unknown.
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// Root: management API key records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ApiKeysConf {
+    #[serde(default)]
+    pub keys: Vec<ApiKeyEntry>,
+}
+
+impl ApiKeysConf {
+    /// Validates names (non-empty, bounded, unique), hashes
+    /// (non-empty), the scope caps and the root length cap.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.keys.len() > MAX_API_KEYS {
+            return Err(ConfigError::Invalid(format!(
+                "api_keys.keys holds {} entries, at most {} (field `keys`)",
+                self.keys.len(),
+                MAX_API_KEYS
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.keys.len());
+        for (index, entry) in self.keys.iter().enumerate() {
+            if entry.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "api_keys.keys[{index}].name must not be empty (field `name`)"
+                )));
+            }
+            if entry.name.len() > MAX_API_KEY_NAME_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "api_keys.keys[{index}].name {:?} is too long (field `name`)",
+                    entry.name
+                )));
+            }
+            if entry.key_hash.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "api_keys.keys[{index}].key_hash must not be empty (field `key_hash`)"
+                )));
+            }
+            if entry.scopes.len() > MAX_API_KEY_SCOPES {
+                return Err(ConfigError::Invalid(format!(
+                    "api_keys.keys[{index}].scopes holds {} entries, at most {} (field `scopes`)",
+                    entry.scopes.len(),
+                    MAX_API_KEY_SCOPES
+                )));
+            }
+            for scope in &entry.scopes {
+                if scope.trim().is_empty() || scope.len() > MAX_API_KEY_SCOPE_LEN {
+                    return Err(ConfigError::Invalid(format!(
+                        "api_keys.keys[{index}].scopes holds an invalid scope (field `scopes`)"
+                    )));
+                }
+            }
+            if !seen.insert(entry.name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "api_keys.keys[{index}].name {:?} is duplicated (field `name`)",
+                    entry.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The full validated configuration: all roots in one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FullSnapshot {
@@ -1367,6 +1490,8 @@ pub struct FullSnapshot {
     pub authz_settings: AuthzSettingsConf,
     #[serde(default)]
     pub authz_sources: AuthzSourcesConf,
+    #[serde(default)]
+    pub api_keys: ApiKeysConf,
 }
 
 impl FullSnapshot {
@@ -1382,6 +1507,7 @@ impl FullSnapshot {
         self.authz_node_cache.validate()?;
         self.authz_settings.validate()?;
         self.authz_sources.validate()?;
+        self.api_keys.validate()?;
         Ok(())
     }
 }
@@ -1409,6 +1535,8 @@ pub enum ConfigRoot {
     AuthzSettings(AuthzSettingsConf),
     /// Validated authorization source registry root.
     AuthzSources(AuthzSourcesConf),
+    /// Validated management API key records root.
+    ApiKeys(ApiKeysConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1495,6 +1623,7 @@ impl ConfigRegistry {
             ConfigRoot::AuthzNodeCache(conf) => self.commit_authz_node_cache(conf),
             ConfigRoot::AuthzSettings(conf) => self.commit_authz_settings(conf),
             ConfigRoot::AuthzSources(conf) => self.commit_authz_sources(conf),
+            ConfigRoot::ApiKeys(conf) => self.commit_api_keys(conf),
         }
     }
 
@@ -1603,6 +1732,17 @@ impl ConfigRegistry {
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.authz_sources = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Commits validated management API key records.
+    pub fn commit_api_keys(&self, conf: ApiKeysConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.api_keys = conf.clone();
             next
         });
         Ok(())
@@ -1719,6 +1859,7 @@ mod tests {
             authz_node_cache: AuthzNodeCacheConf::default(),
             authz_settings: AuthzSettingsConf::default(),
             authz_sources: AuthzSourcesConf::default(),
+            api_keys: ApiKeysConf::default(),
         }
     }
 

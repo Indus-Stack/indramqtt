@@ -18,3 +18,4 @@ wired  slow_subs_settings
 wired  traces
 wired  tracing
 wired  authn_settings
+wired  api_keys

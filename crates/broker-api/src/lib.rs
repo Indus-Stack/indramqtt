@@ -186,6 +186,16 @@ pub struct ApiState {
     /// handling). Publish and deliver never touch this registry's write
     /// lock.
     pub authz_sources: Arc<broker_auth::AuthzSourceRegistry>,
+    /// Management API key directory for `GET/POST /api/v5/api_key` and
+    /// `DELETE /api/v5/api_key/{name}` (W2-25): bounded name-keyed map
+    /// with registry persistence. The routes read one bounded snapshot
+    /// per request; the kernel boot path seeds the same instance from
+    /// the registry (`crates/broker-node/src/main.rs`, boot seeding and
+    /// the `serve_api` share below). Key checks use constant-time
+    /// comparison off the hot path; publish and deliver never touch
+    /// this store. Bearer/Basic enforcement itself is owned elsewhere;
+    /// this store only manages the key records.
+    pub api_keys: Arc<crate::v5::api_keys::ApiKeyStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -261,6 +271,11 @@ impl ApiState {
         // the persisted sources from the first connection. Defaults
         // yield the built-in database source.
         let authz_sources = Arc::new(broker_auth::AuthzSourceRegistry::from_registry(&config));
+        // Boot seeding (W2-25): route the loaded API key records into
+        // a shared directory so management reads observe the persisted
+        // keys from the first connection. An empty snapshot is a no-op
+        // (today's empty behaviour); secrets stay hashed at rest.
+        let api_keys = Arc::new(crate::v5::api_keys::ApiKeyStore::from_registry(&config));
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -305,6 +320,7 @@ impl ApiState {
             authz_node_cache,
             authz_settings,
             authz_sources,
+            api_keys,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -363,6 +379,7 @@ impl ApiState {
             authz_node_cache: Arc::new(broker_auth::AuthzNodeCache::new()),
             authz_settings: Arc::new(broker_auth::AuthzSettingsStore::new()),
             authz_sources: Arc::new(broker_auth::AuthzSourceRegistry::new()),
+            api_keys: Arc::new(crate::v5::api_keys::ApiKeyStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -9655,11 +9672,90 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             "/api/v5/configs",
             "/api/v5/sso",
             "/api/v5/telemetry/status",
-            "/api/v5/api_key",
         ] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
+    }
+
+    #[tokio::test]
+    async fn api_keys_create_list_revoke_and_miss_404() {
+        // W2-25 failing test: mint a key expecting the secret returned
+        // once, list expecting metadata without secrets, delete it
+        // expecting revocation, and delete unknown expecting 404.
+        // Before: all three routes 404.
+        // Broker-through: every step goes through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), not only
+        // through the store; key verification itself is covered by the
+        // store unit test and the management-plane verify off the hot
+        // path, never by publish or deliver.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty store reads as an empty page, never an error.
+        let (status, body) = server.get_auth("/api/v5/api_key", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+
+        // Mint one key: the secret is returned exactly once.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/api_key",
+                json!({"name": "w225-broker-key", "scopes": ["all"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["name"], json!("w225-broker-key"));
+        let secret = created["api_key"].as_str().expect("secret returned once");
+        assert!(!secret.is_empty());
+
+        // Malformed bodies are client errors.
+        let (status, _) = server
+            .post_auth("/api/v5/api_key", json!({"scopes": ["all"]}), &token)
+            .await;
+        assert_eq!(status, 400);
+
+        // Duplicate names are rejected cleanly, never silently rotated.
+        let (status, duplicate) = server
+            .post_auth(
+                "/api/v5/api_key",
+                json!({"name": "w225-broker-key"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(duplicate["code"], json!("ALREADY_EXISTS"));
+
+        // Listing carries metadata without secrets.
+        let (status, listed) = server.get_auth("/api/v5/api_key", &token).await;
+        assert_eq!(status, 200);
+        let data = listed["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["name"], json!("w225-broker-key"));
+        assert!(data[0].get("api_key").is_none());
+        assert!(data[0].get("secret").is_none());
+        assert!(data[0].get("key_hash").is_none());
+        assert_eq!(listed["meta"]["count"], json!(1));
+
+        // Revoke the key and confirm unknown names 404 with the
+        // documented shape.
+        let (status, _) = server
+            .delete_auth("/api/v5/api_key/w225-broker-key", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, missing) = server
+            .delete_auth("/api/v5/api_key/w225-broker-key", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(missing["code"], json!("NOT_FOUND"));
+
+        // Empty again after revocation.
+        let (status, body) = server.get_auth("/api/v5/api_key", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
     }
 
     #[tokio::test]

@@ -1964,6 +1964,15 @@ struct Shared {
     /// lock. The built-in rule table it fronts (`MemoryAuth`) is
     /// consulted by the publish and subscribe authorization events.
     authz_sources: Arc<AuthzSourceRegistry>,
+    /// Management API key directory for W2-25: shared with the
+    /// management API so validated mints and revocations are visible to
+    /// reads without a restart. One `Arc` clone at boot; the kernel boot
+    /// path seeds it from the registry and management reads take one
+    /// bounded snapshot per request. Key checks use constant-time
+    /// comparison off the hot path; publish and deliver never touch it.
+    /// Bearer/Basic enforcement itself is owned elsewhere; this store
+    /// only manages the key records.
+    api_keys: Arc<broker_api::v5::api_keys::ApiKeyStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -2198,6 +2207,7 @@ impl Shared {
             authz_node_cache: Arc::new(AuthzNodeCache::new()),
             authz_settings: Arc::new(AuthzSettingsStore::new()),
             authz_sources: Arc::new(AuthzSourceRegistry::new()),
+            api_keys: Arc::new(broker_api::v5::api_keys::ApiKeyStore::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -5554,6 +5564,13 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Seeding already ran inside `ApiState::new`; sharing replaces that
     // fresh instance with the kernel's so no second copy diverges.
     state.authz_sources = shared.authz_sources.clone();
+    // Share the management API key directory (W2-25) so validated
+    // management mints and revocations are visible to reads without a
+    // restart. One `Arc` clone; management-plane only, never on the
+    // delivery path. Seeding already ran inside `ApiState::new`;
+    // sharing replaces that fresh instance with the kernel's so no
+    // second copy diverges.
+    state.api_keys = shared.api_keys.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -5729,6 +5746,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // management reads observe the persisted sources from the first
     // connection. Defaults yield the built-in database source.
     shared.authz_sources.seed_from_registry(&shared.config);
+    // Management API keys (W2-25): seed the shared directory in place
+    // (the same instance `serve_api` shares with `ApiState`), so
+    // management reads observe the persisted keys from the first
+    // connection. An empty snapshot is a no-op (today's empty
+    // behaviour); secrets stay hashed at rest and are never re-minted
+    // at boot.
+    shared.api_keys.seed_from_registry(&shared.config);
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.
