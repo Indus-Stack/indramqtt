@@ -5150,6 +5150,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authn_status_reports_live_counters_through_connect() {
+        // Status over the real chain entry plus live CONNECT verdicts:
+        // create one built-in entry, read the documented fields at zero,
+        // move success/failed through real console CONNECTs through the
+        // broker, and read the moved counters back. A subscribe/publish/
+        // deliver flow proves status assembly never touches the message
+        // path. Management-plane only for reads; the CONNECT path
+        // attributes one verdict per connect and publish/deliver never
+        // touch these counters.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Unknown ids miss with the documented shape, not an empty body.
+        // Before this task the route itself was missing (bare 404).
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:nowhere/status",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+
+        // One built-in entry: a fresh authenticator reads zeros live.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication",
+                json!({"mechanism": "password_based", "backend": "built_in_database"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/status",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("password_based:built_in_database"));
+        assert_eq!(body["enable"], json!(true));
+        assert_eq!(body["status"], json!("connected"));
+        assert_eq!(body["metrics"]["success"], json!(0));
+        assert_eq!(body["metrics"]["failed"], json!(0));
+        assert_eq!(body["metrics"]["total"], json!(0));
+        assert!(body["metrics"]["nomatch"].is_number());
+        assert_eq!(body["node_status"][0]["status"], json!("connected"));
+        assert_eq!(
+            body["node_metrics"][0]["metrics"]["total"],
+            body["metrics"]["total"]
+        );
+        assert_eq!(body["node_error"], json!([]));
+
+        // Create a user through the broker, then CONNECT through the
+        // broker: success moves the live counters.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authentication/password_based:built_in_database/users",
+                json!({"user_id": "w2-08-user", "password": "W2-08-pass!"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let mut good = WsClient::connect(server.port).await;
+        good.send_bin(&mqtt_connect(
+            "w2-08-good",
+            Some("w2-08-user"),
+            Some(b"W2-08-pass!"),
+        ))
+        .await;
+        let connack = good.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/status",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["success"], json!(1));
+        assert_eq!(body["metrics"]["total"], json!(1));
+
+        // A bad password moves failed through the same broker path.
+        let mut bad = WsClient::connect(server.port).await;
+        bad.send_bin(&mqtt_connect(
+            "w2-08-bad",
+            Some("w2-08-user"),
+            Some(b"wrong-pass"),
+        ))
+        .await;
+        let connack = bad.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0x86);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/status",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["success"], json!(1));
+        assert_eq!(body["metrics"]["failed"], json!(1));
+        assert_eq!(body["metrics"]["total"], json!(2));
+
+        // Unknown query keys degrade to the same read, not a 400: the
+        // route is not paged.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/status?unknown_param=1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["total"], json!(2));
+
+        // The message path still flows while status reads run: status
+        // assembly never touches publish or deliver.
+        let mut sub = WsClient::connect(server.port).await;
+        sub.send_bin(&mqtt_connect(
+            "w2-08-sub",
+            Some("w2-08-user"),
+            Some(b"W2-08-pass!"),
+        ))
+        .await;
+        let connack = sub.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
+        sub.send_bin(&mqtt_subscribe(7, &[("w2-08/t", 1)])).await;
+        let suback = sub.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        let mut publ = WsClient::connect(server.port).await;
+        publ.send_bin(&mqtt_connect(
+            "w2-08-pub",
+            Some("w2-08-user"),
+            Some(b"W2-08-pass!"),
+        ))
+        .await;
+        let connack = publ.recv_msg().await.expect("connack");
+        assert_eq!(connack[3], 0);
+        publ.send_bin(&mqtt_publish("w2-08/t", 42, 1, b"hi-w2-08"))
+            .await;
+        let puback = publ.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let delivery = sub.recv_msg().await.expect("delivery");
+        assert_eq!(mqtt_packet_type(&delivery), 3);
+        assert!(delivery.ends_with(b"hi-w2-08"));
+        // Two more successful CONNECTs moved the counters with the flow.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/password_based:built_in_database/status",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["success"], json!(3));
+        assert_eq!(body["metrics"]["failed"], json!(1));
+        assert_eq!(body["metrics"]["total"], json!(4));
+    }
+
+    #[tokio::test]
     async fn authn_node_cache_status_reset_round_trip() {
         // Status over real state plus a reset that actually evicts:
         // read the documented fields, populate the cache through

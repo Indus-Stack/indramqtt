@@ -467,6 +467,10 @@ async fn handle_packet(
             // chain with no enabled built-in slot fails closed (no live
             // backend can execute), mirroring the BrokerLink bind path.
             if !state.authn_chain.built_in_available() {
+                // W2-08: attribute the no-live-backend refusal to the
+                // first entry so status shows the outage. CONNECT-only;
+                // publish and deliver never touch these counters.
+                state.authn_chain.record_first_failed();
                 send_bin(socket, encode_connack(false, 0x86)).await;
                 return Err(());
             }
@@ -487,6 +491,11 @@ async fn handle_packet(
             // clients are rejected whenever users exist, exactly like the
             // BrokerLink bind path (0x87, not authorized).
             if conn.username.is_none() && state.auth.user_count() > 0 {
+                // W2-08: anonymous refusal is a failed verdict on the
+                // first enabled built-in entry when one exists.
+                // CONNECT-only; publish and deliver never touch these
+                // counters.
+                state.authn_chain.record_built_in_failed();
                 send_bin(socket, encode_connack(false, 0x87)).await;
                 return Err(());
             }
@@ -498,6 +507,9 @@ async fn handle_packet(
                     .await
                     .is_err()
                 {
+                    // W2-08: failed credential verdict. CONNECT-only;
+                    // publish and deliver never touch these counters.
+                    state.authn_chain.record_built_in_failed();
                     send_bin(socket, encode_connack(false, 0x86)).await;
                     return Err(());
                 }
@@ -505,6 +517,10 @@ async fn handle_packet(
                 // node auth cache (one short lock, CONNECT-only; publish
                 // and deliver never touch this store).
                 state.authn_node_cache.record_success(username);
+                // W2-08: successful credential verdict on the first
+                // enabled built-in entry. CONNECT-only; publish and
+                // deliver never touch these counters.
+                state.authn_chain.record_built_in_success();
             }
             // Connection quotas apply to console clients exactly like
             // edge binds (release happens in teardown via unbind). The

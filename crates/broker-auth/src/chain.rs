@@ -36,6 +36,8 @@ use broker_config::{
     is_known_authn_backend, is_known_authn_mechanism, AuthnChainConf, AuthnEntry as ConfEntry,
     ConfigRegistry, MAX_AUTHN_CHAIN_ENTRIES,
 };
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Longest accepted `id`/`mechanism`/`backend` value (256 chars).
@@ -114,6 +116,62 @@ pub enum ChainRemoveError {
     /// The registry commit or atomic save failed after validation.
     Persist(String),
 }
+/// Per-authenticator live counters behind fixed-width atomics.
+///
+/// One record per chain id: `total` counts every CONNECT verdict attributed
+/// to that id, split into `success`, `failed` and `nomatch` (the built-in
+/// entry did not decide because another mechanism answered). All reads are
+/// lock-free atomic loads and all increments are lock-free atomic adds;
+/// the map itself is only looked up under one short read lock per CONNECT
+/// to clone the `Arc`, mirroring the node-cache recorder. Publish and
+/// deliver never touch these counters.
+#[derive(Debug, Default)]
+pub struct AuthnCounters {
+    success: AtomicU64,
+    failed: AtomicU64,
+    nomatch: AtomicU64,
+    total: AtomicU64,
+}
+
+/// Lock-free snapshot of one authenticator's counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthnCounterSnapshot {
+    pub success: u64,
+    pub failed: u64,
+    pub nomatch: u64,
+    pub total: u64,
+}
+
+impl AuthnCounters {
+    fn snapshot(&self) -> AuthnCounterSnapshot {
+        let success = self.success.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        let nomatch = self.nomatch.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        AuthnCounterSnapshot {
+            success,
+            failed,
+            nomatch,
+            total,
+        }
+    }
+
+    fn record_success(&self) {
+        self.success.fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_nomatch(&self) {
+        self.nomatch.fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Ordered authenticator chain behind one short lock plus a lock-free
 /// read snapshot for the CONNECT path.
 ///
@@ -121,11 +179,19 @@ pub enum ChainRemoveError {
 /// publish a fresh snapshot; the CONNECT hook loads the snapshot
 /// without taking the write lock and never blocks on a management
 /// write beyond one `Arc` swap. Publish and deliver never touch either.
+///
+/// Counter bound (stated here and enforced below): at most
+/// [`MAX_AUTHN_CHAIN_ENTRIES`] counter records (8: one per chain id, so
+/// the map can never outgrow the chain); each record holds exactly four
+/// `AtomicU64` values and no list, queue or history ever accumulates.
+/// Counters are memory-only and reset to zero on seeding (status is
+/// computed live and never persists).
 pub struct AuthnChain {
     inner: parking_lot::RwLock<Vec<AuthnEntry>>,
     snapshot: arc_swap::ArcSwap<Vec<AuthnEntry>>,
     registry: parking_lot::RwLock<Option<Arc<ConfigRegistry>>>,
     save_lock: parking_lot::Mutex<()>,
+    counters: parking_lot::RwLock<HashMap<String, Arc<AuthnCounters>>>,
 }
 
 impl AuthnChain {
@@ -136,6 +202,7 @@ impl AuthnChain {
             snapshot: arc_swap::ArcSwap::from(Arc::new(Vec::new())),
             registry: parking_lot::RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
+            counters: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -169,7 +236,17 @@ impl AuthnChain {
             .filter_map(|e| conf_to_entry(e).ok())
             .collect::<Vec<_>>();
         *self.inner.write() = entries.clone();
-        self.snapshot.store(Arc::new(entries));
+        self.snapshot.store(Arc::new(entries.clone()));
+        // Counters never persist: a restart (or re-seed) starts every
+        // authenticator at zero. Bounded by the chain cap: one record per
+        // seeded id, never more than MAX_AUTHN_CHAIN_ENTRIES entries.
+        let mut counters = self.counters.write();
+        counters.clear();
+        for entry in &entries {
+            counters
+                .entry(entry.id.clone())
+                .or_insert_with(|| Arc::new(AuthnCounters::default()));
+        }
     }
 
     /// Ordered snapshot of the chain in stored order. Management-plane
@@ -226,6 +303,12 @@ impl AuthnChain {
                 .map_err(|e| ChainInsertError::Invalid(e.to_string()))?;
             current.push(entry.clone());
             self.snapshot.store(Arc::new(current.clone()));
+            // One bounded counter record per chain id; a re-created id
+            // after a delete restarts at zero.
+            self.counters
+                .write()
+                .entry(entry.id.clone())
+                .or_insert_with(|| Arc::new(AuthnCounters::default()));
             conf
         };
         if let Some(registry) = self.registry.read().clone() {
@@ -333,6 +416,117 @@ impl AuthnChain {
         self.inner.read().iter().find(|e| e.id == id).cloned()
     }
 
+    /// Live counters for one authenticator id (`None` when unknown).
+    ///
+    /// Management-plane read only: lock-free atomic loads, no write lock,
+    /// no allocation beyond the returned copy. Publish and deliver never
+    /// call this.
+    pub fn counter_snapshot(&self, id: &str) -> Option<AuthnCounterSnapshot> {
+        self.counters
+            .read()
+            .get(id)
+            .map(|counters| counters.snapshot())
+    }
+
+    /// Record one successful CONNECT verdict for `id`.
+    ///
+    /// CONNECT-only: one short read lock to clone the counter `Arc` plus
+    /// two lock-free atomic adds; unknown ids apply nothing (no
+    /// accumulation). Publish and deliver never call this.
+    pub fn record_success(&self, id: &str) {
+        if let Some(counters) = self.counters.read().get(id).cloned() {
+            counters.record_success();
+        }
+    }
+
+    /// Record one failed CONNECT verdict for `id`.
+    ///
+    /// CONNECT-only: one short read lock to clone the counter `Arc` plus
+    /// two lock-free atomic adds; unknown ids apply nothing (no
+    /// accumulation). Publish and deliver never call this.
+    pub fn record_failed(&self, id: &str) {
+        if let Some(counters) = self.counters.read().get(id).cloned() {
+            counters.record_failed();
+        }
+    }
+
+    /// Record one CONNECT the built-in entry did not decide (another
+    /// mechanism answered).
+    ///
+    /// CONNECT-only: one short read lock to clone the counter `Arc` plus
+    /// two lock-free atomic adds; unknown ids apply nothing (no
+    /// accumulation). Publish and deliver never call this.
+    pub fn record_nomatch(&self, id: &str) {
+        if let Some(counters) = self.counters.read().get(id).cloned() {
+            counters.record_nomatch();
+        }
+    }
+
+    /// Record success on the first enabled built-in entry, if any.
+    ///
+    /// CONNECT-only convenience so the bind path attributes a local verdict
+    /// without allocating: one lock-free snapshot scan of at most the
+    /// capped entries plus one counter lookup. No entry (empty chain, or
+    /// no enabled built-in) records nothing. Publish and deliver never
+    /// call this.
+    pub fn record_built_in_success(&self) {
+        let snap = self.snapshot.load_full();
+        // The borrow lives with `snap`: no allocation, at most the capped
+        // entries scanned.
+        if let Some(entry) = snap
+            .iter()
+            .find(|e| e.backend == "built_in_database" && e.enable)
+        {
+            self.record_success(&entry.id);
+        }
+    }
+
+    /// Record failure on the first enabled built-in entry, if any.
+    ///
+    /// CONNECT-only convenience, same cost and bounds as
+    /// [`AuthnChain::record_built_in_success`]. Publish and deliver never
+    /// call this.
+    pub fn record_built_in_failed(&self) {
+        let snap = self.snapshot.load_full();
+        if let Some(entry) = snap
+            .iter()
+            .find(|e| e.backend == "built_in_database" && e.enable)
+        {
+            self.record_failed(&entry.id);
+        }
+    }
+
+    /// Record a bypass verdict (another mechanism answered) on the first
+    /// enabled built-in entry, if any.
+    ///
+    /// CONNECT-only convenience, same cost and bounds as
+    /// [`AuthnChain::record_built_in_success`]: the built-in entry did not
+    /// decide, so the attempt counts as `nomatch` plus `total` on its
+    /// counters. Publish and deliver never call this.
+    pub fn record_built_in_nomatch(&self) {
+        let snap = self.snapshot.load_full();
+        if let Some(entry) = snap
+            .iter()
+            .find(|e| e.backend == "built_in_database" && e.enable)
+        {
+            self.record_nomatch(&entry.id);
+        }
+    }
+
+    /// Record failure on the first chain entry, if any.
+    ///
+    /// CONNECT-only convenience for the no-live-backend refusal, which has
+    /// no enabled built-in to attribute to: the refusal still moves the
+    /// first entry's `failed` plus `total` so the outage stays visible in
+    /// status. Same cost and bounds as above. Publish and deliver never
+    /// call this.
+    pub fn record_first_failed(&self) {
+        let snap = self.snapshot.load_full();
+        if let Some(entry) = snap.first() {
+            self.record_failed(&entry.id);
+        }
+    }
+
     /// Replace the entry stored under `id` with `entry` (whose `id` must
     /// equal `id`).
     ///
@@ -377,6 +571,13 @@ impl AuthnChain {
                 .map_err(|e| ChainUpdateError::Invalid(e.to_string()))?;
             *current = next.clone();
             self.snapshot.store(Arc::new(next));
+            // Counters survive config/enable replaces: they are live, not
+            // config. Ensure the record exists for chains seeded before
+            // counters landed.
+            self.counters
+                .write()
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(AuthnCounters::default()));
             conf
         };
         if let Some(registry) = self.registry.read().clone() {
@@ -425,6 +626,7 @@ impl AuthnChain {
             conf.validate()
                 .map_err(|e| ChainRemoveError::Persist(e.to_string()))?;
             self.snapshot.store(Arc::new(next));
+            self.counters.write().remove(id);
             (removed, conf)
         };
         if let Some(registry) = self.registry.read().clone() {

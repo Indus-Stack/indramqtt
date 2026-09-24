@@ -15,7 +15,8 @@ pub mod settings;
 pub mod webhook;
 
 pub use chain::{
-    AuthnChain, AuthnEntry, ChainInsertError, ChainRemoveError, ChainReorderError, ChainUpdateError,
+    AuthnChain, AuthnCounterSnapshot, AuthnEntry, ChainInsertError, ChainRemoveError,
+    ChainReorderError, ChainUpdateError,
 };
 pub use db::{
     DbAuthSet, DbAuthSetConfig, DbSourceSettings, MongoAuth, MongoAuthConfig, MysqlAuth,

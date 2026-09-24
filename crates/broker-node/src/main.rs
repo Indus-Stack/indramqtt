@@ -681,6 +681,10 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 "authentication chain has no live backend: refusing CONNECT"
             );
             shared.metrics.inc_auth_failures();
+            // W2-08: attribute the no-live-backend refusal to the first
+            // entry so status shows the outage. CONNECT-only; publish and
+            // deliver never touch these counters.
+            shared.authn_chain.record_first_failed();
             return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
         }
         // W2-05: authentication-settings consult. Loads one lock-free
@@ -717,6 +721,11 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 || shared.webhook.is_some()
             {
                 shared.metrics.inc_auth_failures();
+                // W2-08: anonymous refusal is a failed verdict on the
+                // first enabled built-in entry when one exists.
+                // CONNECT-only; publish and deliver never touch these
+                // counters.
+                shared.authn_chain.record_built_in_failed();
                 return Some(session_binding_reply(frame, 0, false, 0x87, alias_max));
             }
         } else {
@@ -766,16 +775,22 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                             jwks_subject = subject;
                         }
                         Err(()) => {
+                            // W2-08: failed credential verdict. CONNECT-only.
+                            shared.authn_chain.record_built_in_failed();
                             return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                         }
                     }
                 } else if kerberos_enabled && looks_kerberos {
                     let Some(kerberos) = shared.kerberos.as_ref() else {
                         shared.metrics.inc_auth_failures();
+                        // W2-08: failed credential verdict. CONNECT-only.
+                        shared.authn_chain.record_built_in_failed();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     };
                     let Some(token) = password else {
                         shared.metrics.inc_auth_failures();
+                        // W2-08: failed credential verdict. CONNECT-only.
+                        shared.authn_chain.record_built_in_failed();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     };
                     match kerberos.verify_token(&req.client_id, token) {
@@ -802,6 +817,8 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         }
                         Err(_) => {
                             shared.metrics.inc_auth_failures();
+                            // W2-08: failed credential verdict. CONNECT-only.
+                            shared.authn_chain.record_built_in_failed();
                             return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                         }
                     }
@@ -814,6 +831,8 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         via_ldap = true;
                     } else {
                         shared.metrics.inc_auth_failures();
+                        // W2-08: failed credential verdict. CONNECT-only.
+                        shared.authn_chain.record_built_in_failed();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
                 } else if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
@@ -828,6 +847,8 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         via_db = true;
                     } else {
                         shared.metrics.inc_auth_failures();
+                        // W2-08: failed credential verdict. CONNECT-only.
+                        shared.authn_chain.record_built_in_failed();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
                 } else if let Some(webhook) = shared.webhook.as_ref() {
@@ -849,6 +870,8 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         via_webhook = true;
                     } else {
                         shared.metrics.inc_auth_failures();
+                        // W2-08: failed credential verdict. CONNECT-only.
+                        shared.authn_chain.record_built_in_failed();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
                 } else {
@@ -858,9 +881,13 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     // non-Kerberos password is not an open-mode accept.
                     if kerberos_enabled {
                         shared.metrics.inc_auth_failures();
+                        // W2-08: failed credential verdict. CONNECT-only.
+                        shared.authn_chain.record_built_in_failed();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
                     shared.metrics.inc_auth_failures();
+                    // W2-08: failed credential verdict. CONNECT-only.
+                    shared.authn_chain.record_built_in_failed();
                     return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 }
             } else if jwks_enabled && looks_jwt {
@@ -873,16 +900,22 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                         jwks_subject = subject;
                     }
                     Err(()) => {
+                        // W2-08: failed credential verdict. CONNECT-only.
+                        shared.authn_chain.record_built_in_failed();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
                 }
             } else if kerberos_enabled && looks_kerberos {
                 let Some(kerberos) = shared.kerberos.as_ref() else {
                     shared.metrics.inc_auth_failures();
+                    // W2-08: failed credential verdict. CONNECT-only.
+                    shared.authn_chain.record_built_in_failed();
                     return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 };
                 let Some(token) = password else {
                     shared.metrics.inc_auth_failures();
+                    // W2-08: failed credential verdict. CONNECT-only.
+                    shared.authn_chain.record_built_in_failed();
                     return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 };
                 match kerberos.verify_token(&req.client_id, token) {
@@ -906,6 +939,8 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     }
                     Err(_) => {
                         shared.metrics.inc_auth_failures();
+                        // W2-08: failed credential verdict. CONNECT-only.
+                        shared.authn_chain.record_built_in_failed();
                         return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                     }
                 }
@@ -918,6 +953,8 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     via_ldap = true;
                 } else {
                     shared.metrics.inc_auth_failures();
+                    // W2-08: failed credential verdict. CONNECT-only.
+                    shared.authn_chain.record_built_in_failed();
                     return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 }
             } else if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
@@ -933,6 +970,8 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     via_db = true;
                 } else {
                     shared.metrics.inc_auth_failures();
+                    // W2-08: failed credential verdict. CONNECT-only.
+                    shared.authn_chain.record_built_in_failed();
                     return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 }
             } else if let Some(webhook) = shared.webhook.as_ref() {
@@ -947,12 +986,16 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                     via_webhook = true;
                 } else {
                     shared.metrics.inc_auth_failures();
+                    // W2-08: failed credential verdict. CONNECT-only.
+                    shared.authn_chain.record_built_in_failed();
                     return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
                 }
             } else if kerberos_enabled {
                 // Enabled Kerberos disables the open mode: a credentialed
                 // CONNECT without a Kerberos token fails closed.
                 shared.metrics.inc_auth_failures();
+                // W2-08: failed credential verdict. CONNECT-only.
+                shared.authn_chain.record_built_in_failed();
                 return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
             } else if jwks_enabled {
                 // B5-02: a configured JWKS endpoint disables the open mode
@@ -960,6 +1003,8 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 // mechanism configured fails closed instead of
                 // open-accepting: nothing unverified is ever granted.
                 shared.metrics.inc_auth_failures();
+                // W2-08: failed credential verdict. CONNECT-only.
+                shared.authn_chain.record_built_in_failed();
                 return Some(session_binding_reply(frame, 0, false, 0x86, alias_max));
             } else {
                 // Open broker: no users, no directory, no database, no webhook, no enabled Kerberos
@@ -1013,6 +1058,18 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
             // deliver never touch this store).
             if let Some(username) = &effective_username {
                 shared.authn_node_cache.record_success(username);
+            }
+            // W2-08: attribute one CONNECT verdict to the first enabled
+            // built-in entry. A bypass verdict (another mechanism
+            // answered) counts as `nomatch` plus `total`; a local verdict
+            // counts as `success` plus `total`. Open-mode CONNECTs (no
+            // users, no mechanism) record nothing: no verdict exists.
+            // CONNECT-only; publish and deliver never touch these
+            // counters.
+            if via_ldap || via_kerberos || via_jwks || via_db || via_webhook {
+                shared.authn_chain.record_built_in_nomatch();
+            } else if local_has_users {
+                shared.authn_chain.record_built_in_success();
             }
         }
     }

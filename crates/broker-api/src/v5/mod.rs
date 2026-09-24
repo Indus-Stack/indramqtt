@@ -5,6 +5,7 @@ pub mod auth;
 pub mod authn_cache;
 pub mod authn_chain;
 pub mod authn_settings;
+pub mod authn_status;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
@@ -69,6 +70,14 @@ pub fn protected_router() -> Router<ApiState> {
             get(authn_chain::get_authn_entry)
                 .put(authn_chain::put_authn_entry)
                 .delete(authn_chain::delete_authn_entry),
+        )
+        // Authentication (AuthN) per-id status: liveness plus live
+        // counters over the real chain entry. Management-plane only; the
+        // CONNECT path attributes one verdict per connect and
+        // publish/deliver never touch this store.
+        .route(
+            "/authentication/:id/status",
+            get(authn_status::get_authn_status),
         )
         // Authentication (AuthN) node cache: status read plus reset that
         // actually evicts entries. Management-plane only; the CONNECT
