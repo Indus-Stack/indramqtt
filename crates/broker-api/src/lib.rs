@@ -133,6 +133,16 @@ pub struct ApiState {
     /// (`crates/broker-node/src/main.rs`, CONNECT handling) and never
     /// takes the chain write lock; publish and deliver never touch it.
     pub authn_chain: Arc<broker_auth::AuthnChain>,
+    /// Node authentication cache for `GET
+    /// /api/v5/authentication/node_cache/status` and `POST
+    /// /api/v5/authentication/node_cache/reset` (W2-03): bounded
+    /// per-username record of successful credentialed CONNECTs. The
+    /// routes read one bounded snapshot per request; the kernel CONNECT
+    /// path records one entry per success
+    /// (`crates/broker-node/src/main.rs`, CONNECT handling, plus the
+    /// console CONNECT in `crates/broker-api/src/ws.rs`); publish and
+    /// deliver never touch it.
+    pub authn_node_cache: Arc<broker_auth::NodeAuthCache>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -182,6 +192,11 @@ impl ApiState {
         // consult observe the same order without a restart. An empty
         // snapshot is a no-op (today's empty behaviour).
         let authn_chain = Arc::new(broker_auth::AuthnChain::from_registry(&config));
+        // Boot seeding (W2-03): route the loaded node-cache config into
+        // a shared cache instance so management reads and the CONNECT
+        // recorder observe the same enabled flag and cap without a
+        // restart. Cached entries always start empty (memory-only).
+        let authn_node_cache = Arc::new(broker_auth::NodeAuthCache::from_registry(&config));
         Self {
             engine,
             sessions,
@@ -210,6 +225,7 @@ impl ApiState {
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
             authn_chain,
+            authn_node_cache,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -250,6 +266,7 @@ impl ApiState {
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
             authn_chain: Arc::new(broker_auth::AuthnChain::new()),
+            authn_node_cache: Arc::new(broker_auth::NodeAuthCache::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -4717,6 +4734,80 @@ mod tests {
         assert_eq!(data[0]["id"], json!("password_based:built_in_database"));
         drop(server);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn authn_node_cache_status_reset_round_trip() {
+        // Status over real state plus a reset that actually evicts:
+        // read the documented fields, populate the cache through
+        // authentications through the broker, reset, then read an empty
+        // cache. Management-plane only; publish and deliver never touch
+        // the store.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state
+            .auth
+            .add_user("w2-03-user", b"W2-03-pass!")
+            .expect("test user persists");
+
+        // Empty cache reads as size zero, never an error.
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], json!(true));
+        assert_eq!(body["size"], json!(0));
+        assert_eq!(body["count"], json!(0));
+        assert!(body["max_size"].is_number());
+        assert!(body["max_count"].is_number());
+
+        // Populate through a real credentialed CONNECT through the
+        // broker (console path authenticates against the same store).
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect(
+                "w2-03-cache-1",
+                Some("w2-03-user"),
+                Some(b"W2-03-pass!"),
+            ))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], json!(true));
+        assert_eq!(body["size"], json!(1));
+        assert_eq!(body["count"], json!(1));
+
+        // Unknown query keys are ignored, not a 400.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authentication/node_cache/status?unknown_param=1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["size"], json!(1));
+
+        // Reset evicts; the next read is empty. Resetting again still
+        // succeeds (204).
+        let (status, _) = server
+            .post_auth("/api/v5/authentication/node_cache/reset", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/authentication/node_cache/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["size"], json!(0));
+        assert_eq!(body["count"], json!(0));
+        let (status, _) = server
+            .post_auth("/api/v5/authentication/node_cache/reset", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]

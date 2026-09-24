@@ -488,6 +488,10 @@ async fn handle_packet(
                     send_bin(socket, encode_connack(false, 0x86)).await;
                     return Err(());
                 }
+                // W2-03: record the successful credentialed CONNECT in the
+                // node auth cache (one short lock, CONNECT-only; publish
+                // and deliver never touch this store).
+                state.authn_node_cache.record_success(username);
             }
             // Connection quotas apply to console clients exactly like
             // edge binds (release happens in teardown via unbind). The

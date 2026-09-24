@@ -562,6 +562,61 @@ fn default_authn_enabled() -> bool {
     true
 }
 
+/// Default node authentication cache entry cap (10 000 entries,
+/// LRU-evicted). Reason: the cache is management-plane observability over
+/// CONNECT decisions, so it must stay bounded; 10 000 distinct users cover
+/// ordinary nodes with headroom while keeping the status snapshot cheap
+/// (one short lock, at most the capped small entries).
+pub const DEFAULT_AUTHN_NODE_CACHE_MAX: usize = 10_000;
+/// Upper bound for the node authentication cache cap (1 000 000 entries).
+/// Reason: caps above this would let one node hold unbounded auth state;
+/// larger values are rejected instead of growing without limit.
+pub const MAX_AUTHN_NODE_CACHE_MAX: usize = 1_000_000;
+
+/// Node-level authentication cache configuration. Only the enabled flag
+/// and the entry cap persist via the registry; cached entries themselves
+/// are memory-only and never survive a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthnNodeCacheConf {
+    /// Whether successful CONNECT decisions are recorded (default true).
+    #[serde(default = "default_authn_node_cache_enabled")]
+    pub enabled: bool,
+    /// Entry cap for the node cache (default 10 000, at most 1 000 000).
+    #[serde(default = "default_authn_node_cache_max")]
+    pub max_count: usize,
+}
+
+impl Default for AuthnNodeCacheConf {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_count: DEFAULT_AUTHN_NODE_CACHE_MAX,
+        }
+    }
+}
+
+fn default_authn_node_cache_enabled() -> bool {
+    true
+}
+
+fn default_authn_node_cache_max() -> usize {
+    DEFAULT_AUTHN_NODE_CACHE_MAX
+}
+
+impl AuthnNodeCacheConf {
+    /// Validates the entry cap (finite and non-zero, at most
+    /// [`MAX_AUTHN_NODE_CACHE_MAX`]).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_count == 0 || self.max_count > MAX_AUTHN_NODE_CACHE_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "authn_node_cache.max_count holds {}, must be 1..={} (field `max_count`)",
+                self.max_count, MAX_AUTHN_NODE_CACHE_MAX
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Root: ordered authenticator chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AuthnChainConf {
@@ -642,6 +697,8 @@ pub struct FullSnapshot {
     pub connectors: ConnectorsConf,
     #[serde(default)]
     pub authn_chain: AuthnChainConf,
+    #[serde(default)]
+    pub authn_node_cache: AuthnNodeCacheConf,
 }
 
 impl FullSnapshot {
@@ -652,6 +709,7 @@ impl FullSnapshot {
         self.rules.validate()?;
         self.connectors.validate()?;
         self.authn_chain.validate()?;
+        self.authn_node_cache.validate()?;
         Ok(())
     }
 }
@@ -669,6 +727,8 @@ pub enum ConfigRoot {
     Connectors(ConnectorsConf),
     /// Validated authenticator-chain root.
     AuthnChain(AuthnChainConf),
+    /// Validated node authentication cache config root.
+    AuthnNodeCache(AuthnNodeCacheConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -750,6 +810,7 @@ impl ConfigRegistry {
             ConfigRoot::Rules(conf) => self.commit_rules(conf),
             ConfigRoot::Connectors(conf) => self.commit_connectors(conf),
             ConfigRoot::AuthnChain(conf) => self.commit_authn_chain(conf),
+            ConfigRoot::AuthnNodeCache(conf) => self.commit_authn_node_cache(conf),
         }
     }
 
@@ -803,6 +864,17 @@ impl ConfigRegistry {
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.authn_chain = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Commits a validated node authentication cache config root.
+    pub fn commit_authn_node_cache(&self, conf: AuthnNodeCacheConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.authn_node_cache = conf.clone();
             next
         });
         Ok(())
@@ -914,6 +986,7 @@ mod tests {
                 }],
             },
             authn_chain: AuthnChainConf::default(),
+            authn_node_cache: AuthnNodeCacheConf::default(),
         }
     }
 

@@ -2,6 +2,7 @@
 
 pub mod alarms;
 pub mod auth;
+pub mod authn_cache;
 pub mod authn_chain;
 pub mod auto_subscribe;
 pub mod banned;
@@ -54,6 +55,17 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/authentication",
             get(authn_chain::list_authn_chain).post(authn_chain::create_authn_chain),
+        )
+        // Authentication (AuthN) node cache: status read plus reset that
+        // actually evicts entries. Management-plane only; the CONNECT
+        // path records successes, publish and deliver never touch it.
+        .route(
+            "/authentication/node_cache/status",
+            get(authn_cache::node_cache_status),
+        )
+        .route(
+            "/authentication/node_cache/reset",
+            post(authn_cache::node_cache_reset),
         )
         // Authentication (AuthN) built-in-database users
         .route(

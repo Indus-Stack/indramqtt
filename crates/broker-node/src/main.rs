@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use broker_auth::{
     Authenticator, AuthnChain, Authorizer, KerberosAuthenticator, KerberosConfig,
-    LdapAuthenticator, LdapConfig, MemoryAuth,
+    LdapAuthenticator, LdapConfig, MemoryAuth, NodeAuthCache,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
@@ -628,6 +628,12 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
                 if !shared.sessions.acquire_connection_slot(username, max) {
                     return Some(session_binding_reply(frame, 0, false, 0x8B, alias_max));
                 }
+            }
+            // W2-03: record the successful credentialed CONNECT in the
+            // node auth cache (one short lock, CONNECT-only; publish and
+            // deliver never touch this store).
+            if let Some(username) = &effective_username {
+                shared.authn_node_cache.record_success(username);
             }
         }
     }
@@ -1401,6 +1407,14 @@ struct Shared {
     /// lock-free snapshot per connect and never takes the chain write
     /// lock; publish and deliver never touch it.
     authn_chain: Arc<AuthnChain>,
+    /// Node authentication cache for W2-03: bounded per-username record
+    /// of successful credentialed CONNECTs, shared with the management
+    /// API so status reads and resets observe the same entries without
+    /// a restart. One `Arc` clone at boot; CONNECT records one entry
+    /// per success under a short lock; publish and deliver never touch
+    /// it. Entries are memory-only; the enabled flag and cap persist
+    /// via the config registry.
+    authn_node_cache: Arc<NodeAuthCache>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -1595,6 +1609,7 @@ impl Shared {
             readiness,
             auth: Arc::new(MemoryAuth::new()),
             authn_chain: Arc::new(AuthnChain::new()),
+            authn_node_cache: Arc::new(NodeAuthCache::new()),
             ldap: None,
             kerberos: None,
             allow_anonymous: false,
@@ -4749,6 +4764,14 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // it. Seeding already ran inside `ApiState::new`; sharing replaces
     // that fresh instance with the kernel's so no second copy diverges.
     state.authn_chain = shared.authn_chain.clone();
+    // Share the node auth cache (W2-03) so validated CONNECT records and
+    // management status/reset observe the same entries without a restart.
+    // One `Arc` clone; CONNECT takes one short lock per credentialed
+    // success, management takes one short lock per request; publish and
+    // deliver never touch it. Seeding already ran inside `ApiState::new`;
+    // sharing replaces that fresh instance with the kernel's so no
+    // second copy diverges.
+    state.authn_node_cache = shared.authn_node_cache.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -4890,6 +4913,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // consult enforces the persisted chain from the first connection.
     // An empty snapshot is a no-op (today's empty behaviour).
     shared.authn_chain.seed_from_registry(&shared.config);
+    // Node auth cache config (W2-03): seed the shared cache in place
+    // (the same instance `serve_api` shares with `ApiState`), so
+    // management reads observe the persisted enabled flag and cap from
+    // the first connection. Entries always start empty (memory-only).
+    shared.authn_node_cache.seed_from_registry(&shared.config);
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.
