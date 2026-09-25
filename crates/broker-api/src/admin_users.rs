@@ -342,6 +342,48 @@ impl AdminUsers {
         self.persist()
     }
 
+    /// Replace `role` and/or `description` of one user atomically: one
+    /// map write lock, one registry persist. `None` leaves that field
+    /// untouched. Validation of the values happens in the handler; this
+    /// only refuses the unknown user and the demotion of the last
+    /// administrator, so a validated update applies fully or not at all.
+    /// Management-plane only: publish and deliver never touch this map.
+    pub fn update(
+        &self,
+        username: &str,
+        role: Option<AdminRole>,
+        description: Option<&str>,
+    ) -> Result<(), AdminUserError> {
+        {
+            let mut users = self.users.write().unwrap();
+            if !users.contains_key(username) {
+                return Err(AdminUserError::NotFound);
+            }
+            if let Some(role) = role {
+                let current = users.get(username).ok_or(AdminUserError::NotFound)?;
+                if current.role == AdminRole::Administrator
+                    && role == AdminRole::Viewer
+                    && users
+                        .values()
+                        .filter(|u| u.role == AdminRole::Administrator)
+                        .count()
+                        == 1
+                {
+                    return Err(AdminUserError::LastAdministrator);
+                }
+            }
+            if let Some(user) = users.get_mut(username) {
+                if let Some(role) = role {
+                    user.role = role;
+                }
+                if let Some(description) = description {
+                    user.description = description.to_string();
+                }
+            }
+        }
+        self.persist()
+    }
+
     pub fn change_password(
         &self,
         username: &str,

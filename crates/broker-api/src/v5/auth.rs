@@ -943,41 +943,111 @@ fn parse_dashboard_user_body(
     ))
 }
 
-#[derive(Deserialize)]
-pub struct UpdateUserReq {
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
+/// `PUT /users/{username}`: replace one dashboard user's `role` and/or
+/// `description` (C05-28).
+///
+/// The body must be a JSON object; `role` (`administrator` or `viewer`)
+/// and `description` (string) are optional when present, and a bad value
+/// for either fails with `BAD_REQUEST` in the documented `{code, message}`
+/// shape while applying nothing (validate-all-before-apply: the whole
+/// body is checked before the store is touched). Credential fields
+/// (`password`, `old_pwd`, `new_pwd`) are never accepted here — they
+/// fail with `BAD_REQUEST` and change nothing; password rotation stays
+/// on the change-password route. Unknown usernames fail with `NOT_FOUND`
+/// (404, documented shape) and create nothing. The route is not paged.
+/// On success answers 200 with the stored
+/// `username`/`role`/`description` (never the password or its hash). The
+/// write persists across a restart through the config registry
+/// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users`).
+/// Management-plane only: one short user-map write lock per request
+/// (plus the registry save lock on persist); the login path keeps
+/// reading under short read locks and publish/deliver never touch this
+/// store. The map is bounded by [`crate::admin_users::MAX_ADMIN_USERS`]
+/// entries; an update never grows it, so the cap needs no new check on
+/// this path.
+// TODO(parity): is an unknown username with an invalid body a 404 or a
+// 400? The rulebook does not decide the ordering; the current choice
+// validates the body first (400) and checks existence second (404), so a
+// doubly-bad request reports the validation failure while creating
+// nothing, until the checker pins it.
+// TODO(parity): which credential-adjacent keys beyond
+// `password`/`old_pwd`/`new_pwd` does the documented update refuse? The
+// rulebook does not decide the exact rejected set; the current choice
+// refuses those three fail-closed (they are the only credential fields
+// this broker tracks) and ignores other unknown fields the way create
+// does, until the checker pins it.
+// TODO(parity): does the documented update vocabulary include per-user
+// scopes beyond `role`/`description`? The rulebook does not decide the
+// exact row shape and the broker tracks no per-user scope list on this
+// path, so the current choice omits scopes (never a constant standing
+// in for a measurement) until the checker pins them.
 pub async fn update_user(
     State(state): State<ApiState>,
     Path(username): Path<String>,
-    Json(req): Json<UpdateUserReq>,
+    body: Bytes,
 ) -> Response {
-    if let Some(raw) = req.role.as_deref() {
-        let role = match parse_role(raw) {
-            Some(role) => role,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "code": "BAD_REQUEST",
-                        "message": "role must be administrator or viewer"
-                    })),
-                )
-                    .into_response();
-            }
-        };
-        if let Err(error) = state.admin_users.set_role(&username, role) {
-            return admin_error(error);
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid user body: {error}")).into_response();
+        }
+    };
+    let obj = match value.as_object() {
+        Some(obj) => obj,
+        None => {
+            return ApiError::BadRequest("user body must be a JSON object".to_string())
+                .into_response();
+        }
+    };
+    for key in ["password", "old_pwd", "new_pwd"] {
+        if obj.contains_key(key) {
+            return ApiError::BadRequest(format!(
+                "field `{key}` is not accepted here; use the password route"
+            ))
+            .into_response();
         }
     }
-    if let Some(description) = req.description.as_deref() {
-        if let Err(error) = state.admin_users.set_description(&username, description) {
-            return admin_error(error);
+    let role = match obj.get("role") {
+        None => None,
+        Some(raw) => {
+            let text = match raw.as_str() {
+                Some(text) => text,
+                None => {
+                    return ApiError::BadRequest(
+                        "role must be administrator or viewer".to_string(),
+                    )
+                    .into_response();
+                }
+            };
+            match parse_role(text) {
+                Some(role) => Some(role),
+                None => {
+                    return ApiError::BadRequest(
+                        "role must be administrator or viewer".to_string(),
+                    )
+                    .into_response();
+                }
+            }
         }
+    };
+    let description = match obj.get("description") {
+        None => None,
+        Some(raw) => match raw.as_str() {
+            Some(text) => Some(text.to_string()),
+            None => {
+                return ApiError::BadRequest("field `description` must be a string".to_string())
+                    .into_response();
+            }
+        },
+    };
+    if state.admin_users.get(&username).is_none() {
+        return admin_error(AdminUserError::NotFound);
+    }
+    if let Err(error) = state
+        .admin_users
+        .update(&username, role, description.as_deref())
+    {
+        return admin_error(error);
     }
     match state.admin_users.get(&username) {
         Some(view) => (
@@ -2685,6 +2755,213 @@ mod dashboard_users_tests {
             .iter()
             .any(|u| u.username == "w241-kept");
         assert!(found, "user persists across a restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_replaces_fields_with_404_and_400_corners() {
+        // W2-42 failing test: create a user, update role/description and
+        // read back; update an unknown username expecting 404 without
+        // creating it; submit invalid bodies expecting 400 with the
+        // documented shape while applying nothing. Before: malformed and
+        // mistyped bodies answered with the extractor's status instead of
+        // the documented client error, and credential fields were silently
+        // ignored instead of rejected.
+        // Management-plane only: the handler takes one short user-map
+        // write lock per update (plus the registry save lock on persist);
+        // publish/deliver never touch this store.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w242-upd",
+                    "password": "UpdSecret1!",
+                    "role": "viewer",
+                    "description": "before",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Round trip: replace role and description, read back via the store.
+        let (status, updated, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                body(serde_json::json!({
+                    "role": "administrator",
+                    "description": "after",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["username"], serde_json::json!("w242-upd"));
+        assert_eq!(updated["role"], serde_json::json!("administrator"));
+        assert_eq!(updated["description"], serde_json::json!("after"));
+        assert!(updated.get("password").is_none());
+        let view = state
+            .admin_users
+            .get("w242-upd")
+            .expect("updated user reads back");
+        assert_eq!(view.role, AdminRole::Administrator);
+        assert_eq!(view.description, "after");
+
+        // The broker login path still verifies the untouched credential,
+        // and the issued token resolves through the middleware resolver.
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w242-upd",
+                    "password": "UpdSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = logged_in["token"]
+            .as_str()
+            .expect("login issues a token")
+            .to_string();
+        assert!(
+            resolve_bearer(&state, &token).is_some(),
+            "updated user still authorises management calls"
+        );
+
+        // Unknown usernames are 404 with the documented shape and create
+        // nothing.
+        let (status, missing, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-ghost".to_string()),
+                body(serde_json::json!({"description": "nope"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(missing.get("message").is_some());
+        assert!(
+            state.admin_users.get("w242-ghost").is_none(),
+            "unknown update creates nothing"
+        );
+
+        // Invalid role is 400 with the documented shape and applies nothing.
+        let (status, bad_role, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                body(serde_json::json!({"role": "bogus-role"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_role["code"], serde_json::json!("BAD_REQUEST"));
+        let kept = state
+            .admin_users
+            .get("w242-upd")
+            .expect("user still present");
+        assert_eq!(kept.role, AdminRole::Administrator);
+        assert_eq!(kept.description, "after");
+
+        // Credential fields are never accepted here: 400, password unchanged.
+        let (status, bad_pw, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                body(serde_json::json!({"password": "NewSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_pw["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(
+            state.admin_users.verify_password("w242-upd", "UpdSecret1!"),
+            "rejected password field changes nothing"
+        );
+        assert!(
+            !state.admin_users.verify_password("w242-upd", "NewSecret1!"),
+            "rejected password never takes effect"
+        );
+
+        // Mistyped description is 400 with the documented shape.
+        let (status, bad_desc, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                body(serde_json::json!({"description": 123})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_desc["code"], serde_json::json!("BAD_REQUEST"));
+
+        // Malformed JSON is 400 with the documented shape.
+        let (status, malformed, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w242-upd".to_string()),
+                Bytes::from_static(b"{oops"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(malformed["code"], serde_json::json!("BAD_REQUEST"));
+
+        // Persistence rides the config registry: a registry-backed update
+        // still reads back after a reload, so the record survives a kernel
+        // restart.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-w242-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("scratch registry loads"),
+        );
+        let durable = crate::admin_users::AdminUsers::from_registry(&registry);
+        durable
+            .create(
+                "w242-kept",
+                "KeptSecret1!",
+                AdminRole::Viewer,
+                "before restart",
+            )
+            .expect("registry-backed create persists");
+        durable
+            .update(
+                "w242-kept",
+                Some(AdminRole::Administrator),
+                Some("after restart"),
+            )
+            .expect("registry-backed update persists");
+        drop(durable);
+        let reloaded =
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart");
+        let kept = reloaded
+            .snapshot()
+            .admin_users
+            .users
+            .iter()
+            .find(|u| u.username == "w242-kept")
+            .expect("updated user persists across a restart")
+            .clone();
+        assert_eq!(kept.role, "administrator");
+        assert_eq!(kept.description, "after restart");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
