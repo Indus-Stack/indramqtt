@@ -551,10 +551,42 @@ pub async fn direct_login(State(state): State<ApiState>, body: Bytes) -> Respons
         .into_response()
 }
 
+/// `POST /logout`: revoke the caller's live bearer token.
+///
+/// The bearer token from `Authorization: Bearer <token>` is looked up in
+/// the bounded live-token map (`MAX_LIVE_TOKENS`, `TOKEN_TTL` from the
+/// login task); a live entry is removed and the call answers 204 with no
+/// body. A missing header, an unknown token, an expired token, or a token
+/// whose user was deleted is a client error: 401 with the documented
+/// `{code, message}` shape, never success. Revoked entries are removed,
+/// not retained, so logout never grows the map toward its cap. The route
+/// is not paged and takes no parameters; any body or query is ignored.
+/// Management-plane only: one short token-map lock per call (plus the
+/// admin-user read inside the liveness check); publish and deliver never
+/// touch either store.
+// TODO(parity): is the documented failure code for a missing or
+// already-revoked logout token `UNAUTHORIZED` or a dedicated code? The
+// rulebook does not decide the exact code name; the current choice keeps
+// `UNAUTHORIZED` (401, documented `{code, message}` shape, matching the
+// auth middleware) until the checker pins it.
+// TODO(parity): does the documented logout require a username body that
+// must match the token owner, or is the bearer token alone sufficient?
+// The rulebook does not decide the body contract; the current choice
+// revokes by bearer alone and ignores any body until the checker pins it.
 pub async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    if let Some(token) = bearer_token_from_credentials(&headers) {
-        state.tokens.revoke(&token);
+    let Some(token) = bearer_token_from_credentials(&headers) else {
+        return ApiError::Unauthorized("missing or invalid credentials".to_string())
+            .into_response();
+    };
+    // Liveness check through the same resolver the middleware uses:
+    // unknown, expired, or deleted-user tokens are already gone (expired
+    // entries removed, deleted-user tokens revoked) and must not report
+    // success.
+    if resolve_bearer(&state, &token).is_none() {
+        return ApiError::Unauthorized("missing or invalid credentials".to_string())
+            .into_response();
     }
+    state.tokens.revoke(&token);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1946,5 +1978,88 @@ mod login_token_tests {
             remaining > TOKEN_TTL - Duration::from_secs(100),
             "remaining TTL {remaining:?} must sit at the documented {TOKEN_TTL:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod logout_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("header value"),
+        );
+        headers
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_live_token_and_rejects_reuse_and_missing() {
+        // Before the fix the handler revoked when a bearer token was
+        // present but still answered 204 when it was missing or unknown:
+        // a second logout with the same token reported success.
+        let state = standalone_state();
+        let token = state.tokens.issue("admin", AdminRole::Administrator);
+
+        // Live token: 204 with an empty body, entry removed not retained.
+        let (status, body, raw) =
+            parts(logout(State(state.clone()), bearer_headers(&token)).await).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "success is 204 with no body");
+        assert_eq!(body, serde_json::Value::Null);
+        assert!(
+            state.tokens.lookup(&token).is_none(),
+            "logout must remove the entry, not retain it"
+        );
+
+        // Already-revoked token: client error, never success.
+        let (status, body, _) =
+            parts(logout(State(state.clone()), bearer_headers(&token)).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
+        assert!(body.get("message").is_some());
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+
+        // Unknown token: same client error.
+        let (status, body, _) = parts(
+            logout(
+                State(state.clone()),
+                bearer_headers("indra_garbage-token-that-was-never-issued"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+
+        // Missing header: same client error, never success.
+        let (status, body, _) = parts(logout(State(state.clone()), HeaderMap::new()).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
     }
 }

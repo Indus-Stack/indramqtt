@@ -4449,6 +4449,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logout_revokes_and_rejects_reuse_and_missing() {
+        // Broker-through logout (C05-09): log in, call an authorized
+        // route, log out, then retry the same route with the old token.
+        // Before the fix the second logout still reported success; now a
+        // missing or already-revoked token is a client error, never 204.
+        // Writes to the bounded live-token map in `v5/auth.rs`
+        // (`ApiTokens::issue` on login, `ApiTokens::revoke` on logout);
+        // revoked entries are removed, not retained. Driven by the login
+        // POST, the authorized GET, and the logout POST management calls.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let live_before = state.tokens.len();
+
+        // The fresh token authorizes a management call.
+        let (status, _) = server.get_auth("/api/v5/current_user", &token).await;
+        assert_eq!(status, 200);
+
+        // Logout revokes it: 204 with an empty body.
+        let (status, body) = server
+            .send("POST", "/api/v5/logout", None, Some(&token))
+            .await;
+        assert_eq!(status, 204);
+        assert_eq!(body, serde_json::Value::Null);
+        assert!(
+            state.tokens.lookup(&token).is_none(),
+            "logout must remove the entry, not retain it"
+        );
+        assert_eq!(
+            state.tokens.len(),
+            live_before - 1,
+            "logout must shrink the live-token map"
+        );
+
+        // Reuse of the old token is rejected with the documented shape.
+        let (status, body) = server.get_auth("/api/v5/current_user", &token).await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+        assert!(body.get("message").is_some());
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+
+        // A second logout with the already-revoked token is a client
+        // error, not success.
+        let (status, body) = server
+            .send("POST", "/api/v5/logout", None, Some(&token))
+            .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+
+        // A logout with no token at all is a client error, not success.
+        let (status, body) = server.send("POST", "/api/v5/logout", None, None).await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+    }
+
+    #[tokio::test]
     async fn scram_login_end_to_end() {
         let (server, _state) = TestServer::start().await;
         let client_nonce = "testclientnonce123";
