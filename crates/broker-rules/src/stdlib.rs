@@ -630,6 +630,25 @@ fn func_contains_topic_match(args: &[Value]) -> Value {
     Value::Bool(false)
 }
 
+fn func_topic_match(args: &[Value]) -> Value {
+    if args.len() != 2 {
+        return Value::Null;
+    }
+    let Value::String(topic) = &args[0] else {
+        return Value::Null;
+    };
+    let Value::String(filter) = &args[1] else {
+        return Value::Null;
+    };
+    let Ok(filter) = broker_protocol::TopicFilter::new(filter) else {
+        return Value::Null;
+    };
+    let Ok(topic) = broker_protocol::Topic::new(topic) else {
+        return Value::Null;
+    };
+    Value::Bool(filter.matches(&topic))
+}
+
 fn func_null(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::Null;
@@ -3254,6 +3273,7 @@ pub fn ensure_stdlib_registered() {
         add("payload", func_payload);
         add("contains_topic", func_contains_topic);
         add("contains_topic_match", func_contains_topic_match);
+        add("topic_match", func_topic_match);
         add("null", func_null);
         add("coalesce_ne", func_coalesce_ne);
         add("div", func_div);
