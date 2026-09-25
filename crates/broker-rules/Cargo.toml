@@ -13,7 +13,9 @@ broker-observability = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
-rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git" }
+rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "da6aa63eda45ef87161d7f1e8ab91cb9ea0ab30f" }
+# Pinned to the revision the tree is tested with today (RQ-01); moving to a
+# newer revision is a separate, reviewed task.
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
