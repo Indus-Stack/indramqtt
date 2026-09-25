@@ -10555,22 +10555,35 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn ui_schema_unknown_is_404() {
+        // Named dashboard objects (C05-10, W2-31): known names return the
+        // named-object envelope, never the UI-form variant; unknown names
+        // are 404 with `{code, message}`. Goes through the broker API
+        // server (authenticated request), not only the store.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        let (status, _) = server.get_auth("/api/v5/schemas/hotconf", &token).await;
-        assert_eq!(status, 404, "unserved schema must be 404");
-        let (status, _) = server.get_auth("/api/v5/schemas/sources", &token).await;
+        let (status, body) = server.get_auth("/api/v5/schemas/sources", &token).await;
         assert_eq!(status, 404, "sources alias must be 404");
-        for name in ["actions", "connectors"] {
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(body["message"].is_string());
+        for name in ["actions", "connectors", "hotconf"] {
             let (status, body) = server
                 .get_auth(&format!("/api/v5/schemas/{name}"), &token)
                 .await;
             assert_eq!(status, 200, "served schema {name} must be 200");
-            assert!(body["components"]["schemas"].is_object());
+            assert_eq!(body["name"], json!(name));
+            assert!(body["schema"].is_object());
+            assert!(
+                body.get("components").is_none(),
+                "must not return the UI-form variant for {name}"
+            );
         }
+        // Hot-config alias resolves to the same canonical object.
+        let (status, body) = server.get_auth("/api/v5/schemas/hot-config", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["name"], json!("hotconf"));
         let (status, body) = server.get_auth("/api/v5/schemas", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!(["actions", "connectors"]));
+        assert_eq!(body, json!(["hotconf", "actions", "connectors"]));
     }
 
     #[tokio::test]

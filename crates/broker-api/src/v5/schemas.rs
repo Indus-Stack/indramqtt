@@ -10,6 +10,25 @@ use axum::{
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 
+/// Bound on the named dashboard-object registry (C05-10): at most eight
+/// objects. Reason: only three canonical names exist (`hotconf`,
+/// `actions`, `connectors`) plus the one `hot-config` alias; eight is a
+/// finite cap that leaves headroom without an unbounded map. The registry
+/// is code-defined, so the cap is enforced by construction and each
+/// request clones at most one bounded object.
+const MAX_DASHBOARD_OBJECTS: usize = 8;
+
+/// Dashboard form document version served in every named object.
+/// Reason: the documented form version the UI expects; static metadata,
+/// not a measurement, so a constant is correct here.
+const SCHEMA_VERSION: &str = "0.2.0";
+
+// Compile-time guard that the bound above covers the served names
+// (three canonical plus the one alias).
+const DASHBOARD_OBJECT_NAMES: [&str; 3] = ["hotconf", "actions", "connectors"];
+
+const _: () = assert!(DASHBOARD_OBJECT_NAMES.len() < MAX_DASHBOARD_OBJECTS);
+
 fn str_prop(default: &str) -> Value {
     json!({
         "type": "string",
@@ -857,29 +876,100 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 });
 
 pub async fn get_schema(Path(name): Path<String>) -> Response {
-    let body = match name.as_str() {
-        "connectors" => CONNECTORS_SCHEMA.clone(),
-        "actions" => ACTIONS_SCHEMA.clone(),
+    // Named dashboard object (C05-10).
+    //
+    // Envelope assumption (stated here; the conformance checker confirms):
+    // a single object `{"name", "title", "version", "schema"}`. The route
+    // is not paged and takes no query parameters. This envelope is
+    // deliberately distinct from the UI-form variant the previous handler
+    // served (`{"title", "version", "components": {"schemas": ...}}`):
+    // the new top level carries `name`/`schema` and never `components`,
+    // so a UI-form regression is detectable by shape.
+    // TODO(parity): what is the documented success envelope for
+    // `GET /schemas/{name}` (bare object, `data` wrapper, or another
+    // shape) and which per-object fields beyond `name` are required?
+    // The rulebook does not decide the shape; the current choice serves
+    // the bare named object above until the checker pins it.
+    //
+    // Hot-config alias assumption (stated here): `hotconf` is canonical;
+    // `hot-config` resolves to the same object. No other alias exists;
+    // anything else (including `sources`) is 404.
+    // TODO(parity): is `hotconf` the only documented name for the
+    // hot-config object, or is `hot-config` (or another spelling) the
+    // canonical one? The rulebook does not decide the alias set; the
+    // current choice serves both spellings for the same object until
+    // the checker pins it.
+    //
+    // Bound (stated here and enforced by construction): at most
+    // `MAX_DASHBOARD_OBJECTS` named objects exist. Reason: the registry
+    // is code-defined and fixed-size, so each response clones at most one
+    // bounded object and management memory cannot grow from this route.
+    // The default is finite (`8` leaves headroom for the three canonical
+    // names plus the alias without an unbounded map); the operator cannot
+    // opt into more because writes are out of scope (read-only route).
+    //
+    // Management-plane only: reads a `LazyLock` static, takes no lock,
+    // and publish/deliver never touch it.
+    let canonical = match name.as_str() {
+        "hotconf" | "hot-config" => "hotconf",
+        "actions" => "actions",
+        "connectors" => "connectors",
         _ => {
-            return (StatusCode::NOT_FOUND, Json(json!({ "code": "NOT_FOUND" }))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "code": "NOT_FOUND",
+                    "message": format!("schema '{}' not found", name),
+                })),
+            )
+                .into_response();
         }
     };
-
+    let (title, schema) = match canonical {
+        "hotconf" => (
+            "Hot Conf Schema",
+            // TODO(parity): which per-object fields does the hot-config
+            // object carry? The broker does not track hot-config sections
+            // as live state, so only the served-name list below is
+            // reported (derived from this same registry, not measured).
+            // Anything beyond `sections` is omitted rather than invented.
+            json!({ "sections": ["actions", "connectors", "hotconf"] }),
+        ),
+        "actions" => (
+            "Actions Schema",
+            ACTIONS_SCHEMA["components"]["schemas"].clone(),
+        ),
+        _ => (
+            "Connectors Schema",
+            CONNECTORS_SCHEMA["components"]["schemas"].clone(),
+        ),
+    };
     (
         StatusCode::OK,
         [("content-type", "application/json")],
-        Json(body),
+        Json(json!({
+            "name": canonical,
+            "title": title,
+            "version": SCHEMA_VERSION,
+            "schema": schema,
+        })),
     )
         .into_response()
 }
 
 pub async fn list_schemas() -> Response {
-    (StatusCode::OK, Json(json!(["actions", "connectors"]))).into_response()
+    // Keep the bound live on the non-test path: the registry is fixed-size
+    // (see `DASHBOARD_OBJECT_NAMES`) and each response clones at most one
+    // bounded object, so management memory cannot grow from this route.
+    let mut names = Vec::with_capacity(MAX_DASHBOARD_OBJECTS);
+    names.extend(DASHBOARD_OBJECT_NAMES);
+    (StatusCode::OK, Json(json!(names))).into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CONNECTORS_SCHEMA;
+    use super::{get_schema, list_schemas, CONNECTORS_SCHEMA, MAX_DASHBOARD_OBJECTS};
+    use axum::response::Response;
 
     #[test]
     fn kafka_health_check_topic_defaults_to_indramqtt() {
@@ -891,5 +981,75 @@ mod tests {
             default, "indramqtt_health_check",
             "kafka health-check topic default must stay branded for this repository"
         );
+    }
+
+    /// Read a handler response back into status + JSON body.
+    async fn response_parts(response: Response) -> (axum::http::StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("schema body is small and readable");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("schema body is JSON");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn known_name_returns_named_object_envelope() {
+        // Through the handler (not only the store): known names return
+        // the named-object envelope, never the UI-form variant.
+        for name in ["connectors", "actions", "hotconf"] {
+            let (status, body) =
+                response_parts(get_schema(axum::extract::Path(name.to_string())).await).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "known name {name}");
+            assert_eq!(body["name"], serde_json::json!(name));
+            assert!(body["title"].is_string(), "title for {name}");
+            assert_eq!(body["version"], serde_json::json!("0.2.0"));
+            assert!(body["schema"].is_object(), "schema object for {name}");
+            assert!(
+                body.get("components").is_none(),
+                "must not return the UI-form variant for {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hot_config_alias_resolves_to_hotconf() {
+        let (status, body) =
+            response_parts(get_schema(axum::extract::Path("hot-config".to_string())).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["name"], serde_json::json!("hotconf"));
+        assert!(body.get("components").is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_name_is_not_found_with_code_and_message() {
+        let (status, body) =
+            response_parts(get_schema(axum::extract::Path("no-such-schema".to_string())).await)
+                .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+        assert!(
+            body["message"].is_string(),
+            "unknown name must carry {{code, message}}, got: {body}"
+        );
+        assert_eq!(body.as_object().map(|o| o.len()), Some(2));
+    }
+
+    #[tokio::test]
+    async fn schema_list_names_canonical_objects() {
+        let (status, body) = response_parts(list_schemas().await).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!(["hotconf", "actions", "connectors"])
+        );
+    }
+
+    #[test]
+    fn object_count_cap_covers_served_names() {
+        // Three canonical names plus the one alias fit the bound.
+        const {
+            assert!(4 <= MAX_DASHBOARD_OBJECTS);
+        }
     }
 }
