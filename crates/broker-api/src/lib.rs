@@ -10213,6 +10213,96 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn user_scopes_catalogue_is_stable_and_unpaged() {
+        // W2-40 failing test: fetch the dashboard-user scope catalogue
+        // expecting the documented names with per-scope fields, matching
+        // what the dashboard-user validation accepts, stable across two
+        // reads. Before: a constant string list detached from validation
+        // (wrong vocabulary, no fields, no shared registry).
+        // Broker-through: both reads go through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), not only
+        // through the store; the catalogue itself is code-defined
+        // (`crates/broker-api/src/v5/auth.rs`, `USER_SCOPES`), shared
+        // with the dashboard-user validation predicates
+        // (`is_known_user_scope`, `role_may_hold_scope`), with no broker
+        // event driving it beyond serving the management read.
+        // Management-plane only; publish and deliver never touch it.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, first) = server.get_auth("/api/v5/user_scopes", &token).await;
+        assert_eq!(status, 200);
+        let scopes = first["scopes"].as_array().expect("scopes is a list");
+        assert_eq!(scopes.len(), 14);
+        let names: Vec<&str> = scopes
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("entry has a name"))
+            .collect();
+        for entry in scopes {
+            assert!(entry["name"].is_string(), "entry carries a name");
+            assert!(entry["desc"].is_string(), "entry carries a summary");
+            assert!(
+                entry["admin_only"].is_boolean(),
+                "entry carries its administrator-only flag"
+            );
+        }
+        for documented in [
+            "connections",
+            "publish",
+            "data_integration",
+            "access_control",
+            "gateways",
+            "monitoring",
+            "cluster_operations",
+            "system",
+            "audit",
+            "license",
+            "user_management",
+            "mfa_management",
+            "sso_management",
+            "api_key_management",
+        ] {
+            assert!(
+                names.contains(&documented),
+                "catalogue must contain {documented}"
+            );
+        }
+        // The login-only scopes are flagged administrator-only; the
+        // generic scopes are not.
+        for entry in scopes {
+            let name = entry["name"].as_str().expect("entry has a name");
+            let admin_only = entry["admin_only"].as_bool().expect("flag is a bool");
+            let expect_admin_only = matches!(
+                name,
+                "user_management" | "mfa_management" | "sso_management" | "api_key_management"
+            );
+            assert_eq!(
+                admin_only, expect_admin_only,
+                "scope {name} carries the documented administrator-only flag"
+            );
+        }
+
+        // Stable across two reads.
+        let (status, second) = server.get_auth("/api/v5/user_scopes", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(first, second);
+
+        // Not paged and takes no parameters: unknown query parameters
+        // are ignored, not errors.
+        let (status, tolerated) = server
+            .send(
+                "GET",
+                "/api/v5/user_scopes?unexpected_param=1&page=2&limit=1",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(tolerated, first);
+    }
+
+    #[tokio::test]
     async fn removed_cluster_inflight_routes_return_404() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;

@@ -614,22 +614,165 @@ pub async fn current_user(
         .into_response()
 }
 
+/// One entry of the fixed dashboard-user scope catalogue: the stable
+/// scope name, a short operator-facing summary, and whether only the
+/// administrator role may hold it.
+struct UserScopeEntry {
+    name: &'static str,
+    desc: &'static str,
+    admin_only: bool,
+}
+
+/// Fixed catalogue of scopes a dashboard login user may hold (C05-24).
+///
+/// Bound (stated here and enforced by construction): exactly fourteen
+/// entries, no growth; the list lives in code, so there is no
+/// persistence beyond it and no per-request growth. Each summary is a
+/// short static string, so serving the catalogue allocates only the
+/// small bounded response body once per request.
+///
+/// The first ten are the generic scopes shared with API keys (held by
+/// either role); the last four are login-only scopes restricted to the
+/// administrator role. This is the single registry the dashboard-user
+/// scope validation shares with the catalogue route:
+/// [`is_known_user_scope`] and [`role_may_hold_scope`] consult this
+/// same list. Vocabulary enforcement on the user write paths (rejecting
+/// unknown names, refusing non-administrators the login-only scopes)
+/// is owned by the admin-users lane; the catalogue route serves the
+/// list verbatim regardless of which scopes any stored user holds.
+// TODO(parity): what are the exact operator-facing summaries per
+// scope? The rulebook does not decide the wording; the current choice
+// describes each scope's area in our own words and keeps the stable
+// scope names (protocol values) exact until the checker pins them.
+// TODO(parity): does the documented user create/update reject scope
+// lists that mix administrator-equivalent scopes with restricted ones,
+// or only enforce the per-scope administrator-only flag? The rulebook
+// does not decide the combination rule; the current choice records the
+// per-scope flag in the catalogue and checks only per-scope role
+// compatibility (`role_may_hold_scope`), leaving combination refusal
+// to the write-path lane until the checker pins it.
+const USER_SCOPES: [UserScopeEntry; 14] = [
+    UserScopeEntry {
+        name: "connections",
+        desc: "View and manage client connections, subscriptions and topics",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "publish",
+        desc: "Publish messages through the management API",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "data_integration",
+        desc: "Manage rules, connectors and data integrations",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "access_control",
+        desc: "Manage client authentication and authorization settings",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "gateways",
+        desc: "Manage protocol gateways and their clients",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "monitoring",
+        desc: "Read metrics, alarms, traces and monitoring data",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "cluster_operations",
+        desc: "Manage cluster membership and node operations",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "system",
+        desc: "Manage core configuration, listeners and system settings",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "audit",
+        desc: "Query the audit log",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "license",
+        desc: "Manage licence installation and status",
+        admin_only: false,
+    },
+    UserScopeEntry {
+        name: "user_management",
+        desc: "Manage dashboard users and their scopes",
+        admin_only: true,
+    },
+    UserScopeEntry {
+        name: "mfa_management",
+        desc: "Manage other users' multi-factor authentication",
+        admin_only: true,
+    },
+    UserScopeEntry {
+        name: "sso_management",
+        desc: "Manage single sign-on backends and settings",
+        admin_only: true,
+    },
+    UserScopeEntry {
+        name: "api_key_management",
+        desc: "Manage API keys and their scopes",
+        admin_only: true,
+    },
+];
+
+/// Whether `name` is one of the catalogue scopes a dashboard login
+/// user may hold.
+///
+/// Shared by the dashboard-user create/update validation path and the
+/// catalogue route so both read the same registry. Advisory for now:
+/// enforcement stays with the admin-users write-path lane (see the
+/// module TODO); the catalogue route serves this list regardless.
+pub fn is_known_user_scope(name: &str) -> bool {
+    USER_SCOPES.iter().any(|entry| entry.name == name)
+}
+
+/// Whether `role` may hold `scope` under the catalogue's
+/// administrator-only flags: viewers hold only the generic scopes,
+/// administrators hold any catalogue scope. Unknown names fail closed
+/// (false) so validation never grants what the catalogue does not
+/// list. Advisory for now, shared with the catalogue route through
+/// [`USER_SCOPES`]; enforcement on the write paths stays with the
+/// admin-users lane until the checker pins it.
+pub fn role_may_hold_scope(role: &AdminRole, scope: &str) -> bool {
+    match USER_SCOPES.iter().find(|entry| entry.name == scope) {
+        Some(entry) => !entry.admin_only || *role == AdminRole::Administrator,
+        None => false,
+    }
+}
+
+/// `GET /user_scopes`: fixed catalogue of scopes a dashboard login
+/// user may hold (C05-24).
+///
+/// Returns `{"scopes": [{"name", "desc", "admin_only"}]}` in catalogue
+/// order, served from the same [`USER_SCOPES`] registry that the
+/// dashboard-user validation predicates consult. The route is not
+/// paged and takes no parameters; unknown query parameters are ignored
+/// (the handler takes no extractor, so Axum never parses them).
+/// Management-plane only: reads a code-defined list, takes no lock,
+/// and publish/deliver never touch it.
 pub async fn user_scopes() -> Response {
+    let scopes: Vec<serde_json::Value> = USER_SCOPES
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "name": entry.name,
+                "desc": entry.desc,
+                "admin_only": entry.admin_only,
+            })
+        })
+        .collect();
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "scopes": [
-                "all",
-                "user_management",
-                "monitoring",
-                "rules",
-                "connectors",
-                "clients",
-                "subscriptions",
-                "gateways",
-                "listeners"
-            ]
-        })),
+        Json(serde_json::json!({ "scopes": scopes })),
     )
         .into_response()
 }
@@ -2061,5 +2204,95 @@ mod logout_tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
         assert_eq!(body.as_object().expect("error is an object").len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod user_scope_tests {
+    use super::*;
+
+    #[test]
+    fn scope_catalogue_lists_the_documented_names_with_fields() {
+        // W2-40 failing test: the catalogue must carry the documented
+        // scope names with per-scope fields, and the validation
+        // predicates must agree with the served list. Before: a
+        // constant string list detached from validation (no fields, no
+        // shared registry, wrong vocabulary).
+        assert_eq!(USER_SCOPES.len(), 14);
+        let mut names: Vec<&str> = USER_SCOPES.iter().map(|entry| entry.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 14);
+        for entry in &USER_SCOPES {
+            assert!(!entry.name.is_empty());
+            assert!(!entry.desc.is_empty());
+            assert!(is_known_user_scope(entry.name));
+        }
+        for documented in [
+            "connections",
+            "publish",
+            "data_integration",
+            "access_control",
+            "gateways",
+            "monitoring",
+            "cluster_operations",
+            "system",
+            "audit",
+            "license",
+            "user_management",
+            "mfa_management",
+            "sso_management",
+            "api_key_management",
+        ] {
+            assert!(
+                is_known_user_scope(documented),
+                "catalogue must contain {documented}"
+            );
+        }
+        assert!(!is_known_user_scope("no-such-scope"));
+        assert!(!is_known_user_scope("all"));
+        // The generic scopes are shared with the API-key catalogue, so
+        // both registries agree on them.
+        for shared in [
+            "connections",
+            "publish",
+            "data_integration",
+            "access_control",
+            "gateways",
+            "monitoring",
+            "cluster_operations",
+            "system",
+            "audit",
+            "license",
+        ] {
+            assert!(
+                super::super::api_keys::is_known_api_key_scope(shared),
+                "generic scope {shared} must stay shared with the key catalogue"
+            );
+        }
+    }
+
+    #[test]
+    fn role_compatibility_follows_the_admin_only_flags() {
+        // Viewers hold only the generic scopes; administrators hold any
+        // catalogue scope; unknown names fail closed for both roles.
+        for entry in &USER_SCOPES {
+            assert!(
+                role_may_hold_scope(&AdminRole::Administrator, entry.name),
+                "administrator holds {}",
+                entry.name
+            );
+            assert_eq!(
+                role_may_hold_scope(&AdminRole::Viewer, entry.name),
+                !entry.admin_only,
+                "viewer holds {} exactly when it is not admin-only",
+                entry.name
+            );
+        }
+        assert!(!role_may_hold_scope(
+            &AdminRole::Administrator,
+            "no-such-scope"
+        ));
+        assert!(!role_may_hold_scope(&AdminRole::Viewer, "no-such-scope"));
     }
 }
