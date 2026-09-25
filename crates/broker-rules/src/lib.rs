@@ -8,6 +8,11 @@ use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
 /// Bounded on-disk spill buffer behind [`BackpressurePolicy::SpillToDisk`].
 pub mod spill;
 
+/// Standard rule-dialect built-in functions (RQ-03): inventory in
+/// `FUNCTIONS.md`, implementations registered as user functions on the
+/// streaming engine's public registry. No engine source is changed.
+pub mod stdlib;
+
 /// The streaming-SQL function catalog (name, category, aggregate flag,
 /// arity, example) served to the dashboard SQL studio.
 pub use rekuiper_sql::{builtin_function_metadata, FunctionMeta};
@@ -731,6 +736,10 @@ impl RuleEngine {
 
     /// Shared construction from a ready ingress queue.
     fn with_input(input: Arc<BoundedEventInput>, window_channel_depth: usize) -> Self {
+        // RQ-03: standard-dialect functions are registered once process-wide;
+        // after the first call this is one atomic load (no mutex), so the
+        // publish path pays no new lock.
+        stdlib::ensure_stdlib_registered();
         let connectors = Arc::new(ConnectorManager::new());
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         Self {
@@ -759,6 +768,8 @@ impl RuleEngine {
         policy: BackpressurePolicy,
         window_channel_depth: usize,
     ) -> Self {
+        // RQ-03: see `with_input` (one atomic load after the first call).
+        stdlib::ensure_stdlib_registered();
         let connectors = Arc::new(ConnectorManager::new());
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         Self {
@@ -899,7 +910,8 @@ impl RuleEngine {
         let parsed_query = match &stripped_sql {
             Some(sql) => {
                 let normalized = normalize_from_target(sql);
-                let stmt = rekuiper_sql::Parser::new(&normalized)
+                let rewritten = rewrite_colliding_functions(&normalized);
+                let stmt = rekuiper_sql::Parser::new(&rewritten)
                     .parse_select()
                     .map_err(|e| RuleEngineError::InvalidRule(format!("invalid sql_query: {e}")))?;
                 Some(stmt)
@@ -1154,7 +1166,7 @@ impl RuleEngine {
     /// the JSON payload, evaluate the rule WHERE clause, and push passing
     /// records into the worker channel. Lazily spawns a missing worker
     /// (creation outside a runtime defers it to this point).
-    fn dispatch_windowed(&self, rule: &Rule, topic: &Topic, payload: &Bytes) {
+    fn dispatch_windowed(&self, rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) {
         let stmt = match rule.parsed_query.as_ref() {
             Some(stmt) => stmt,
             None => return,
@@ -1163,6 +1175,16 @@ impl RuleEngine {
             Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
             _ => return,
         };
+        stdlib::ensure_stdlib_registered();
+        let ctx = stdlib::RuleContext {
+            topic: Some(topic.as_str().to_string()),
+            qos: Some(qos as u8),
+            record: record.clone(),
+            payload_raw: std::str::from_utf8(payload).ok().map(str::to_string),
+            rule_id: rule.id.clone(),
+            ..Default::default()
+        };
+        let _guard = stdlib::RuleContextGuard::enter(ctx);
         let passes = match stmt.where_clause.as_ref() {
             Some(condition) => Evaluator::eval_bool(condition, &record),
             None => true,
@@ -1275,10 +1297,16 @@ impl RuleEngine {
                     .as_ref()
                     .is_some_and(|stmt| stmt.window.is_some())
             {
-                self.dispatch_windowed(rule, topic, payload);
+                self.dispatch_windowed(rule, topic, payload, qos);
                 continue;
             }
-            let Some(data) = apply_sql(&rule.parsed_query, payload, &rule.id) else {
+            let Some(data) = apply_sql(
+                &rule.parsed_query,
+                payload,
+                &rule.id,
+                Some(topic),
+                Some(qos),
+            ) else {
                 rule.failed_cnt.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
@@ -1649,7 +1677,7 @@ async fn flush_window(
         .collect();
     // The sink snapshot is shared across this flush's rows.
     let sink = flush_ctx.broker_sink.read().clone();
-    for (topic, row) in aggregate_partitioned(stmt, records) {
+    for (topic, row) in aggregate_partitioned(stmt, records, rule_id, false) {
         let object: serde_json::Map<String, serde_json::Value> = row.into_iter().collect();
         let bytes = match serde_json::to_vec(&serde_json::Value::Object(object)) {
             Ok(bytes) => Bytes::from(bytes),
@@ -1681,17 +1709,45 @@ async fn flush_window(
 /// aggregate row per partition (first-seen group order). Without
 /// `GROUP BY`, the whole batch is a single partition. Used by window
 /// flushes and the batch dry-run tester alike so both agree.
+///
+/// Each partition's aggregate evaluation runs with that partition's
+/// context installed (`RuleContextGuard`): `topic()`, `payload()`,
+/// `qos()` and the other zero-argument accessors read the partition's
+/// first record instead of stale/empty state from another thread. Without
+/// the guard the window path would evaluate with whatever context the
+/// flushing thread last saw.
 fn aggregate_partitioned(
     stmt: &SelectStmt,
     records: Vec<(Topic, HashMap<String, serde_json::Value>)>,
+    rule_id: &str,
+    dry_run: bool,
 ) -> Vec<(Topic, HashMap<String, serde_json::Value>)> {
     if records.is_empty() {
         return Vec::new();
     }
+    stdlib::ensure_stdlib_registered();
+    // Build the evaluation context for one partition: the partition's
+    // topic plus its first record, so context accessors resolve. Dry-run
+    // partitions inherit the probe flag so state-mutating UDFs fail closed
+    // instead of touching production state.
+    let partition_ctx = |topic: &Topic, first: &HashMap<String, serde_json::Value>| {
+        let object: serde_json::Map<String, serde_json::Value> =
+            first.clone().into_iter().collect();
+        stdlib::RuleContext {
+            topic: Some(topic.as_str().to_string()),
+            record: first.clone(),
+            payload_raw: serde_json::to_string(&serde_json::Value::Object(object)).ok(),
+            rule_id: rule_id.to_string(),
+            dry_run,
+            ..Default::default()
+        }
+    };
     if stmt.group_by.is_empty() {
         let topic = records[0].0.clone();
         let maps: Vec<HashMap<String, serde_json::Value>> =
             records.into_iter().map(|(_, map)| map).collect();
+        let ctx = partition_ctx(&topic, &maps[0]);
+        let _guard = stdlib::RuleContextGuard::enter(ctx);
         return Evaluator::eval_aggregate(stmt, &maps)
             .map(|row| vec![(topic, row)])
             .unwrap_or_default();
@@ -1710,6 +1766,8 @@ fn aggregate_partitioned(
     let mut out = Vec::new();
     for key in order {
         let (topic, maps) = groups.remove(&key).expect("group just inserted");
+        let ctx = partition_ctx(&topic, &maps[0]);
+        let _guard = stdlib::RuleContextGuard::enter(ctx);
         if let Some(row) = Evaluator::eval_aggregate(stmt, &maps) {
             out.push((topic, row));
         }
@@ -1800,6 +1858,138 @@ fn normalize_from_target(sql: &str) -> String {
     sql.to_string()
 }
 
+/// Rewrite colliding standard-dialect function names to internal `std_*`
+/// aliases before parsing, so SQL evaluation uses the standard semantics
+/// without changing the engine crate.
+///
+/// The engine resolves `substr`, `split`, `concat`, `length`,
+/// `base64_encode`, `base64_decode` and `rtrim` against its own built-ins
+/// before consulting the registered-function table, so a same-name
+/// wrapper registered from outside can never take effect. Rewriting here
+/// (outside the engine) is the from-outside-crate implementation: user
+/// SQL keeps the documented names, the parser sees only the aliases,
+/// and `stdlib::ensure_stdlib_registered` provides both spellings.
+/// String literals (`'...'`, `"..."`, `` `...` ``) and comments are left
+/// untouched; matching is case-insensitive and requires `(` after the
+/// name so columns named e.g. `substr` are unaffected.
+pub fn rewrite_colliding_functions(sql: &str) -> String {
+    const MAPPINGS: &[(&str, &str)] = &[
+        ("base64_encode", "std_base64_encode"),
+        ("base64_decode", "std_base64_decode"),
+        ("substr", "std_substr"),
+        ("split", "std_split"),
+        ("concat", "std_concat"),
+        ("length", "std_length"),
+        ("rtrim", "std_rtrim"),
+    ];
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_string: Option<u8> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    while i < n {
+        let c = bytes[i];
+        // Preserve multi-byte UTF-8 in literals/comments: pushing a raw
+        // byte via `as char` would corrupt it (e.g. 0xC3 becomes U+00C3
+        // instead of the original scalar). All SQL syntax below is
+        // ASCII-only, so a non-ASCII byte always belongs to a UTF-8 scalar
+        // that is copied verbatim in any lexer state.
+        if c >= 0x80 {
+            if let Some(ch) = sql[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if in_line_comment {
+            out.push(c as char);
+            if c == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            out.push(c as char);
+            if c == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
+                out.push('/');
+                i += 2;
+                in_block_comment = false;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(q) = in_string {
+            out.push(c as char);
+            if c == q {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' || c == b'"' || c == b'`' {
+            in_string = Some(c);
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+        if c == b'-' && i + 1 < n && bytes[i + 1] == b'-' {
+            in_line_comment = true;
+            out.push('-');
+            out.push('-');
+            i += 2;
+            continue;
+        }
+        if c == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+            in_block_comment = true;
+            out.push('/');
+            out.push('*');
+            i += 2;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < n && is_word(bytes[i]) {
+                i += 1;
+            }
+            let word = &sql[start..i];
+            let mut j = i;
+            while j < n && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let is_call = j < n && bytes[j] == b'(';
+            if is_call {
+                let lower = word.to_ascii_lowercase();
+                let mut replaced = false;
+                for (from, to) in MAPPINGS {
+                    if lower == *from {
+                        // Keep the call intact: alias plus original
+                        // whitespace/paren from j onward.
+                        out.push_str(to);
+                        replaced = true;
+                        break;
+                    }
+                }
+                if !replaced {
+                    out.push_str(word);
+                }
+            } else {
+                out.push_str(word);
+            }
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
 /// Dry-run SQL evaluation for the management console's payload tester.
 ///
 /// Parses `sql` (if any), checks `topic_filter` coverage when given, and
@@ -1808,6 +1998,11 @@ fn normalize_from_target(sql: &str) -> String {
 /// projected) value on match and `None` when the predicate is false or
 /// the payload is not a JSON object. Invalid SQL, topics, or filters
 /// fail with a message.
+///
+/// Side-effect free: the probe runs with `dry_run` set, so state-mutating
+/// UDFs (`proc_dict_put/del`, `kv_store_put/del`) fail closed with `Null`
+/// instead of touching the node-global maps. A dry-run never mutates
+/// production rule state.
 pub fn try_evaluate(
     sql: Option<&str>,
     topic_filter: Option<&str>,
@@ -1827,14 +2022,17 @@ pub fn try_evaluate(
     let stmt = match sql {
         Some(sql) if !sql.trim().is_empty() => {
             let normalized = normalize_from_target(sql);
+            let rewritten = rewrite_colliding_functions(&normalized);
             Some(
-                rekuiper_sql::Parser::new(&normalized)
+                rekuiper_sql::Parser::new(&rewritten)
                     .parse_select()
                     .map_err(|e| format!("invalid sql_query: {e}"))?,
             )
         }
         _ => None,
     };
+    // RQ-03: standard functions are available to the tester as well.
+    stdlib::ensure_stdlib_registered();
     match payload {
         serde_json::Value::Array(elements) => {
             // Batch dry-run: multi-event aggregation over the object
@@ -1857,10 +2055,11 @@ pub fn try_evaluate(
                     Ok((true, Some(payload.clone())))
                 }
                 Some(stmt) => {
-                    let rows: Vec<serde_json::Value> = aggregate_partitioned(&stmt, records)
-                        .into_iter()
-                        .map(|(_, row)| serde_json::Value::Object(row.into_iter().collect()))
-                        .collect();
+                    let rows: Vec<serde_json::Value> =
+                        aggregate_partitioned(&stmt, records, "", true)
+                            .into_iter()
+                            .map(|(_, row)| serde_json::Value::Object(row.into_iter().collect()))
+                            .collect();
                     if rows.is_empty() {
                         Ok((false, None))
                     } else {
@@ -1871,6 +2070,18 @@ pub fn try_evaluate(
         }
         serde_json::Value::Object(map) => {
             let record: HashMap<String, serde_json::Value> = map.clone().into_iter().collect();
+            // RQ-03: install the evaluation context so zero-argument
+            // accessors (`topic()`, `payload()`, ...) read this probe.
+            // Dry-run: mutating UDFs fail closed, never touching
+            // production state.
+            let ctx = stdlib::RuleContext {
+                topic: Some(probe.as_str().to_string()),
+                record: record.clone(),
+                payload_raw: serde_json::to_string(payload).ok(),
+                dry_run: true,
+                ..Default::default()
+            };
+            let _guard = stdlib::RuleContextGuard::enter(ctx);
             match stmt {
                 None => Ok((true, Some(payload.clone()))),
                 Some(stmt) => match Evaluator::eval_select(&stmt, &record) {
@@ -2003,7 +2214,18 @@ fn split_into_connector(sql: &str) -> Result<(String, Option<String>), RuleEngin
 /// the projected JSON when evaluation succeeds, or `None` to skip the
 /// rule (WHERE false, non-JSON/non-object payload, serialization
 /// failure). Never panics on attacker-controlled bytes.
-fn apply_sql(parsed: &Option<SelectStmt>, payload: &Bytes, rule_id: &str) -> Option<Bytes> {
+///
+/// `topic`/`qos` feed the RQ-03 evaluation context so zero-argument
+/// accessors (`topic()`, `payload()`, ...) resolve; client identity fields
+/// stay `Null` here because ingress dispatch does not carry them yet
+/// (RQ-04 supplies event context).
+fn apply_sql(
+    parsed: &Option<SelectStmt>,
+    payload: &Bytes,
+    rule_id: &str,
+    topic: Option<&Topic>,
+    qos: Option<QoS>,
+) -> Option<Bytes> {
     let stmt = match parsed {
         None => return Some(payload.clone()),
         Some(stmt) => stmt,
@@ -2018,6 +2240,16 @@ fn apply_sql(parsed: &Option<SelectStmt>, payload: &Bytes, rule_id: &str) -> Opt
             return None;
         }
     };
+    stdlib::ensure_stdlib_registered();
+    let ctx = stdlib::RuleContext {
+        topic: topic.map(|t| t.as_str().to_string()),
+        qos: qos.map(|q| q as u8),
+        record: record.clone(),
+        payload_raw: std::str::from_utf8(payload).ok().map(str::to_string),
+        rule_id: rule_id.to_string(),
+        ..Default::default()
+    };
+    let _guard = stdlib::RuleContextGuard::enter(ctx);
     match Evaluator::eval_select(stmt, &record) {
         Some(projected) => {
             // serde_json::Map is key-sorted: deterministic wire bytes.
@@ -2956,12 +3188,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_scalar_string_functions() {
+        // Colliding names use the standard-dialect semantics via the SQL
+        // rewriter (0-based substr, 1/2-arg concat): concat('a','b') is
+        // "ab" and substr('hello',2,3) starts at 0-based offset 2 ("llo").
         let row = project_one(
-            r#"SELECT concat('a', 'b', 'c') AS a, lower('AbC') AS b, upper('AbC') AS c, length('hello') AS d FROM s"#,
+            r#"SELECT concat('a', 'b') AS a, lower('AbC') AS b, upper('AbC') AS c, length('hello') AS d FROM s"#,
             br#"{ "v": 1 }"#,
         )
         .await;
-        assert_eq!(row["a"], serde_json::json!("abc"));
+        assert_eq!(row["a"], serde_json::json!("ab"));
         assert_eq!(row["b"], serde_json::json!("abc"));
         assert_eq!(row["c"], serde_json::json!("ABC"));
         assert_eq!(num(&row, "d"), 5.0);
@@ -3006,7 +3241,7 @@ mod tests {
             br#"{ "v": 1 }"#,
         )
         .await;
-        assert_eq!(row["a"], serde_json::json!("ell"));
+        assert_eq!(row["a"], serde_json::json!("llo"));
         assert_eq!(row["b"], serde_json::json!("ello"));
 
         let row = project_one(
