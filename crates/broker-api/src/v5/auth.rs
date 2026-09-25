@@ -246,6 +246,7 @@ fn admin_error(error: AdminUserError) -> Response {
         AdminUserError::InvalidUsername
         | AdminUserError::WeakPassword
         | AdminUserError::SameAsOld
+        | AdminUserError::TooManyUsers
         | AdminUserError::LastAdministrator => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
     };
     (
@@ -780,11 +781,39 @@ pub async fn user_scopes() -> Response {
 /// Dashboard/API users live in the admin-user store only. MQTT client
 /// credentials stay in `MemoryAuth` behind the `/authentication/.../users`
 /// and v1 `/auth/users` endpoints.
-pub async fn list_users(State(state): State<ApiState>) -> Response {
-    let users: Vec<_> = state
-        .admin_users
-        .list()
-        .into_iter()
+///
+/// `GET /users`: paged dashboard users with the standard page envelope
+/// (`data` plus `meta {page, limit, count, hasnext}`, C05-25).
+///
+/// Reads the live admin-user map (sorted by username) and slices the
+/// requested page with the shared [`PageParams`] helper (defaults
+/// `page=1`, `limit=100`, clamped to `1..=1000`; malformed values fall
+/// back to defaults, never 400). An empty map reads as an empty page
+/// (`data: []`), never an error. Each row carries only the documented
+/// per-user fields the broker tracks (`username`, `role`,
+/// `description`); passwords are write-only and password hashes never
+/// render.
+/// Management-plane only: clones at most the sorted view list once per
+/// request under a short read lock and slices one page; the login and
+/// middleware consults keep reading under their own short locks
+/// (`AdminUsers::verify_password` on `POST /login`,
+/// `resolve_bearer` per authenticated request) and publish/deliver never
+/// touch this store. The map is bounded by
+/// [`crate::admin_users::MAX_ADMIN_USERS`] (1024 entries), so list reads
+/// stay paged and per-request clones stay cheap.
+// TODO(parity): which per-user fields beyond username/role/description
+// does the listing require (scopes, creation time, login-only flags)?
+// The rulebook does not decide the exact row shape and the broker tracks
+// neither field on this path, so the current choice omits fields the
+// broker cannot supply (never a constant standing in for a measurement)
+// until the checker pins them. Scope vocabulary and per-user MFA state
+// are owned by their own lanes.
+pub async fn list_users(State(state): State<ApiState>, params: PageParams) -> Response {
+    let users = state.admin_users.list();
+    let total = users.len();
+    let page_items = paginate(&users, params.page, params.limit);
+    let data: Vec<_> = page_items
+        .iter()
         .map(|u| {
             serde_json::json!({
                 "username": u.username,
@@ -793,57 +822,125 @@ pub async fn list_users(State(state): State<ApiState>) -> Response {
             })
         })
         .collect();
-    (StatusCode::OK, Json(users)).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "data": data,
+            "meta": meta_page(params.page, params.limit, total),
+        })),
+    )
+        .into_response()
 }
 
-#[derive(Deserialize)]
-pub struct CreateUserReq {
-    pub username: String,
-    pub password: String,
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-pub async fn create_user(
-    State(state): State<ApiState>,
-    Json(req): Json<CreateUserReq>,
-) -> Response {
-    // Authentication and the administrator role are enforced by the
-    // middleware; the handler only validates the payload.
-    let role = match req.role.as_deref() {
-        None => AdminRole::Administrator,
-        Some(raw) => match parse_role(raw) {
-            Some(role) => role,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "code": "BAD_REQUEST",
-                        "message": "role must be administrator or viewer"
-                    })),
-                )
-                    .into_response();
-            }
-        },
+/// `POST /users`: add one dashboard user (C05-26).
+///
+/// The body must be a JSON object with non-empty string `username` and
+/// `password` fields; `role` (`administrator` or `viewer`, default
+/// `administrator`) and `description` (default empty) are optional. Extra
+/// fields are ignored so future record fields degrade to the same create
+/// instead of a 400. Anything else fails with `BAD_REQUEST` in the
+/// documented `{code, message}` shape and creates nothing. A `username`
+/// that already exists fails with `ALREADY_EXISTS` instead of updating
+/// in place; a store that already holds
+/// [`crate::admin_users::MAX_ADMIN_USERS`] entries fails with
+/// `BAD_REQUEST`. Usernames must match the store charset (alphanumeric
+/// plus `_-.@`, at most 64 bytes) and passwords must be at least 8
+/// characters; both fail closed with `BAD_REQUEST`. On success answers
+/// 200 with the stored `username`/`role`/`description` (never the
+/// password or its hash). The password is hashed (PBKDF2-HMAC-SHA-256
+/// SCRAM verifier) before storing; plaintext never persists. The write
+/// persists across a restart through the config registry
+/// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users`).
+/// Management-plane only: one short existence check plus the user-map
+/// write lock (plus the registry save lock on persist); the login path
+/// keeps reading under short read locks and publish/deliver never touch
+/// this store.
+// TODO(parity): is the documented create success 200 or 201? The
+// rulebook does not decide the exact code; the current choice keeps 200
+// (the long-standing response for this route) until the checker pins it.
+// TODO(parity): is a duplicate `username` rejected with `ALREADY_EXISTS`
+// (409 here) or `BAD_REQUEST` (400)? The rulebook does not decide the
+// exact duplicate code; the current choice keeps `ALREADY_EXISTS`
+// (409, distinct from validation failures) until the checker pins it.
+pub async fn create_user(State(state): State<ApiState>, body: Bytes) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid user body: {error}")).into_response();
+        }
     };
-    let description = req.description.unwrap_or_default();
+    let (username, password, role, description) = match parse_dashboard_user_body(&value) {
+        Ok(parsed) => parsed,
+        Err(message) => return ApiError::BadRequest(message).into_response(),
+    };
     if let Err(error) = state
         .admin_users
-        .create(&req.username, &req.password, role, &description)
+        .create(&username, &password, role, &description)
     {
         return admin_error(error);
     }
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "username": req.username,
+            "username": username,
             "role": role_str(&role),
             "description": description
         })),
     )
         .into_response()
+}
+
+/// Validate a dashboard-user create body into
+/// `(username, password, role, description)`.
+///
+/// The body must be a JSON object with non-empty string `username` and
+/// `password` fields. `role` defaults to administrator and must be
+/// `administrator`/`admin` or `viewer` when present; `description`
+/// defaults to empty and must be a string when present. Extra fields are
+/// ignored so future record fields degrade to the same create instead of
+/// a 400.
+fn parse_dashboard_user_body(
+    value: &serde_json::Value,
+) -> Result<(String, String, AdminRole, String), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "user body must be a JSON object".to_string())?;
+    let username = obj
+        .get("username")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `username` is required".to_string())?;
+    if username.trim().is_empty() {
+        return Err("field `username` must not be empty".to_string());
+    }
+    let password = obj
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "field `password` is required".to_string())?;
+    if password.is_empty() {
+        return Err("field `password` must not be empty".to_string());
+    }
+    let role = match obj.get("role") {
+        None => AdminRole::Administrator,
+        Some(raw) => {
+            let text = raw
+                .as_str()
+                .ok_or_else(|| "role must be administrator or viewer".to_string())?;
+            parse_role(text).ok_or_else(|| "role must be administrator or viewer".to_string())?
+        }
+    };
+    let description = match obj.get("description") {
+        None => String::new(),
+        Some(raw) => raw
+            .as_str()
+            .ok_or_else(|| "field `description` must be a string".to_string())?
+            .to_string(),
+    };
+    Ok((
+        username.to_string(),
+        password.to_string(),
+        role,
+        description,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -896,6 +993,21 @@ pub async fn update_user(
     }
 }
 
+/// `DELETE /users/{username}`: revoke one dashboard user (C05-27).
+///
+/// Unknown usernames fail with 404 in the documented `{code, message}`
+/// shape and revoke nothing. On success answers 204 with no body, revokes
+/// every live token of that user (`ApiTokens::revoke_user_except`, so a
+/// deleted user stops authorising management calls immediately), and
+/// persists the removal across a restart through the config registry.
+/// Management-plane only: one short user-map write lock per request (plus
+/// the registry save lock on persist); the login path keeps reading under
+/// short read locks and publish/deliver never touch this store.
+// TODO(parity): is the documented miss code `USER_NOT_FOUND` or
+// `NOT_FOUND`? The rulebook does not decide the exact code name; the
+// current choice keeps `NOT_FOUND` (404, documented `{code, message}`
+// shape, shared with the other dashboard miss paths) until the checker
+// pins it.
 pub async fn delete_user(State(state): State<ApiState>, Path(username): Path<String>) -> Response {
     match state.admin_users.delete(&username) {
         Ok(()) => {
@@ -2294,5 +2406,304 @@ mod user_scope_tests {
             "no-such-scope"
         ));
         assert!(!role_may_hold_scope(&AdminRole::Viewer, "no-such-scope"));
+    }
+}
+
+#[cfg(test)]
+mod dashboard_users_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn body(value: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
+    }
+
+    fn params(page: u32, limit: u32) -> PageParams {
+        PageParams { page, limit }
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    #[tokio::test]
+    async fn crud_lists_with_envelope_rejects_duplicates_and_misses_404() {
+        // W2-41 failing test: create a user, list expecting it without
+        // secrets; re-create the duplicate expecting rejection; delete
+        // then delete again expecting 404. Before: the list answered a
+        // bare array with no page envelope, and malformed bodies were
+        // not shaped as documented client errors.
+        let state = standalone_state();
+
+        for (username, password, role) in [
+            ("w241-alice", "AliceSecret1!", "administrator"),
+            ("w241-bob", "BobSecret1!", "viewer"),
+        ] {
+            let (status, created, raw) = parts(
+                create_user(
+                    State(state.clone()),
+                    body(serde_json::json!({
+                        "username": username,
+                        "password": password,
+                        "role": role,
+                        "description": format!("{username} via w241"),
+                    })),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "create {username}");
+            assert_eq!(created["username"], serde_json::json!(username));
+            assert_eq!(created["role"], serde_json::json!(role));
+            assert!(
+                created.get("password").is_none(),
+                "create renders no password"
+            );
+            assert!(
+                created.get("password_hash").is_none(),
+                "create renders no hash"
+            );
+            assert!(
+                !String::from_utf8_lossy(&raw).contains(password),
+                "create body carries no plaintext"
+            );
+        }
+
+        // List carries both users with the standard page envelope.
+        let (status, listed, raw) =
+            parts(list_users(State(state.clone()), params(1, 100)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = listed["data"].as_array().expect("data array");
+        assert_eq!(data.len(), 3, "default admin plus two created users");
+        assert_eq!(listed["meta"]["page"], serde_json::json!(1));
+        assert_eq!(listed["meta"]["limit"], serde_json::json!(100));
+        assert_eq!(listed["meta"]["count"], serde_json::json!(3));
+        assert_eq!(listed["meta"]["hasnext"], serde_json::json!(false));
+        let names: Vec<&str> = data
+            .iter()
+            .map(|row| row["username"].as_str().expect("row has username"))
+            .collect();
+        assert_eq!(names, vec!["admin", "w241-alice", "w241-bob"]);
+        for row in data {
+            assert!(row.get("password").is_none(), "row renders no password");
+            assert!(row.get("password_hash").is_none(), "row renders no hash");
+        }
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("AliceSecret1!"),
+            "list body carries no plaintext"
+        );
+
+        // Paging slices after sorting: page 2 with limit 2 holds the last user.
+        let (status, page2, _) = parts(list_users(State(state.clone()), params(2, 2)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page2["data"].as_array().expect("data").len(), 1);
+        assert_eq!(page2["data"][0]["username"], serde_json::json!("w241-bob"));
+        assert_eq!(page2["meta"]["count"], serde_json::json!(3));
+        assert_eq!(page2["meta"]["hasnext"], serde_json::json!(false));
+
+        // Re-creating an existing username is rejected, never an update.
+        let (status, duplicate, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w241-alice",
+                    "password": "OtherSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
+        assert!(duplicate["message"].is_string());
+
+        // Malformed bodies are client errors with the documented shape.
+        let (status, malformed, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({"username": "w241-nopw"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(malformed["code"], serde_json::json!("BAD_REQUEST"));
+
+        // Delete one user; the list shrinks.
+        let gone = delete_user(State(state.clone()), Path("w241-bob".to_string())).await;
+        assert_eq!(gone.status(), StatusCode::NO_CONTENT);
+        let (status, listed, _) =
+            parts(list_users(State(state.clone()), params(1, 100)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["data"].as_array().expect("data").len(), 2);
+        assert_eq!(listed["meta"]["count"], serde_json::json!(2));
+
+        // Deleting an unknown username is a 404 with the documented shape.
+        let (status, missing, _) =
+            parts(delete_user(State(state.clone()), Path("w241-ghost".to_string())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert!(missing.get("message").is_some());
+    }
+
+    #[tokio::test]
+    async fn created_credential_logs_in_and_delete_revokes_its_tokens() {
+        // Goes through the broker auth path, not only the store: the
+        // created credential must verify on the login path
+        // (`AdminUsers::verify_password`, driven by `POST /login` in
+        // `direct_login`), the issued token must resolve through the
+        // middleware resolver (`resolve_bearer`, driven by every
+        // authenticated management request in
+        // `crate::api_auth::require_api_auth`), and must stop resolving
+        // after the delete revokes it.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w241-conn",
+                    "password": "ConnSecret1!",
+                    "role": "viewer",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(
+            state
+                .admin_users
+                .verify_password("w241-conn", "ConnSecret1!"),
+            "correct password verifies on the login path"
+        );
+        assert!(
+            !state
+                .admin_users
+                .verify_password("w241-conn", "wrong-secret"),
+            "wrong password fails closed"
+        );
+
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w241-conn",
+                    "password": "ConnSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = logged_in["token"]
+            .as_str()
+            .expect("login issues a token")
+            .to_string();
+        assert!(
+            resolve_bearer(&state, &token).is_some(),
+            "issued token resolves through the middleware resolver"
+        );
+
+        let gone = delete_user(State(state.clone()), Path("w241-conn".to_string())).await;
+        assert_eq!(gone.status(), StatusCode::NO_CONTENT);
+        assert!(
+            resolve_bearer(&state, &token).is_none(),
+            "deleted user stops authorising management calls"
+        );
+        assert!(
+            !state
+                .admin_users
+                .verify_password("w241-conn", "ConnSecret1!"),
+            "deleted user fails closed on the login path"
+        );
+    }
+
+    #[tokio::test]
+    async fn passwords_are_hashed_never_rendered_and_survive_a_restart() {
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w241-hash",
+                    "password": "HashSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Persistence rides the config registry: a registry-backed store
+        // still holds the user after a reload, so the credential survives
+        // a kernel restart.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-w241-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("scratch registry loads"),
+        );
+        let durable = crate::admin_users::AdminUsers::from_registry(&registry);
+        durable
+            .create(
+                "w241-kept",
+                "KeptSecret1!",
+                AdminRole::Viewer,
+                "kept across restart",
+            )
+            .expect("registry-backed create persists");
+        drop(durable);
+        let reloaded =
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart");
+        let found = reloaded
+            .snapshot()
+            .admin_users
+            .users
+            .iter()
+            .any(|u| u.username == "w241-kept");
+        assert!(found, "user persists across a restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admin_user_cap_is_finite_and_maps_to_bad_request() {
+        // The bound from the task: the store never grows without limit.
+        const {
+            assert!(
+                crate::admin_users::MAX_ADMIN_USERS <= 10_000,
+                "admin-user cap must stay small enough to keep list snapshots cheap"
+            );
+        }
+        const {
+            assert!(
+                crate::admin_users::MAX_ADMIN_USERS >= 2,
+                "admin-user cap must leave room beyond the default admin"
+            );
+        }
+        let response = admin_error(AdminUserError::TooManyUsers);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

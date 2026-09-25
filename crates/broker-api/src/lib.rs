@@ -4753,12 +4753,14 @@ mod tests {
         assert_eq!(created["description"], json!("read-only"));
         assert_eq!(state.auth.user_count(), 0);
 
-        // Listing serves the admin store with roles, sorted by username.
+        // Listing serves the admin store with roles, sorted by username,
+        // in the standard page envelope (W2-41, C05-25).
         let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
         assert_eq!(status, 200);
-        let names: Vec<&str> = body
+        assert_eq!(body["meta"]["count"], json!(2));
+        let names: Vec<&str> = body["data"]
             .as_array()
-            .expect("users array")
+            .expect("users data array")
             .iter()
             .map(|u| u["username"].as_str().expect("username"))
             .collect();
@@ -4987,9 +4989,9 @@ mod tests {
         let admin_token = body["token"].as_str().expect("admin token").to_string();
         let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
         assert_eq!(status, 200);
-        let names: Vec<&str> = body
+        let names: Vec<&str> = body["data"]
             .as_array()
-            .expect("users array")
+            .expect("users data array")
             .iter()
             .map(|u| u["username"].as_str().expect("username"))
             .collect();

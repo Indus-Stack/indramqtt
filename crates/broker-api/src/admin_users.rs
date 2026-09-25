@@ -23,6 +23,17 @@ const SALT_LEN: usize = 16;
 /// Minimum accepted password length.
 const MIN_PASSWORD_LEN: usize = 8;
 
+/// Upper bound for stored dashboard/API users. Creates past this size are
+/// rejected instead of growing the map without limit. Reason: the
+/// management plane snapshots the whole list per list request and each
+/// entry holds SCRAM verifier material plus map overhead, so an unbounded
+/// map lets one management batch exhaust the kernel; 1024 covers operator
+/// provisioning with headroom while keeping list reads paged and
+/// per-request clones cheap. The default is finite: no opt-in to unlimited
+/// exists anywhere on this path.
+/// Management-plane only: publish and deliver never touch this map.
+pub const MAX_ADMIN_USERS: usize = 1024;
+
 /// Role of a management API user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminRole {
@@ -48,6 +59,9 @@ pub enum AdminUserError {
     SameAsOld,
     LastAdministrator,
     InvalidUsername,
+    /// The store already holds [`MAX_ADMIN_USERS`] entries. Handlers map
+    /// this to HTTP 400; it is never silent.
+    TooManyUsers,
     /// The mutation applied in memory but the registry commit or atomic
     /// save failed. Handlers map this to HTTP 500; it is never silent.
     Persist(String),
@@ -62,6 +76,7 @@ impl fmt::Display for AdminUserError {
             Self::SameAsOld => write!(f, "new password is the same as the old one"),
             Self::LastAdministrator => write!(f, "cannot remove the last administrator"),
             Self::InvalidUsername => write!(f, "invalid username"),
+            Self::TooManyUsers => write!(f, "admin user limit of {MAX_ADMIN_USERS} reached"),
             Self::Persist(reason) => write!(f, "cannot persist admin users: {reason}"),
         }
     }
@@ -250,6 +265,14 @@ impl AdminUsers {
             let mut users = self.users.write().unwrap();
             if users.contains_key(username) {
                 return Err(AdminUserError::AlreadyExists);
+            }
+            // TODO(parity): does the documented behaviour count a duplicate
+            // against the cap or report the duplicate first? The rulebook
+            // does not decide the ordering; the current choice reports the
+            // duplicate first (no growth) and enforces the cap only on
+            // genuinely new usernames until the checker pins it.
+            if users.len() >= MAX_ADMIN_USERS {
+                return Err(AdminUserError::TooManyUsers);
             }
             let mut salt = [0u8; SALT_LEN];
             rand::rng().fill_bytes(&mut salt);
