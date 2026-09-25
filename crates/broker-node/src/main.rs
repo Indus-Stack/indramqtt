@@ -1973,6 +1973,13 @@ struct Shared {
     /// Bearer/Basic enforcement itself is owned elsewhere; this store
     /// only manages the key records.
     api_keys: Arc<broker_api::v5::api_keys::ApiKeyStore>,
+    /// Management audit ring for W2-28: shared with the management API
+    /// so middleware records and `GET /audit` reads observe the same
+    /// bounded buffer. One `Arc` clone at boot; writes are non-blocking
+    /// `try_write` from the management middleware and reads take one
+    /// short read lock. Publish and deliver never touch it. Memory-only;
+    /// a restart starts from an empty ring (persist-or-trim: trim).
+    audit: Arc<broker_api::v5::audit::AuditLog>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -2208,6 +2215,7 @@ impl Shared {
             authz_settings: Arc::new(AuthzSettingsStore::new()),
             authz_sources: Arc::new(AuthzSourceRegistry::new()),
             api_keys: Arc::new(broker_api::v5::api_keys::ApiKeyStore::new()),
+            audit: Arc::new(broker_api::v5::audit::AuditLog::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -5571,6 +5579,11 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // sharing replaces that fresh instance with the kernel's so no
     // second copy diverges.
     state.api_keys = shared.api_keys.clone();
+    // Share the management audit ring (W2-28) so middleware records and
+    // `GET /audit` reads observe the same bounded buffer instead of an
+    // empty per-request copy. One `Arc` clone; management-plane only,
+    // the publish path never touches it.
+    state.audit = shared.audit.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.

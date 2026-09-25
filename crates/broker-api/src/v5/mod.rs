@@ -2,6 +2,7 @@
 
 pub mod alarms;
 pub mod api_keys;
+pub mod audit;
 pub mod auth;
 pub mod authn_cache;
 pub mod authn_chain;
@@ -315,6 +316,11 @@ pub fn protected_router() -> Router<ApiState> {
         // touch it. The route is not paged and takes no parameters;
         // unknown query parameters are ignored.
         .route("/api_key_scopes", get(api_keys::list_api_key_scopes))
+        // Management audit log (W2-28, C05-07): paged query over the
+        // bounded management ring. Management-plane only; writes are
+        // fire-and-forget from the auth middleware and publish/deliver
+        // never touch the ring.
+        .route("/audit", get(audit::list_audit))
         // Live Monitoring & Rates
         .route("/metrics", get(monitoring::get_metrics))
         .route(

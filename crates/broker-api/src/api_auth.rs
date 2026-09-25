@@ -205,8 +205,30 @@ pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next:
     }
 
     let mut req = req;
-    req.extensions_mut().insert(info);
-    next.run(req).await
+    req.extensions_mut().insert(info.clone());
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+    // Management audit (W2-28): one fire-and-forget entry per
+    // authenticated management request, recorded after the response so
+    // the audited request never waits on the ring. Management-plane
+    // only; publish and deliver never pass through here. The peer
+    // address is not available in this layer without connection info,
+    // so `source_ip` records empty rather than an invented address
+    // (see the module TODO).
+    let status = response.status().as_u16();
+    state.audit.record(crate::v5::audit::AuditRecordInput {
+        created_at_us: crate::v5::audit::now_micros(),
+        node: state.node_id.clone(),
+        source: info.username.clone(),
+        source_ip: String::new(),
+        operation_id: path.clone(),
+        operation_type: crate::v5::audit::operation_type_for_path(&path),
+        operation_result: crate::v5::audit::outcome_for_status(status).to_string(),
+        http_method: method.as_str().to_lowercase(),
+        http_status_code: status,
+        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    });
+    response
 }
 
 #[cfg(test)]

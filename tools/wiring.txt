@@ -19,3 +19,4 @@ wired  traces
 wired  tracing
 wired  authn_settings
 wired  api_keys
+wired  audit

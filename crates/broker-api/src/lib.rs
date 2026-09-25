@@ -196,6 +196,15 @@ pub struct ApiState {
     /// this store. Bearer/Basic enforcement itself is owned elsewhere;
     /// this store only manages the key records.
     pub api_keys: Arc<crate::v5::api_keys::ApiKeyStore>,
+    /// Management audit ring for `GET /api/v5/audit` (W2-28): bounded
+    /// oldest-evicted log of authenticated management requests. The
+    /// routes read one bounded snapshot per request; the kernel boot
+    /// path shares the same instance (`crates/broker-node/src/main.rs`,
+    /// `Shared.audit` plus the `serve_api` share below) and the
+    /// management auth middleware records one fire-and-forget entry per
+    /// authenticated request (`crate::api_auth::require_api_auth`).
+    /// Publish and deliver never touch this store.
+    pub audit: Arc<crate::v5::audit::AuditLog>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -321,6 +330,7 @@ impl ApiState {
             authz_settings,
             authz_sources,
             api_keys,
+            audit: Arc::new(crate::v5::audit::AuditLog::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -380,6 +390,7 @@ impl ApiState {
             authz_settings: Arc::new(broker_auth::AuthzSettingsStore::new()),
             authz_sources: Arc::new(broker_auth::AuthzSourceRegistry::new()),
             api_keys: Arc::new(crate::v5::api_keys::ApiKeyStore::new()),
+            audit: Arc::new(crate::v5::audit::AuditLog::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -11088,5 +11099,117 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             assert_eq!(status, 400, "{path} failure must be 400");
             assert_eq!(body["code"], json!("TEST_FAILED"), "{path} code");
         }
+    }
+
+    #[tokio::test]
+    async fn audit_log_lists_management_operations_with_paging_and_time_filter() {
+        // W2-28 failing test: perform two management operations, query
+        // the audit log expecting both entries with paging metadata;
+        // query with a time filter excluding them expecting an empty
+        // page. Before: 404 (no route).
+        // Broker-through: every step goes through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), not only
+        // through the store. The entries are recorded by the management
+        // auth middleware (`crates/broker-api/src/api_auth.rs`,
+        // `require_api_auth`) on each authenticated request; publish and
+        // deliver never touch the ring.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Two management operations through the broker.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/api_key",
+                json!({"name": "w228-audit-a", "scopes": ["all"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/api_key",
+                json!({"name": "w228-audit-b", "scopes": ["all"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Query the log: both entries read back with paging metadata.
+        let (status, body) = server.get_auth("/api/v5/audit", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert!(
+            data.len() >= 2,
+            "both management operations are audited: {body:?}"
+        );
+        assert!(body["meta"].is_object(), "page envelope carries meta");
+        assert_eq!(
+            body["meta"]["page"],
+            json!(1),
+            "default page reports: {body:?}"
+        );
+        assert_eq!(
+            body["meta"]["limit"],
+            json!(100),
+            "default limit reports: {body:?}"
+        );
+        let ids: Vec<&str> = data
+            .iter()
+            .filter_map(|entry| entry["operation_id"].as_str())
+            .collect();
+        assert!(
+            ids.iter().any(|id| id.contains("api_key")),
+            "audit rows name the operated resource: {ids:?}"
+        );
+        for entry in data {
+            assert!(entry["created_at"].is_string(), "row has a timestamp");
+            assert_eq!(entry["from"], json!("rest_api"));
+            assert_eq!(entry["operation_result"], json!("success"));
+            assert!(entry["http_status_code"].is_number());
+        }
+
+        // Paged read keeps the envelope.
+        let (status, paged) = server
+            .get_auth("/api/v5/audit?page=1&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(paged["meta"]["page"], json!(1));
+        assert_eq!(paged["meta"]["limit"], json!(1));
+        assert_eq!(paged["data"].as_array().expect("paged data").len(), 1);
+
+        // Unknown query parameters are ignored, not errors.
+        let (status, _) = server
+            .get_auth("/api/v5/audit?unknown_param=1", &token)
+            .await;
+        assert_eq!(status, 200);
+
+        // A time window excluding both entries reads as an empty page,
+        // not an error.
+        let (status, empty) = server
+            .get_auth("/api/v5/audit?gte_created_at=4102444800000000", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(empty["data"], json!([]));
+        assert_eq!(empty["meta"]["count"], json!(0));
+
+        // The outcome filter honours success.
+        let (status, filtered) = server
+            .get_auth("/api/v5/audit?operation_result=success", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert!(
+            filtered["meta"]["count"].as_u64().expect("count") >= 2,
+            "success filter keeps both entries: {filtered:?}"
+        );
+
+        let (status, _) = server
+            .delete_auth("/api/v5/api_key/w228-audit-a", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/api_key/w228-audit-b", &token)
+            .await;
+        assert_eq!(status, 204);
     }
 }
