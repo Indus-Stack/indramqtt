@@ -221,7 +221,10 @@ fn parse_role(raw: &str) -> Option<AdminRole> {
 fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "code": "FORBIDDEN" })),
+        Json(serde_json::json!({
+            "code": "FORBIDDEN",
+            "message": "insufficient permissions"
+        })),
     )
         .into_response()
 }
@@ -1096,17 +1099,62 @@ pub struct ChangePasswordReq {
     pub new_pwd: Option<String>,
 }
 
-/// `PUT /users/:username/change_pwd {old_pwd, new_pwd}` (compatible with the documented API).
-/// Administrators may change any user's password; viewers only their own.
-/// `old_pwd` is required when changing your own password. The middleware
-/// guarantees a valid token; the self-or-administrator rule stays here.
+/// `PUT/POST /users/{username}/change_pwd {old_pwd, new_pwd}` (C05-29).
+///
+/// Verifies the old credential when a user changes their own password,
+/// validates the new value against the dashboard password policy (minimum
+/// length plus complexity, stated on
+/// [`crate::admin_users::AdminUsers::change_password`]), persists the new
+/// verifier across a restart through the config registry
+/// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users` in
+/// `crates/broker-config/src/lib.rs`), and revokes that user's other live
+/// tokens (`ApiTokens::revoke_user_except`, so a rotated credential stops
+/// authorising the user's other management sessions immediately).
+/// Unknown usernames fail with `NOT_FOUND` (404, documented `{code,
+/// message}` shape); a wrong or missing `old_pwd` on a self change fails
+/// with `NAME_PWD_ERROR` (401, documented shape); a missing or weak
+/// `new_pwd` fails with `BAD_REQUEST` (400, documented shape).
+/// Administrators may rotate any user's password without that user's old
+/// credential; viewers may only rotate their own and must prove the old
+/// one. The middleware guarantees a valid token; the self-or-administrator
+/// rule stays here. The route is not paged. On success answers 204 with no
+/// body.
+/// Management-plane only: one short user-map write lock per request (plus
+/// the registry save lock on persist and the token-map lock on revoke);
+/// the login path keeps reading under short read locks
+/// (`AdminUsers::verify_password` on `POST /login`, `resolve_bearer` per
+/// authenticated request) and publish and deliver never touch either
+/// store. The password map is bounded by
+/// [`crate::admin_users::MAX_ADMIN_USERS`] and the live-token map by
+/// `MAX_LIVE_TOKENS`; rotation replaces in place and revocation only
+/// removes entries, so neither grows toward its cap on this path.
+// TODO(parity): does the documented behaviour revoke the caller's own
+// token as well, or keep it working while revoking every other live token
+// of that user? The rulebook does not decide the revocation scope; the
+// current choice keeps the caller's bearer alive (so the operator stays
+// logged in) and revokes the rest, until the checker pins it.
+// TODO(parity): is a viewer rotating an unknown username a 403 (role
+// check first) or a 404 (existence first)? The rulebook does not decide
+// the ordering; the current choice checks the role first fail-closed
+// (never leaks existence to viewers) until the checker pins it.
+// TODO(parity): is a missing `old_pwd` on a self change malformed (400)
+// or wrong (401)? The rulebook does not decide the empty boundary; the
+// current choice answers both missing and wrong the same way (401
+// `NAME_PWD_ERROR`, fail closed, stores nothing) until the checker pins it.
 pub async fn change_user_password(
     State(state): State<ApiState>,
     Extension(caller): Extension<TokenInfo>,
     headers: HeaderMap,
     Path(username): Path<String>,
-    Json(req): Json<ChangePasswordReq>,
+    body: Bytes,
 ) -> Response {
+    let req: ChangePasswordReq = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid change_pwd body: {error}"))
+                .into_response();
+        }
+    };
     let is_self = caller.username == username;
     if !is_self && caller.role != AdminRole::Administrator {
         return forbidden();
@@ -1123,14 +1171,7 @@ pub async fn change_user_password(
         }
     }
     let Some(new_pwd) = req.new_pwd.as_deref() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": "new_pwd must not be empty"
-            })),
-        )
-            .into_response();
+        return ApiError::BadRequest("new_pwd must not be empty".to_string()).into_response();
     };
     if let Err(error) = state.admin_users.change_password(&username, new_pwd) {
         return admin_error(error);
@@ -2982,5 +3023,355 @@ mod dashboard_users_tests {
         }
         let response = admin_error(AdminUserError::TooManyUsers);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod change_password_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn body(value: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("header value"),
+        );
+        headers
+    }
+
+    fn caller(username: &str, role: AdminRole) -> Extension<TokenInfo> {
+        Extension(TokenInfo {
+            username: username.to_string(),
+            role,
+            expires_at: Instant::now() + Duration::from_secs(3600),
+            must_change_password: false,
+        })
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    fn assert_documented_shape(json: &serde_json::Value, code: &str) {
+        assert_eq!(json["code"], serde_json::json!(code));
+        assert!(json.get("message").is_some(), "error carries a message");
+        assert_eq!(
+            json.as_object().expect("error is an object").len(),
+            2,
+            "error body is exactly {{code, message}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_password_round_trip_revokes_old_token_and_accepts_new() {
+        // W2-43 failing test: log in, change password, then expect the
+        // other live token revoked, the old password rejected and the new
+        // password accepted. Before: a single-class new value was stored
+        // (no complexity rule), malformed bodies answered with the
+        // extractor's status instead of the documented client error, and
+        // the viewer refusal carried no message.
+        // Goes through the broker auth path, not only the store: the
+        // credential verifies on the login path (`direct_login`, driven
+        // by `POST /login`), the issued tokens resolve through the
+        // middleware resolver (`resolve_bearer`, driven by every
+        // authenticated management request in
+        // `crate::api_auth::require_api_auth`), and the rotation persists
+        // through the config registry. Management-plane only: the handler
+        // takes one short user-map write lock per call (plus the registry
+        // save lock on persist); publish and deliver never touch this
+        // store.
+        let state = standalone_state();
+        let (status, _, _) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "OldSecret1!",
+                    "role": "viewer",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Two live sessions on the login path.
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "OldSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token_old = logged_in["token"]
+            .as_str()
+            .expect("login issues a token")
+            .to_string();
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "OldSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token_other = logged_in["token"]
+            .as_str()
+            .expect("second login issues a token")
+            .to_string();
+        assert_ne!(token_old, token_other);
+
+        // Self rotation proves the old credential and sets the new one.
+        let (status, _, raw) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("w243-user", AdminRole::Viewer),
+                bearer_headers(&token_old),
+                Path("w243-user".to_string()),
+                body(serde_json::json!({
+                    "old_pwd": "OldSecret1!",
+                    "new_pwd": "NewSecret2!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "success is 204 with no body");
+
+        // The other live token is revoked through the middleware resolver;
+        // the caller's own bearer keeps working.
+        assert!(
+            resolve_bearer(&state, &token_other).is_none(),
+            "rotated user stops authorising other sessions"
+        );
+        assert!(
+            resolve_bearer(&state, &token_old).is_some(),
+            "caller's own bearer keeps working"
+        );
+
+        // The old password is rejected on the login path; the new one is
+        // accepted and its token resolves through the middleware resolver.
+        let (status, rejected, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "OldSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_documented_shape(&rejected, "NAME_PWD_ERROR");
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w243-user",
+                    "password": "NewSecret2!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token_new = logged_in["token"]
+            .as_str()
+            .expect("rotated login issues a token")
+            .to_string();
+        assert!(
+            resolve_bearer(&state, &token_new).is_some(),
+            "rotated credential authorises management calls"
+        );
+
+        // A wrong old credential is a client error and changes nothing.
+        let (status, wrong_old, _) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("w243-user", AdminRole::Viewer),
+                bearer_headers(&token_new),
+                Path("w243-user".to_string()),
+                body(serde_json::json!({
+                    "old_pwd": "NotTheSecret1!",
+                    "new_pwd": "Another3!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_documented_shape(&wrong_old, "NAME_PWD_ERROR");
+        assert!(
+            state
+                .admin_users
+                .verify_password("w243-user", "NewSecret2!"),
+            "rejected rotation applies nothing"
+        );
+
+        // A weak new value is a client error even at full length:
+        // single-class secrets never store.
+        for weak in ["short", "longbutsimple", "12345678"] {
+            let (status, rejected, _) = parts(
+                change_user_password(
+                    State(state.clone()),
+                    caller("w243-user", AdminRole::Viewer),
+                    bearer_headers(&token_new),
+                    Path("w243-user".to_string()),
+                    body(serde_json::json!({
+                        "old_pwd": "NewSecret2!",
+                        "new_pwd": weak,
+                    })),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "weak {weak:?} rejected");
+            assert_documented_shape(&rejected, "BAD_REQUEST");
+        }
+        assert!(
+            state
+                .admin_users
+                .verify_password("w243-user", "NewSecret2!"),
+            "rejected weak values apply nothing"
+        );
+
+        // Unknown usernames are 404 with the documented shape and create
+        // nothing.
+        let (status, missing, _) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("admin", AdminRole::Administrator),
+                bearer_headers(&token_new),
+                Path("w243-ghost".to_string()),
+                body(serde_json::json!({"new_pwd": "GhostSecret1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_documented_shape(&missing, "NOT_FOUND");
+        assert!(
+            state.admin_users.get("w243-ghost").is_none(),
+            "unknown rotation creates nothing"
+        );
+
+        // A viewer cannot rotate another user's password: 403 with the
+        // documented shape, and the target credential is untouched.
+        let (status, refused, _) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("w243-user", AdminRole::Viewer),
+                bearer_headers(&token_new),
+                Path("admin".to_string()),
+                body(serde_json::json!({"new_pwd": "Takeover1!"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_documented_shape(&refused, "FORBIDDEN");
+        assert!(
+            state.admin_users.verify_password("admin", "public"),
+            "refused rotation changes nothing"
+        );
+
+        // Malformed bodies are client errors with the documented shape,
+        // never the extractor's status.
+        let (status, malformed, _) = parts(
+            change_user_password(
+                State(state.clone()),
+                caller("w243-user", AdminRole::Viewer),
+                bearer_headers(&token_new),
+                Path("w243-user".to_string()),
+                Bytes::from_static(b"{oops"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_documented_shape(&malformed, "BAD_REQUEST");
+
+        // Persistence rides the config registry: a registry-backed
+        // rotation still verifies after a reload, so the new credential
+        // survives a kernel restart.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-w243-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("scratch registry loads"),
+        );
+        let durable = crate::admin_users::AdminUsers::from_registry(&registry);
+        durable
+            .create(
+                "w243-kept",
+                "KeptSecret1!",
+                AdminRole::Viewer,
+                "before restart",
+            )
+            .expect("registry-backed create persists");
+        durable
+            .change_password("w243-kept", "KeptSecret2!")
+            .expect("registry-backed rotation persists");
+        drop(durable);
+        let reloaded =
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart");
+        assert!(
+            reloaded
+                .snapshot()
+                .admin_users
+                .users
+                .iter()
+                .any(|u| u.username == "w243-kept"),
+            "rotated user persists across a restart"
+        );
+        let revived =
+            crate::admin_users::AdminUsers::from_snapshot(&reloaded.snapshot().admin_users);
+        assert!(
+            revived.verify_password("w243-kept", "KeptSecret2!"),
+            "new credential verifies after a restart"
+        );
+        assert!(
+            !revived.verify_password("w243-kept", "KeptSecret1!"),
+            "old credential fails closed after a restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

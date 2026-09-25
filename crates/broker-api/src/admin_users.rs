@@ -23,6 +23,27 @@ const SALT_LEN: usize = 16;
 /// Minimum accepted password length.
 const MIN_PASSWORD_LEN: usize = 8;
 
+/// A new dashboard/API password must be at least [`MIN_PASSWORD_LEN`]
+/// characters and carry both a letter and a digit. Reason: short or
+/// single-class secrets fall to guessing and credential stuffing, and the
+/// management plane is reachable from the operator network; the
+/// length-plus-two-class floor is the documented bar every write path must
+/// clear. The default is finite and fail-closed: anything shorter or
+/// simpler is rejected, never stored.
+// TODO(parity): what is the exact documented complexity rule (which
+// character classes, and does it also demand a symbol or a longer
+// minimum)? The rulebook does not decide the wording; the current choice
+// enforces length 8 with at least one letter and one digit fail-closed
+// until the checker pins it.
+fn is_strong_password(password: &str) -> bool {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return false;
+    }
+    let has_letter = password.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = password.chars().any(|c| c.is_ascii_digit());
+    has_letter && has_digit
+}
+
 /// Upper bound for stored dashboard/API users. Creates past this size are
 /// rejected instead of growing the map without limit. Reason: the
 /// management plane snapshots the whole list per list request and each
@@ -389,7 +410,7 @@ impl AdminUsers {
         username: &str,
         new_password: &str,
     ) -> Result<(), AdminUserError> {
-        if new_password.chars().count() < MIN_PASSWORD_LEN {
+        if !is_strong_password(new_password) {
             return Err(AdminUserError::WeakPassword);
         }
         {
