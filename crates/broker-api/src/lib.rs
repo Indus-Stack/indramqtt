@@ -4286,6 +4286,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_issues_usable_token_and_rejects_bad_and_malformed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (server, state) = TestServer::start().await;
+        let admin = server.login_as_admin().await;
+
+        // Create a fresh administrator through the broker, then log in as
+        // it: the issued token must open a follow-up management call.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "w229-op", "password": "W229-op-pass!", "role": "administrator"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let before = state.tokens.len();
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "w229-op", "password": "W229-op-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"]
+            .as_str()
+            .expect("login issues a token")
+            .to_string();
+        assert!(!token.is_empty(), "issued token must not be empty");
+        assert_eq!(body["role"], json!("administrator"));
+        assert_eq!(
+            state.tokens.len(),
+            before + 1,
+            "one successful login mints exactly one entry"
+        );
+
+        // The token carries the documented 3600 s TTL ...
+        let info = state.tokens.lookup(&token).expect("fresh token looks up");
+        let remaining = info
+            .expires_at
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining <= std::time::Duration::from_secs(3600),
+            "remaining TTL {remaining:?} must not exceed the documented 3600 s"
+        );
+        assert!(
+            remaining > std::time::Duration::from_secs(3500),
+            "remaining TTL {remaining:?} must sit at the documented 3600 s"
+        );
+
+        // ... authorises a follow-up call ...
+        let (status, me) = server.get_auth("/api/v5/current_user", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(me["username"], json!("w229-op"));
+
+        // ... and the success response sets no cookies: the token travels
+        // in the JSON body only.
+        let raw_login =
+            serde_json::to_string(&json!({"username": "w229-op", "password": "W229-op-pass!"}))
+                .expect("encode login body");
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+            .await
+            .expect("connect test server");
+        stream
+            .write_all(
+                format!(
+                    "POST /api/v5/login HTTP/1.0\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw_login}",
+                    raw_login.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write login request");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read response");
+        let text = String::from_utf8(buf).expect("response is UTF-8");
+        assert!(
+            !text.to_ascii_lowercase().contains("set-cookie"),
+            "login must not set cookies, got: {text}"
+        );
+        assert_eq!(
+            state.tokens.len(),
+            before + 2,
+            "the raw-socket success above mints one more entry"
+        );
+
+        // Wrong password: the documented error, no token, no new entry.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "w229-op", "password": "Wr0ng-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("NAME_PWD_ERROR"));
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+        assert!(
+            body.get("token").is_none(),
+            "a failed login issues no token"
+        );
+        assert_eq!(
+            state.tokens.len(),
+            before + 2,
+            "failed logins create no entries"
+        );
+
+        // Unknown user: same refusal, nothing created anywhere.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "w229-ghost", "password": "whatever-123"}),
+            )
+            .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("NAME_PWD_ERROR"));
+        assert!(body.get("token").is_none());
+        assert!(state.admin_users.get("w229-ghost").is_none());
+        assert_eq!(state.tokens.len(), before + 2);
+
+        // Malformed bodies are client errors in the documented shape and
+        // create nothing: a missing field ...
+        let (status, body) = server
+            .post("/api/v5/login", json!({"username": "w229-op"}))
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body.get("message").is_some());
+        assert_eq!(body.as_object().expect("error is an object").len(), 2);
+        assert!(body.get("token").is_none());
+        assert_eq!(state.tokens.len(), before + 2);
+
+        // ... empty credentials ...
+        let (status, body) = server
+            .post("/api/v5/login", json!({"username": "", "password": ""}))
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body.get("token").is_none());
+        assert_eq!(state.tokens.len(), before + 2);
+
+        // ... and a body that is not JSON at all.
+        let (status, raw) = server
+            .request_raw(
+                "POST /api/v5/login HTTP/1.0\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{not json!",
+            )
+            .await;
+        assert_eq!(status, 400);
+        let malformed: serde_json::Value =
+            serde_json::from_str(&raw).expect("malformed login answers JSON");
+        assert_eq!(malformed["code"], json!("BAD_REQUEST"));
+        assert!(malformed.get("token").is_none());
+        assert_eq!(state.tokens.len(), before + 2);
+
+        // Logout revokes the issued token: the follow-up call fails after.
+        let (status, _) = server
+            .send("POST", "/api/v5/logout", None, Some(&token))
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/current_user", &token).await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+    }
+
+    #[tokio::test]
     async fn scram_login_end_to_end() {
         let (server, _state) = TestServer::start().await;
         let client_nonce = "testclientnonce123";

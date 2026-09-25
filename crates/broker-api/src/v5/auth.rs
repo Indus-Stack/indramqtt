@@ -25,8 +25,18 @@ use crate::errors::ApiError;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
-/// Token lifetime: 60 minutes.
+/// Token lifetime: 3600 s (60 minutes), the documented dashboard TTL.
+/// Reason: the documented expiry for dashboard sessions; every lookup
+/// re-checks `expires_at`, and logout plus password change revoke eagerly.
 const TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+/// Upper bound on live dashboard tokens: 1024 entries, expiry-swept on
+/// every issue. Failed logins never insert.
+/// Reason: each entry holds a short token string plus identity (hundreds
+/// of bytes), so 1024 covers concurrent dashboard sessions while keeping
+/// management memory bounded regardless of login rate. The default is
+/// finite: no opt-in to unlimited exists anywhere on this path.
+/// Management-plane only: publish and deliver never touch this map.
+pub(crate) const MAX_LIVE_TOKENS: usize = 1024;
 /// SCRAM challenge lifetime: 60 seconds.
 const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 /// Upper bound on pending SCRAM challenges (flood cap).
@@ -82,6 +92,8 @@ impl ApiTokens {
     }
 
     /// Issue a random 32-byte URL-safe token bound to `username`/`role`.
+    /// Management-plane only: one short lock plus an expiry sweep per
+    /// login; publish and deliver never touch this map.
     pub fn issue(&self, username: &str, role: AdminRole) -> String {
         let mut token_bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut token_bytes);
@@ -95,8 +107,31 @@ impl ApiTokens {
         let mut tokens = self.tokens.lock().unwrap();
         let now = Instant::now();
         tokens.retain(|_, v| v.expires_at > now);
+        // TODO(parity): when the map is still full after the expiry sweep,
+        // does the documented behaviour evict the oldest entry or refuse
+        // the login? The rulebook does not decide the full-map policy; the
+        // current choice evicts the oldest-expiring entry so a live
+        // administrator can always log in, until the checker pins it.
+        while tokens.len() >= MAX_LIVE_TOKENS {
+            let oldest = tokens
+                .iter()
+                .min_by_key(|(_, info)| info.expires_at)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    tokens.remove(&key);
+                }
+                None => break,
+            }
+        }
         tokens.insert(token.clone(), info);
         token
+    }
+
+    /// Number of entries currently held (tests only).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.tokens.lock().unwrap().len()
     }
 
     /// Look up a token; unknown or expired tokens return `None`.
@@ -457,12 +492,40 @@ pub struct DirectLoginRequest {
     pub password: String,
 }
 
-pub async fn direct_login(
-    State(state): State<ApiState>,
-    Json(req): Json<DirectLoginRequest>,
-) -> Response {
-    // Only the admin-user store decides. The default `admin`/`public`
-    // already lives there; there is no shortcut and no MQTT-store fallback.
+/// `POST /login`: verify dashboard credentials against the real
+/// admin-user store and, on success, issue a live bearer token.
+///
+/// Only the admin-user store decides (constant-time password comparison
+/// in `AdminUsers::verify_password`, including a dummy derivation for
+/// unknown users so names cannot be enumerated). The default
+/// `admin`/`public` already lives there; there is no shortcut and no
+/// MQTT-store fallback. A successful login mints one entry in the
+/// bounded live-token map (`MAX_LIVE_TOKENS`, `TOKEN_TTL`); a failed
+/// login creates nothing. Tokens are revoked by logout and by password
+/// change, and expire on lookup. The route is not paged and sets no
+/// cookies: the token travels in the JSON body only.
+/// Management-plane only: one short store read plus one token-map lock
+/// per call; publish and deliver never touch either store.
+// TODO(parity): is `NAME_PWD_ERROR` the documented failure code here or
+// is it `BAD_USERNAME_OR_PWD` (the shared error module names the latter
+// as the dashboard login code)? The rulebook does not decide the exact
+// code name; the current choice keeps `NAME_PWD_ERROR` (401, documented
+// `{code, message}` shape) until the checker pins it.
+pub async fn direct_login(State(state): State<ApiState>, body: Bytes) -> Response {
+    let req: DirectLoginRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid login body: {error}")).into_response();
+        }
+    };
+    // TODO(parity): are empty credentials malformed (400) or wrong (401)?
+    // The rulebook does not decide the empty boundary; the current choice
+    // rejects empty the same way as a missing field (400, fail closed,
+    // creates nothing) until the checker pins it.
+    if req.username.trim().is_empty() || req.password.is_empty() {
+        return ApiError::BadRequest("username and password must not be empty".to_string())
+            .into_response();
+    }
     if !state
         .admin_users
         .verify_password(&req.username, &req.password)
@@ -1831,5 +1894,57 @@ mod authn_users_tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+    }
+}
+
+#[cfg(test)]
+mod login_token_tests {
+    use super::*;
+
+    #[test]
+    fn live_token_map_is_bounded() {
+        // Before the bound the map grew without limit; now it holds at
+        // most MAX_LIVE_TOKENS live entries no matter the login rate.
+        let store = ApiTokens::new();
+        for i in 0..(MAX_LIVE_TOKENS + 64) {
+            store.issue(&format!("w229-user-{i}"), AdminRole::Viewer);
+        }
+        assert!(
+            store.len() <= MAX_LIVE_TOKENS,
+            "live-token map must stay bounded at {MAX_LIVE_TOKENS}, got {}",
+            store.len()
+        );
+        assert_eq!(
+            store.len(),
+            MAX_LIVE_TOKENS,
+            "a full map of live tokens keeps exactly the bound"
+        );
+    }
+
+    #[test]
+    fn issue_sweeps_expired_entries() {
+        let store = ApiTokens::new();
+        for i in 0..8 {
+            store.issue_expired(&format!("w229-stale-{i}"), AdminRole::Viewer);
+        }
+        assert_eq!(store.len(), 8, "expired entries linger until swept");
+        store.issue("w229-fresh", AdminRole::Administrator);
+        assert_eq!(store.len(), 1, "the next issue sweeps every expired entry");
+    }
+
+    #[test]
+    fn issued_tokens_carry_the_documented_ttl() {
+        let store = ApiTokens::new();
+        let token = store.issue("w229-ttl", AdminRole::Administrator);
+        let info = store.lookup(&token).expect("fresh token looks up");
+        let remaining = info.expires_at.saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= TOKEN_TTL,
+            "remaining TTL {remaining:?} must not exceed {TOKEN_TTL:?}"
+        );
+        assert!(
+            remaining > TOKEN_TTL - Duration::from_secs(100),
+            "remaining TTL {remaining:?} must sit at the documented {TOKEN_TTL:?}"
+        );
     }
 }
