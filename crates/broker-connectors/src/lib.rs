@@ -1170,4 +1170,574 @@ mod tests {
         );
         assert_eq!(ymd_from_millis(-1), (1970, 1, 1));
     }
+
+    #[test]
+    fn test_action_types_catalogue_basics() {
+        let catalogue = action_types_catalogue();
+        assert!(!catalogue.is_empty(), "catalogue must not be empty");
+        assert!(
+            catalogue.len() <= MAX_ACTION_TYPES,
+            "catalogue must not exceed {MAX_ACTION_TYPES}"
+        );
+        let kinds: std::collections::HashSet<&str> = catalogue.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds.len(), catalogue.len(), "kinds must be unique");
+    }
+
+    #[test]
+    fn test_action_types_catalogue_matches_connector_kinds() {
+        // Every kind the kernel can execute (every non-test `Sink::kind()`
+        // in this crate) must be listed, and every listed kind must be a
+        // real connector kind: a kind is listed only if its connector
+        // module exists and its config validates. The `test`
+        // RecordingSink below is a unit-test helper, not an executable
+        // sink, so it stays out of the catalogue.
+        let catalogue = action_types_catalogue();
+        let kinds: std::collections::HashSet<&str> = catalogue.iter().map(|e| e.kind).collect();
+        let expected: std::collections::HashSet<&str> = [
+            "alloydb",
+            "aws_iot",
+            "azure_blob",
+            "azure_eventhubs",
+            "azure_iot",
+            "bigquery",
+            "cassandra",
+            "clickhouse",
+            "cockroachdb",
+            "confluent",
+            "console",
+            "couchbase",
+            "databricks",
+            "datalayers",
+            "disk_log",
+            "doris",
+            "dynamodb",
+            "elasticsearch",
+            "gcp_iot",
+            "gcp_pubsub",
+            "greptimedb",
+            "influxdb",
+            "iotdb",
+            "kafka",
+            "kinesis",
+            "mongodb",
+            "mqtt_bridge",
+            "mssql",
+            "mysql",
+            "oci_streaming",
+            "opc_ua",
+            "opentsdb",
+            "oracle",
+            "postgres",
+            "pulsar",
+            "rabbitmq",
+            "redis",
+            "redshift",
+            "rocketmq",
+            "s3",
+            "s3_tables",
+            "snowflake",
+            "sparkplug_b",
+            "tablestore",
+            "tdengine",
+            "timescaledb",
+            "timestream",
+            "webhook",
+        ]
+        .into_iter()
+        .collect();
+        if let Some(missing) = expected.difference(&kinds).next() {
+            panic!("catalogue is missing executable kind '{missing}'");
+        }
+        if let Some(invented) = kinds.difference(&expected).next() {
+            panic!("catalogue lists kind '{invented}' with no connector module");
+        }
+    }
+
+    #[test]
+    fn test_action_types_serialization_is_object_map() {
+        let catalogue = action_types_catalogue();
+        let json = serde_json::to_value(&catalogue).unwrap();
+        let arr = json.as_array().unwrap();
+        assert!(!arr.is_empty());
+        for entry in arr {
+            assert!(entry["kind"].is_string());
+            assert!(entry["description"].is_string());
+            assert!(
+                entry["configuration"].is_object(),
+                "configuration must serialize as a JSON object"
+            );
+            // tier field must not be present (not in spec)
+            assert!(
+                entry.get("tier").is_none(),
+                "tier field must not be in the response"
+            );
+        }
+    }
+}
+
+/// Upper bound on the action-types catalogue size (spec C06-01).
+/// The built-in kind set is well below this; the value is a finite safety
+/// cap — the catalogue is a static snapshot that does not grow at runtime.
+pub const MAX_ACTION_TYPES: usize = 128;
+
+/// Serialize a static slice of (key, description) pairs as a JSON object
+/// rather than an array of pairs, so the field renders as a map.
+fn serialize_config_map<S: serde::Serializer>(
+    config: &&'static [(&'static str, &'static str)],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(config.len()))?;
+    for (key, desc) in *config {
+        map.serialize_entry(key, desc)?;
+    }
+    map.end()
+}
+
+/// Catalogue entry for one action type (connector kind) with configuration
+/// shape hints. This is a static snapshot of what the kernel can execute;
+/// it does not depend on runtime registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActionTypeInfo {
+    /// Stable kind name (e.g., "kafka", "webhook", "postgres").
+    pub kind: &'static str,
+    /// Human-readable description of the connector.
+    pub description: &'static str,
+    /// Configuration shape hints: each required config key mapped to a
+    /// one-line description. Empty means the kind has no required keys.
+    #[serde(serialize_with = "serialize_config_map")]
+    pub configuration: &'static [(&'static str, &'static str)],
+}
+
+/// Compile-time catalogue of every action type the kernel can execute.
+/// A kind is listed only if its connector module exists and its config validates.
+/// The catalogue is bounded (max [`MAX_ACTION_TYPES`]) and does not grow at runtime.
+const ACTION_TYPES_CATALOGUE: &[ActionTypeInfo] = &[
+    ActionTypeInfo {
+        kind: "kafka",
+        description: "Apache Kafka producer sink",
+        configuration: &[
+            (
+                "bootstrap_servers",
+                "Kafka broker list, comma-separated host:port",
+            ),
+            ("topic", "Target topic name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "rabbitmq",
+        description: "RabbitMQ / AMQP 0.9.1 sink",
+        configuration: &[
+            ("endpoint", "Endpoint URL or host:port"),
+            ("exchange", "AMQP exchange name"),
+            ("routing_key", "AMQP routing key"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "postgres",
+        description: "PostgreSQL / TimescaleDB sink",
+        configuration: &[
+            ("connection_url", "Database connection URL with credentials"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "redis",
+        description: "Redis stream / list sink",
+        configuration: &[
+            ("endpoint", "Endpoint URL or host:port"),
+            ("key", "Stream or list key name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "mysql",
+        description: "MySQL / MariaDB sink",
+        configuration: &[
+            ("connection_url", "Database connection URL with credentials"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "clickhouse",
+        description: "ClickHouse HTTP sink",
+        configuration: &[("url", "Target URL"), ("table", "Target table name")],
+    },
+    ActionTypeInfo {
+        kind: "influxdb",
+        description: "InfluxDB v1/v2 line protocol sink",
+        configuration: &[
+            ("url", "Target URL"),
+            ("org", "InfluxDB organization"),
+            ("bucket", "Bucket or container name"),
+            ("token", "Authentication token"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "s3",
+        description: "S3 / MinIO object storage sink",
+        configuration: &[
+            ("bucket", "Bucket or container name"),
+            ("region", "AWS region"),
+            ("key_template", "Key template for object names"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "elasticsearch",
+        description: "Elasticsearch / OpenSearch bulk sink",
+        configuration: &[
+            ("url", "Target URL"),
+            ("index_template", "Index name template"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "timescaledb",
+        description: "TimescaleDB (native PostgreSQL) sink",
+        configuration: &[
+            ("connection_url", "Database connection URL with credentials"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "webhook",
+        description: "Generic HTTP webhook sink",
+        configuration: &[("url", "Target URL")],
+    },
+    ActionTypeInfo {
+        kind: "mqtt_bridge",
+        description: "MQTT bridge to another broker",
+        configuration: &[
+            ("endpoint", "Endpoint URL or host:port"),
+            ("topic_template", "Target topic template string"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "disk_log",
+        description: "Local disk log sink (JSONL, CSV, etc.)",
+        configuration: &[
+            ("directory", "Output directory path"),
+            ("format", "Log format (jsonl, csv, raw)"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "sparkplug_b",
+        description: "Sparkplug B edge node sink",
+        configuration: &[
+            ("group_id", "Sparkplug group ID"),
+            ("edge_node_id", "Sparkplug edge node ID"),
+            ("device_id", "Device ID"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "kinesis",
+        description: "AWS Kinesis Data Streams sink",
+        configuration: &[("stream_name", "Stream name"), ("region", "AWS region")],
+    },
+    ActionTypeInfo {
+        kind: "gcp_pubsub",
+        description: "Google Cloud Pub/Sub sink",
+        configuration: &[
+            ("project_id", "GCP project ID"),
+            ("topic", "Target topic name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "azure_eventhubs",
+        description: "Azure Event Hubs sink",
+        configuration: &[
+            ("namespace", "Azure Event Hubs namespace"),
+            ("event_hub", "Event hub name"),
+            ("policy_name", "SAS policy name"),
+            ("policy_key", "SAS policy key"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "pulsar",
+        description: "Apache Pulsar sink",
+        configuration: &[
+            ("service_url", "Service URL"),
+            ("topic", "Target topic name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "mongodb",
+        description: "MongoDB / DocumentDB sink",
+        configuration: &[
+            ("connection_string", "Full connection string"),
+            ("database", "Database name"),
+            ("collection", "Collection name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "mssql",
+        description: "Microsoft SQL Server / Azure SQL sink",
+        configuration: &[
+            ("connection_url", "Database connection URL with credentials"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "cassandra",
+        description: "Cassandra / ScyllaDB sink",
+        configuration: &[
+            ("contact_points", "Contact points (host:port list)"),
+            ("keyspace", "Keyspace name"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "couchbase",
+        description: "Couchbase KV sink",
+        configuration: &[
+            ("connection_string", "Full connection string"),
+            ("bucket", "Bucket or container name"),
+            ("scope", "Bucket scope name"),
+            ("collection", "Collection name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "tdengine",
+        description: "TDengine time-series sink",
+        configuration: &[
+            ("url", "Target URL"),
+            ("database", "Database name"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "iotdb",
+        description: "Apache IoTDB sink",
+        configuration: &[
+            ("url", "Target URL"),
+            ("database", "Database name"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "timestream",
+        description: "AWS Timestream sink",
+        configuration: &[
+            ("database", "Database name"),
+            ("table", "Target table name"),
+            ("region", "AWS region"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "dynamodb",
+        description: "AWS DynamoDB sink",
+        configuration: &[("table", "Target table name"), ("region", "AWS region")],
+    },
+    ActionTypeInfo {
+        kind: "snowflake",
+        description: "Snowflake data warehouse sink",
+        configuration: &[
+            ("account", "Account identifier"),
+            ("user", "Username"),
+            ("private_key", "Private key file path"),
+            ("database", "Database name"),
+            ("schema", "Schema name"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "databricks",
+        description: "Databricks SQL / Delta Lake sink",
+        configuration: &[
+            ("host", "Host address"),
+            ("token", "Authentication token"),
+            ("http_path", "HTTP path for connection"),
+            ("catalog", "Catalog name"),
+            ("schema", "Schema name"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "doris",
+        description: "Apache Doris sink",
+        configuration: &[
+            ("url", "Target URL"),
+            ("database", "Database name"),
+            ("table", "Target table name"),
+            ("user", "Username"),
+            ("password", "Password"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "bigquery",
+        description: "Google BigQuery sink",
+        configuration: &[
+            ("project_id", "GCP project ID"),
+            ("dataset", "Target dataset name"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "redshift",
+        description: "Amazon Redshift sink",
+        configuration: &[
+            ("url", "Target URL"),
+            ("table", "Target table name"),
+            ("user", "Username"),
+            ("password", "Password"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "oracle",
+        description: "Oracle Database sink",
+        configuration: &[
+            ("connection_url", "Database connection URL with credentials"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "cockroachdb",
+        description: "CockroachDB sink",
+        configuration: &[
+            ("connection_url", "Database connection URL with credentials"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "alloydb",
+        description: "Google AlloyDB sink",
+        configuration: &[
+            ("connection_url", "Database connection URL with credentials"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "opentsdb",
+        description: "OpenTSDB telnet/HTTP sink",
+        configuration: &[("host", "Host address"), ("port", "Port number")],
+    },
+    ActionTypeInfo {
+        kind: "greptimedb",
+        description: "GreptimeDB sink",
+        configuration: &[
+            ("url", "Target URL"),
+            ("database", "Database name"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "datalayers",
+        description: "Datalayers sink",
+        configuration: &[
+            ("url", "Target URL"),
+            ("token", "Authentication token"),
+            ("table", "Target table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "oci_streaming",
+        description: "OCI Streaming sink",
+        configuration: &[
+            ("stream_ocid", "Stream OCID"),
+            ("compartment_ocid", "Compartment OCID"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "aws_iot",
+        description: "AWS IoT Core sink",
+        configuration: &[
+            ("endpoint", "Endpoint URL or host:port"),
+            ("thing_name", "IoT thing name"),
+            ("cert_file", "Certificate file path"),
+            ("key_file", "Path to private key file"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "azure_iot",
+        description: "Azure IoT Hub sink",
+        configuration: &[
+            ("hub_name", "IoT Hub name"),
+            ("device_id", "Device ID"),
+            ("sas_key", "SAS key"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "gcp_iot",
+        description: "Google Cloud IoT Core sink",
+        configuration: &[
+            ("project_id", "GCP project ID"),
+            ("registry_id", "Registry ID"),
+            ("device_id", "Device ID"),
+            ("private_key", "Private key file path"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "opc_ua",
+        description: "OPC UA publisher sink",
+        configuration: &[
+            ("endpoint_url", "OPC UA endpoint URL"),
+            ("security_policy", "Security policy"),
+            ("node_id", "Node ID"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "azure_blob",
+        description: "Azure Blob Storage sink",
+        configuration: &[
+            ("account", "Account identifier"),
+            ("container", "Container name"),
+            ("key_template", "Key template for object names"),
+            ("sas_token", "SAS token"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "tablestore",
+        description: "Alibaba Tablestore sink",
+        configuration: &[
+            ("endpoint", "Endpoint URL or host:port"),
+            ("instance", "Instance ID"),
+            ("table", "Target table name"),
+            ("access_key_id", "Access key ID"),
+            ("access_key_secret", "Access key secret"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "s3_tables",
+        description: "AWS S3 Tables (Iceberg) sink",
+        configuration: &[
+            ("table_bucket_arn", "Table bucket ARN"),
+            ("table_name", "Iceberg table name"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "confluent",
+        description: "Confluent Cloud / Platform Kafka sink",
+        configuration: &[
+            (
+                "bootstrap_servers",
+                "Kafka broker list, comma-separated host:port",
+            ),
+            ("topic", "Target topic name"),
+            ("schema_registry_url", "Schema registry URL"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "rocketmq",
+        description: "Apache RocketMQ sink",
+        configuration: &[
+            ("name_server", "Name server address"),
+            ("topic", "Target topic name"),
+            ("access_key", "Access key"),
+            ("secret_key", "Secret key"),
+        ],
+    },
+    ActionTypeInfo {
+        kind: "console",
+        description: "Console logger sink (diagnostic)",
+        configuration: &[],
+    },
+];
+const _: () = assert!(
+    ACTION_TYPES_CATALOGUE.len() <= MAX_ACTION_TYPES,
+    "action types catalogue exceeds its bound"
+);
+
+/// Returns the complete catalogue of action types the kernel can execute.
+/// A kind is listed only if its connector module exists and its config validates.
+/// The catalogue is bounded (max [`MAX_ACTION_TYPES`]) and does not grow at runtime.
+pub fn action_types_catalogue() -> Vec<ActionTypeInfo> {
+    ACTION_TYPES_CATALOGUE.to_vec()
 }

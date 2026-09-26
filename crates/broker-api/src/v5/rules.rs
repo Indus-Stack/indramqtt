@@ -4430,20 +4430,8 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
 // Action Types & Probe (real catalogue/probe, kept)
 // ---------------------------------------------------------------------------
 pub async fn get_action_types() -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!([
-            "kafka",
-            "pgsql",
-            "mysql",
-            "redis",
-            "mongodb",
-            "clickhouse",
-            "s3",
-            "http"
-        ])),
-    )
-        .into_response()
+    let catalogue = broker_connectors::action_types_catalogue();
+    (StatusCode::OK, Json(serde_json::json!(catalogue))).into_response()
 }
 
 pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {

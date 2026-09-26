@@ -11537,4 +11537,53 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 204);
     }
+
+    #[tokio::test]
+    async fn action_types_catalogue_lists_executable_kinds() {
+        // W3-01 failing test: GET /action_types returns the catalogue of
+        // supported action kinds with per-entry kind plus configuration
+        // shape hints; an unknown query parameter is ignored. Before:
+        // the handler returned a hardcoded array of 8 strings with wrong
+        // names ("pgsql", "http") and no shape hints.
+        // Broker-through: the request goes through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`); the catalogue
+        // itself is a static snapshot owned by `broker-connectors`
+        // (`action_types_catalogue` in
+        // `crates/broker-connectors/src/lib.rs`), read only on this
+        // management GET and never consulted on publish or deliver.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server.get_auth("/api/v5/action_types", &token).await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("catalogue is a list");
+        assert!(!entries.is_empty(), "catalogue must not be empty");
+        for entry in entries {
+            assert!(entry["kind"].is_string(), "entry carries kind: {entry:?}");
+            assert!(
+                entry["configuration"].is_object(),
+                "entry carries configuration shape hints: {entry:?}"
+            );
+        }
+        let kinds: std::collections::HashSet<&str> =
+            entries.iter().filter_map(|e| e["kind"].as_str()).collect();
+        assert_eq!(kinds.len(), entries.len(), "kinds must be unique");
+        for expected in ["kafka", "postgres", "mysql", "redis", "webhook", "s3"] {
+            assert!(kinds.contains(expected), "catalogue lists '{expected}'");
+        }
+        for wrong in ["pgsql", "http"] {
+            assert!(
+                !kinds.contains(wrong),
+                "catalogue has no invented '{wrong}'"
+            );
+        }
+
+        // Unknown query parameters are ignored, never an error.
+        let (status, again) = server
+            .get_auth("/api/v5/action_types?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(again, body);
+    }
 }
