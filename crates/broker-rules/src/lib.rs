@@ -3,6 +3,7 @@ use broker_connectors::ConnectorManager;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use bytes::Bytes;
 use parking_lot::RwLock;
+use rekuiper_core::{RuleCounters, StreamBus, StreamReceiver, StreamSender};
 use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
 
 /// Bounded on-disk spill buffer behind [`BackpressurePolicy::SpillToDisk`].
@@ -15,6 +16,12 @@ pub mod std_sql;
 /// `FUNCTIONS.md`, implementations registered as user functions on the
 /// streaming engine's public registry. No engine source is changed.
 pub mod stdlib;
+
+/// RX-01 embeddable rule-task runtime: broker rules on rekuiper's runtime
+/// (bounded [`rekuiper_core::StreamBus`] feed, per-rule tasks, sink bridge).
+/// Bounds, the ingress [`rekuiper_core::StreamRecord`] conversion and the
+/// [`runtime::RuleOutputSink`] bridge trait live here.
+pub mod runtime;
 
 /// The streaming-SQL function catalog (name, category, aggregate flag,
 /// arity, example) served to the dashboard SQL studio.
@@ -483,7 +490,9 @@ impl EventInput for BoundedEventInput {
 /// Open-core licensing tier of a rule, derived from its SQL at creation:
 /// any `GROUP BY` window clause (`TUMBLINGWINDOW`, `HOPPINGWINDOW`,
 /// `SLIDINGWINDOW`, `COUNTWINDOW`) makes a rule Enterprise; everything
-/// else is Community.
+/// else is Community. Tier labels stay for display but never select the
+/// execution path: every window rule runs on rekuiper's runtime
+/// (see [`runtime`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleTier {
@@ -494,9 +503,11 @@ pub enum RuleTier {
 /// `sql_query` is an optional streaming-SQL program parsed once at
 /// creation into `parsed_query`. Community rules (no window clause) run
 /// statelessly at ingress: matching JSON payloads are filtered (WHERE)
-/// and projected (SELECT). Enterprise rules (window clause present)
-/// accumulate matching records in a background worker and evaluate
-/// multi-event aggregations per window close. `parsed_query` is skipped
+/// and projected (SELECT). Rules with a window clause run on rekuiper's
+/// runtime: matching ingress is converted once to a
+/// [`rekuiper_core::StreamRecord`], handed to the rule's task over the
+/// bounded [`rekuiper_core::StreamBus`], and evaluated per window close by
+/// that task. `parsed_query` is skipped
 /// in JSON output: the wire form carries the source SQL string, which
 /// re-parses on creation.
 #[derive(Debug, Clone, Serialize)]
@@ -651,16 +662,30 @@ mod qos_serde {
 /// and are never re-dispatched, so rules cannot recurse through their
 /// own output.
 ///
-/// Enterprise (windowed) rules do not execute inline: matching records
-/// are pushed to a per-rule background worker ([`WindowWorker`]) that
-/// aggregates per window close and dispatches through the actions.
+/// Enterprise (windowed) rules do not execute inline: matching ingress is
+/// converted once to a [`rekuiper_core::StreamRecord`] and handed to the
+/// rule's task ([`RuleTask`]) over the bounded [`rekuiper_core::StreamBus`]);
+/// the task aggregates per window close and dispatches through the
+/// [`runtime::RuleOutputSink`] bridge.
 pub struct RuleEngine {
     rules: RwLock<HashMap<String, Arc<Rule>>>,
     next_id: AtomicU64,
     input: Arc<BoundedEventInput>,
     connectors: Arc<ConnectorManager>,
     flush_ctx: Arc<FlushContext>,
-    window_workers: RwLock<HashMap<String, WindowWorker>>,
+    /// Embedded rule runtime transport: one [`rekuiper_core::StreamBus`]
+    /// per engine plus its send handle for [`runtime::RULE_INGRESS_STREAM`].
+    /// Every windowed rule's task subscribes; the publish path hands each
+    /// windowed ingress over with [`StreamSender::send`] (async admission
+    /// with backpressure).
+    stream_bus: StreamBus,
+    ingress_sender: StreamSender,
+    /// One live rule task per windowed rule (see [`RuleTask`]).
+    rule_tasks: RwLock<HashMap<String, RuleTask>>,
+    /// Windowed ingress records dropped because runtime admission failed
+    /// (the rule task closed mid-admission). Counted with a warning; bus
+    /// backpressure awaits capacity instead of dropping on full.
+    runtime_feed_dropped: AtomicU64,
     window_channel_depth: usize,
     forward_throttle: Arc<parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>>,
     /// Kernel config registry receiving every rule mutation (`None` in
@@ -671,8 +696,8 @@ pub struct RuleEngine {
     save_lock: parking_lot::Mutex<()>,
 }
 
-/// Shared flush context: what a window worker needs at flush time. The
-/// broker sink is installed post-construction via
+/// Shared flush context: what a rule-task sink worker needs at emit time.
+/// The broker sink is installed post-construction via
 /// [`RuleEngine::set_broker_sink`] (the engine is built before the node
 /// sink exists); connectors are shared with the engine itself.
 struct FlushContext {
@@ -683,23 +708,49 @@ struct FlushContext {
 
 /// One timestamped record waiting inside a window buffer. The ingress
 /// topic travels along so flush dispatches carry real routing context.
-/// `injected` plus `std_has_wildcard`/`std_explicit_keys` carry the
+/// `qos` carries the ingress QoS so flush delivery stays
+/// `min(ingress QoS, action QoS)` and a rule can never upgrade delivery
+/// guarantees. `injected` plus `std_has_wildcard`/`std_explicit_keys` carry the
 /// standard front-end projection state so window flushes strip injected
 /// message keys from `SELECT *` exactly like the inline path.
 #[derive(Debug, Clone)]
 struct TimedRecord {
     arrived_ms: u64,
     topic: Topic,
+    qos: QoS,
     record: HashMap<String, serde_json::Value>,
     injected: Vec<String>,
     std_has_wildcard: bool,
     std_explicit_keys: Vec<String>,
 }
 
-/// Background aggregation worker for one Enterprise window rule.
-struct WindowWorker {
-    handle: tokio::task::JoinHandle<()>,
-    tx: mpsc::Sender<TimedRecord>,
+/// One live rule task on rekuiper's runtime for a windowed rule: a bus
+/// feeder (bus subscription into the bounded rule-task feed), an eval loop
+/// (window aggregation per close) and a sink worker (bounded sink queue
+/// into the [`runtime::RuleOutputSink`] bridge). Created by
+/// `ensure_rule_task`, aborted on remove/seed (start/stop/delete with abort
+/// semantics). The per-rule [`RuleCounters`] travel with the task;
+/// `status` is `running` until the task is stopped.
+struct RuleTask {
+    eval: tokio::task::JoinHandle<()>,
+    feeder: tokio::task::JoinHandle<()>,
+    sink_worker: tokio::task::JoinHandle<()>,
+    /// Bounded rule-task feed (replacement for the retired worker channel):
+    /// depth is [`DEFAULT_WINDOW_CHANNEL_DEPTH`]. A full feed drops with a
+    /// warning and a counter, never blocks publish.
+    feed_tx: mpsc::Sender<TimedRecord>,
+    counters: Arc<RuleCounters>,
+    status: Arc<RwLock<String>>,
+}
+
+/// One evaluated output row waiting in a rule-task sink queue: the
+/// partition's first record topic (real routing context), the ingress QoS
+/// floor (`min` over the flushed batch) so republish stays
+/// `min(ingress QoS, action QoS)`, plus the encoded row bytes.
+struct SinkRow {
+    topic: Topic,
+    qos: QoS,
+    payload: Bytes,
 }
 
 /// The parsed result of a standard-dialect rule SQL statement.
@@ -720,31 +771,82 @@ type EnrichedWindowRecord = (
     Vec<String>,
 );
 
-/// Configuration for a window worker, grouping parameters to avoid
+/// Configuration for a rule-task eval loop, grouping parameters to avoid
 /// clippy::too_many_arguments.
-struct WindowWorkerConfig {
+struct RuleTaskConfig {
     rule_id: String,
     stmt: SelectStmt,
-    actions: Vec<RuleAction>,
-    flush_ctx: Arc<FlushContext>,
-    rx: mpsc::Receiver<TimedRecord>,
+    feed_rx: mpsc::Receiver<TimedRecord>,
+    sink_tx: mpsc::Sender<SinkRow>,
     window: WindowDef,
-    counters: ActionCounters,
     std_has_wildcard: bool,
     std_explicit_keys: Vec<String>,
 }
 
-/// Default per-rule window worker ingress depth (INDRA-215): large
+/// Configuration for a rule-task bus feeder: what the feeder needs to turn
+/// bus [`rekuiper_core::StreamRecord`]s into feed records. Grouped to avoid
+/// clippy::too_many_arguments.
+struct RuleFeederConfig {
+    rule_id: String,
+    topic_filter: TopicFilter,
+    std_sources: Vec<StdSource>,
+    has_foreach: bool,
+    parsed_query: Option<SelectStmt>,
+    std_has_wildcard: bool,
+    std_explicit_keys: Vec<String>,
+    feed_tx: mpsc::Sender<TimedRecord>,
+    bus_rx: StreamReceiver,
+    counters: Arc<RuleCounters>,
+}
+
+/// The runtime sink bridge: [`runtime::RuleOutputSink`] over the broker's
+/// [`ConnectorManager::send`] and [`BrokerSink::publish`]. Built once per
+/// rule task (cold path only, so the publish path pays no new allocation):
+/// the inline stateless path keeps calling [`run_actions`] directly with
+/// the same guarantee. Delivery QoS is `min(action QoS, cap)`; the sink
+/// worker passes the flushed batch's ingress-QoS floor as the cap so a
+/// windowed rule can never upgrade delivery guarantees, exactly like the
+/// inline path.
+struct BrokerRuleSink {
+    rule_id: String,
+    actions: Vec<RuleAction>,
+    flush_ctx: Arc<FlushContext>,
+    counters: ActionCounters,
+    task_counters: Arc<RuleCounters>,
+}
+
+#[async_trait]
+impl runtime::RuleOutputSink for BrokerRuleSink {
+    async fn emit(&self, topic: Topic, payload: Bytes, qos_cap: QoS) {
+        let sink = self.flush_ctx.broker_sink.read().clone();
+        run_actions(
+            &self.rule_id,
+            &self.actions,
+            &topic,
+            payload,
+            qos_cap,
+            &self.flush_ctx.connectors,
+            sink.as_ref(),
+            &self.counters,
+            &self.flush_ctx.forward_throttle,
+        )
+        .await;
+        self.task_counters.inc_sink_out(1);
+    }
+}
+
+/// Default per-rule task feed ingress depth (INDRA-215): large
 /// enough for high-scale bursts without drops, still bounded so a
-/// stalled worker cannot grow memory without limit. Backpressure stays
-/// at the edge input queue; a full worker buffer drops with a warning,
+/// stalled task cannot grow memory without limit. Backpressure stays
+/// at the edge input queue; a full task feed drops with a warning,
 /// never blocks. Override per engine via
 /// [`RuleEngine::new_with_window_depth`] or
-/// [`RuleEngine::with_window_channel_depth`].
+/// [`RuleEngine::with_window_channel_depth`]. Same value as
+/// [`runtime::RULE_TASK_FEED_DEPTH`]: the rule-task feed bound.
 pub const DEFAULT_WINDOW_CHANNEL_DEPTH: usize = 65_536;
 
 /// Wall-clock milliseconds.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -769,7 +871,7 @@ impl RuleEngine {
     /// Create an engine with a bounded ingress queue (`capacity` floors at
     /// 1). The queue backs future async ingestion; the hot path calls
     /// [`RuleEngine::dispatch_ingress`] synchronously for determinism.
-    /// Window worker channels use [`DEFAULT_WINDOW_CHANNEL_DEPTH`].
+    /// Rule-task feed channels use [`DEFAULT_WINDOW_CHANNEL_DEPTH`].
     pub fn new(queue_capacity: usize, policy: BackpressurePolicy) -> Self {
         Self::new_with_window_depth(queue_capacity, policy, DEFAULT_WINDOW_CHANNEL_DEPTH)
     }
@@ -777,7 +879,7 @@ impl RuleEngine {
     /// Create an engine whose ingress queue spills to disk under
     /// pressure (`SpillToDisk` policy with a bounded buffer in `dir`).
     /// Opening recovers the directory, so a previous engine's spilled
-    /// events survive the restart. Window worker channels use
+    /// events survive the restart. Rule-task feed channels use
     /// [`DEFAULT_WINDOW_CHANNEL_DEPTH`]. A bad directory fails loudly.
     pub fn new_with_spill(
         queue_capacity: usize,
@@ -804,6 +906,8 @@ impl RuleEngine {
         stdlib::ensure_stdlib_registered();
         let connectors = Arc::new(ConnectorManager::new());
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let stream_bus = StreamBus::new();
+        let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
             rules: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -814,7 +918,10 @@ impl RuleEngine {
                 broker_sink: RwLock::new(None),
                 forward_throttle: forward_throttle.clone(),
             }),
-            window_workers: RwLock::new(HashMap::new()),
+            stream_bus,
+            ingress_sender,
+            rule_tasks: RwLock::new(HashMap::new()),
+            runtime_feed_dropped: AtomicU64::new(0),
             window_channel_depth: window_channel_depth.max(1),
             forward_throttle,
             registry: RwLock::new(None),
@@ -822,7 +929,7 @@ impl RuleEngine {
         }
     }
 
-    /// Create an engine with an explicit per-rule window worker channel
+    /// Create an engine with an explicit per-rule task feed channel
     /// depth (`depth` floors at 1, no ceiling). Use 65,536+ for
     /// high-scale bursts.
     pub fn new_with_window_depth(
@@ -834,6 +941,8 @@ impl RuleEngine {
         stdlib::ensure_stdlib_registered();
         let connectors = Arc::new(ConnectorManager::new());
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let stream_bus = StreamBus::new();
+        let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
             rules: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -844,7 +953,10 @@ impl RuleEngine {
                 broker_sink: RwLock::new(None),
                 forward_throttle: forward_throttle.clone(),
             }),
-            window_workers: RwLock::new(HashMap::new()),
+            stream_bus,
+            ingress_sender,
+            rule_tasks: RwLock::new(HashMap::new()),
+            runtime_feed_dropped: AtomicU64::new(0),
             window_channel_depth: window_channel_depth.max(1),
             forward_throttle,
             registry: RwLock::new(None),
@@ -852,14 +964,14 @@ impl RuleEngine {
         }
     }
 
-    /// Override the window worker channel depth after construction
-    /// (floors at 1, no ceiling). Applies to workers spawned from here on.
+    /// Override the rule-task feed channel depth after construction
+    /// (floors at 1, no ceiling). Applies to tasks spawned from here on.
     pub fn with_window_channel_depth(mut self, depth: usize) -> Self {
         self.window_channel_depth = depth.max(1);
         self
     }
 
-    /// Configured per-rule window worker channel depth.
+    /// Configured per-rule task feed channel depth.
     pub fn window_channel_depth(&self) -> usize {
         self.window_channel_depth
     }
@@ -888,21 +1000,70 @@ impl RuleEngine {
         &self.connectors
     }
 
-    /// Install (or replace) the broker sink used by window-flush
-    /// republish actions. Called once by the node after the shared sink
-    /// exists; the inline stateless path keeps taking its sink per call.
+    /// Install (or replace) the broker sink used by rule-task sink
+    /// workers for republish actions. Called once by the node after the
+    /// shared sink exists; the inline stateless path keeps taking its sink
+    /// per call.
     pub fn set_broker_sink(&self, sink: Arc<dyn BrokerSink>) {
         *self.flush_ctx.broker_sink.write() = Some(sink);
     }
 
-    /// The currently installed flush sink, if any.
+    /// The currently installed task sink, if any.
     pub fn broker_sink(&self) -> Option<Arc<dyn BrokerSink>> {
         self.flush_ctx.broker_sink.read().clone()
     }
 
-    /// Live window worker count (observability/testing hook).
-    pub fn window_worker_count(&self) -> usize {
-        self.window_workers.read().len()
+    /// Live rule-task count on the embedded runtime
+    /// (observability/testing hook).
+    pub fn rule_task_count(&self) -> usize {
+        self.rule_tasks.read().len()
+    }
+
+    /// Send handle for the runtime ingress stream
+    /// ([`runtime::RULE_INGRESS_STREAM`]). The publish path uses it with
+    /// async admission and backpressure ([`StreamSender::send`]); sync
+    /// non-blocking [`StreamSender::try_send`] stays reserved for cyclic
+    /// feedback only. Exposed so qualification tests can
+    /// drive the exact transport the broker uses.
+    pub fn ingress_sender(&self) -> &StreamSender {
+        &self.ingress_sender
+    }
+
+    /// Windowed ingress records dropped because runtime admission failed
+    /// (the rule task closed mid-admission; fail closed and counted).
+    /// Bus backpressure awaits subscriber capacity, so a full bus waits
+    /// instead of dropping.
+    pub fn runtime_feed_dropped(&self) -> u64 {
+        self.runtime_feed_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Lifecycle status of one rule task (`running`/`stopped`), if present.
+    pub fn rule_task_status(&self, id: &str) -> Option<String> {
+        self.rule_tasks
+            .read()
+            .get(id)
+            .map(|task| task.status.read().clone())
+    }
+
+    /// Per-rule runtime counters of one rule task, if present. The hot path
+    /// never takes the task map lock: tasks hold the counters' `Arc` and
+    /// bump them lock-free.
+    pub fn rule_task_counters(&self, id: &str) -> Option<Arc<RuleCounters>> {
+        self.rule_tasks
+            .read()
+            .get(id)
+            .map(|task| task.counters.clone())
+    }
+
+    /// Bounded rule-task feed capacity for one live task, if present
+    /// (observability/testing hook). Reads the task's feed sender so the
+    /// configured [`DEFAULT_WINDOW_CHANNEL_DEPTH`] is observable per task;
+    /// the publish path never takes the task map lock.
+    pub fn rule_task_feed_capacity(&self, id: &str) -> Option<usize> {
+        self.rule_tasks
+            .read()
+            .get(id)
+            .map(|task| task.feed_tx.max_capacity())
     }
 
     /// Build and store a rule, assigning its id (`rule-<n>`).
@@ -1014,10 +1175,19 @@ impl RuleEngine {
         };
         let rule_arc = Arc::new(rule);
         self.rules.write().insert(id.clone(), rule_arc.clone());
-        // Eager worker start when a runtime is available; otherwise the
-        // first matching ingress spawns it lazily (see dispatch_ingress).
-        if tier == RuleTier::Enterprise {
-            self.ensure_worker(&rule_arc);
+        // Eager task start when a runtime is available and the rule is
+        // enabled; otherwise the first matching ingress spawns it lazily
+        // (see dispatch_ingress). A disabled windowed rule owns no task
+        // so bus fan-out can never deliver through it.
+        // Tier labels stay for display: the window clause, not the tier,
+        // selects the runtime path.
+        if rule_arc.enabled
+            && rule_arc
+                .parsed_query
+                .as_ref()
+                .is_some_and(|stmt| stmt.window.is_some())
+        {
+            self.ensure_rule_task(&rule_arc);
         }
         Ok(rule_arc.as_ref().clone())
     }
@@ -1065,14 +1235,17 @@ impl RuleEngine {
     }
 
     /// Replace all rules with the snapshot contents through the validated
-    /// create path. Existing window workers are aborted first so no
+    /// create path. Existing rule tasks are stopped and aborted first so no
     /// orphan task survives its rule; `next_id` restarts at 1 and
     /// advances past every restored numeric suffix.
     fn seed_from_snapshot(&self, conf: &broker_config::RulesConf) -> Result<(), RuleEngineError> {
         conf.validate()
             .map_err(|e| RuleEngineError::InvalidRule(format!("invalid rules snapshot: {e}")))?;
-        for (_, worker) in self.window_workers.write().drain() {
-            worker.handle.abort();
+        for (_, task) in self.rule_tasks.write().drain() {
+            *task.status.write() = "stopped".to_string();
+            task.eval.abort();
+            task.feeder.abort();
+            task.sink_worker.abort();
         }
         self.rules.write().clear();
         self.next_id.store(1, Ordering::SeqCst);
@@ -1209,11 +1382,15 @@ impl RuleEngine {
     /// Remove a rule (false when unknown; unknown ids persist nothing).
     /// Persists through the registry when one is attached; a save
     /// failure is returned and the in-memory removal stays (commit
-    /// precedes the atomic save).
+    /// precedes the atomic save). Stops and deletes the rule task first
+    /// (status flips to `stopped`, all three handles abort) so no orphan
+    /// task survives its rule and the aborted task delivers nothing more.
     pub fn remove_rule(&self, id: &str) -> Result<bool, RuleEngineError> {
-        // Abort the window worker first so no orphan task survives its rule.
-        if let Some(worker) = self.window_workers.write().remove(id) {
-            worker.handle.abort();
+        if let Some(task) = self.rule_tasks.write().remove(id) {
+            *task.status.write() = "stopped".to_string();
+            task.eval.abort();
+            task.feeder.abort();
+            task.sink_worker.abort();
         }
         let removed = self.rules.write().remove(id).is_some();
         if removed {
@@ -1224,6 +1401,10 @@ impl RuleEngine {
 
     /// Enable or disable a rule (false when unknown; unknown ids persist
     /// nothing). Persists through the registry when one is attached.
+    /// Disabling stops and deletes the rule task first (status flips to
+    /// `stopped`, all three handles abort) so a disabled windowed rule
+    /// delivers nothing more, including via another rule's bus fan-out;
+    /// re-enabling defers the task to the next matching ingress.
     pub fn set_rule_enabled(&self, id: &str, enabled: bool) -> Result<bool, RuleEngineError> {
         let found = {
             let mut rules = self.rules.write();
@@ -1237,93 +1418,74 @@ impl RuleEngine {
             }
         };
         if found {
+            if !enabled {
+                if let Some(task) = self.rule_tasks.write().remove(id) {
+                    *task.status.write() = "stopped".to_string();
+                    task.eval.abort();
+                    task.feeder.abort();
+                    task.sink_worker.abort();
+                }
+            }
             self.persist()?;
         }
         Ok(found)
     }
 
-    /// Route one matching record into an Enterprise window worker: parse
-    /// the JSON payload, evaluate the rule WHERE clause, and push passing
-    /// records into the worker channel. Lazily spawns a missing worker
-    /// (creation outside a runtime defers it to this point). Standard-dialect
-    /// `FROM` sources are consulted first (`Event` sources never fire on MQTT
-    /// ingress); the pushed record is the enriched message record so window
-    /// aggregates see `payload`/`topic`/`qos`.
-    fn dispatch_windowed(&self, rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) {
-        let stmt = match rule.parsed_query.as_ref() {
-            Some(stmt) => stmt,
-            None => return,
-        };
-        if !std_sources_match(&rule.std_sources, topic) {
-            return;
+    /// Feed matching windowed ingress into the embedded rule runtime:
+    /// convert the ingress `(topic, payload, qos)` once to a
+    /// [`rekuiper_core::StreamRecord`] and hand it to the runtime over the
+    /// in-process bounded [`StreamBus`] with async admission and
+    /// backpressure ([`StreamSender::send`]: awaits subscriber capacity, so
+    /// a burst waits for the feeder to drain instead of dropping; sync
+    /// non-blocking [`StreamSender::try_send`] stays reserved for cyclic
+    /// feedback only). Every rule task subscribes to the single shared
+    /// [`runtime::RULE_INGRESS_STREAM`] (fan-out: each subscriber receives
+    /// the one record), rebuilds the exact evaluation record, applies its
+    /// own topic-filter/WHERE gate and pushes passing records into its
+    /// bounded task feed (a full task feed drops with a warning and a
+    /// counter, never blocks publish). Lazily spawns a missing task per
+    /// matched rule (creation outside a runtime defers it to this point).
+    /// No TCP or loopback connection between the publish path and the
+    /// runtime, ever.
+    async fn feed_rule_runtime(
+        &self,
+        windowed: &[Arc<Rule>],
+        topic: &Topic,
+        payload: &Bytes,
+        qos: QoS,
+    ) {
+        for rule in windowed {
+            self.ensure_rule_task(rule);
         }
-        let (record, injected) = if rule.std_sources.is_empty() && rule.std_foreach.is_none() {
-            let record: HashMap<String, serde_json::Value> = match serde_json::from_slice(payload) {
-                Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
-                _ => return,
-            };
-            (record, Vec::new())
-        } else {
-            if rule.std_foreach.is_some() {
-                return;
-            }
-            let (record, injected) = build_std_record(topic, payload, qos);
-            // A non-object JSON payload carries no top-level object to
-            // aggregate; without any object keys the window has nothing to
-            // evaluate, so skip (fail closed).
-            let has_object = serde_json::from_slice::<serde_json::Value>(payload)
-                .map(|v| matches!(v, serde_json::Value::Object(_)))
-                .unwrap_or(false);
-            if !has_object && record.len() <= injected.len() {
-                return;
-            }
-            (record, injected)
-        };
-        stdlib::ensure_stdlib_registered();
-        let ctx = stdlib::RuleContext {
-            topic: Some(topic.as_str().to_string()),
-            qos: Some(qos as u8),
-            record: record.clone(),
-            payload_raw: std::str::from_utf8(payload).ok().map(str::to_string),
-            rule_id: rule.id.clone(),
-            ..Default::default()
-        };
-        let _guard = stdlib::RuleContextGuard::enter(ctx);
-        let passes = match stmt.where_clause.as_ref() {
-            Some(condition) => Evaluator::eval_bool(condition, &record),
-            None => true,
-        };
-        if !passes {
-            return;
-        }
-        self.ensure_worker(rule);
-        let workers = self.window_workers.read();
-        let Some(worker) = workers.get(&rule.id) else {
-            return;
-        };
-        if worker
-            .tx
-            .try_send(TimedRecord {
-                arrived_ms: now_ms(),
-                topic: topic.clone(),
-                record,
-                injected,
-                std_has_wildcard: rule.std_has_wildcard,
-                std_explicit_keys: rule.std_explicit_keys.clone(),
-            })
-            .is_err()
-        {
+        let record = runtime::ingress_to_stream_record(topic, payload, qos);
+        if let Err(e) = self.ingress_sender.send(record).await {
+            self.runtime_feed_dropped.fetch_add(1, Ordering::Relaxed);
+            let ids = windowed
+                .iter()
+                .map(|rule| rule.id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             tracing::warn!(
-                rule_id = %rule.id,
-                "window worker buffer full; ingress record dropped"
+                rule_ids = %ids,
+                error = %e,
+                "runtime feed admission failed; ingress record dropped"
             );
         }
     }
 
-    /// Ensure a background worker exists for an Enterprise window rule.
-    /// Idempotent: a second call for the same id is a no-op. Requires a
-    /// Tokio runtime (returns silently without one; dispatch retries).
-    fn ensure_worker(&self, rule: &Rule) {
+    /// Ensure a rule task exists for a windowed rule on the embedded
+    /// runtime. Idempotent: a second call for the same id is a no-op.
+    /// Requires a Tokio runtime (returns silently without one; the feed
+    /// path retries on the next ingress). Spawns three handles per task
+    /// with abort semantics: the bus feeder (bus subscription into the
+    /// bounded task feed), the eval loop (window aggregation per close)
+    /// and the sink worker (bounded sink queue into the output bridge).
+    fn ensure_rule_task(&self, rule: &Rule) {
+        // A disabled rule owns no task: never (re)spawn while disabled so
+        // shared bus fan-out cannot deliver through it.
+        if !rule.enabled {
+            return;
+        }
         let window = match rule
             .parsed_query
             .as_ref()
@@ -1332,42 +1494,188 @@ impl RuleEngine {
             Some(window) => window,
             None => return,
         };
-        if self.window_workers.read().contains_key(&rule.id) {
+        if self.rule_tasks.read().contains_key(&rule.id) {
             return;
         }
-        let runtime = match tokio::runtime::Handle::try_current() {
+        let handle = match tokio::runtime::Handle::try_current() {
             Ok(handle) => handle,
             Err(_) => {
                 tracing::warn!(
                     rule_id = %rule.id,
-                    "no async runtime: window worker deferred until first ingress"
+                    "no async runtime: rule task deferred until first ingress"
                 );
                 return;
             }
         };
-        let (tx, rx) = mpsc::channel(self.window_channel_depth);
         let stmt = match rule.parsed_query.clone() {
             Some(stmt) => stmt,
             None => return,
         };
-        let config = WindowWorkerConfig {
+        let bus_rx = self.stream_bus.subscribe(runtime::RULE_INGRESS_STREAM);
+        let (feed_tx, feed_rx) = mpsc::channel(self.window_channel_depth);
+        let (sink_tx, sink_rx) = mpsc::channel(runtime::PER_RULE_SINK_QUEUE_DEPTH);
+        let counters = Arc::new(RuleCounters::default());
+        let status = Arc::new(RwLock::new("running".to_string()));
+        let feeder = RuleFeederConfig {
+            rule_id: rule.id.clone(),
+            topic_filter: rule.topic_filter.clone(),
+            std_sources: rule.std_sources.clone(),
+            has_foreach: rule.std_foreach.is_some(),
+            parsed_query: rule.parsed_query.clone(),
+            std_has_wildcard: rule.std_has_wildcard,
+            std_explicit_keys: rule.std_explicit_keys.clone(),
+            feed_tx: feed_tx.clone(),
+            bus_rx,
+            counters: counters.clone(),
+        };
+        let eval_config = RuleTaskConfig {
             rule_id: rule.id.clone(),
             stmt,
-            actions: rule.actions.clone(),
-            flush_ctx: self.flush_ctx.clone(),
-            rx,
+            feed_rx,
+            sink_tx,
             window,
-            counters: ActionCounters::from_rule(rule),
             std_has_wildcard: rule.std_has_wildcard,
             std_explicit_keys: rule.std_explicit_keys.clone(),
         };
-        let worker = WindowWorker {
-            tx,
-            handle: runtime.spawn(window_worker_loop(config)),
+        let bridge = BrokerRuleSink {
+            rule_id: rule.id.clone(),
+            actions: rule.actions.clone(),
+            flush_ctx: self.flush_ctx.clone(),
+            counters: ActionCounters::from_rule(rule),
+            task_counters: counters.clone(),
         };
-        self.window_workers.write().insert(rule.id.clone(), worker);
+        let task = RuleTask {
+            eval: handle.spawn(rule_task_loop(eval_config)),
+            feeder: handle.spawn(rule_feeder_loop(feeder)),
+            sink_worker: handle.spawn(rule_sink_loop(sink_rx, bridge)),
+            feed_tx,
+            counters,
+            status,
+        };
+        self.rule_tasks.write().insert(rule.id.clone(), task);
     }
+}
 
+/// One rule-task bus feeder: drain this task's [`StreamBus`] subscription,
+/// rebuild the exact evaluation record from each [`StreamRecord`], apply
+/// the standard-dialect source gate and the WHERE gate, and push passing
+/// records into the bounded task feed. A full feed drops with a warning and
+/// a counter, never blocks publish (and never blocks the bus: the feeder
+/// is the only reader of its subscription).
+async fn rule_feeder_loop(config: RuleFeederConfig) {
+    let RuleFeederConfig {
+        rule_id,
+        topic_filter,
+        std_sources,
+        has_foreach,
+        parsed_query,
+        std_has_wildcard,
+        std_explicit_keys,
+        feed_tx,
+        mut bus_rx,
+        counters,
+    } = config;
+    let stmt = match parsed_query.as_ref() {
+        Some(stmt) => stmt,
+        None => return,
+    };
+    while let Some(stream_record) = bus_rx.recv().await {
+        counters.inc_source(1);
+        let Some(feeder) = runtime::split_stream_record(stream_record.data) else {
+            continue;
+        };
+        if !topic_filter.matches(&feeder.topic) {
+            continue;
+        }
+        if !std_sources_match(&std_sources, &feeder.topic) {
+            continue;
+        }
+        // Rebuild the exact evaluation record for either dialect mode:
+        // pre-front-end rules see the raw object keys only, standard rules
+        // see the enriched message record so window aggregates see
+        // `payload`/`topic`/`qos`. Standard-dialect `FOREACH` expansion
+        // never fires on MQTT ingress; a non-object payload carries no
+        // top-level object to aggregate, so both skip (fail closed).
+        let (record, injected) = if std_sources.is_empty() && !has_foreach {
+            // A non-object payload carries no top-level object to
+            // aggregate, so skip (fail closed), exactly like the old
+            // non-object early return. An empty object still proceeds.
+            if !feeder.has_object {
+                continue;
+            }
+            let mut record = feeder.record;
+            for key in &feeder.injected {
+                record.remove(key);
+            }
+            (record, Vec::new())
+        } else {
+            if has_foreach {
+                continue;
+            }
+            if !feeder.has_object && feeder.record.len() <= feeder.injected.len() {
+                continue;
+            }
+            (feeder.record, feeder.injected)
+        };
+        stdlib::ensure_stdlib_registered();
+        // Context accessors resolve against the partition's real routing
+        // context. `payload_raw` stays empty on this path: `payload()`
+        // resolves against the record's `payload` key exactly like the
+        // inline standard path, and no constant stands in for the raw
+        // bytes. Dry-run probes are unaffected (see `try_evaluate`).
+        let ctx = stdlib::RuleContext {
+            topic: Some(feeder.topic.as_str().to_string()),
+            qos: Some(feeder.qos),
+            record: record.clone(),
+            payload_raw: None,
+            rule_id: rule_id.clone(),
+            ..Default::default()
+        };
+        let _guard = stdlib::RuleContextGuard::enter(ctx);
+        let passes = match stmt.where_clause.as_ref() {
+            Some(condition) => Evaluator::eval_bool(condition, &record),
+            None => true,
+        };
+        if !passes {
+            continue;
+        }
+        // Carry the ingress QoS into the window buffer so flush delivery
+        // stays `min(ingress QoS, action QoS)`. A malformed transport QoS
+        // is unreachable (the conversion writes 0/1/2); fail closed to the
+        // lowest QoS so a rule can never upgrade delivery guarantees.
+        let ingress_qos = QoS::try_from(feeder.qos).unwrap_or(QoS::AtMostOnce);
+        if feed_tx
+            .try_send(TimedRecord {
+                arrived_ms: now_ms(),
+                topic: feeder.topic,
+                qos: ingress_qos,
+                record,
+                injected,
+                std_has_wildcard,
+                std_explicit_keys: std_explicit_keys.clone(),
+            })
+            .is_err()
+        {
+            counters.inc_dropped(1);
+            tracing::warn!(
+                rule_id = %rule_id,
+                "rule-task feed full; ingress record dropped"
+            );
+        }
+    }
+}
+
+/// One rule-task sink worker: drain the bounded per-rule sink queue into
+/// the [`runtime::RuleOutputSink`] bridge, in order. Runs behind the eval
+/// loop, so connector sends stay behind the rule engine's bounded queue.
+async fn rule_sink_loop(mut sink_rx: mpsc::Receiver<SinkRow>, bridge: BrokerRuleSink) {
+    use runtime::RuleOutputSink;
+    while let Some(row) = sink_rx.recv().await {
+        bridge.emit(row.topic, row.payload, row.qos).await;
+    }
+}
+
+impl RuleEngine {
     /// Execute every enabled rule whose filter matches `topic`.
     /// Delivery QoS per republish is `min(ingress QoS, action QoS)` so a
     /// rule can never upgrade delivery guarantees. Rules carrying SQL
@@ -1378,9 +1686,10 @@ impl RuleEngine {
     /// still run. Returns the number of rules that matched (for the
     /// `indramqtt_rules_executed_total` counter).
     ///
-    /// Enterprise window rules never execute inline: matching records
-    /// passing the WHERE clause are pushed to the rule's background
-    /// worker instead (still counted as matched).
+    /// Windowed rules never execute inline: matching ingress is converted
+    /// once and fed to the rule's task on the embedded runtime (still
+    /// counted as matched). Tier labels stay for display and never select
+    /// the path: the window clause does.
     pub async fn dispatch_ingress(
         &self,
         topic: &Topic,
@@ -1401,13 +1710,22 @@ impl RuleEngine {
         };
         for rule in &matched {
             rule.matched_cnt.fetch_add(1, Ordering::Relaxed);
-            if rule.tier == RuleTier::Enterprise
-                && rule
-                    .parsed_query
-                    .as_ref()
-                    .is_some_and(|stmt| stmt.window.is_some())
+        }
+        // Tier labels stay for display: the window clause, not the
+        // tier, selects the runtime path, so every window rule runs on
+        // rekuiper's runtime. Windowed ingress is converted once and
+        // sent once over the shared fan-out bus; each task self-filters.
+        let mut windowed: Vec<Arc<Rule>> = Vec::new();
+        for rule in &matched {
+            // Tier labels stay for display: the window clause, not the
+            // tier, selects the runtime path, so every window rule runs on
+            // rekuiper's runtime.
+            if rule
+                .parsed_query
+                .as_ref()
+                .is_some_and(|stmt| stmt.window.is_some())
             {
-                self.dispatch_windowed(rule, topic, payload, qos);
+                windowed.push(rule.clone());
                 continue;
             }
             let outputs = apply_rule(rule, topic, payload, qos);
@@ -1430,6 +1748,9 @@ impl RuleEngine {
                 )
                 .await;
             }
+        }
+        if !windowed.is_empty() {
+            self.feed_rule_runtime(&windowed, topic, payload, qos).await;
         }
         // B4-07 live wiring: every broker ingress (see
         // `crates/broker-node/src/main.rs:ingress_pipeline_with_publisher`,
@@ -1464,11 +1785,11 @@ impl RuleEngine {
 }
 
 /// Execute one rule's actions for a single output row. Shared by the
-/// inline stateless path and window flushes. `qos_cap` floors delivery:
+/// inline stateless path and rule-task sink workers. `qos_cap` floors delivery:
 /// the inline path passes the ingress QoS (`min(action, ingress)`), the
-/// flush path passes [`QoS::ExactlyOnce`] so the action QoS applies
-/// verbatim. A missing broker sink drops republish actions with a
-/// warning instead of panicking.
+/// flush path passes the flushed batch's ingress-QoS floor
+/// (`min(action, ingress floor)`). A missing broker sink drops republish
+/// actions with a warning instead of panicking.
 #[allow(clippy::too_many_arguments)]
 async fn run_actions(
     rule_id: &str,
@@ -1552,18 +1873,19 @@ async fn run_actions(
     }
 }
 
-/// Background aggregation loop for one Enterprise window rule. Time
-/// windows tick; count windows flush on arrivals; sliding windows
-/// aggregate on every arrival. An empty window never dispatches.
-async fn window_worker_loop(config: WindowWorkerConfig) {
-    let WindowWorkerConfig {
+/// Rule-task eval loop for one windowed rule on the embedded runtime.
+/// Time windows tick; count windows flush on arrivals; sliding windows
+/// aggregate on every arrival. An empty window never dispatches. Closed
+/// windows go to the bounded per-rule sink queue (`sink_tx`); a full sink
+/// queue applies backpressure here (await), which fills the task feed,
+/// which drops with a counter — the publish path itself never blocks.
+async fn rule_task_loop(config: RuleTaskConfig) {
+    let RuleTaskConfig {
         rule_id,
         stmt,
-        actions,
-        flush_ctx,
-        mut rx,
+        mut feed_rx,
+        sink_tx,
         window,
-        counters,
         std_has_wildcard,
         std_explicit_keys,
     } = config;
@@ -1579,10 +1901,10 @@ async fn window_worker_loop(config: WindowWorkerConfig) {
                     _ = ticker.tick() => {
                         let end = now_ms();
                         let batch = std::mem::take(&mut buffer);
-                        flush_window(&rule_id, &stmt, &actions, batch, window_start, end, &flush_ctx, &counters, std_has_wildcard, &std_explicit_keys).await;
+                        flush_rule_window(&rule_id, &stmt, batch, window_start, end, &sink_tx, std_has_wildcard, &std_explicit_keys).await;
                         window_start = end;
                     }
-                    rec = rx.recv() => {
+                    rec = feed_rx.recv() => {
                         match rec {
                             Some(record) => buffer.push(record),
                             None => break,
@@ -1595,7 +1917,7 @@ async fn window_worker_loop(config: WindowWorkerConfig) {
             let size = size.max(1);
             let mut buffer: Vec<TimedRecord> = Vec::new();
             let mut since_flush = 0usize;
-            while let Some(record) = rx.recv().await {
+            while let Some(record) = feed_rx.recv().await {
                 buffer.push(record);
                 since_flush += 1;
                 let step = interval.unwrap_or(size).max(1);
@@ -1610,15 +1932,13 @@ async fn window_worker_loop(config: WindowWorkerConfig) {
                         std::mem::take(&mut buffer)
                     };
                     let start = batch.first().map(|r| r.arrived_ms).unwrap_or(end);
-                    flush_window(
+                    flush_rule_window(
                         &rule_id,
                         &stmt,
-                        &actions,
                         batch,
                         start,
                         end,
-                        &flush_ctx,
-                        &counters,
+                        &sink_tx,
                         std_has_wildcard,
                         &std_explicit_keys,
                     )
@@ -1651,21 +1971,19 @@ async fn window_worker_loop(config: WindowWorkerConfig) {
                             buffer.pop_front();
                         }
                         let batch: Vec<TimedRecord> = buffer.iter().cloned().collect();
-                        flush_window(
+                        flush_rule_window(
                             &rule_id,
                             &stmt,
-                            &actions,
                             batch,
                             cutoff,
                             end,
-                            &flush_ctx,
-                            &counters,
+                            &sink_tx,
                             std_has_wildcard,
                             &std_explicit_keys,
                         )
                         .await;
                     }
-                    rec = rx.recv() => {
+                    rec = feed_rx.recv() => {
                         match rec {
                             Some(record) => buffer.push_back(record),
                             None => break,
@@ -1677,7 +1995,7 @@ async fn window_worker_loop(config: WindowWorkerConfig) {
         WindowDef::SlidingTime { unit, length, .. } => {
             let span = window_length_ms(&unit, length);
             let mut buffer: VecDeque<TimedRecord> = VecDeque::new();
-            while let Some(record) = rx.recv().await {
+            while let Some(record) = feed_rx.recv().await {
                 let end = now_ms();
                 let cutoff = end.saturating_sub(span);
                 buffer.push_back(record);
@@ -1690,15 +2008,13 @@ async fn window_worker_loop(config: WindowWorkerConfig) {
                 }
                 // Aggregate the trailing window on every arrival.
                 let batch: Vec<TimedRecord> = buffer.iter().cloned().collect();
-                flush_window(
+                flush_rule_window(
                     &rule_id,
                     &stmt,
-                    &actions,
                     batch,
                     cutoff,
                     end,
-                    &flush_ctx,
-                    &counters,
+                    &sink_tx,
                     std_has_wildcard,
                     &std_explicit_keys,
                 )
@@ -1728,11 +2044,11 @@ async fn window_worker_loop(config: WindowWorkerConfig) {
                         let end = now_ms();
                         let start = session_start.unwrap_or(end);
                         let batch = std::mem::take(&mut buffer);
-                        flush_window(&rule_id, &stmt, &actions, batch, start, end, &flush_ctx, &counters, std_has_wildcard, &std_explicit_keys).await;
+                        flush_rule_window(&rule_id, &stmt, batch, start, end, &sink_tx, std_has_wildcard, &std_explicit_keys).await;
                         session_start = None;
                         last_arrival = None;
                     }
-                    rec = rx.recv() => {
+                    rec = feed_rx.recv() => {
                         match rec {
                             Some(record) => {
                                 let now = record.arrived_ms;
@@ -1747,7 +2063,7 @@ async fn window_worker_loop(config: WindowWorkerConfig) {
                                 last_arrival = Some(now);
                                 if now.saturating_sub(start) >= max_duration_ms {
                                     let batch = std::mem::take(&mut buffer);
-                                    flush_window(&rule_id, &stmt, &actions, batch, start, now, &flush_ctx, &counters, std_has_wildcard, &std_explicit_keys).await;
+                                    flush_rule_window(&rule_id, &stmt, batch, start, now, &sink_tx, std_has_wildcard, &std_explicit_keys).await;
                                     session_start = None;
                                     last_arrival = None;
                                 }
@@ -1764,26 +2080,36 @@ async fn window_worker_loop(config: WindowWorkerConfig) {
 /// Flush one closed window: inject `__window_start__`,
 /// `__window_end__`, `window_start`, `window_end` epoch millis into every
 /// record (so `window_start()`/`window_end()` resolve), partition by
-/// `GROUP BY` when present, evaluate aggregates per partition, and
-/// dispatch each resulting row through the rule actions. Empty windows
-/// and fully-having-filtered windows dispatch nothing. Each row routes
-/// with its partition's first record topic.
+/// `GROUP BY` when present, evaluate aggregates per partition, and enqueue
+/// each resulting row into the bounded per-rule sink queue (`sink_tx`) for
+/// the sink worker, which delivers through the [`runtime::RuleOutputSink`]
+/// bridge. Delivery QoS per row is `min(ingress QoS, action QoS)`: the
+/// batch's ingress-QoS floor travels in the sink row so a rule can never
+/// upgrade delivery guarantees. A full sink queue applies backpressure
+/// here (await); a closed queue means the rule is gone, so the flush
+/// returns. Empty windows and fully-having-filtered windows enqueue
+/// nothing. Each row routes with its partition's first record topic.
 #[allow(clippy::too_many_arguments)]
-async fn flush_window(
+async fn flush_rule_window(
     rule_id: &str,
     stmt: &SelectStmt,
-    actions: &[RuleAction],
     batch: Vec<TimedRecord>,
     window_start_ms: u64,
     window_end_ms: u64,
-    flush_ctx: &FlushContext,
-    counters: &ActionCounters,
+    sink_tx: &mpsc::Sender<SinkRow>,
     std_has_wildcard: bool,
     std_explicit_keys: &[String],
 ) {
     if batch.is_empty() {
         return;
     }
+    // Ingress-QoS floor over the flushed batch: the most conservative
+    // (lowest) ingress QoS, so `min(ingress, action)` never upgrades.
+    let qos_floor = batch
+        .iter()
+        .map(|timed| timed.qos)
+        .min()
+        .unwrap_or(QoS::AtMostOnce);
     let records: Vec<EnrichedWindowRecord> = batch
         .into_iter()
         .map(|timed| {
@@ -1824,8 +2150,6 @@ async fn flush_window(
         .first()
         .map(|(_, _, injected, _, _)| injected.clone())
         .unwrap_or_default();
-    // The sink snapshot is shared across this flush's rows.
-    let sink = flush_ctx.broker_sink.read().clone();
     for (topic, mut row) in aggregate_partitioned(stmt, agg_input, rule_id, false) {
         strip_injected_keys(
             &mut row,
@@ -1845,18 +2169,17 @@ async fn flush_window(
                 continue;
             }
         };
-        run_actions(
-            rule_id,
-            actions,
-            &topic,
-            bytes,
-            QoS::ExactlyOnce,
-            &flush_ctx.connectors,
-            sink.as_ref(),
-            counters,
-            &flush_ctx.forward_throttle,
-        )
-        .await;
+        if sink_tx
+            .send(SinkRow {
+                topic,
+                qos: qos_floor,
+                payload: bytes,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
 }
 
@@ -3706,7 +4029,7 @@ mod tests {
             )
             .expect("probe rule creates");
         assert_eq!(rule.tier, RuleTier::Community);
-        assert_eq!(engine.window_worker_count(), 0);
+        assert_eq!(engine.rule_task_count(), 0);
         let sink = Arc::new(RecordingSink::default());
         let sink_obj: Arc<dyn BrokerSink> = sink.clone();
         engine
@@ -4184,9 +4507,9 @@ mod tests {
     }
 
     #[test]
-    fn test_window_rule_created_outside_runtime_defers_worker() {
+    fn test_window_rule_created_outside_runtime_defers_task() {
         // Plain #[test]: no Tokio runtime, so eager spawn is impossible.
-        // Creation still succeeds; the worker arrives on first ingress.
+        // Creation still succeeds; the task arrives on first ingress.
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
         let rule = engine
             .create_rule(
@@ -4201,14 +4524,14 @@ mod tests {
             )
             .expect("rule creates");
         assert_eq!(rule.tier, RuleTier::Enterprise);
-        assert_eq!(engine.window_worker_count(), 0);
+        assert_eq!(engine.rule_task_count(), 0);
         assert!(engine.get_rule(&rule.id).is_some());
     }
 
     #[tokio::test]
-    async fn test_window_worker_lifecycle() {
+    async fn test_rule_task_lifecycle() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
-        assert_eq!(engine.window_worker_count(), 0);
+        assert_eq!(engine.rule_task_count(), 0);
         let rule = engine
             .create_rule(
                 "w".to_string(),
@@ -4221,12 +4544,12 @@ mod tests {
                 vec![RuleAction::Log],
             )
             .expect("rule creates");
-        assert_eq!(engine.window_worker_count(), 1);
-        // Re-creating is per-rule; removing aborts the worker.
+        assert_eq!(engine.rule_task_count(), 1);
+        // Re-creating is per-rule; removing stops and aborts the task.
         assert!(engine
             .remove_rule(&rule.id)
             .expect("memory-only remove cannot fail"));
-        assert_eq!(engine.window_worker_count(), 0);
+        assert_eq!(engine.rule_task_count(), 0);
         assert!(!engine
             .remove_rule(&rule.id)
             .expect("memory-only remove cannot fail"));
@@ -4488,7 +4811,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_window_channel_depth_reaches_worker() {
-        // The spawned worker's channel bound equals the configured depth.
+        // The spawned task's feed bound equals the configured depth.
         async fn worker_capacity(depth: usize) -> usize {
             let engine =
                 RuleEngine::new_with_window_depth(16, BackpressurePolicy::DropOldest, depth);
@@ -4506,9 +4829,9 @@ mod tests {
                 )
                 .expect("rule creates");
             ingress(&engine, &sink, br#"{ "temperature": 1.0 }"#).await;
-            let workers = engine.window_workers.read();
-            let worker = workers.get("rule-1").expect("worker spawned");
-            worker.tx.max_capacity()
+            let tasks = engine.rule_tasks.read();
+            let task = tasks.get("rule-1").expect("task spawned");
+            task.feed_tx.max_capacity()
         }
         assert_eq!(worker_capacity(65_536).await, 65_536);
         assert_eq!(worker_capacity(10_000).await, 10_000);
@@ -4582,7 +4905,7 @@ mod tests {
             ),
             republish_action(),
         );
-        assert_eq!(engine.window_worker_count(), 1);
+        assert_eq!(engine.rule_task_count(), 1);
 
         // Records buffer, then the rule disappears before any close.
         for _ in 0..5 {
@@ -4591,11 +4914,11 @@ mod tests {
         assert!(engine
             .remove_rule(&rule.id)
             .expect("memory-only remove cannot fail"));
-        assert_eq!(engine.window_worker_count(), 0);
+        assert_eq!(engine.rule_task_count(), 0);
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
             published_rows(&sink).is_empty(),
-            "aborted worker must not deliver"
+            "aborted task must not deliver"
         );
     }
 
