@@ -48,14 +48,19 @@
 // checker pins it.
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
+use serde::Deserialize;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use crate::errors::ApiError;
+use crate::pagination::{meta_page, paginate};
 use crate::ApiState;
 
 /// Upper bound for a presented licence token (16 KiB). Reason: a token is
@@ -148,6 +153,221 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// Session high-water-mark history (W5-12, C13-18):
+// `GET /api/v5/license/session_hwm_history` over real session counts.
+// ---------------------------------------------------------------------------
+
+/// Upper bound for stored HWM samples. Recording past this size evicts
+/// the oldest sample first instead of growing the buffer without limit.
+/// Reason: 90 samples cover fifteen minutes at one sample per ten seconds
+/// (the same cadence as the monitor sampler); one sample holds three
+/// integers, so the buffer stays at a few kilobytes and a management read
+/// copies at most 90 small documents.
+pub const MAX_HWM_SAMPLES: usize = 90;
+
+/// Default number of entries returned per page when the caller names no
+/// `limit`. Reason: 30 samples cover five minutes at the default cadence,
+/// enough to see recent peaks without copying the whole ring; the caller
+/// may page up to [`MAX_HWM_SAMPLES`] explicitly. The default is finite;
+/// the operator cannot opt into unlimited (the `limit` clamp below caps
+/// every request).
+pub const DEFAULT_HWM_LIMIT: u32 = 30;
+
+/// One recorded high-water-mark sample: the sampling instant
+/// (`sampled_at`, Unix seconds), the connected-session count then
+/// (`sessions`, rebuilt from session truth) and the running high-water
+/// mark (`session_hwm`, never falls within a run except across a restart,
+/// which starts a fresh memory-only ring).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HwmSample {
+    pub sampled_at: u64,
+    pub sessions: u64,
+    pub session_hwm: u64,
+}
+
+impl HwmSample {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sampled_at": self.sampled_at,
+            "timestamp": self.sampled_at,
+            "sessions": self.sessions,
+            "session_hwm": self.session_hwm,
+            "sessions_max": self.session_hwm,
+        })
+    }
+}
+
+/// Bounded HWM recorder behind one short lock plus a lock-free running
+/// maximum.
+///
+/// Store wiring (rulebook section 2: name the file and line outside
+/// `crates/broker-api` that writes or consults it, and the broker event
+/// that drives it):
+/// - writer `crates/broker-node/src/main.rs` (`sample_hwm_history`,
+///   driven by `spawn_hwm_sampler` on its timer tick plus the immediate
+///   boot sample, rebuilt from session truth via
+///   `SessionManager::connected_count`);
+/// - reader shared into `ApiState` by `serve_api` in the same file, so
+///   the handler below observes the kernel's ring instead of an empty
+///   per-request copy. The broker event that drives it is node boot plus
+///   the periodic management-plane timer tick; the publish and deliver
+///   paths never touch it.
+///
+/// Store bounds (stated here and enforced below):
+/// - at most [`MAX_HWM_SAMPLES`] samples are kept in a fixed ring
+///   (`VecDeque`); recording past the cap evicts the oldest sample
+///   instead of growing without limit;
+/// - every sample is three integers, so per-sample memory is constant;
+/// - recorder writes are constant-time (one atomic raise plus one push
+///   and at most one pop); listing copies at most the capped buffer once
+///   per request.
+///
+/// Persistence: memory-only. A restart starts a fresh empty ring (and a
+/// reset running maximum); history is rebuilt from session truth and does
+/// not need to persist across a restart beyond the persisted cap.
+///
+/// Management-plane only: the timer task and this handler run off the
+/// publish and deliver paths (edge receive, kernel route, session,
+/// deliver never touch this store).
+pub struct HwmRecorder {
+    inner: RwLock<VecDeque<HwmSample>>,
+    high: AtomicU64,
+}
+
+impl HwmRecorder {
+    /// Empty recorder with a reset running maximum.
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(VecDeque::new()),
+            high: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one sample. Constant-time: one push plus at most one pop
+    /// of the oldest sample when the buffer is full. The running maximum
+    /// is raised to at least `sample.session_hwm` so direct records and
+    /// truth samples share one monotone mark.
+    pub fn record(&self, sample: HwmSample) {
+        self.high.fetch_max(sample.session_hwm, Ordering::Relaxed);
+        let mut buffer = self.inner.write().expect("hwm store lock");
+        if buffer.len() >= MAX_HWM_SAMPLES {
+            buffer.pop_front();
+        }
+        buffer.push_back(sample);
+    }
+
+    /// Rebuild one sample from session truth and record it: read the live
+    /// connected-session count from the session directory, raise the
+    /// running maximum to at least that count, and store the point.
+    /// Constant-time like [`Self::record`]. Returns the stored sample.
+    /// Management-plane only; never called on the publish or deliver
+    /// path (only the kernel timer task and management tests call it).
+    pub fn sample_session_truth(
+        &self,
+        sessions: &broker_session::SessionManager,
+        now_secs: u64,
+    ) -> HwmSample {
+        let current = sessions.connected_count();
+        let previous = self.high.fetch_max(current, Ordering::Relaxed);
+        let mark = previous.max(current);
+        let sample = HwmSample {
+            sampled_at: now_secs,
+            sessions: current,
+            session_hwm: mark,
+        };
+        let mut buffer = self.inner.write().expect("hwm store lock");
+        if buffer.len() >= MAX_HWM_SAMPLES {
+            buffer.pop_front();
+        }
+        buffer.push_back(sample.clone());
+        sample
+    }
+
+    /// Snapshot of stored samples newest first. An empty store reads as
+    /// an empty list, never an error.
+    pub fn list_newest(&self) -> Vec<HwmSample> {
+        let buffer = self.inner.read().expect("hwm store lock");
+        buffer.iter().rev().cloned().collect()
+    }
+
+    /// Number of stored samples (never above [`MAX_HWM_SAMPLES`]).
+    pub fn len(&self) -> usize {
+        self.inner.read().expect("hwm store lock").len()
+    }
+
+    /// Whether any sample is stored.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for HwmRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Documented `GET /api/v5/license/session_hwm_history` paging. Only
+/// `page`/`limit` narrow the read; every other query key is ignored by
+/// the extractor so new parameters degrade to the default page instead of
+/// a 400. Malformed values fall back to the defaults below.
+#[derive(Deserialize, Default)]
+pub struct HwmHistoryQuery {
+    #[serde(default)]
+    pub page: Option<String>,
+    #[serde(default)]
+    pub limit: Option<String>,
+}
+
+fn parse_hwm_page(query: &HwmHistoryQuery) -> (u32, u32) {
+    let page = query
+        .page
+        .as_deref()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let limit = query
+        .limit
+        .as_deref()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_HWM_LIMIT)
+        .clamp(1, MAX_HWM_SAMPLES as u32);
+    (page, limit)
+}
+
+/// `GET /license/session_hwm_history`: paged HWM samples, newest first.
+///
+/// Returns the standard page envelope (`data` plus `meta`). Each row
+/// carries the documented per-entry fields (`sampled_at`, `sessions`,
+/// `session_hwm`, with the `timestamp`/`sessions_max` aliases naming the
+/// same measurements). With no samples it returns an empty page with
+/// 200, never an error. Paging honours `page`/`limit` (`limit` defaults
+/// to [`DEFAULT_HWM_LIMIT`] and is clamped to `1..=90`, i.e. the
+/// [`MAX_HWM_SAMPLES`] cap is enforced); out-of-range pages read as an
+/// empty page. Unknown query parameters are ignored. Management-plane
+/// only: one short store lock per request; publish and deliver never
+/// touch this store.
+pub async fn get_session_hwm_history(
+    State(state): State<ApiState>,
+    Query(query): Query<HwmHistoryQuery>,
+) -> Response {
+    let (page, limit) = parse_hwm_page(&query);
+    let rows = state.hwm_history.list_newest();
+    let total = rows.len();
+    let rendered: Vec<serde_json::Value> = rows.iter().map(HwmSample::to_json).collect();
+    let page_items = paginate(&rendered, page, limit);
+    let data: Vec<serde_json::Value> = page_items.to_vec();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "data": data,
+            "meta": meta_page(page, limit, total),
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -424,6 +644,193 @@ mod tests {
             .await,
         )
         .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("id").is_some(), "publish answers with an id");
+    }
+
+    async fn hwm_response_parts(response: Response) -> (StatusCode, serde_json::Value) {
+        response_parts(response).await
+    }
+
+    fn hwm_query(page: Option<&str>, limit: Option<&str>) -> HwmHistoryQuery {
+        HwmHistoryQuery {
+            page: page.map(str::to_string),
+            limit: limit.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn hwm_empty_store_reads_as_empty_page_not_an_error() {
+        // W5-12 broker-through: the read goes through the served handler
+        // on shared `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), not only
+        // through the store. With no samples it returns an empty page
+        // with 200, never an error.
+        let engine = Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let state = ApiState::standalone(engine);
+        assert!(state.hwm_history.is_empty());
+        let (status, body) = hwm_response_parts(
+            get_session_hwm_history(State(state), Query(hwm_query(None, None))).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], serde_json::json!([]));
+        assert_eq!(body["meta"]["count"], serde_json::json!(0));
+        assert_eq!(body["meta"]["page"], serde_json::json!(1));
+        assert_eq!(body["meta"]["limit"], serde_json::json!(DEFAULT_HWM_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn hwm_returns_entries_newest_first_after_connects() {
+        // W5-12 failing test shape: connect clients through the session
+        // directory (the same session truth the kernel timer rebuilds
+        // from), sample the way the timer does, then fetch history
+        // through the handler expecting entries with numeric marks,
+        // newest first. Before: 404 (no route).
+        let engine = Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let state = ApiState::standalone(engine);
+        state.sessions.get_or_create("hwm-c1", true);
+        state
+            .hwm_history
+            .sample_session_truth(&state.sessions, 1_700_000_100);
+        state.sessions.get_or_create("hwm-c2", true);
+        state.sessions.get_or_create("hwm-c3", true);
+        let newest = state
+            .hwm_history
+            .sample_session_truth(&state.sessions, 1_700_000_200);
+        assert_eq!(newest.sessions, 3);
+        assert_eq!(newest.session_hwm, 3);
+        let (status, body) = hwm_response_parts(
+            get_session_hwm_history(State(state), Query(hwm_query(None, None))).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        // Newest first: the later sample leads.
+        assert_eq!(data[0]["sampled_at"], serde_json::json!(1_700_000_200));
+        assert_eq!(data[1]["sampled_at"], serde_json::json!(1_700_000_100));
+        for row in data {
+            assert!(row["sampled_at"].is_u64(), "sample carries a time: {row}");
+            assert!(row["sessions"].is_u64(), "sample carries sessions: {row}");
+            assert!(
+                row["session_hwm"].is_u64(),
+                "sample carries a numeric mark: {row}"
+            );
+            assert!(row["timestamp"].is_u64(), "alias carries a time: {row}");
+            assert!(
+                row["sessions_max"].is_u64(),
+                "alias carries a numeric mark: {row}"
+            );
+        }
+        assert_eq!(data[0]["sessions"], serde_json::json!(3));
+        assert_eq!(data[0]["session_hwm"], serde_json::json!(3));
+        assert_eq!(body["meta"]["count"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn hwm_paging_honoured_and_cap_enforced() {
+        // W5-12 bounds: the ring holds at most MAX_HWM_SAMPLES samples
+        // (oldest evicted first), paging slices newest-first, and an
+        // over-cap limit is clamped instead of growing the read.
+        let engine = Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let state = ApiState::standalone(engine);
+        for i in 0..(MAX_HWM_SAMPLES + 5) {
+            state.hwm_history.record(HwmSample {
+                sampled_at: 1_700_000_000 + i as u64,
+                sessions: i as u64,
+                session_hwm: i as u64,
+            });
+        }
+        assert_eq!(state.hwm_history.len(), MAX_HWM_SAMPLES);
+        let rows = state.hwm_history.list_newest();
+        assert_eq!(rows.len(), MAX_HWM_SAMPLES);
+        // The five oldest samples were evicted; the newest leads.
+        assert_eq!(
+            rows[0].sampled_at,
+            1_700_000_000 + (MAX_HWM_SAMPLES + 5) as u64 - 1
+        );
+        assert_eq!(rows[rows.len() - 1].sampled_at, 1_700_000_005);
+        // First page of two holds the two newest samples.
+        let (status, first) = hwm_response_parts(
+            get_session_hwm_history(State(state.clone()), Query(hwm_query(Some("1"), Some("2"))))
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["data"].as_array().expect("list").len(), 2);
+        assert_eq!(first["meta"]["page"], serde_json::json!(1));
+        assert_eq!(first["meta"]["limit"], serde_json::json!(2));
+        assert_eq!(first["meta"]["count"], serde_json::json!(MAX_HWM_SAMPLES));
+        // An out-of-range page reads as an empty page, never an error.
+        let (status, beyond) = hwm_response_parts(
+            get_session_hwm_history(
+                State(state.clone()),
+                Query(hwm_query(Some("9999"), Some("10"))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(beyond["data"], serde_json::json!([]));
+        assert_eq!(beyond["meta"]["count"], serde_json::json!(MAX_HWM_SAMPLES));
+        // An over-cap limit is clamped to the cap instead of rejected.
+        let (status, capped) = hwm_response_parts(
+            get_session_hwm_history(State(state), Query(hwm_query(Some("1"), Some("99999")))).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            capped["meta"]["limit"],
+            serde_json::json!(MAX_HWM_SAMPLES as u32)
+        );
+        assert_eq!(
+            capped["data"].as_array().expect("list").len(),
+            MAX_HWM_SAMPLES
+        );
+    }
+
+    #[tokio::test]
+    async fn hwm_read_adds_no_work_to_publish() {
+        // Management-plane only: sampling plus a history read followed by
+        // a management publish through the rule engine and deliver path
+        // still answers 200, so customer traffic keeps serving.
+        let engine = Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let state = ApiState::standalone(engine);
+        state.sessions.get_or_create("hwm-p1", true);
+        state
+            .hwm_history
+            .sample_session_truth(&state.sessions, 1_700_000_300);
+        let (status, _) = hwm_response_parts(
+            get_session_hwm_history(State(state.clone()), Query(hwm_query(None, None))).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response = crate::v5::clients::publish_message(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "topic": "w512/probe",
+                    "payload": "hello",
+                    "qos": 0,
+                }))
+                .expect("json"),
+            ),
+        )
+        .await;
+        let (status, body) = response_parts(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.get("id").is_some(), "publish answers with an id");
     }

@@ -126,6 +126,15 @@ pub struct ApiState {
     /// stored token and trusted signing set. Management-plane only; never
     /// touched on the per-message path.
     pub licence: Arc<crate::licence::LicenceStore>,
+    /// Session HWM history recorder for `GET
+    /// /api/v5/license/session_hwm_history` (W5-12): bounded ring of
+    /// high-water-mark samples rebuilt from session truth. The kernel
+    /// timer task writes it (`crates/broker-node/src/main.rs`,
+    /// `sample_hwm_history` on the `spawn_hwm_sampler` tick plus the boot
+    /// sample) and `serve_api` in the same file shares this instance, so
+    /// management reads observe the kernel's ring. Management-plane only;
+    /// never touched on the per-message path.
+    pub hwm_history: Arc<crate::v5::license::HwmRecorder>,
     /// Ordered authenticator chain for `GET/POST /api/v5/authentication`
     /// (W2-02): bounded ordered list plus the CONNECT-time consult. The
     /// routes read one bounded snapshot per request; the kernel CONNECT
@@ -323,6 +332,7 @@ impl ApiState {
             traces: Arc::new(crate::v5::trace::TraceStore::new()),
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
+            hwm_history: Arc::new(crate::v5::license::HwmRecorder::new()),
             authn_chain,
             authn_node_cache,
             authn_settings,
@@ -383,6 +393,7 @@ impl ApiState {
             traces: Arc::new(crate::v5::trace::TraceStore::new()),
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
+            hwm_history: Arc::new(crate::v5::license::HwmRecorder::new()),
             authn_chain: Arc::new(broker_auth::AuthnChain::new()),
             authn_node_cache,
             authn_settings,

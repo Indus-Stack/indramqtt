@@ -476,6 +476,13 @@ pub fn protected_router() -> Router<ApiState> {
             "/license",
             get(license::get_license).post(license::install_license),
         )
+        // Session HWM history (W5-12, C13-18): paged newest-first read
+        // over the bounded recorder on real session counts.
+        // Management-plane only; publish and deliver never touch it.
+        .route(
+            "/license/session_hwm_history",
+            get(license::get_session_hwm_history),
+        )
         // Feature registry read (W5-11, C13-15): fixed bounded set
         // filtered by the installed licence on the real licence store.
         // Management-plane only; publish and deliver never touch it.

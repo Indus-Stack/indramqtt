@@ -1908,6 +1908,13 @@ struct Shared {
     /// lock per tick, reads take one short read lock, and the publish
     /// path never touches it.
     monitor: Arc<broker_api::v5::monitor::MonitorHistory>,
+    /// Session HWM history ring shared with the management API (W5-12,
+    /// C13-18) so the sampler below and the
+    /// `GET /license/session_hwm_history` reads observe the same bounded
+    /// buffer. One Arc clone; the sampler takes one short write lock per
+    /// tick, reads take one short read lock, and the publish and deliver
+    /// paths never touch it.
+    hwm_history: Arc<broker_api::v5::license::HwmRecorder>,
     /// Cluster routing plane. `None` runs standalone; `Some` announces
     /// local subscriptions and forwards each publish once per matching
     /// remote node (single forward per node; remotes fan out locally).
@@ -2203,6 +2210,7 @@ impl Shared {
             licence: Arc::new(broker_api::licence::LicenceStore::new()),
             alarms: Arc::new(broker_api::v5::alarms::AlarmStore::new()),
             monitor: Arc::new(broker_api::v5::monitor::MonitorHistory::new()),
+            hwm_history: Arc::new(broker_api::v5::license::HwmRecorder::new()),
             cluster: None,
             metrics,
             stats,
@@ -2969,6 +2977,52 @@ fn spawn_monitor_sampler(shared: Shared, interval_secs: u64) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(clamped)).await;
             sample_monitor(&shared);
+        }
+    });
+}
+
+/// Rebuild one session HWM sample from session truth (W5-12, C13-18):
+/// read the live connected-session count from the session directory and
+/// record it into the shared bounded ring. One atomic load plus one short
+/// ring write lock; the publish path never touches
+/// `Shared.hwm_history`, so a slow management read can never stall
+/// fan-out or fan-in. Constant-time per tick and bounded by
+/// `MAX_HWM_SAMPLES` in the ring.
+fn sample_hwm_history(shared: &Shared) {
+    shared
+        .hwm_history
+        .sample_session_truth(&shared.sessions, hwm_now_secs());
+}
+
+fn hwm_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Spawn the session HWM sampler (W5-12, C13-18): one immediate boot
+/// sample so `GET /license/session_hwm_history` reflects session truth
+/// from the first read, then one sample per `interval_secs` (the same
+/// management sampling cadence as the monitor sampler, clamped to the
+/// same 1..3600 bounds; 0 records only the boot sample). The task owns
+/// only a `Shared` clone and sleeps between ticks, so it adds no lock,
+/// allocation or unbounded work to the publish or deliver path: the
+/// recorder samples on this timer, never on the message path.
+fn spawn_hwm_sampler(shared: Shared, interval_secs: u64) {
+    sample_hwm_history(&shared);
+    if interval_secs == 0 {
+        return;
+    }
+    // Bound the timer like the monitor sampler: faster than one second
+    // wakes the task for no visible gain (samples carry one-second
+    // stamps), slower than one hour leaves the history stale past the
+    // ring window.
+    let clamped = interval_secs.clamp(1, 3600);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(clamped)).await;
+            sample_hwm_history(&shared);
         }
     });
 }
@@ -5594,6 +5648,12 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // empty per-request copy. One `Arc` clone; management-plane only, the
     // publish path never touches it.
     state.monitor = shared.monitor.clone();
+    // Share the session HWM ring (W5-12, C13-18) so the kernel sampler
+    // and the `GET /license/session_hwm_history` reads observe the same
+    // bounded buffer instead of an empty per-request copy. One `Arc`
+    // clone; management-plane only, the publish and deliver paths never
+    // touch it.
+    state.hwm_history = shared.hwm_history.clone();
     // Share the slow-subscription recorder and thresholds (F1-03, T-73) so
     // the egress hook and the `GET/DELETE /slow_subscriptions` reads plus
     // `GET/PUT /slow_subscriptions/settings` observe the same records and
@@ -5684,6 +5744,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // permanent empty list. One timer task reading atomics off the delivery
     // path; see `spawn_monitor_sampler` for the interval bounds.
     spawn_monitor_sampler(shared.clone(), args.monitor_sample_secs);
+    // Session HWM sampler (W5-12, C13-18): record the boot sample and
+    // start the periodic tick so `GET /license/session_hwm_history`
+    // reflects session truth instead of a permanent empty list. One timer
+    // task reading the session directory off the delivery path; see
+    // `spawn_hwm_sampler` for the interval bounds. Reuses the monitor
+    // cadence (same one-second stamps, same reason) instead of a new flag.
+    spawn_hwm_sampler(shared.clone(), args.monitor_sample_secs);
     // Offline queue durability (B4-06): back every detached durable
     // session's queue with `<data-dir>/offline`, then rebuild the
     // in-memory index from it so a restart replays instead of losing the
