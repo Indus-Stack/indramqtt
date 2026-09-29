@@ -17,6 +17,7 @@ pub mod authz_sources;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
+pub mod error_codes;
 pub mod features;
 pub mod gateways;
 pub mod license;
@@ -490,6 +491,12 @@ pub fn protected_router() -> Router<ApiState> {
             "/license/setting",
             get(license::get_license_setting).put(license::put_license_setting),
         )
+        // Fixed error-code catalogue (W5-22, C15-01/C15-02): static
+        // code-defined list with the standard page envelope, plus a
+        // per-code read with a 404 for unknown codes. Management-plane
+        // only; publish and deliver never touch it.
+        .route("/error_codes", get(error_codes::list_error_codes))
+        .route("/error_codes/:code", get(error_codes::get_error_code))
         // Feature registry read (W5-11, C13-15): fixed bounded set
         // filtered by the installed licence on the real licence store.
         // Management-plane only; publish and deliver never touch it.
