@@ -17,6 +17,7 @@ pub mod authz_sources;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
+pub mod features;
 pub mod gateways;
 pub mod license;
 pub mod monitor;
@@ -475,4 +476,8 @@ pub fn protected_router() -> Router<ApiState> {
             "/license",
             get(license::get_license).post(license::install_license),
         )
+        // Feature registry read (W5-11, C13-15): fixed bounded set
+        // filtered by the installed licence on the real licence store.
+        // Management-plane only; publish and deliver never touch it.
+        .route("/features", get(features::list_features))
 }
