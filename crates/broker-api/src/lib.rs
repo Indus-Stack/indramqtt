@@ -9900,7 +9900,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         for path in [
-            "/api/v5/license",
             "/api/v5/license/setting",
             "/api/v5/configs",
             "/api/v5/sso",

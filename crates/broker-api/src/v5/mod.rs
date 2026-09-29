@@ -18,6 +18,7 @@ pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
 pub mod gateways;
+pub mod license;
 pub mod monitor;
 pub mod monitoring;
 pub mod nodes;
@@ -467,4 +468,11 @@ pub fn protected_router() -> Router<ApiState> {
         // Schema API for dynamic UI forms
         .route("/schemas", get(schemas::list_schemas))
         .route("/schemas/:name", get(schemas::get_schema))
+        // License state and install (W5-10, C13-16/C13-17): live read
+        // plus validated install on the real licence store.
+        // Management-plane only; publish and deliver never touch it.
+        .route(
+            "/license",
+            get(license::get_license).post(license::install_license),
+        )
 }
