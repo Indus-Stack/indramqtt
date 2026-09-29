@@ -62,6 +62,7 @@ use std::sync::RwLock;
 use crate::errors::ApiError;
 use crate::pagination::{meta_page, paginate};
 use crate::ApiState;
+use std::path::{Path, PathBuf};
 
 /// Upper bound for a presented licence token (16 KiB). Reason: a token is
 /// a few hundred bytes of base64 payload plus a 64-byte signature, so
@@ -368,6 +369,359 @@ pub async fn get_session_hwm_history(
         })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// License settings (W5-13, C13-19/C13-20):
+// `GET /api/v5/license/setting` (read) and `PUT /api/v5/license/setting`
+// (validated update) over a single-record store persisted through the
+// kernel data directory.
+// ---------------------------------------------------------------------------
+
+/// Default low watermark for licence quota alarms. Reason: the documented
+/// default threshold below which quota usage alarms deactivate.
+pub const DEFAULT_LICENSE_LOW_WATERMARK: &str = "75%";
+/// Default high watermark for licence quota alarms. Reason: the documented
+/// default threshold above which quota usage alarms activate.
+pub const DEFAULT_LICENSE_HIGH_WATERMARK: &str = "80%";
+/// Default day-boundary timezone for quota history. Reason: the documented
+/// default follows the node host's local timezone.
+pub const DEFAULT_LICENSE_HWM_TIMEZONE: &str = "system";
+/// Default gated allocation before an explicit setting. Reason: the
+/// documented default allocation applied until the operator sets one.
+pub const DEFAULT_LICENSE_DYNAMIC_MAX: u64 = 25;
+
+/// File holding the persisted settings inside the kernel data directory.
+const LICENSE_SETTING_FILE: &str = "license_setting.json";
+
+/// Upper bound for a settings body (8 KiB). Reason: the record is four
+/// small fields (two short percent strings, one short timezone string and
+/// one integer), so 8 KiB covers any realistic update with headroom while
+/// one write cannot balloon the atomically replaced file; longer bodies
+/// are rejected before parsing.
+pub const MAX_LICENSE_SETTING_BODY: usize = 8 * 1024;
+
+/// Validated licence quota settings: alarm watermarks, the history
+/// day-boundary timezone and the gated allocation.
+///
+/// One small struct behind a short lock; reads clone it per request and
+/// never grow with connections or subscriptions. Management-plane only;
+/// nothing on the publish or deliver path touches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LicenseSetting {
+    pub connection_low_watermark: String,
+    pub connection_high_watermark: String,
+    pub high_watermark_timezone: String,
+    pub dynamic_max_connections: u64,
+}
+
+impl Default for LicenseSetting {
+    fn default() -> Self {
+        Self {
+            connection_low_watermark: DEFAULT_LICENSE_LOW_WATERMARK.to_string(),
+            connection_high_watermark: DEFAULT_LICENSE_HIGH_WATERMARK.to_string(),
+            high_watermark_timezone: DEFAULT_LICENSE_HWM_TIMEZONE.to_string(),
+            dynamic_max_connections: DEFAULT_LICENSE_DYNAMIC_MAX,
+        }
+    }
+}
+
+impl LicenseSetting {
+    /// Render the full documented object.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "connection_low_watermark": self.connection_low_watermark,
+            "connection_high_watermark": self.connection_high_watermark,
+            "high_watermark_timezone": self.high_watermark_timezone,
+            "dynamic_max_connections": self.dynamic_max_connections,
+        })
+    }
+}
+
+/// Single validated settings record behind a short lock plus an optional
+/// data-directory for persistence. Constant-time reads and writes;
+/// readers take a snapshot clone so management reads never block delivery
+/// and no delivery lock is ever taken here.
+///
+/// Store wiring (rulebook section 2: name the file and line outside
+/// `crates/broker-api` that writes or consults it, and the broker event
+/// that drives it):
+/// - writer `crates/broker-node/src/main.rs` (boot `load_from_data_dir`
+///   plus the `serve_api` share of this instance, so management reads
+///   observe the kernel's record instead of an empty per-request copy);
+/// - the PUT handler below persists through the recorded data directory
+///   after every validated update. The broker event that drives it is node
+///   boot plus the management write; the publish and deliver paths never
+///   touch this store.
+///
+/// Store bounds (stated here and enforced below):
+/// - exactly one validated struct is ever held; updates replace in place
+///   and never grow a list;
+/// - bodies past [`MAX_LICENSE_SETTING_BODY`] bytes are rejected before
+///   parsing so one write cannot balloon memory or the persisted file;
+/// - every field is one short string or integer, so per-request memory is
+///   constant.
+///
+/// Persistence: `license_setting.json` in the kernel data directory,
+/// atomically replaced (tmp file plus rename); a failed write reverts the
+/// in-memory record so prior settings stay intact, and a restart reloads
+/// the same settings via `load_from_data_dir`.
+///
+/// Management-plane only: handlers run off the publish and deliver paths
+/// (edge receive, kernel route, session, deliver never touch this store).
+pub struct LicenseSettingStore {
+    inner: RwLock<LicenseSetting>,
+    data_dir: RwLock<Option<PathBuf>>,
+}
+
+impl LicenseSettingStore {
+    /// Default settings with no persistence directory (in-memory only
+    /// until [`Self::load_from_data_dir`] records one).
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(LicenseSetting::default()),
+            data_dir: RwLock::new(None),
+        }
+    }
+
+    /// Snapshot the current settings.
+    pub fn get(&self) -> LicenseSetting {
+        self.inner.read().expect("license setting lock").clone()
+    }
+
+    /// Record the kernel data directory and reload persisted settings, if
+    /// any. A missing file keeps the defaults; a corrupt or invalid file
+    /// fails loudly instead of being skipped silently.
+    pub fn load_from_data_dir(&self, dir: &Path) -> Result<(), String> {
+        *self.data_dir.write().expect("license setting lock") = Some(dir.to_path_buf());
+        let path = dir.join(LICENSE_SETTING_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "cannot read license settings from {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid stored license settings: {error}"))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| "stored license settings must be a JSON object".to_string())?;
+        let next = self.validate_merge(obj)?;
+        *self.inner.write().expect("license setting lock") = next;
+        Ok(())
+    }
+
+    /// Validate a merged update without mutating the stored record.
+    /// Every supplied field is checked; the merged whole (supplied fields
+    /// over the current record) must satisfy the low-is-below-high rule.
+    /// Unknown fields are ignored so newer settings degrade to the known
+    /// subset instead of a 400. Nothing is applied on error.
+    pub fn validate_merge(
+        &self,
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<LicenseSetting, String> {
+        if obj.is_empty() {
+            return Err("license setting body must not be empty".to_string());
+        }
+        let mut next = self.get();
+        if let Some(value) = obj.get("connection_low_watermark") {
+            let text = value.as_str().ok_or_else(|| {
+                "field `connection_low_watermark` must be a percent string like `75%`".to_string()
+            })?;
+            parse_percent(text).ok_or_else(|| {
+                "field `connection_low_watermark` must be a percent string like `75%`".to_string()
+            })?;
+            next.connection_low_watermark = text.trim().to_string();
+        }
+        if let Some(value) = obj.get("connection_high_watermark") {
+            let text = value.as_str().ok_or_else(|| {
+                "field `connection_high_watermark` must be a percent string like `80%`".to_string()
+            })?;
+            parse_percent(text).ok_or_else(|| {
+                "field `connection_high_watermark` must be a percent string like `80%`".to_string()
+            })?;
+            next.connection_high_watermark = text.trim().to_string();
+        }
+        if let Some(value) = obj.get("high_watermark_timezone") {
+            let text = value.as_str().ok_or_else(|| {
+                "field `high_watermark_timezone` must be `system` or an offset like `+08:00`"
+                    .to_string()
+            })?;
+            validate_timezone(text)?;
+            next.high_watermark_timezone = text.trim().to_string();
+        }
+        if let Some(value) = obj.get("dynamic_max_connections") {
+            let num = parse_dynamic_max(value).ok_or_else(|| {
+                "field `dynamic_max_connections` must be a non-negative integer".to_string()
+            })?;
+            next.dynamic_max_connections = num;
+        }
+        let low = parse_percent(&next.connection_low_watermark)
+            .ok_or_else(|| "stored `connection_low_watermark` is not a percent".to_string())?;
+        let high = parse_percent(&next.connection_high_watermark)
+            .ok_or_else(|| "stored `connection_high_watermark` is not a percent".to_string())?;
+        if low >= high {
+            return Err(format!(
+                "field `connection_low_watermark` ({}) must be below `connection_high_watermark` ({})",
+                next.connection_low_watermark, next.connection_high_watermark
+            ));
+        }
+        Ok(next)
+    }
+
+    /// Store a validated record and persist it. A persist failure reverts
+    /// the in-memory record so prior settings stay intact.
+    pub fn store(&self, next: LicenseSetting) -> Result<(), String> {
+        let previous = self.get();
+        *self.inner.write().expect("license setting lock") = next.clone();
+        if let Err(error) = self.persist(&next) {
+            *self.inner.write().expect("license setting lock") = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist(&self, next: &LicenseSetting) -> Result<(), String> {
+        let dir = self.data_dir.read().expect("license setting lock").clone();
+        let Some(dir) = dir else {
+            return Ok(());
+        };
+        let data = serde_json::to_vec_pretty(&next.to_json())
+            .map_err(|error| format!("cannot encode license settings: {error}"))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+        let tmp = dir.join(format!("{LICENSE_SETTING_FILE}.tmp"));
+        std::fs::write(&tmp, &data)
+            .map_err(|error| format!("cannot write {}: {error}", tmp.display()))?;
+        std::fs::rename(&tmp, dir.join(LICENSE_SETTING_FILE))
+            .map_err(|error| format!("cannot replace {}: {error}", LICENSE_SETTING_FILE))?;
+        Ok(())
+    }
+}
+
+impl Default for LicenseSettingStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parse a percent string like `75%` into its numeric value (0..=100).
+/// Returns `None` for missing suffix, unparsable numbers, non-finite
+/// values and out-of-range values. Plain numbers without the `%` suffix
+/// are rejected: the documented shape is a string.
+fn parse_percent(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    let num_part = trimmed.strip_suffix('%')?;
+    if num_part.trim().is_empty() {
+        return None;
+    }
+    // Reject interior whitespace (`75 %`): the documented shape has the
+    // suffix glued to the number.
+    if num_part.contains(char::is_whitespace) {
+        return None;
+    }
+    let num: f64 = num_part.parse().ok()?;
+    if !num.is_finite() || !(0.0..=100.0).contains(&num) {
+        return None;
+    }
+    Some(num)
+}
+
+/// Timezone values the write path accepts: `system` (follow the node
+/// host) or an explicit numeric offset `+HH:MM`/`-HH:MM` (hours 00..=14,
+/// minutes 00..=59), so day boundaries stay consistent across nodes.
+fn validate_timezone(text: &str) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed == "system" {
+        return Ok(());
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() != 6 || (bytes[0] != b'+' && bytes[0] != b'-') || bytes[3] != b':' {
+        return Err(
+            "field `high_watermark_timezone` must be `system` or an offset like `+08:00`"
+                .to_string(),
+        );
+    }
+    let hour: u32 = trimmed[1..3].parse().map_err(|_| {
+        "field `high_watermark_timezone` must be `system` or an offset like `+08:00`".to_string()
+    })?;
+    let minute: u32 = trimmed[4..6].parse().map_err(|_| {
+        "field `high_watermark_timezone` must be `system` or an offset like `+08:00`".to_string()
+    })?;
+    // Reason: numeric offsets beyond fourteen hours match no civil zone,
+    // so they are a typo; `system` covers hosts that already know theirs.
+    if hour > 14 || minute > 59 {
+        return Err(
+            "field `high_watermark_timezone` must be `system` or an offset like `+08:00`"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Integers the write path accepts for the gated allocation: JSON
+/// integers zero or above. Floats, strings and negatives are rejected
+/// (`as_u64` is `None` for all of them).
+fn parse_dynamic_max(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64()
+}
+
+/// `GET /license/setting`: the current settings.
+///
+/// One short lock and one small JSON clone per request; no delivery
+/// locks, no new buffering.
+pub async fn get_license_setting(State(state): State<ApiState>) -> Response {
+    let cfg = state.license_setting.get();
+    (StatusCode::OK, Json(cfg.to_json())).into_response()
+}
+
+/// `PUT /license/setting`: validated update.
+///
+/// The whole body is validated before anything is applied: one bad field
+/// rejects the entire write with the documented `BAD_REQUEST` shape and
+/// leaves the stored settings untouched. Supplied fields merge over the
+/// current record; unknown fields are ignored. On success returns 200
+/// with the new settings, persisted across a restart through the kernel
+/// data directory. Management-plane only: one snapshot swap per request;
+/// publish and deliver never touch this store.
+pub async fn put_license_setting(State(state): State<ApiState>, body: Bytes) -> Response {
+    if body.len() > MAX_LICENSE_SETTING_BODY {
+        return ApiError::BadRequest("license setting body is too large".to_string())
+            .into_response();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid license setting body: {error}"))
+                .into_response();
+        }
+    };
+    let obj = match value.as_object() {
+        Some(map) => map.clone(),
+        None => {
+            return ApiError::BadRequest("license setting body must be a JSON object".to_string())
+                .into_response();
+        }
+    };
+    let next = match state.license_setting.validate_merge(&obj) {
+        Ok(next) => next,
+        Err(reason) => return ApiError::BadRequest(reason).into_response(),
+    };
+    match state.license_setting.store(next.clone()) {
+        Ok(()) => (StatusCode::OK, Json(next.to_json())).into_response(),
+        Err(reason) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": format!("cannot persist license setting: {reason}"),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -823,6 +1177,218 @@ mod tests {
             Bytes::from(
                 serde_json::to_vec(&serde_json::json!({
                     "topic": "w512/probe",
+                    "payload": "hello",
+                    "qos": 0,
+                }))
+                .expect("json"),
+            ),
+        )
+        .await;
+        let (status, body) = response_parts(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("id").is_some(), "publish answers with an id");
+    }
+
+    async fn setting_response_parts(response: Response) -> (StatusCode, serde_json::Value) {
+        response_parts(response).await
+    }
+
+    #[tokio::test]
+    async fn setting_round_trip_read_write_read() {
+        // W5-13 failing test: read settings, write a valid update and
+        // read it back. Before: both 404. Broker-through: every step goes
+        // through the handler on `ApiState`.
+        let engine = Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let state = ApiState::standalone(engine);
+        let (status, before) =
+            setting_response_parts(get_license_setting(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            before["connection_low_watermark"],
+            serde_json::json!(DEFAULT_LICENSE_LOW_WATERMARK)
+        );
+        assert_eq!(
+            before["connection_high_watermark"],
+            serde_json::json!(DEFAULT_LICENSE_HIGH_WATERMARK)
+        );
+        assert_eq!(
+            before["high_watermark_timezone"],
+            serde_json::json!(DEFAULT_LICENSE_HWM_TIMEZONE)
+        );
+        assert_eq!(
+            before["dynamic_max_connections"],
+            serde_json::json!(DEFAULT_LICENSE_DYNAMIC_MAX)
+        );
+
+        let update = serde_json::json!({
+            "connection_low_watermark": "60%",
+            "connection_high_watermark": "85%",
+            "high_watermark_timezone": "+08:00",
+            "dynamic_max_connections": 42,
+        });
+        let (status, after) = setting_response_parts(
+            put_license_setting(
+                State(state.clone()),
+                Bytes::from(serde_json::to_vec(&update).expect("update is JSON")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after["connection_low_watermark"], serde_json::json!("60%"));
+        assert_eq!(after["connection_high_watermark"], serde_json::json!("85%"));
+        assert_eq!(
+            after["high_watermark_timezone"],
+            serde_json::json!("+08:00")
+        );
+        assert_eq!(after["dynamic_max_connections"], serde_json::json!(42));
+
+        let (status, reread) =
+            setting_response_parts(get_license_setting(State(state)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reread, after);
+    }
+
+    #[tokio::test]
+    async fn setting_invalid_write_is_rejected_and_prior_settings_persist() {
+        // W5-13 failing test: write invalid expecting rejection with the
+        // documented `{code, message}` shape. A failed write leaves the
+        // prior settings intact.
+        let engine = Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let state = ApiState::standalone(engine);
+        let update = serde_json::json!({
+            "connection_low_watermark": "60%",
+            "connection_high_watermark": "85%",
+        });
+        let (status, _) = setting_response_parts(
+            put_license_setting(
+                State(state.clone()),
+                Bytes::from(serde_json::to_vec(&update).expect("update is JSON")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, before) =
+            setting_response_parts(get_license_setting(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+
+        for bad in [
+            serde_json::json!({"connection_low_watermark": "85%", "connection_high_watermark": "85%"}),
+            serde_json::json!({"connection_low_watermark": "90%", "connection_high_watermark": "85%"}),
+            serde_json::json!({"connection_high_watermark": "50%"}),
+            serde_json::json!({"connection_low_watermark": "huge"}),
+            serde_json::json!({"connection_low_watermark": 75}),
+            serde_json::json!({"connection_low_watermark": "75"}),
+            serde_json::json!({"connection_low_watermark": "101%"}),
+            serde_json::json!({"connection_high_watermark": "never"}),
+            serde_json::json!({"high_watermark_timezone": "mars"}),
+            serde_json::json!({"high_watermark_timezone": 8}),
+            serde_json::json!({"dynamic_max_connections": -1}),
+            serde_json::json!({"dynamic_max_connections": "many"}),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!("just-a-string"),
+        ] {
+            let (status, body) = setting_response_parts(
+                put_license_setting(
+                    State(state.clone()),
+                    Bytes::from(serde_json::to_vec(&bad).expect("bad body is JSON")),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "body {bad} must be rejected"
+            );
+            assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(body["message"].as_str().is_some_and(|m| !m.is_empty()));
+        }
+
+        // The prior good settings survive every rejection.
+        let (status, reread) =
+            setting_response_parts(get_license_setting(State(state)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reread, before);
+    }
+
+    #[test]
+    fn setting_persists_across_restart() {
+        // Settings persist across a restart through the kernel data
+        // directory: update on one store, reload from the same directory
+        // on a fresh store, observe the same settings.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-license-setting-w513-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let first = LicenseSettingStore::new();
+        first.load_from_data_dir(&dir).expect("loads defaults");
+        let update: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "connection_low_watermark": "60%",
+                "connection_high_watermark": "85%",
+                "high_watermark_timezone": "+08:00",
+                "dynamic_max_connections": 42,
+            }))
+            .expect("update is an object");
+        let next = first.validate_merge(&update).expect("validates");
+        first.store(next).expect("persists");
+        // A fresh store reloading the same directory observes the same
+        // settings without another write.
+        let second = LicenseSettingStore::new();
+        second.load_from_data_dir(&dir).expect("reloads");
+        let reloaded = second.get();
+        assert_eq!(reloaded.connection_low_watermark, "60%");
+        assert_eq!(reloaded.connection_high_watermark, "85%");
+        assert_eq!(reloaded.high_watermark_timezone, "+08:00");
+        assert_eq!(reloaded.dynamic_max_connections, 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn setting_read_adds_no_work_to_publish() {
+        // Management-plane only: a settings read plus a validated write
+        // followed by a management publish through the rule engine and
+        // deliver path still answers 200, so customer traffic keeps
+        // serving.
+        let engine = Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let state = ApiState::standalone(engine);
+        let (status, _) =
+            setting_response_parts(get_license_setting(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let update = serde_json::json!({
+            "connection_low_watermark": "60%",
+            "connection_high_watermark": "85%",
+        });
+        let (status, _) = setting_response_parts(
+            put_license_setting(
+                State(state.clone()),
+                Bytes::from(serde_json::to_vec(&update).expect("update is JSON")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response = crate::v5::clients::publish_message(
+            State(state),
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "topic": "w513/probe",
                     "payload": "hello",
                     "qos": 0,
                 }))

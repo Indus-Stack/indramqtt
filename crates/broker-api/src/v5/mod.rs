@@ -483,6 +483,13 @@ pub fn protected_router() -> Router<ApiState> {
             "/license/session_hwm_history",
             get(license::get_session_hwm_history),
         )
+        // License settings (W5-13, C13-19/C13-20): validated read plus
+        // validated update over the persisted single-record store.
+        // Management-plane only; publish and deliver never touch it.
+        .route(
+            "/license/setting",
+            get(license::get_license_setting).put(license::put_license_setting),
+        )
         // Feature registry read (W5-11, C13-15): fixed bounded set
         // filtered by the installed licence on the real licence store.
         // Management-plane only; publish and deliver never touch it.

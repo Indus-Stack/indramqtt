@@ -135,6 +135,14 @@ pub struct ApiState {
     /// management reads observe the kernel's ring. Management-plane only;
     /// never touched on the per-message path.
     pub hwm_history: Arc<crate::v5::license::HwmRecorder>,
+    /// Licence quota settings for `GET/PUT /api/v5/license/setting`
+    /// (W5-13): single validated record persisted through the kernel data
+    /// directory. The kernel boot path reloads it from the same directory
+    /// (`crates/broker-node/src/main.rs`, boot load) and `serve_api` in
+    /// the same file shares this instance, so management reads observe
+    /// the kernel's record. Management-plane only; never touched on the
+    /// per-message path.
+    pub license_setting: Arc<crate::v5::license::LicenseSettingStore>,
     /// Ordered authenticator chain for `GET/POST /api/v5/authentication`
     /// (W2-02): bounded ordered list plus the CONNECT-time consult. The
     /// routes read one bounded snapshot per request; the kernel CONNECT
@@ -333,6 +341,7 @@ impl ApiState {
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
             hwm_history: Arc::new(crate::v5::license::HwmRecorder::new()),
+            license_setting: Arc::new(crate::v5::license::LicenseSettingStore::new()),
             authn_chain,
             authn_node_cache,
             authn_settings,
@@ -394,6 +403,7 @@ impl ApiState {
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
             hwm_history: Arc::new(crate::v5::license::HwmRecorder::new()),
+            license_setting: Arc::new(crate::v5::license::LicenseSettingStore::new()),
             authn_chain: Arc::new(broker_auth::AuthnChain::new()),
             authn_node_cache,
             authn_settings,
@@ -9910,12 +9920,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     async fn removed_system_fake_routes_return_404() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in [
-            "/api/v5/license/setting",
-            "/api/v5/configs",
-            "/api/v5/sso",
-            "/api/v5/telemetry/status",
-        ] {
+        for path in ["/api/v5/configs", "/api/v5/sso", "/api/v5/telemetry/status"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }

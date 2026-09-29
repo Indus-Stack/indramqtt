@@ -1915,6 +1915,12 @@ struct Shared {
     /// tick, reads take one short read lock, and the publish and deliver
     /// paths never touch it.
     hwm_history: Arc<broker_api::v5::license::HwmRecorder>,
+    /// Licence quota settings for W5-13 (C13-19/C13-20): single validated
+    /// record shared with the management API so validated writes are
+    /// visible to reads without a restart and survive a restart through
+    /// the data directory. One `Arc` clone; management-plane only, the
+    /// publish and deliver paths never touch it.
+    license_setting: Arc<broker_api::v5::license::LicenseSettingStore>,
     /// Cluster routing plane. `None` runs standalone; `Some` announces
     /// local subscriptions and forwards each publish once per matching
     /// remote node (single forward per node; remotes fan out locally).
@@ -2211,6 +2217,7 @@ impl Shared {
             alarms: Arc::new(broker_api::v5::alarms::AlarmStore::new()),
             monitor: Arc::new(broker_api::v5::monitor::MonitorHistory::new()),
             hwm_history: Arc::new(broker_api::v5::license::HwmRecorder::new()),
+            license_setting: Arc::new(broker_api::v5::license::LicenseSettingStore::new()),
             cluster: None,
             metrics,
             stats,
@@ -5654,6 +5661,12 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // clone; management-plane only, the publish and deliver paths never
     // touch it.
     state.hwm_history = shared.hwm_history.clone();
+    // Share the licence quota settings (W5-13, C13-19/C13-20) so the
+    // kernel record and the `GET/PUT /license/setting` reads and writes
+    // observe the same persisted settings instead of an empty per-request
+    // copy. One `Arc` clone; management-plane only, the publish and
+    // deliver paths never touch it.
+    state.license_setting = shared.license_setting.clone();
     // Share the slow-subscription recorder and thresholds (F1-03, T-73) so
     // the egress hook and the `GET/DELETE /slow_subscriptions` reads plus
     // `GET/PUT /slow_subscriptions/settings` observe the same records and
@@ -6164,6 +6177,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     log_licence_lifecycle(&licence_state, args.licence_expiry_warn_days);
     shared.licence.refresh_alarms(&shared.alarms, now_licence);
+    // Reload the persisted licence quota settings (W5-13) from the same
+    // data directory so a restart observes the settings a previous run
+    // stored. A corrupt file fails boot loudly instead of being skipped
+    // silently.
+    if let Err(e) = shared
+        .license_setting
+        .load_from_data_dir(std::path::Path::new(&args.data_dir))
+    {
+        return Err(format!("cannot load license settings from {}: {e}", args.data_dir).into());
+    }
 
     if let Some(seeds) = &args.cluster_seeds {
         info!("Cluster mode enabled with seeds: {}", seeds);
