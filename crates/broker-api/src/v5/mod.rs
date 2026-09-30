@@ -52,6 +52,13 @@ pub fn public_router() -> Router<ApiState> {
         // holds a token). Management-plane only; publish and deliver
         // never touch the backend registry or the pending-flow table.
         .route("/sso/login/:backend", post(sso::login))
+        // Single-sign-on OIDC callback (W2-35, C05-16): completes the
+        // code flow against the stored backend config and the bounded
+        // single-use pending-flow table from the login task. Pre-auth by
+        // definition (the provider redirects the browser here before
+        // anyone holds a token). Management-plane only; publish and
+        // deliver never touch the backend registry or the pending table.
+        .route("/sso/oidc/callback", get(sso::oidc_callback))
 }
 
 /// Authenticated `/api/v5/*` endpoints. Served behind the

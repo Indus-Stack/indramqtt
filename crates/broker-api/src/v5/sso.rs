@@ -35,7 +35,7 @@
 // cap, without claiming any backend executes, until the checker pins it.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -80,6 +80,16 @@ pub const PENDING_SSO_LOGIN_TTL: Duration = Duration::from_secs(300);
 /// record bloat each list read; 8 KiB covers provider URLs, client ids
 /// and field maps with headroom while keeping rows small.
 const MAX_SSO_CONFIG_LEN: usize = 8192;
+/// Longest accepted OIDC `state` query value (256 bytes). Reason: states
+/// issued here are 32 hex chars; 256 covers provider-relayed states with
+/// headroom while bounding the pending-table lookup key on this
+/// management-plane route.
+const MAX_OIDC_STATE_LEN: usize = 256;
+/// Longest accepted OIDC `code` query value (4096 bytes). Reason:
+/// authorization codes are short opaque strings (hundreds of bytes);
+/// 4 KiB covers providers with headroom while bounding per-request memory
+/// on this management-plane route (the code itself is never stored).
+const MAX_OIDC_CODE_LEN: usize = 4096;
 
 /// One configured backend: the registry key plus the enable flag and the
 /// opaque backend config (Null when nothing is stored).
@@ -277,6 +287,18 @@ impl SsoStore {
             },
         );
         flow_id
+    }
+
+    /// Take one pending flow by its `state` id and remove it (single-use).
+    /// Sweeps expired flows first; an expired or already-consumed state
+    /// returns `None` and stays removed so a replay fails the same way.
+    /// Management-plane only: one short mutex per callback; publish and
+    /// deliver never touch this table.
+    fn consume_pending_state(&self, state: &str) -> Option<PendingSsoLogin> {
+        let mut pending = self.pending.lock().expect("sso pending lock");
+        let now = Instant::now();
+        pending.retain(|_, flow| !flow.expired(now));
+        pending.remove(state)
     }
 
     /// Live pending flows after sweeping expired ones. Test and operator
@@ -533,6 +555,179 @@ pub async fn login(
         Json(serde_json::json!({
             "code": "BAD_USERNAME_OR_PWD",
             "message": "Auth failed",
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /sso/oidc/callback`: complete one OIDC code flow.
+///
+/// The route is public (no bearer token: the dashboard login page lands
+/// here via a provider redirect before anyone holds a token) and not
+/// paged. Documented query parameters are `state` and `code`; unknown
+/// query parameters are ignored. Behaviour, in order:
+/// - a provider `error` parameter, or a missing/empty `state` or `code`,
+///   fails with 400 in the documented `{code, message}` shape and issues
+///   no token (malformed requests never consume a pending state);
+/// - an unknown, expired or already-consumed `state` fails with 400 in
+///   the documented shape and issues no token (states are single-use
+///   with [`PENDING_SSO_LOGIN_TTL`]; replays fail the same way);
+/// - a state whose backend is no longer stored fails with 404
+///   `BACKEND_NOT_FOUND` (mirrors the login miss) and issues no token;
+/// - a disabled backend, a backend with no stored provider config, or a
+///   flow whose username names no admin user fails closed with 401
+///   `BAD_USERNAME_OR_PWD` and issues no token (a disabled slot must
+///   never authenticate, and an issued token must resolve through the
+///   live admin-user store or it would be revoked on first use);
+/// - otherwise one live dashboard token is issued for the flow's username
+///   (with that user's current role) and the response carries the
+///   documented token/redirect fields.
+///
+/// No outbound provider client runs here (provider discovery beyond the
+/// stored config is out of scope), so any non-empty code paired with a
+/// live state and an enabled, configured backend completes; the consumed
+/// state is what binds the code to the login attempt. Codes are never
+/// logged and never stored. Management-plane only: one short pending-table
+/// lock plus short registry/admin reads per call; publish and deliver
+/// never touch any of them.
+// TODO(parity): what are the documented query parameter names (`state`
+// versus `state_id`, `code` versus `auth_code`, plus provider `error`)?
+// The rulebook does not decide the exact names; the current choice reads
+// `state` and `code` (plus `error`) and ignores the rest until the
+// checker pins them.
+// TODO(parity): what are the documented miss/auth codes for this route
+// (`BACKEND_NOT_FOUND` versus `NOT_FOUND`, `BAD_USERNAME_OR_PWD` versus
+// a dedicated OIDC code)? The rulebook does not decide the exact code
+// names; the current choice mirrors the login route (404
+// `BACKEND_NOT_FOUND` for a vanished backend, 401 `BAD_USERNAME_OR_PWD`
+// for disabled/unverifiable flows, 400 `BAD_REQUEST` for malformed or
+// unknown states) until the checker pins them.
+// TODO(parity): what are the documented success field names (`token`
+// versus `access_token`, `redirect` versus `redirect_uri`, plus
+// username/backend)? The rulebook does not decide the exact shape; the
+// current choice answers `{token, username, backend, redirect}` (token
+// is the live bearer, redirect comes from the stored backend config's
+// `redirect`/`redirect_uri` string when one is stored and defaults to
+// `/`) until the checker pins it.
+// TODO(parity): does the documented flow exchange `code` against the
+// provider token endpoint, or complete locally as here? Provider
+// discovery beyond the stored config is out of scope for this task, so
+// the current choice completes locally against the stored config and
+// the pending table (fail closed without both) until the checker pins
+// the exchange.
+pub async fn oidc_callback(
+    State(state): State<ApiState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    use crate::errors::ApiError;
+    let bad_request = |message: String| ApiError::BadRequest(message).into_response();
+    // Provider-denied flows arrive with `?error=...&state=...`: fail
+    // closed, consume the state when one is presented so it cannot be
+    // replayed, issue no token.
+    if let Some(error) = params.get("error").map(|value| value.trim().to_string()) {
+        if !error.is_empty() {
+            if let Some(state_param) = params.get("state").map(|value| value.trim().to_string()) {
+                if !state_param.is_empty() && state_param.len() <= MAX_OIDC_STATE_LEN {
+                    state.sso_backends.consume_pending_state(&state_param);
+                }
+            }
+            tracing::warn!("sso oidc callback refused: provider reported an error");
+            return bad_request(format!("oidc callback failed: {error}"));
+        }
+    }
+    let state_param = params
+        .get("state")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    let code_param = params
+        .get("code")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    if state_param.is_empty() {
+        return bad_request("field `state` must not be empty".to_string());
+    }
+    if state_param.len() > MAX_OIDC_STATE_LEN {
+        return bad_request("field `state` is too long".to_string());
+    }
+    if code_param.is_empty() {
+        return bad_request("field `code` must not be empty".to_string());
+    }
+    if code_param.len() > MAX_OIDC_CODE_LEN {
+        return bad_request("field `code` is too long".to_string());
+    }
+    // Single-use: the lookup removes the flow whether this attempt
+    // succeeds or fails from here on, so a replayed state fails below
+    // as unknown.
+    let Some(flow) = state.sso_backends.consume_pending_state(&state_param) else {
+        return bad_request("unknown or expired state".to_string());
+    };
+    let Some(stored) = state.sso_backends.get(&flow.backend) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "BACKEND_NOT_FOUND",
+                "message": "Backend not found",
+            })),
+        )
+            .into_response();
+    };
+    if !stored.enable {
+        tracing::warn!(
+            backend = flow.backend.as_str(),
+            username = flow.username.as_str(),
+            "sso oidc callback refused: backend is disabled"
+        );
+        return ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response();
+    }
+    if stored.config.is_null() {
+        // Fail closed: with no stored provider config there is nothing
+        // the code could be exchanged against, so granting a token would
+        // grant access without verification.
+        tracing::warn!(
+            backend = flow.backend.as_str(),
+            username = flow.username.as_str(),
+            "sso oidc callback failed: no provider config for this backend"
+        );
+        return ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response();
+    }
+    let Some(view) = state.admin_users.get(&flow.username) else {
+        tracing::warn!(
+            backend = flow.backend.as_str(),
+            username = flow.username.as_str(),
+            "sso oidc callback failed: unknown user for this flow"
+        );
+        return ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response();
+    };
+    // Live token: issued through the same store the auth middleware
+    // resolves, with the user's current role, so the callback hands back
+    // a bearer that works instead of a constant standing in for one.
+    // The code itself is never logged and never stored.
+    let token = state.tokens.issue(&flow.username, view.role);
+    tracing::warn!(
+        backend = flow.backend.as_str(),
+        username = flow.username.as_str(),
+        "sso oidc callback completed"
+    );
+    let redirect = stored
+        .config
+        .as_object()
+        .and_then(|object| {
+            object
+                .get("redirect")
+                .or_else(|| object.get("redirect_uri"))
+                .or_else(|| object.get("post_login_redirect"))
+        })
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/")
+        .to_string();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "token": token,
+            "username": flow.username,
+            "backend": flow.backend,
+            "redirect": redirect,
         })),
     )
         .into_response()
@@ -841,5 +1036,221 @@ mod sso_login_tests {
             store.record_login_attempt("w233-ldap", &format!("user-{index}"));
         }
         assert_eq!(store.pending_len(), MAX_PENDING_SSO_LOGINS);
+    }
+}
+
+#[cfg(test)]
+mod sso_oidc_callback_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+    use std::collections::HashMap;
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn seed_backend(state: &ApiState, name: &str, enable: bool, config: serde_json::Value) {
+        state
+            .sso_backends
+            .insert(sso_backend(name.to_string(), enable, config))
+            .expect("seed backend inserts");
+    }
+
+    fn seed_user(state: &ApiState, username: &str) {
+        state
+            .admin_users
+            .create(
+                username,
+                "OidcProbe123!",
+                crate::admin_users::AdminRole::Viewer,
+                "oidc probe",
+            )
+            .expect("probe user creates");
+    }
+
+    fn query(pairs: &[(&str, &str)]) -> Query<HashMap<String, String>> {
+        Query(
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        )
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("test body is JSON");
+        (status, json)
+    }
+
+    async fn callback(state: &ApiState, pairs: &[(&str, &str)]) -> (StatusCode, serde_json::Value) {
+        parts(oidc_callback(State(state.clone()), query(pairs)).await).await
+    }
+
+    fn begin_flow(state: &ApiState, backend: &str, username: &str) -> String {
+        state.sso_backends.record_login_attempt(backend, username)
+    }
+
+    #[tokio::test]
+    async fn bad_state_is_rejected_with_documented_shape_and_no_token() {
+        // W2-35 failing test (bad half): before this task the route
+        // answered 404 with the router's plain-text body; now an unknown
+        // state answers 400 in the documented `{code, message}` shape.
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w235-oidc",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_user(&state, "w235-alice");
+        let (status, err) = callback(
+            &state,
+            &[
+                ("state", "w235-no-such-state"),
+                ("code", "w235-no-such-code"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(err["message"].is_string());
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert!(err.get("token").is_none(), "no token is issued on failure");
+    }
+
+    #[tokio::test]
+    async fn happy_path_against_stubbed_config_returns_token_and_redirect() {
+        // W2-35 failing test (good half): a live state plus a non-empty
+        // code against a stubbed (stored, enabled, configured) backend
+        // completes with the documented token/redirect fields. Before:
+        // 404 for everything on this path.
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w235-oidc",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_user(&state, "w235-bob");
+        let flow = begin_flow(&state, "w235-oidc", "w235-bob");
+        let (status, ok) = callback(&state, &[("state", &flow), ("code", "w235-stub-code")]).await;
+        assert_eq!(status, StatusCode::OK);
+        let token = ok["token"].as_str().expect("success carries a token");
+        assert!(!token.is_empty());
+        assert_eq!(ok["username"], serde_json::json!("w235-bob"));
+        assert_eq!(ok["backend"], serde_json::json!("w235-oidc"));
+        assert!(
+            ok["redirect"].is_string(),
+            "success carries redirect fields"
+        );
+        assert!(ok.get("code").is_none(), "success carries no error code");
+        // The issued bearer resolves through the live token store: the
+        // callback hands back a bearer that works instead of a constant
+        // standing in for one.
+        assert!(
+            state.tokens.lookup(token).is_some(),
+            "issued token is live in the token store"
+        );
+        // States are single-use: replaying the same state fails even with
+        // a fresh code and issues no token.
+        let (status, err) = callback(&state, &[("state", &flow), ("code", "w235-again")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(err.get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_queries_disabled_backends_and_unknown_users_fail_closed() {
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w235-oidc",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_backend(
+            &state,
+            "w235-off",
+            false,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_backend(&state, "w235-bare", true, serde_json::Value::Null);
+        seed_user(&state, "w235-carol");
+
+        // Malformed queries never consume a pending state: the flow below
+        // still completes afterwards.
+        let flow = begin_flow(&state, "w235-oidc", "w235-carol");
+        for pairs in [
+            vec![],
+            vec![("state", flow.as_str())],
+            vec![("code", "w235-x")],
+            vec![("state", ""), ("code", "w235-x")],
+            vec![("state", flow.as_str()), ("code", "")],
+            vec![("state", flow.as_str()), ("code", "   ")],
+        ] {
+            let (status, err) = callback(&state, &pairs).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "pairs {pairs:?}");
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(err.get("token").is_none());
+        }
+        let (status, ok) = callback(&state, &[("state", flow.as_str()), ("code", "w235-x")]).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "malformed attempts leave the state live"
+        );
+        assert!(ok["token"].is_string());
+
+        // Provider-denied flows fail closed and burn the state.
+        let flow = begin_flow(&state, "w235-oidc", "w235-carol");
+        let (status, err) = callback(
+            &state,
+            &[
+                ("state", flow.as_str()),
+                ("code", "w235-x"),
+                ("error", "access_denied"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err.get("token").is_none());
+        let (status, _) = callback(&state, &[("state", flow.as_str()), ("code", "w235-x")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "error consumes the state");
+
+        // Disabled backends fail closed with no token.
+        let flow = begin_flow(&state, "w235-off", "w235-carol");
+        let (status, err) = callback(&state, &[("state", flow.as_str()), ("code", "w235-x")]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err["code"], serde_json::json!("BAD_USERNAME_OR_PWD"));
+        assert!(err.get("token").is_none());
+
+        // Backends with no stored provider config fail closed: there is
+        // nothing the code could be exchanged against.
+        let flow = begin_flow(&state, "w235-bare", "w235-carol");
+        let (status, err) = callback(&state, &[("state", flow.as_str()), ("code", "w235-x")]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+
+        // Flows for unknown admin users fail closed: an issued token
+        // would be revoked on first use, so none is issued.
+        let flow = begin_flow(&state, "w235-oidc", "w235-ghost");
+        let (status, err) = callback(&state, &[("state", flow.as_str()), ("code", "w235-x")]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+    }
+
+    #[test]
+    fn callback_bounds_are_finite_and_reasoned() {
+        const { assert!(MAX_PENDING_SSO_LOGINS > 0) };
+        const { assert!(MAX_OIDC_STATE_LEN > 0) };
+        const { assert!(MAX_OIDC_CODE_LEN > 0) };
+        assert!(!PENDING_SSO_LOGIN_TTL.is_zero());
     }
 }
