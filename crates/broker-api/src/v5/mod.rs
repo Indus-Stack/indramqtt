@@ -21,6 +21,7 @@ pub mod error_codes;
 pub mod features;
 pub mod gateways;
 pub mod license;
+pub mod mfa;
 pub mod monitor;
 pub mod monitoring;
 pub mod nodes;
@@ -336,6 +337,16 @@ pub fn protected_router() -> Router<ApiState> {
         // takes no parameters; unknown query parameters are ignored.
         // Management-plane only; publish and deliver never touch it.
         .route("/sso", get(sso::list_sso))
+        // Dashboard multi-factor enrolment and verification (W2-34,
+        // C05-13..C05-15): TOTP setup, enrolment-state read and
+        // single-use code verification on the real admin-user MFA state.
+        // All three are POST with JSON bodies, none is paged, and all
+        // fail closed with the documented `{code, message}` shape.
+        // Management-plane only; publish and deliver never touch the
+        // user map or the attempt counters.
+        .route("/sso/mfa/setup", post(mfa::setup))
+        .route("/sso/mfa/setup_info", post(mfa::setup_info))
+        .route("/sso/mfa/verify", post(mfa::verify))
         // Live Monitoring & Rates
         .route("/metrics", get(monitoring::get_metrics))
         .route(

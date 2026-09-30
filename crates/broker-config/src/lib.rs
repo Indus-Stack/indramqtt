@@ -163,6 +163,14 @@ pub enum ConfigError {
 /// (missing roles from pre-persistence files load as `viewer`, the least
 /// privilege). `must_change_password` forces a password change on next
 /// login, matching the in-memory store flag.
+///
+/// `mfa_secret` holds the TOTP enrolment secret as standard base64 of the
+/// raw bytes (empty = no enrolment; the secret must stay recoverable so
+/// the management plane can verify one-time codes, unlike the password
+/// verifier which is a one-way hash). `mfa_enabled` flips from false to
+/// true on the first successful code verification. `mfa_last_step` is the
+/// most recently verified 30 s counter for single-use (replay) rejection.
+/// All three default for pre-MFA files (no enrolment, disabled, no use).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminUser {
     /// Login name; must be non-empty and unique within the root.
@@ -178,6 +186,16 @@ pub struct AdminUser {
     /// Whether the next login must change the password.
     #[serde(default)]
     pub must_change_password: bool,
+    /// TOTP enrolment secret, standard base64 of the raw bytes;
+    /// empty means no enrolment.
+    #[serde(default)]
+    pub mfa_secret: String,
+    /// Whether MFA is enabled (set on first successful verification).
+    #[serde(default)]
+    pub mfa_enabled: bool,
+    /// Most recently verified 30 s TOTP counter, for replay rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mfa_last_step: Option<u64>,
 }
 
 impl Default for AdminUser {
@@ -188,6 +206,9 @@ impl Default for AdminUser {
             description: String::new(),
             role: default_admin_user_role(),
             must_change_password: false,
+            mfa_secret: String::new(),
+            mfa_enabled: false,
+            mfa_last_step: None,
         }
     }
 }
@@ -229,6 +250,27 @@ impl AdminUsersConf {
                 return Err(ConfigError::Invalid(format!(
                     "admin_users.users[{index}].username {:?} is duplicated (field `username`)",
                     user.username
+                )));
+            }
+            // MFA state: an enabled record must carry a decodable secret;
+            // a record with no secret must not claim to be enabled.
+            if !user.mfa_secret.is_empty() {
+                use base64::Engine as _;
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&user.mfa_secret)
+                    .map_err(|_| {
+                        ConfigError::Invalid(format!(
+                            "admin_users.users[{index}].mfa_secret is not valid base64 (field `mfa_secret`)"
+                        ))
+                    })?;
+                if decoded.len() < 10 || decoded.len() > 64 {
+                    return Err(ConfigError::Invalid(format!(
+                        "admin_users.users[{index}].mfa_secret must decode to 10..=64 bytes (field `mfa_secret`)"
+                    )));
+                }
+            } else if user.mfa_enabled {
+                return Err(ConfigError::Invalid(format!(
+                    "admin_users.users[{index}].mfa_enabled must not be true without a secret (field `mfa_enabled`)"
                 )));
             }
         }
@@ -1932,6 +1974,9 @@ mod tests {
                     role: "administrator".to_string(),
                     description: "Default administrator".to_string(),
                     must_change_password: true,
+                    mfa_secret: String::new(),
+                    mfa_enabled: false,
+                    mfa_last_step: None,
                 }],
             },
             mqtt_users: MqttUsersConf {
@@ -1987,6 +2032,9 @@ mod tests {
                 role: "viewer".to_string(),
                 description: String::new(),
                 must_change_password: false,
+                mfa_secret: String::new(),
+                mfa_enabled: false,
+                mfa_last_step: None,
             }],
         };
         let err = conf.validate().expect_err("empty username must fail");
@@ -2328,6 +2376,9 @@ mod tests {
                 role: "administrator".to_string(),
                 description: String::new(),
                 must_change_password: false,
+                mfa_secret: String::new(),
+                mfa_enabled: false,
+                mfa_last_step: None,
             }],
         };
         let after_rules = RulesConf {

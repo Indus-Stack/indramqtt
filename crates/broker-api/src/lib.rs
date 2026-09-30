@@ -26,6 +26,7 @@ pub mod api_auth;
 pub mod dashboard;
 pub mod errors;
 pub mod licence;
+pub mod mfa_totp;
 pub mod node_scope;
 pub mod pagination;
 pub mod swagger;

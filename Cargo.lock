@@ -582,6 +582,7 @@ dependencies = [
  "broker-storage",
  "brokerlink",
  "bytes",
+ "hmac 0.12.1",
  "p256",
  "rand 0.10.2",
  "regex",
@@ -589,6 +590,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -663,6 +665,7 @@ name = "broker-config"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "base64 0.22.1",
  "serde",
  "thiserror 1.0.69",
  "toml",
