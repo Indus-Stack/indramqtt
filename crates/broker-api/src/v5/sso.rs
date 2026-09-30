@@ -35,14 +35,16 @@
 // cap, without claiming any backend executes, until the checker pins it.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use broker_config::{ConfigRegistry, SsoBackendsConf};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::ApiState;
 
@@ -53,6 +55,25 @@ use crate::ApiState;
 /// one management batch exhaust the kernel; 16 covers the dashboard
 /// backend families with headroom while keeping list reads cheap.
 pub const MAX_SSO_BACKENDS: usize = broker_config::MAX_SSO_BACKENDS;
+/// Upper bound for pending single-sign-on login flows. Every login attempt
+/// that reaches verification records one entry; entries expire after
+/// [`PENDING_SSO_LOGIN_TTL`] and are swept on every attempt. Failed logins
+/// never issue tokens and never complete, so without expiry the table would
+/// grow with the attempt rate. Reason: each entry holds a flow id plus
+/// backend/username (hundreds of bytes), so 1024 covers concurrent dashboard
+/// login attempts while keeping management memory bounded regardless of
+/// attempt rate. The default is finite: no opt-in to unlimited exists
+/// anywhere on this path.
+pub const MAX_PENDING_SSO_LOGINS: usize = 1024;
+/// Lifetime of one pending login flow: 300 s (5 minutes). Reason: a login
+/// flow completes via a dashboard redirect round-trip measured in seconds;
+/// 300 s covers slow round-trips while the per-attempt expiry sweep keeps
+/// stale flows from accumulating. Flows that never complete (every flow
+/// today: verification waits on the provider clients) vanish after this.
+// TODO(parity): is 300 s the documented flow/code lifetime, or does the
+// spec expire login flows sooner? The rulebook does not decide the exact
+// TTL; 300 s is the conservative choice until the checker pins it.
+pub const PENDING_SSO_LOGIN_TTL: Duration = Duration::from_secs(300);
 /// Longest accepted rendered backend config document (8 KiB of JSON).
 /// Reason: the config renders in the detail row and is cloned per list
 /// snapshot plus persisted per entry, so an unbounded document lets one
@@ -85,14 +106,39 @@ impl SsoBackend {
     }
 }
 
+/// One initiated login flow awaiting verification. The flow never completes
+/// in this task: verification needs a provider client that only the stored
+/// backend config describes (no outbound client here), so every flow fails
+/// closed and vanishes at [`PENDING_SSO_LOGIN_TTL`]. The table exists so an
+/// initiated attempt is observable and bounded, never an unbounded session
+/// table.
+#[derive(Debug, Clone)]
+struct PendingSsoLogin {
+    flow_id: String,
+    backend: String,
+    username: String,
+    created_at: Instant,
+}
+
+impl PendingSsoLogin {
+    fn expired(&self, now: Instant) -> bool {
+        now.duration_since(self.created_at) >= PENDING_SSO_LOGIN_TTL
+    }
+}
+
 /// In-memory backend registry keyed by backend name.
 ///
 /// Single-node map behind one lock; every method finishes quickly.
 /// Management writes take the write lock plus the registry save lock on
 /// persist; reads take one short read lock and clone at most the capped
 /// entries once per request. Publish and deliver never touch this store.
+/// The pending-flow table beside it takes one short mutex per login attempt
+/// (sweep plus insert); publish and deliver never touch it either.
 pub struct SsoStore {
     inner: RwLock<HashMap<String, SsoBackend>>,
+    /// Initiated login flows, swept for expiry on every attempt and capped
+    /// at [`MAX_PENDING_SSO_LOGINS`]. Management-plane only.
+    pending: Mutex<HashMap<String, PendingSsoLogin>>,
     /// Kernel config registry receiving every mutation (`None` in unit
     /// tests and standalone state, which stay memory-only).
     registry: RwLock<Option<Arc<ConfigRegistry>>>,
@@ -106,6 +152,7 @@ impl SsoStore {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             registry: RwLock::new(None),
             save_lock: Mutex::new(()),
         }
@@ -184,6 +231,62 @@ impl SsoStore {
             .expect("sso store lock")
             .get(backend)
             .cloned()
+    }
+
+    /// Record one initiated login flow and return its id. Sweeps expired
+    /// flows first; when the table is still at [`MAX_PENDING_SSO_LOGINS`]
+    /// evicts the oldest flow so one burst of attempts cannot grow the map
+    /// without limit. Management-plane only: one short mutex per login
+    /// attempt; publish and deliver never touch this table.
+    // TODO(parity): when the table is still full after the expiry sweep,
+    // does the documented behaviour evict the oldest flow or refuse the
+    // login? The rulebook does not decide the full-map policy; the current
+    // choice evicts the oldest flow so a live login attempt is always
+    // recorded, until the checker pins it.
+    pub fn record_login_attempt(&self, backend: &str, username: &str) -> String {
+        let flow_id = format!("{:032x}", rand::random::<u128>());
+        let mut pending = self.pending.lock().expect("sso pending lock");
+        let now = Instant::now();
+        pending.retain(|_, flow| !flow.expired(now));
+        while pending.len() >= MAX_PENDING_SSO_LOGINS {
+            let oldest = pending
+                .iter()
+                .min_by_key(|(_, flow)| flow.created_at)
+                .map(|(id, _)| id.clone());
+            match oldest {
+                Some(id) => {
+                    if let Some(evicted) = pending.remove(&id) {
+                        tracing::debug!(
+                            flow_id = evicted.flow_id.as_str(),
+                            backend = evicted.backend.as_str(),
+                            username = evicted.username.as_str(),
+                            "sso pending login flow evicted: table full"
+                        );
+                    }
+                }
+                None => break,
+            }
+        }
+        pending.insert(
+            flow_id.clone(),
+            PendingSsoLogin {
+                flow_id: flow_id.clone(),
+                backend: backend.to_string(),
+                username: username.to_string(),
+                created_at: now,
+            },
+        );
+        flow_id
+    }
+
+    /// Live pending flows after sweeping expired ones. Test and operator
+    /// hook; the login route itself never reads it.
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        let mut pending = self.pending.lock().expect("sso pending lock");
+        let now = Instant::now();
+        pending.retain(|_, flow| !flow.expired(now));
+        pending.len()
     }
 
     /// Record one backend. Used by the broker-through test seed and the
@@ -322,6 +425,117 @@ pub async fn list_sso(State(state): State<ApiState>) -> Response {
     let all = state.sso_backends.list();
     let data: Vec<serde_json::Value> = all.iter().map(SsoBackend::to_json).collect();
     (StatusCode::OK, Json(data)).into_response()
+}
+
+/// `POST /sso/login/{backend}`: initiate a login against one configured
+/// backend.
+///
+/// The route is public (no bearer token: the dashboard login page calls it
+/// before anyone holds a token) and not paged. Behaviour, in order:
+/// - unknown backends fail with 404 in the documented `{code, message}`
+///   shape and record nothing;
+/// - bodies that are not a JSON object, or carry no non-empty `username`,
+///   fail with 400 in the documented shape and record nothing;
+/// - a backend stored with `enable` set to false fails closed with 401:
+///   a disabled slot must never authenticate;
+/// - otherwise the attempt is recorded in the bounded pending-flow table
+///   and fails closed with 401: verification needs the provider the stored
+///   config describes, and no provider client runs in this task, so no
+///   credential can be verified and no token is ever issued here.
+///
+/// Fail-closed rows are logged without secrets (usernames only, never
+/// bodies). Management-plane only: one short registry read plus one short
+/// pending-table lock per call; publish and deliver never touch either.
+// TODO(parity): is the documented miss code `BACKEND_NOT_FOUND` or the
+// generic `NOT_FOUND`? The rulebook does not decide the exact code name;
+// the current choice keeps `BACKEND_NOT_FOUND` (404, documented
+// `{code, message}` shape) until the checker pins it.
+// TODO(parity): what is the documented per-backend body (password,
+// one-time code, redirect response, ...)? The rulebook does not decide the
+// body contract; the current choice accepts any JSON object with a
+// non-empty `username` and ignores the rest until the checker pins it.
+// TODO(parity): what completes a flow (token fields, redirect fields,
+// MFA steps)? Verification needs a provider client beyond the stored
+// config, which is out of scope here, so every verified attempt currently
+// fails closed with `BAD_USERNAME_OR_PWD` (401, documented shape, no
+// token) until the provider and token-exchange tasks pin success.
+pub async fn login(
+    State(state): State<ApiState>,
+    Path(backend): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some(stored) = state.sso_backends.get(&backend) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "BACKEND_NOT_FOUND",
+                "message": "Backend not found",
+            })),
+        )
+            .into_response();
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": format!("invalid login body: {error}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(username) = value
+        .as_object()
+        .and_then(|object| object.get("username"))
+        .and_then(|name| name.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": "field `username` must not be empty",
+            })),
+        )
+            .into_response();
+    };
+    if !stored.enable {
+        tracing::warn!(
+            backend = backend.as_str(),
+            username = username,
+            "sso login refused: backend is disabled"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "code": "BAD_USERNAME_OR_PWD",
+                "message": "Auth failed",
+            })),
+        )
+            .into_response();
+    }
+    // Initiated and bounded: the flow is recorded, then verification fails
+    // closed. No provider client runs here, so no credential can be
+    // checked against anything; granting a token would grant access
+    // without verification. The attempt is logged without secrets.
+    state.sso_backends.record_login_attempt(&backend, username);
+    tracing::warn!(
+        backend = backend.as_str(),
+        username = username,
+        "sso login failed: no provider client for this backend"
+    );
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "code": "BAD_USERNAME_OR_PWD",
+            "message": "Auth failed",
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -480,5 +694,152 @@ mod sso_store_tests {
         assert_eq!(listed[0].backend, "w232-oidc");
         assert!(restarted.get("w232-missing").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod sso_login_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn seed_backend(state: &ApiState, name: &str, enable: bool) {
+        state
+            .sso_backends
+            .insert(sso_backend(
+                name.to_string(),
+                enable,
+                serde_json::json!({"issuer": "https://idp.example.invalid"}),
+            ))
+            .expect("seed backend inserts");
+    }
+
+    fn body(value: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("test body is JSON");
+        (status, json)
+    }
+
+    async fn attempt(
+        state: &ApiState,
+        backend: &str,
+        raw: Bytes,
+    ) -> (StatusCode, serde_json::Value) {
+        parts(login(State(state.clone()), Path(backend.to_string()), raw).await).await
+    }
+
+    #[tokio::test]
+    async fn unknown_backend_is_404_with_documented_shape_and_records_nothing() {
+        // Before this task every login answered 404 with the router's
+        // plain-text body; now unknown backends answer 404 in the
+        // documented `{code, message}` shape.
+        let state = standalone_state();
+        let (status, err) = attempt(
+            &state,
+            "w233-no-such-backend",
+            body(serde_json::json!({"username": "alice", "password": "wrong"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("BACKEND_NOT_FOUND"));
+        assert!(err["message"].is_string());
+        assert_eq!(state.sso_backends.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn configured_backend_with_bad_credentials_is_rejected_without_token() {
+        // The registry decides: a stored backend with unverifiable
+        // credentials fails closed (401, documented shape, no token) and
+        // the attempt is recorded in the bounded pending table.
+        let state = standalone_state();
+        seed_backend(&state, "w233-ldap", true);
+        let (status, err) = attempt(
+            &state,
+            "w233-ldap",
+            body(serde_json::json!({"username": "alice", "password": "wrong"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err["code"], serde_json::json!("BAD_USERNAME_OR_PWD"));
+        assert!(err["message"].is_string());
+        assert!(err.get("token").is_none(), "no token is issued on failure");
+        assert_eq!(state.sso_backends.pending_len(), 1);
+        // The list still serves the backend; login recorded nothing there.
+        assert_eq!(state.sso_backends.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_bodies_are_400_and_record_nothing() {
+        let state = standalone_state();
+        seed_backend(&state, "w233-ldap", true);
+        for raw in [
+            Bytes::from_static(b""),
+            Bytes::from_static(b"not json"),
+            body(serde_json::json!([1, 2])),
+            body(serde_json::json!(null)),
+            body(serde_json::json!({})),
+            body(serde_json::json!({"password": "x"})),
+            body(serde_json::json!({"username": ""})),
+            body(serde_json::json!({"username": "   "})),
+            body(serde_json::json!({"username": 7})),
+        ] {
+            let (status, err) = attempt(&state, "w233-ldap", raw).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(err["message"].is_string());
+        }
+        assert_eq!(state.sso_backends.pending_len(), 0);
+        // Backend lookup runs first: garbage bodies against an unknown
+        // backend still answer 404, never 400.
+        let (status, err) = attempt(
+            &state,
+            "w233-no-such-backend",
+            Bytes::from_static(b"not json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("BACKEND_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn disabled_backend_is_denied_without_recording() {
+        // A stored but disabled slot fails closed: 401, no token, and no
+        // pending flow (disabled backends never authenticate).
+        let state = standalone_state();
+        seed_backend(&state, "w233-off", false);
+        let (status, err) = attempt(
+            &state,
+            "w233-off",
+            body(serde_json::json!({"username": "alice", "password": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err["code"], serde_json::json!("BAD_USERNAME_OR_PWD"));
+        assert!(err.get("token").is_none());
+        assert_eq!(state.sso_backends.pending_len(), 0);
+    }
+
+    #[test]
+    fn pending_table_is_bounded_regardless_of_attempt_rate() {
+        let store = SsoStore::new();
+        const { assert!(MAX_PENDING_SSO_LOGINS > 0) };
+        assert!(!PENDING_SSO_LOGIN_TTL.is_zero());
+        for index in 0..(MAX_PENDING_SSO_LOGINS + 10) {
+            store.record_login_attempt("w233-ldap", &format!("user-{index}"));
+        }
+        assert_eq!(store.pending_len(), MAX_PENDING_SSO_LOGINS);
     }
 }

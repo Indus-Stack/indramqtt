@@ -46,6 +46,11 @@ pub fn public_router() -> Router<ApiState> {
         .route("/login/challenge", post(auth::scram_challenge))
         .route("/login/verify", post(auth::scram_verify))
         .route("/login", post(auth::direct_login))
+        // Single-sign-on backend login (W2-33, C05-12): pre-auth by
+        // definition (the dashboard login page calls it before anyone
+        // holds a token). Management-plane only; publish and deliver
+        // never touch the backend registry or the pending-flow table.
+        .route("/sso/login/:backend", post(sso::login))
 }
 
 /// Authenticated `/api/v5/*` endpoints. Served behind the
