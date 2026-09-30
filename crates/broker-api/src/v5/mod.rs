@@ -65,6 +65,20 @@ pub fn public_router() -> Router<ApiState> {
         // is not paged, reflects live state, and carries only names.
         // Management-plane only; publish and deliver never touch it.
         .route("/sso/running", get(sso::list_running))
+        // Single-sign-on SAML assertion consumer (W2-37, C05-18):
+        // consumes the provider response against the stored backend and
+        // the bounded single-use pending-flow table from the login task,
+        // issuing a live bearer on success. Pre-auth by definition (the
+        // provider posts the browser here before anyone holds a token).
+        // Management-plane only; publish and deliver never touch the
+        // backend registry or the pending table.
+        .route("/sso/saml/acs", post(sso::saml_acs))
+        // Single-sign-on SAML service-provider metadata (W2-37, C05-19):
+        // bounded static document rendered from the stored SAML slot.
+        // Pre-auth by definition (provider operators fetch it before
+        // anyone holds a token). The route is not paged.
+        // Management-plane only; publish and deliver never touch it.
+        .route("/sso/saml/metadata", get(sso::saml_metadata))
 }
 
 /// Authenticated `/api/v5/*` endpoints. Served behind the

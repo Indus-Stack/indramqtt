@@ -773,6 +773,916 @@ pub async fn oidc_callback(
         .into_response()
 }
 
+/// Default SAML backend name selected when the ACS body and the metadata
+/// query name no backend. Reason: the registry keys backends by name and
+/// the seed documents `saml` as the SAML slot; a fixed default keeps the
+/// two routes that carry no path parameter total without inventing a
+/// registry entry.
+// TODO(parity): does the documented ACS/metadata select the backend by a
+// path parameter, a query parameter, a body field, or a fixed `saml`
+// slot? The rulebook does not decide the selection; the current choice
+// accepts an optional `backend` body field or `?backend=` query value and
+// falls back to `saml` until the checker pins it.
+pub const DEFAULT_SAML_BACKEND: &str = "saml";
+/// Longest accepted SAML `SAMLResponse` value (65536 bytes). Reason: a
+/// response is base64-encoded XML, typically a few kilobytes; 64 KiB
+/// covers large assertions with headroom while bounding per-request memory
+/// on this management-plane route (the value itself is never stored).
+pub const MAX_SAML_RESPONSE_LEN: usize = 65536;
+/// Longest accepted SAML `RelayState` value (256 bytes). Reason: states
+/// issued here are 32 hex chars; 256 covers provider-relayed states with
+/// headroom while bounding the pending-table lookup key on this
+/// management-plane route.
+pub const MAX_SAML_RELAYSTATE_LEN: usize = 256;
+/// Longest rendered SAML service-provider metadata document (8 KiB).
+/// Reason: the document renders per request from the stored slot plus a
+/// fixed envelope, so bounding it keeps each metadata read cheap; 8 KiB
+/// covers entity ids, endpoints and key descriptors with headroom.
+pub const MAX_SAML_METADATA_LEN: usize = 8192;
+/// Content type rendered by `GET /sso/saml/metadata`. Reason: the
+/// metadata document is SAML service-provider XML, and this is the media
+/// type validators expect for it.
+// TODO(parity): which content type does the documented metadata route
+// serve (`application/samlmetadata+xml` versus generic XML)? The rulebook
+// does not decide the exact media type; the current choice serves the
+// SAML metadata media type until the checker pins it.
+pub const SAML_METADATA_CONTENT_TYPE: &str = "application/samlmetadata+xml";
+
+/// Parsed `POST /sso/saml/acs` fields from a JSON or form-encoded body.
+#[derive(Debug, Default)]
+struct SamlAcsFields {
+    backend: Option<String>,
+    saml_response: Option<String>,
+    relay_state: Option<String>,
+    username: Option<String>,
+}
+
+/// Percent-decode one form component (`+` becomes space). Small local
+/// decoder so the ACS can read the browser form binding without a new
+/// dependency; malformed escapes are kept literally and fail closed
+/// downstream as a bad response.
+fn form_percent_decode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = &input[index + 1..index + 3];
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte as char);
+                        index += 3;
+                    }
+                    Err(_) => {
+                        out.push('%');
+                        index += 1;
+                    }
+                }
+            }
+            _ => {
+                out.push(bytes[index] as char);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Read one optional string field from a string map, trimming nothing:
+/// emptiness is decided by the caller so blank and missing stay distinct.
+fn map_string_field(map: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = map.get(*key) {
+            return Some(value.clone());
+        }
+    }
+    None
+}
+
+/// Parse an ACS body as JSON first (the management harness posts JSON),
+/// then as a `application/x-www-form-urlencoded` browser binding. Either
+/// shape yields the same field set; anything else is malformed.
+fn parse_saml_acs_fields(body: &[u8]) -> Result<SamlAcsFields, String> {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(object) = value.as_object() {
+            let string_field = |keys: &[&str]| -> Option<String> {
+                for key in keys {
+                    if let Some(value) = object.get(*key).and_then(|name| name.as_str()) {
+                        return Some(value.to_string());
+                    }
+                }
+                None
+            };
+            return Ok(SamlAcsFields {
+                backend: string_field(&["backend"]),
+                saml_response: string_field(&["SAMLResponse", "saml_response", "response"]),
+                relay_state: string_field(&["RelayState", "relay_state", "state"]),
+                username: string_field(&["username", "Username"]),
+            });
+        }
+        return Err("acs body must be a JSON object".to_string());
+    }
+    let text = std::str::from_utf8(body)
+        .map_err(|_| "acs body is neither JSON nor a form binding".to_string())?;
+    if !text.contains('=') {
+        return Err("acs body is neither JSON nor a form binding".to_string());
+    }
+    let mut map = HashMap::new();
+    for pair in text.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        map.insert(
+            form_percent_decode(name.trim()),
+            form_percent_decode(value.trim()),
+        );
+    }
+    if !map.contains_key("SAMLResponse")
+        && !map.contains_key("RelayState")
+        && !map.contains_key("backend")
+    {
+        return Err("acs form body carries no SAML fields".to_string());
+    }
+    Ok(SamlAcsFields {
+        backend: map_string_field(&map, &["backend"]),
+        saml_response: map_string_field(&map, &["SAMLResponse"]),
+        relay_state: map_string_field(&map, &["RelayState", "state"]),
+        username: map_string_field(&map, &["username"]),
+    })
+}
+
+/// Decode a `SAMLResponse` to its XML text. Accepts base64-encoded XML
+/// (the POST binding) or raw XML (operator tooling); anything else is not
+/// a response. Returns the XML text for structural checks.
+fn decode_saml_response(raw: &str) -> Option<String> {
+    use base64::Engine as _;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    for engine in [
+        base64::engine::general_purpose::STANDARD,
+        base64::engine::general_purpose::URL_SAFE,
+    ] {
+        if let Ok(bytes) = engine.decode(compact.as_bytes()) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                if text.contains('<') {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    if trimmed.contains('<') {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// Allowed SAML clock skew (300 s, 5 minutes). Reason: identity-provider
+/// and service-provider clocks drift by seconds to minutes; 300 s is the
+/// common SAML tolerance, accepting small drift while keeping expired
+/// assertions short-lived on this management-plane route.
+pub const SAML_CLOCK_SKEW_SECS: i64 = 300;
+
+/// Expected identity-provider issuer for one stored backend config.
+/// Read from the stored slot so the response is validated against the real
+/// backend config, never against a value carried in the request itself.
+fn saml_expected_issuer(config: &serde_json::Value) -> Option<String> {
+    config_string(config, &["issuer", "idp_entity_id", "idp_issuer"])
+}
+
+/// Expected audience (our service-provider entity id) for one stored
+/// backend config. Read from the stored slot for the same reason.
+fn saml_expected_audience(config: &serde_json::Value) -> Option<String> {
+    config_string(
+        config,
+        &[
+            "audience",
+            "sp_entity_id",
+            "entity_id",
+            "audience_restriction",
+        ],
+    )
+}
+
+/// Expected recipient (this assertion-consumer location) when the stored
+/// backend names one. `None` means the slot names no recipient, so no
+/// recipient check applies beyond the audience and time checks.
+fn saml_expected_recipient(config: &serde_json::Value) -> Option<String> {
+    config_string(
+        config,
+        &[
+            "acs_url",
+            "acsUrl",
+            "acs",
+            "assertion_consumer_service_url",
+            "recipient",
+        ],
+    )
+}
+
+/// Shared secret that authenticates SAML responses for one stored backend
+/// config. Read from the stored slot (`hmac_secret`, `shared_secret`,
+/// `saml_hmac_secret` or `client_secret`); a base64 value decodes to the
+/// key bytes, otherwise the trimmed UTF-8 bytes are the key. `None` means
+/// the slot carries no verification key, so every response fails closed.
+fn saml_hmac_secret(config: &serde_json::Value) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let raw = config_string(
+        config,
+        &[
+            "hmac_secret",
+            "shared_secret",
+            "saml_hmac_secret",
+            "client_secret",
+        ],
+    )?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&compact) {
+        if !decoded.is_empty() {
+            return Some(decoded);
+        }
+    }
+    Some(trimmed.as_bytes().to_vec())
+}
+
+/// Collect every element body for `tag` (tolerating a namespace prefix and
+/// attributes), e.g. all `<Issuer>` / `<Audience>` bodies. Empty and
+/// nested bodies are skipped so garbage cannot pass as a value. Only an
+/// opening element tag counts: the name must start right after `<` (or a
+/// namespace `:`) and end at `>`, `/` or whitespace, so a longer element
+/// name (`Audience` in `AudienceRestriction`), a closing tag
+/// (`</Audience>`) or an attribute never shadows the real element body.
+fn saml_tag_bodies(xml: &str, tag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut search = 0;
+    while search < xml.len() {
+        let Some(open) = xml[search..].find(tag) else {
+            break;
+        };
+        let pos = search + open;
+        let before_ok = matches!(xml.as_bytes()[..pos].last(), Some(b'<') | Some(b':'));
+        let after_ok = matches!(
+            xml.as_bytes()[pos + tag.len()..].first(),
+            Some(b'>') | Some(b'/') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        );
+        if !before_ok || !after_ok {
+            search = pos + 1;
+            continue;
+        }
+        let Some(end) = xml[pos..].find('>') else {
+            break;
+        };
+        let body_start = pos + end + 1;
+        if body_start >= xml.len() {
+            break;
+        }
+        let Some(close) = xml[body_start..].find("</") else {
+            break;
+        };
+        let body = xml[body_start..body_start + close].trim();
+        if !body.is_empty() && !body.contains('<') {
+            out.push(body.to_string());
+        }
+        search = body_start + close + 2;
+    }
+    out
+}
+
+/// Read one `Attribute="value"` from response XML (double or single
+/// quoted), e.g. `Recipient`, `InResponseTo`, `NotBefore`,
+/// `NotOnOrAfter`. Returns the first match.
+fn saml_attribute(xml: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}");
+        if let Some(open) = xml.find(&needle) {
+            let body_start = open + needle.len();
+            if let Some(close) = xml[body_start..].find(quote) {
+                let value = xml[body_start..body_start + close].trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse a SAML `YYYY-MM-DDTHH:MM:SSZ` instant to Unix seconds. Fractional
+/// seconds and numeric offsets fail closed (return `None`): the broker
+/// mints and checks whole-second UTC instants only.
+fn parse_saml_time(raw: &str) -> Option<i64> {
+    let text = raw.trim();
+    if !text.ends_with('Z') && !text.ends_with('z') {
+        return None;
+    }
+    let text = &text[..text.len() - 1];
+    let (date, time) = text.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month as u32, day as u32)?;
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Days since the Unix epoch for a civil date (Howard Hinnant's
+/// algorithm). Returns `None` for out-of-range inputs.
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month_prime = (month as i64 + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146097 + day_of_era - 719468)
+}
+
+/// Current Unix time in whole seconds (management-plane only).
+fn saml_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The `<SignatureValue>` body decoded to bytes. `None` when the response
+/// carries no signature value: unsigned responses never verify.
+fn extract_saml_signature_value(xml: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let bodies = saml_tag_bodies(xml, "SignatureValue");
+    let body = bodies.first()?;
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(&compact)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&compact))
+        .ok()
+        .filter(|decoded| !decoded.is_empty())
+}
+
+/// The signed content: the decoded response XML with the first
+/// `<Signature>...</Signature>` (or self-closed `<Signature .../>`) block
+/// removed. The signature is computed over everything else, so verification
+/// recomputes over this exact remainder. A `<SignatureValue` prefix never
+/// opens a block: only a `<Signature>` element whose next character is
+/// `>` or whitespace counts.
+fn strip_saml_signature(xml: &str) -> String {
+    let mut cursor = 0;
+    while let Some(found) = xml[cursor..].find("<Signature") {
+        let start = cursor + found;
+        let after = xml[start + "<Signature".len()..].chars().next();
+        match after {
+            Some('>') | Some(' ') | Some('\t') | Some('\n') | Some('\r') => {
+                if let Some(close) = xml[start..].find("</Signature>") {
+                    let end = start + close + "</Signature>".len();
+                    let mut out = String::with_capacity(xml.len().saturating_sub(end - start));
+                    out.push_str(&xml[..start]);
+                    out.push_str(&xml[end..]);
+                    return out;
+                }
+                if let Some(close) = xml[start..].find("/>") {
+                    let end = start + close + "/>".len();
+                    let mut out = String::with_capacity(xml.len().saturating_sub(end - start));
+                    out.push_str(&xml[..start]);
+                    out.push_str(&xml[end..]);
+                    return out;
+                }
+                return xml.to_string();
+            }
+            _ => {
+                cursor = start + "<Signature".len();
+            }
+        }
+    }
+    xml.to_string()
+}
+
+/// Verify the response's HMAC-SHA256 signature against the stored backend
+/// secret using the maintained `hmac` and `sha2` crates. The
+/// `<SignatureValue>` must be `base64(HMAC-SHA256(secret, stripped_xml))`.
+/// Missing secrets, missing signatures and mismatches all return `false`;
+/// callers fail closed and log without secrets.
+fn verify_saml_hmac(xml: &str, config: &serde_json::Value) -> bool {
+    use hmac::Mac as _;
+    let Some(secret) = saml_hmac_secret(config) else {
+        return false;
+    };
+    if secret.is_empty() {
+        return false;
+    }
+    let Some(expected) = extract_saml_signature_value(xml) else {
+        return false;
+    };
+    if expected.len() != 32 {
+        return false;
+    }
+    let stripped = strip_saml_signature(xml);
+    let mut mac = match hmac::Hmac::<sha2::Sha256>::new_from_slice(&secret) {
+        Ok(mac) => mac,
+        Err(_) => return false,
+    };
+    mac.update(stripped.as_bytes());
+    let computed = mac.finalize().into_bytes();
+    let mut diff = 0u8;
+    for (left, right) in computed.iter().zip(expected.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+/// Extract a `<NameID>` element body from response XML, tolerating a
+/// namespace prefix and attributes. Returns the trimmed body when one is
+/// present and non-empty.
+fn extract_saml_name_id(xml: &str) -> Option<String> {
+    let mut search = 0;
+    while let Some(open) = xml[search..].find("NameID") {
+        let tag = search + open;
+        let end = xml[tag..].find('>')?;
+        let body_start = tag + end + 1;
+        let close = xml[body_start..].find("</")?;
+        let body = xml[body_start..body_start + close].trim();
+        if !body.is_empty() && !body.contains('<') {
+            return Some(body.to_string());
+        }
+        search = body_start + close + 2;
+    }
+    None
+}
+
+/// First non-empty string under any of `keys` in a stored backend config
+/// object. Lets the metadata and redirect render tolerate the field names
+/// the per-backend detail task stores without inventing values.
+fn config_string(config: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    config.as_object().and_then(|object| {
+        keys.iter().find_map(|key| {
+            object
+                .get(*key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+    })
+}
+
+/// XML-escape one attribute or element body.
+fn xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the service-provider metadata document for one stored backend.
+/// The entity id and the consumer location come from the stored config
+/// when it names them and fall back to deterministic defaults otherwise;
+/// fields the broker does not track are omitted, never invented beyond
+/// the address of this route itself.
+// TODO(parity): which entity id, endpoints, bindings and key descriptors
+// does the documented metadata carry, and where do they come from in the
+// backend config? The rulebook does not decide the exact document; the
+// current choice renders the entity id plus one POST consumer location
+// until the checker pins the shape.
+fn render_saml_metadata(backend: &str, config: &serde_json::Value) -> String {
+    let entity_id = config_string(config, &["entity_id", "entityId", "sp_entity_id", "issuer"])
+        .unwrap_or_else(|| format!("urn:indramqtt:saml:sp:{backend}"));
+    let acs_location = config_string(
+        config,
+        &["acs_url", "acsUrl", "acs", "assertion_consumer_service_url"],
+    )
+    .unwrap_or_else(|| "/api/v5/sso/saml/acs".to_string());
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<EntityDescriptor xmlns=\"urn:oasis:names:tc:SAML:2.0:metadata\" entityID=\"{}\">\n",
+            "  <SPSSODescriptor AuthnRequestsSigned=\"false\" WantAssertionsSigned=\"false\" protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\">\n",
+            "    <AssertionConsumerService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\" Location=\"{}\" index=\"1\"/>\n",
+            "  </SPSSODescriptor>\n",
+            "</EntityDescriptor>\n"
+        ),
+        xml_escape(&entity_id),
+        xml_escape(&acs_location)
+    )
+}
+
+fn saml_backend_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "code": "BACKEND_NOT_FOUND",
+            "message": "Backend not found",
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /sso/saml/metadata`: serve the service-provider document for one
+/// stored SAML backend as SAML metadata XML.
+///
+/// The route is public (no bearer token: identity-provider operators fetch
+/// it before anyone holds a token) and not paged. The backend is the
+/// `?backend=` query value or [`DEFAULT_SAML_BACKEND`]; unknown query
+/// parameters are ignored. A backend with no stored slot answers 404
+/// `BACKEND_NOT_FOUND` in the documented `{code, message}` shape; a stored
+/// slot answers 200 with [`SAML_METADATA_CONTENT_TYPE`] regardless of its
+/// enable flag (the document describes the provider, it grants nothing).
+///
+/// Management-plane only: one short registry read per request plus a
+/// bounded static render; publish and deliver never touch this store.
+/// Bound: the rendered document is capped at [`MAX_SAML_METADATA_LEN`]
+/// bytes (today's render is hundreds of bytes); no new state.
+// TODO(parity): does the documented route 404 on disabled backends or
+// serve the document anyway? The rulebook does not decide the disabled
+// filter and the document grants nothing, so the current choice serves
+// every stored slot until the checker pins it.
+// TODO(parity): does the documented route take a backend selector at all,
+// or is there exactly one SAML slot? The rulebook does not decide the
+// selection; the current choice keeps the optional `?backend=` selector
+// with the `saml` default until the checker pins it.
+pub async fn saml_metadata(
+    State(state): State<ApiState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    use crate::errors::ApiError;
+    let backend = params
+        .get("backend")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_SAML_BACKEND.to_string());
+    if backend.is_empty() {
+        return ApiError::BadRequest("field `backend` must not be empty".to_string())
+            .into_response();
+    }
+    let Some(stored) = state.sso_backends.get(&backend) else {
+        return saml_backend_not_found();
+    };
+    let document = render_saml_metadata(&backend, &stored.config);
+    debug_assert!(document.len() <= MAX_SAML_METADATA_LEN);
+    (
+        StatusCode::OK,
+        [("content-type", SAML_METADATA_CONTENT_TYPE)],
+        document,
+    )
+        .into_response()
+}
+
+/// `POST /sso/saml/acs`: consume one SAML response for the configured
+/// backend.
+///
+/// The route is public (no bearer token: the provider posts the browser
+/// here before anyone holds a token) and not paged. It accepts the JSON
+/// management shape or the browser form binding, in order:
+/// - bodies that parse as neither fail with 400 in the documented
+///   `{code, message}` shape;
+/// - when `RelayState` names a live pending flow it binds the response to
+///   that flow single-use (unknown, expired or replayed states fail with
+///   400 and issue no token; a state that names a different backend than
+///   an explicit `backend` field fails with 400);
+/// - otherwise the backend is the `backend` body field, the `?backend=`
+///   query value, or [`DEFAULT_SAML_BACKEND`]; a backend with no stored
+///   slot fails with 404 `BACKEND_NOT_FOUND` and records nothing;
+/// - a stored backend with `enable` false, with no stored provider config,
+///   or whose verified username names no admin user fails closed with 401
+///   `BAD_USERNAME_OR_PWD` and issues no token;
+/// - a missing, oversized or undecodable `SAMLResponse` fails with 400
+///   and issues no token; a response whose issuer, audience, time window,
+///   recipient, subject confirmation or signature does not verify against
+///   the stored backend config fails closed with 401 and issues no token;
+/// - otherwise one live dashboard token is issued for the verified
+///   `NameID` user (RelayState flows additionally bind `NameID` and
+///   `InResponseTo` to the pending flow; the flow-less shape binds the
+///   verified `NameID` only and never trusts a request `username` field)
+///   with that user's current role, and the response carries the
+///   documented token/redirect fields.
+///
+/// Every success verifies the response against the stored backend slot:
+/// the `<Issuer>` must equal the slot's `issuer`, an `<Audience>` must
+/// equal the slot's `audience`, the `Conditions` window must contain now
+/// within [`SAML_CLOCK_SKEW_SECS`], the `Recipient` must match the slot's
+/// consumer location when one is stored, the `<NameID>` must name the
+/// flow user (RelayState shape), and the HMAC-SHA256 `<SignatureValue>`
+/// (maintained `hmac`/`sha2` crates) over the response must verify with
+/// the slot's stored secret. Responses are never logged and never stored.
+/// Management-plane only: short registry/admin reads plus at most one
+/// short pending-table lock per call; publish and deliver never touch any
+/// of them. Bound: the pending-flow table from W2-33
+/// ([`MAX_PENDING_SSO_LOGINS`], [`PENDING_SSO_LOGIN_TTL`]); the response
+/// itself is capped at [`MAX_SAML_RESPONSE_LEN`] bytes and the relay state
+/// at [`MAX_SAML_RELAYSTATE_LEN`] bytes; no new state.
+// TODO(parity): is the documented miss code `BACKEND_NOT_FOUND` or the
+// generic `NOT_FOUND`? The rulebook does not decide the exact code name;
+// the current choice keeps `BACKEND_NOT_FOUND` (404, documented
+// `{code, message}` shape) until the checker pins it.
+// TODO(parity): what are the documented ACS field names (`SAMLResponse`
+// versus `response`, `RelayState` versus `state`, plus `backend`)? The
+// rulebook does not decide the exact names; the current choice reads the
+// standard POST-binding names plus the `backend` management field (a
+// request `username` field is accepted by the parser but never trusted)
+// until the checker pins them.
+// TODO(parity): what are the documented success field names (`token`
+// versus `access_token`, `redirect` versus `redirect_uri`, plus
+// username/backend)? The rulebook does not decide the exact shape; the
+// current choice answers `{token, username, backend, redirect}` (token is
+// the live bearer, redirect comes from the stored backend config's
+// `redirect`/`redirect_uri` string when one is stored and defaults to
+// `/`) until the checker pins it.
+// TODO(parity): which signature profile does the documented ACS verify
+// (RSA XML-DSig with provider certificates versus the HMAC-SHA256 shared
+// secret checked here)? The rulebook does not decide the profile; the
+// current choice verifies HMAC-SHA256 with the slot's stored secret and
+// fails closed without one until the checker pins the profile.
+pub async fn saml_acs(
+    State(state): State<ApiState>,
+    Query(query): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    use crate::errors::ApiError;
+    let bad_request = |message: String| ApiError::BadRequest(message).into_response();
+    let fields = match parse_saml_acs_fields(&body) {
+        Ok(fields) => fields,
+        Err(message) => return bad_request(message),
+    };
+    let relay_state = fields
+        .relay_state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(relay) = relay_state {
+        if relay.len() > MAX_SAML_RELAYSTATE_LEN {
+            return bad_request("field `RelayState` is too long".to_string());
+        }
+        let Some(flow) = state.sso_backends.consume_pending_state(&relay) else {
+            return bad_request("unknown or expired RelayState".to_string());
+        };
+        let explicit = fields
+            .backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                query
+                    .get("backend")
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+            });
+        if let Some(explicit) = explicit {
+            if explicit != flow.backend {
+                return bad_request("RelayState does not belong to this backend".to_string());
+            }
+        }
+        let Some(stored) = state.sso_backends.get(&flow.backend) else {
+            return saml_backend_not_found();
+        };
+        return complete_saml_acs(
+            &state,
+            &stored,
+            &flow.backend,
+            &flow.username,
+            &fields,
+            Some(relay.as_str()),
+        );
+    }
+    let backend = fields
+        .backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            query
+                .get("backend")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_SAML_BACKEND.to_string());
+    let Some(stored) = state.sso_backends.get(&backend) else {
+        return saml_backend_not_found();
+    };
+    complete_saml_acs_with_username(&state, &stored, &backend, &fields)
+}
+
+/// Shared tail of [`saml_acs`] once the backend row and the username are
+/// known: fail closed on disabled slots, missing provider config and
+/// unknown users, then verify the response issuer, audience, time window,
+/// recipient, subject confirmation and HMAC signature against the stored
+/// backend config before issuing one live bearer with the documented
+/// token/redirect fields. `expected_in_response_to` is `Some` for the
+/// RelayState shape (the consumed flow id the `InResponseTo` must name)
+/// and `None` for the flow-less shape.
+fn complete_saml_acs(
+    state: &ApiState,
+    stored: &SsoBackend,
+    backend: &str,
+    username: &str,
+    fields: &SamlAcsFields,
+    expected_in_response_to: Option<&str>,
+) -> Response {
+    use crate::errors::ApiError;
+    let bad_request = |message: String| ApiError::BadRequest(message).into_response();
+    let denied = |reason: &str| {
+        tracing::warn!(
+            backend = backend,
+            username = username,
+            reason = reason,
+            "sso saml acs failed"
+        );
+        ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response()
+    };
+    if !stored.enable {
+        tracing::warn!(
+            backend = backend,
+            username = username,
+            "sso saml acs refused: backend is disabled"
+        );
+        return ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response();
+    }
+    if stored.config.is_null() {
+        tracing::warn!(
+            backend = backend,
+            username = username,
+            "sso saml acs failed: no provider config for this backend"
+        );
+        return ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response();
+    }
+    let Some(view) = state.admin_users.get(username) else {
+        tracing::warn!(
+            backend = backend,
+            username = username,
+            "sso saml acs failed: unknown user for this response"
+        );
+        return ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response();
+    };
+    let raw = fields.saml_response.as_deref().unwrap_or("").trim();
+    if raw.is_empty() {
+        return bad_request("field `SAMLResponse` must not be empty".to_string());
+    }
+    if raw.len() > MAX_SAML_RESPONSE_LEN {
+        return bad_request("field `SAMLResponse` is too long".to_string());
+    }
+    let Some(xml) = decode_saml_response(raw) else {
+        return bad_request("field `SAMLResponse` is not a SAML response".to_string());
+    };
+    if !(xml.contains("<Response") || xml.contains("<Assertion")) {
+        return bad_request("field `SAMLResponse` is not a SAML response".to_string());
+    }
+    // Issuer must equal the stored backend's identity-provider issuer.
+    let Some(expected_issuer) = saml_expected_issuer(&stored.config) else {
+        return denied("no identity-provider issuer for this backend");
+    };
+    let issuers = saml_tag_bodies(&xml, "Issuer");
+    if issuers.is_empty() || issuers.iter().any(|issuer| issuer != &expected_issuer) {
+        return denied("issuer does not match this backend");
+    }
+    // At least one audience must equal the stored service-provider entity.
+    let Some(expected_audience) = saml_expected_audience(&stored.config) else {
+        return denied("no audience for this backend");
+    };
+    let audiences = saml_tag_bodies(&xml, "Audience");
+    if audiences.is_empty()
+        || !audiences
+            .iter()
+            .any(|audience| audience == &expected_audience)
+    {
+        return denied("audience does not match this backend");
+    }
+    // Conditions window must contain now within the allowed skew.
+    let not_before = saml_attribute(&xml, "NotBefore").and_then(|raw| parse_saml_time(&raw));
+    let not_on_or_after =
+        saml_attribute(&xml, "NotOnOrAfter").and_then(|raw| parse_saml_time(&raw));
+    let (Some(not_before), Some(not_on_or_after)) = (not_before, not_on_or_after) else {
+        return denied("response carries no usable validity window");
+    };
+    if not_on_or_after <= not_before {
+        return denied("response validity window is empty");
+    }
+    let now = saml_now_secs();
+    if now < not_before - SAML_CLOCK_SKEW_SECS || now >= not_on_or_after + SAML_CLOCK_SKEW_SECS {
+        return denied("response is outside its validity window");
+    }
+    // Recipient must match the stored consumer location when one is stored.
+    if let Some(expected_recipient) = saml_expected_recipient(&stored.config) {
+        let recipient = saml_attribute(&xml, "Recipient");
+        if recipient.as_deref() != Some(expected_recipient.as_str()) {
+            return denied("recipient does not match this backend");
+        }
+    }
+    // The asserted NameID is the authenticated user: it must name the flow
+    // user, never a request field. Self-asserted identities for another
+    // user fail closed here.
+    let asserted = extract_saml_name_id(&xml);
+    if asserted.as_deref() != Some(username) {
+        return denied("subject does not match this login");
+    }
+    // RelayState flows additionally bind InResponseTo to the consumed flow.
+    if let Some(expected) = expected_in_response_to {
+        let in_response_to = saml_attribute(&xml, "InResponseTo");
+        if in_response_to.as_deref() != Some(expected) {
+            return denied("response does not answer this login");
+        }
+    }
+    // The HMAC-SHA256 signature must verify with the stored backend secret.
+    // Unsigned responses and responses signed with any other key fail here,
+    // so a self-made document never yields a bearer.
+    if !verify_saml_hmac(&xml, &stored.config) {
+        return denied("response signature does not verify for this backend");
+    }
+    let token = state.tokens.issue(username, view.role);
+    tracing::warn!(
+        backend = backend,
+        username = username,
+        "sso saml acs completed"
+    );
+    let redirect = stored
+        .config
+        .as_object()
+        .and_then(|object| {
+            object
+                .get("redirect")
+                .or_else(|| object.get("redirect_uri"))
+                .or_else(|| object.get("post_login_redirect"))
+        })
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/")
+        .to_string();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "token": token,
+            "username": username,
+            "backend": backend,
+            "redirect": redirect,
+        })),
+    )
+        .into_response()
+}
+
+/// Username resolution for the flow-less ACS shape: the verified
+/// response's `<NameID>` body alone binds the user. A request `username`
+/// field is never trusted (it is accepted by the parser for compatibility
+/// but ignored here), so a caller cannot self-assert another identity.
+/// A missing `NameID` is malformed; an unknown user fails closed.
+fn complete_saml_acs_with_username(
+    state: &ApiState,
+    stored: &SsoBackend,
+    backend: &str,
+    fields: &SamlAcsFields,
+) -> Response {
+    use crate::errors::ApiError;
+    // The parser accepts a `username` management field for compatibility,
+    // but it is never trusted: the verified `<NameID>` alone binds the user.
+    let _ = fields.username.as_deref();
+    let Some(username) = fields
+        .saml_response
+        .as_deref()
+        .and_then(decode_saml_response)
+        .as_deref()
+        .and_then(extract_saml_name_id)
+    else {
+        return ApiError::BadRequest("field `username` must not be empty".to_string())
+            .into_response();
+    };
+    complete_saml_acs(state, stored, backend, &username, fields, None)
+}
+
 #[cfg(test)]
 mod sso_store_tests {
     use super::*;
@@ -1326,5 +2236,660 @@ mod sso_oidc_callback_tests {
         const { assert!(MAX_OIDC_STATE_LEN > 0) };
         const { assert!(MAX_OIDC_CODE_LEN > 0) };
         assert!(!PENDING_SSO_LOGIN_TTL.is_zero());
+    }
+}
+
+#[cfg(test)]
+mod sso_saml_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+    use std::collections::HashMap;
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn seed_backend(state: &ApiState, name: &str, enable: bool, config: serde_json::Value) {
+        state
+            .sso_backends
+            .insert(sso_backend(name.to_string(), enable, config))
+            .expect("seed backend inserts");
+    }
+
+    fn seed_user(state: &ApiState, username: &str) {
+        state
+            .admin_users
+            .create(
+                username,
+                "SamlProbe123!",
+                crate::admin_users::AdminRole::Viewer,
+                "saml probe",
+            )
+            .expect("probe user creates");
+    }
+
+    fn body(value: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
+    }
+
+    const TEST_ISSUER: &str = "https://idp.example.invalid";
+    const TEST_AUDIENCE: &str = "https://sp.example.invalid/metadata";
+    const TEST_RECIPIENT: &str = "https://sp.example.invalid/acs";
+    // `!` keeps this outside the base64 alphabet so the stored slot uses
+    // the raw UTF-8 bytes on both the signing and verifying sides.
+    const TEST_SECRET: &str = "w237-saml-test-secret-!!";
+
+    fn saml_config() -> serde_json::Value {
+        serde_json::json!({
+            "issuer": TEST_ISSUER,
+            "audience": TEST_AUDIENCE,
+            "acs_url": TEST_RECIPIENT,
+            "hmac_secret": TEST_SECRET,
+            "redirect": "/dashboard",
+        })
+    }
+
+    fn unsigned_xml(username: &str, in_response_to: Option<&str>) -> String {
+        let response_in_response_to = in_response_to
+            .map(|state| format!(" InResponseTo=\"{state}\""))
+            .unwrap_or_default();
+        let confirmation_in_response_to = in_response_to
+            .map(|state| format!(" InResponseTo=\"{state}\""))
+            .unwrap_or_default();
+        format!(
+            concat!(
+                "<Response ID=\"_r\" Version=\"2.0\" IssueInstant=\"2026-01-01T00:00:00Z\"{response_attr}>",
+                "<Issuer>{issuer}</Issuer>",
+                "<Status><StatusCode Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/></Status>",
+                "<Assertion ID=\"_a\" IssueInstant=\"2026-01-01T00:00:00Z\" Version=\"2.0\">",
+                "<Issuer>{issuer}</Issuer>",
+                "<Subject><NameID>{username}</NameID>",
+                "<SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">",
+                "<SubjectConfirmationData NotOnOrAfter=\"2100-01-01T00:00:00Z\" Recipient=\"{recipient}\"{confirmation_attr}/>",
+                "</SubjectConfirmation></Subject>",
+                "<Conditions NotBefore=\"2020-01-01T00:00:00Z\" NotOnOrAfter=\"2100-01-01T00:00:00Z\">",
+                "<AudienceRestriction><Audience>{audience}</Audience></AudienceRestriction>",
+                "</Conditions>",
+                "<AuthnStatement AuthnInstant=\"2026-01-01T00:00:00Z\"/>",
+                "</Assertion></Response>"
+            ),
+            response_attr = response_in_response_to,
+            confirmation_attr = confirmation_in_response_to,
+            issuer = TEST_ISSUER,
+            username = username,
+            recipient = TEST_RECIPIENT,
+            audience = TEST_AUDIENCE,
+        )
+    }
+
+    fn sign_xml(unsigned: &str) -> String {
+        use base64::Engine as _;
+        use hmac::Mac as _;
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(TEST_SECRET.as_bytes())
+            .expect("test secret is a valid HMAC key");
+        mac.update(unsigned.as_bytes());
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let block = format!("<Signature><SignatureValue>{signature}</SignatureValue></Signature>");
+        let end = unsigned.find('>').expect("test response has a root tag") + 1;
+        format!("{}{block}{}", &unsigned[..end], &unsigned[end..])
+    }
+
+    fn signed_response(username: &str, in_response_to: Option<&str>) -> String {
+        use base64::Engine as _;
+        let unsigned = unsigned_xml(username, in_response_to);
+        base64::engine::general_purpose::STANDARD.encode(sign_xml(&unsigned).as_bytes())
+    }
+
+    fn stub_response(username: &str) -> String {
+        signed_response(username, None)
+    }
+
+    async fn acs_json(
+        state: &ApiState,
+        query: HashMap<String, String>,
+        raw: Bytes,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = saml_acs(State(state.clone()), Query(query), raw).await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("test body is JSON");
+        (status, json)
+    }
+
+    async fn metadata_raw(
+        state: &ApiState,
+        query: HashMap<String, String>,
+    ) -> (StatusCode, HashMap<String, String>, Vec<u8>) {
+        let response = saml_metadata(State(state.clone()), Query(query)).await;
+        let status = response.status();
+        let headers: HashMap<String, String> = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        (status, headers, bytes.to_vec())
+    }
+
+    fn empty_query() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    #[tokio::test]
+    async fn unknown_backend_is_404_with_documented_shape() {
+        // W2-37 failing test (miss half): before this task the ACS path
+        // answered 404 with the router's plain-text body; now an unknown
+        // backend answers 404 in the documented `{code, message}` shape.
+        let state = standalone_state();
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "backend": "w237-no-such-backend",
+                "SAMLResponse": stub_response("w237-alice"),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("BACKEND_NOT_FOUND"));
+        assert!(err["message"].is_string());
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert!(err.get("token").is_none());
+        // The default slot is equally unknown when nothing is stored.
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({"SAMLResponse": stub_response("w237-alice")})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("BACKEND_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn bad_responses_are_rejected_with_documented_shape_and_no_token() {
+        let state = standalone_state();
+        seed_backend(&state, "saml", true, saml_config());
+        seed_user(&state, "w237-alice");
+        for raw in [
+            Bytes::from_static(b""),
+            Bytes::from_static(b"not json"),
+            body(serde_json::json!([1, 2])),
+            body(serde_json::json!({})),
+            body(serde_json::json!({"SAMLResponse": ""})),
+            body(serde_json::json!({"SAMLResponse": "   "})),
+            body(serde_json::json!({"SAMLResponse": "!!!not-base64!!!"})),
+            body(serde_json::json!({"SAMLResponse": "aGVsbG8td29ybGQ="})),
+            body(serde_json::json!({"username": "w237-alice"})),
+        ] {
+            let (status, err) = acs_json(&state, empty_query(), raw).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(err["message"].is_string());
+            assert_eq!(err.as_object().expect("error is an object").len(), 2);
+            assert!(err.get("token").is_none(), "no token is issued on failure");
+        }
+        // Backend lookup runs first: a bad response against an unknown
+        // backend still answers 404, never 400.
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "backend": "w237-no-such-backend",
+                "SAMLResponse": "",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("BACKEND_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn happy_path_with_verified_response_issues_live_token_and_redirect() {
+        // W2-37 failing test (good half): a response verified against the
+        // stored backend (issuer, audience, time window, recipient and
+        // HMAC signature) completes with the documented token/redirect
+        // fields. Before: 404 for everything on this path.
+        let state = standalone_state();
+        seed_backend(&state, "saml", true, saml_config());
+        seed_user(&state, "w237-bob");
+        let (status, ok) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-bob", None),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = ok["token"].as_str().expect("success carries a token");
+        assert!(!token.is_empty());
+        assert_eq!(ok["username"], serde_json::json!("w237-bob"));
+        assert_eq!(ok["backend"], serde_json::json!("saml"));
+        assert_eq!(ok["redirect"], serde_json::json!("/dashboard"));
+        assert!(ok.get("code").is_none(), "success carries no error code");
+        assert!(
+            state.tokens.lookup(token).is_some(),
+            "issued token is live in the token store"
+        );
+        // A request `username` field is never trusted: it cannot redirect
+        // the verified NameID to another identity.
+        let (status, ok) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-bob", None),
+                "username": "w237-eve",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ok["username"], serde_json::json!("w237-bob"));
+        // The browser form binding carries the same fields.
+        let form = format!(
+            "SAMLResponse={}&RelayState=",
+            url_encode(&signed_response("w237-bob", None))
+        );
+        let (status, _) = acs_json(
+            &state,
+            empty_query(),
+            Bytes::from(format!("username=w237-bob&{form}").into_bytes()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn self_made_responses_never_issue_tokens() {
+        // The arbiter's stub: a self-made base64 Response/Assertion with no
+        // issuer, audience, window or signature must fail closed, even for
+        // a known user on an enabled, configured backend.
+        use base64::Engine as _;
+        let state = standalone_state();
+        seed_backend(&state, "saml", true, saml_config());
+        seed_user(&state, "w237-bob");
+        let forged = base64::engine::general_purpose::STANDARD.encode(
+            "<Response><Assertion><Subject><NameID>w237-bob</NameID></Subject></Assertion></Response>"
+                .as_bytes(),
+        );
+        for payload in [
+            body(serde_json::json!({"SAMLResponse": forged})),
+            body(serde_json::json!({"SAMLResponse": forged, "username": "w237-bob"})),
+        ] {
+            let (status, err) = acs_json(&state, empty_query(), payload).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(err["code"], serde_json::json!("BAD_USERNAME_OR_PWD"));
+            assert!(err.get("token").is_none());
+        }
+        // Unsigned but otherwise well-formed responses fail the same way.
+        let unsigned = base64::engine::general_purpose::STANDARD
+            .encode(unsigned_xml("w237-bob", None).as_bytes());
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({"SAMLResponse": unsigned})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+        // Flipping one NameID byte after signing breaks the HMAC, so the
+        // tampered document fails closed even though its NameID names a
+        // known user.
+        seed_user(&state, "w237-eve");
+        let good = signed_response("w237-bob", None);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&good)
+            .expect("test response decodes");
+        let tampered_xml = String::from_utf8(decoded)
+            .expect("test response is UTF-8")
+            .replacen("w237-bob", "w237-eve", 1);
+        let tampered = base64::engine::general_purpose::STANDARD.encode(tampered_xml.as_bytes());
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({"SAMLResponse": tampered})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn issuer_audience_window_and_recipient_mismatch_fail_closed() {
+        use base64::Engine as _;
+        let state = standalone_state();
+        seed_backend(&state, "saml", true, saml_config());
+        seed_user(&state, "w237-bob");
+        // Wrong issuer.
+        let wrong_issuer =
+            unsigned_xml("w237-bob", None).replacen(TEST_ISSUER, "https://evil.example.invalid", 2);
+        let wrong_issuer =
+            base64::engine::general_purpose::STANDARD.encode(sign_xml(&wrong_issuer).as_bytes());
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({"SAMLResponse": wrong_issuer})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+        // Wrong audience.
+        let wrong_audience = unsigned_xml("w237-bob", None).replacen(
+            TEST_AUDIENCE,
+            "https://evil.example.invalid/aud",
+            1,
+        );
+        let wrong_audience =
+            base64::engine::general_purpose::STANDARD.encode(sign_xml(&wrong_audience).as_bytes());
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({"SAMLResponse": wrong_audience})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+        // Expired window.
+        let expired = unsigned_xml("w237-bob", None).replacen(
+            "2100-01-01T00:00:00Z",
+            "2020-01-02T00:00:00Z",
+            2,
+        );
+        let expired =
+            base64::engine::general_purpose::STANDARD.encode(sign_xml(&expired).as_bytes());
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({"SAMLResponse": expired})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+        // Wrong recipient.
+        let wrong_recipient = unsigned_xml("w237-bob", None).replacen(
+            TEST_RECIPIENT,
+            "https://evil.example.invalid/acs",
+            1,
+        );
+        let wrong_recipient =
+            base64::engine::general_purpose::STANDARD.encode(sign_xml(&wrong_recipient).as_bytes());
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({"SAMLResponse": wrong_recipient})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+    }
+
+    fn url_encode(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        for byte in input.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char);
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn relaystate_binds_single_use_flow_and_fail_closed_cases() {
+        let state = standalone_state();
+        seed_backend(&state, "saml", true, saml_config());
+        let mut off_config = saml_config();
+        off_config["redirect"] = serde_json::json!("/off");
+        seed_backend(&state, "w237-off", false, off_config);
+        seed_backend(&state, "w237-bare", true, serde_json::Value::Null);
+        seed_user(&state, "w237-carol");
+
+        // A live RelayState with a response verified against the stored
+        // slot completes and burns: the replay fails as unknown.
+        let flow = state
+            .sso_backends
+            .record_login_attempt("saml", "w237-carol");
+        let (status, ok) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-carol", Some(flow.as_str())),
+                "RelayState": flow,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ok["token"].is_string());
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-carol", Some(flow.as_str())),
+                "RelayState": flow,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "states are single-use");
+        assert!(err.get("token").is_none());
+
+        // Unknown RelayStates fail without a token.
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-carol", None),
+                "RelayState": "w237-no-such-state",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err.get("token").is_none());
+
+        // A response bound to another flow does not answer this one.
+        let flow_a = state
+            .sso_backends
+            .record_login_attempt("saml", "w237-carol");
+        let flow_b = state
+            .sso_backends
+            .record_login_attempt("saml", "w237-carol");
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-carol", Some(flow_a.as_str())),
+                "RelayState": flow_b,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+
+        // A NameID for another user does not complete this flow.
+        let flow = state
+            .sso_backends
+            .record_login_attempt("saml", "w237-carol");
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-eve", Some(flow.as_str())),
+                "RelayState": flow,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+
+        // A state that names a vanished backend is 404.
+        let flow = state
+            .sso_backends
+            .record_login_attempt("w237-gone", "w237-carol");
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-carol", Some(flow.as_str())),
+                "RelayState": flow,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("BACKEND_NOT_FOUND"));
+
+        // Disabled backends fail closed with no token.
+        let flow = state
+            .sso_backends
+            .record_login_attempt("w237-off", "w237-carol");
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-carol", Some(flow.as_str())),
+                "RelayState": flow,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err["code"], serde_json::json!("BAD_USERNAME_OR_PWD"));
+        assert!(err.get("token").is_none());
+
+        // Backends with no stored provider config fail closed.
+        let flow = state
+            .sso_backends
+            .record_login_attempt("w237-bare", "w237-carol");
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-carol", Some(flow.as_str())),
+                "RelayState": flow,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+
+        // Flows for unknown admin users fail closed.
+        let flow = state
+            .sso_backends
+            .record_login_attempt("saml", "w237-ghost");
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-ghost", Some(flow.as_str())),
+                "RelayState": flow,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+
+        // The flow-less shape fails closed for unknown users too.
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": signed_response("w237-ghost", None),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_serves_bounded_document_and_404s_when_unconfigured() {
+        // W2-37 failing test (metadata half): before this task the path
+        // answered 404 with the router's plain-text body; now a stored
+        // slot serves its document with the metadata content type.
+        let state = standalone_state();
+        let (status, _, _) = metadata_raw(&state, empty_query()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unconfigured SAML is 404");
+        seed_backend(
+            &state,
+            "saml",
+            true,
+            serde_json::json!({
+                "entity_id": "https://sp.example.invalid/metadata",
+                "acs_url": "https://sp.example.invalid/acs",
+            }),
+        );
+        let (status, headers, raw) = metadata_raw(&state, empty_query()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some(SAML_METADATA_CONTENT_TYPE)
+        );
+        let document = String::from_utf8(raw).expect("metadata is UTF-8 XML");
+        assert!(
+            document.contains("EntityDescriptor"),
+            "metadata carries the documented document"
+        );
+        assert!(document.contains("https://sp.example.invalid/metadata"));
+        assert!(document.contains("https://sp.example.invalid/acs"));
+        assert!(
+            document.len() <= MAX_SAML_METADATA_LEN,
+            "metadata is a bounded static document"
+        );
+        // Unknown query parameters are ignored; an unknown backend is 404.
+        let mut query = HashMap::new();
+        query.insert("unexpected_param".to_string(), "1".to_string());
+        let (status, _, _) = metadata_raw(&state, query).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut query = HashMap::new();
+        query.insert("backend".to_string(), "w237-no-such-backend".to_string());
+        let (status, _, raw) = metadata_raw(&state, query).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let err: serde_json::Value = serde_json::from_slice(&raw).expect("miss body is JSON");
+        assert_eq!(err["code"], serde_json::json!("BACKEND_NOT_FOUND"));
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+    }
+
+    #[test]
+    fn saml_bounds_are_finite_and_reasoned() {
+        const { assert!(MAX_PENDING_SSO_LOGINS > 0) };
+        const { assert!(MAX_SAML_RESPONSE_LEN > 0) };
+        const { assert!(MAX_SAML_RELAYSTATE_LEN > 0) };
+        const { assert!(MAX_SAML_METADATA_LEN > 0) };
+        const { assert!(!DEFAULT_SAML_BACKEND.is_empty()) };
+        const { assert!(SAML_CLOCK_SKEW_SECS > 0) };
+        assert!(!SAML_METADATA_CONTENT_TYPE.is_empty());
+        assert!(!PENDING_SSO_LOGIN_TTL.is_zero());
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_rejected() {
+        let state = standalone_state();
+        seed_backend(&state, "saml", true, saml_config());
+        seed_user(&state, "w237-dave");
+        let big = "A".repeat(MAX_SAML_RESPONSE_LEN + 1);
+        let (status, err) = acs_json(
+            &state,
+            empty_query(),
+            body(serde_json::json!({
+                "SAMLResponse": big,
+                "username": "w237-dave",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(err.get("token").is_none());
     }
 }
