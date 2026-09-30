@@ -59,6 +59,12 @@ pub fn public_router() -> Router<ApiState> {
         // anyone holds a token). Management-plane only; publish and
         // deliver never touch the backend registry or the pending table.
         .route("/sso/oidc/callback", get(sso::oidc_callback))
+        // Single-sign-on running state (W2-36, C05-17): enabled backend
+        // names over the real registry. Pre-auth by definition (the
+        // login page probes it before anyone holds a token). The route
+        // is not paged, reflects live state, and carries only names.
+        // Management-plane only; publish and deliver never touch it.
+        .route("/sso/running", get(sso::list_running))
 }
 
 /// Authenticated `/api/v5/*` endpoints. Served behind the

@@ -10422,6 +10422,106 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn sso_running_empty_then_enabled_only_and_survives_restart() {
+        // W2-36 failing test: list running with none enabled expecting
+        // empty, enable one backend then list expecting it.
+        // Before: 404 (no route for this path).
+        // Broker-through: every read goes through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), not only
+        // through the store; the registry seed is the kernel boot path
+        // (`Shared.sso_backends`, `seed_from_registry`). Store unit
+        // tests cover the enabled filter; publish and deliver never
+        // touch this store.
+        let dir = unique_data_dir("sso-running");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+
+        // Empty set reads as an empty collection, never an error. The
+        // route is public (login page probes it pre-auth), so both the
+        // anonymous and the authenticated reads answer 200 here.
+        let (status, body) = server.get("/api/v5/sso/running").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let token = server.login_as_admin().await;
+        let (status, body) = server.get_auth("/api/v5/sso/running", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // The route is not paged and takes no parameters: unknown query
+        // parameters are ignored, not errors.
+        let (status, tolerated) = server
+            .send(
+                "GET",
+                "/api/v5/sso/running?unexpected_param=1&page=2&limit=1",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(tolerated, json!([]));
+
+        // Enable one backend and leave one disabled through the registry
+        // root, persist, and restart: running must list only the enabled
+        // name while the full list still shows both slots.
+        registry
+            .commit_sso_backends(broker_config::SsoBackendsConf {
+                backends: vec![
+                    broker_config::SsoBackendEntry {
+                        backend: "w236-oidc".to_string(),
+                        enable: true,
+                        config: serde_json::json!({"issuer": "https://idp.example.invalid"})
+                            .to_string(),
+                    },
+                    broker_config::SsoBackendEntry {
+                        backend: "w236-off".to_string(),
+                        enable: false,
+                        config: String::new(),
+                    },
+                ],
+            })
+            .expect("commit sso backends");
+        registry.save().expect("save sso backends");
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/sso/running", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!(["w236-oidc"]));
+        // Anonymous probe agrees with the authenticated read.
+        let (status, anon) = server.get("/api/v5/sso/running").await;
+        assert_eq!(status, 200);
+        assert_eq!(anon, body);
+        // The full list still carries both slots; running is the enabled
+        // subset of that live state.
+        let (status, full) = server.get_auth("/api/v5/sso", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(full.as_array().expect("sso list is a collection").len(), 2);
+        // Unknown query parameters stay ignored on the configured read.
+        let (status, tolerated) = server
+            .send(
+                "GET",
+                "/api/v5/sso/running?unexpected_param=1",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(tolerated, body);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn removed_cluster_inflight_routes_return_404() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;

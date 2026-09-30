@@ -1,6 +1,7 @@
 //! Configured single-sign-on backends for the v5 management API.
 //!
-//! Covers `GET /sso` (ordered list, C05-11) on real state.
+//! Covers `GET /sso` (ordered list, C05-11) and `GET /sso/running`
+//! (enabled names, C05-17) on real state.
 //! Single-node, management-plane only: handlers clone at most the capped
 //! list once per request under a short lock; publish and deliver never
 //! touch this store, and no identity-provider client runs here (listing
@@ -233,6 +234,27 @@ impl SsoStore {
         out
     }
 
+    /// Names of currently running backends, sorted for stable reads.
+    /// Running means stored with `enable` set to true; disabled slots
+    /// are configured but not running. An empty set reads as an empty
+    /// collection, never an error. No new state: a filtered view over
+    /// the capped registry from W2-32.
+    // TODO(parity): does the documented running set mean enabled slots,
+    // or only enabled slots whose provider resource is healthy (no last
+    // error)? The rulebook does not decide the health filter and the
+    // broker tracks only the registry slot (no provider client), so the
+    // current choice reports every enabled slot until the checker pins it.
+    pub fn running(&self) -> Vec<String> {
+        let map = self.inner.read().expect("sso store lock");
+        let mut out: Vec<String> = map
+            .values()
+            .filter(|backend| backend.enable)
+            .map(|backend| backend.backend.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Read one backend by name. Returns a clone under a short read lock,
     /// or `None` when nothing is stored under the name.
     pub fn get(&self, backend: &str) -> Option<SsoBackend> {
@@ -447,6 +469,24 @@ pub async fn list_sso(State(state): State<ApiState>) -> Response {
     let all = state.sso_backends.list();
     let data: Vec<serde_json::Value> = all.iter().map(SsoBackend::to_json).collect();
     (StatusCode::OK, Json(data)).into_response()
+}
+
+/// `GET /sso/running`: running backends as a bare JSON array of backend
+/// names in backend-name order. Running means stored with `enable` set
+/// to true; an empty set reads as `[]`, never an error. The route is
+/// not paged, reflects live state, and takes no parameters; unknown
+/// query parameters are ignored (the handler takes no query extractor,
+/// so Axum never parses them).
+///
+/// The route is public (no bearer token: the dashboard login page probes
+/// it before anyone holds a token to render the provider buttons) and
+/// carries only backend names, never configs or secrets.
+/// Management-plane only: one short read lock per request cloning at most
+/// the capped names; publish and deliver never touch this store. Bound:
+/// backend cap as in W2-32; no new state.
+pub async fn list_running(State(state): State<ApiState>) -> Response {
+    let running = state.sso_backends.running();
+    (StatusCode::OK, Json(running)).into_response()
 }
 
 /// `POST /sso/login/{backend}`: initiate a login against one configured
@@ -745,7 +785,41 @@ mod sso_store_tests {
     fn empty_registry_lists_nothing() {
         let store = empty_store();
         assert!(store.list().is_empty());
+        assert!(store.running().is_empty());
         assert!(store.get("w232-missing").is_none());
+    }
+
+    #[test]
+    fn running_lists_only_enabled_names_sorted() {
+        // W2-36: running is the enabled subset of the live registry as
+        // bare names in backend-name order; an empty set reads as `[]`.
+        let store = empty_store();
+        assert!(store.running().is_empty());
+        store
+            .insert(sso_backend(
+                "w236-saml".to_string(),
+                true,
+                serde_json::Value::Null,
+            ))
+            .expect("enabled insert succeeds");
+        store
+            .insert(sso_backend(
+                "w236-oidc".to_string(),
+                false,
+                serde_json::json!({"issuer": "https://idp.example.invalid"}),
+            ))
+            .expect("disabled insert succeeds");
+        store
+            .insert(sso_backend(
+                "w236-aaa".to_string(),
+                true,
+                serde_json::Value::Null,
+            ))
+            .expect("second enabled insert succeeds");
+        assert_eq!(
+            store.running(),
+            vec!["w236-aaa".to_string(), "w236-saml".to_string()]
+        );
     }
 
     #[test]
