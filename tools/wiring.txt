@@ -20,5 +20,6 @@ wired  tracing
 wired  authn_settings
 wired  api_keys
 wired  audit
+wired  sso_backends
 wired  hwm_history
 wired  license_setting

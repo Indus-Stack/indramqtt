@@ -222,6 +222,14 @@ pub struct ApiState {
     /// authenticated request (`crate::api_auth::require_api_auth`).
     /// Publish and deliver never touch this store.
     pub audit: Arc<crate::v5::audit::AuditLog>,
+    /// Configured single-sign-on backend registry for `GET /api/v5/sso`
+    /// (W2-32): bounded name-keyed map with registry persistence. The
+    /// route reads one bounded snapshot per request; the kernel boot
+    /// path seeds the same instance from the registry
+    /// (`crates/broker-node/src/main.rs`, boot seeding and the
+    /// `serve_api` share below). Management-plane only; publish and
+    /// deliver never touch this store.
+    pub sso_backends: Arc<crate::v5::sso::SsoStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -302,6 +310,11 @@ impl ApiState {
         // keys from the first connection. An empty snapshot is a no-op
         // (today's empty behaviour); secrets stay hashed at rest.
         let api_keys = Arc::new(crate::v5::api_keys::ApiKeyStore::from_registry(&config));
+        // Boot seeding (W2-32): route the loaded SSO backends into a
+        // shared registry so management reads observe the persisted
+        // backends from the first connection. An empty snapshot is a
+        // no-op (today's empty behaviour: an empty set lists as `[]`).
+        let sso_backends = Arc::new(crate::v5::sso::SsoStore::from_registry(&config));
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -350,6 +363,7 @@ impl ApiState {
             authz_sources,
             api_keys,
             audit: Arc::new(crate::v5::audit::AuditLog::new()),
+            sso_backends,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -412,6 +426,7 @@ impl ApiState {
             authz_sources: Arc::new(broker_auth::AuthzSourceRegistry::new()),
             api_keys: Arc::new(crate::v5::api_keys::ApiKeyStore::new()),
             audit: Arc::new(crate::v5::audit::AuditLog::new()),
+            sso_backends: Arc::new(crate::v5::sso::SsoStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -9920,7 +9935,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     async fn removed_system_fake_routes_return_404() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in ["/api/v5/configs", "/api/v5/sso", "/api/v5/telemetry/status"] {
+        for path in ["/api/v5/configs", "/api/v5/telemetry/status"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
@@ -10317,6 +10332,92 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         assert_eq!(tolerated, first);
+    }
+
+    #[tokio::test]
+    async fn sso_list_empty_then_configured_and_survives_restart() {
+        // W2-32 failing test: list when empty expecting an empty
+        // collection, configure one backend then list expecting it.
+        // Before: 404 (route removed).
+        // Broker-through: every read goes through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), not only
+        // through the store; the registry seed is the kernel boot path
+        // (`Shared.sso_backends`, `seed_from_registry`), and the
+        // per-backend detail write path belongs to a sibling task, so
+        // the seed here commits the registry root directly. Store unit
+        // tests cover insert validation and the management-plane read off
+        // the hot path; publish and deliver never touch this store.
+        let dir = unique_data_dir("sso-list");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+
+        // Empty set reads as an empty collection, never an error.
+        let (status, body) = server.get_auth("/api/v5/sso", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // The route is not paged and takes no parameters: unknown query
+        // parameters are ignored, not errors.
+        let (status, tolerated) = server
+            .send(
+                "GET",
+                "/api/v5/sso?unexpected_param=1&page=2&limit=1",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(tolerated, json!([]));
+
+        // Configure one backend through the registry root, persist, and
+        // restart: the list must show it with its stored fields.
+        registry
+            .commit_sso_backends(broker_config::SsoBackendsConf {
+                backends: vec![broker_config::SsoBackendEntry {
+                    backend: "w232-oidc".to_string(),
+                    enable: true,
+                    config: serde_json::json!({"issuer": "https://idp.example.invalid"})
+                        .to_string(),
+                }],
+            })
+            .expect("commit sso backend");
+        registry.save().expect("save sso backend");
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The admin password persisted too, so the rebooted node logs in
+        // with the changed password (`login_as_admin` only fits fresh
+        // servers still on the default password).
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/sso", &token).await;
+        assert_eq!(status, 200);
+        let data = body.as_array().expect("sso list is a collection");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["backend"], json!("w232-oidc"));
+        assert_eq!(data[0]["enable"], json!(true));
+        assert_eq!(
+            data[0]["config"]["issuer"],
+            json!("https://idp.example.invalid")
+        );
+
+        // Unknown query parameters stay ignored on the configured read.
+        let (status, tolerated) = server
+            .send("GET", "/api/v5/sso?unexpected_param=1", None, Some(&token))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(tolerated, body);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

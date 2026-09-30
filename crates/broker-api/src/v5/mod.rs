@@ -28,6 +28,7 @@ pub mod retainer;
 pub mod rules;
 pub mod schemas;
 pub mod slow_subscriptions;
+pub mod sso;
 pub mod status;
 pub mod trace;
 pub mod tracing;
@@ -324,6 +325,12 @@ pub fn protected_router() -> Router<ApiState> {
         // fire-and-forget from the auth middleware and publish/deliver
         // never touch the ring.
         .route("/audit", get(audit::list_audit))
+        // Configured single-sign-on backends (W2-32, C05-11): bare
+        // ordered list over the real registry. An empty set reads as an
+        // empty collection, never an error. The route is not paged and
+        // takes no parameters; unknown query parameters are ignored.
+        // Management-plane only; publish and deliver never touch it.
+        .route("/sso", get(sso::list_sso))
         // Live Monitoring & Rates
         .route("/metrics", get(monitoring::get_metrics))
         .route(

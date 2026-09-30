@@ -1467,6 +1467,103 @@ impl ApiKeysConf {
     }
 }
 
+/// Upper bound for configured single-sign-on backends. Writes past this
+/// size are rejected instead of growing the list without limit. Reason:
+/// the management plane snapshots the whole registry per list request
+/// and each entry holds an opaque config document, so an unbounded list
+/// lets one management batch exhaust the kernel; 16 covers the
+/// dashboard backend families with headroom while keeping list reads
+/// cheap (one short lock, at most the capped small entries).
+// TODO(parity): is 16 the documented backend cap, or does the spec allow
+// more entries? The rulebook does not decide the exact bound; 16 is the
+// conservative choice until the conformance checker pins it.
+pub const MAX_SSO_BACKENDS: usize = 16;
+
+/// Longest accepted single-sign-on backend name (128 bytes). Reason:
+/// names are map keys cloned into every list snapshot and persisted per
+/// entry, so an unbounded name lets one record bloat each list read; 128
+/// covers backend naming with headroom while keeping per-request clones
+/// cheap.
+pub const MAX_SSO_BACKEND_NAME_LEN: usize = 128;
+
+/// One configured single-sign-on backend: the registry slot the
+/// management API lists. `backend` is the registry key (for example
+/// `oidc` or `saml`); `enable` selects whether the slot participates;
+/// `config` carries the backend-specific fields as a JSON document (may
+/// be empty until the per-backend detail task fills it). Only the
+/// registry is real in this task; identity-provider clients are
+/// out of scope and no endpoint claims a backend it cannot execute.
+// TODO(parity): which per-backend fields does the spec document beyond
+// backend/enable (display name, URLs, client ids, ...)? The rulebook does
+// not decide the exact shape; fields the broker cannot supply are omitted
+// rather than invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SsoBackendEntry {
+    /// Registry key; must be non-empty and unique within the root.
+    pub backend: String,
+    /// Whether the slot participates (missing entries from
+    /// pre-persistence files load as `true`, the historical behaviour).
+    #[serde(default = "default_sso_backend_enabled")]
+    pub enable: bool,
+    /// Opaque backend configuration as a JSON document; may be empty.
+    #[serde(default)]
+    pub config: String,
+}
+
+/// Serde default for a missing backend enable flag: historical entries
+/// predate the flag and were always enabled.
+fn default_sso_backend_enabled() -> bool {
+    true
+}
+
+/// Root: configured single-sign-on backends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SsoBackendsConf {
+    #[serde(default)]
+    pub backends: Vec<SsoBackendEntry>,
+}
+
+impl SsoBackendsConf {
+    /// Validates backend names (non-empty, bounded, unique) and the
+    /// registry length cap.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.backends.len() > MAX_SSO_BACKENDS {
+            return Err(ConfigError::Invalid(format!(
+                "sso_backends.backends holds {} entries, at most {} (field `backends`)",
+                self.backends.len(),
+                MAX_SSO_BACKENDS
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.backends.len());
+        for (index, entry) in self.backends.iter().enumerate() {
+            if entry.backend.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "sso_backends.backends[{index}].backend must not be empty (field `backend`)"
+                )));
+            }
+            if entry.backend.len() > MAX_SSO_BACKEND_NAME_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "sso_backends.backends[{index}].backend {:?} is too long (field `backend`)",
+                    entry.backend
+                )));
+            }
+            if entry.backend.contains('/') {
+                return Err(ConfigError::Invalid(format!(
+                    "sso_backends.backends[{index}].backend {:?} must not contain `/` (field `backend`)",
+                    entry.backend
+                )));
+            }
+            if !seen.insert(entry.backend.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "sso_backends.backends[{index}].backend {:?} is duplicated (field `backend`)",
+                    entry.backend
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The full validated configuration: all roots in one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FullSnapshot {
@@ -1492,6 +1589,8 @@ pub struct FullSnapshot {
     pub authz_sources: AuthzSourcesConf,
     #[serde(default)]
     pub api_keys: ApiKeysConf,
+    #[serde(default)]
+    pub sso_backends: SsoBackendsConf,
 }
 
 impl FullSnapshot {
@@ -1508,6 +1607,7 @@ impl FullSnapshot {
         self.authz_settings.validate()?;
         self.authz_sources.validate()?;
         self.api_keys.validate()?;
+        self.sso_backends.validate()?;
         Ok(())
     }
 }
@@ -1537,6 +1637,8 @@ pub enum ConfigRoot {
     AuthzSources(AuthzSourcesConf),
     /// Validated management API key records root.
     ApiKeys(ApiKeysConf),
+    /// Validated single-sign-on backend registry root.
+    SsoBackends(SsoBackendsConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1624,6 +1726,7 @@ impl ConfigRegistry {
             ConfigRoot::AuthzSettings(conf) => self.commit_authz_settings(conf),
             ConfigRoot::AuthzSources(conf) => self.commit_authz_sources(conf),
             ConfigRoot::ApiKeys(conf) => self.commit_api_keys(conf),
+            ConfigRoot::SsoBackends(conf) => self.commit_sso_backends(conf),
         }
     }
 
@@ -1748,6 +1851,17 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits a validated single-sign-on backend registry.
+    pub fn commit_sso_backends(&self, conf: SsoBackendsConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.sso_backends = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Serialises the current snapshot to TOML and writes it atomically.
     ///
     /// The snapshot is written to a unique temp file in the same
@@ -1860,6 +1974,7 @@ mod tests {
             authz_settings: AuthzSettingsConf::default(),
             authz_sources: AuthzSourcesConf::default(),
             api_keys: ApiKeysConf::default(),
+            sso_backends: SsoBackendsConf::default(),
         }
     }
 
@@ -2011,6 +2126,60 @@ mod tests {
         for source_type in KNOWN_AUTHZ_SOURCE_TYPES.iter().take(MAX_AUTHZ_SOURCES + 1) {
             bad.sources.push(AuthzSourceEntry {
                 source_type: source_type.to_string(),
+                enable: true,
+                config: String::new(),
+            });
+        }
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn sso_backends_defaults_match_documented_shape() {
+        // Default registry: empty set (W2-32). An empty set lists as an
+        // empty collection, never an error.
+        let defaults = SsoBackendsConf::default();
+        assert!(defaults.backends.is_empty());
+        defaults.validate().expect("documented defaults validate");
+    }
+
+    #[test]
+    fn sso_backends_validation_rejects_bad_fields() {
+        let good = SsoBackendsConf::default();
+        assert!(good.validate().is_ok());
+        // Empty backend.
+        let mut bad = good.clone();
+        bad.backends.push(SsoBackendEntry {
+            backend: "  ".to_string(),
+            enable: true,
+            config: String::new(),
+        });
+        assert!(bad.validate().is_err());
+        // Slash in backend.
+        let mut bad = good.clone();
+        bad.backends.push(SsoBackendEntry {
+            backend: "has/slash".to_string(),
+            enable: true,
+            config: String::new(),
+        });
+        assert!(bad.validate().is_err());
+        // Duplicate backend.
+        let mut bad = good.clone();
+        bad.backends.push(SsoBackendEntry {
+            backend: "oidc".to_string(),
+            enable: true,
+            config: String::new(),
+        });
+        bad.backends.push(SsoBackendEntry {
+            backend: "oidc".to_string(),
+            enable: true,
+            config: String::new(),
+        });
+        assert!(bad.validate().is_err());
+        // Over the cap.
+        let mut bad = SsoBackendsConf { backends: vec![] };
+        for index in 0..=MAX_SSO_BACKENDS {
+            bad.backends.push(SsoBackendEntry {
+                backend: format!("backend-{index}"),
                 enable: true,
                 config: String::new(),
             });

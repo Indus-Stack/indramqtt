@@ -1993,6 +1993,12 @@ struct Shared {
     /// short read lock. Publish and deliver never touch it. Memory-only;
     /// a restart starts from an empty ring (persist-or-trim: trim).
     audit: Arc<broker_api::v5::audit::AuditLog>,
+    /// Configured single-sign-on backend registry for W2-32: shared with
+    /// the management API so registry writes are visible to `GET /sso`
+    /// reads without a restart. One `Arc` clone at boot; the kernel boot
+    /// path seeds it from the registry and management reads take one
+    /// bounded snapshot per request. Publish and deliver never touch it.
+    sso_backends: Arc<broker_api::v5::sso::SsoStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -2231,6 +2237,7 @@ impl Shared {
             authz_sources: Arc::new(AuthzSourceRegistry::new()),
             api_keys: Arc::new(broker_api::v5::api_keys::ApiKeyStore::new()),
             audit: Arc::new(broker_api::v5::audit::AuditLog::new()),
+            sso_backends: Arc::new(broker_api::v5::sso::SsoStore::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -5645,6 +5652,12 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // empty per-request copy. One `Arc` clone; management-plane only,
     // the publish path never touches it.
     state.audit = shared.audit.clone();
+    // Share the SSO backend registry (W2-32) so registry writes are
+    // visible to `GET /sso` reads without a restart. One `Arc` clone;
+    // management-plane only, never on the delivery path. Seeding already
+    // ran inside `ApiState::new`; sharing replaces that fresh instance
+    // with the kernel's so no second copy diverges.
+    state.sso_backends = shared.sso_backends.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -5846,6 +5859,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // behaviour); secrets stay hashed at rest and are never re-minted
     // at boot.
     shared.api_keys.seed_from_registry(&shared.config);
+    // SSO backends (W2-32): seed the shared registry in place (the same
+    // instance `serve_api` shares with `ApiState`), so management reads
+    // observe the persisted backends from the first connection. An empty
+    // snapshot is a no-op (today's empty behaviour: `GET /sso` reads
+    // `[]`).
+    shared.sso_backends.seed_from_registry(&shared.config);
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.
