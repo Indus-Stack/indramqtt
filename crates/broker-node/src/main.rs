@@ -2006,6 +2006,14 @@ struct Shared {
     /// summary takes one bounded snapshot clone per request.
     /// Management-plane only; publish and deliver never touch it.
     sources: Arc<broker_api::v5::sources::SourceStore>,
+    /// Action instance directory for W3-02 (`GET/POST /actions`,
+    /// `DELETE /actions/:id`): shared with the management API so
+    /// validated creates and deletes are visible to list reads without
+    /// a restart. One `Arc` clone at boot; the list takes one bounded
+    /// snapshot clone per request. Management-plane only; rule
+    /// evaluation reads a snapshot, never this store directly, and
+    /// publish and deliver never touch it.
+    actions: Arc<broker_api::v5::actions::ActionStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -2246,6 +2254,7 @@ impl Shared {
             audit: Arc::new(broker_api::v5::audit::AuditLog::new()),
             sso_backends: Arc::new(broker_api::v5::sso::SsoStore::new()),
             sources: Arc::new(broker_api::v5::sources::SourceStore::new()),
+            actions: Arc::new(broker_api::v5::actions::ActionStore::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -5671,6 +5680,12 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // reads without a restart. One `Arc` clone; management-plane only,
     // the publish and deliver paths never touch it.
     state.sources = shared.sources.clone();
+    // Share the action instance directory (W3-02) so validated
+    // management creates/deletes are visible to `GET /actions` reads
+    // without a restart. One `Arc` clone; management-plane only, rule
+    // evaluation reads a snapshot and the publish and deliver paths
+    // never touch it.
+    state.actions = shared.actions.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -5878,6 +5893,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot is a no-op (today's empty behaviour: `GET /sso` reads
     // `[]`).
     shared.sso_backends.seed_from_registry(&shared.config);
+    // Action directory (W3-02): seed the shared directory in place (the
+    // same instance `serve_api` shares with `ApiState`), so management
+    // reads observe the persisted actions from the first connection and
+    // mutations persist through the bound registry. An empty snapshot is
+    // a no-op (today's empty behaviour: `GET /actions` reads an empty
+    // page).
+    shared.actions.seed_from_registry(&shared.config);
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.

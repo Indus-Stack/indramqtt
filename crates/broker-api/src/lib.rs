@@ -243,6 +243,19 @@ pub struct ApiState {
     /// stored. Management-plane only; publish and deliver never touch
     /// this store.
     pub sources: Arc<crate::v5::sources::SourceStore>,
+    /// Action instance directory for `GET /api/v5/actions`,
+    /// `POST /api/v5/actions` and `DELETE /api/v5/actions/{id}`
+    /// (W3-02, C06-02..C06-04): bounded id-keyed map validated against
+    /// the action-kind registry from the action-types catalogue, with
+    /// persistence across a restart via the config core and delete
+    /// refused while a rule references the action. The routes read one
+    /// bounded snapshot per request; the kernel boot path shares the
+    /// same instance (`crates/broker-node/src/main.rs`, `serve_api`
+    /// share below) so management reads observe the kernel's
+    /// directory. Management-plane only; rule evaluation reads a
+    /// snapshot, never this store directly, and publish and deliver
+    /// never touch it.
+    pub actions: Arc<crate::v5::actions::ActionStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -328,6 +341,12 @@ impl ApiState {
         // backends from the first connection. An empty snapshot is a
         // no-op (today's empty behaviour: an empty set lists as `[]`).
         let sso_backends = Arc::new(crate::v5::sso::SsoStore::from_registry(&config));
+        // Boot seeding (W3-02): route the loaded actions into a shared
+        // directory so management reads observe the persisted actions
+        // from the first connection. An empty snapshot is a no-op
+        // (today's empty behaviour: an empty store lists as an empty
+        // page).
+        let actions = Arc::new(crate::v5::actions::ActionStore::from_registry(&config));
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -378,6 +397,7 @@ impl ApiState {
             audit: Arc::new(crate::v5::audit::AuditLog::new()),
             sso_backends,
             sources: Arc::new(crate::v5::sources::SourceStore::new()),
+            actions,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -442,6 +462,7 @@ impl ApiState {
             audit: Arc::new(crate::v5::audit::AuditLog::new()),
             sso_backends: Arc::new(crate::v5::sso::SsoStore::new()),
             sources: Arc::new(crate::v5::sources::SourceStore::new()),
+            actions: Arc::new(crate::v5::actions::ActionStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -9972,20 +9993,149 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     async fn removed_action_routes_return_404() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in [
-            "/api/v5/actions",
-            "/api/v5/actions/x",
-            "/api/v5/actions/x/metrics",
-            "/api/v5/actions_summary",
-        ] {
+        // W3-02 restores `GET /api/v5/actions`, `POST /api/v5/actions`
+        // and `DELETE /api/v5/actions/:id` on the real action directory,
+        // so only the still-removed action paths stay 404 here.
+        // `/api/v5/actions/:id` now exists for DELETE, so a GET on it
+        // answers 405 (method not allowed), not 404; it is no longer a
+        // removed route (mirrors the `/api/v5/sources` handling in
+        // `removed_sources_rulenotest_routes_return_404`).
+        for path in ["/api/v5/actions/x/metrics", "/api/v5/actions_summary"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
-        let (status, _) = server.post_auth("/api/v5/actions", json!({}), &token).await;
-        assert_eq!(
-            status, 404,
-            "removed route POST /api/v5/actions must be 404"
-        );
+    }
+
+    #[tokio::test]
+    async fn actions_list_create_delete_round_trip() {
+        // W3-02 (C06-02..C06-04) broker-through test: create an action,
+        // list and expect it present with paging metadata; create the
+        // same id again and expect rejection; delete it and expect a
+        // second delete to be 404. Every assertion goes through the HTTP
+        // router against the shared store, never at the store directly.
+        // Management-plane only; publish and deliver never touch the
+        // action directory.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Empty store returns an empty page, not an error.
+        let (status, body) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["limit"], json!(100));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+        // Unknown query parameters are ignored.
+        let (status, _) = server
+            .get_auth("/api/v5/actions?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        // Unknown action kind is rejected with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "bad-kind-action", "type": "no_such_kind_xyz"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "unknown action kind must be 400");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Create one action.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-02-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(body["id"], json!("w3-02-action"));
+        assert_eq!(body["type"], json!("mqtt_bridge"));
+        // List shows it with paging metadata.
+        let (status, body) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+        let ids: Vec<String> = body["data"]
+            .as_array()
+            .expect("list data is an array")
+            .iter()
+            .filter_map(|row| row.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(ids.contains(&"w3-02-action".to_string()));
+        // Duplicate create is rejected cleanly, never overwritten.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-02-action", "type": "mqtt_bridge"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "duplicate action id must be rejected");
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        // Delete hit, then miss.
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/w3-02-action", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .delete_auth("/api/v5/actions/w3-02-action", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Store is empty again.
+        let (status, body) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn actions_delete_refused_while_rule_references() {
+        // W3-02 rule-linkage broker-through test: an action still
+        // referenced by a rule cannot be dropped while the reference
+        // stands; once the rule is gone the delete succeeds. The
+        // reference check consults the live rule engine
+        // (`broker-rules`, `RuleEngine::list_rules`), driven by rule
+        // create/delete events. Management-plane only; publish and
+        // deliver never touch either store.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "linked-action", "type": "mqtt_bridge"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "linked-rule",
+                    "sql": "SELECT * FROM \"w3/02/linked\"",
+                    "actions": ["linked-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Rules are addressed by their generated `id`, not by `name`:
+        // delete the created rule id so the reference is really gone.
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let (status, body) = server
+            .delete_auth("/api/v5/actions/linked-action", &token)
+            .await;
+        assert_eq!(status, 400, "referenced action delete must be refused");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/linked-action", &token)
+            .await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]

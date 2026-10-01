@@ -24,3 +24,4 @@ wired  sso_backends
 wired  hwm_history
 wired  license_setting
 wired  sources
+wired  actions

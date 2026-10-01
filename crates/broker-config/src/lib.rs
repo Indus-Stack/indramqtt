@@ -87,6 +87,72 @@ pub fn is_known_connector_type(kind: &str) -> bool {
     KNOWN_CONNECTOR_TYPES.contains(&kind)
 }
 
+/// Action kinds the kernel can execute as rule-engine actions.
+///
+/// Must match the action-types catalogue (W3-01 kind registry): every
+/// entry here names an executable connector kind, and every catalogue
+/// entry is listed here. The connector registry additionally accepts
+/// `http`, `mqtt` and `test`, which are not executable action kinds
+/// (management/compat aliases and a unit-test helper), so they are
+/// excluded here; `ActionsConf::validate` uses this list so a persisted
+/// action is always creatable through the API and vice versa.
+pub const KNOWN_ACTION_TYPES: &[&str] = &[
+    "alloydb",
+    "aws_iot",
+    "azure_blob",
+    "azure_eventhubs",
+    "azure_iot",
+    "bigquery",
+    "cassandra",
+    "clickhouse",
+    "cockroachdb",
+    "confluent",
+    "console",
+    "couchbase",
+    "databricks",
+    "datalayers",
+    "disk_log",
+    "doris",
+    "dynamodb",
+    "elasticsearch",
+    "gcp_iot",
+    "gcp_pubsub",
+    "greptimedb",
+    "influxdb",
+    "iotdb",
+    "kafka",
+    "kinesis",
+    "mongodb",
+    "mqtt_bridge",
+    "mssql",
+    "mysql",
+    "oci_streaming",
+    "opc_ua",
+    "opentsdb",
+    "oracle",
+    "postgres",
+    "pulsar",
+    "rabbitmq",
+    "redis",
+    "redshift",
+    "rocketmq",
+    "s3",
+    "s3_tables",
+    "snowflake",
+    "sparkplug_b",
+    "tablestore",
+    "tdengine",
+    "timescaledb",
+    "timestream",
+    "webhook",
+];
+
+/// Returns true for an action kind the kernel can execute.
+#[must_use]
+pub fn is_known_action_type(kind: &str) -> bool {
+    KNOWN_ACTION_TYPES.contains(&kind)
+}
+
 /// Returns true for an ACL action the kernel can evaluate
 /// (`publish`, `subscribe` or `all`, case-insensitive).
 #[must_use]
@@ -1606,6 +1672,107 @@ impl SsoBackendsConf {
     }
 }
 
+/// Upper bound for stored rule-engine actions. Writes past this size
+/// are rejected instead of growing the list without limit. Reason: the
+/// management plane snapshots the whole registry per list request and
+/// each entry holds an opaque config document, so an unbounded list
+/// lets one management batch exhaust the kernel; 1024 covers the
+/// documented action catalogue with headroom while keeping list reads
+/// cheap (one short lock, at most the capped small entries).
+// TODO(parity): is 1024 the documented action cap, or does the spec allow
+// more entries? The rulebook does not decide the exact bound; 1024 is the
+// conservative choice until the conformance checker pins it.
+pub const MAX_ACTIONS: usize = 1024;
+
+/// Longest accepted action id (256 bytes). Reason: ids are map keys
+/// cloned into every list snapshot and persisted per entry, so an
+/// unbounded id lets one record bloat each list read; 256 covers
+/// operator naming with headroom while keeping per-request clones cheap.
+pub const MAX_ACTION_ID_LEN: usize = 256;
+
+/// One stored rule-engine action: the operator-chosen id, the action
+/// kind it was validated against, whether it participates, and the
+/// kind-specific fields as a JSON document (may be empty). Only the
+/// registry is real in this task; per-action execution counters and
+/// lifecycle operations land with their own tasks and never persist.
+// TODO(parity): which per-action fields does the spec document beyond
+// id/type/enable (connector reference, failure handling, ...)? The
+// rulebook does not decide the exact shape; fields the broker cannot
+// supply are omitted rather than invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ActionEntry {
+    /// Action id; must be non-empty and unique within the root.
+    pub id: String,
+    /// Action kind; must name a known action type (field `action_type`).
+    pub action_type: String,
+    /// Whether the action participates (missing entries from
+    /// pre-persistence files load as `true`, the historical behaviour).
+    #[serde(default = "default_action_enabled")]
+    pub enable: bool,
+    /// Opaque kind-specific configuration as a JSON document; may be empty.
+    #[serde(default)]
+    pub config: String,
+}
+
+/// Serde default for a missing action enable flag: historical entries
+/// predate the flag and were always enabled.
+fn default_action_enabled() -> bool {
+    true
+}
+
+/// Root: stored rule-engine actions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ActionsConf {
+    #[serde(default)]
+    pub actions: Vec<ActionEntry>,
+}
+
+impl ActionsConf {
+    /// Validates action ids (non-empty, bounded, unique), kinds (known)
+    /// and the registry length cap.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.actions.len() > MAX_ACTIONS {
+            return Err(ConfigError::Invalid(format!(
+                "actions.actions holds {} entries, at most {} (field `actions`)",
+                self.actions.len(),
+                MAX_ACTIONS
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.actions.len());
+        for (index, entry) in self.actions.iter().enumerate() {
+            if entry.id.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "actions.actions[{index}].id must not be empty (field `id`)"
+                )));
+            }
+            if entry.id.len() > MAX_ACTION_ID_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "actions.actions[{index}].id {:?} is too long (field `id`)",
+                    entry.id
+                )));
+            }
+            if entry.action_type.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "actions.actions[{index}].action_type must not be empty (field `action_type`)"
+                )));
+            }
+            if !is_known_action_type(&entry.action_type) {
+                return Err(ConfigError::Invalid(format!(
+                    "actions.actions[{index}].action_type {:?} is unknown (field `action_type`)",
+                    entry.action_type
+                )));
+            }
+            if !seen.insert(entry.id.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "actions.actions[{index}].id {:?} is duplicated (field `id`)",
+                    entry.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The full validated configuration: all roots in one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FullSnapshot {
@@ -1633,6 +1800,8 @@ pub struct FullSnapshot {
     pub api_keys: ApiKeysConf,
     #[serde(default)]
     pub sso_backends: SsoBackendsConf,
+    #[serde(default)]
+    pub actions: ActionsConf,
 }
 
 impl FullSnapshot {
@@ -1650,6 +1819,7 @@ impl FullSnapshot {
         self.authz_sources.validate()?;
         self.api_keys.validate()?;
         self.sso_backends.validate()?;
+        self.actions.validate()?;
         Ok(())
     }
 }
@@ -1681,6 +1851,8 @@ pub enum ConfigRoot {
     ApiKeys(ApiKeysConf),
     /// Validated single-sign-on backend registry root.
     SsoBackends(SsoBackendsConf),
+    /// Validated rule-engine action registry root.
+    Actions(ActionsConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1769,6 +1941,7 @@ impl ConfigRegistry {
             ConfigRoot::AuthzSources(conf) => self.commit_authz_sources(conf),
             ConfigRoot::ApiKeys(conf) => self.commit_api_keys(conf),
             ConfigRoot::SsoBackends(conf) => self.commit_sso_backends(conf),
+            ConfigRoot::Actions(conf) => self.commit_actions(conf),
         }
     }
 
@@ -1904,6 +2077,17 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits a validated rule-engine action registry.
+    pub fn commit_actions(&self, conf: ActionsConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.actions = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Serialises the current snapshot to TOML and writes it atomically.
     ///
     /// The snapshot is written to a unique temp file in the same
@@ -2020,6 +2204,7 @@ mod tests {
             authz_sources: AuthzSourcesConf::default(),
             api_keys: ApiKeysConf::default(),
             sso_backends: SsoBackendsConf::default(),
+            actions: ActionsConf::default(),
         }
     }
 

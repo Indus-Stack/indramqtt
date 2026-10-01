@@ -1,5 +1,6 @@
 //! v5 REST API compatibility router for IndraMQTT.
 
+pub mod actions;
 pub mod alarms;
 pub mod api_keys;
 pub mod audit;
@@ -546,6 +547,16 @@ pub fn protected_router() -> Router<ApiState> {
                 .delete(rules::delete_connector),
         )
         .route("/connectors_probe", post(rules::probe_connector))
+        // Actions (W3-02, C06-02..C06-04): paged list, validated create
+        // and delete with rule-reference refusal on the real action
+        // directory. Management-plane only; rule evaluation reads a
+        // snapshot, never this store directly, and publish and deliver
+        // never touch it.
+        .route(
+            "/actions",
+            get(actions::list_actions).post(actions::create_action),
+        )
+        .route("/actions/:id", delete(actions::delete_action))
         // Actions & Sources
         .route("/action_types", get(rules::get_action_types))
         .route("/actions_probe", post(rules::probe_action))
