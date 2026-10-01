@@ -548,6 +548,10 @@ pub fn protected_router() -> Router<ApiState> {
         // Actions & Sources
         .route("/action_types", get(rules::get_action_types))
         .route("/actions_probe", post(rules::probe_action))
+        // Stateless source probe (W3-30, C07-21): validates the config
+        // against the named kind and dials where the kind supports it.
+        // Management-plane only; publish and deliver never touch it.
+        .route("/sources_probe", post(rules::probe_source))
         // Schema API for dynamic UI forms
         .route("/schemas", get(schemas::list_schemas))
         .route("/schemas/:name", get(schemas::get_schema))

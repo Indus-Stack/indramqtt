@@ -9983,14 +9983,56 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
-        for path in [
-            "/api/v5/sources_probe",
-            "/api/v5/rule_test",
-            "/api/v5/rules/abc/test",
-        ] {
+        for path in ["/api/v5/rule_test", "/api/v5/rules/abc/test"] {
             let (status, _) = server.post_auth(path, json!({}), &token).await;
             assert_eq!(status, 404, "removed route POST {path} must be 404");
         }
+    }
+
+    #[tokio::test]
+    async fn sources_probe_is_stateless_with_documented_shapes() {
+        // W3-30 (C07-21) broker-through test: a valid probe succeeds without
+        // creating a source, a bad config fails with the documented error
+        // shape, and an unknown kind is rejected. Management-plane only;
+        // publish and deliver never touch the probe path.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Valid probe: known kind, nothing to dial, so reachable by
+        // validation alone. Must not create a source: the sources CRUD
+        // remains absent (404).
+        let (status, body) = server
+            .post_auth("/api/v5/sources_probe", json!({"type": "mqtt"}), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"], json!("ok"));
+        let (status, _) = server.get_auth("/api/v5/sources", &token).await;
+        assert_eq!(status, 404, "probe must not create a source");
+        // Bad config: known kind with a closed port reports the failure.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sources_probe",
+                json!({"type": "http", "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "bad probe config must be 400");
+        assert_eq!(body["code"], json!("TEST_FAILED"));
+        // Unknown kind is rejected with the documented error shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sources_probe",
+                json!({"type": "no_such_source_kind_xyz"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "unknown source kind must be 400");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Malformed body is rejected with the documented error shape.
+        let (status, body) = server
+            .post_auth("/api/v5/sources_probe", json!({}), &token)
+            .await;
+        assert_eq!(status, 400, "malformed probe body must be 400");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
     }
 
     #[tokio::test]

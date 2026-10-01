@@ -4455,3 +4455,123 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
     )
         .into_response()
 }
+
+// ---------------------------------------------------------------------------
+// Source Probe (W3-30, C07-21)
+// ---------------------------------------------------------------------------
+
+/// Single-request bound for `POST /api/v5/sources_probe`: one TCP dial at
+/// most, capped by this timeout. Reason: a probe is an operator-driven
+/// management-plane dial, never on the publish/deliver path; 5 s bounds the
+/// worst case per request (the inner dial itself times out after 1.5 s) while
+/// staying well under management-plane HTTP timeouts. Results are never
+/// cached (default no caching): every request re-validates and re-dials so a
+/// transient failure cannot be served stale.
+pub const SOURCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Source-kind validation for the probe (the W3-25 kind set): a kind is
+/// listed only if the kernel can instantiate it. Source kinds mirror the
+/// connector backend families (ingress versus egress over the same backends),
+/// so this reuses the connector registry rather than a second list that
+/// could drift from the runtimes.
+fn is_known_source_type(kind: &str) -> bool {
+    broker_config::is_known_connector_type(kind)
+}
+
+/// Stateless source probe: validates the config against the named kind and
+/// dials where the kind exposes a network target, reporting success or the
+/// failure reason with the documented `{code, message}` / `{result, status}`
+/// shape. Management-plane only: runs off the message path (no lock, no
+/// allocation, no state on publish/deliver), performs single-request bounded
+/// work capped by [`SOURCE_PROBE_TIMEOUT`], writes to no store, registers no
+/// runtime, and leaves nothing running after return.
+pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
+    let body = match body {
+        Some(Json(b)) => b,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": "request body is required"
+                })),
+            )
+                .into_response();
+        }
+    };
+    if !body.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": "request body must be a JSON object"
+            })),
+        )
+            .into_response();
+    }
+    let kind = body
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": "missing required field: type"
+            })),
+        )
+            .into_response();
+    }
+    if !is_known_source_type(&kind) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": format!("unknown source type: {kind}")
+            })),
+        )
+            .into_response();
+    }
+    // Runtime probe hook (the W3-23 dial path): kinds that expose a network
+    // target get one bounded dial; kinds without one count as reachable once
+    // the kind itself validated, matching the connector/action probes.
+    if let Some(target) = extract_target_host_port(&body) {
+        let dial = tokio::time::timeout(SOURCE_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
+        match dial {
+            Ok(Ok(())) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "result": "ok",
+                    "status": "connected",
+                    "message": format!("Target endpoint {} reachable", target)
+                })),
+            )
+                .into_response(),
+            Ok(Err(err)) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "TEST_FAILED",
+                    "message": err
+                })),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "TEST_FAILED",
+                    "message": format!("Connection to {} timed out after 5s", target)
+                })),
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "result": "ok", "status": "connected" })),
+        )
+            .into_response()
+    }
+}
