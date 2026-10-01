@@ -232,6 +232,17 @@ pub struct ApiState {
     /// `serve_api` share below). Management-plane only; publish and
     /// deliver never touch this store.
     pub sso_backends: Arc<crate::v5::sso::SsoStore>,
+    /// Source instance directory for `POST /api/v5/sources`,
+    /// `DELETE /api/v5/sources/{id}` and `GET /api/v5/sources_summary`
+    /// (W3-31, C07-22): bounded id-keyed map validated against the
+    /// source-kind set. The routes read one bounded snapshot per
+    /// request; the kernel boot path shares the same instance
+    /// (`crates/broker-node/src/main.rs`, `serve_api` share below) so
+    /// management reads observe the kernel's directory. The summary
+    /// counts are computed on demand from the live snapshot, never
+    /// stored. Management-plane only; publish and deliver never touch
+    /// this store.
+    pub sources: Arc<crate::v5::sources::SourceStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -366,6 +377,7 @@ impl ApiState {
             api_keys,
             audit: Arc::new(crate::v5::audit::AuditLog::new()),
             sso_backends,
+            sources: Arc::new(crate::v5::sources::SourceStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -429,6 +441,7 @@ impl ApiState {
             api_keys: Arc::new(crate::v5::api_keys::ApiKeyStore::new()),
             audit: Arc::new(crate::v5::audit::AuditLog::new()),
             sso_backends: Arc::new(crate::v5::sso::SsoStore::new()),
+            sources: Arc::new(crate::v5::sources::SourceStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -9979,7 +9992,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     async fn removed_sources_rulenotest_routes_return_404() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in ["/api/v5/sources", "/api/v5/rule_events"] {
+        // W3-31 restores `POST /api/v5/sources`, `DELETE
+        // /api/v5/sources/:id` and `GET /api/v5/sources_summary` on the
+        // real source directory, so `/api/v5/sources` is no longer a
+        // removed route (GET on the POST-only path is 405); only the
+        // rule-events path stays removed here.
+        for path in ["/api/v5/rule_events"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
@@ -9998,15 +10016,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         // Valid probe: known kind, nothing to dial, so reachable by
-        // validation alone. Must not create a source: the sources CRUD
-        // remains absent (404).
+        // validation alone. Must not create a source: the summary still
+        // reports zeroes (W3-31 restores the source directory, so the
+        // absence check reads the live summary, not a 404).
         let (status, body) = server
             .post_auth("/api/v5/sources_probe", json!({"type": "mqtt"}), &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["result"], json!("ok"));
-        let (status, _) = server.get_auth("/api/v5/sources", &token).await;
-        assert_eq!(status, 404, "probe must not create a source");
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(0), "probe must not create a source");
         // Bad config: known kind with a closed port reports the failure.
         let (status, body) = server
             .post_auth(
@@ -10033,6 +10053,70 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 400, "malformed probe body must be 400");
         assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn sources_summary_tracks_create_delete() {
+        // W3-31 (C07-22) broker-through test: create two sources of
+        // different states, read the summary expecting matching counts;
+        // delete both and expect zeroes. Every assertion goes through
+        // the HTTP router against the shared store, never at the store
+        // directly. Management-plane only; publish and deliver never
+        // touch the source directory.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Empty store returns zeroes, not an error.
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(0));
+        assert_eq!(body["enabled"], json!(0));
+        assert_eq!(body["disabled"], json!(0));
+        // Two sources of different states: one enabled, one disabled.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "sum-src-a", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "sum-src-b", "type": "http", "enable": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Counts match the live snapshot; unknown query parameters are
+        // ignored.
+        let (status, body) = server
+            .get_auth("/api/v5/sources_summary?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(2));
+        assert_eq!(body["enabled"], json!(1));
+        assert_eq!(body["disabled"], json!(1));
+        // Delete of an unknown id is 404 with the documented shape.
+        let (status, body) = server
+            .delete_auth("/api/v5/sources/no-such-source", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Delete both; the summary returns to zeroes.
+        let (status, _) = server
+            .delete_auth("/api/v5/sources/sum-src-a", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/sources/sum-src-b", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(0));
+        assert_eq!(body["enabled"], json!(0));
+        assert_eq!(body["disabled"], json!(0));
     }
 
     #[tokio::test]

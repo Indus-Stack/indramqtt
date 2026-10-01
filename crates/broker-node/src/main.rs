@@ -1999,6 +1999,13 @@ struct Shared {
     /// path seeds it from the registry and management reads take one
     /// bounded snapshot per request. Publish and deliver never touch it.
     sso_backends: Arc<broker_api::v5::sso::SsoStore>,
+    /// Source instance directory for W3-31 (`POST /sources`,
+    /// `DELETE /sources/{id}`, `GET /sources_summary`): shared with the
+    /// management API so validated creates and deletes are visible to
+    /// summary reads without a restart. One `Arc` clone at boot; the
+    /// summary takes one bounded snapshot clone per request.
+    /// Management-plane only; publish and deliver never touch it.
+    sources: Arc<broker_api::v5::sources::SourceStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -2238,6 +2245,7 @@ impl Shared {
             api_keys: Arc::new(broker_api::v5::api_keys::ApiKeyStore::new()),
             audit: Arc::new(broker_api::v5::audit::AuditLog::new()),
             sso_backends: Arc::new(broker_api::v5::sso::SsoStore::new()),
+            sources: Arc::new(broker_api::v5::sources::SourceStore::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -5658,6 +5666,11 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // ran inside `ApiState::new`; sharing replaces that fresh instance
     // with the kernel's so no second copy diverges.
     state.sso_backends = shared.sso_backends.clone();
+    // Share the source instance directory (W3-31) so validated
+    // management creates/deletes are visible to `GET /sources_summary`
+    // reads without a restart. One `Arc` clone; management-plane only,
+    // the publish and deliver paths never touch it.
+    state.sources = shared.sources.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.

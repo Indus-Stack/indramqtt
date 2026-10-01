@@ -29,6 +29,7 @@ pub mod retainer;
 pub mod rules;
 pub mod schemas;
 pub mod slow_subscriptions;
+pub mod sources;
 pub mod sso;
 pub mod status;
 pub mod trace;
@@ -552,6 +553,15 @@ pub fn protected_router() -> Router<ApiState> {
         // against the named kind and dials where the kind supports it.
         // Management-plane only; publish and deliver never touch it.
         .route("/sources_probe", post(rules::probe_source))
+        // Source instances plus the aggregated summary (W3-26 store,
+        // W3-31 C07-22): validated register with duplicate rejection, a
+        // delete with a 404 for unknown ids, and counts computed on
+        // demand from the live snapshot (zeroes when empty, never an
+        // error). Management-plane only; publish and deliver never
+        // touch the store.
+        .route("/sources", post(sources::create_source))
+        .route("/sources/:id", delete(sources::delete_source))
+        .route("/sources_summary", get(sources::get_sources_summary))
         // Schema API for dynamic UI forms
         .route("/schemas", get(schemas::list_schemas))
         .route("/schemas/:name", get(schemas::get_schema))
