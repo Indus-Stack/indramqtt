@@ -10021,8 +10021,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let token = server.login_as_admin().await;
         // W3-02 restores `GET /api/v5/actions`, `POST /api/v5/actions`
         // and `DELETE /api/v5/actions/:id` on the real action directory,
-        // W3-03 adds `GET`/`PUT /api/v5/actions/:id`, and W3-05 adds
+        // W3-03 adds `GET`/`PUT /api/v5/actions/:id`, W3-04 adds
+        // `PUT /api/v5/actions/:id/enable/:enable`, W3-05 adds
         // `GET /api/v5/actions/:id/metrics` plus `PUT .../metrics/reset`,
+        // and W3-06 adds `POST /api/v5/actions/:id/:operation`,
         // so only the still-removed action paths stay 404 here.
         // `/api/v5/actions/:id` now exists for GET, PUT and DELETE and
         // `/api/v5/actions/:id/metrics` for GET, so neither is a removed
@@ -10488,6 +10490,227 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, _) = server
             .delete_auth("/api/v5/actions/w3-04-action", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn action_operation_start_stop_round_trip() {
+        // W3-06 (C06-10) broker-through test: create an action via the
+        // W3-02 route, stop it through the operation route and read back
+        // disabled, start it and read back enabled; an unknown operation
+        // is rejected and an unknown id is 404, both with the documented
+        // shape. Then a rule forwarding to the action id fires while
+        // started and is skipped at fire time while stopped, through the
+        // engine's lock-free dispatch snapshot (one publish through
+        // `dispatch_ingress` per case). Every assertion goes through the
+        // HTTP router against the shared store, never at the store
+        // directly. Management-plane only otherwise; publish and deliver
+        // never touch the action store directly.
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown id is 404 with the documented shape, not an empty body.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/actions/no-such-action/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one action via the W3-02 route (defaults to enabled).
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-06-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Unknown operation is rejected with the documented shape and
+        // persists nothing (the stored flag is untouched).
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/actions/w3-06-action/frobnicate",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 400, "unknown operation must be rejected");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-06-action", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // Stop: the reported state changes to disabled on the next read.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/actions/w3-06-action/stop",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-06-action", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        // Start: the reported state changes back to enabled.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/actions/w3-06-action/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-06-action", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // Rule dispatch through the broker: a rule forwarding to the
+        // action id fires while started and skips while stopped. The
+        // counting sink is registered under the action id, the rule is
+        // created through the HTTP router, and each publish goes through
+        // `dispatch_ingress` (the broker's rule path), never `sink.send`
+        // directly.
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state
+            .engine
+            .connectors()
+            .register("w3-06-action", counter.clone());
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "w3-06-rule",
+                    "sql": "SELECT * FROM \"w3/06/operation\"",
+                    "actions": ["w3-06-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w3/06/operation").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "started action must fire"
+        );
+        // Stop again: the next publish skips the forward.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/actions/w3-06-action/stop",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "stopped action must be skipped at fire time"
+        );
+        // Start again: firing resumes without re-registering anything.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/actions/w3-06-action/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            2,
+            "re-started action must fire again"
+        );
+        // Cleanup: rule then action (the rule holds the reference).
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/w3-06-action", &token)
             .await;
         assert_eq!(status, 204);
     }

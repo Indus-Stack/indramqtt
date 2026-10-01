@@ -582,6 +582,17 @@ pub fn protected_router() -> Router<ApiState> {
             "/actions/:id/metrics/reset",
             put(actions::reset_action_metrics),
         )
+        // Action lifecycle operation (W3-06, C06-10): `start`/`stop`
+        // dispatch on the W3-02 action store wired to the connector
+        // lifecycle underneath (the engine's lock-free dispatch snapshot
+        // gating `ForwardConnector` forwards). Only supported names are
+        // served; unsupported names are rejected, never claimed.
+        // Management-plane only; publish and deliver never touch the
+        // store.
+        .route(
+            "/actions/:id/:operation",
+            post(actions::run_action_operation),
+        )
         // Actions & Sources
         .route("/action_types", get(rules::get_action_types))
         .route("/actions_probe", post(rules::probe_action))

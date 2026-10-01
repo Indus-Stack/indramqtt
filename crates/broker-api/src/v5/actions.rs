@@ -737,6 +737,88 @@ pub async fn reset_action_metrics(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// `POST /api/v5/actions/:id/:operation`: run one named lifecycle
+/// operation against one action (W3-06, C06-10).
+///
+/// Only the operations the lifecycle supports are served: `start`
+/// (enable the action) and `stop` (disable it). Both flip the stored
+/// enable flag in place, mirror the flag into the engine's lock-free
+/// dispatch snapshot (disabled forwards are skipped at fire time before
+/// reaching the connector), persist through the config core like every
+/// other action write, and report the resulting action with 200 so the
+/// state change is visible without a second read.
+///
+/// An unknown action id returns 404 with the documented `{code, message}`
+/// shape and persists nothing; an unknown operation name is rejected
+/// with the documented error shape and persists nothing. The pair is not
+/// paged; unknown query parameters are ignored (no query is extracted).
+/// Management-plane only: one short store read plus one short write lock
+/// cloning at most one small record per request (plus the registry save
+/// lock on persist) and one lock-free snapshot swap; rule evaluation
+/// reads the snapshot, and publish and deliver never touch this store.
+///
+/// Lifecycle state persists with the action record (the enable flag in
+/// the config core); transient run state is not kept, so nothing extra
+/// needs clearing across a restart (boot rebuilds the dispatch snapshot
+/// from the persisted flags).
+///
+/// Fire-path cost (stated for the delivery-path note): no new work on
+/// publish or deliver. The operation itself runs entirely on the
+/// management plane; the publish path keeps paying what the enable route
+/// already pays (one `Arc` of the disabled set per ingress plus one
+/// `HashSet` lookup per forward, lock-free, no per-fire allocation).
+// TODO(parity): which operation names does the documented spec serve
+// beyond `start` (for example `stop`, `restart`)? The rulebook does not
+// decide the exact verb set; the current choice serves exactly
+// `start`/`stop` as enable flips (the only lifecycle the kernel tracks)
+// and rejects everything else with `BAD_REQUEST` until the checker pins
+// it.
+// TODO(parity): are operation names case-sensitive (`START` versus
+// `start`)? The rulebook does not decide; the current choice matches
+// exactly `start`/`stop` in lower case and rejects every other spelling
+// with `BAD_REQUEST` until the checker pins it.
+// TODO(parity): for an unknown id with an unknown operation, is the
+// answer 404 or 400? The rulebook does not decide the precedence; the
+// current choice answers 404 first (existence before validation,
+// mirroring the action update and enable routes) and persists nothing
+// either way.
+// TODO(parity): does a valid operation answer 200 with the updated action
+// or 204 with no body? The rulebook does not decide the exact shape; the
+// current choice returns the updated action with 200 (mirroring the
+// enable route) so the resulting state is visible without a second read.
+pub async fn run_action_operation(
+    State(state): State<ApiState>,
+    Path((id, operation)): Path<(String, String)>,
+) -> Response {
+    if state.actions.get(&id).is_none() {
+        return ApiError::NotFound(format!("action {id:?} not found")).into_response();
+    }
+    let enable = match operation.as_str() {
+        "start" => true,
+        "stop" => false,
+        _ => {
+            return ApiError::BadRequest(format!(
+                "unknown action operation {operation:?}: expected \"start\" or \"stop\" (field `operation`)"
+            ))
+            .into_response();
+        }
+    };
+    let Some(entry) = state.actions.set_enabled(&id, enable) else {
+        return ApiError::NotFound(format!("action {id:?} not found")).into_response();
+    };
+    // Wire into the connector lifecycle underneath: the engine's
+    // lock-free dispatch snapshot gates every `ForwardConnector` forward
+    // before `ConnectorManager::send` (see `run_actions` in
+    // `crates/broker-rules/src/lib.rs`), so flipping the flag here
+    // starts/stops delivery through the connector without touching the
+    // publish path itself.
+    state.engine.set_action_enabled(&id, enable);
+    if let Err(error) = state.actions.persist() {
+        return action_persist_error(error);
+    }
+    (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
