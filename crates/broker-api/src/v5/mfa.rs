@@ -47,7 +47,7 @@
 // (never silently replaces a live second factor) until the checker pins it.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -241,6 +241,119 @@ pub async fn verify(State(state): State<ApiState>, body: Bytes) -> Response {
                 .into_response()
         }
         Err(MfaVerifyError::Persist(reason)) => internal_error(reason),
+    }
+}
+
+/// `POST /users/{username}/mfa`: enrol TOTP multi-factor for one
+/// dashboard user (C05-31).
+///
+/// The username comes from the path. The body may be empty (TOTP is the
+/// only factor this broker tracks, so an empty body enrols TOTP) or a
+/// JSON object with an optional string `mechanism` field; any other
+/// mechanism fails with 400 fail-closed, since non-TOTP factors are out
+/// of scope and must never enrol silently. A malformed body fails with
+/// 400 and enrols nothing. Unknown users fail with 404; a user with any
+/// existing enrolment (pending or enabled) fails with 409
+/// `ALREADY_EXISTS` and changes nothing, so enrolment never grows past
+/// the single secret slot. On success answers 200 with the provisioning
+/// fields (`username`, base32 `secret`, `provisioning_uri`) once; the
+/// user stays pending until a code verifies on the verification route.
+/// The route is not paged. Secrets are never logged.
+/// Management-plane only: one short user-map write lock per call (plus
+/// the registry save lock on persist); publish and deliver never touch
+/// the user map or the attempt counters.
+// TODO(parity): what are the documented request/response field names and
+// shapes for this route (mechanism body, secret versus provisioning
+// fields, 200 versus an empty success)? The rulebook does not decide the
+// exact shapes; the current choice accepts an empty or
+// `{mechanism: "totp"}` body and answers the same provisioning fields
+// as the setup route until the checker pins them.
+// TODO(parity): is a duplicate enrolment rejected with `ALREADY_EXISTS`
+// (409 here) or `BAD_REQUEST` (400)? The rulebook does not decide the
+// exact duplicate code; the current choice keeps `ALREADY_EXISTS`
+// (409, distinct from validation failures, shared with the setup route's
+// enabled-duplicate) until the checker pins it.
+// TODO(parity): may an administrator enrol their own account through
+// this route, or must self-service stay on the current-user MFA route?
+// The rulebook does not decide the self-target policy; the current
+// choice enrols any known user including the caller until the checker
+// pins it.
+pub async fn enrol(
+    State(state): State<ApiState>,
+    Path(username): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(message) = check_enrol_body(&body) {
+        return ApiError::BadRequest(message).into_response();
+    }
+    let secret = match state.admin_users.mfa_admin_enrol(&username) {
+        Ok(secret) => secret,
+        Err(AdminUserError::NotFound) => {
+            return ApiError::NotFound(format!("user {username:?} not found")).into_response();
+        }
+        Err(AdminUserError::AlreadyExists) => {
+            return already_exists(format!("user {username:?} already has MFA enrolled"));
+        }
+        Err(error @ AdminUserError::Persist(_)) => return internal_error(error.to_string()),
+        Err(error) => return ApiError::BadRequest(error.to_string()).into_response(),
+    };
+    let secret_b32 = crate::mfa_totp::base32_encode(&secret);
+    let uri = crate::mfa_totp::provisioning_uri(MFA_ISSUER, &username, &secret_b32);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "username": username,
+            "secret": secret_b32,
+            "provisioning_uri": uri,
+        })),
+    )
+        .into_response()
+}
+
+/// Check the optional enrol body: empty enrols TOTP; a JSON object with
+/// no `mechanism` or `"mechanism": "totp"` enrols TOTP; any other
+/// mechanism fails closed (non-TOTP factors are out of scope); anything
+/// else malformed fails with 400 and enrols nothing.
+fn check_enrol_body(body: &[u8]) -> Result<(), String> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|error| format!("invalid mfa body: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "invalid mfa body: expected JSON object".to_string())?;
+    let mechanism = object.get("mechanism");
+    match mechanism {
+        None => Ok(()),
+        Some(raw) => match raw.as_str() {
+            Some("totp") => Ok(()),
+            Some(other) => Err(format!("unsupported mfa mechanism {other:?}")),
+            None => Err("field `mechanism` must be a string".to_string()),
+        },
+    }
+}
+
+/// `DELETE /users/{username}/mfa`: disable multi-factor for one
+/// dashboard user (C05-30).
+///
+/// Clears the secret, the enabled flag and the last verified counter so
+/// re-enabling later requires a fresh enrolment. Unknown users, and
+/// known users with no enrolment, fail with 404 in the documented
+/// `{code, message}` shape and change nothing. On success answers 204
+/// with no body. The route is not paged. Codes and secrets are never
+/// logged.
+/// Management-plane only: one short user-map write lock per call (plus
+/// the registry save lock on persist); publish and deliver never touch
+/// the user map or the attempt counters.
+pub async fn disable(State(state): State<ApiState>, Path(username): Path<String>) -> Response {
+    match state.admin_users.mfa_disable(&username) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AdminUserError::NotFound) => {
+            ApiError::NotFound(format!("user {username:?} has no MFA enrolment")).into_response()
+        }
+        Err(error @ AdminUserError::Persist(_)) => internal_error(error.to_string()),
+        Err(error) => ApiError::BadRequest(error.to_string()).into_response(),
     }
 }
 
@@ -653,6 +766,275 @@ mod mfa_handler_tests {
             .expect("restored store reports enrolment");
         assert!(status.enabled);
         assert!(!status.pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn admin_mfa_enrol_then_disable_round_trip_with_duplicate_rejected() {
+        // W2-44 failing test: enrol returns the provisioning fields, a
+        // second enrol is rejected as a duplicate, delete disables, and a
+        // second delete is a miss. Before: both routes answered 404.
+        let state = standalone_state();
+        create_user(&state, "w244-alice");
+
+        // Enrol returns the documented provisioning fields once.
+        let (status, enrolled, raw) = parts(
+            enrol(
+                State(state.clone()),
+                Path("w244-alice".to_string()),
+                body(serde_json::json!({"mechanism": "totp"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(enrolled["username"], serde_json::json!("w244-alice"));
+        assert!(
+            enrolled["secret"].as_str().is_some_and(|s| !s.is_empty()),
+            "enrol returns a secret"
+        );
+        assert!(
+            enrolled["provisioning_uri"].is_string(),
+            "enrol returns provisioning fields"
+        );
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("MfaSecret1!"),
+            "enrol body carries no password"
+        );
+
+        // The shared admin-user state reports the enrolment as pending.
+        let (status, info, _) = parts(
+            setup_info(
+                State(state.clone()),
+                body(serde_json::json!({"username": "w244-alice"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["pending"], serde_json::json!(true));
+
+        // Re-enrolling (pending or enabled) is rejected cleanly and keeps
+        // the stored secret.
+        let before = state
+            .admin_users
+            .mfa_secret_for_test("w244-alice")
+            .expect("enrolment stores a secret");
+        let (status, err, _) = parts(
+            enrol(
+                State(state.clone()),
+                Path("w244-alice".to_string()),
+                body(serde_json::json!({"mechanism": "totp"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err["code"], serde_json::json!("ALREADY_EXISTS"));
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert_eq!(
+            state
+                .admin_users
+                .mfa_secret_for_test("w244-alice")
+                .expect("secret survives a duplicate"),
+            before
+        );
+
+        // Delete disables and reports success with no body.
+        let (status, gone, raw) =
+            parts(disable(State(state.clone()), Path("w244-alice".to_string())).await).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "delete answers 204 with no body");
+        assert_eq!(gone, serde_json::Value::Null);
+
+        // Deleting again is a miss with the documented shape.
+        let (status, err, _) =
+            parts(disable(State(state.clone()), Path("w244-alice".to_string())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+
+        // Unknown users are 404 with the documented shape on both routes.
+        let (status, err, _) = parts(
+            enrol(
+                State(state.clone()),
+                Path("w244-ghost".to_string()),
+                body(serde_json::json!({"mechanism": "totp"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        let (status, err, _) =
+            parts(disable(State(state.clone()), Path("w244-ghost".to_string())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn admin_mfa_enrol_body_rules_and_enabled_duplicate() {
+        let state = standalone_state();
+        create_user(&state, "w244-bob");
+
+        // An empty body enrols TOTP (the only factor this broker tracks).
+        let (status, enrolled, _) = parts(
+            enrol(
+                State(state.clone()),
+                Path("w244-bob".to_string()),
+                Bytes::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(enrolled["secret"].is_string());
+
+        // Non-TOTP factors are out of scope and fail closed.
+        create_user(&state, "w244-carol");
+        for body_value in [
+            serde_json::json!({"mechanism": "sms"}),
+            serde_json::json!({"mechanism": 7}),
+            serde_json::json!([1, 2]),
+        ] {
+            let (status, err, _) = parts(
+                enrol(
+                    State(state.clone()),
+                    Path("w244-carol".to_string()),
+                    body(body_value.clone()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body {body_value}");
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(
+                state
+                    .admin_users
+                    .mfa_secret_for_test("w244-carol")
+                    .is_none_or(|secret| secret.is_empty()),
+                "rejected bodies enrol nothing"
+            );
+        }
+        let (status, _, _) = parts(
+            enrol(
+                State(state.clone()),
+                Path("w244-carol".to_string()),
+                Bytes::from_static(b"not json"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // An enabled user re-enrolling is rejected the same clean way.
+        let secret = state
+            .admin_users
+            .mfa_secret_for_test("w244-bob")
+            .expect("enrolment stores a secret");
+        let now = crate::mfa_totp::unix_now_secs();
+        let code = crate::mfa_totp::totp_code(&secret, crate::mfa_totp::totp_counter(now));
+        state
+            .admin_users
+            .mfa_verify("w244-bob", &code, now)
+            .expect("verify enables");
+        let (status, err, _) = parts(
+            enrol(
+                State(state.clone()),
+                Path("w244-bob".to_string()),
+                Bytes::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(err["code"], serde_json::json!("ALREADY_EXISTS"));
+
+        // Disabling an enabled user clears the enrolment; the state reads
+        // as neither pending nor enabled afterwards.
+        let (status, _, _) =
+            parts(disable(State(state.clone()), Path("w244-bob".to_string())).await).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, info, _) = parts(
+            setup_info(
+                State(state.clone()),
+                body(serde_json::json!({"username": "w244-bob"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["enabled"], serde_json::json!(false));
+        assert_eq!(info["pending"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn admin_mfa_enrol_and_disable_persist_across_restart() {
+        // Bound plus persistence: one record per user rides the config
+        // registry byte-identically, and the disable survives a reload.
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-w244-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("scratch registry loads"),
+        );
+        let durable = crate::admin_users::AdminUsers::from_registry(&registry);
+        durable
+            .create(
+                "w244-kept",
+                "KeptSecret1!",
+                crate::admin_users::AdminRole::Viewer,
+                "kept across restart",
+            )
+            .expect("registry-backed create persists");
+        let secret = durable
+            .mfa_admin_enrol("w244-kept")
+            .expect("enrol persists");
+        assert_eq!(
+            durable.mfa_admin_enrol("w244-kept"),
+            Err(crate::admin_users::AdminUserError::AlreadyExists),
+            "duplicate enrol is rejected without growing state"
+        );
+        drop(durable);
+        let reloaded = std::sync::Arc::new(
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart"),
+        );
+        let restored = crate::admin_users::AdminUsers::from_registry(&reloaded);
+        let status = restored
+            .mfa_status("w244-kept")
+            .expect("restored store reports enrolment");
+        assert!(!status.enabled);
+        assert!(
+            status.pending,
+            "pending enrolment persists across a restart"
+        );
+        restored.mfa_disable("w244-kept").expect("disable persists");
+        assert_eq!(
+            restored.mfa_disable("w244-kept"),
+            Err(crate::admin_users::AdminUserError::NotFound),
+            "second disable is a miss"
+        );
+        drop(restored);
+        let reloaded =
+            broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a disable");
+        let cleared =
+            crate::admin_users::AdminUsers::from_snapshot(&reloaded.snapshot().admin_users);
+        let status = cleared
+            .mfa_status("w244-kept")
+            .expect("user survives the disable");
+        assert!(!status.enabled);
+        assert!(!status.pending, "disable persists across a restart");
+        assert!(
+            (10..=64).contains(&secret.len()),
+            "one bounded record per user, never logged"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

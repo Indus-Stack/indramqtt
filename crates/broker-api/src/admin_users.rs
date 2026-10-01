@@ -715,6 +715,100 @@ impl AdminUsers {
         Ok(secret)
     }
 
+    /// Strict per-user MFA enrolment for the admin
+    /// `POST /users/{username}/mfa` route (C05-31): one enrolment per user.
+    /// Unlike [`AdminUsers::mfa_setup`] (which returns the pending secret
+    /// idempotently), any existing enrolment — pending or enabled — is
+    /// rejected with [`AdminUserError::AlreadyExists`] so a live second
+    /// factor is never silently replaced and enrolment never grows past
+    /// the single secret slot. Unknown users fail with
+    /// [`AdminUserError::NotFound`]. Persists through the registry; a
+    /// commit or save failure rolls back the in-memory secret and surfaces
+    /// as [`AdminUserError::Persist`].
+    /// Management-plane only: one short write lock (plus the registry save
+    /// lock on persist); publish and deliver never touch this map. The
+    /// secret is never logged; only the caller (the enrol route) returns
+    /// it once.
+    // TODO(parity): does the documented create re-key an already-enrolled
+    // user (secret rotation) or reject the duplicate? The rulebook does
+    // not decide the rotation policy; the current choice rejects with
+    // `AlreadyExists` fail-closed (never silently replaces a live second
+    // factor) until the checker pins it.
+    pub fn mfa_admin_enrol(&self, username: &str) -> Result<Vec<u8>, AdminUserError> {
+        let secret = {
+            let mut users = self.users.write().unwrap();
+            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
+            if user.mfa_enabled || !user.mfa_secret.is_empty() {
+                return Err(AdminUserError::AlreadyExists);
+            }
+            let secret = crate::mfa_totp::generate_secret();
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret = secret.clone();
+                user.mfa_enabled = false;
+                user.mfa_last_step = None;
+            }
+            secret
+        };
+        if let Err(error) = self.persist() {
+            let mut users = self.users.write().unwrap();
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret.clear();
+                user.mfa_enabled = false;
+                user.mfa_last_step = None;
+            }
+            return Err(error);
+        }
+        Ok(secret)
+    }
+
+    /// Disable per-user MFA for the admin `DELETE /users/{username}/mfa`
+    /// route (C05-30): clears the secret, the enabled flag and the last
+    /// verified counter, and drops the memory-only attempt counters, so
+    /// re-enabling later requires a fresh enrolment. Unknown users, and
+    /// known users with no enrolment (no secret and never enabled), fail
+    /// with [`AdminUserError::NotFound`] and change nothing. Persists
+    /// through the registry; a commit or save failure rolls back the
+    /// in-memory triple and surfaces as [`AdminUserError::Persist`].
+    /// Management-plane only: one short write lock (plus the registry save
+    /// lock on persist); publish and deliver never touch this map. Codes
+    /// and secrets are never logged.
+    // TODO(parity): does the documented delete of a never-enrolled user
+    // report a miss (404) or a bad request (400, already-disabled)? The
+    // rulebook does not decide the exact code; the current choice reports
+    // `NotFound` (404, documented `{code, message}` shape, shared with the
+    // other dashboard miss paths) until the checker pins it.
+    pub fn mfa_disable(&self, username: &str) -> Result<(), AdminUserError> {
+        let previous = {
+            let mut users = self.users.write().unwrap();
+            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
+            if user.mfa_secret.is_empty() && !user.mfa_enabled {
+                return Err(AdminUserError::NotFound);
+            }
+            let previous = (
+                user.mfa_secret.clone(),
+                user.mfa_enabled,
+                user.mfa_last_step,
+            );
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret.clear();
+                user.mfa_enabled = false;
+                user.mfa_last_step = None;
+            }
+            previous
+        };
+        self.mfa_attempts.lock().unwrap().remove(username);
+        if let Err(error) = self.persist() {
+            let mut users = self.users.write().unwrap();
+            if let Some(user) = users.get_mut(username) {
+                user.mfa_secret = previous.0;
+                user.mfa_enabled = previous.1;
+                user.mfa_last_step = previous.2;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Verify one six-digit code for `username` at `unix_secs`.
     ///
     /// Behaviour, in order: unknown users fail with

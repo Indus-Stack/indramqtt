@@ -5042,6 +5042,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_user_mfa_enrol_disable_round_trip() {
+        // W2-44 through-the-router test: enrol MFA for a dashboard user
+        // over HTTP, reject the duplicate, delete, then miss the second
+        // delete. The enrolment lands on the same admin-user MFA state the
+        // setup/verify routes consult, and the MQTT credential store stays
+        // untouched throughout (management-plane only).
+        let (server, state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "w244-http", "password": "W244-http-pass1", "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // Enrol returns the provisioning fields once.
+        let (status, enrolled) = server
+            .post_auth(
+                "/api/v5/users/w244-http/mfa",
+                json!({"mechanism": "totp"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(enrolled["username"], json!("w244-http"));
+        assert!(
+            enrolled["secret"].as_str().is_some_and(|s| !s.is_empty()),
+            "enrol returns a secret, got: {enrolled}"
+        );
+        assert!(
+            enrolled["provisioning_uri"].is_string(),
+            "enrol returns provisioning fields, got: {enrolled}"
+        );
+        assert_eq!(state.auth.user_count(), 0);
+
+        // The setup route sees the same enrolment as pending.
+        let (status, info) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup_info",
+                json!({"username": "w244-http"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(info["pending"], json!(true));
+
+        // A second enrol is rejected cleanly.
+        let (status, err) = server
+            .post_auth(
+                "/api/v5/users/w244-http/mfa",
+                json!({"mechanism": "totp"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 409);
+        assert_eq!(err["code"], json!("ALREADY_EXISTS"));
+
+        // Delete disables; a second delete is a miss.
+        let (status, _) = server
+            .delete_auth("/api/v5/users/w244-http/mfa", &admin_token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, err) = server
+            .delete_auth("/api/v5/users/w244-http/mfa", &admin_token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(err["code"], json!("NOT_FOUND"));
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+
+        // Unknown users are 404 on both routes.
+        let (status, err) = server
+            .post_auth(
+                "/api/v5/users/w244-ghost/mfa",
+                json!({"mechanism": "totp"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(err["code"], json!("NOT_FOUND"));
+        let (status, err) = server
+            .delete_auth("/api/v5/users/w244-ghost/mfa", &admin_token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(err["code"], json!("NOT_FOUND"));
+        assert_eq!(state.auth.user_count(), 0);
+
+        let (status, _) = server
+            .delete_auth("/api/v5/users/w244-http", &admin_token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn mqtt_users_and_quotas_survive_restart() {
         let dir = unique_data_dir("mqtt-survive");
         let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));

@@ -106,6 +106,17 @@ pub fn protected_router() -> Router<ApiState> {
             "/users/:username/change_pwd",
             put(auth::change_user_password).post(auth::change_user_password),
         )
+        // Dashboard per-user MFA enrol and disable (W2-44, C05-30/C05-31):
+        // TOTP enrol returning the provisioning fields plus duplicate
+        // rejection, and a disable that clears the enrolment, both on the
+        // real admin-user MFA state shared with the setup/verify routes.
+        // Neither route is paged; misses fail closed with the documented
+        // `{code, message}` shape. Management-plane only; publish and
+        // deliver never touch the user map or the attempt counters.
+        .route(
+            "/users/:username/mfa",
+            post(mfa::enrol).delete(mfa::disable),
+        )
         // Authentication (AuthN) chain: ordered list plus append, plus
         // whole-order replacement. Management-plane only; the CONNECT
         // path reads a lock-free snapshot and publish/deliver never
