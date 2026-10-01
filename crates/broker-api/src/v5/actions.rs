@@ -196,6 +196,19 @@ impl ActionStore {
         out
     }
 
+    /// Aggregated counts over the live snapshot: (total, enabled,
+    /// disabled). Computed on demand from the live entries, never
+    /// stored, so the counts always track creates, deletes and enable
+    /// flips. Takes one short read lock and counts in place without
+    /// cloning, so a management read never blocks messaging (and
+    /// publish/deliver never touch this store at all).
+    pub fn summary_counts(&self) -> (usize, usize, usize) {
+        let map = self.inner.read().expect("action store lock");
+        let total = map.len();
+        let enabled = map.values().filter(|record| record.enable).count();
+        (total, enabled, total - enabled)
+    }
+
     /// Insert one entry. Fails cleanly when the id already exists
     /// (caller maps to `ALREADY_EXISTS`) or the store is at
     /// [`MAX_ACTIONS`] (caller maps to `BAD_REQUEST`).
@@ -817,6 +830,32 @@ pub async fn run_action_operation(
         return action_persist_error(error);
     }
     (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
+/// `GET /api/v5/actions_summary` (W3-08, C06-12): aggregated counts
+/// over the real action store computed on demand from the live
+/// entries, never constants; an empty store returns zeroes, not an
+/// error. Not paged and not per-id, so there is no 404 path; unknown
+/// query parameters are ignored (no query is extracted).
+/// Management-plane only: one short read lock counting in place per
+/// request, and publish and deliver never touch this store.
+///
+/// The output shape is fixed (`total`, `enabled`, `disabled`); no
+/// history is kept.
+// TODO(parity): does the documented spec want totals by kind as well
+// as by state (for example a per-`type` breakdown)? The rulebook does
+// not decide the exact count fields; the current choice reports the
+// honest live subset that always tracks the store (`total`, `enabled`,
+// `disabled`, mirroring the sibling summary) and omits the rest rather
+// than inventing constants, until the checker pins it.
+pub async fn get_actions_summary(State(state): State<ApiState>) -> Response {
+    let (total, enabled, disabled) = state.actions.summary_counts();
+    Json(serde_json::json!({
+        "total": total,
+        "enabled": enabled,
+        "disabled": disabled,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

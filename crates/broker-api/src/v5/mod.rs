@@ -593,6 +593,12 @@ pub fn protected_router() -> Router<ApiState> {
             "/actions/:id/:operation",
             post(actions::run_action_operation),
         )
+        // Aggregated action summary (W3-08, C06-12): counts computed on
+        // demand from the live W3-02 store snapshot (zeroes when empty,
+        // never an error). Not paged and not per-id, so no 404 path;
+        // unknown query parameters are ignored. Management-plane only;
+        // publish and deliver never touch the store.
+        .route("/actions_summary", get(actions::get_actions_summary))
         // Actions & Sources
         .route("/action_types", get(rules::get_action_types))
         .route("/actions_probe", post(rules::probe_action))

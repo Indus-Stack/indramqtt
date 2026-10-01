@@ -10024,16 +10024,18 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // W3-03 adds `GET`/`PUT /api/v5/actions/:id`, W3-04 adds
         // `PUT /api/v5/actions/:id/enable/:enable`, W3-05 adds
         // `GET /api/v5/actions/:id/metrics` plus `PUT .../metrics/reset`,
-        // and W3-06 adds `POST /api/v5/actions/:id/:operation`,
-        // so only the still-removed action paths stay 404 here.
+        // W3-06 adds `POST /api/v5/actions/:id/:operation`, and W3-08
+        // adds `GET /api/v5/actions_summary`, so no removed action path
+        // stays 404 here: the summary reads live on the shared store.
         // `/api/v5/actions/:id` now exists for GET, PUT and DELETE and
         // `/api/v5/actions/:id/metrics` for GET, so neither is a removed
         // route (mirrors the `/api/v5/sources` handling in
         // `removed_sources_rulenotest_routes_return_404`).
-        for path in ["/api/v5/actions_summary"] {
-            let (status, _) = server.get_auth(path, &token).await;
-            assert_eq!(status, 404, "removed route {path} must be 404");
-        }
+        let (status, _) = server.get_auth("/api/v5/actions_summary", &token).await;
+        assert_eq!(
+            status, 200,
+            "restored route /api/v5/actions_summary must be live"
+        );
     }
 
     #[tokio::test]
@@ -10713,6 +10715,67 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .delete_auth("/api/v5/actions/w3-06-action", &token)
             .await;
         assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn actions_summary_tracks_create_delete() {
+        // W3-08 (C06-12) broker-through test: create two actions of
+        // different states, read the summary expecting matching counts;
+        // delete both and expect zeroes. Every assertion goes through
+        // the HTTP router against the shared W3-02 store, never at the
+        // store directly. The summary counts are computed on demand from
+        // the live snapshot in `crate::v5::actions::ActionStore`
+        // (`summary_counts`, read by `get_actions_summary`), driven by
+        // action create/delete events. Management-plane only; publish
+        // and deliver never touch the action directory.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Empty store returns zeroes, not an error.
+        let (status, body) = server.get_auth("/api/v5/actions_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(0));
+        assert_eq!(body["enabled"], json!(0));
+        assert_eq!(body["disabled"], json!(0));
+        // Two actions of different states: one enabled, one disabled.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "sum-act-a", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "sum-act-b", "type": "mqtt_bridge", "server": "127.0.0.1:1883", "enable": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Counts match the live snapshot; unknown query parameters are
+        // ignored.
+        let (status, body) = server
+            .get_auth("/api/v5/actions_summary?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(2));
+        assert_eq!(body["enabled"], json!(1));
+        assert_eq!(body["disabled"], json!(1));
+        // Delete both; the summary returns to zeroes.
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/sum-act-a", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/sum-act-b", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/actions_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(0));
+        assert_eq!(body["enabled"], json!(0));
+        assert_eq!(body["disabled"], json!(0));
     }
 
     #[tokio::test]
