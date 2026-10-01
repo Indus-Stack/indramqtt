@@ -5,8 +5,8 @@
 //! Single-node, management-plane only: handlers clone at most the capped
 //! list once per request under a short lock; publish and deliver never
 //! touch this store, and no identity-provider client runs here (listing
-//! configured backends only; login flows, MFA, callbacks and token
-//! exchange are sibling tasks).
+//! configured backends only; login flows, MFA and callbacks are sibling
+//! tasks, and token exchange is covered here).
 //!
 //! Store bounds (stated here and enforced below):
 //! - at most [`MAX_SSO_BACKENDS`] backend records; inserts past the cap
@@ -91,6 +91,12 @@ const MAX_OIDC_STATE_LEN: usize = 256;
 /// 4 KiB covers providers with headroom while bounding per-request memory
 /// on this management-plane route (the code itself is never stored).
 const MAX_OIDC_CODE_LEN: usize = 4096;
+/// Longest accepted token-exchange `grant` body value (4096 bytes).
+/// Reason: grants issued here are 32 hex chars; 4 KiB covers
+/// provider-relayed grants with headroom while bounding per-request memory
+/// on this management-plane route (the grant itself is never logged and
+/// never stored beyond the single-use pending-table consume below).
+pub const MAX_SSO_GRANT_LEN: usize = 4096;
 
 /// One configured backend: the registry key plus the enable flag and the
 /// opaque backend config (Null when nothing is stored).
@@ -747,6 +753,195 @@ pub async fn oidc_callback(
         backend = flow.backend.as_str(),
         username = flow.username.as_str(),
         "sso oidc callback completed"
+    );
+    let redirect = stored
+        .config
+        .as_object()
+        .and_then(|object| {
+            object
+                .get("redirect")
+                .or_else(|| object.get("redirect_uri"))
+                .or_else(|| object.get("post_login_redirect"))
+        })
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/")
+        .to_string();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "token": token,
+            "username": flow.username,
+            "backend": flow.backend,
+            "redirect": redirect,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /sso/token_exchange`: exchange one backend-issued grant for a
+/// live dashboard token.
+///
+/// The route is public (no bearer token: the dashboard login page calls it
+/// before anyone holds a token) and not paged. The body must be a JSON
+/// object carrying a non-empty `backend` name and a non-empty grant. The
+/// grant is one pending login flow id from the login task (W2-33): the
+/// login attempt records it, and this route consumes it. Behaviour, in
+/// order:
+/// - bodies that are not a JSON object, or carry no non-empty `backend`
+///   or grant, or carry an oversized value, fail with 400 in the
+///   documented `{code, message}` shape and consume nothing (malformed
+///   requests never burn a live grant);
+/// - a backend with no stored slot fails with 404 `BACKEND_NOT_FOUND` in
+///   the documented shape and consumes nothing;
+/// - an unknown, expired or already-consumed grant fails with 400 in the
+///   documented shape and issues no token (grants are single-use with
+///   [`PENDING_SSO_LOGIN_TTL`]; replays fail the same way);
+/// - a grant that names a different backend than the request fails with
+///   400 and issues no token (the grant is already consumed, so it cannot
+///   be retried elsewhere);
+/// - a disabled backend, a backend with no stored provider config, or a
+///   grant whose username names no admin user fails closed with 401
+///   `BAD_USERNAME_OR_PWD` and issues no token (a disabled slot must
+///   never authenticate, an issued token must resolve through the live
+///   admin-user store, and with no stored provider config there is nothing
+///   the grant could have been issued against);
+/// - otherwise one live dashboard token is issued for the grant's username
+///   (with that user's current role, through the same store the auth
+///   middleware resolves) and the response carries the documented
+///   token/redirect fields.
+///
+/// Grants are never logged and never stored beyond the pending-table
+/// consume. Management-plane only: one short registry read, one short
+/// pending-table lock and short admin/token reads per call; publish and
+/// deliver never touch any of them. Bound: the pending-grant table is the
+/// login table from W2-33 ([`MAX_PENDING_SSO_LOGINS`] entries,
+/// [`PENDING_SSO_LOGIN_TTL`], single-use); this route adds no new state.
+// TODO(parity): what are the documented body field names (`backend` plus
+// `grant`, versus `code`, `auth_code` or `state`)? The rulebook does not
+// decide the exact names; the current choice requires `backend` and reads
+// the grant from `grant` (falling back to `code` and `state`, the sibling
+// flows' names for the same pending-table id) until the checker pins them.
+// TODO(parity): what are the documented miss/auth codes for this route
+// (`BACKEND_NOT_FOUND` versus `NOT_FOUND`, `BAD_REQUEST` versus a
+// dedicated exchange code for unknown grants, `BAD_USERNAME_OR_PWD`
+// versus a dedicated code for disabled backends)? The rulebook does not
+// decide the exact code names; the current choice mirrors the login and
+// callback routes (404 `BACKEND_NOT_FOUND` for an unknown backend, 400
+// `BAD_REQUEST` for malformed or unknown grants, 401 `BAD_USERNAME_OR_PWD`
+// for disabled/unverifiable flows) until the checker pins them.
+// TODO(parity): what are the documented success field names (`token`
+// versus `access_token`, `redirect` versus `redirect_uri`, plus
+// username/backend)? The rulebook does not decide the exact shape; the
+// current choice answers `{token, username, backend, redirect}` (token is
+// the live bearer, redirect comes from the stored backend config's
+// `redirect`/`redirect_uri` string when one is stored and defaults to
+// `/`) until the checker pins it.
+// TODO(parity): does the documented exchange mint the grant itself, or
+// consume a login-flow id as here? The rulebook does not decide the grant
+// source; the current choice consumes the W2-33 pending login flow
+// (fail closed without one) until the checker pins it.
+pub async fn token_exchange(State(state): State<ApiState>, body: Bytes) -> Response {
+    use crate::errors::ApiError;
+    let bad_request = |message: String| ApiError::BadRequest(message).into_response();
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return bad_request(format!("invalid exchange body: {error}"));
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return bad_request("exchange body must be a JSON object".to_string());
+    };
+    let backend = object
+        .get("backend")
+        .and_then(|name| name.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    if backend.is_empty() {
+        return bad_request("field `backend` must not be empty".to_string());
+    }
+    if backend.len() > broker_config::MAX_SSO_BACKEND_NAME_LEN {
+        return bad_request("field `backend` is too long".to_string());
+    }
+    // The grant is the pending login flow id under its documented name;
+    // `code` and `state` are the sibling flows' names for the same id.
+    let grant = ["grant", "code", "state"]
+        .iter()
+        .find_map(|key| object.get(*key))
+        .and_then(|grant| grant.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    if grant.is_empty() {
+        return bad_request("field `grant` must not be empty".to_string());
+    }
+    if grant.len() > MAX_SSO_GRANT_LEN {
+        return bad_request("field `grant` is too long".to_string());
+    }
+    let Some(stored) = state.sso_backends.get(backend) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "BACKEND_NOT_FOUND",
+                "message": "Backend not found",
+            })),
+        )
+            .into_response();
+    };
+    // Single-use: the lookup removes the grant whether this attempt
+    // succeeds or fails from here on, so a replayed grant fails below
+    // as unknown.
+    let Some(flow) = state.sso_backends.consume_pending_state(grant) else {
+        tracing::warn!(
+            backend = backend,
+            "sso token exchange failed: unknown or expired grant"
+        );
+        return bad_request("unknown or expired grant".to_string());
+    };
+    if flow.backend != backend {
+        tracing::warn!(
+            backend = backend,
+            username = flow.username.as_str(),
+            "sso token exchange failed: grant does not belong to this backend"
+        );
+        return bad_request("grant does not belong to this backend".to_string());
+    }
+    if !stored.enable {
+        tracing::warn!(
+            backend = backend,
+            username = flow.username.as_str(),
+            "sso token exchange refused: backend is disabled"
+        );
+        return ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response();
+    }
+    if stored.config.is_null() {
+        // Fail closed: with no stored provider config there is nothing
+        // the grant could have been issued against, so granting a token
+        // would grant access without verification.
+        tracing::warn!(
+            backend = backend,
+            username = flow.username.as_str(),
+            "sso token exchange failed: no provider config for this backend"
+        );
+        return ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response();
+    }
+    let Some(view) = state.admin_users.get(&flow.username) else {
+        tracing::warn!(
+            backend = backend,
+            username = flow.username.as_str(),
+            "sso token exchange failed: unknown user for this grant"
+        );
+        return ApiError::BadUsernameOrPwd("Auth failed".to_string()).into_response();
+    };
+    // Live token: issued through the same store the auth middleware
+    // resolves, with the user's current role, so the exchange hands back
+    // a bearer that works instead of a constant standing in for one.
+    // The grant itself is never logged and never stored.
+    let token = state.tokens.issue(&flow.username, view.role);
+    tracing::warn!(
+        backend = backend,
+        username = flow.username.as_str(),
+        "sso token exchange completed"
     );
     let redirect = stored
         .config
@@ -2891,5 +3086,356 @@ mod sso_saml_tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
         assert!(err.get("token").is_none());
+    }
+}
+
+#[cfg(test)]
+mod sso_token_exchange_tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn seed_backend(state: &ApiState, name: &str, enable: bool, config: serde_json::Value) {
+        state
+            .sso_backends
+            .insert(sso_backend(name.to_string(), enable, config))
+            .expect("seed backend inserts");
+    }
+
+    fn seed_user(state: &ApiState, username: &str) {
+        state
+            .admin_users
+            .create(
+                username,
+                "ExchangeProbe123!",
+                crate::admin_users::AdminRole::Viewer,
+                "exchange probe",
+            )
+            .expect("probe user creates");
+    }
+
+    fn body(value: serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("test body is JSON");
+        (status, json)
+    }
+
+    async fn exchange(state: &ApiState, raw: Bytes) -> (StatusCode, serde_json::Value) {
+        parts(token_exchange(State(state.clone()), raw).await).await
+    }
+
+    fn begin_grant(state: &ApiState, backend: &str, username: &str) -> String {
+        state.sso_backends.record_login_attempt(backend, username)
+    }
+
+    #[tokio::test]
+    async fn unknown_backend_is_404_with_documented_shape_and_consumes_nothing() {
+        // W2-38 failing test (miss half): before this task the path
+        // answered 404 with the router's plain-text body; now an unknown
+        // backend answers 404 in the documented `{code, message}` shape.
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w238-oidc",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_user(&state, "w238-alice");
+        let grant = begin_grant(&state, "w238-oidc", "w238-alice");
+        let (status, err) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-no-such-backend", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("BACKEND_NOT_FOUND"));
+        assert!(err["message"].is_string());
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert!(err.get("token").is_none(), "no token is issued on failure");
+        // The miss consumed nothing: the live grant still exchanges
+        // against its own backend afterwards.
+        let (status, ok) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-oidc", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ok["token"].is_string());
+    }
+
+    #[tokio::test]
+    async fn bad_grant_is_rejected_with_documented_shape_and_no_token() {
+        // W2-38 failing test (bad-grant half): before this task the path
+        // answered 404 with the router's plain-text body; now an unknown
+        // grant answers 400 in the documented `{code, message}` shape.
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w238-oidc",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_user(&state, "w238-bob");
+        let (status, err) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-oidc", "grant": "w238-no-such-grant"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(err["message"].is_string());
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert!(err.get("token").is_none(), "no token is issued on failure");
+    }
+
+    #[tokio::test]
+    async fn malformed_bodies_are_400_and_consume_nothing() {
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w238-oidc",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_user(&state, "w238-carol");
+        let grant = begin_grant(&state, "w238-oidc", "w238-carol");
+        let long_backend = "b".repeat(broker_config::MAX_SSO_BACKEND_NAME_LEN + 1);
+        let long_grant = "g".repeat(MAX_SSO_GRANT_LEN + 1);
+        for raw in [
+            Bytes::from_static(b""),
+            Bytes::from_static(b"not json"),
+            body(serde_json::json!([1, 2])),
+            body(serde_json::json!(null)),
+            body(serde_json::json!("grant")),
+            body(serde_json::json!({})),
+            body(serde_json::json!({"grant": grant})),
+            body(serde_json::json!({"backend": "w238-oidc"})),
+            body(serde_json::json!({"backend": "", "grant": grant})),
+            body(serde_json::json!({"backend": "   ", "grant": grant})),
+            body(serde_json::json!({"backend": "w238-oidc", "grant": ""})),
+            body(serde_json::json!({"backend": "w238-oidc", "grant": "   "})),
+            body(serde_json::json!({"backend": "w238-oidc", "grant": 7})),
+            body(serde_json::json!({"backend": 7, "grant": grant})),
+            body(serde_json::json!({"backend": long_backend, "grant": grant})),
+            body(serde_json::json!({"backend": "w238-oidc", "grant": long_grant})),
+        ] {
+            let (status, err) = exchange(&state, raw).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(err["message"].is_string());
+            assert!(err.get("token").is_none());
+        }
+        // Malformed attempts never consume a pending grant: the live
+        // grant below still completes afterwards.
+        let (status, ok) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-oidc", "grant": grant})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "malformed attempts leave the grant live"
+        );
+        assert!(ok["token"].is_string());
+    }
+
+    #[tokio::test]
+    async fn happy_path_issues_live_token_with_documented_fields_and_single_use() {
+        // A live grant against a stored, enabled, configured backend
+        // completes with the documented token/redirect fields. Before:
+        // 404 for everything on this path.
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w238-oidc",
+            true,
+            serde_json::json!({
+                "issuer": "https://idp.example.invalid",
+                "redirect": "/dashboard",
+            }),
+        );
+        seed_user(&state, "w238-dave");
+        let grant = begin_grant(&state, "w238-oidc", "w238-dave");
+        let (status, ok) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-oidc", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = ok["token"].as_str().expect("success carries a token");
+        assert!(!token.is_empty());
+        assert_eq!(ok["username"], serde_json::json!("w238-dave"));
+        assert_eq!(ok["backend"], serde_json::json!("w238-oidc"));
+        assert_eq!(ok["redirect"], serde_json::json!("/dashboard"));
+        assert!(ok.get("code").is_none(), "success carries no error code");
+        // The issued bearer resolves through the live token store: the
+        // exchange hands back a bearer that works instead of a constant
+        // standing in for one.
+        assert!(
+            state.tokens.lookup(token).is_some(),
+            "issued token is live in the token store"
+        );
+        // Grants are single-use: replaying the same grant fails even
+        // though the backend and user are unchanged, and issues no token.
+        let (status, err) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-oidc", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(err.get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn sibling_grant_names_resolve_the_same_pending_flow() {
+        // The grant travels under the sibling flows' names for the same
+        // pending-table id; all three complete the same way.
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w238-oidc",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_user(&state, "w238-erin");
+        for key in ["grant", "code", "state"] {
+            let grant = begin_grant(&state, "w238-oidc", "w238-erin");
+            let mut fields = serde_json::Map::new();
+            fields.insert("backend".to_string(), serde_json::json!("w238-oidc"));
+            fields.insert(key.to_string(), serde_json::json!(grant));
+            let (status, ok) = exchange(&state, body(serde_json::Value::Object(fields))).await;
+            assert_eq!(status, StatusCode::OK, "grant travels as `{key}`");
+            assert!(ok["token"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_for_another_backend_is_rejected_and_burned() {
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w238-a",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_backend(
+            &state,
+            "w238-b",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_user(&state, "w238-frank");
+        let grant = begin_grant(&state, "w238-a", "w238-frank");
+        let (status, err) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-b", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(err.get("token").is_none());
+        // The grant is already consumed, so it cannot be retried against
+        // its own backend afterwards.
+        let (status, err) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-a", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "grants are single-use");
+        assert!(err.get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_unconfigured_and_unknown_user_flows_fail_closed() {
+        let state = standalone_state();
+        seed_backend(
+            &state,
+            "w238-oidc",
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid"}),
+        );
+        seed_backend(
+            &state,
+            "w238-off",
+            false,
+            serde_json::json!({
+                "issuer": "https://idp.example.invalid",
+            }),
+        );
+        seed_backend(&state, "w238-bare", true, serde_json::Value::Null);
+        seed_user(&state, "w238-grace");
+
+        // Disabled backends fail closed with no token.
+        let grant = begin_grant(&state, "w238-off", "w238-grace");
+        let (status, err) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-off", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err["code"], serde_json::json!("BAD_USERNAME_OR_PWD"));
+        assert!(err.get("token").is_none());
+
+        // Backends with no stored provider config fail closed: there is
+        // nothing the grant could have been issued against.
+        let grant = begin_grant(&state, "w238-bare", "w238-grace");
+        let (status, err) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-bare", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+
+        // Grants for unknown admin users fail closed: an issued token
+        // would be revoked on first use, so none is issued.
+        let grant = begin_grant(&state, "w238-oidc", "w238-ghost");
+        let (status, err) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-oidc", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(err.get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn grant_for_vanished_backend_is_404_with_documented_shape() {
+        // The grant names a backend that is no longer stored: the miss
+        // mirrors the login route instead of granting anything.
+        let state = standalone_state();
+        seed_user(&state, "w238-heidi");
+        let grant = begin_grant(&state, "w238-gone", "w238-heidi");
+        let (status, err) = exchange(
+            &state,
+            body(serde_json::json!({"backend": "w238-gone", "grant": grant})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("BACKEND_NOT_FOUND"));
+        assert!(err.get("token").is_none());
+    }
+
+    #[test]
+    fn exchange_bounds_are_finite_and_reasoned() {
+        const { assert!(MAX_PENDING_SSO_LOGINS > 0) };
+        const { assert!(MAX_SSO_GRANT_LEN > 0) };
+        const { assert!(broker_config::MAX_SSO_BACKEND_NAME_LEN > 0) };
+        assert!(!PENDING_SSO_LOGIN_TTL.is_zero());
     }
 }

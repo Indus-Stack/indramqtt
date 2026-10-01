@@ -79,6 +79,14 @@ pub fn public_router() -> Router<ApiState> {
         // anyone holds a token). The route is not paged.
         // Management-plane only; publish and deliver never touch it.
         .route("/sso/saml/metadata", get(sso::saml_metadata))
+        // Single-sign-on token exchange (W2-38, C05-20): exchanges one
+        // backend-issued grant (a single-use pending login flow from the
+        // login task) for a live bearer against the stored backend config.
+        // Pre-auth by definition (the dashboard login page calls it before
+        // anyone holds a token). The route is not paged.
+        // Management-plane only; publish and deliver never touch the
+        // backend registry or the pending table.
+        .route("/sso/token_exchange", post(sso::token_exchange))
 }
 
 /// Authenticated `/api/v5/*` endpoints. Served behind the

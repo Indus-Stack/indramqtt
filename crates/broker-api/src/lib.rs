@@ -10522,6 +10522,47 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn sso_token_exchange_bad_grant_and_unknown_backend_through_router() {
+        // W2-38 failing test through the served management API: before
+        // this task the path answered 404 with the router's plain-text
+        // body; now unknown backends answer 404 and malformed bodies
+        // answer 400, both in the documented `{code, message}` shape.
+        // Broker-through: every call goes through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), not only
+        // through the store. The route is public (pre-auth: the dashboard
+        // login page calls it before anyone holds a token), so no bearer
+        // is sent. Handler unit tests seed the registry for the success
+        // half; this test pins the wiring plus the failure shapes.
+        // Management-plane only; publish and deliver never touch the
+        // backend registry or the pending table.
+        let (server, _state) = TestServer::start().await;
+
+        // Unknown backends fail with 404 and issue no token.
+        let (status, err) = server
+            .post(
+                "/api/v5/sso/token_exchange",
+                json!({"backend": "w238-no-such-backend", "grant": "w238-no-such-grant"}),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(err["code"], json!("BACKEND_NOT_FOUND"));
+        assert!(err["message"].is_string());
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert!(err.get("token").is_none());
+
+        // Malformed bodies fail with 400 and issue no token.
+        let (status, err) = server.post("/api/v5/sso/token_exchange", json!({})).await;
+        assert_eq!(status, 400);
+        assert_eq!(err["code"], json!("BAD_REQUEST"));
+        assert!(err["message"].is_string());
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert!(err.get("token").is_none());
+
+        drop(server);
+    }
+
+    #[tokio::test]
     async fn removed_cluster_inflight_routes_return_404() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
