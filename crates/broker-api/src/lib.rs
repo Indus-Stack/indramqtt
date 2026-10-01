@@ -245,8 +245,9 @@ pub struct ApiState {
     pub sources: Arc<crate::v5::sources::SourceStore>,
     /// Action instance directory for `GET /api/v5/actions`,
     /// `POST /api/v5/actions`, `DELETE /api/v5/actions/{id}` (W3-02,
-    /// C06-02..C06-04) and `GET`/`PUT /api/v5/actions/{id}` (W3-03,
-    /// C06-05/C06-06): bounded id-keyed map validated against the
+    /// C06-02..C06-04), `GET`/`PUT /api/v5/actions/{id}` (W3-03,
+    /// C06-05/C06-06) and `PUT /api/v5/actions/{id}/enable/{enable}`
+    /// (W3-04, C06-07): bounded id-keyed map validated against the
     /// action-kind registry from the action-types catalogue, with
     /// persistence across a restart via the config core and delete
     /// refused while a rule references the action. The routes read one
@@ -348,6 +349,18 @@ impl ApiState {
         // (today's empty behaviour: an empty store lists as an empty
         // page).
         let actions = Arc::new(crate::v5::actions::ActionStore::from_registry(&config));
+        // Boot seeding (W3-04): mirror the persisted action enable flags
+        // into the engine's lock-free dispatch snapshot so a restart keeps
+        // disabled actions skipped from the first publish. An empty store
+        // is a no-op (today's empty behaviour: nothing disabled).
+        {
+            let enables: Vec<(String, bool)> = actions
+                .snapshot()
+                .iter()
+                .map(|record| (record.id.clone(), record.enable))
+                .collect();
+            engine.sync_action_enables(&enables);
+        }
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -10246,6 +10259,223 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 400);
         assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn actions_enable_flag_round_trip_and_dispatch_skip() {
+        // W3-04 (C06-07) broker-through test: create an action via the
+        // W3-02 route, disable it through the enable route and read back
+        // disabled, re-enable and read back enabled; unknown ids are 404
+        // and malformed flags are 400, both with the documented shape.
+        // Then a rule forwarding to the action id fires while enabled
+        // and is skipped at fire time while disabled, through the
+        // engine's lock-free dispatch snapshot (one publish through
+        // `dispatch_ingress` per case). Management-plane only otherwise;
+        // publish and deliver never touch the action store directly.
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown id is 404 with the documented shape, not an empty body.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/actions/no-such-action/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one action via the W3-02 route (defaults to enabled).
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-04-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Malformed flag is rejected with the documented shape (an empty
+        // segment never reaches the handler: the router has no such route
+        // and answers 404, so only non-empty spellings are exercised here).
+        for bad in ["maybe", "1", "0", "on", "TRUEE", "enabled"] {
+            let (status, body) = server
+                .send(
+                    "PUT",
+                    &format!("/api/v5/actions/w3-04-action/enable/{bad}"),
+                    None,
+                    Some(&token),
+                )
+                .await;
+            assert_eq!(status, 400, "flag {bad:?} must be rejected");
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+        // Disable: flag change is visible on the next read.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/actions/w3-04-action/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-04-action", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        // Re-enable: visible on the next read.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/actions/w3-04-action/enable/true",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-04-action", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // Rule dispatch through the broker: a rule forwarding to the
+        // action id fires while enabled and skips while disabled. The
+        // counting sink is registered under the action id, the rule is
+        // created through the HTTP router, and each publish goes through
+        // `dispatch_ingress` (the broker's rule path), never `sink.send`
+        // directly.
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state
+            .engine
+            .connectors()
+            .register("w3-04-action", counter.clone());
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "w3-04-rule",
+                    "sql": "SELECT * FROM \"w3/04/enable\"",
+                    "actions": ["w3-04-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w3/04/enable").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "enabled action must fire"
+        );
+        // Disable again: the next publish skips the forward.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/actions/w3-04-action/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "disabled action must be skipped at fire time"
+        );
+        // Re-enable: firing resumes without re-registering anything.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/actions/w3-04-action/enable/true",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            2,
+            "re-enabled action must fire again"
+        );
+        // Cleanup: rule then action (the rule holds the reference).
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/w3-04-action", &token)
+            .await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]

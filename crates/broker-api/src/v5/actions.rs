@@ -2,8 +2,10 @@
 //!
 //! Covers `GET /actions` (paged list, C06-02), `POST /actions`
 //! (validated create, C06-03), `DELETE /actions/:id` (drop one action,
-//! C06-04), `GET /actions/:id` (single read, C06-05) and
-//! `PUT /actions/:id` (validated replace, C06-06) on a real backend.
+//! C06-04), `GET /actions/:id` (single read, C06-05),
+//! `PUT /actions/:id` (validated replace, C06-06) and
+//! `PUT /actions/:id/enable/:enable` (flag flip, C06-07) on a real
+//! backend.
 //! Single-node, management-plane only: handlers clone at most the capped
 //! list (list) or one entry (single read/replace) per request under a
 //! short lock; rule evaluation reads a snapshot, never this store
@@ -246,6 +248,20 @@ impl ActionStore {
         true
     }
 
+    /// Flip the enable flag of one entry in place (W3-04, C06-07).
+    /// Returns the updated record, or `None` when the id is unknown
+    /// (caller maps to `NOT_FOUND` and persists nothing). Touches only
+    /// the single boolean; the id, kind and params are untouched, so the
+    /// update can never trip the store cap or change validation.
+    /// Management-plane only; publish and deliver never call this (rule
+    /// evaluation reads the engine's lock-free dispatch snapshot).
+    pub fn set_enabled(&self, id: &str, enable: bool) -> Option<ActionRecord> {
+        let mut map = self.inner.write().expect("action store lock");
+        let entry = map.get_mut(id)?;
+        entry.enable = enable;
+        Some(entry.clone())
+    }
+
     /// Export the store as a validated config root: entries sorted by
     /// id so the persisted file is deterministic. Each entry carries
     /// the id, kind, enable flag and the opaque kind-specific fields as
@@ -388,6 +404,10 @@ pub async fn create_action(
         params: serde_json::Value::Object(params),
     }) {
         Ok(entry) => {
+            // W3-04: mirror the flag into the engine's lock-free dispatch
+            // snapshot so rule evaluation observes the create without
+            // taking this store's lock on the message path.
+            state.engine.set_action_enabled(&id, enable);
             if let Err(error) = state.actions.persist() {
                 return action_persist_error(error);
             }
@@ -434,6 +454,9 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
     if !state.actions.remove(&id) {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
+    // W3-04: drop the id from the dispatch snapshot so a later re-create
+    // with the same id starts enabled.
+    state.engine.remove_action(&id);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -545,6 +568,70 @@ pub async fn update_action(
     if !state.actions.replace(&id, entry.clone()) {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
+    // W3-04: mirror the flag into the dispatch snapshot (same lock-free
+    // path as the enable route below).
+    state.engine.set_action_enabled(&id, entry.enable);
+    if let Err(error) = state.actions.persist() {
+        return action_persist_error(error);
+    }
+    (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
+/// `PUT /api/v5/actions/:id/enable/:enable`: flip one action's enable
+/// flag (W3-04, C06-07).
+///
+/// An unknown id returns 404 with the documented `{code, message}` shape
+/// and persists nothing. A malformed enable value is rejected with the
+/// documented error shape and persists nothing. On success the stored
+/// flag is flipped, the change is mirrored into the engine's lock-free
+/// dispatch snapshot (disabled forwards are skipped at fire time), the
+/// mutation persists through the config core like every other action
+/// write, and the updated action reads back with 200 so the flag change
+/// is visible on the next read.
+///
+/// The pair is not paged; unknown query parameters are ignored (no query
+/// is extracted). Management-plane only: one short write lock plus the
+/// registry save lock on persist, and one lock-free snapshot swap; rule
+/// evaluation reads the snapshot, and publish and deliver never touch
+/// this store.
+// TODO(parity): which spellings does the enable path accept (`true`/
+/// `false` only, or also `1`/`0`, `on`/`off`, mixed case)? The rulebook
+// does not decide; the current choice accepts exactly `true`/`false`
+// case-insensitively and rejects everything else with `BAD_REQUEST`
+// until the checker pins it.
+// TODO(parity): for an unknown id with a malformed enable value, is the
+// answer 404 or 400? The rulebook does not decide the precedence; the
+// current choice answers 404 first (existence before validation,
+// mirroring the action update) and persists nothing either way.
+// TODO(parity): does the enable route answer 200 with the updated action
+// or 204 with no body? The rulebook does not decide the exact shape;
+// the current choice returns the updated action with 200 (mirroring the
+// action update) so the flag change is visible without a second read.
+pub async fn set_action_enabled(
+    State(state): State<ApiState>,
+    Path((id, enable_raw)): Path<(String, String)>,
+) -> Response {
+    if state.actions.get(&id).is_none() {
+        return ApiError::NotFound(format!("action {id:?} not found")).into_response();
+    }
+    let enable = match enable_raw.trim().to_ascii_lowercase().as_str() {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return ApiError::BadRequest(format!(
+                "invalid enable value {enable_raw:?}: expected \"true\" or \"false\" (field `enable`)"
+            ))
+            .into_response();
+        }
+    };
+    let Some(entry) = state.actions.set_enabled(&id, enable) else {
+        return ApiError::NotFound(format!("action {id:?} not found")).into_response();
+    };
+    // Mirror into the dispatch snapshot before persisting: the in-memory
+    // flag is already flipped, so evaluation must observe it even if the
+    // disk save below fails (the store itself keeps the mutation on a
+    // persist failure and answers 500, never silently).
+    state.engine.set_action_enabled(&id, enable);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -639,6 +726,20 @@ mod tests {
         let found = store.get("a").expect("stored action reads back");
         assert_eq!(found.id, "a");
         assert!(store.get("nope").is_none());
+    }
+
+    #[test]
+    fn set_enabled_flips_only_the_flag_and_misses_unknown() {
+        let store = ActionStore::new();
+        assert!(store.set_enabled("missing", false).is_none());
+        assert!(store.insert(record("a")).is_ok());
+        let disabled = store.set_enabled("a", false).expect("known id flips");
+        assert!(!disabled.enable);
+        assert!(!store.get("a").expect("reads back").enable);
+        let enabled = store.set_enabled("a", true).expect("known id flips");
+        assert!(enabled.enable);
+        assert!(store.get("a").expect("reads back").enable);
+        assert_eq!(store.snapshot().len(), 1);
     }
 
     #[test]

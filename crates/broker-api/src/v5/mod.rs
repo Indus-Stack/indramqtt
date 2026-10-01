@@ -563,6 +563,14 @@ pub fn protected_router() -> Router<ApiState> {
                 .put(actions::update_action)
                 .delete(actions::delete_action),
         )
+        // Action enable flag (W3-04, C06-07): flips one action's enable
+        // bit with the flag honoured by rule dispatch via the engine's
+        // lock-free snapshot. Management-plane only; publish and deliver
+        // never touch the store.
+        .route(
+            "/actions/:id/enable/:enable",
+            put(actions::set_action_enabled),
+        )
         // Actions & Sources
         .route("/action_types", get(rules::get_action_types))
         .route("/actions_probe", post(rules::probe_action))

@@ -809,6 +809,7 @@ dependencies = [
 name = "broker-rules"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.22.1",

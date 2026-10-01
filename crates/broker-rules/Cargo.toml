@@ -12,6 +12,7 @@ broker-config = { workspace = true }
 broker-observability = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
+arc-swap = { workspace = true }
 parking_lot = { workspace = true }
 rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "da6aa63eda45ef87161d7f1e8ab91cb9ea0ab30f" }
 # Same revision as rekuiper-sql: only the public user-function registry is

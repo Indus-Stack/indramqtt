@@ -27,7 +27,7 @@ pub mod runtime;
 /// arity, example) served to the dashboard SQL studio.
 pub use rekuiper_sql::{builtin_function_metadata, FunctionMeta};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -673,6 +673,17 @@ pub struct RuleEngine {
     input: Arc<BoundedEventInput>,
     connectors: Arc<ConnectorManager>,
     flush_ctx: Arc<FlushContext>,
+    /// Lock-free snapshot of disabled action ids (W3-04, C06-07): the
+    /// management plane swaps the whole set on every action
+    /// create/update/delete/enable, and the publish path loads one `Arc`
+    /// per ingress with no store lock. A single `bool` per action lives
+    /// here as set membership (absent means enabled); no list or cache
+    /// grows on the message path. Reason for `ArcSwap`: the publish
+    /// path must never take the management store lock, and the engine's
+    /// own rule-map lock is already held for the rule snapshot, so the
+    /// enable read stays a lock-free `Arc` clone plus a `HashSet`
+    /// lookup per forward action.
+    action_disabled: Arc<arc_swap::ArcSwap<HashSet<String>>>,
     /// Embedded rule runtime transport: one [`rekuiper_core::StreamBus`]
     /// per engine plus its send handle for [`runtime::RULE_INGRESS_STREAM`].
     /// Every windowed rule's task subscribes; the publish path hands each
@@ -704,6 +715,10 @@ struct FlushContext {
     connectors: Arc<ConnectorManager>,
     broker_sink: RwLock<Option<Arc<dyn BrokerSink>>>,
     forward_throttle: Arc<parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>>,
+    /// Shared disabled-action snapshot with the engine (W3-04, C06-07):
+    /// the same `ArcSwap` instance, so window-flush emits observe the
+    /// same management-plane swaps as the inline path without a lock.
+    action_disabled: Arc<arc_swap::ArcSwap<HashSet<String>>>,
 }
 
 /// One timestamped record waiting inside a window buffer. The ingress
@@ -819,6 +834,9 @@ struct BrokerRuleSink {
 impl runtime::RuleOutputSink for BrokerRuleSink {
     async fn emit(&self, topic: Topic, payload: Bytes, qos_cap: QoS) {
         let sink = self.flush_ctx.broker_sink.read().clone();
+        // W3-04: window-flush emits honour the same lock-free snapshot as
+        // the inline path (one `Arc` clone per flush, not per message).
+        let disabled = self.flush_ctx.action_disabled.load_full();
         run_actions(
             &self.rule_id,
             &self.actions,
@@ -829,6 +847,7 @@ impl runtime::RuleOutputSink for BrokerRuleSink {
             sink.as_ref(),
             &self.counters,
             &self.flush_ctx.forward_throttle,
+            &disabled,
         )
         .await;
         self.task_counters.inc_sink_out(1);
@@ -906,6 +925,7 @@ impl RuleEngine {
         stdlib::ensure_stdlib_registered();
         let connectors = Arc::new(ConnectorManager::new());
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let action_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
         let stream_bus = StreamBus::new();
         let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
@@ -917,7 +937,9 @@ impl RuleEngine {
                 connectors,
                 broker_sink: RwLock::new(None),
                 forward_throttle: forward_throttle.clone(),
+                action_disabled: action_disabled.clone(),
             }),
+            action_disabled,
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
@@ -941,6 +963,7 @@ impl RuleEngine {
         stdlib::ensure_stdlib_registered();
         let connectors = Arc::new(ConnectorManager::new());
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let action_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
         let stream_bus = StreamBus::new();
         let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
@@ -952,7 +975,9 @@ impl RuleEngine {
                 connectors,
                 broker_sink: RwLock::new(None),
                 forward_throttle: forward_throttle.clone(),
+                action_disabled: action_disabled.clone(),
             }),
+            action_disabled,
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
@@ -1431,6 +1456,68 @@ impl RuleEngine {
         Ok(found)
     }
 
+    /// Record one action's enable flag in the lock-free dispatch snapshot
+    /// (W3-04, C06-07). Management-plane only: the action store owns the
+    /// flag and persistence, this snapshot only mirrors it so the publish
+    /// path never takes the store lock. Enabling removes the id, disabling
+    /// inserts it; unknown ids can be recorded (harmless: no rule forwards
+    /// to them until one does).
+    pub fn set_action_enabled(&self, id: &str, enabled: bool) {
+        if self.is_action_enabled(id) == enabled {
+            return;
+        }
+        let current = self.action_disabled_snapshot();
+        let mut next = current.as_ref().clone();
+        if enabled {
+            next.remove(id);
+        } else {
+            next.insert(id.to_string());
+        }
+        self.action_disabled.store(Arc::new(next));
+    }
+
+    /// Drop one action id from the dispatch snapshot (W3-04, C06-07).
+    /// Management-plane only: called after the action store deletes the
+    /// entry so a later re-create with the same id starts enabled.
+    pub fn remove_action(&self, id: &str) {
+        let current = self.action_disabled.load_full();
+        if !current.contains(id) {
+            return;
+        }
+        let mut next = current.as_ref().clone();
+        next.remove(id);
+        self.action_disabled.store(Arc::new(next));
+    }
+
+    /// Replace the whole dispatch snapshot from `(id, enable)` pairs
+    /// (W3-04, C06-07). Boot path: rebuilds the snapshot from the action
+    /// store after a restart so the persisted flags take effect from the
+    /// first publish. Management-plane/boot only; the publish path only
+    /// loads.
+    pub fn sync_action_enables(&self, enables: &[(String, bool)]) {
+        let mut disabled = HashSet::with_capacity(enables.len());
+        for (id, enabled) in enables {
+            if !enabled {
+                disabled.insert(id.clone());
+            }
+        }
+        self.action_disabled.store(Arc::new(disabled));
+    }
+
+    /// Lock-free snapshot of disabled action ids for the publish path
+    /// (W3-04, C06-07): one `Arc` clone, no lock, no allocation beyond
+    /// the refcount bump. Disabled forwards are skipped at fire time.
+    pub fn action_disabled_snapshot(&self) -> Arc<HashSet<String>> {
+        self.action_disabled.load_full()
+    }
+
+    /// Whether one action currently participates (W3-04, C06-07).
+    /// Management-plane/tests helper; the publish path uses
+    /// [`RuleEngine::action_disabled_snapshot`] once per ingress instead.
+    pub fn is_action_enabled(&self, id: &str) -> bool {
+        !self.action_disabled_snapshot().contains(id)
+    }
+
     /// Feed matching windowed ingress into the embedded rule runtime:
     /// convert the ingress `(topic, payload, qos)` once to a
     /// [`rekuiper_core::StreamRecord`] and hand it to the runtime over the
@@ -1708,6 +1795,11 @@ impl RuleEngine {
                 .cloned()
                 .collect()
         };
+        // W3-04: one lock-free `Arc` clone of the disabled-action set per
+        // ingress (no store lock, no allocation beyond the refcount bump).
+        // Disabled forwards are skipped at fire time below and in
+        // `BrokerRuleSink::emit` for window flushes.
+        let disabled = self.action_disabled_snapshot();
         for rule in &matched {
             rule.matched_cnt.fetch_add(1, Ordering::Relaxed);
         }
@@ -1745,6 +1837,7 @@ impl RuleEngine {
                     Some(broker_sink),
                     &ActionCounters::from_rule(rule),
                     &self.forward_throttle,
+                    &disabled,
                 )
                 .await;
             }
@@ -1790,6 +1883,16 @@ impl RuleEngine {
 /// flush path passes the flushed batch's ingress-QoS floor
 /// (`min(action, ingress floor)`). A missing broker sink drops republish
 /// actions with a warning instead of panicking.
+///
+/// `disabled` is the lock-free disabled-action snapshot loaded once per
+/// ingress (W3-04, C06-07): a `ForwardConnector` naming a disabled action
+/// id is skipped at fire time with no counters bumped and no send
+/// attempted, so a disabled action costs one `HashSet` lookup and never
+/// touches the connector.
+// TODO(parity): do skipped disabled forwards count in the rule
+// `actions.total` metrics, or are they invisible until re-enabled? The
+// rulebook does not decide; the current choice leaves all three counters
+// untouched (the action never fired) until the checker pins it.
 #[allow(clippy::too_many_arguments)]
 async fn run_actions(
     rule_id: &str,
@@ -1801,6 +1904,7 @@ async fn run_actions(
     broker_sink: Option<&Arc<dyn BrokerSink>>,
     counters: &ActionCounters,
     throttle: &parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>,
+    disabled: &HashSet<String>,
 ) {
     for action in actions {
         match action {
@@ -1847,6 +1951,12 @@ async fn run_actions(
                 );
             }
             RuleAction::ForwardConnector { connector_id } => {
+                // W3-04: disabled actions are skipped at fire time via the
+                // dispatch snapshot, never under the store lock. No
+                // counters, no send, no log: the action never fired.
+                if disabled.contains(connector_id) {
+                    continue;
+                }
                 if let Err(e) = connectors
                     .send(connector_id, topic, &payload, qos_cap)
                     .await

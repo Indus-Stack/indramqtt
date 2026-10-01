@@ -5962,6 +5962,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot yields today's empty behaviour (no rules); an invalid
     // stored rule fails boot loudly, never skipped silently.
     shared.engine.seed_from_registry(&shared.config)?;
+    // Action enable flags (W3-04): mirror the persisted flags (seeded
+    // in place above) into the engine's lock-free dispatch snapshot so a
+    // restart keeps disabled actions skipped from the first publish. An
+    // empty store is a no-op (today's empty behaviour: nothing disabled).
+    // One snapshot swap at boot; the publish path only loads afterwards.
+    {
+        let enables: Vec<(String, bool)> = shared
+            .actions
+            .snapshot()
+            .iter()
+            .map(|record| (record.id.clone(), record.enable))
+            .collect();
+        shared.engine.sync_action_enables(&enables);
+    }
     // Rule spill drain (B4-07): when a spill directory is configured,
     // start the single pressure-ease replay driver. It pends on
     // `input().next_event()` (the prod caller beside tests), draining
