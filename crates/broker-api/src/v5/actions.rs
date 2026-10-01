@@ -1,10 +1,12 @@
 //! Action instance store for the v5 management API.
 //!
 //! Covers `GET /actions` (paged list, C06-02), `POST /actions`
-//! (validated create, C06-03) and `DELETE /actions/:id` (drop one
-//! action, C06-04) on a real backend. Single-node, management-plane
-//! only: handlers clone at most the capped list once per request under
-//! a short lock; rule evaluation reads a snapshot, never this store
+//! (validated create, C06-03), `DELETE /actions/:id` (drop one action,
+//! C06-04), `GET /actions/:id` (single read, C06-05) and
+//! `PUT /actions/:id` (validated replace, C06-06) on a real backend.
+//! Single-node, management-plane only: handlers clone at most the capped
+//! list (list) or one entry (single read/replace) per request under a
+//! short lock; rule evaluation reads a snapshot, never this store
 //! directly, and publish and deliver never touch it.
 //!
 //! Store bounds (both stated here and enforced below):
@@ -217,6 +219,33 @@ impl ActionStore {
             .is_some()
     }
 
+    /// Read one entry by id. Clones at most one small record under a
+    /// short read lock; returns `None` when the id is unknown (caller
+    /// maps to `NOT_FOUND`). Management-plane only; publish and deliver
+    /// never call this.
+    pub fn get(&self, id: &str) -> Option<ActionRecord> {
+        self.inner
+            .read()
+            .expect("action store lock")
+            .get(id)
+            .cloned()
+    }
+
+    /// Replace the entry stored under `id` with a validated snapshot.
+    /// Returns false when the id is unknown (caller maps to `NOT_FOUND`
+    /// and creates nothing). The replace swaps one validated entry in
+    /// place and never grows the map toward [`MAX_ACTIONS`], so an
+    /// update can never trip the store cap. Management-plane only;
+    /// publish and deliver never call this.
+    pub fn replace(&self, id: &str, entry: ActionRecord) -> bool {
+        let mut map = self.inner.write().expect("action store lock");
+        if !map.contains_key(id) {
+            return false;
+        }
+        map.insert(id.to_string(), entry);
+        true
+    }
+
     /// Export the store as a validated config root: entries sorted by
     /// id so the persisted file is deterministic. Each entry carries
     /// the id, kind, enable flag and the opaque kind-specific fields as
@@ -411,6 +440,117 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// `GET /api/v5/actions/:id`: read one action (C06-05).
+///
+/// A known id returns the documented action fields (`id`, `type`,
+/// `enable` plus the kind-specific fields stored opaquely); an unknown
+/// id returns 404 with the documented `{code, message}` shape, not an
+/// empty body. The pair is not paged; unknown query parameters are
+/// ignored (no query is extracted). Management-plane only: one short
+/// read lock cloning at most one small record per request, and publish
+/// and deliver never touch this store.
+pub async fn get_action(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    match state.actions.get(&id) {
+        Some(entry) => (StatusCode::OK, Json(entry.to_json())).into_response(),
+        None => ApiError::NotFound(format!("action {id:?} not found")).into_response(),
+    }
+}
+
+/// `PUT /api/v5/actions/:id`: validated replace of one action (C06-06).
+///
+/// The body gets the same validation as create: it must be a JSON
+/// object carrying a known `type` (unknown kind or a missing `type` is
+/// rejected with the documented error shape), and the same id-length
+/// bound applies to the path id. An unknown path id returns 404 and
+/// creates nothing. On success the stored entry is swapped for the
+/// validated snapshot and the new fields read back with 200.
+///
+/// The path id is authoritative: a body `id`/`name` that names a
+/// different action is rejected instead of renaming or forking the
+/// entry. An omitted `enable` defaults to `true`, mirroring create.
+/// The pair is not paged; unknown query parameters are ignored (no
+/// query is extracted). Management-plane only: one short write lock
+/// swapping a single validated entry (plus the registry save lock on
+/// persist); rule evaluation keeps reading its snapshot and publish and
+/// deliver never touch this store.
+// TODO(parity): may an update rename the action (body id differing
+// from the path id), or change only the config half? The rulebook does
+// not decide the exact PUT field set; the current choice keeps the path
+// id authoritative and replaces the whole entry in place until the
+// checker pins it.
+// TODO(parity): does an omitted `enable` keep the stored value or
+// default to `true`? The rulebook does not decide; the current choice
+// mirrors create (`true`) until the checker pins it.
+// TODO(parity): for an unknown id with an invalid body, is the answer
+// 404 or 400? The rulebook does not decide the precedence; the current
+// choice answers 404 first (existence before validation, mirroring the
+// connector update) and creates nothing either way.
+pub async fn update_action(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if state.actions.get(&id).is_none() {
+        return ApiError::NotFound(format!("action {id:?} not found")).into_response();
+    }
+    let Some(obj) = body.as_object() else {
+        return ApiError::BadRequest("request body must be a JSON object".to_string())
+            .into_response();
+    };
+    if let Some(body_id) = obj
+        .get("id")
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())
+    {
+        let trimmed = body_id.trim();
+        if !trimmed.is_empty() && trimmed != id {
+            return ApiError::BadRequest(format!(
+                "body id {trimmed:?} does not match path id {id:?} (field `id`)"
+            ))
+            .into_response();
+        }
+    }
+    if id.len() > MAX_ACTION_ID_LEN {
+        return ApiError::BadRequest(format!(
+            "action id holds {} chars, at most {MAX_ACTION_ID_LEN} (field `id`)",
+            id.len()
+        ))
+        .into_response();
+    }
+    let kind = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return ApiError::BadRequest("missing required field: type".to_string()).into_response();
+    }
+    if !is_known_action_type(&kind) {
+        return ApiError::BadRequest(format!("unknown action type: {kind}")).into_response();
+    }
+    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    let mut params = serde_json::Map::new();
+    for (key, value) in obj {
+        if key != "id" && key != "name" && key != "type" && key != "enable" {
+            params.insert(key.clone(), value.clone());
+        }
+    }
+    let entry = ActionRecord {
+        id: id.clone(),
+        action_type: kind,
+        enable,
+        params: serde_json::Value::Object(params),
+    };
+    if !state.actions.replace(&id, entry.clone()) {
+        return ApiError::NotFound(format!("action {id:?} not found")).into_response();
+    }
+    if let Err(error) = state.actions.persist() {
+        return action_persist_error(error);
+    }
+    (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +629,32 @@ mod tests {
         assert!(is_known_action_type("kafka"));
         assert!(!is_known_action_type("no_such_kind_xyz"));
         assert!(!is_known_action_type(""));
+    }
+
+    #[test]
+    fn get_returns_one_record_and_misses_unknown() {
+        let store = ActionStore::new();
+        assert!(store.get("missing").is_none());
+        assert!(store.insert(record("a")).is_ok());
+        let found = store.get("a").expect("stored action reads back");
+        assert_eq!(found.id, "a");
+        assert!(store.get("nope").is_none());
+    }
+
+    #[test]
+    fn replace_swaps_in_place_and_misses_unknown() {
+        let store = ActionStore::new();
+        assert!(store.insert(record("a")).is_ok());
+        let updated = ActionRecord {
+            id: "a".to_string(),
+            action_type: "kafka".to_string(),
+            enable: false,
+            params: serde_json::json!({"topic": "events"}),
+        };
+        assert!(store.replace("a", updated.clone()));
+        let found = store.get("a").expect("replaced action reads back");
+        assert_eq!(found, updated);
+        assert_eq!(store.snapshot().len(), 1);
+        assert!(!store.replace("missing", record("missing")));
     }
 }

@@ -244,9 +244,10 @@ pub struct ApiState {
     /// this store.
     pub sources: Arc<crate::v5::sources::SourceStore>,
     /// Action instance directory for `GET /api/v5/actions`,
-    /// `POST /api/v5/actions` and `DELETE /api/v5/actions/{id}`
-    /// (W3-02, C06-02..C06-04): bounded id-keyed map validated against
-    /// the action-kind registry from the action-types catalogue, with
+    /// `POST /api/v5/actions`, `DELETE /api/v5/actions/{id}` (W3-02,
+    /// C06-02..C06-04) and `GET`/`PUT /api/v5/actions/{id}` (W3-03,
+    /// C06-05/C06-06): bounded id-keyed map validated against the
+    /// action-kind registry from the action-types catalogue, with
     /// persistence across a restart via the config core and delete
     /// refused while a rule references the action. The routes read one
     /// bounded snapshot per request; the kernel boot path shares the
@@ -9995,9 +9996,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let token = server.login_as_admin().await;
         // W3-02 restores `GET /api/v5/actions`, `POST /api/v5/actions`
         // and `DELETE /api/v5/actions/:id` on the real action directory,
-        // so only the still-removed action paths stay 404 here.
-        // `/api/v5/actions/:id` now exists for DELETE, so a GET on it
-        // answers 405 (method not allowed), not 404; it is no longer a
+        // and W3-03 adds `GET`/`PUT /api/v5/actions/:id`, so only the
+        // still-removed action paths stay 404 here. `/api/v5/actions/:id`
+        // now exists for GET, PUT and DELETE, so it is no longer a
         // removed route (mirrors the `/api/v5/sources` handling in
         // `removed_sources_rulenotest_routes_return_404`).
         for path in ["/api/v5/actions/x/metrics", "/api/v5/actions_summary"] {
@@ -10136,6 +10137,115 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .delete_auth("/api/v5/actions/linked-action", &token)
             .await;
         assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn actions_single_read_and_replace_round_trip() {
+        // W3-03 (C06-05/C06-06) broker-through test: create an action via
+        // the W3-02 routes, read it back and expect the documented
+        // fields; replace its config and read again expecting the new
+        // values; read an unknown id expecting 404. Every assertion goes
+        // through the HTTP router against the shared store, never at the
+        // store directly. Management-plane only; publish and deliver
+        // never touch the action directory.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown read is 404 with the documented shape, not empty.
+        let (status, body) = server
+            .get_auth("/api/v5/actions/no-such-action", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one action via the W3-02 route.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-03-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Read hit carries the documented fields.
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-03-action", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-03-action"));
+        assert_eq!(body["type"], json!("mqtt_bridge"));
+        assert_eq!(body["server"], json!("127.0.0.1:1883"));
+        // Unknown query parameters are ignored on the single read.
+        let (status, _) = server
+            .get_auth("/api/v5/actions/w3-03-action?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        // Replace the stored config with the same validation as create.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/w3-03-action",
+                json!({"type": "kafka", "topic": "events-updated", "enable": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-03-action"));
+        assert_eq!(body["type"], json!("kafka"));
+        assert_eq!(body["enable"], json!(false));
+        // Read again sees the new values.
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-03-action", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], json!("kafka"));
+        assert_eq!(body["topic"], json!("events-updated"));
+        // Update of an unknown id is 404 and creates nothing.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/no-such-action",
+                json!({"type": "kafka"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, _) = server
+            .get_auth("/api/v5/actions/no-such-action", &token)
+            .await;
+        assert_eq!(status, 404);
+        // Unknown kind and malformed bodies are rejected, leaving the
+        // stored entry untouched.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/w3-03-action",
+                json!({"type": "no_such_kind_xyz"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/w3-03-action",
+                json!({"server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-03-action", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], json!("kafka"));
+        // Mismatched body id is rejected instead of renaming.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/w3-03-action",
+                json!({"id": "other-action", "type": "kafka"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
     }
 
     #[tokio::test]
