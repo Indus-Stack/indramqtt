@@ -12948,18 +12948,81 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     async fn probe_failures_report_documented_code() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        // Port 9 is closed, so the probe reaches its failure branch.
-        for path in ["/api/v5/connectors_probe", "/api/v5/actions_probe"] {
-            let (status, body) = server
-                .post_auth(
-                    path,
-                    json!({"type": "http", "url": "http://127.0.0.1:9"}),
-                    &token,
-                )
-                .await;
+        // Port 9 is closed, so each probe reaches its failure branch.
+        // The connector registry accepts `http`; the action registry
+        // (W3-01 catalogue) serves `webhook` for the same URL shape.
+        for (path, body) in [
+            (
+                "/api/v5/connectors_probe",
+                json!({"type": "http", "url": "http://127.0.0.1:9"}),
+            ),
+            (
+                "/api/v5/actions_probe",
+                json!({"type": "webhook", "url": "http://127.0.0.1:9"}),
+            ),
+        ] {
+            let (status, body) = server.post_auth(path, body, &token).await;
             assert_eq!(status, 400, "{path} failure must be 400");
             assert_eq!(body["code"], json!("TEST_FAILED"), "{path} code");
         }
+    }
+
+    #[tokio::test]
+    async fn actions_probe_is_stateless_with_documented_shapes() {
+        // W3-07 (C06-11) broker-through test: a valid probe succeeds without
+        // creating an action, a bad config fails with the documented error
+        // shape, and an unknown kind is rejected. Before: the handler dialled
+        // without validating the kind, so unknown kinds and malformed bodies
+        // read as success. Management-plane only; publish and deliver never
+        // touch the probe path.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Valid probe: known kind with nothing to dial, so reachable by
+        // validation alone. Must not create an action: the list still
+        // reports an empty page afterwards.
+        let (status, body) = server
+            .post_auth("/api/v5/actions_probe", json!({"type": "console"}), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"], json!("ok"));
+        let (status, body) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["meta"]["count"],
+            json!(0),
+            "probe must not create an action"
+        );
+        assert_eq!(body["data"], json!([]));
+        // Bad config: known kind with a closed port reports the failure.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/actions_probe",
+                json!({"type": "webhook", "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "bad probe config must be 400");
+        assert_eq!(body["code"], json!("TEST_FAILED"));
+        // Unknown kind is rejected with the documented error shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/actions_probe",
+                json!({"type": "no_such_kind_xyz"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "unknown action kind must be 400");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Malformed body is rejected with the documented error shape.
+        let (status, body) = server
+            .post_auth("/api/v5/actions_probe", json!({}), &token)
+            .await;
+        assert_eq!(status, 400, "malformed probe body must be 400");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Probe leaves no state behind even after failures.
+        let (status, body) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(0), "probe must leave no state");
     }
 
     #[tokio::test]

@@ -4427,33 +4427,136 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
 }
 
 // ---------------------------------------------------------------------------
-// Action Types & Probe (real catalogue/probe, kept)
+// Action Probe (W3-07, C06-11)
 // ---------------------------------------------------------------------------
+
 pub async fn get_action_types() -> Response {
     let catalogue = broker_connectors::action_types_catalogue();
     (StatusCode::OK, Json(serde_json::json!(catalogue))).into_response()
 }
 
+/// Single-request bound for `POST /api/v5/actions_probe`: one TCP dial at
+/// most, capped by this timeout. Reason: a probe is an operator-driven
+/// management-plane dial, never on the publish/deliver path; 5 s bounds the
+/// worst case per request (the inner dial itself times out after 1.5 s) while
+/// staying well under management-plane HTTP timeouts. Results are never
+/// cached (default no caching): every request re-validates and re-dials so a
+/// transient failure cannot be served stale.
+pub const ACTION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Action-kind validation for the probe (the W3-01 kind set): a kind is
+/// listed only if the kernel can execute it, read from the action-types
+/// catalogue rather than a second list that could drift from the runtimes.
+/// This is the same registry `POST /api/v5/actions` validates against.
+fn is_known_probe_action_type(kind: &str) -> bool {
+    broker_connectors::action_types_catalogue()
+        .iter()
+        .any(|entry| entry.kind == kind)
+}
+
+/// Stateless action probe: validates the config against the named kind and
+/// dials where the kind exposes a network target, reporting success or the
+/// failure reason with the documented `{code, message}` / `{result, status}`
+/// shape. Management-plane only: runs off the message path (no lock, no
+/// allocation, no state on publish/deliver), performs single-request bounded
+/// work capped by [`ACTION_PROBE_TIMEOUT`], writes to no store, registers no
+/// runtime, and leaves nothing running after return.
+// TODO(parity): what per-kind config validation does the probe require
+// beyond the kind being known (required fields per kind, value ranges)?
+// The rulebook does not decide the exact per-kind schemas; the current
+// choice validates the kind against the W3-01 registry and dials the
+// exposed network target, storing nothing, until the checker pins it.
 pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
-    if let Some(Json(b)) = body {
-        if let Some(target) = extract_target_host_port(&b) {
-            if let Err(err) = check_tcp_reachable(&target).await {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "code": "TEST_FAILED",
-                        "message": err
-                    })),
-                )
-                    .into_response();
-            }
+    let body = match body {
+        Some(Json(b)) => b,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": "request body is required"
+                })),
+            )
+                .into_response();
         }
+    };
+    if !body.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": "request body must be a JSON object"
+            })),
+        )
+            .into_response();
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "result": "ok", "status": "connected" })),
-    )
-        .into_response()
+    let kind = body
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": "missing required field: type"
+            })),
+        )
+            .into_response();
+    }
+    if !is_known_probe_action_type(&kind) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": format!("unknown action type: {kind}")
+            })),
+        )
+            .into_response();
+    }
+    // Runtime probe hook (the connector dial path reused from the
+    // connector create path): kinds that expose a network target get one
+    // bounded dial; kinds without one count as reachable once the kind
+    // itself validated. No store write, no runtime registration, no
+    // background task survives the return.
+    if let Some(target) = extract_target_host_port(&body) {
+        let dial = tokio::time::timeout(ACTION_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
+        match dial {
+            Ok(Ok(())) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "result": "ok",
+                    "status": "connected",
+                    "message": format!("Target endpoint {} reachable", target)
+                })),
+            )
+                .into_response(),
+            Ok(Err(err)) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "TEST_FAILED",
+                    "message": err
+                })),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "TEST_FAILED",
+                    "message": format!("Connection to {} timed out after 5s", target)
+                })),
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "result": "ok", "status": "connected" })),
+        )
+            .into_response()
+    }
 }
 
 // ---------------------------------------------------------------------------
