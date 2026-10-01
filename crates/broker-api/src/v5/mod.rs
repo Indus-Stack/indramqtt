@@ -571,6 +571,17 @@ pub fn protected_router() -> Router<ApiState> {
             "/actions/:id/enable/:enable",
             put(actions::set_action_enabled),
         )
+        // Per-action metrics (W3-05, C06-08/C06-09): live lock-free
+        // counters attributed on the rule-fire path, plus a reset that
+        // zeroes them. Unknown ids are 404 with the documented shape;
+        // neither route is paged and unknown query keys are ignored.
+        // Management-plane only; increments stay lock-free atomics and
+        // publish/deliver never touch the action store.
+        .route("/actions/:id/metrics", get(actions::get_action_metrics))
+        .route(
+            "/actions/:id/metrics/reset",
+            put(actions::reset_action_metrics),
+        )
         // Actions & Sources
         .route("/action_types", get(rules::get_action_types))
         .route("/actions_probe", post(rules::probe_action))

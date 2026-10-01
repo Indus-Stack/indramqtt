@@ -361,6 +361,18 @@ impl ApiState {
                 .collect();
             engine.sync_action_enables(&enables);
         }
+        // Boot seeding (W3-05): register a zeroed per-action metric record
+        // for every stored action so the first publish after a restart
+        // attributes from zero. Metrics are memory-only by design (action
+        // config itself persists via W3-02); an empty store is a no-op.
+        {
+            let ids: Vec<String> = actions
+                .snapshot()
+                .iter()
+                .map(|record| record.id.clone())
+                .collect();
+            engine.sync_action_metrics(&ids);
+        }
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -10009,12 +10021,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let token = server.login_as_admin().await;
         // W3-02 restores `GET /api/v5/actions`, `POST /api/v5/actions`
         // and `DELETE /api/v5/actions/:id` on the real action directory,
-        // and W3-03 adds `GET`/`PUT /api/v5/actions/:id`, so only the
-        // still-removed action paths stay 404 here. `/api/v5/actions/:id`
-        // now exists for GET, PUT and DELETE, so it is no longer a
-        // removed route (mirrors the `/api/v5/sources` handling in
+        // W3-03 adds `GET`/`PUT /api/v5/actions/:id`, and W3-05 adds
+        // `GET /api/v5/actions/:id/metrics` plus `PUT .../metrics/reset`,
+        // so only the still-removed action paths stay 404 here.
+        // `/api/v5/actions/:id` now exists for GET, PUT and DELETE and
+        // `/api/v5/actions/:id/metrics` for GET, so neither is a removed
+        // route (mirrors the `/api/v5/sources` handling in
         // `removed_sources_rulenotest_routes_return_404`).
-        for path in ["/api/v5/actions/x/metrics", "/api/v5/actions_summary"] {
+        for path in ["/api/v5/actions_summary"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
@@ -10474,6 +10488,156 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, _) = server
             .delete_auth("/api/v5/actions/w3-04-action", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn action_metrics_move_on_real_fire_and_reset_zeroes() {
+        // W3-05 (C06-08/C06-09) broker-through test: create an action via
+        // the W3-02 route, read zeroed metrics, fire a rule bound to the
+        // action through a real publish (`dispatch_ingress`, the broker's
+        // rule path), read non-zero attributed counts, reset and expect
+        // zeroes; unknown ids are 404. Before: both routes were 404.
+        // The per-action counters live in `broker-rules`
+        // (`RuleEngine::action_metrics`, bumped in `run_actions` on the
+        // `ForwardConnector` arm), driven by the publish event.
+        struct CountingSink;
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown ids miss with the documented shape, not an empty body.
+        let (status, body) = server
+            .get_auth("/api/v5/actions/no-such-action/metrics", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/actions/no-such-action/metrics/reset",
+                Some(json!({})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one action via the W3-02 route; metrics start at zero.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-05-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-05-action/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-05-action"));
+        assert_eq!(body["metrics"]["total"], json!(0));
+        assert_eq!(body["metrics"]["success"], json!(0));
+        assert_eq!(body["metrics"]["failed"], json!(0));
+        // Unknown query parameters are ignored on both routes.
+        let (status, _) = server
+            .get_auth("/api/v5/actions/w3-05-action/metrics?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        // Bind a rule to the action id and fire it through a real publish.
+        // The counting sink is registered under the action id so the fire
+        // succeeds; the rule is created through the HTTP router and the
+        // publish goes through `dispatch_ingress` (the broker's rule path),
+        // never `sink.send` directly.
+        state
+            .engine
+            .connectors()
+            .register("w3-05-action", std::sync::Arc::new(CountingSink));
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "w3-05-rule",
+                    "sql": "SELECT * FROM \"w3/05/fire\"",
+                    "actions": ["w3-05-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w3/05/fire").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        // Counters moved only through the real fire, never constants.
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-05-action/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["total"], json!(1));
+        assert_eq!(body["metrics"]["success"], json!(1));
+        assert_eq!(body["metrics"]["failed"], json!(0));
+        // Reset zeroes and reports success; the next read is zero.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/actions/w3-05-action/metrics/reset",
+                Some(json!({})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/actions/w3-05-action/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["total"], json!(0));
+        assert_eq!(body["metrics"]["success"], json!(0));
+        assert_eq!(body["metrics"]["failed"], json!(0));
+        // Cleanup: rule then action (the rule holds the reference).
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/w3-05-action", &token)
             .await;
         assert_eq!(status, 204);
     }

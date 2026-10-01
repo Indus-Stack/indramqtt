@@ -573,6 +573,60 @@ impl ActionCounters {
     }
 }
 
+/// Fixed per-action metric counters for one action id (W3-05, C06-08/09).
+///
+/// One record per action id, created by the management plane when the
+/// action is created and dropped when the action is deleted. All three
+/// fields are lock-free atomics bumped on the rule-fire path; the publish
+/// path pays one `HashMap` lookup plus relaxed `fetch_add`s, no lock, no
+/// per-fire allocation. Text rendering stays in the management handler.
+/// Memory-only by design: a restart rebuilds the map at zero (action config
+/// itself persists elsewhere). The set is fixed (`total`/`success`/`failed`,
+/// default zero); no unbounded history is kept.
+///
+/// An `inflight` gauge is deliberately omitted: the broker hands each fire
+/// to the connector `send` and does not track per-action in-flight depth,
+/// and a constant standing in for it would be worse than a missing field.
+// TODO(parity): which counter names plus envelope shapes does the documented
+// spec require beyond `total`/`success`/`failed` (rates, node rows, ...)?
+// The rulebook does not decide the exact shape; the current choice reports
+// the honest live subset the fire path can attribute and omits the rest
+// until the checker pins it.
+#[derive(Debug, Default)]
+pub struct ActionMetrics {
+    /// Fires attributed to this action id (success plus failure).
+    pub total: AtomicU64,
+    /// Fires whose connector `send` returned success.
+    pub success: AtomicU64,
+    /// Fires whose connector `send` returned an error (unknown connector,
+    /// transport failure, missing sink).
+    pub failed: AtomicU64,
+}
+
+impl ActionMetrics {
+    /// Zeroed counters for a freshly created action.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lock-free snapshot of the three counters for management reads.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.total.load(Ordering::Relaxed),
+            self.success.load(Ordering::Relaxed),
+            self.failed.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Zero all three counters in place; the record stays registered so the
+    /// next fire resumes from zero.
+    pub fn reset(&self) {
+        self.total.store(0, Ordering::Relaxed);
+        self.success.store(0, Ordering::Relaxed);
+        self.failed.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Throttle state for one (rule id, connector id) pair: when the last
 /// forward-failure line was logged and how many failures were suppressed
 /// since then.
@@ -684,6 +738,15 @@ pub struct RuleEngine {
     /// enable read stays a lock-free `Arc` clone plus a `HashSet`
     /// lookup per forward action.
     action_disabled: Arc<arc_swap::ArcSwap<HashSet<String>>>,
+    /// Lock-free per-action metric records keyed by action id (W3-05,
+    /// C06-08/09): the management plane swaps the whole map on action
+    /// create/delete, and the publish path loads one `Arc` per ingress
+    /// with no store lock, then bumps lock-free atomics. One fixed-size
+    /// record per action (at most the action-store cap of entries), so no
+    /// list or history grows on the message path. Reason for `ArcSwap`:
+    /// the same as the disabled snapshot above — the publish path must
+    /// never take a management lock.
+    action_metrics: Arc<arc_swap::ArcSwap<HashMap<String, Arc<ActionMetrics>>>>,
     /// Embedded rule runtime transport: one [`rekuiper_core::StreamBus`]
     /// per engine plus its send handle for [`runtime::RULE_INGRESS_STREAM`].
     /// Every windowed rule's task subscribes; the publish path hands each
@@ -719,6 +782,10 @@ struct FlushContext {
     /// the same `ArcSwap` instance, so window-flush emits observe the
     /// same management-plane swaps as the inline path without a lock.
     action_disabled: Arc<arc_swap::ArcSwap<HashSet<String>>>,
+    /// Shared per-action metric map with the engine (W3-05, C06-08/09):
+    /// the same `ArcSwap` instance, so window-flush emits attribute to
+    /// the same lock-free records as the inline path without a lock.
+    action_metrics: Arc<arc_swap::ArcSwap<HashMap<String, Arc<ActionMetrics>>>>,
 }
 
 /// One timestamped record waiting inside a window buffer. The ingress
@@ -837,6 +904,10 @@ impl runtime::RuleOutputSink for BrokerRuleSink {
         // W3-04: window-flush emits honour the same lock-free snapshot as
         // the inline path (one `Arc` clone per flush, not per message).
         let disabled = self.flush_ctx.action_disabled.load_full();
+        // W3-05: same for the per-action metric map (one `Arc` clone per
+        // flush, lock-free atomic bumps per forward, no per-fire
+        // allocation).
+        let action_metrics = self.flush_ctx.action_metrics.load_full();
         run_actions(
             &self.rule_id,
             &self.actions,
@@ -848,6 +919,7 @@ impl runtime::RuleOutputSink for BrokerRuleSink {
             &self.counters,
             &self.flush_ctx.forward_throttle,
             &disabled,
+            &action_metrics,
         )
         .await;
         self.task_counters.inc_sink_out(1);
@@ -926,6 +998,7 @@ impl RuleEngine {
         let connectors = Arc::new(ConnectorManager::new());
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let action_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
+        let action_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
         let stream_bus = StreamBus::new();
         let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
@@ -938,8 +1011,10 @@ impl RuleEngine {
                 broker_sink: RwLock::new(None),
                 forward_throttle: forward_throttle.clone(),
                 action_disabled: action_disabled.clone(),
+                action_metrics: action_metrics.clone(),
             }),
             action_disabled,
+            action_metrics,
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
@@ -964,6 +1039,7 @@ impl RuleEngine {
         let connectors = Arc::new(ConnectorManager::new());
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let action_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
+        let action_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
         let stream_bus = StreamBus::new();
         let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
@@ -976,8 +1052,10 @@ impl RuleEngine {
                 broker_sink: RwLock::new(None),
                 forward_throttle: forward_throttle.clone(),
                 action_disabled: action_disabled.clone(),
+                action_metrics: action_metrics.clone(),
             }),
             action_disabled,
+            action_metrics,
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
@@ -1518,6 +1596,79 @@ impl RuleEngine {
         !self.action_disabled_snapshot().contains(id)
     }
 
+    /// Ensure a zeroed per-action metric record exists for `id` (W3-05,
+    /// C06-08/09). Management-plane only: called when an action is
+    /// created (or on boot for every stored action). Swaps the whole map;
+    /// the publish path only loads. Existing counters are kept.
+    pub fn ensure_action_metrics(&self, id: &str) {
+        let current = self.action_metrics.load_full();
+        if current.contains_key(id) {
+            return;
+        }
+        let mut next = current.as_ref().clone();
+        next.entry(id.to_string())
+            .or_insert_with(|| Arc::new(ActionMetrics::new()));
+        self.action_metrics.store(Arc::new(next));
+    }
+
+    /// Drop the per-action metric record for `id` (W3-05, C06-08/09).
+    /// Management-plane only: called after the action store deletes the
+    /// entry, so a later re-create starts at zero. Unknown ids are a
+    /// no-op.
+    pub fn remove_action_metrics(&self, id: &str) {
+        let current = self.action_metrics.load_full();
+        if !current.contains_key(id) {
+            return;
+        }
+        let mut next = current.as_ref().clone();
+        next.remove(id);
+        self.action_metrics.store(Arc::new(next));
+    }
+
+    /// Rebuild the whole metric map from the live action ids (W3-05,
+    /// C06-08/09). Boot path: every stored action gets a zeroed record so
+    /// the first publish after a restart attributes from zero. Metrics
+    /// never persist: the map is always rebuilt at zero, never loaded from
+    /// disk. Management-plane/boot only; the publish path only loads.
+    pub fn sync_action_metrics(&self, ids: &[String]) {
+        let mut next = HashMap::with_capacity(ids.len());
+        for id in ids {
+            next.insert(id.clone(), Arc::new(ActionMetrics::new()));
+        }
+        self.action_metrics.store(Arc::new(next));
+    }
+
+    /// Lock-free snapshot of the per-action metric map for the publish
+    /// path (W3-05, C06-08/09): one `Arc` clone, no lock, no allocation
+    /// beyond the refcount bump. Callers hold the snapshot across one
+    /// ingress (or one window flush) and bump atomics through it.
+    pub fn action_metrics_snapshot(&self) -> Arc<HashMap<String, Arc<ActionMetrics>>> {
+        self.action_metrics.load_full()
+    }
+
+    /// Lock-free read of one action's counters for management handlers.
+    /// Returns `None` when the id has no record (caller maps to 404).
+    /// One `Arc` clone plus one `HashMap` lookup plus three relaxed
+    /// loads; no lock, no allocation beyond the refcount bump.
+    pub fn action_metrics_snapshot_for(&self, id: &str) -> Option<(u64, u64, u64)> {
+        let snapshot = self.action_metrics.load_full();
+        snapshot.get(id).map(|record| record.snapshot())
+    }
+
+    /// Zero one action's counters in place (W3-05, C06-09). Returns false
+    /// when the id has no record (caller maps to 404 and creates
+    /// nothing). Lock-free atomic stores; the record stays registered.
+    pub fn reset_action_metrics(&self, id: &str) -> bool {
+        let snapshot = self.action_metrics.load_full();
+        match snapshot.get(id) {
+            Some(record) => {
+                record.reset();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Feed matching windowed ingress into the embedded rule runtime:
     /// convert the ingress `(topic, payload, qos)` once to a
     /// [`rekuiper_core::StreamRecord`] and hand it to the runtime over the
@@ -1800,6 +1951,11 @@ impl RuleEngine {
         // Disabled forwards are skipped at fire time below and in
         // `BrokerRuleSink::emit` for window flushes.
         let disabled = self.action_disabled_snapshot();
+        // W3-05: one lock-free `Arc` clone of the per-action metric map
+        // per ingress (no store lock, no allocation beyond the refcount
+        // bump). Forward outcomes attribute through it below and in
+        // `BrokerRuleSink::emit` for window flushes.
+        let action_metrics = self.action_metrics_snapshot();
         for rule in &matched {
             rule.matched_cnt.fetch_add(1, Ordering::Relaxed);
         }
@@ -1838,6 +1994,7 @@ impl RuleEngine {
                     &ActionCounters::from_rule(rule),
                     &self.forward_throttle,
                     &disabled,
+                    &action_metrics,
                 )
                 .await;
             }
@@ -1889,10 +2046,22 @@ impl RuleEngine {
 /// id is skipped at fire time with no counters bumped and no send
 /// attempted, so a disabled action costs one `HashSet` lookup and never
 /// touches the connector.
+///
+/// `action_metrics` is the lock-free per-action metric map loaded once per
+/// ingress (W3-05, C06-08/09): a `ForwardConnector` whose id names a known
+/// action attributes one outcome through it (one `HashMap` lookup plus
+/// relaxed `fetch_add`s, no lock, no per-fire allocation). Unknown ids
+/// (plain connectors with no action record) move only the per-rule
+/// counters, never the per-action map.
 // TODO(parity): do skipped disabled forwards count in the rule
 // `actions.total` metrics, or are they invisible until re-enabled? The
 // rulebook does not decide; the current choice leaves all three counters
 // untouched (the action never fired) until the checker pins it.
+// TODO(parity): do skipped disabled forwards count in the per-action
+// `total` metrics, or are they invisible until re-enabled? The rulebook
+// does not decide; the current choice leaves the per-action counters
+// untouched too (the action never fired), mirroring the per-rule choice
+// until the checker pins it.
 #[allow(clippy::too_many_arguments)]
 async fn run_actions(
     rule_id: &str,
@@ -1905,6 +2074,7 @@ async fn run_actions(
     counters: &ActionCounters,
     throttle: &parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>,
     disabled: &HashSet<String>,
+    action_metrics: &HashMap<String, Arc<ActionMetrics>>,
 ) {
     for action in actions {
         match action {
@@ -1957,12 +2127,21 @@ async fn run_actions(
                 if disabled.contains(connector_id) {
                     continue;
                 }
+                // W3-05: attribute the outcome to the per-action record when
+                // one exists (lock-free atomics only; unknown ids move only
+                // the per-rule counters above). One `HashMap` lookup plus
+                // relaxed `fetch_add`s; no lock, no allocation.
+                let per_action = action_metrics.get(connector_id);
                 if let Err(e) = connectors
                     .send(connector_id, topic, &payload, qos_cap)
                     .await
                 {
                     counters.total.fetch_add(1, Ordering::Relaxed);
                     counters.failed.fetch_add(1, Ordering::Relaxed);
+                    if let Some(record) = per_action {
+                        record.total.fetch_add(1, Ordering::Relaxed);
+                        record.failed.fetch_add(1, Ordering::Relaxed);
+                    }
                     if let Some(suppressed) =
                         forward_failure_should_log(throttle, rule_id, connector_id, now_ms())
                     {
@@ -1977,6 +2156,10 @@ async fn run_actions(
                 } else {
                     counters.total.fetch_add(1, Ordering::Relaxed);
                     counters.success.fetch_add(1, Ordering::Relaxed);
+                    if let Some(record) = per_action {
+                        record.total.fetch_add(1, Ordering::Relaxed);
+                        record.success.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }

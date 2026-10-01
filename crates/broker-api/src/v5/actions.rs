@@ -44,7 +44,7 @@
 // conformance checker pins it.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -408,6 +408,10 @@ pub async fn create_action(
             // snapshot so rule evaluation observes the create without
             // taking this store's lock on the message path.
             state.engine.set_action_enabled(&id, enable);
+            // W3-05: register a zeroed per-action metric record so the next
+            // fire attributes through lock-free atomics (management-plane
+            // swap; the publish path only loads).
+            state.engine.ensure_action_metrics(&id);
             if let Err(error) = state.actions.persist() {
                 return action_persist_error(error);
             }
@@ -457,6 +461,9 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
     // W3-04: drop the id from the dispatch snapshot so a later re-create
     // with the same id starts enabled.
     state.engine.remove_action(&id);
+    // W3-05: drop the per-action metric record so the id reads as unknown
+    // (404) until re-created, which starts again at zero.
+    state.engine.remove_action_metrics(&id);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -571,6 +578,9 @@ pub async fn update_action(
     // W3-04: mirror the flag into the dispatch snapshot (same lock-free
     // path as the enable route below).
     state.engine.set_action_enabled(&id, entry.enable);
+    // W3-05: keep the metric record registered across replaces (counters
+    // survive a config replace; only delete or reset zeroes them).
+    state.engine.ensure_action_metrics(&id);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -636,6 +646,95 @@ pub async fn set_action_enabled(
         return action_persist_error(error);
     }
     (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
+/// `GET /api/v5/actions/:id/metrics`: live per-action counters (W3-05,
+/// C06-08).
+///
+/// A known id returns the live counters attributed on the rule-fire path
+/// (`total` fires, `success` connector sends, `failed` connector errors)
+/// with zero defaults at creation and after a restart. An unknown id
+/// returns 404 with the documented `{code, message}` shape, not an empty
+/// body. The pair is not paged; unknown query parameters are ignored (no
+/// query beyond the ignore sink is extracted). Management-plane only: one
+/// short store read plus lock-free atomic loads; the publish path bumps
+/// the same atomics and never takes this store's lock.
+///
+/// The counter set is fixed per action (three atomics, no history), so a
+/// read never grows anything; an `inflight` gauge is omitted because the
+/// broker does not track per-action in-flight depth and a constant would
+/// stand in for a measurement.
+///
+/// Fire-path cost (stated for the delivery-path note): the publish path
+/// holds one `Arc` of the metric map per ingress plus one `HashMap`
+/// lookup and relaxed `fetch_add`s per forward — lock-free atomics only,
+/// no lock, no queue, no per-fire allocation; text rendering stays here
+/// in the handler.
+// TODO(parity): which counter names plus envelope shapes does the documented
+// spec require beyond `total`/`success`/`failed` (rates, node rows,
+// `inflight`, ...)? The rulebook does not decide the exact shape; the
+// current choice reports the honest live subset the fire path attributes
+// (`id` plus `metrics {total, success, failed}`) and omits the rest rather
+// than inventing constants, until the checker pins it.
+pub async fn get_action_metrics(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    if state.actions.get(&id).is_none() {
+        return ApiError::NotFound(format!("action {id:?} not found")).into_response();
+    }
+    // The record is registered on create/boot, but a standalone engine or
+    // a race keeps this fail-closed at zero rather than 500.
+    let (total, success, failed) = state
+        .engine
+        .action_metrics_snapshot_for(&id)
+        .unwrap_or((0, 0, 0));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": id,
+            "metrics": {
+                "total": total,
+                "success": success,
+                "failed": failed,
+            },
+        })),
+    )
+        .into_response()
+}
+
+/// `PUT /api/v5/actions/:id/metrics/reset`: zero one action's counters
+/// (W3-05, C06-09).
+///
+/// Resets the live counters to zero and reports success with 204 and no
+/// body. Resetting an unknown id is 404 with the documented `{code,
+/// message}` shape, not an empty body. Counters resume from zero on the
+/// next fire; the reset itself persists only as the zeroed values (the map
+/// is memory-only and restarts at zero by design). The pair is not paged;
+/// unknown query parameters are ignored. Management-plane only: one short
+/// store read plus lock-free atomic stores; increments stay lock-free
+/// atomics and publish/deliver never touch this store.
+// TODO(parity): does the spec report a reset as an empty 204 or as a 200
+// with a body? The rulebook does not decide the exact success shape; the
+// current choice answers 204 with no body, mirroring the sibling rule and
+// authenticator resets, until the checker pins it.
+pub async fn reset_action_metrics(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    if state.actions.get(&id).is_none() {
+        return ApiError::NotFound(format!("action {id:?} not found")).into_response();
+    }
+    if !state.engine.reset_action_metrics(&id) {
+        // The action exists but its record is missing (standalone engine
+        // or a boot race): register a zeroed record and report success so
+        // the reset is still observable as zeroes on the next read.
+        state.engine.ensure_action_metrics(&id);
+        state.engine.reset_action_metrics(&id);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]
