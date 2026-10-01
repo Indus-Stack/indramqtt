@@ -1,7 +1,10 @@
 //! Configured single-sign-on backends for the v5 management API.
 //!
-//! Covers `GET /sso` (ordered list, C05-11) and `GET /sso/running`
-//! (enabled names, C05-17) on real state.
+//! Covers `GET /sso` (ordered list, C05-11), `GET /sso/running`
+//! (enabled names, C05-17) and the per-backend `GET /sso/{backend}`
+//! (read one backend, C05-22), `PUT /sso/{backend}` (create or replace
+//! one backend, C05-23) and `DELETE /sso/{backend}` (remove one backend,
+//! C05-21) on real state.
 //! Single-node, management-plane only: handlers clone at most the capped
 //! list once per request under a short lock; publish and deliver never
 //! touch this store, and no identity-provider client runs here (listing
@@ -107,17 +110,75 @@ pub struct SsoBackend {
     config: serde_json::Value,
 }
 
+/// Placeholder rendered instead of a stored secret value on every read.
+/// Reason: reads must prove a secret is stored without ever carrying the
+/// secret itself; a fixed marker keeps the field present for operators
+/// while the stored value stays sealed in the registry file and out of
+/// logs and responses alike.
+pub const REDACTED_SECRET: &str = "******";
+
+/// True when a config field name carries secret material. Matched
+/// case-insensitively against the field name: any name containing one of
+/// these substrings is treated as a secret and its whole value is replaced
+/// with [`REDACTED_SECRET`], never rendered or logged.
+fn is_secret_key(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("private_key")
+        || lower.contains("privatekey")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+}
+
+/// Copy one config document with every secret value replaced by
+/// [`REDACTED_SECRET`]. Objects redact by field name and recurse into the
+/// rest; arrays recurse element-wise; scalars pass through. The stored
+/// document is never mutated and never logged.
+fn redact_secrets(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut out = serde_json::Map::with_capacity(object.len());
+            for (key, member) in object {
+                if is_secret_key(key) {
+                    out.insert(
+                        key.clone(),
+                        serde_json::Value::String(REDACTED_SECRET.to_string()),
+                    );
+                } else {
+                    out.insert(key.clone(), redact_secrets(member));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_secrets).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
 impl SsoBackend {
-    /// List row: the stored slot. `config` renders only when one is
-    /// stored; backends without stored config omit it rather than
-    /// inventing an empty object.
+    /// API row: the stored slot with secrets redacted. `config` renders
+    /// only when one is stored; backends without stored config omit it
+    /// rather than inventing an empty object. Secret fields inside the
+    /// config render as [`REDACTED_SECRET`], never the stored value: the
+    /// stored secret stays sealed in the registry file and out of logs
+    /// and responses, while non-secret fields (issuer, URLs) render
+    /// verbatim so operators can still inspect them.
+    // TODO(parity): which config fields does the documented shape redact
+    // (marker string versus omission, exact secret field list)? The
+    // rulebook does not decide the redaction shape; the current choice
+    // keeps every field present with secret values replaced by a fixed
+    // marker until the checker pins it.
     fn to_json(&self) -> serde_json::Value {
         let mut value = serde_json::json!({
             "backend": self.backend,
             "enable": self.enable,
         });
         if !self.config.is_null() {
-            value["config"] = self.config.clone();
+            value["config"] = redact_secrets(&self.config);
         }
         value
     }
@@ -340,7 +401,7 @@ impl SsoStore {
     }
 
     /// Record one backend. Used by the broker-through test seed and the
-    /// future per-backend detail task; the list route itself never writes.
+    /// login-flow tasks; the list route itself never writes.
     /// Fails cleanly on duplicate names (caller maps to `ALREADY_EXISTS`),
     /// a full registry (caller maps to `BAD_REQUEST`) or an invalid entry
     /// (caller maps to `BAD_REQUEST`). Persists through the registry when
@@ -364,6 +425,71 @@ impl SsoStore {
             return Err(SsoInsertError::Persist(reason));
         }
         Ok(backend)
+    }
+
+    /// Create or replace one backend. The detail write path shares this so
+    /// seeding and the management route validate the same way. The whole
+    /// record is validated before anything is applied: an invalid entry
+    /// fails with [`SsoUpsertError::Invalid`] and leaves the stored slot
+    /// untouched. A name with no stored slot counts toward
+    /// [`MAX_SSO_BACKENDS`] and fails with [`SsoUpsertError::Full`] past
+    /// the cap; replacing the slot stored under the same name never grows
+    /// the map. Persists through the registry when one is attached; a
+    /// commit or save failure restores the previous slot (or removes the
+    /// fresh insert) and surfaces as [`SsoUpsertError::Persist`].
+    /// Returns the stored record plus whether the name is newly created.
+    pub fn upsert(&self, backend: SsoBackend) -> Result<(SsoBackend, bool), SsoUpsertError> {
+        // `validate_backend` only ever reports `Invalid`; the other arms
+        // cannot fire and map to the same invalid outcome if they ever do.
+        validate_backend(&backend).map_err(|err| match err {
+            SsoInsertError::Invalid(reason) => SsoUpsertError::Invalid(reason),
+            SsoInsertError::Duplicate | SsoInsertError::Full => {
+                SsoUpsertError::Invalid("field `backend` is not valid".to_string())
+            }
+            SsoInsertError::Persist(reason) => SsoUpsertError::Persist(reason),
+        })?;
+        let previous = {
+            let mut map = self.inner.write().expect("sso store lock");
+            if !map.contains_key(&backend.backend) && map.len() >= MAX_SSO_BACKENDS {
+                return Err(SsoUpsertError::Full);
+            }
+            map.insert(backend.backend.clone(), backend.clone())
+        };
+        if let Err(reason) = self.persist() {
+            let mut map = self.inner.write().expect("sso store lock");
+            match previous {
+                Some(old) => {
+                    map.insert(old.backend.clone(), old);
+                }
+                None => {
+                    map.remove(&backend.backend);
+                }
+            }
+            return Err(SsoUpsertError::Persist(reason));
+        }
+        Ok((backend, previous.is_none()))
+    }
+
+    /// Remove one backend by name. Returns `true` when a slot was removed
+    /// and `false` when nothing was stored under the name (callers map
+    /// that to 404 and create nothing). The removal persists through the
+    /// registry when one is attached; a commit or save failure restores
+    /// the removed slot and surfaces the reason so callers answer 500
+    /// and the loss is never silent.
+    pub fn remove(&self, backend: &str) -> Result<bool, String> {
+        let removed = {
+            let mut map = self.inner.write().expect("sso store lock");
+            map.remove(backend)
+        };
+        let Some(old) = removed else {
+            return Ok(false);
+        };
+        if let Err(reason) = self.persist() {
+            let mut map = self.inner.write().expect("sso store lock");
+            map.insert(old.backend.clone(), old);
+            return Err(reason);
+        }
+        Ok(true)
     }
 
     /// Export the current contents as a validated config root, sorted by
@@ -427,6 +553,21 @@ pub enum SsoInsertError {
     Persist(String),
 }
 
+/// Why [`SsoStore::upsert`] refused a record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SsoUpsertError {
+    /// The registry holds [`MAX_SSO_BACKENDS`] records and the name is
+    /// new. Replacing the stored slot never reports this.
+    Full,
+    /// The entry failed validation (empty name, slash, too long, or an
+    /// oversized config document). Nothing was applied.
+    Invalid(String),
+    /// The in-memory write applied but the registry commit or atomic
+    /// save failed; the previous slot was restored. Callers map this to
+    /// HTTP 500; it is never silent.
+    Persist(String),
+}
+
 /// Validate one backend record before it can become visible.
 fn validate_backend(backend: &SsoBackend) -> Result<(), SsoInsertError> {
     if backend.backend.trim().is_empty() {
@@ -452,9 +593,8 @@ fn validate_backend(backend: &SsoBackend) -> Result<(), SsoInsertError> {
     Ok(())
 }
 
-/// Build one backend record from parts. The list route never calls this;
-/// the broker-through seed and the future detail task share it so both
-/// validate the same way.
+/// Build one backend record from parts. The broker-through seeds and the
+/// per-backend detail write path share it so both validate the same way.
 pub fn sso_backend(backend: String, enable: bool, config: serde_json::Value) -> SsoBackend {
     SsoBackend {
         backend,
@@ -493,6 +633,229 @@ pub async fn list_sso(State(state): State<ApiState>) -> Response {
 pub async fn list_running(State(state): State<ApiState>) -> Response {
     let running = state.sso_backends.running();
     (StatusCode::OK, Json(running)).into_response()
+}
+
+/// Validate one per-backend detail name from the path. The router splits
+/// on `/`, so a slash can never arrive here; the check stays so a stored
+/// slot can never be addressed through a smuggled path.
+fn validate_detail_name(backend: &str) -> Result<(), String> {
+    if backend.trim().is_empty() {
+        return Err("field `backend` must not be empty".to_string());
+    }
+    if backend.len() > broker_config::MAX_SSO_BACKEND_NAME_LEN {
+        return Err("field `backend` is too long".to_string());
+    }
+    if backend.contains('/') {
+        return Err("field `backend` must not contain `/`".to_string());
+    }
+    Ok(())
+}
+
+/// Build the record one `PUT /sso/{backend}` write stores. The body must
+/// be a JSON object carrying `enable` (boolean, defaults to `true` when
+/// omitted or null, the historical behaviour for slots that predate the
+/// flag) and `config` (object, JSON-text string, or null/missing for an
+/// empty slot); a `backend` field, when present as a non-empty string,
+/// must name the path backend. Unknown fields are ignored, consistently
+/// with the sibling create paths' extra-fields-ignored rule. Every field
+/// is checked before the record is built, so a bad body applies nothing.
+// TODO(parity): which fields does the documented write accept beyond
+// enable/config (display name, URLs, client ids, ...)? The rulebook does
+// not decide the exact shape and the broker tracks only the registry slot
+// (backend key, enable flag, opaque config), so the current choice stores
+// the opaque config verbatim and omits fields the broker cannot supply
+// (never a constant standing in for a measurement) until the checker
+// pins them.
+// TODO(parity): does the documented write reject a `backend` body field
+// that differs from the path, or ignore it? The rulebook does not decide
+// the mismatch policy; the current choice rejects it as the conservative
+// fail-closed answer until the checker pins it.
+fn parse_detail_body(path_backend: &str, value: &serde_json::Value) -> Result<SsoBackend, String> {
+    let Some(object) = value.as_object() else {
+        return Err("detail body must be a JSON object".to_string());
+    };
+    if let Some(name) = object.get("backend") {
+        match name.as_str() {
+            Some(text) if text.trim().is_empty() || text == path_backend => {}
+            Some(_) => {
+                return Err("field `backend` must match the path".to_string());
+            }
+            None => {
+                return Err("field `backend` must be a string".to_string());
+            }
+        }
+    }
+    let enable = match object.get("enable") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(_) => return Err("field `enable` must be a boolean".to_string()),
+    };
+    let config = match object.get("config") {
+        None | Some(serde_json::Value::Null) => serde_json::Value::Null,
+        Some(serde_json::Value::Object(_)) => {
+            object.get("config").expect("config is an object").clone()
+        }
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => serde_json::Value::Null,
+        Some(serde_json::Value::String(text)) => match serde_json::from_str(text) {
+            Ok(parsed) => parsed,
+            Err(_) => return Err("field `config` is not valid JSON".to_string()),
+        },
+        Some(_) => return Err("field `config` must be an object".to_string()),
+    };
+    Ok(SsoBackend {
+        backend: path_backend.to_string(),
+        enable,
+        config,
+    })
+}
+
+fn sso_backend_not_found(backend: &str) -> Response {
+    // `BACKEND_NOT_FOUND` mirrors the sibling single-sign-on routes
+    // (login, callback, ACS, metadata, exchange); see their TODO(parity)
+    // notes on the exact code name.
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "code": "BACKEND_NOT_FOUND",
+            "message": format!("sso backend {backend:?} not found"),
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /sso/{backend}`: read one configured backend.
+///
+/// Returns the stored slot with 200, secrets redacted (see
+/// [`REDACTED_SECRET`]): secret config values never render, are never
+/// logged, and stay sealed in the registry file, while non-secret fields
+/// render verbatim. Unknown backends fail with 404 in the documented
+/// `{code, message}` shape. The route is not paged and takes no
+/// parameters; unknown query parameters are ignored (the handler takes
+/// no query extractor, so Axum never parses them).
+///
+/// Management-plane only: one short read lock per request cloning at
+/// most one capped entry; publish and deliver never touch this store.
+// TODO(parity): is the documented miss code `BACKEND_NOT_FOUND` or the
+// generic `NOT_FOUND`? The rulebook does not decide the exact code name;
+// the current choice mirrors the sibling single-sign-on routes (404
+// `BACKEND_NOT_FOUND`, documented `{code, message}` shape) until the
+// checker pins it.
+pub async fn get_sso_backend(
+    State(state): State<ApiState>,
+    Path(backend): Path<String>,
+) -> Response {
+    match state.sso_backends.get(&backend) {
+        Some(stored) => (StatusCode::OK, Json(stored.to_json())).into_response(),
+        None => sso_backend_not_found(&backend),
+    }
+}
+
+/// `PUT /sso/{backend}`: create or replace one configured backend.
+///
+/// The whole write is validated before anything is applied: a malformed
+/// body, a mismatched `backend` field, a non-boolean `enable`, a
+/// non-object `config`, or an oversized document fails with 400 in the
+/// documented `{code, message}` shape and leaves the stored slot
+/// untouched. A new name past [`MAX_SSO_BACKENDS`] fails with 400 instead
+/// of growing the map without limit; replacing the stored slot never
+/// counts toward the cap. On success returns 200 with the stored slot,
+/// secrets redacted. The write persists across a restart through the
+/// config registry. The route is not paged.
+///
+/// Management-plane only: one short write lock per request (plus the
+/// registry save lock on persist); publish and deliver never touch this
+/// store. Fail-closed rows are logged with the backend name only, never
+/// config values.
+pub async fn put_sso_backend(
+    State(state): State<ApiState>,
+    Path(backend): Path<String>,
+    body: Bytes,
+) -> Response {
+    use crate::errors::ApiError;
+    if let Err(reason) = validate_detail_name(&backend) {
+        return ApiError::BadRequest(reason).into_response();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid sso backend body: {error}"))
+                .into_response();
+        }
+    };
+    let record = match parse_detail_body(&backend, &value) {
+        Ok(record) => record,
+        Err(reason) => return ApiError::BadRequest(reason).into_response(),
+    };
+    match state.sso_backends.upsert(record) {
+        Ok((stored, created)) => {
+            tracing::warn!(
+                backend = backend.as_str(),
+                created = created,
+                "sso backend stored"
+            );
+            (StatusCode::OK, Json(stored.to_json())).into_response()
+        }
+        Err(SsoUpsertError::Full) => {
+            tracing::warn!(
+                backend = backend.as_str(),
+                "sso backend refused: registry is full"
+            );
+            ApiError::BadRequest("sso backend store is full".to_string()).into_response()
+        }
+        Err(SsoUpsertError::Invalid(reason)) => {
+            tracing::warn!(
+                backend = backend.as_str(),
+                reason = reason.as_str(),
+                "sso backend refused: invalid write"
+            );
+            ApiError::BadRequest(reason).into_response()
+        }
+        Err(SsoUpsertError::Persist(reason)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": reason,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /sso/{backend}`: remove one configured backend.
+///
+/// A stored name reports success with 204 and the removal persists
+/// across a restart through the config registry; the freed name may be
+/// re-created. An unknown name reports 404 in the documented `{code,
+/// message}` shape and applies nothing. The route is not paged.
+///
+/// Management-plane only: one short write lock per request (plus the
+/// registry save lock on persist); publish and deliver never touch this
+/// store.
+// TODO(parity): is the documented delete success 204 with no body or 200
+// with an envelope, and is the miss code `BACKEND_NOT_FOUND` or the
+// generic `NOT_FOUND`? The rulebook does not decide the exact shapes; the
+// current choice answers 204 like the sibling single-entry deletes and
+// mirrors the sibling single-sign-on miss code until the checker pins
+// them.
+pub async fn delete_sso_backend(
+    State(state): State<ApiState>,
+    Path(backend): Path<String>,
+) -> Response {
+    match state.sso_backends.remove(&backend) {
+        Ok(true) => {
+            tracing::warn!(backend = backend.as_str(), "sso backend removed");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => sso_backend_not_found(&backend),
+        Err(reason) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "code": "INTERNAL_ERROR",
+                "message": reason,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// `POST /sso/login/{backend}`: initiate a login against one configured
@@ -3437,5 +3800,272 @@ mod sso_token_exchange_tests {
         const { assert!(MAX_SSO_GRANT_LEN > 0) };
         const { assert!(broker_config::MAX_SSO_BACKEND_NAME_LEN > 0) };
         assert!(!PENDING_SSO_LOGIN_TTL.is_zero());
+    }
+}
+
+#[cfg(test)]
+mod sso_detail_tests {
+    use super::*;
+
+    fn empty_store() -> SsoStore {
+        SsoStore::new()
+    }
+
+    #[test]
+    fn redaction_replaces_secret_values_and_keeps_the_rest() {
+        // Secrets never render: every secret-named value becomes the
+        // marker, including nested objects and arrays, while non-secret
+        // fields render verbatim.
+        let config = serde_json::json!({
+            "issuer": "https://idp.example.invalid",
+            "client_secret": "w239-real-secret",
+            "nested": {"password": "w239-real-password", "url": "https://sp.example.invalid"},
+            "list": [{"api_key": "w239-real-key"}, "plain"],
+            "CLIENTSECRET": "w239-upper-secret",
+        });
+        let redacted = redact_secrets(&config);
+        let text = serde_json::to_string(&redacted).expect("redacted config serialises");
+        for secret in [
+            "w239-real-secret",
+            "w239-real-password",
+            "w239-real-key",
+            "w239-upper-secret",
+        ] {
+            assert!(!text.contains(secret), "secret must not render: {secret}");
+        }
+        assert_eq!(
+            redacted["client_secret"],
+            serde_json::json!(REDACTED_SECRET)
+        );
+        assert_eq!(
+            redacted["nested"]["password"],
+            serde_json::json!(REDACTED_SECRET)
+        );
+        assert_eq!(
+            redacted["list"][0]["api_key"],
+            serde_json::json!(REDACTED_SECRET)
+        );
+        assert_eq!(redacted["CLIENTSECRET"], serde_json::json!(REDACTED_SECRET));
+        assert_eq!(
+            redacted["issuer"],
+            serde_json::json!("https://idp.example.invalid")
+        );
+        assert_eq!(
+            redacted["nested"]["url"],
+            serde_json::json!("https://sp.example.invalid")
+        );
+        assert_eq!(redacted["list"][1], serde_json::json!("plain"));
+    }
+
+    #[test]
+    fn detail_row_renders_redacted_config_and_omits_empty_config() {
+        let secret_row = sso_backend(
+            "w239-oidc".to_string(),
+            true,
+            serde_json::json!({"issuer": "https://idp.example.invalid", "hmac_secret": "w239-live-secret"}),
+        );
+        let rendered = secret_row.to_json();
+        assert_eq!(rendered["backend"], serde_json::json!("w239-oidc"));
+        assert_eq!(rendered["enable"], serde_json::json!(true));
+        assert_eq!(
+            rendered["config"]["issuer"],
+            serde_json::json!("https://idp.example.invalid")
+        );
+        assert_eq!(
+            rendered["config"]["hmac_secret"],
+            serde_json::json!(REDACTED_SECRET)
+        );
+        let text = serde_json::to_string(&rendered).expect("row serialises");
+        assert!(
+            !text.contains("w239-live-secret"),
+            "stored secret must not render"
+        );
+
+        // Backends without stored config omit it rather than inventing
+        // an empty object.
+        let bare = sso_backend("w239-bare".to_string(), false, serde_json::Value::Null);
+        let rendered = bare.to_json();
+        assert!(rendered.get("config").is_none());
+    }
+
+    #[test]
+    fn upsert_creates_then_replaces_without_growing_past_the_cap() {
+        let store = empty_store();
+        let (stored, created) = store
+            .upsert(sso_backend(
+                "w239-oidc".to_string(),
+                true,
+                serde_json::json!({"issuer": "https://idp.example.invalid"}),
+            ))
+            .expect("create succeeds");
+        assert!(created);
+        assert_eq!(stored.backend, "w239-oidc");
+        // Replace the same slot: not a creation, still one entry.
+        let (stored, created) = store
+            .upsert(sso_backend(
+                "w239-oidc".to_string(),
+                false,
+                serde_json::json!({"issuer": "https://other.example.invalid"}),
+            ))
+            .expect("replace succeeds");
+        assert!(!created);
+        assert!(!stored.enable);
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.get("w239-oidc"), Some(stored));
+    }
+
+    #[test]
+    fn upsert_rejects_invalid_writes_and_applies_nothing() {
+        let store = empty_store();
+        store
+            .upsert(sso_backend(
+                "w239-keep".to_string(),
+                true,
+                serde_json::json!({"issuer": "https://idp.example.invalid"}),
+            ))
+            .expect("seed succeeds");
+        for bad in [
+            sso_backend(String::new(), true, serde_json::Value::Null),
+            sso_backend("has/slash".to_string(), true, serde_json::Value::Null),
+            sso_backend(
+                "x".repeat(broker_config::MAX_SSO_BACKEND_NAME_LEN + 1),
+                true,
+                serde_json::Value::Null,
+            ),
+            sso_backend(
+                "w239-too-big".to_string(),
+                true,
+                serde_json::json!({"blob": "x".repeat(MAX_SSO_CONFIG_LEN)}),
+            ),
+        ] {
+            assert!(
+                matches!(store.upsert(bad), Err(SsoUpsertError::Invalid(_))),
+                "bad write must be rejected"
+            );
+        }
+        // The stored slot is untouched by every rejected write.
+        assert_eq!(store.list().len(), 1);
+        assert!(store.get("w239-keep").expect("kept slot").enable);
+    }
+
+    #[test]
+    fn upsert_rejects_new_names_past_the_cap_but_replaces_freely() {
+        let store = empty_store();
+        {
+            let mut map = store.inner.write().expect("test lock");
+            for index in 0..MAX_SSO_BACKENDS {
+                let name = format!("w239-fill-{index}");
+                map.insert(
+                    name.clone(),
+                    SsoBackend {
+                        backend: name,
+                        enable: true,
+                        config: serde_json::Value::Null,
+                    },
+                );
+            }
+        }
+        assert_eq!(
+            store.upsert(sso_backend(
+                "w239-one-more".to_string(),
+                true,
+                serde_json::Value::Null
+            )),
+            Err(SsoUpsertError::Full)
+        );
+        // Replacing a stored slot at the cap still succeeds: it never
+        // grows the map.
+        let (stored, created) = store
+            .upsert(sso_backend(
+                "w239-fill-0".to_string(),
+                false,
+                serde_json::Value::Null,
+            ))
+            .expect("replace at the cap succeeds");
+        assert!(!created);
+        assert!(!stored.enable);
+    }
+
+    #[test]
+    fn remove_deletes_and_reports_missing_without_creating() {
+        let store = empty_store();
+        assert_eq!(store.remove("w239-missing"), Ok(false));
+        store
+            .upsert(sso_backend(
+                "w239-gone".to_string(),
+                true,
+                serde_json::Value::Null,
+            ))
+            .expect("seed succeeds");
+        assert_eq!(store.remove("w239-gone"), Ok(true));
+        assert!(store.get("w239-gone").is_none());
+        assert_eq!(store.remove("w239-gone"), Ok(false));
+    }
+
+    #[test]
+    fn detail_body_parsing_validates_every_field_before_apply() {
+        // Full shape with a matching backend field.
+        let record = parse_detail_body(
+            "w239-oidc",
+            &serde_json::json!({
+                "backend": "w239-oidc",
+                "enable": false,
+                "config": {"issuer": "https://idp.example.invalid"},
+            }),
+        )
+        .expect("full body parses");
+        assert_eq!(record.backend, "w239-oidc");
+        assert!(!record.enable);
+        // Omitted fields default: enabled with no config.
+        let record =
+            parse_detail_body("w239-oidc", &serde_json::json!({})).expect("empty object parses");
+        assert!(record.enable);
+        assert!(record.config.is_null());
+        // Nulls default the same way.
+        let record = parse_detail_body(
+            "w239-oidc",
+            &serde_json::json!({"enable": null, "config": null}),
+        )
+        .expect("null fields parse");
+        assert!(record.enable);
+        assert!(record.config.is_null());
+        // JSON-text configs parse; blank strings mean no config.
+        let record = parse_detail_body(
+            "w239-oidc",
+            &serde_json::json!({"config": "{\"issuer\": \"https://idp.example.invalid\"}"}),
+        )
+        .expect("text config parses");
+        assert_eq!(
+            record.config,
+            serde_json::json!({"issuer": "https://idp.example.invalid"})
+        );
+        let record = parse_detail_body("w239-oidc", &serde_json::json!({"config": "   "}))
+            .expect("blank text config parses");
+        assert!(record.config.is_null());
+        // Every bad shape is rejected.
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!([1, 2]),
+            serde_json::json!("w239-oidc"),
+            serde_json::json!({"backend": "w239-other", "enable": true}),
+            serde_json::json!({"backend": 7}),
+            serde_json::json!({"enable": "yes"}),
+            serde_json::json!({"config": 7}),
+            serde_json::json!({"config": [1]}),
+            serde_json::json!({"config": "{not json"}),
+        ] {
+            assert!(
+                parse_detail_body("w239-oidc", &bad).is_err(),
+                "bad body must be rejected: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn detail_bounds_are_finite_and_reasoned() {
+        const { assert!(MAX_SSO_BACKENDS > 0) };
+        const { assert!(MAX_SSO_CONFIG_LEN > 0) };
+        const { assert!(broker_config::MAX_SSO_BACKEND_NAME_LEN > 0) };
+        assert!(!REDACTED_SECRET.is_empty());
     }
 }

@@ -372,6 +372,18 @@ pub fn protected_router() -> Router<ApiState> {
         // takes no parameters; unknown query parameters are ignored.
         // Management-plane only; publish and deliver never touch it.
         .route("/sso", get(sso::list_sso))
+        // Single single-sign-on backend read, write and delete (W2-39,
+        // C05-21..C05-23): per-backend detail read with secret redaction,
+        // create-or-replace write with validate-all-before-apply, and a
+        // removal that reports success, all on the real registry with
+        // persistence across a restart. None of these routes is paged.
+        // Management-plane only; publish and deliver never touch it.
+        .route(
+            "/sso/:backend",
+            get(sso::get_sso_backend)
+                .put(sso::put_sso_backend)
+                .delete(sso::delete_sso_backend),
+        )
         // Dashboard multi-factor enrolment and verification (W2-34,
         // C05-13..C05-15): TOTP setup, enrolment-state read and
         // single-use code verification on the real admin-user MFA state.
