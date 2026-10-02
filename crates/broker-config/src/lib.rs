@@ -1773,6 +1773,275 @@ impl ActionsConf {
     }
 }
 
+/// Most entries accepted in one request-filter list inside the
+/// rule-engine settings (allow/deny CIDRs, deny hosts). Reason: the lists
+/// are cloned into every management snapshot and consulted per connector
+/// send, so an unbounded list lets one write bloat reads and the send
+/// path; 1024 covers operator allow/deny provisioning with headroom while
+/// keeping snapshots small.
+pub const MAX_SSRF_LIST_ENTRIES: usize = 1024;
+
+/// Longest accepted single request-filter entry (one CIDR or hostname, 256
+/// bytes). Reason: entries are cloned per snapshot and persisted per
+/// record, so an unbounded entry lets one record bloat each read; 256
+/// covers IPv6 CIDRs and long hostnames with headroom while keeping rows
+/// small.
+pub const MAX_SSRF_ENTRY_LEN: usize = 256;
+
+/// Longest accepted jq-function timeout setting (`10s` shape, at most 32
+/// bytes). Reason: the setting rides the per-request snapshot clone, so
+/// one write cannot balloon memory; duration strings longer than this
+/// cannot be valid timeouts and are rejected instead of growing the
+/// snapshot.
+pub const MAX_JQ_TIMEOUT_LEN: usize = 32;
+
+/// Upper bound for the jq-function default timeout (1 hour in
+/// milliseconds). Reason: jq runs per rule evaluation, so the timeout must
+/// stay bounded; 1 hour is orders above the documented default with
+/// headroom while refusing absurd values instead of honouring them.
+// TODO(parity): is the documented timeout range capped, and does the
+// documented PUT merge missing fields or reset them to defaults? The
+// rulebook does not decide the range cap or the merge semantics; the
+// current choice bounds the timeout conservatively and replaces missing
+// fields with the defaults below (full replace) until the checker pins it.
+pub const MAX_JQ_TIMEOUT_MS: u64 = 3_600_000;
+
+/// Default request-filter allow list (empty: nothing explicitly allowed).
+/// Reason: the documented default; filtering denies by default and the
+/// operator opts ranges in explicitly (fail closed).
+fn default_ssrf_allow_cidrs() -> Vec<String> {
+    Vec::new()
+}
+
+/// Default request-filter deny CIDRs. Reason: the documented defaults;
+/// loopback, link-local, private ranges, the unspecified and multicast
+/// blocks and the well-known cloud metadata endpoints stay unreachable
+/// from rule actions until the operator narrows the list explicitly.
+fn default_ssrf_deny_cidrs() -> Vec<String> {
+    [
+        "127.0.0.0/8",
+        "::1/128",
+        "fe80::/10",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+        "0.0.0.0/32",
+        "224.0.0.0/4",
+        "ff00::/8",
+        "100.100.100.200/32",
+        "169.254.0.0/16",
+    ]
+    .iter()
+    .map(|entry| entry.to_string())
+    .collect()
+}
+
+/// Default request-filter deny hosts. Reason: the documented defaults;
+/// the well-known cloud metadata hostnames stay unreachable from rule
+/// actions until the operator narrows the list explicitly.
+fn default_ssrf_deny_hosts() -> Vec<String> {
+    [
+        "metadata.tencentyun.com",
+        "metadata.google.internal",
+        "metadata.azure.internal",
+    ]
+    .iter()
+    .map(|entry| entry.to_string())
+    .collect()
+}
+
+/// Default jq-function default timeout (`10s`). Reason: the documented
+/// default; jq evaluations that run past it fail the evaluation instead
+/// of stalling the rule.
+fn default_jq_function_default_timeout() -> String {
+    "10s".to_string()
+}
+
+/// Default jq implementation backend. Reason: the documented default; the
+/// native backend serves evaluations unless the operator opts into the
+/// port backend explicitly.
+fn default_jq_implementation_module() -> String {
+    "jq_nif".to_string()
+}
+
+/// Request-filtering half of the rule-engine settings: whether outbound
+/// rule-action requests are filtered, which CIDRs are allowed or denied
+/// and which hostnames are denied. Stored, validated and reported;
+/// enforcement on the connector send path is a sibling concern, never
+/// this task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SsrfConf {
+    /// Whether outbound request filtering applies (default false).
+    #[serde(default)]
+    pub enable: bool,
+    /// Explicitly allowed CIDRs (default empty).
+    #[serde(default = "default_ssrf_allow_cidrs")]
+    pub allow_cidrs: Vec<String>,
+    /// Denied CIDRs (defaults stated above).
+    #[serde(default = "default_ssrf_deny_cidrs")]
+    pub deny_cidrs: Vec<String>,
+    /// Denied hostnames (defaults stated above).
+    #[serde(default = "default_ssrf_deny_hosts")]
+    pub deny_hosts: Vec<String>,
+}
+
+impl Default for SsrfConf {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            allow_cidrs: default_ssrf_allow_cidrs(),
+            deny_cidrs: default_ssrf_deny_cidrs(),
+            deny_hosts: default_ssrf_deny_hosts(),
+        }
+    }
+}
+
+impl SsrfConf {
+    /// Validates the list caps and every entry (CIDR shape for the CIDR
+    /// lists, non-empty bounded hostnames for the host list).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (field, list, is_cidr) in [
+            ("ssrf.allow_cidrs", &self.allow_cidrs, true),
+            ("ssrf.deny_cidrs", &self.deny_cidrs, true),
+            ("ssrf.deny_hosts", &self.deny_hosts, false),
+        ] {
+            if list.len() > MAX_SSRF_LIST_ENTRIES {
+                return Err(ConfigError::Invalid(format!(
+                    "rule_engine.{field} holds {} entries, at most {} (field `{}`)",
+                    list.len(),
+                    MAX_SSRF_LIST_ENTRIES,
+                    field.rsplit('.').next().unwrap_or(field)
+                )));
+            }
+            for (index, entry) in list.iter().enumerate() {
+                if entry.trim().is_empty() || entry.len() > MAX_SSRF_ENTRY_LEN {
+                    return Err(ConfigError::Invalid(format!(
+                        "rule_engine.{field}[{index}] must be 1..={} bytes (field `{}`)",
+                        MAX_SSRF_ENTRY_LEN,
+                        field.rsplit('.').next().unwrap_or(field)
+                    )));
+                }
+                if is_cidr && !is_valid_cidr(entry) {
+                    return Err(ConfigError::Invalid(format!(
+                        "rule_engine.{field}[{index}] holds {entry:?}, must be a CIDR like `192.168.0.0/16` (field `{}`)",
+                        field.rsplit('.').next().unwrap_or(field)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// True for `address/prefix` strings with a parseable IP literal and an
+/// in-range prefix length (32-bit for IPv4, 128-bit for IPv6).
+fn is_valid_cidr(entry: &str) -> bool {
+    let Some((addr, prefix)) = entry.trim().split_once('/') else {
+        return false;
+    };
+    let addr: Result<std::net::IpAddr, _> = addr.trim().parse();
+    let Ok(addr) = addr else {
+        return false;
+    };
+    let Ok(bits): Result<u8, _> = prefix.trim().parse() else {
+        return false;
+    };
+    match addr {
+        std::net::IpAddr::V4(_) => bits <= 32,
+        std::net::IpAddr::V6(_) => bits <= 128,
+    }
+}
+
+/// Rule-engine settings root: the live engine knobs served by the
+/// management plane. Fixed struct (stated fields and defaults); no
+/// unbounded values: every list is capped and every duration is bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleEngineConf {
+    /// Whether system-message topics are skipped by rule matching
+    /// (default true).
+    #[serde(default = "default_rule_engine_ignore_sys_message")]
+    pub ignore_sys_message: bool,
+    /// Default jq-function timeout (default `10s`).
+    #[serde(default = "default_jq_function_default_timeout")]
+    pub jq_function_default_timeout: String,
+    /// jq implementation backend: `jq_nif` or `jq_port` (default
+    /// `jq_nif`).
+    #[serde(default = "default_jq_implementation_module")]
+    pub jq_implementation_module: String,
+    /// Request-filtering half (defaults stated on the struct).
+    #[serde(default)]
+    pub ssrf: SsrfConf,
+    /// Whether rule `SELECT` fields stay scoped to their namespace
+    /// (default true).
+    #[serde(default = "default_rule_engine_limit_selects_in_namespace")]
+    pub limit_selects_in_namespace: bool,
+}
+
+/// Default system-message skip (true). Reason: the documented default;
+/// system topics stay out of user rules unless the operator opts in.
+fn default_rule_engine_ignore_sys_message() -> bool {
+    true
+}
+
+/// Default namespace scoping for rule selects (true). Reason: the
+/// documented default; rule projections stay inside their namespace
+/// unless the operator opts out.
+fn default_rule_engine_limit_selects_in_namespace() -> bool {
+    true
+}
+
+impl Default for RuleEngineConf {
+    fn default() -> Self {
+        Self {
+            ignore_sys_message: default_rule_engine_ignore_sys_message(),
+            jq_function_default_timeout: default_jq_function_default_timeout(),
+            jq_implementation_module: default_jq_implementation_module(),
+            ssrf: SsrfConf::default(),
+            limit_selects_in_namespace: default_rule_engine_limit_selects_in_namespace(),
+        }
+    }
+}
+
+impl RuleEngineConf {
+    /// Validates every field; the first bad field names itself.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.jq_function_default_timeout.len() > MAX_JQ_TIMEOUT_LEN {
+            return Err(ConfigError::Invalid(format!(
+                "rule_engine.jq_function_default_timeout holds {:?}, must be a duration like `10s` (field `jq_function_default_timeout`)",
+                self.jq_function_default_timeout
+            )));
+        }
+        match parse_settings_duration_to_ms(&self.jq_function_default_timeout) {
+            Some(ms) if (1..=MAX_JQ_TIMEOUT_MS).contains(&ms) => {}
+            _ => {
+                return Err(ConfigError::Invalid(format!(
+                    "rule_engine.jq_function_default_timeout holds {:?}, must be a duration like `10s` (field `jq_function_default_timeout`)",
+                    self.jq_function_default_timeout
+                )));
+            }
+        }
+        if self.jq_implementation_module != "jq_nif" && self.jq_implementation_module != "jq_port" {
+            return Err(ConfigError::Invalid(format!(
+                "rule_engine.jq_implementation_module holds {:?}, must be `jq_nif` or `jq_port` (field `jq_implementation_module`)",
+                self.jq_implementation_module
+            )));
+        }
+        self.ssrf.validate()?;
+        Ok(())
+    }
+
+    /// Default timeout in milliseconds (the validated
+    /// `jq_function_default_timeout` parsed; falls back to 10 000 ms only
+    /// when validation was bypassed, never on the validated path).
+    #[must_use]
+    pub fn jq_timeout_ms(&self) -> u64 {
+        parse_settings_duration_to_ms(&self.jq_function_default_timeout).unwrap_or(10_000)
+    }
+}
+
 /// The full validated configuration: all roots in one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FullSnapshot {
@@ -1802,6 +2071,8 @@ pub struct FullSnapshot {
     pub sso_backends: SsoBackendsConf,
     #[serde(default)]
     pub actions: ActionsConf,
+    #[serde(default)]
+    pub rule_engine: RuleEngineConf,
 }
 
 impl FullSnapshot {
@@ -1820,6 +2091,7 @@ impl FullSnapshot {
         self.api_keys.validate()?;
         self.sso_backends.validate()?;
         self.actions.validate()?;
+        self.rule_engine.validate()?;
         Ok(())
     }
 }
@@ -1853,6 +2125,8 @@ pub enum ConfigRoot {
     SsoBackends(SsoBackendsConf),
     /// Validated rule-engine action registry root.
     Actions(ActionsConf),
+    /// Validated rule-engine settings root.
+    RuleEngine(RuleEngineConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1942,6 +2216,7 @@ impl ConfigRegistry {
             ConfigRoot::ApiKeys(conf) => self.commit_api_keys(conf),
             ConfigRoot::SsoBackends(conf) => self.commit_sso_backends(conf),
             ConfigRoot::Actions(conf) => self.commit_actions(conf),
+            ConfigRoot::RuleEngine(conf) => self.commit_rule_engine(conf),
         }
     }
 
@@ -2088,6 +2363,17 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits validated rule-engine settings.
+    pub fn commit_rule_engine(&self, conf: RuleEngineConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.rule_engine = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Serialises the current snapshot to TOML and writes it atomically.
     ///
     /// The snapshot is written to a unique temp file in the same
@@ -2205,6 +2491,80 @@ mod tests {
             api_keys: ApiKeysConf::default(),
             sso_backends: SsoBackendsConf::default(),
             actions: ActionsConf::default(),
+            rule_engine: RuleEngineConf::default(),
+        }
+    }
+
+    #[test]
+    fn rule_engine_defaults_match_documented_shape() {
+        let defaults = RuleEngineConf::default();
+        assert!(defaults.ignore_sys_message);
+        assert_eq!(defaults.jq_function_default_timeout, "10s");
+        assert_eq!(defaults.jq_timeout_ms(), 10_000);
+        assert_eq!(defaults.jq_implementation_module, "jq_nif");
+        assert!(!defaults.ssrf.enable);
+        assert!(defaults.ssrf.allow_cidrs.is_empty());
+        assert_eq!(defaults.ssrf.deny_cidrs.len(), 12);
+        assert!(defaults
+            .ssrf
+            .deny_cidrs
+            .contains(&"127.0.0.0/8".to_string()));
+        assert_eq!(defaults.ssrf.deny_hosts.len(), 3);
+        assert!(defaults.limit_selects_in_namespace);
+        defaults.validate().expect("documented defaults validate");
+        defaults
+            .ssrf
+            .validate()
+            .expect("documented ssrf defaults validate");
+    }
+
+    #[test]
+    fn rule_engine_validation_rejects_bad_fields() {
+        let good = RuleEngineConf::default();
+        for bad in [
+            RuleEngineConf {
+                jq_function_default_timeout: "soon".to_string(),
+                ..good.clone()
+            },
+            RuleEngineConf {
+                jq_function_default_timeout: "0s".to_string(),
+                ..good.clone()
+            },
+            RuleEngineConf {
+                jq_function_default_timeout: "2h".to_string(),
+                ..good.clone()
+            },
+            RuleEngineConf {
+                jq_implementation_module: "jq_wasm".to_string(),
+                ..good.clone()
+            },
+            RuleEngineConf {
+                ssrf: SsrfConf {
+                    allow_cidrs: vec!["not-a-cidr".to_string()],
+                    ..good.ssrf.clone()
+                },
+                ..good.clone()
+            },
+            RuleEngineConf {
+                ssrf: SsrfConf {
+                    deny_cidrs: vec!["10.0.0.0/33".to_string()],
+                    ..good.ssrf.clone()
+                },
+                ..good.clone()
+            },
+            RuleEngineConf {
+                ssrf: SsrfConf {
+                    deny_hosts: vec![String::new()],
+                    ..good.ssrf.clone()
+                },
+                ..good.clone()
+            },
+        ] {
+            let err = bad.validate().expect_err("bad engine config must fail");
+            assert!(
+                err.to_string().contains("rule_engine"),
+                "error must name the root, got: {err}"
+            );
         }
     }
 
@@ -2489,9 +2849,19 @@ mod tests {
         registry
             .commit_connectors(sample_snapshot().connectors)
             .expect("commit connectors");
+        let engine_conf = RuleEngineConf {
+            ignore_sys_message: false,
+            jq_function_default_timeout: "30s".to_string(),
+            ..Default::default()
+        };
+        registry
+            .commit_rule_engine(engine_conf.clone())
+            .expect("commit engine config");
         registry.save().expect("save");
         let reloaded = ConfigRegistry::load(&dir).expect("reload");
-        assert_eq!(*reloaded.snapshot(), sample_snapshot());
+        let mut expected = sample_snapshot();
+        expected.rule_engine = engine_conf;
+        assert_eq!(*reloaded.snapshot(), expected);
     }
 
     #[test]

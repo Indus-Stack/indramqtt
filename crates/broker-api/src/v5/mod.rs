@@ -27,6 +27,7 @@ pub mod monitor;
 pub mod monitoring;
 pub mod nodes;
 pub mod retainer;
+pub mod rule_engine;
 pub mod rules;
 pub mod schemas;
 pub mod slow_subscriptions;
@@ -527,6 +528,16 @@ pub fn protected_router() -> Router<ApiState> {
         .route("/publish", post(clients::publish_message))
         .route("/publish/bulk", post(clients::publish_bulk))
         // Rules, Flow Designer & Connectors
+        // Rule-engine settings (W3-10, C06-14/C06-15): live read plus
+        // validated full replace on the real engine-config store, persisted
+        // across a restart with hot-apply to the fire-path snapshot. Not
+        // paged and not per-id, so no 404 path; unknown query keys on
+        // writes fail closed. Management-plane only; publish and deliver
+        // never touch the store.
+        .route(
+            "/rule_engine",
+            get(rule_engine::get_rule_engine).put(rule_engine::put_rule_engine),
+        )
         .route("/rules", get(rules::list_rules).post(rules::create_rule))
         .route(
             "/rules/:id",

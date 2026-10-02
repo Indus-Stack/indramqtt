@@ -6,6 +6,9 @@ use parking_lot::RwLock;
 use rekuiper_core::{RuleCounters, StreamBus, StreamReceiver, StreamSender};
 use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
 
+/// Rule-engine settings store: validated structs, registry persistence and
+/// the subscriber callback feeding the fire-path snapshot (W3-10).
+pub mod engine_config;
 /// Bounded on-disk spill buffer behind [`BackpressurePolicy::SpillToDisk`].
 pub mod spill;
 /// Standard rule SQL dialect front end: parser plus lowering onto the
@@ -35,6 +38,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 
+pub use engine_config::{EngineConfigStore, EngineConfigSubscriber, EngineConfigUpdateError};
 use spill::SpillLog;
 pub use spill::{
     SpillConfig, SpillOutcome, SpillStats, DEFAULT_SPILL_MAX_BYTES, DEFAULT_SPILL_SEGMENT_MAX_BYTES,
@@ -768,6 +772,15 @@ pub struct RuleEngine {
     /// Serialises export-commit-save so concurrent mutations cannot
     /// interleave into a lost update on disk.
     save_lock: parking_lot::Mutex<()>,
+    /// Lock-free rule-engine settings for the fire path (W3-10): the
+    /// management plane swaps the whole struct on every validated engine
+    /// write (via [`RuleEngine::apply_engine_config`], fed by the
+    /// [`EngineConfigStore`] subscriber), and the publish path loads one
+    /// `Arc` per ingress with no registry or store lock. Fixed struct, so
+    /// no list or cache grows on the message path. Reason for `ArcSwap`:
+    /// the publish path must never take a management lock, and the sys
+    /// check below stays a lock-free `Arc` clone plus one prefix test.
+    engine_config: Arc<arc_swap::ArcSwap<broker_config::RuleEngineConf>>,
 }
 
 /// Shared flush context: what a rule-task sink worker needs at emit time.
@@ -944,6 +957,14 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// True for system-message topics (`$SYS` and `$SYS/...`), which the rule
+/// engine skips while `ignore_sys_message` holds (W3-10). Pure prefix test
+/// on the topic string: no lock, no allocation.
+fn is_system_topic(topic: &Topic) -> bool {
+    let name = topic.as_str();
+    name == "$SYS" || name.starts_with("$SYS/")
+}
+
 /// Window length in milliseconds (saturating; clamped to at least 1ms so
 /// degenerate `TUMBLINGWINDOW(ss, 0)` style definitions tick instead of
 /// panicking the ticker).
@@ -1023,6 +1044,9 @@ impl RuleEngine {
             forward_throttle,
             registry: RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
+            engine_config: Arc::new(arc_swap::ArcSwap::from(Arc::new(
+                broker_config::RuleEngineConf::default(),
+            ))),
         }
     }
 
@@ -1064,6 +1088,9 @@ impl RuleEngine {
             forward_throttle,
             registry: RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
+            engine_config: Arc::new(arc_swap::ArcSwap::from(Arc::new(
+                broker_config::RuleEngineConf::default(),
+            ))),
         }
     }
 
@@ -1669,6 +1696,26 @@ impl RuleEngine {
         }
     }
 
+    /// Lock-free snapshot of the rule-engine settings for the publish path
+    /// (W3-10): one `Arc` clone, no lock, no allocation beyond the
+    /// refcount bump. The engine reads this snapshot per ingress, never
+    /// the registry or the management store.
+    pub fn engine_config_snapshot(&self) -> Arc<broker_config::RuleEngineConf> {
+        self.engine_config.load_full()
+    }
+
+    /// Swap the fire-path engine settings (W3-10). Hot-apply path: the
+    /// [`EngineConfigStore`] subscriber calls this after every validated
+    /// management write, and boot calls it once from the registry
+    /// snapshot, so persisted settings take effect from the first publish.
+    /// Management-plane/boot only; the publish path only loads. Callers
+    /// pass validated settings (see
+    /// [`broker_config::RuleEngineConf::validate`]); the swap itself is
+    /// one atomic store.
+    pub fn apply_engine_config(&self, conf: broker_config::RuleEngineConf) {
+        self.engine_config.store(Arc::new(conf));
+    }
+
     /// Feed matching windowed ingress into the embedded rule runtime:
     /// convert the ingress `(topic, payload, qos)` once to a
     /// [`rekuiper_core::StreamRecord`] and hand it to the runtime over the
@@ -1935,6 +1982,14 @@ impl RuleEngine {
         qos: QoS,
         broker_sink: &Arc<dyn BrokerSink>,
     ) -> usize {
+        // W3-10: one lock-free `Arc` clone of the engine settings per
+        // ingress (no registry or store lock, no allocation beyond the
+        // refcount bump). System-message topics are skipped while the flag
+        // holds, before any rule lock is taken.
+        let engine_config = self.engine_config_snapshot();
+        if engine_config.ignore_sys_message && is_system_topic(topic) {
+            return 0;
+        }
         // Snapshot matching rules so the sink (which may touch the router,
         // never this map) runs without holding the lock.
         // B4-07 live wiring (durability push after match, see below).

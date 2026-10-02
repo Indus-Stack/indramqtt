@@ -2014,6 +2014,14 @@ struct Shared {
     /// evaluation reads a snapshot, never this store directly, and
     /// publish and deliver never touch it.
     actions: Arc<broker_api::v5::actions::ActionStore>,
+    /// Rule-engine settings for W3-10 (`GET`/`PUT /rule_engine`): shared
+    /// with the management API so validated writes are visible to reads
+    /// without a restart and hot-apply to the engine's fire-path snapshot
+    /// through the subscriber. One `Arc` clone at boot; the fire path
+    /// loads the engine snapshot per ingress and never takes a management
+    /// lock. Management-plane only; publish and deliver never touch this
+    /// store.
+    rule_engine_config: Arc<broker_rules::EngineConfigStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -2224,6 +2232,19 @@ impl Shared {
                 },
             ));
         }
+        // W3-10: engine-config store shares its subscriber with the very
+        // engine above, so validated engine writes hot-apply to the
+        // fire-path snapshot without a restart.
+        let rule_engine_config = Arc::new(broker_rules::EngineConfigStore::new());
+        engine.apply_engine_config(rule_engine_config.get());
+        {
+            let engine_handle = Arc::clone(&engine);
+            rule_engine_config.set_subscriber(Arc::new(
+                move |next: &broker_config::RuleEngineConf| {
+                    engine_handle.apply_engine_config(next.clone());
+                },
+            ));
+        }
         Self {
             sessions,
             router,
@@ -2255,6 +2276,7 @@ impl Shared {
             sso_backends: Arc::new(broker_api::v5::sso::SsoStore::new()),
             sources: Arc::new(broker_api::v5::sources::SourceStore::new()),
             actions: Arc::new(broker_api::v5::actions::ActionStore::new()),
+            rule_engine_config,
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -5686,6 +5708,14 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // evaluation reads a snapshot and the publish and deliver paths
     // never touch it.
     state.actions = shared.actions.clone();
+    // Share the rule-engine settings (W3-10) so validated management
+    // writes are visible to `GET /rule_engine` reads without a restart
+    // and hot-apply to the engine's fire-path snapshot through the
+    // subscriber. One `Arc` clone; the fire path loads the engine
+    // snapshot per ingress and never takes a management lock.
+    // Seeding already ran inside `ApiState::new`; sharing replaces that
+    // fresh instance with the kernel's so no second copy diverges.
+    state.rule_engine_config = shared.rule_engine_config.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -5900,6 +5930,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a no-op (today's empty behaviour: `GET /actions` reads an empty
     // page).
     shared.actions.seed_from_registry(&shared.config);
+    // Rule-engine settings (W3-10): seed the shared store in place (the
+    // same instance `serve_api` shares with `ApiState`), so management
+    // reads observe the persisted knobs from the first connection, then
+    // hot-apply the snapshot to the engine so the fire path observes the
+    // persisted settings from the first publish. An empty snapshot is a
+    // no-op (today's defaults: system messages skipped).
+    shared.rule_engine_config.seed_from_registry(&shared.config);
+    shared
+        .engine
+        .apply_engine_config(shared.rule_engine_config.get());
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.

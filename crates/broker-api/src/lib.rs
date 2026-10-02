@@ -258,6 +258,14 @@ pub struct ApiState {
     /// snapshot, never this store directly, and publish and deliver
     /// never touch it.
     pub actions: Arc<crate::v5::actions::ActionStore>,
+    /// Rule-engine settings for `GET`/`PUT /api/v5/rule_engine` (W3-10,
+    /// C06-14/C06-15): one validated struct persisted across a restart via
+    /// the config core, with a subscriber callback hot-applying every
+    /// validated write to the engine's fire-path snapshot. The routes read
+    /// one small snapshot per request; the fire path loads the engine
+    /// snapshot per ingress and never takes a management lock.
+    /// Management-plane only; publish and deliver never touch this store.
+    pub rule_engine_config: Arc<broker_rules::EngineConfigStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -384,6 +392,22 @@ impl ApiState {
             authn_node_cache
                 .apply_settings(current.node_cache.enable, current.node_cache.max_count);
         }
+        // Boot seeding (W3-10): route the loaded rule-engine settings
+        // into a shared store so management reads observe the persisted
+        // knobs from the first connection, and hot-apply every validated
+        // write to the engine's fire-path snapshot through the subscriber
+        // (no restart; the fire path never touches the registry or this
+        // store). Defaults skip system messages from the first publish.
+        let rule_engine_config = Arc::new(broker_rules::EngineConfigStore::from_registry(&config));
+        engine.apply_engine_config(rule_engine_config.get());
+        {
+            let engine_handle = Arc::clone(&engine);
+            rule_engine_config.set_subscriber(Arc::new(
+                move |next: &broker_config::RuleEngineConf| {
+                    engine_handle.apply_engine_config(next.clone());
+                },
+            ));
+        }
         Self {
             engine,
             sessions,
@@ -424,6 +448,7 @@ impl ApiState {
             sso_backends,
             sources: Arc::new(crate::v5::sources::SourceStore::new()),
             actions,
+            rule_engine_config,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -446,6 +471,20 @@ impl ApiState {
             authn_settings.set_subscriber(Arc::new(
                 move |next: &broker_config::AuthnSettingsConf| {
                     cache.apply_settings(next.node_cache.enable, next.node_cache.max_count);
+                },
+            ));
+        }
+        // Standalone engine-config store shares its subscriber with the
+        // very engine instance above, so validated replaces hot-apply to
+        // the fire-path snapshot without a restart (mirrors the kernel
+        // boot wiring).
+        let rule_engine_config = Arc::new(broker_rules::EngineConfigStore::new());
+        engine.apply_engine_config(rule_engine_config.get());
+        {
+            let engine_handle = Arc::clone(&engine);
+            rule_engine_config.set_subscriber(Arc::new(
+                move |next: &broker_config::RuleEngineConf| {
+                    engine_handle.apply_engine_config(next.clone());
                 },
             ));
         }
@@ -489,6 +528,7 @@ impl ApiState {
             sso_backends: Arc::new(crate::v5::sso::SsoStore::new()),
             sources: Arc::new(crate::v5::sources::SourceStore::new()),
             actions: Arc::new(crate::v5::actions::ActionStore::new()),
+            rule_engine_config,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
