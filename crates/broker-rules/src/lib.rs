@@ -9,6 +9,9 @@ use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
 /// Rule-engine settings store: validated structs, registry persistence and
 /// the subscriber callback feeding the fire-path snapshot (W3-10).
 pub mod engine_config;
+/// Rule-event producer registry behind `GET /rule_events` (W3-11, C06-16):
+/// the single catalogue of event types the kernel actually produces.
+pub mod events;
 /// Bounded on-disk spill buffer behind [`BackpressurePolicy::SpillToDisk`].
 pub mod spill;
 /// Standard rule SQL dialect front end: parser plus lowering onto the

@@ -11207,9 +11207,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // W3-31 restores `POST /api/v5/sources`, `DELETE
         // /api/v5/sources/:id` and `GET /api/v5/sources_summary` on the
         // real source directory, so `/api/v5/sources` is no longer a
-        // removed route (GET on the POST-only path is 405); only the
-        // rule-events path stays removed here.
-        for path in ["/api/v5/rule_events"] {
+        // removed route (GET on the POST-only path is 405); W3-11
+        // restores `GET /api/v5/rule_events` on the real producer
+        // registry, so no GET path stays removed here.
+        for path in ["/api/v5/rule_events_missing"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
@@ -11217,6 +11218,87 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             let (status, _) = server.post_auth(path, json!({}), &token).await;
             assert_eq!(status, 404, "removed route POST {path} must be 404");
         }
+    }
+
+    #[tokio::test]
+    async fn rule_events_catalogue_lists_only_produced_events() {
+        // W3-11 failing test: GET /rule_events returns the catalogue of
+        // event types rules can trigger on, built from the real producer
+        // registry; every listed event has a real producer, and a
+        // published message is seen by the rule trigger path behind the
+        // listed event. Before: route returned 404.
+        // Broker-through: the request goes through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`); the catalogue
+        // itself is owned by `broker-rules`
+        // (`rule_event_catalogue` in `crates/broker-rules/src/events.rs`),
+        // read only on this management GET and never consulted on publish
+        // or deliver.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server.get_auth("/api/v5/rule_events", &token).await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("catalogue is a list");
+        assert!(!entries.is_empty(), "catalogue must not be empty");
+        assert!(entries.len() <= broker_rules::events::MAX_RULE_EVENTS);
+        for entry in entries {
+            let event = entry["event"].as_str().expect("entry carries event");
+            assert!(
+                crate::v5::rule_events::is_produced_event(event),
+                "catalogue lists unproduced event '{event}'"
+            );
+            assert!(
+                entry["description"].as_str().is_some_and(|d| !d.is_empty()),
+                "entry carries a summary: {entry}"
+            );
+        }
+        let names: Vec<&str> = entries.iter().filter_map(|e| e["event"].as_str()).collect();
+        assert!(
+            names.contains(&"$events/message_publish"),
+            "catalogue lists the message-ingress producer"
+        );
+
+        // Unknown query parameters are ignored, never an error.
+        let (status, again) = server
+            .get_auth("/api/v5/rule_events?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(again, body);
+
+        // Publish an event through the broker rule path: a rule over the
+        // published topic fires, so the listed producer is real.
+        state
+            .engine
+            .create_rule(
+                "w311-broker-rule".to_string(),
+                broker_protocol::TopicFilter::new("w311/#").expect("filter"),
+                None,
+                true,
+                vec![broker_rules::RuleAction::Log],
+            )
+            .expect("rule creates");
+        struct FnSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for FnSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(FnSink);
+        let topic = broker_protocol::Topic::new("w311/probe").expect("topic");
+        let payload = bytes::Bytes::from_static(b"{}");
+        let matched = state
+            .engine
+            .dispatch_ingress(&topic, &payload, broker_protocol::QoS::AtMostOnce, &sink)
+            .await;
+        assert_eq!(matched, 1);
     }
 
     #[tokio::test]

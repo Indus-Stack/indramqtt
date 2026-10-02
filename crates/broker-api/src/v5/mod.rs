@@ -28,6 +28,7 @@ pub mod monitoring;
 pub mod nodes;
 pub mod retainer;
 pub mod rule_engine;
+pub mod rule_events;
 pub mod rules;
 pub mod schemas;
 pub mod slow_subscriptions;
@@ -538,6 +539,11 @@ pub fn protected_router() -> Router<ApiState> {
             "/rule_engine",
             get(rule_engine::get_rule_engine).put(rule_engine::put_rule_engine),
         )
+        // Rule-event catalogue (W3-11, C06-16): bare list over the real
+        // producer registry in `broker-rules`. Not paged; unknown query
+        // keys are ignored. Management-plane only; publish and deliver
+        // never touch the registry.
+        .route("/rule_events", get(rule_events::list_rule_events))
         .route("/rules", get(rules::list_rules).post(rules::create_rule))
         .route(
             "/rules/:id",
