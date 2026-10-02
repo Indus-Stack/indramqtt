@@ -560,6 +560,12 @@ pub fn protected_router() -> Router<ApiState> {
         )
         .route("/rules/:id/metrics", get(rules::get_rule_metrics))
         .route("/rules/:id/metrics/reset", put(rules::reset_rule_metrics))
+        // Per-rule offline test (W3-16, C06-25): offline evaluation of
+        // the stored rule against a sample message reusing the real rule
+        // compiler, side-effect-free by construction (no store writes, no
+        // publish, no action firing). Management-plane only; publish and
+        // deliver never touch it.
+        .route("/rules/:id/test", post(rule_test::test_stored_rule))
         .route(
             "/connectors",
             get(rules::list_connectors).post(rules::create_connector),

@@ -11738,14 +11738,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // restores `GET /api/v5/rule_events` on the real producer
         // registry, so no GET path stays removed here; W3-12 restores
         // `POST /api/v5/rule_test` on the real offline evaluator, so it
-        // is no longer a removed route either.
+        // is no longer a removed route either; W3-16 restores `POST
+        // /api/v5/rules/:id/test` on the stored-rule evaluator, so it is
+        // no longer a removed route either.
         for path in ["/api/v5/rule_events_missing"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
-        }
-        for path in ["/api/v5/rules/abc/test"] {
-            let (status, _) = server.post_auth(path, json!({}), &token).await;
-            assert_eq!(status, 404, "removed route POST {path} must be 404");
         }
     }
 
@@ -11835,6 +11833,130 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 200);
         assert_eq!(body["data"], json!([]));
         assert_eq!(state.engine.list_rules().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rule_test_one_match_no_match_side_effect_free() {
+        // W3-16 failing test: POST /rules/:id/test evaluates the stored
+        // rule against a sample through the served management API on
+        // `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), reusing the real
+        // rule compiler (`broker_rules::try_evaluate` in
+        // `crates/broker-rules/src/lib.rs`) bound to the stored SQL and
+        // topic filter. Before: route returned 404.
+        // Broker-through: management POSTs plus a live ingress dispatch
+        // through the engine, then a metrics read proving the probe fired
+        // no action and bumped no live counter.
+        // Management-plane only; publish and deliver never touch this path.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Create the stored rule the probe binds to.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/rules",
+                Some(json!({
+                    "id": "w3-16-rule",
+                    "sql": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 100.0",
+                    "actions": [],
+                })),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Matching sample reports matched output.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules/w3-16-rule/test",
+                json!({
+                    "topic": "sensors/kitchen",
+                    "payload": {"temperature": 150.0, "secret": "x"},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["matched"], json!(true));
+        assert_eq!(body["projected"], json!({"temperature": 150.0}));
+        assert_eq!(body["output"], body["projected"]);
+
+        // Non-matching sample reports no-match.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules/w3-16-rule/test",
+                json!({
+                    "topic": "sensors/kitchen",
+                    "payload": {"temperature": 72.5},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["matched"], json!(false));
+        assert!(body["projected"].is_null());
+
+        // Malformed samples are rejected with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules/w3-16-rule/test",
+                json!({"payload": {"temperature": 1.0}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Unknown rule id is 404 with the documented error code.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules/no-such-rule/test",
+                json!({
+                    "topic": "sensors/kitchen",
+                    "payload": {"temperature": 1.0},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Side-effect-free: the stored rule survives, live counters stayed
+        // at zero (the probe bumps nothing), and live routing still works
+        // through the broker.
+        struct W316Sink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for W316Sink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(W316Sink);
+        let topic = broker_protocol::Topic::new("sensors/kitchen").expect("topic");
+        let payload = bytes::Bytes::from_static(b"{\"temperature\": 150.0}");
+        let matched = state
+            .engine
+            .dispatch_ingress(&topic, &payload, broker_protocol::QoS::AtMostOnce, &sink)
+            .await;
+        assert_eq!(matched, 1, "stored rule still fires on live dispatch");
+        let (status, body) = server
+            .get_auth("/api/v5/rules/w3-16-rule/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["metrics"]["matched"],
+            json!(1),
+            "only the live dispatch bumped counters; offline probes bump nothing"
+        );
+        let (status, _) = server.delete_auth("/api/v5/rules/w3-16-rule", &token).await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]

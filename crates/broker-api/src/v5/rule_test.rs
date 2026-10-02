@@ -61,11 +61,15 @@
 // until the checker pins it.
 
 use axum::{
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
+use std::collections::HashMap;
+
+use crate::ApiState;
 
 /// Single-request body bound for `POST /api/v5/rule_test`: 256 KiB.
 /// Reason: a rule body plus a sample message comfortably fit, while one
@@ -281,10 +285,136 @@ pub async fn test_rule_offline(body: Bytes) -> Response {
     }
 }
 
+/// `POST /rules/:id/test`: per-rule offline evaluation bound to the stored
+/// compiled rule (C06-25).
+///
+/// Loads the stored rule by id and evaluates it against the supplied sample
+/// message (`topic` plus `payload`, flat or `context`-nested, the same
+/// aliases [`test_rule_offline`] accepts) through the same
+/// [`broker_rules::try_evaluate`] front end, reusing the stored SQL and the
+/// stored topic filter. A sample `sql` field, when present, is ignored: the
+/// probe is bound to the stored compiled rule, never to a caller-supplied
+/// program. Reports 200 with `{matched, projected, output}` (`output`
+/// mirrors `projected` for shape compatibility; both are `null` on
+/// no-match). An unknown id returns 404 with the documented `{code,
+/// message}` shape, not an empty body; malformed samples are rejected with
+/// 400 and the documented error shape. Nothing is stored, published, fired
+/// or retained: the probe runs with `dry_run` set, writes to no store and
+/// leaves nothing cached. Management-plane only; publish and deliver never
+/// touch this path.
+///
+/// Bounds (stated here and enforced below): the same single-request
+/// [`MAX_RULE_TEST_BODY_BYTES`] body cap and [`RULE_TEST_TIMEOUT`]
+/// evaluation bound as [`test_rule_offline`], for the same reasons (a
+/// sample payload comfortably fits while one management request cannot
+/// bloat the kernel; a bounded input evaluates in milliseconds).
+///
+/// Fire-path cost: none. The evaluator is never consulted per message;
+/// the publish path keeps paying what message ingress already pays (the
+/// rule match in `dispatch_ingress`) with no new lock, allocation or queue
+/// from this route. The stored-rule lookup clones at most one small rule
+/// under one short read lock on the management plane.
+// TODO(parity): which exact sample shape does the documented per-rule probe
+// require (flat `topic`/`payload` versus nested `context`, sample `sql`
+// overriding or ignored)? The rulebook does not decide the exact shape;
+// the current choice accepts flat and `context`-nested topic/payload
+// aliases and ignores a sample `sql` (bound to the stored rule) until the
+// checker pins it.
+// TODO(parity): which exact success shape does the documented per-rule
+// probe require beyond match/no-match plus projected output (`projected`
+// versus `output` key)? The rulebook does not decide the exact shape;
+// fields the broker can supply are served under both keys (`output`
+// mirrors `projected`) until the checker pins it.
+// TODO(parity): for an unknown id with an invalid sample body, is the
+// answer 404 or 400? The rulebook does not decide the precedence; the
+// current choice answers 404 first (existence before validation, mirroring
+// the rule update) and stores nothing either way.
+pub async fn test_stored_rule(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let Some(rule) = state.engine.get_rule(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "NOT_FOUND",
+                "message": "Rule not found"
+            })),
+        )
+            .into_response();
+    };
+    if body.len() > MAX_RULE_TEST_BODY_BYTES {
+        return bad_request(format!(
+            "rule test body is too large: {} bytes exceeds {} bytes",
+            body.len(),
+            MAX_RULE_TEST_BODY_BYTES
+        ));
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => return bad_request(format!("invalid rule test body: {error}")),
+    };
+    if !value.is_object() {
+        return bad_request("rule test body must be a JSON object".to_string());
+    }
+    let Some(topic) = extract_topic(&value) else {
+        return missing_field("topic");
+    };
+    let Some(payload) = extract_payload(&value) else {
+        return missing_field("payload");
+    };
+    // Bound to the stored compiled rule: the stored SQL text plus the
+    // stored topic filter, never a caller-supplied program.
+    let stored_sql = rule.sql_query.clone();
+    let stored_filter = rule.topic_filter.as_str().to_string();
+    // The stated [`RULE_TEST_TIMEOUT`] bounds one synchronous in-memory
+    // evaluation per request via `tokio::time::timeout`, the same bound
+    // as the stateless probe.
+    let evaluated = tokio::time::timeout(RULE_TEST_TIMEOUT, async move {
+        broker_rules::try_evaluate(
+            stored_sql.as_deref(),
+            Some(stored_filter.as_str()),
+            topic.as_str(),
+            &payload,
+        )
+    })
+    .await;
+    let (matched, projected) = match evaluated {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return bad_request(error),
+        Err(_) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({
+                    "code": "TIMEOUT",
+                    "message": format!(
+                        "rule test timed out after {}s",
+                        RULE_TEST_TIMEOUT.as_secs()
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    };
+    {
+        let output = projected.clone().unwrap_or(serde_json::Value::Null);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "matched": matched,
+                "projected": output,
+                "output": output,
+            })),
+        )
+            .into_response()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ApiState;
     use std::sync::Arc;
 
     fn standalone_state() -> ApiState {
@@ -450,5 +580,119 @@ mod tests {
             )
             .await;
         assert_eq!(matched, 1);
+    }
+
+    fn stored_state() -> ApiState {
+        let state = standalone_state();
+        state
+            .engine
+            .create_rule_with_id(
+                "w316-rule".to_string(),
+                "w316-rule".to_string(),
+                broker_protocol::TopicFilter::new("sensors/+").expect("filter"),
+                Some("SELECT temperature FROM \"sensors/+\" WHERE temperature > 100.0".to_string()),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        state
+    }
+
+    /// Per-rule probe bound to the stored rule: match reports projected
+    /// output, no-match reports no-match, and the stored rule survives.
+    #[tokio::test]
+    async fn stored_probe_reports_match_and_no_match() {
+        let state = stored_state();
+        let (status, body) = response_parts(
+            test_stored_rule(
+                State(state.clone()),
+                Path("w316-rule".to_string()),
+                Query(HashMap::new()),
+                body_of(serde_json::json!({
+                    "topic": "sensors/kitchen",
+                    "payload": {"temperature": 150.0, "secret": "x"},
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["matched"], serde_json::json!(true));
+        assert_eq!(body["projected"], serde_json::json!({"temperature": 150.0}));
+        assert_eq!(body["output"], body["projected"]);
+
+        let (status, body) = response_parts(
+            test_stored_rule(
+                State(state.clone()),
+                Path("w316-rule".to_string()),
+                Query(HashMap::new()),
+                body_of(serde_json::json!({
+                    "topic": "sensors/kitchen",
+                    "payload": {"temperature": 72.5},
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["matched"], serde_json::json!(false));
+        assert!(body["projected"].is_null());
+        assert!(body["output"].is_null());
+        assert!(state.engine.get_rule("w316-rule").is_some());
+    }
+
+    /// Unknown rule ids are 404 with the documented shape, even with a
+    /// body that would otherwise be invalid (existence before validation).
+    #[tokio::test]
+    async fn stored_probe_unknown_id_is_404() {
+        let state = stored_state();
+        for raw in [
+            body_of(serde_json::json!({
+                "topic": "sensors/kitchen",
+                "payload": {"temperature": 1.0},
+            })),
+            body_of(serde_json::json!({"topic": "sensors/kitchen"})),
+        ] {
+            let (status, body) = response_parts(
+                test_stored_rule(
+                    State(state.clone()),
+                    Path("no-such-rule".to_string()),
+                    Query(HashMap::new()),
+                    raw,
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+            assert!(body["message"].is_string());
+        }
+    }
+
+    /// Malformed samples on a known rule are 400 with the documented
+    /// shape and store nothing new.
+    #[tokio::test]
+    async fn stored_probe_malformed_sample_is_rejected() {
+        let state = stored_state();
+        let before = state.engine.list_rules().len();
+        for bad in [
+            serde_json::json!({"payload": {"temperature": 1.0}}),
+            serde_json::json!({"topic": "sensors/kitchen"}),
+            serde_json::json!([]),
+        ] {
+            let (status, body) = response_parts(
+                test_stored_rule(
+                    State(state.clone()),
+                    Path("w316-rule".to_string()),
+                    Query(HashMap::new()),
+                    body_of(bad),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+        }
+        assert_eq!(state.engine.list_rules().len(), before);
     }
 }
