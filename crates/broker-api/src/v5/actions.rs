@@ -53,8 +53,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::errors::ApiError;
+use crate::node_scope::resolve_node;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
+
+/// Single-node name rendered by `v5::nodes::list_nodes`. Accepted alongside
+/// [`ApiState::node_id`] until every caller migrates to the configured id
+/// (see `node_scope` docs); both name the same local node.
+const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
 
 /// Upper bound for stored actions. Creates past this size are rejected
 /// with `BAD_REQUEST` instead of growing the map without limit. Reason:
@@ -803,10 +809,78 @@ pub async fn run_action_operation(
     State(state): State<ApiState>,
     Path((id, operation)): Path<(String, String)>,
 ) -> Response {
-    if state.actions.get(&id).is_none() {
+    apply_action_operation(&state, &id, &operation).await
+}
+
+/// `POST /api/v5/nodes/:node/actions/:id/:operation`: run one named
+/// lifecycle operation against one action on one named node (W3-09,
+/// C06-13).
+///
+/// Single-node execution only: the `{node}` segment is checked with the
+/// shared [`resolve_node`] helper against the configured
+/// [`ApiState::node_id`] (falling back to the [`LEGACY_NODE_NAME`] literal
+/// the v5 rows render today); an unknown name returns the helper's 404
+/// `NOT_FOUND` shape naming the node and touches no other state. A known
+/// node dispatches to the same [`apply_action_operation`] path as the
+/// global `POST /actions/:id/:operation` route (W3-06), so the reported
+/// state, the 404 for an unknown id, and the rejection of an unknown
+/// operation are identical on both routes.
+///
+/// The pair is not paged; unknown query parameters are ignored (no query
+/// is extracted). Management-plane only: one short store read plus one
+/// short write lock cloning at most one small record per request (plus the
+/// registry save lock on persist) and one lock-free snapshot swap; rule
+/// evaluation reads the snapshot, and publish and deliver never touch this
+/// store.
+///
+/// Bound (stated here and enforced by construction): single-request bounded
+/// work with no wait and no accumulated per-node state. The operation
+/// completes synchronously under short in-memory locks with no remote call,
+/// no retry and no timer, so there is no timeout to tune; node membership
+/// itself is owned elsewhere (exactly one local record) and nothing here
+/// grows with connections, sessions or subscriptions.
+///
+/// Fire-path cost: no new work on publish or deliver. The operation itself
+/// runs entirely on the management plane; the publish path keeps paying
+/// what the enable route already pays (one `Arc` of the disabled set per
+/// ingress plus one `HashSet` lookup per forward, lock-free, no per-fire
+/// allocation).
+// TODO(parity): for an unknown node with an unknown id or operation, is
+// the answer the node 404 or the action/operation error? The rulebook does
+// not decide the precedence; the current choice answers the node 404 first
+// (node scope before action existence before operation validity, fail
+// closed) and touches nothing else either way.
+// TODO(parity): does the node-scoped answer carry a node envelope or the
+// bare updated action? The rulebook does not decide the exact shape; the
+// current choice returns the same bare updated action with 200 as the
+// global route (single-node answer) until the checker pins it.
+pub async fn run_node_action_operation(
+    State(state): State<ApiState>,
+    Path((node, id, operation)): Path<(String, String, String)>,
+) -> Response {
+    if resolve_node(&state.node_id, &node).is_err()
+        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+    {
+        // Reuse the helper's error so the unknown-node shape stays exactly
+        // the documented `{code: NOT_FOUND, message}` body.
+        return resolve_node(&state.node_id, &node)
+            .expect_err("node already checked as unknown")
+            .into_response();
+    }
+    apply_action_operation(&state, &id, &operation).await
+}
+
+/// Shared dispatch behind both the global and the node-scoped operation
+/// routes: existence check (unknown id is 404, creates nothing), operation
+/// validity check (unknown name is `BAD_REQUEST`, persists nothing), then
+/// the enable flip with the engine snapshot mirror, persistence and the
+/// updated action with 200. Management-plane only; see the callers for the
+/// locking and fire-path notes.
+async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> Response {
+    if state.actions.get(id).is_none() {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
-    let enable = match operation.as_str() {
+    let enable = match operation {
         "start" => true,
         "stop" => false,
         _ => {
@@ -816,7 +890,7 @@ pub async fn run_action_operation(
             .into_response();
         }
     };
-    let Some(entry) = state.actions.set_enabled(&id, enable) else {
+    let Some(entry) = state.actions.set_enabled(id, enable) else {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     };
     // Wire into the connector lifecycle underneath: the engine's
@@ -825,7 +899,7 @@ pub async fn run_action_operation(
     // `crates/broker-rules/src/lib.rs`), so flipping the flag here
     // starts/stops delivery through the connector without touching the
     // publish path itself.
-    state.engine.set_action_enabled(&id, enable);
+    state.engine.set_action_enabled(id, enable);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }

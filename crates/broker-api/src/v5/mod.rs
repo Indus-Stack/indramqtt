@@ -593,6 +593,15 @@ pub fn protected_router() -> Router<ApiState> {
             "/actions/:id/:operation",
             post(actions::run_action_operation),
         )
+        // Node-scoped action lifecycle operation (W3-09, C06-13):
+        // single-node execution of the W3-06 operation path guarded by
+        // the shared node-scope helper (unknown nodes are NOT_FOUND).
+        // Management-plane only; publish and deliver never touch the
+        // store.
+        .route(
+            "/nodes/:node/actions/:id/:operation",
+            post(actions::run_node_action_operation),
+        )
         // Aggregated action summary (W3-08, C06-12): counts computed on
         // demand from the live W3-02 store snapshot (zeroes when empty,
         // never an error). Not paged and not per-id, so no 404 path;
