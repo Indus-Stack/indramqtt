@@ -1217,9 +1217,37 @@ impl RuleEngine {
         actions: Vec<RuleAction>,
     ) -> Result<Rule, RuleEngineError> {
         let id = format!("rule-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        self.create_rule_with_id(id, name, topic_filter, sql_query, enabled, actions)
+    }
+
+    /// Build and store a rule under a caller-chosen id (management-plane
+    /// `POST /rules` with an explicit `id`). Shares the same SQL
+    /// compilation, duplicate rejection and rule-cap bound as
+    /// [`RuleEngine::create_rule`]: invalid SQL fails creation with
+    /// [`RuleEngineError::InvalidRule`] so a broken rule can never go
+    /// live, a duplicate id fails loudly instead of overwriting, and a
+    /// full store (at most [`broker_config::MAX_RULES`] entries) fails
+    /// loudly instead of growing without limit. Persists through the
+    /// registry like [`RuleEngine::create_rule`].
+    pub fn create_rule_with_id(
+        &self,
+        id: String,
+        name: String,
+        topic_filter: TopicFilter,
+        sql_query: Option<String>,
+        enabled: bool,
+        actions: Vec<RuleAction>,
+    ) -> Result<Rule, RuleEngineError> {
         let rule = self.insert_rule_with_id(id, name, topic_filter, sql_query, enabled, actions)?;
         self.persist()?;
         Ok(rule)
+    }
+
+    /// Live rule count for the management plane (rule-cap reporting).
+    /// One short read lock; the publish path never calls this (it holds
+    /// a rule snapshot per ingress instead).
+    pub fn rule_count(&self) -> usize {
+        self.rules.read().len()
     }
 
     /// Insert a rule under a preserved id (boot replay path). Shares the
@@ -1276,6 +1304,23 @@ impl RuleEngine {
             return Err(RuleEngineError::InvalidRule(format!(
                 "duplicate rule id: {id}"
             )));
+        }
+        // Rule cap (management-plane bound): a full store fails loudly
+        // instead of growing without limit. Reason: the list handler
+        // clones the whole snapshot once per request, so the catalogue
+        // must stay small and bounded. Checked after SQL compilation
+        // (a broken rule is rejected as invalid either way) and after
+        // the duplicate check (mirroring the action directory: duplicate
+        // before full), so a duplicate id on a full store still reports
+        // the duplicate.
+        {
+            let live = self.rules.read().len();
+            if live >= broker_config::MAX_RULES {
+                return Err(RuleEngineError::InvalidRule(format!(
+                    "rule store holds {live} entries, at most {}",
+                    broker_config::MAX_RULES
+                )));
+            }
         }
         if let Some(suffix) = id.strip_prefix("rule-") {
             if let Ok(n) = suffix.parse::<u64>() {

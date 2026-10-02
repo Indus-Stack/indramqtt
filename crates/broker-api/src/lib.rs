@@ -4227,6 +4227,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rules_list_create_delete_round_trip() {
+        // W3-13 (C06-18/C06-19/C06-20) failing test: create a rule, list
+        // and expect it with paging metadata; duplicate create expects
+        // rejection; delete then second delete expects 404. Before:
+        // paging missing (bare envelope) and duplicate ids accepted.
+        // Broker-through: the rule is created through the HTTP router on
+        // the live engine, one publish goes through `dispatch_ingress`
+        // (the broker's rule path) into a sink registered under the
+        // referenced action id, and the delete goes through the router
+        // too. Management-plane only otherwise; publish and deliver never
+        // touch the rule map directly (dispatch reads a snapshot).
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty engine returns an empty page, not an error.
+        let (status, body) = server.get_auth("/api/v5/rules", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["limit"], json!(100));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // Unknown query parameters are ignored, never an error.
+        let (status, _) = server.get_auth("/api/v5/rules?unknown=param", &token).await;
+        assert_eq!(status, 200);
+
+        // The forward target must name a known action (W3-02 linkage):
+        // an unknown action id is rejected before anything is stored.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "w3-13-rule",
+                    "sql": "SELECT * FROM \"w3/13/rules\"",
+                    "actions": ["w3-13-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Create the action first, then the rule referencing it.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-13-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "w3-13-rule",
+                    "sql": "SELECT * FROM \"w3/13/rules\"",
+                    "actions": ["w3-13-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["id"], json!("w3-13-rule"));
+
+        // Malformed SQL is compiled before storing and rejected.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "w3-13-bad-sql",
+                    "sql": "SELECT WHERE WHERE",
+                    "actions": [],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // List carries the rule with the standard page envelope.
+        let (status, body) = server.get_auth("/api/v5/rules", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], json!("w3-13-rule"));
+        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // Paging slices after filtering: page 2 of a 1-row store is empty.
+        let (status, body) = server
+            .get_auth("/api/v5/rules?page=2&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["page"], json!(2));
+        assert_eq!(body["meta"]["limit"], json!(1));
+        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+
+        // Duplicate id is rejected cleanly, never overwritten.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "w3-13-rule",
+                    "sql": "SELECT * FROM \"w3/13/rules\"",
+                    "actions": [],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+
+        // Broker rule path: one publish through `dispatch_ingress` fires
+        // the stored rule into the registered sink, never `sink.send`
+        // directly.
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state
+            .engine
+            .connectors()
+            .register("w3-13-action", counter.clone());
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w3/13/rules").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "stored rule must fire through dispatch"
+        );
+
+        // Delete hits with 204; a second delete is 404, not an empty body.
+        let (status, _) = server.delete_auth("/api/v5/rules/w3-13-rule", &token).await;
+        assert_eq!(status, 204);
+        let (status, body) = server.get_auth("/api/v5/rules", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        let (status, body) = server.delete_auth("/api/v5/rules/w3-13-rule", &token).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Cleanup: the action the rule referenced.
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/w3-13-action", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn test_auth_users_and_acls() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;

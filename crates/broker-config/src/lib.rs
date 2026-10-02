@@ -481,6 +481,22 @@ fn default_rule_enabled() -> bool {
     true
 }
 
+/// Upper bound for stored routing rules. Creates past this size are
+/// rejected instead of growing the map without limit. Reason: the list
+/// handler clones the whole snapshot once per request, so the catalogue
+/// must stay small and bounded; 1024 covers the documented rule set with
+/// headroom while keeping per-request clones cheap.
+// TODO(parity): is 1024 the documented rule cap? The rulebook does not
+// decide the exact bound; 1024 is the conservative choice until the
+// conformance checker pins it.
+pub const MAX_RULES: usize = 1024;
+
+/// Longest accepted rule `id` (256 bytes). Reason: ids are map keys
+/// cloned into every list snapshot and persisted per entry, so an
+/// unbounded id lets one record bloat each list read; 256 covers
+/// operator naming with headroom while keeping per-request clones cheap.
+pub const MAX_RULE_ID_LEN: usize = 256;
+
 /// One routing rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RuleEntry {
@@ -512,14 +528,27 @@ pub struct RulesConf {
 }
 
 impl RulesConf {
-    /// Validates rule ids (non-empty, unique), required fields and the
-    /// full action list.
+    /// Validates the registry length cap, rule ids (non-empty, bounded,
+    /// unique), required fields and the full action list.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.rules.len() > MAX_RULES {
+            return Err(ConfigError::Invalid(format!(
+                "rules.rules holds {} entries, at most {} (field `rules`)",
+                self.rules.len(),
+                MAX_RULES
+            )));
+        }
         let mut seen = HashSet::with_capacity(self.rules.len());
         for (index, rule) in self.rules.iter().enumerate() {
             if rule.id.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
                     "rules.rules[{index}].id must not be empty (field `id`)"
+                )));
+            }
+            if rule.id.len() > MAX_RULE_ID_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "rules.rules[{index}].id {:?} is too long (field `id`)",
+                    rule.id
                 )));
             }
             if rule.topic_filter.trim().is_empty() {

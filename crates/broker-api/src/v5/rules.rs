@@ -6,10 +6,69 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Deserialize;
 use std::sync::{Arc, LazyLock, RwLock};
 
+use crate::errors::ApiError;
+use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
+
+// ---------------------------------------------------------------------------
+// Streaming Rules (W3-13, C06-18/C06-19/C06-20): paged list, validated
+// create with duplicate rejection, and delete with a 404 for unknown ids,
+// all on the live engine rule-map.
+//
+// Single-node, management-plane only: handlers clone at most the capped
+// list (list) or one entry per request under a short lock; rule evaluation
+// reads a snapshot, never this map directly, and publish and deliver never
+// touch it.
+//
+// Store bounds (both stated here and enforced below):
+// - at most [`MAX_RULES`] entries (1024: caps management-plane memory
+//   for the rule catalogue; creates past the cap are rejected with
+//   `BAD_REQUEST` instead of growing without limit);
+// - `id` is capped at [`MAX_RULE_ID_LEN`] chars (256: bounds map-key
+//   memory per entry; longer ids are rejected with `BAD_REQUEST`);
+// - list paging reuses the shared extractor (default limit 100, max
+//   1000); the default store is empty.
+//
+// Persistence: every mutation exports the validated store into the
+// config core (`RulesConf`, versioned file) and saves atomically;
+// a commit or save failure answers 500 so the loss is never silent.
+// Per-rule counters do not persist (memory-only by design: a restart
+// rebuilds the map at zero).
+//
+// Fire-path cost (stated for the delivery-path note): no new work on
+// publish or deliver. Dispatch loads one lock-free settings `Arc` plus
+// one `Arc` each of the disabled-action set and the per-action metric
+// map per ingress, then clones the matching rule `Arc`s under one short
+// read lock; list/create/delete take the map lock only on the
+// management plane.
+// TODO(parity): is 1024 the documented rule cap? The rulebook does not
+// decide the exact bound; 1024 is the conservative choice until the
+// conformance checker pins it.
+// TODO(parity): which per-rule fields does the spec document beyond
+// id/name/sql/from/enable/actions? The rulebook does not decide the
+// exact shape; fields the broker cannot supply are omitted rather than
+// invented until the checker pins it.
+// TODO(parity): for an explicit-id create whose SQL is also malformed,
+// is the answer the duplicate or the SQL error? The rulebook does not
+// decide the precedence; the current choice compiles the SQL first
+// (a broken rule is rejected as invalid either way) until the checker
+// pins it.
+// TODO(parity): do rule actions name action ids only, or also raw
+// connector ids? The rulebook does not decide; the current choice
+// validates `ForwardConnector` targets against the W3-02 action
+// directory (unknown ids rejected) until the checker pins it.
+
+/// Upper bound for stored rules. Creates past this size are rejected
+/// with `BAD_REQUEST` instead of growing the map without limit. Reason:
+/// the list handler clones the whole snapshot once per request, so the
+/// catalogue must stay small and bounded; 1024 covers the documented
+/// rule set with headroom while keeping per-request clones cheap.
+pub const MAX_RULES: usize = broker_config::MAX_RULES;
+/// Longest accepted rule `id`. Reason: bounds map-key memory per
+/// entry so one create cannot balloon the store.
+const MAX_RULE_ID_LEN: usize = broker_config::MAX_RULE_ID_LEN;
 
 // ---------------------------------------------------------------------------
 // Streaming Rules
@@ -35,42 +94,19 @@ fn rule_to_v5(rule: &broker_rules::Rule) -> serde_json::Value {
     })
 }
 
-pub async fn list_rules(State(state): State<ApiState>) -> Response {
+pub async fn list_rules(State(state): State<ApiState>, params: PageParams) -> Response {
     let data: Vec<_> = state.engine.list_rules().iter().map(rule_to_v5).collect();
 
     let count = data.len();
+    let page_rows = paginate(&data, params.page, params.limit);
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "data": data,
-            "meta": {
-                "page": 1,
-                "limit": 100,
-                "count": count,
-                "hasnext": false
-            }
+            "data": page_rows,
+            "meta": meta_page(params.page, params.limit, count),
         })),
     )
         .into_response()
-}
-
-#[derive(Deserialize)]
-pub struct CreateRuleV5Request {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    pub sql: String,
-    #[serde(default = "default_enable")]
-    pub enable: bool,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub actions: Vec<serde_json::Value>,
-}
-
-fn default_enable() -> bool {
-    true
 }
 
 /// Map a rule registry failure onto a 500: the in-memory mutation
@@ -85,31 +121,70 @@ fn rule_persist_error(error: broker_rules::RuleEngineError) -> Response {
         .into_response()
 }
 
+/// `POST /api/v5/rules`: compile the rule before storing (malformed
+/// bodies rejected with the documented error shape); a duplicate id is
+/// rejected cleanly, never overwritten. An explicit `id` is stored
+/// verbatim so duplicates are detectable; without one the engine assigns
+/// `rule-<n>`. A `ForwardConnector` target naming no known action is
+/// rejected (the W3-02 action linkage). Management-plane only; publish
+/// and deliver never touch this map (dispatch reads a snapshot).
 pub async fn create_rule(
     State(state): State<ApiState>,
-    Json(req): Json<CreateRuleV5Request>,
+    Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let CreateRuleV5Request {
-        id,
-        name,
-        sql,
-        enable,
-        description: _,
-        actions: raw_actions,
-    } = req;
-    let name = match (name, id) {
-        (Some(name), _) => name,
-        (None, Some(id)) => id,
-        (None, None) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "BAD_REQUEST",
-                    "message": "rule id or name is required"
-                })),
-            )
-                .into_response();
-        }
+    let Some(obj) = body.as_object() else {
+        return ApiError::BadRequest("request body must be a JSON object".to_string())
+            .into_response();
+    };
+    // Explicit `id` wins, `name` falls back (mirrors the action create).
+    let raw_id = obj
+        .get("id")
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if raw_id.is_empty() {
+        return ApiError::BadRequest("rule id or name is required".to_string()).into_response();
+    }
+    if raw_id.len() > MAX_RULE_ID_LEN {
+        return ApiError::BadRequest(format!(
+            "rule id holds {} chars, at most {MAX_RULE_ID_LEN} (field `id`)",
+            raw_id.len()
+        ))
+        .into_response();
+    }
+    let explicit_id = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let name = obj
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| raw_id.to_string());
+    let Some(sql) = obj
+        .get("sql")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    else {
+        return ApiError::BadRequest("missing required field: sql".to_string()).into_response();
+    };
+    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    let raw_actions: Vec<serde_json::Value> = match obj.get("actions") {
+        None => Vec::new(),
+        Some(value) => match value.as_array() {
+            Some(items) => items.clone(),
+            None => {
+                return ApiError::BadRequest("field `actions` must be an array".to_string())
+                    .into_response();
+            }
+        },
     };
     let topic_str = if sql.contains("FROM \"") {
         sql.split("FROM \"")
@@ -127,65 +202,110 @@ pub async fn create_rule(
             // `TopicFilter` accepts them, but a rule FROM-target containing
             // `[` or `]` is rejected here with 400 instead of going live.
             if topic_str.contains('[') || topic_str.contains(']') {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "code": "BAD_REQUEST",
-                        "message": "invalid topic filter: bracket characters are not allowed",
-                    })),
+                return ApiError::BadRequest(
+                    "invalid topic filter: bracket characters are not allowed".to_string(),
                 )
-                    .into_response();
+                .into_response();
             }
             filter
         }
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "BAD_REQUEST",
-                    "message": format!("invalid topic filter: {e}")
-                })),
-            )
-                .into_response();
+            return ApiError::BadRequest(format!("invalid topic filter: {e}")).into_response();
         }
     };
 
     let mut actions = Vec::new();
     for a in &raw_actions {
         if let Some(id_str) = a.as_str() {
+            // Rule-to-action linkage (W3-02): a forward target naming no
+            // known action is rejected instead of going live and failing
+            // at fire time.
+            if state.actions.get(id_str).is_none() {
+                return ApiError::BadRequest(format!(
+                    "unknown action {id_str:?} (field `actions`)"
+                ))
+                .into_response();
+            }
             actions.push(broker_rules::RuleAction::ForwardConnector {
                 connector_id: id_str.to_string(),
             });
         } else if let Some(obj) = a.as_object() {
-            if let Some(conn_id) = obj
+            let Some(conn_id) = obj
                 .get("id")
                 .or_else(|| obj.get("name"))
                 .and_then(|v| v.as_str())
-            {
-                actions.push(broker_rules::RuleAction::ForwardConnector {
-                    connector_id: conn_id.to_string(),
-                });
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                // Fail closed (UNKNOWN rule): an object without an
+                // addressable forward target is rejected, never silently
+                // dropped while create still answers 201.
+                return ApiError::BadRequest(
+                    "action entry object must carry an `id` or `name` (field `actions`)"
+                        .to_string(),
+                )
+                .into_response();
+            };
+            if state.actions.get(conn_id).is_none() {
+                return ApiError::BadRequest(format!(
+                    "unknown action {conn_id:?} (field `actions`)"
+                ))
+                .into_response();
             }
+            actions.push(broker_rules::RuleAction::ForwardConnector {
+                connector_id: conn_id.to_string(),
+            });
+        } else {
+            return ApiError::BadRequest(
+                "unsupported action entry: expected a string id or an object (field `actions`)"
+                    .to_string(),
+            )
+            .into_response();
         }
     }
 
-    let rule = state
-        .engine
-        .create_rule(name, topic_filter, Some(sql), enable, actions);
+    // Rule-cap bound (management-plane, fail closed): the engine re-checks
+    // the same bound after SQL compilation, but this early reject wires the
+    // local [`MAX_RULES`] cap and [`broker_rules::RuleEngine::rule_count`]
+    // so an obviously full store fails without a needless insert attempt.
+    // Duplicate ids still report duplicate (mirroring the engine ordering:
+    // duplicate before full), and a broken-SQL body on a full store stays
+    // a 400 either way.
+    {
+        let live = state.engine.rule_count();
+        let is_duplicate = explicit_id
+            .as_ref()
+            .is_some_and(|id| state.engine.get_rule(id).is_some());
+        if !is_duplicate && live >= MAX_RULES {
+            return ApiError::BadRequest(format!(
+                "rule store holds {live} entries, at most {MAX_RULES}"
+            ))
+            .into_response();
+        }
+    }
+
+    let rule = match explicit_id {
+        Some(id) => {
+            state
+                .engine
+                .create_rule_with_id(id, name, topic_filter, Some(sql), enable, actions)
+        }
+        None => state
+            .engine
+            .create_rule(name, topic_filter, Some(sql), enable, actions),
+    };
 
     match rule {
         Ok(r) => (StatusCode::CREATED, Json(rule_to_v5(&r))).into_response(),
         // A persist failure is a 500 (the in-memory rule stays but the
         // disk save failed); validation failures stay 400.
         Err(error @ broker_rules::RuleEngineError::Persist(_)) => rule_persist_error(error),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": format!("Rule creation failed: {e}")
-            })),
-        )
-            .into_response(),
+        Err(broker_rules::RuleEngineError::InvalidRule(message))
+            if message.starts_with("duplicate rule id:") =>
+        {
+            ApiError::AlreadyExists(message).into_response()
+        }
+        Err(e) => ApiError::BadRequest(format!("Rule creation failed: {e}")).into_response(),
     }
 }
 
@@ -238,11 +358,14 @@ pub async fn update_rule(
     }
 }
 
+/// `DELETE /api/v5/rules/:id`: drop one rule. An unknown id returns
+/// 404 with the documented error code, not an empty body.
+/// Management-plane only; publish and deliver never touch this map
+/// (dispatch reads a snapshot).
 pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     match state.engine.remove_rule(&id) {
-        // Preserve the long-standing v5 contract (unconditional 204, even
-        // for unknown ids); only a persist failure surfaces as a 500.
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => ApiError::NotFound(format!("rule {id:?} not found")).into_response(),
         // A persist failure must surface as a 500, never as a success:
         // the in-memory removal applied but the disk save failed.
         Err(error) => rule_persist_error(error),
