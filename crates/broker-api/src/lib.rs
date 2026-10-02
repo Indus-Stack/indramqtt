@@ -9835,6 +9835,142 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn rule_metrics_move_on_real_traffic_and_reset_zeroes() {
+        // W3-15 (C06-23/C06-24) broker-through test: create a stored rule
+        // via the HTTP router, publish a matching and a non-matching
+        // message through the real evaluation path (`dispatch_ingress`,
+        // the broker's rule path also used by `crates/broker-node` ingress
+        // and the management publish path), read metrics and expect the
+        // documented counters to move; reset and expect zeroes; unknown id
+        // is 404. Before: constant metrics or missing 404.
+        // The per-rule counters live in `broker-rules`
+        // (`Rule::{matched,passed,failed}_cnt`, bumped in
+        // `RuleEngine::dispatch_ingress` on the publish event), driven by
+        // the publish event.
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown ids miss with the documented shape, not an empty body.
+        let (status, body) = server
+            .get_auth("/api/v5/rules/no-such-rule-metrics/metrics", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/rules/no-such-rule-metrics/metrics/reset",
+                Some(json!({})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Stored rule with a WHERE gate so matching and non-matching
+        // traffic diverge; empty actions keep the fire side-effect-free
+        // while `passed`/`failed` still move.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"name": "w3-15-metrics",
+                       "sql": "SELECT * FROM \"w3/15/metrics\" WHERE k > 10",
+                       "enable": true,
+                       "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let rule_id = created["id"].as_str().expect("rule id").to_string();
+        // Fresh rule reads zeroes; unknown query keys are ignored.
+        let (status, body) = server
+            .get_auth(
+                &format!("/api/v5/rules/{rule_id}/metrics?unknown=param"),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["matched"], json!(0));
+        assert_eq!(body["metrics"]["passed"], json!(0));
+        assert_eq!(body["metrics"]["failed"], json!(0));
+        // One matching and two non-matching publishes through the real
+        // evaluation path (WHERE-true, WHERE-false, non-JSON payload),
+        // never constants and never `sink.send` directly.
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w3/15/metrics").expect("valid topic");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &bytes::Bytes::from_static(b"{\"k\":20}"),
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &bytes::Bytes::from_static(b"{\"k\":1}"),
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &bytes::Bytes::from_static(b"not json"),
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        // Counters moved only through real evaluation.
+        let (status, body) = server
+            .get_auth(&format!("/api/v5/rules/{rule_id}/metrics"), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["matched"], json!(3));
+        assert_eq!(body["metrics"]["passed"], json!(1));
+        assert_eq!(body["metrics"]["failed"], json!(2));
+        // Reset zeroes the counters and reports success; the next read is
+        // zero. Reset is not paged; unknown query keys are ignored.
+        let (status, _) = server
+            .send(
+                "PUT",
+                &format!("/api/v5/rules/{rule_id}/metrics/reset?unknown=param"),
+                Some(json!({})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth(&format!("/api/v5/rules/{rule_id}/metrics"), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["matched"], json!(0));
+        assert_eq!(body["metrics"]["passed"], json!(0));
+        assert_eq!(body["metrics"]["failed"], json!(0));
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn connector_unknown_is_404() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;

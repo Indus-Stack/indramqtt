@@ -584,7 +584,48 @@ pub async fn delete_rule(State(state): State<ApiState>, Path(id): Path<String>) 
     }
 }
 
-pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+/// `GET /api/v5/rules/:id/metrics`: live per-rule counters (C06-23).
+///
+/// Reads the fixed counter set from live engine state (`matched`,
+/// `passed`, `failed` plus the per-rule action attribution
+/// `actions.total`/`actions.success`/`actions.failed`). Every field is a
+/// lock-free atomic bumped only on the evaluation path
+/// (`RuleEngine::dispatch_ingress` in `broker-rules`), never a constant:
+/// `matched` counts topic-filter hits, `passed` counts rows that produced
+/// output, `failed` counts hits that produced none (WHERE-false and
+/// non-JSON payloads alike). A fresh rule reads zeroes; a restart rebuilds
+/// the map at zero (memory-only by design, never persisted).
+///
+/// An unknown id returns 404 with the documented `{code, message}` shape,
+/// not an empty body. The pair is not paged; unknown query parameters are
+/// ignored (the ignored query sink below). Management-plane only: one
+/// snapshot clone plus relaxed atomic loads; increments stay lock-free
+/// atomics and publish/deliver never touch this map directly.
+///
+/// Bound (stated here and enforced by construction): a fixed six-counter
+/// set per rule (three `AtomicU64` for match/pass/fail plus three for
+/// action attribution, default zero); no per-fire allocation (one snapshot
+/// clone per request on the read path, relaxed loads only) and no
+/// unbounded history.
+///
+/// Fire-path cost (stated for the delivery-path note): no new work on
+/// publish or deliver. The evaluation path pays one relaxed `fetch_add`
+/// per counter per ingress (lock-free atomics only, no lock, no queue, no
+/// per-fire allocation); text rendering stays here in the handler.
+// TODO(parity): which counter names plus envelope shapes does the documented
+// spec require beyond `matched`/`passed`/`failed` (rates, node rows, ...)?
+// The rulebook does not decide the exact shape; the current choice reports
+// the honest live subset the fire path can attribute and omits the rest
+// rather than inventing constants, until the checker pins it.
+// TODO(parity): are the per-rule action-attribution keys part of the
+// documented shape, or only the three match counters? The rulebook does
+// not decide; the current choice reports both (dotted `actions.*` keys)
+// until the checker pins it.
+pub async fn get_rule_metrics(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
     let rules = state.engine.list_rules();
     let Some(r) = rules.iter().find(|r| r.id == id) else {
         return (
@@ -626,7 +667,25 @@ pub async fn get_rule_metrics(State(state): State<ApiState>, Path(id): Path<Stri
         .into_response()
 }
 
-pub async fn reset_rule_metrics(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+/// `PUT /api/v5/rules/:id/metrics/reset`: zero one rule's counters (C06-24).
+///
+/// Resets the live counters to zero and reports success with 204 and no
+/// body. Resetting an unknown id is 404 with the documented `{code,
+/// message}` shape, not an empty body. Counters resume from zero on the
+/// next evaluation; the reset itself persists only as the zeroed values
+/// (the map is memory-only and restarts at zero by design). The pair is
+/// not paged; unknown query parameters are ignored. Management-plane only:
+/// one snapshot clone plus lock-free atomic stores; increments stay
+/// lock-free atomics and publish/deliver never touch this map directly.
+// TODO(parity): does the spec report a reset as an empty 204 or as a 200
+// with a body? The rulebook does not decide the exact success shape; the
+// current choice answers 204 with no body, mirroring the sibling action
+// and authenticator resets, until the checker pins it.
+pub async fn reset_rule_metrics(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
     let rules = state.engine.list_rules();
     let Some(r) = rules.iter().find(|r| r.id == id) else {
         return (
