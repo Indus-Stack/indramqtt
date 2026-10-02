@@ -11209,15 +11209,105 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // real source directory, so `/api/v5/sources` is no longer a
         // removed route (GET on the POST-only path is 405); W3-11
         // restores `GET /api/v5/rule_events` on the real producer
-        // registry, so no GET path stays removed here.
+        // registry, so no GET path stays removed here; W3-12 restores
+        // `POST /api/v5/rule_test` on the real offline evaluator, so it
+        // is no longer a removed route either.
         for path in ["/api/v5/rule_events_missing"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
-        for path in ["/api/v5/rule_test", "/api/v5/rules/abc/test"] {
+        for path in ["/api/v5/rules/abc/test"] {
             let (status, _) = server.post_auth(path, json!({}), &token).await;
             assert_eq!(status, 404, "removed route POST {path} must be 404");
         }
+    }
+
+    #[tokio::test]
+    async fn rule_test_offline_match_no_match_side_effect_free() {
+        // W3-12 failing test: POST /rule_test evaluates a rule body
+        // against a sample through the served management API on `ApiState`
+        // (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), reusing the real
+        // rule compiler (`broker_rules::try_evaluate` in
+        // `crates/broker-rules/src/lib.rs`). Before: route returned 404.
+        // Broker-through: management POST plus a live ingress dispatch
+        // through the engine, then a rules list proving nothing was stored.
+        // Management-plane only; publish and deliver never touch this path.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Matching sample reports matched output.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rule_test",
+                json!({
+                    "sql": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 0",
+                    "topic": "sensors/kitchen",
+                    "payload": {"temperature": 72.5, "secret": "x"},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["matched"], json!(true));
+        assert_eq!(body["projected"], json!({"temperature": 72.5}));
+
+        // Non-matching sample reports no-match.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rule_test",
+                json!({
+                    "sql": "SELECT * FROM \"sensors/+\" WHERE temperature > 100.0",
+                    "topic": "sensors/kitchen",
+                    "payload": {"temperature": 72.5},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["matched"], json!(false));
+
+        // Malformed rule bodies are rejected with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rule_test",
+                json!({"sql": "SELECT WHERE WHERE", "topic": "a/b", "payload": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Side-effect-free: no rule, action binding or retained state left
+        // behind, and live routing still works through the broker.
+        struct W312Sink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for W312Sink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(W312Sink);
+        let topic = broker_protocol::Topic::new("sensors/kitchen").expect("topic");
+        let payload = bytes::Bytes::from_static(b"{\"temperature\": 72.5}");
+        let matched = state
+            .engine
+            .dispatch_ingress(&topic, &payload, broker_protocol::QoS::AtMostOnce, &sink)
+            .await;
+        assert_eq!(
+            matched, 0,
+            "no stored rule so live dispatch matches nothing"
+        );
+        let (status, body) = server.get_auth("/api/v5/rules", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(state.engine.list_rules().len(), 0);
     }
 
     #[tokio::test]
