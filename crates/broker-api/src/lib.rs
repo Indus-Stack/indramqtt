@@ -5930,6 +5930,301 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn w317_connectors_list_create_delete_round_trip() {
+        // W3-17 (C07-01/C07-02/C07-03) failing test: create a connector,
+        // list and expect it with paging metadata and live fields;
+        // duplicate create expects rejection; unknown kind expects
+        // rejection; delete then second delete expects 404 with exact-id
+        // semantics. Before: dump shape (bare array), fuzzy suffix match,
+        // missing kind validation. Broker-through: every step goes through
+        // the HTTP router on the live engine; create registers the live
+        // sink (asserted via the manager, driven by the create event) and
+        // one publish goes through `dispatch_ingress` (the broker's rule
+        // path), never `sink.send` directly. Management-plane only
+        // otherwise; publish and deliver never touch the connector map
+        // (dispatch reads the manager directly).
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Scrub leftovers from earlier runs sharing the process-global
+        // store so paging assertions stay deterministic. The fire rule
+        // goes first: a connector still referenced by a rule cannot be
+        // deleted.
+        let _ = server
+            .delete_auth("/api/v5/rules/w317-fire-rule", &token)
+            .await;
+        for stale in [
+            "w317-list-conn",
+            "w317-exact",
+            "w317-guarded",
+            "w317-guard-action",
+            "w317-fire-conn",
+            "w317-fire-rule",
+        ] {
+            let _ = server
+                .delete_auth(&format!("/api/v5/rules/{stale}"), &token)
+                .await;
+            let _ = server
+                .delete_auth(&format!("/api/v5/actions/{stale}"), &token)
+                .await;
+            let _ = server
+                .delete_auth(&format!("/api/v5/connectors/{stale}"), &token)
+                .await;
+        }
+
+        // Create: validated write with live fields, not a raw dump.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w317-list-conn", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "create must succeed, got: {created}");
+        assert_eq!(created["id"], json!("w317-list-conn"));
+        assert_eq!(created["type"], json!("http"));
+        assert!(created.get("status").and_then(|v| v.as_str()).is_some());
+        assert!(created.get("node_status").is_some());
+        // Live health linkage: create registered the sink through the
+        // same path boot replay uses, driven by the create event
+        // (`crates/broker-api/src/v5/rules.rs`, `register_live_sink`;
+        // consulted on the fire path at
+        // `crates/broker-rules/src/lib.rs`, `run_actions` via
+        // `ConnectorManager::send`).
+        assert!(
+            state.engine.connectors().get("w317-list-conn").is_some(),
+            "create must register a live sink"
+        );
+
+        // List: paged collection with live health, not a raw dump.
+        let (status, body) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("data is a list");
+        assert!(
+            data.iter().any(|c| c["id"] == json!("w317-list-conn")),
+            "list must contain the created connector, got: {body}"
+        );
+        let row = data
+            .iter()
+            .find(|c| c["id"] == json!("w317-list-conn"))
+            .expect("created row present");
+        assert!(row.get("status").and_then(|v| v.as_str()).is_some());
+        assert!(row.get("node_status").is_some());
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["limit"], json!(100));
+        assert!(body["meta"]["count"].as_u64().unwrap_or(0) >= 1);
+        assert!(body.get("meta").and_then(|m| m.get("hasnext")).is_some());
+
+        // Unknown query parameters are ignored, never an error.
+        let (status, _) = server
+            .get_auth("/api/v5/connectors?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        let (status, paged) = server
+            .get_auth("/api/v5/connectors?page=1&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(paged["meta"]["page"], json!(1));
+        assert_eq!(paged["meta"]["limit"], json!(1));
+        assert_eq!(paged["data"].as_array().expect("data").len(), 1);
+
+        // Duplicate create is rejected cleanly, never overwritten.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w317-list-conn", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "duplicate must be rejected, got: {body}");
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"id": "w317-list-conn", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "duplicate by id must be rejected, got: {body}");
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+
+        // Unknown kind and malformed bodies are rejected with the
+        // documented error shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w317-bad-kind", "type": "no_such_kind_xyz"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "unknown kind must be rejected, got: {body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w317-no-type"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        let (status, _) = server
+            .post_auth("/api/v5/connectors", json!({"type": "http"}), &token)
+            .await;
+        assert_eq!(status, 400);
+
+        // Exact-id semantics: the legacy `prefix:id` suffix form no longer
+        // matches. Before, `x:w317-exact` deleted `w317-exact`.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w317-exact", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/x:w317-exact", &token)
+            .await;
+        assert_eq!(status, 404, "fuzzy delete must miss");
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/w317-exact", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .delete_auth("/api/v5/connectors/w317-exact", &token)
+            .await;
+        assert_eq!(status, 404, "second delete must miss, got: {body}");
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Delete of an unknown id is 404 with the documented code.
+        let (status, body) = server
+            .delete_auth("/api/v5/connectors/w317-no-such", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Delete of a connector still referenced by an action is rejected.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w317-guarded", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w317-guard-action", "type": "mqtt_bridge",
+                       "server": "127.0.0.1:1883", "connector": "w317-guarded"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .delete_auth("/api/v5/connectors/w317-guarded", &token)
+            .await;
+        assert_eq!(
+            status, 400,
+            "referenced delete must be rejected, got: {body}"
+        );
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/w317-guard-action", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/w317-guarded", &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // Broker rule path: a rule forwarding through the live manager
+        // fires on publish, never `sink.send` directly.
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w317-fire-conn", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w317-fire-conn", "type": "mqtt_bridge",
+                       "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "w317-fire-rule", "name": "w317-fire-rule",
+                       "sql": "SELECT * FROM \"w317/fire\"",
+                       "actions": ["w317-fire-conn"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let broker_sink: Arc<dyn broker_rules::BrokerSink> = Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w317/fire").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        let matched = state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(matched, 1, "rule must fire on its topic");
+        let rule = state
+            .engine
+            .get_rule("w317-fire-rule")
+            .expect("rule present");
+        assert_eq!(
+            rule.actions_total_cnt.load(Ordering::Relaxed),
+            1,
+            "exactly one forward must attribute"
+        );
+
+        // Cleanup so the shared global store stays tidy. The rule goes
+        // first: a connector still referenced by a rule cannot be
+        // deleted.
+        let _ = server
+            .delete_auth("/api/v5/rules/w317-fire-rule", &token)
+            .await;
+        for stale in [
+            "w317-list-conn",
+            "w317-guarded",
+            "w317-guard-action",
+            "w317-fire-conn",
+        ] {
+            let _ = server
+                .delete_auth(&format!("/api/v5/actions/{stale}"), &token)
+                .await;
+            let _ = server
+                .delete_auth(&format!("/api/v5/connectors/{stale}"), &token)
+                .await;
+        }
+    }
+
     fn fill_pending_challenges(tokens: &crate::v5::auth::ApiTokens, count: usize) {
         for i in 0..count {
             let inserted = tokens.insert_challenge(

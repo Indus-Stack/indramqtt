@@ -1081,9 +1081,93 @@ pub fn seed_connectors_from_registry(
     });
 }
 
-pub async fn list_connectors() -> Response {
-    let list = CONNECTORS.read().unwrap().clone();
-    (StatusCode::OK, Json(list)).into_response()
+/// Upper bound for stored connectors. Creates past this size are rejected
+/// with `BAD_REQUEST` instead of growing the map without limit. Reason:
+/// the list handler clones the whole snapshot once per request, so the
+/// catalogue must stay small and bounded; 512 covers the documented
+/// connector catalogue with headroom while keeping per-request clones
+/// cheap.
+// TODO(parity): is 512 the documented connector cap? The rulebook does not
+// decide the exact bound; 512 is the conservative choice until the
+// conformance checker pins it.
+pub const MAX_CONNECTORS: usize = 512;
+/// Longest accepted connector `id`. Reason: bounds map-key memory per
+/// entry so one create cannot balloon the store.
+const MAX_CONNECTOR_ID_LEN: usize = 256;
+
+/// Render one stored connector with live health, never the write-time
+/// snapshot: `status`/`node_status` are recomputed from the live
+/// connector manager (`engine.connectors()`), so a restart or a later
+/// delete is visible on the next read. Only the inputs persist (see
+/// [`export_connectors_conf`]); display values are derived here per
+/// request. Management-plane only: one short store lock plus lock-free
+/// manager lookups, and publish and deliver never call this.
+fn connector_live_view(
+    body: &serde_json::Value,
+    engine: &broker_rules::RuleEngine,
+) -> serde_json::Value {
+    let mut out = body.clone();
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| body.get("name").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let live = engine.connectors().get(id).is_some();
+    let status = connector_status(live);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.to_string()),
+        );
+        obj.insert("node_status".to_string(), connector_node_status(status));
+    }
+    out
+}
+
+/// `GET /api/v5/connectors` (C07-01): paged list over the real store with
+/// the standard page envelope (`data` plus `meta {page, limit, count,
+/// hasnext}`); an empty store returns an empty page, not an error.
+/// Each row renders live health from the connector manager, not the
+/// write-time snapshot. Unknown query parameters are ignored (the ignored
+/// query sink below; `page`/`limit` come from the shared extractor with
+/// default limit 100, max 1000). Management-plane only: one short lock
+/// cloning at most the capped list per request plus lock-free manager
+/// lookups for health; publish and deliver never touch this store (rule
+/// dispatch reads the manager directly, never this map).
+pub async fn list_connectors(
+    State(state): State<ApiState>,
+    params: PageParams,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    let store = CONNECTORS.read().unwrap();
+    let mut rows: Vec<serde_json::Value> = store
+        .iter()
+        .map(|body| connector_live_view(body, &state.engine))
+        .collect();
+    rows.sort_by(|a, b| {
+        let a_id = a
+            .get("id")
+            .and_then(|v| v.as_str())
+            .or_else(|| a.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let b_id = b
+            .get("id")
+            .and_then(|v| v.as_str())
+            .or_else(|| b.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        a_id.cmp(b_id)
+    });
+    drop(store);
+    let count = rows.len();
+    let page_rows = paginate(&rows, params.page, params.limit);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "data": page_rows,
+            "meta": meta_page(params.page, params.limit, count),
+        })),
+    )
+        .into_response()
 }
 
 pub async fn get_connector(Path(id): Path<String>) -> Response {
@@ -4144,54 +4228,74 @@ fn connector_id_exists(name: &str) -> bool {
     })
 }
 
+/// `POST /api/v5/connectors` (C07-02): validate the body against the
+/// named kind (unknown kind or malformed config rejected with the
+/// documented error shape); a duplicate id is rejected cleanly, never
+/// overwritten. Only the built-in execution path registers a live sink;
+/// non-built-in kinds store config and health first and never claim
+/// execution they lack (their live status reads back `disconnected` until
+/// their follow-up build registers them). Management-plane only: one
+/// short lock per request plus one bounded probe dial at most; publish
+/// and deliver never touch this map (dispatch reads the manager
+/// directly, never this map).
+///
+/// Store bounds (stated here and enforced below): at most
+/// [`MAX_CONNECTORS`] entries (512); creates past the cap are rejected
+/// with `BAD_REQUEST`. Connectors persist across restart via the config
+/// core; live health does not (recomputed per read from the manager).
+// TODO(parity): which per-kind config fields does the spec require beyond
+// the kind being known plus the credential gates in
+// `missing_connector_field`? The rulebook does not decide the exact
+// per-kind schemas; the current choice validates the kind against the
+// kernel registry and the credential gates, storing remaining fields
+// opaquely until the checker pins it.
+// TODO(parity): for an explicit-id create that is both a duplicate and an
+// unknown kind, is the answer the duplicate or the kind error? The
+// rulebook does not decide the precedence; the current choice rejects the
+// duplicate first (existence before validation, mirroring the rule and
+// action creates) until the checker pins it.
 pub async fn create_connector(
     State(state): State<ApiState>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
-    // The connector id is `name`, with `id` accepted as an alias: stored
-    // entries carry both keys with the same value, and reads match either.
-    let name = body
-        .get("name")
-        .and_then(|v| v.as_str())
-        .or_else(|| body.get("id").and_then(|v| v.as_str()))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("connector-{}", rand::random::<u16>()));
-    let raw_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let conn_type = if !raw_type.is_empty() && raw_type != "http" {
-        raw_type.to_string()
-    } else if body.get("bootstrap_hosts").is_some() || name.contains("kafka") {
-        "kafka".to_string()
-    } else if (body.get("server").is_some()
-        && body.get("database").is_some()
-        && !body
-            .get("server")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .contains("3306"))
-        || name.contains("postgres")
-        || name.contains("pgsql")
-    {
-        "pgsql".to_string()
-    } else if (body.get("server").is_some() && body.get("database").is_some())
-        || name.contains("mysql")
-    {
-        "mysql".to_string()
-    } else if body.get("servers").is_some()
-        || body.get("redis_type").is_some()
-        || name.contains("redis")
-    {
-        "redis".to_string()
-    } else if (body.get("url").is_some() && body.get("database").is_some())
-        || name.contains("clickhouse")
-    {
-        "clickhouse".to_string()
-    } else if raw_type == "http" || body.get("url").is_some() {
-        "http".to_string()
-    } else if !raw_type.is_empty() {
-        raw_type.to_string()
-    } else {
-        "http".to_string()
+    let Some(obj_check) = body.as_object() else {
+        return ApiError::BadRequest("request body must be a JSON object".to_string())
+            .into_response();
     };
+    // The connector id is `name`, with `id` accepted as an alias: stored
+    // entries carry both keys with the same value, and reads match either
+    // exactly (no fuzzy matching).
+    let name = obj_check
+        .get("id")
+        .or_else(|| obj_check.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return ApiError::BadRequest("connector id or name is required".to_string())
+            .into_response();
+    }
+    if name.len() > MAX_CONNECTOR_ID_LEN {
+        return ApiError::BadRequest(format!(
+            "connector id holds {} chars, at most {MAX_CONNECTOR_ID_LEN} (field `id`)",
+            name.len()
+        ))
+        .into_response();
+    }
+    let conn_type = obj_check
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if conn_type.is_empty() {
+        return ApiError::BadRequest("missing required field: type".to_string()).into_response();
+    }
+    if !broker_config::is_known_connector_type(&conn_type) {
+        return ApiError::BadRequest(format!("unknown connector type: {conn_type}"))
+            .into_response();
+    }
 
     // Reject a duplicate id before mutating anything: pushing it into
     // the store would poison every later connector POST/PUT/DELETE, whose
@@ -4201,14 +4305,19 @@ pub async fn create_connector(
     // registration below; the write-locked re-check before the push
     // closes the check-then-insert race for the in-memory store.
     if connector_id_exists(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "ALREADY_EXISTS",
-                "message": "Connector already exists."
-            })),
-        )
+        return ApiError::AlreadyExists(format!("connector {name:?} already exists"))
             .into_response();
+    }
+    // Store-cap bound (management-plane, fail closed): an obviously full
+    // store fails without a needless probe or registration attempt.
+    {
+        let live = CONNECTORS.read().unwrap().len();
+        if live >= MAX_CONNECTORS {
+            return ApiError::BadRequest(format!(
+                "connector store holds {live} entries, at most {MAX_CONNECTORS}"
+            ))
+            .into_response();
+        }
     }
 
     // Fail closed (S1-01): a connector without its required credential or
@@ -4229,7 +4338,14 @@ pub async fn create_connector(
     }
 
     let is_reachable = probe_connector_reachable(&body).await;
-    let status_str = connector_status(is_reachable);
+    if is_reachable {
+        register_live_sink(&state.engine, &conn_type, &name, &body).await;
+    }
+    // Live health, never the probe snapshot alone: a kind with no
+    // execution path registers nothing, so it honestly reads back
+    // `disconnected` (stored config first, no claimed execution).
+    let live = state.engine.connectors().get(&name).is_some();
+    let status_str = connector_status(live);
 
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(name.clone()));
@@ -4248,10 +4364,6 @@ pub async fn create_connector(
         obj.insert("node_status".to_string(), connector_node_status(status_str));
     }
 
-    if is_reachable {
-        register_live_sink(&state.engine, &conn_type, &name, &body).await;
-    }
-
     // Re-check under the write lock so two concurrent creates for the
     // same id cannot both pass the early check and push a duplicate pair.
     {
@@ -4260,14 +4372,15 @@ pub async fn create_connector(
             c.get("id").and_then(|v| v.as_str()) == Some(name.as_str())
                 || c.get("name").and_then(|v| v.as_str()) == Some(name.as_str())
         }) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "ALREADY_EXISTS",
-                    "message": "Connector already exists."
-                })),
-            )
+            return ApiError::AlreadyExists(format!("connector {name:?} already exists"))
                 .into_response();
+        }
+        if store.len() >= MAX_CONNECTORS {
+            return ApiError::BadRequest(format!(
+                "connector store holds {} entries, at most {MAX_CONNECTORS}",
+                store.len()
+            ))
+            .into_response();
         }
         store.push(body.clone());
     }
@@ -4353,271 +4466,80 @@ pub async fn update_connector(
 }
 
 pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').next_back().unwrap_or(&id);
-    state.engine.connectors().unregister(&id);
-    state.engine.connectors().unregister(clean_id);
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("redis:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("http:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("kafka:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("pgsql:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("mysql:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("rabbitmq:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("clickhouse:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("influxdb:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("mongodb:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("cassandra:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("cockroachdb:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("couchbase:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("mssql:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("oracle:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("alloydb:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("tdengine:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("greptimedb:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("greptime:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("iotdb:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("opentsdb:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("doris:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("datalayers:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("elasticsearch:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("opensearch:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("pulsar:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("rocketmq:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("confluent:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("disk_log:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("disk:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("opc_ua:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("opcua:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("sparkplug_b:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("sparkplug:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("s3:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("minio:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("s3_tables:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("s3tables:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("kinesis:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("dynamodb:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("timestream:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("redshift:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("aws_iot:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("aws_iot_core:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("azure_blob:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("azure_blob_storage:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("azure_eventhubs:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("azure_event_hubs:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("azure_iot:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("azure_iot_hub:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("gcp_pubsub:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("pubsub:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("bigquery:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("gcp_iot:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("gcp_iot_core:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("databricks:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("delta_lake:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("snowflake:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("tablestore:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("ots:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("oci_streaming:{}", clean_id));
-    state
-        .engine
-        .connectors()
-        .unregister(&format!("oci:{}", clean_id));
+    // Exact id matching only: the path id must equal the stored `id` or
+    // `name` exactly. The previous `split(':')` suffix match is gone: it
+    // let `a:b` delete `b`, which is never correct for operator-owned ids.
+    // TODO(parity): `get_connector`/`update_connector` below still match
+    // the legacy suffix form until their own tasks land; delete is exact
+    // from here on.
+    let exists = CONNECTORS.read().unwrap().iter().any(|c| {
+        c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+            || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
+    });
+    if !exists {
+        return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
+    }
+    // Reference guard: a connector still referenced by a rule forward or
+    // by an action's stored `connector`/`connector_id` field cannot be
+    // dropped while the reference stands. The first referencing owner is
+    // named in the refusal, mirroring the action delete guard.
+    if let Some(rule_id) = state.engine.list_rules().iter().find_map(|rule| {
+        rule.actions
+            .iter()
+            .any(|action| {
+                matches!(
+                    action,
+                    broker_rules::RuleAction::ForwardConnector { connector_id }
+                    if connector_id == &id
+                )
+            })
+            .then(|| rule.id.clone())
+    }) {
+        return ApiError::BadRequest(format!(
+            "connector {id:?} is referenced by rule {rule_id:?}"
+        ))
+        .into_response();
+    }
+    if let Some(action_id) = state.actions.snapshot().iter().find_map(|record| {
+        let params = &record.params;
+        let target = params
+            .get("connector")
+            .or_else(|| params.get("connector_id"))
+            .and_then(|v| v.as_str());
+        (target == Some(id.as_str())).then(|| record.id.clone())
+    }) {
+        return ApiError::BadRequest(format!(
+            "connector {id:?} is referenced by action {action_id:?}"
+        ))
+        .into_response();
+    }
+    // TODO(parity): do sources reference connectors (ingress bindings), or
+    // is the rule/action guard above the complete reference set? The
+    // rulebook does not decide; the current choice guards rules and
+    // actions (the only stores with a connector reference field today)
+    // until the checker pins it.
+    for registered in state.engine.connectors().ids() {
+        if registered == id || registered.ends_with(&format!(":{id}")) {
+            state.engine.connectors().unregister(&registered);
+        }
+    }
 
     let removed = {
         let mut connectors = CONNECTORS.write().unwrap();
         let before = connectors.len();
         connectors.retain(|c| {
-            c.get("id").and_then(|v| v.as_str()) != Some(&id)
-                && c.get("name").and_then(|v| v.as_str()) != Some(&id)
-                && c.get("id").and_then(|v| v.as_str()) != Some(clean_id)
-                && c.get("name").and_then(|v| v.as_str()) != Some(clean_id)
+            c.get("id").and_then(|v| v.as_str()) != Some(id.as_str())
+                && c.get("name").and_then(|v| v.as_str()) != Some(id.as_str())
         });
         connectors.len() != before
     };
+    if !removed {
+        return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
+    }
     // Unknown ids persist nothing; a persist failure after a real removal
     // is a 500 (the in-memory removal stays but the disk save failed).
-    if removed {
-        if let Err(error) = persist_connectors(&state.config) {
-            return connector_persist_error(error);
-        }
+    if let Err(error) = persist_connectors(&state.config) {
+        return connector_persist_error(error);
     }
     StatusCode::NO_CONTENT.into_response()
 }
