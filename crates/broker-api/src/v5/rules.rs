@@ -1,11 +1,12 @@
 //! Streaming SQL rules, data connectors, action sinks, and schema registry for the v5 REST API.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::errors::ApiError;
@@ -309,7 +310,20 @@ pub async fn create_rule(
     }
 }
 
-pub async fn get_rule(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+/// `GET /api/v5/rules/:id`: read one rule (C06-21).
+///
+/// A known id returns the full documented rule fields (`id`, `name`,
+/// `sql`, `from`, `enable`, `actions`) from live engine state; an unknown
+/// id returns 404 with the documented error code, not an empty body. The
+/// pair is not paged; unknown query parameters are ignored (the ignored
+/// query sink below). Management-plane only: one short read lock cloning
+/// at most one small rule per request, and publish and deliver never touch
+/// this map (dispatch reads a snapshot).
+pub async fn get_rule(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
     match state.engine.get_rule(&id) {
         Some(r) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
         _ => (
@@ -323,12 +337,73 @@ pub async fn get_rule(State(state): State<ApiState>, Path(id): Path<String>) -> 
     }
 }
 
+/// `PUT /api/v5/rules/:id`: validated full replace of one rule (C06-22).
+///
+/// The body gets the same compilation as create: it must be a JSON object
+/// carrying the full rule (`sql` required, `actions` as string ids or
+/// `{id,name}` objects validated against the W3-02 action directory,
+/// `enable` as a bool, `name` free-form). The SQL is recompiled before
+/// anything is stored: a malformed body is rejected with the documented
+/// error shape and the old rule is kept. An unknown path id returns 404
+/// and creates nothing. On success the stored entry is swapped for the
+/// recompiled snapshot and the new fields read back with 200.
+///
+/// A body carrying none of `sql`/`from`/`actions`/`name` is treated as a
+/// legacy enable flip (the pre-W3-14 shape): only `enable` is applied, so
+/// existing enable-only callers keep working while full bodies replace.
+///
+/// The path id is authoritative: a body `id`/`name` that names a different
+/// rule is rejected instead of renaming or forking the entry. An omitted
+/// `enable` keeps the stored value; an omitted `name` keeps the stored
+/// name; an omitted `actions` clears to empty (whole-replace semantics).
+/// The `from` array, when present, is accepted but the topic is derived
+/// from the SQL `FROM` clause (the same derivation create uses), so a
+/// conflicting `from` does not fork routing.
+///
+/// The pair is not paged; unknown query parameters are ignored (the
+/// ignored query sink below). Management-plane only: one short write lock
+/// swapping a single recompiled entry (plus the registry save lock on
+/// persist); rule evaluation keeps reading its snapshot and publish and
+/// deliver never touch this map.
+///
+/// Bound (stated here and enforced by construction): a replace never grows
+/// the map, so the [`MAX_RULES`] cap from W3-13 applies unchanged and no
+/// new accumulation is introduced. Rules persist across restart via the
+/// config core; per-rule counters are memory-only and rebuild at zero.
+///
+/// Fire-path cost (stated for the delivery-path note): no new work on
+/// publish or deliver. Dispatch keeps loading one lock-free settings `Arc`
+/// plus one `Arc` each of the disabled-action set and the per-action metric
+/// map per ingress, then clones the matching rule `Arc`s under one short
+/// read lock; this update takes the map lock only on the management plane.
+// TODO(parity): may an update rename the rule (body id differing from the
+// path id), or change only the enable half? The rulebook does not decide
+// the exact PUT field set; the current choice keeps the path id
+// authoritative and replaces the whole entry in place until the checker
+// pins it.
+// TODO(parity): does an omitted `enable` keep the stored value or default
+// to `true`? The rulebook does not decide; the current choice keeps the
+// stored value (a replace must not surprise-disable a rule) until the
+// checker pins it.
+// TODO(parity): does an omitted `actions` clear to empty or keep the
+// stored list? The rulebook does not decide; the current choice clears to
+// empty (whole-replace semantics, mirroring create's default) until the
+// checker pins it.
+// TODO(parity): is the topic taken from the SQL `FROM` clause, from the
+// `from` array, or must both agree? The rulebook does not decide; the
+// current choice derives from SQL (the same derivation create uses) and
+// accepts `from` without forking routing until the checker pins it.
+// TODO(parity): for an unknown id with an invalid body, is the answer 404
+// or 400? The rulebook does not decide the precedence; the current choice
+// answers 404 first (existence before validation, mirroring the action
+// update) and creates nothing either way.
 pub async fn update_rule(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if state.engine.get_rule(&id).is_none() {
+    let Some(existing) = state.engine.get_rule(&id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -337,24 +412,161 @@ pub async fn update_rule(
             })),
         )
             .into_response();
-    }
-    if let Some(enable) = body.get("enable").and_then(|v| v.as_bool()) {
-        // A persist failure must surface as a 500, never as a success:
-        // the in-memory flag applied but the disk save failed.
-        if let Err(error) = state.engine.set_rule_enabled(&id, enable) {
-            return rule_persist_error(error);
+    };
+    let Some(obj) = body.as_object() else {
+        return ApiError::BadRequest("request body must be a JSON object".to_string())
+            .into_response();
+    };
+    if let Some(body_id) = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if body_id != id {
+            return ApiError::BadRequest(format!(
+                "body id {body_id:?} does not match path id {id:?} (field `id`)"
+            ))
+            .into_response();
         }
     }
-    match state.engine.get_rule(&id) {
-        Some(r) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "code": "NOT_FOUND",
-                "message": "Rule not found"
-            })),
-        )
-            .into_response(),
+    let has_full_keys = obj.contains_key("sql")
+        || obj.contains_key("from")
+        || obj.contains_key("actions")
+        || obj.contains_key("name");
+    if !has_full_keys {
+        // Legacy enable-only shape (pre-W3-14): apply only the flag.
+        if let Some(enable) = obj.get("enable").and_then(|v| v.as_bool()) {
+            // A persist failure must surface as a 500, never as a success:
+            // the in-memory flag applied but the disk save failed.
+            match state.engine.set_rule_enabled(&id, enable) {
+                Ok(_) => {}
+                Err(error) => return rule_persist_error(error),
+            }
+        }
+        match state.engine.get_rule(&id) {
+            Some(r) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "code": "NOT_FOUND",
+                    "message": "Rule not found"
+                })),
+            )
+                .into_response(),
+        }
+    } else {
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| existing.name.clone());
+        let Some(sql) = obj
+            .get("sql")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return ApiError::BadRequest("missing required field: sql".to_string()).into_response();
+        };
+        let enable = obj
+            .get("enable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(existing.enabled);
+        let raw_actions: Vec<serde_json::Value> = match obj.get("actions") {
+            None => Vec::new(),
+            Some(value) => match value.as_array() {
+                Some(items) => items.clone(),
+                None => {
+                    return ApiError::BadRequest("field `actions` must be an array".to_string())
+                        .into_response();
+                }
+            },
+        };
+        let topic_str = if sql.contains("FROM \"") {
+            sql.split("FROM \"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("t/#")
+        } else {
+            "t/#"
+        };
+        let topic_filter = match broker_protocol::TopicFilter::new(topic_str) {
+            Ok(filter) => {
+                if topic_str.contains('[') || topic_str.contains(']') {
+                    return ApiError::BadRequest(
+                        "invalid topic filter: bracket characters are not allowed".to_string(),
+                    )
+                    .into_response();
+                }
+                filter
+            }
+            Err(e) => {
+                return ApiError::BadRequest(format!("invalid topic filter: {e}")).into_response();
+            }
+        };
+        let mut actions = Vec::new();
+        for a in &raw_actions {
+            if let Some(id_str) = a.as_str() {
+                if state.actions.get(id_str).is_none() {
+                    return ApiError::BadRequest(format!(
+                        "unknown action {id_str:?} (field `actions`)"
+                    ))
+                    .into_response();
+                }
+                actions.push(broker_rules::RuleAction::ForwardConnector {
+                    connector_id: id_str.to_string(),
+                });
+            } else if let Some(action_obj) = a.as_object() {
+                let Some(conn_id) = action_obj
+                    .get("id")
+                    .or_else(|| action_obj.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return ApiError::BadRequest(
+                        "action entry object must carry an `id` or `name` (field `actions`)"
+                            .to_string(),
+                    )
+                    .into_response();
+                };
+                if state.actions.get(conn_id).is_none() {
+                    return ApiError::BadRequest(format!(
+                        "unknown action {conn_id:?} (field `actions`)"
+                    ))
+                    .into_response();
+                }
+                actions.push(broker_rules::RuleAction::ForwardConnector {
+                    connector_id: conn_id.to_string(),
+                });
+            } else {
+                return ApiError::BadRequest(
+                    "unsupported action entry: expected a string id or an object (field `actions`)"
+                        .to_string(),
+                )
+                .into_response();
+            }
+        }
+        match state
+            .engine
+            .replace_rule(&id, name, topic_filter, Some(sql), enable, actions)
+        {
+            Ok(Some(r)) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "code": "NOT_FOUND",
+                    "message": "Rule not found"
+                })),
+            )
+                .into_response(),
+            Err(error @ broker_rules::RuleEngineError::Persist(_)) => rule_persist_error(error),
+            Err(e) => ApiError::BadRequest(format!("Rule update failed: {e}")).into_response(),
+        }
     }
 }
 

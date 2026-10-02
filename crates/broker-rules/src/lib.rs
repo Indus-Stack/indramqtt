@@ -1577,6 +1577,105 @@ impl RuleEngine {
         Ok(removed)
     }
 
+    /// Replace a stored rule in full (W3-14, C06-22): recompile the new
+    /// SQL before touching the map (malformed bodies are rejected and the
+    /// old rule is kept), then swap one compiled snapshot in place and
+    /// persist. Returns `None` when the id is unknown (caller maps to 404
+    /// and creates nothing). A replace never grows the map toward
+    /// [`broker_config::MAX_RULES`], so an update can never trip the store
+    /// cap. Counters are preserved from the old rule (the same `Arc`s are
+    /// carried over, mirroring the per-action metric continuity across
+    /// config replaces); only delete or an explicit metrics reset zeroes
+    /// them.
+    /// Management-plane only: one short write lock swapping a single
+    /// validated entry (plus the registry save lock on persist); the
+    /// publish path keeps reading its per-ingress snapshot and never takes
+    /// this lock beyond the snapshot clone in `dispatch_ingress`.
+    // TODO(parity): do per-rule counters reset on a full replace, or are
+    // they preserved across updates? The rulebook does not decide; the
+    // current choice preserves them (the same `Arc`s, mirroring the
+    // per-action continuity) until the checker pins it.
+    pub fn replace_rule(
+        &self,
+        id: &str,
+        name: String,
+        topic_filter: TopicFilter,
+        sql_query: Option<String>,
+        enabled: bool,
+        mut actions: Vec<RuleAction>,
+    ) -> Result<Option<Rule>, RuleEngineError> {
+        let old = self.rules.read().get(id).map(|arc| arc.as_ref().clone());
+        let Some(old) = old else {
+            return Ok(None);
+        };
+        let stripped_sql = match &sql_query {
+            Some(sql) => {
+                let (stripped, into_connector) = split_into_connector(sql)?;
+                if let Some(connector_id) = into_connector {
+                    let already = actions.iter().any(|action| {
+                        matches!(action, RuleAction::ForwardConnector { connector_id: cid } if cid == &connector_id)
+                    });
+                    if !already {
+                        actions.push(RuleAction::ForwardConnector { connector_id });
+                    }
+                }
+                Some(stripped)
+            }
+            None => None,
+        };
+        let (parsed_query, std_foreach, std_sources, std_has_wildcard, std_explicit_keys) =
+            match &stripped_sql {
+                Some(sql) => {
+                    let (stmt, foreach, sources, has_wildcard, explicit_keys) =
+                        parse_rule_sql(sql)?;
+                    (Some(stmt), foreach, sources, has_wildcard, explicit_keys)
+                }
+                None => (None, None, Vec::new(), false, Vec::new()),
+            };
+        let tier = match &parsed_query {
+            Some(stmt) if stmt.window.is_some() => RuleTier::Enterprise,
+            _ => RuleTier::Community,
+        };
+        let rule = Rule {
+            id: id.to_string(),
+            name,
+            topic_filter,
+            sql_query,
+            parsed_query,
+            std_foreach,
+            std_sources,
+            std_has_wildcard,
+            std_explicit_keys,
+            tier,
+            enabled,
+            actions,
+            matched_cnt: old.matched_cnt.clone(),
+            passed_cnt: old.passed_cnt.clone(),
+            failed_cnt: old.failed_cnt.clone(),
+            actions_total_cnt: old.actions_total_cnt.clone(),
+            actions_success_cnt: old.actions_success_cnt.clone(),
+            actions_failed_cnt: old.actions_failed_cnt.clone(),
+        };
+        let rule_arc = Arc::new(rule);
+        if let Some(task) = self.rule_tasks.write().remove(id) {
+            *task.status.write() = "stopped".to_string();
+            task.eval.abort();
+            task.feeder.abort();
+            task.sink_worker.abort();
+        }
+        self.rules.write().insert(id.to_string(), rule_arc.clone());
+        if rule_arc.enabled
+            && rule_arc
+                .parsed_query
+                .as_ref()
+                .is_some_and(|stmt| stmt.window.is_some())
+        {
+            self.ensure_rule_task(&rule_arc);
+        }
+        self.persist()?;
+        Ok(Some(rule_arc.as_ref().clone()))
+    }
+
     /// Enable or disable a rule (false when unknown; unknown ids persist
     /// nothing). Persists through the registry when one is attached.
     /// Disabling stops and deletes the rule task first (status flips to

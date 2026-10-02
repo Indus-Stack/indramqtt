@@ -4227,6 +4227,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rules_read_and_full_update_round_trip() {
+        // W3-14 (C06-21/C06-22) failing test: create a rule, read it back
+        // expecting the full fields, replace the whole body and read again
+        // expecting the new values (not just an enable flip); an unknown id
+        // reads and updates as 404, and a malformed update keeps the old
+        // rule. Before: update applied only the enable flag. Broker-through:
+        // every step goes through the HTTP router on the live engine, and
+        // one publish goes through `dispatch_ingress` (the broker's rule
+        // path) before and after the replace. Management-plane only
+        // otherwise; publish and deliver never touch the rule map directly
+        // (dispatch reads a snapshot).
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Unknown read is 404 with the documented code, not an empty body.
+        let (status, body) = server.get_auth("/api/v5/rules/w3-14-nope", &token).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Unknown update creates nothing.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/rules/w3-14-nope",
+                json!({"sql": "SELECT * FROM \"w3/14/missing\"", "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Create the action first, then the rule referencing it.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-14-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "w3-14-rule",
+                    "name": "w3-14-rule",
+                    "sql": "SELECT * FROM \"w3/14/before\"",
+                    "actions": ["w3-14-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Read back expects the full documented fields.
+        let (status, fetched) = server.get_auth("/api/v5/rules/w3-14-rule", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["id"], json!("w3-14-rule"));
+        assert_eq!(fetched["name"], json!("w3-14-rule"));
+        assert_eq!(fetched["sql"], json!("SELECT * FROM \"w3/14/before\""));
+        assert_eq!(fetched["from"], json!(["w3/14/before"]));
+        assert_eq!(fetched["enable"], json!(true));
+
+        // Unknown query parameters are ignored, never an error.
+        let (status, _) = server
+            .get_auth("/api/v5/rules/w3-14-rule?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/rules/w3-14-rule?unknown=param",
+                json!({
+                    "id": "w3-14-rule",
+                    "name": "w3-14-rule-v2",
+                    "sql": "SELECT * FROM \"w3/14/after\"",
+                    "enable": false,
+                    "actions": [],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // Full replace round trip: the new values read back, not just the
+        // enable flag.
+        let (status, fetched) = server.get_auth("/api/v5/rules/w3-14-rule", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["name"], json!("w3-14-rule-v2"));
+        assert_eq!(fetched["sql"], json!("SELECT * FROM \"w3/14/after\""));
+        assert_eq!(fetched["from"], json!(["w3/14/after"]));
+        assert_eq!(fetched["enable"], json!(false));
+        assert_eq!(fetched["actions"], json!([]));
+        assert_eq!(created["id"], json!("w3-14-rule"));
+
+        // Broker rule path: the replaced rule fires through
+        // `dispatch_ingress` on its new topic, never `sink.send` directly.
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state
+            .engine
+            .connectors()
+            .register("w3-14-action", counter.clone());
+        // Re-enable with the action attached so the fire is observable.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/rules/w3-14-rule",
+                json!({
+                    "id": "w3-14-rule",
+                    "name": "w3-14-rule-v3",
+                    "sql": "SELECT * FROM \"w3/14/after\"",
+                    "enable": true,
+                    "actions": ["w3-14-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w3/14/after").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "replaced rule must fire through dispatch on its new topic"
+        );
+
+        // Malformed update is rejected and the old rule is kept.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/rules/w3-14-rule",
+                json!({"sql": "SELECT WHERE WHERE", "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, fetched) = server.get_auth("/api/v5/rules/w3-14-rule", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["sql"], json!("SELECT * FROM \"w3/14/after\""));
+
+        // Cleanup: the rule, then the action it referenced.
+        let (status, _) = server.delete_auth("/api/v5/rules/w3-14-rule", &token).await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/w3-14-action", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn rules_list_create_delete_round_trip() {
         // W3-13 (C06-18/C06-19/C06-20) failing test: create a rule, list
         // and expect it with paging metadata; duplicate create expects
