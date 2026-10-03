@@ -13368,6 +13368,135 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn source_operation_start_stop_round_trip() {
+        // W3-23 (C07-20) broker-through test: create a source via the
+        // `POST /sources` route, stop it through the operation route and
+        // read back disabled from the reported state plus the summary,
+        // start it and read back enabled; an unknown operation is
+        // rejected and an unknown id is 404, both with the documented
+        // shape and a non-empty body. Before: the operation route
+        // returned 404. Every assertion goes through the HTTP router
+        // against the shared store (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`), never at the
+        // store directly. Management-plane only; a live ingress dispatch
+        // through the engine still matches nothing afterwards, so
+        // publish and deliver never touch the source directory.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown id is 404 with the documented shape, not an empty body.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/sources/no-such-source/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Unknown id with an unknown operation is still 404 (existence
+        // before validation) and changes nothing.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/sources/no-such-source/frobnicate",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one source (defaults to enabled).
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "w3-23-src", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Unknown operation is rejected with the documented shape and
+        // changes nothing (the stored flag stays enabled).
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/sources/w3-23-src/frobnicate",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 400, "unknown operation must be rejected");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["enabled"], json!(1));
+        assert_eq!(body["disabled"], json!(0));
+        // Stop: the reported runtime state changes to disabled.
+        let (status, body) = server
+            .send("POST", "/api/v5/sources/w3-23-src/stop", None, Some(&token))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-23-src"));
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["enabled"], json!(0));
+        assert_eq!(body["disabled"], json!(1));
+        // Start: the reported runtime state changes back to enabled.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/sources/w3-23-src/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-23-src"));
+        assert_eq!(body["enable"], json!(true));
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["enabled"], json!(1));
+        assert_eq!(body["disabled"], json!(0));
+        // The message path is untouched: live ingress dispatch still
+        // works and the source directory reports the same counts after.
+        struct W323Sink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for W323Sink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(W323Sink);
+        let topic = broker_protocol::Topic::new("w323/probe").expect("topic");
+        let payload = bytes::Bytes::from_static(b"{}");
+        let matched = state
+            .engine
+            .dispatch_ingress(&topic, &payload, broker_protocol::QoS::AtMostOnce, &sink)
+            .await;
+        assert_eq!(
+            matched, 0,
+            "no stored rule so live dispatch matches nothing"
+        );
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1));
+        let (status, _) = server
+            .delete_auth("/api/v5/sources/w3-23-src", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn removed_schema_registry_routes_return_404() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;

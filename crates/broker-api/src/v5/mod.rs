@@ -680,6 +680,15 @@ pub fn protected_router() -> Router<ApiState> {
         // touch the store.
         .route("/sources", post(sources::create_source))
         .route("/sources/:id", delete(sources::delete_source))
+        // Source lifecycle operation (W3-23, C07-20): `start`/`stop`
+        // dispatch on the source runtime core (enable flip in the live
+        // store). Only supported names are served; unsupported names
+        // are rejected, never claimed. Management-plane only; publish
+        // and deliver never touch the store.
+        .route(
+            "/sources/:id/:operation",
+            post(sources::run_source_operation),
+        )
         .route("/sources_summary", get(sources::get_sources_summary))
         // Schema API for dynamic UI forms
         .route("/schemas", get(schemas::list_schemas))

@@ -1,11 +1,21 @@
 //! Source instance store for the v5 management API.
 //!
 //! Covers `POST /sources` (register one source), `DELETE /sources/:id`
-//! (drop one source) and `GET /sources_summary` (C07-22, aggregated
-//! counts over the live store). Single-node, management-plane only:
-//! the summary is computed on demand from a bounded snapshot clone, so
-//! aggregation never runs on the publish or deliver path and neither
-//! path references this store.
+//! (drop one source), `POST /sources/:id/:operation` (C07-20, run one
+//! lifecycle operation against one source) and `GET /sources_summary`
+//! (C07-22, aggregated counts over the live store). Single-node,
+//! management-plane only: the summary is computed on demand from a
+//! bounded snapshot clone, so aggregation never runs on the publish or
+//! deliver path and neither path references this store.
+//!
+//! Runtime core: the lifecycle state is the stored `enable` flag. `start`
+//! sets it, `stop` clears it; later source tasks reuse [`SourceStore::get`]
+//! and [`SourceStore::set_enabled`] rather than reimplementing the flip.
+//! Ingress runs on its own runtime (a dedicated source task consulting a
+//! snapshot off the message path), never inline on publish or deliver.
+//! Transient run state is memory-only: nothing here persists across a
+//! restart (config persistence lands with the source store task, which
+//! reuses this same flag).
 //!
 //! Store bounds (both stated here and enforced below):
 //! - at most [`MAX_SOURCES`] entries (512: caps management-plane memory
@@ -16,9 +26,29 @@
 //! - every entry is three small fields (`id`, `type`, `enable`), so
 //!   per-entry memory is constant and a summary snapshot clones at most
 //!   the capped list once per request under a short lock.
+// TODO(parity): which operation names does the documented spec serve
+// beyond `start`/`stop` (for example `restart`)? The rulebook does not
+// decide the exact verb set; the current choice serves exactly
+// `start`/`stop` as enable flips (the only lifecycle the kernel tracks,
+// mirroring the connector operation) and rejects everything else with
+// `BAD_REQUEST` until the checker pins it.
+// TODO(parity): are operation names case-sensitive (`START` versus
+// `start`)? The rulebook does not decide; the current choice matches
+// exactly `start`/`stop` in lower case and rejects every other spelling
+// with `BAD_REQUEST` until the checker pins it.
+// TODO(parity): for an unknown id with an unknown operation, is the
+// answer 404 or 400? The rulebook does not decide the precedence; the
+// current choice answers 404 first (existence before validation,
+// mirroring the connector operation) and persists nothing either way.
+// TODO(parity): does a valid operation answer 200 with the updated source
+// or 204 with no body? The rulebook does not decide the exact shape; the
+// current choice returns the updated source with 200 (mirroring the
+// connector operation) so the resulting state is visible without a
+// second read.
 
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -127,6 +157,33 @@ impl SourceStore {
             .remove(id)
             .is_some()
     }
+
+    /// Read one entry by id. Clones at most one small record under a
+    /// short read lock; returns `None` when the id is unknown (caller
+    /// maps to `NOT_FOUND`). Management-plane only; publish and deliver
+    /// never call this.
+    pub fn get(&self, id: &str) -> Option<SourceEntry> {
+        self.inner
+            .read()
+            .expect("source store lock")
+            .get(id)
+            .cloned()
+    }
+
+    /// Flip the enable flag of one entry in place (W3-23, C07-20
+    /// runtime core). Returns the updated record, or `None` when the id
+    /// is unknown (caller maps to `NOT_FOUND` and changes nothing).
+    /// Touches only the single boolean; the id and kind are untouched,
+    /// so the update can never trip the store cap or change validation.
+    /// Later source tasks reuse this flip rather than reimplementing it.
+    /// Management-plane only; publish and deliver never call this
+    /// (ingress consults a snapshot off the message path).
+    pub fn set_enabled(&self, id: &str, enable: bool) -> Option<SourceEntry> {
+        let mut map = self.inner.write().expect("source store lock");
+        let entry = map.get_mut(id)?;
+        entry.enable = enable;
+        Some(entry.clone())
+    }
 }
 
 impl Default for SourceStore {
@@ -212,6 +269,66 @@ pub async fn delete_source(State(state): State<ApiState>, Path(id): Path<String>
     }
 }
 
+/// `POST /api/v5/sources/:id/:operation`: run one named lifecycle
+/// operation against one source (W3-23, C07-20).
+///
+/// Only the operations the runtime supports are served: `start`
+/// (enable the source) and `stop` (disable it). Both flip the stored
+/// enable flag in place via [`SourceStore::set_enabled`] and report the
+/// resulting source with 200 so the state change is visible without a
+/// second read. Later source tasks reuse the same flip (and the same
+/// `get` existence check) rather than reimplementing the runtime.
+///
+/// An unknown source id returns 404 with the documented error code, not
+/// an empty body, and changes nothing; an unknown operation name is
+/// rejected with the documented error shape and changes nothing. The
+/// pair is not paged; unknown query parameters are ignored (no query is
+/// extracted). Management-plane only: one short store read plus one
+/// short write lock cloning at most one small record per request;
+/// ingress runs on its own runtime off the message path, and publish
+/// and deliver never touch this store.
+///
+/// Lifecycle state is memory-only: the enable flag does not persist
+/// across a restart (config persistence lands with the source store
+/// task, which reuses this same flag), and no history is kept, so an
+/// operation never grows anything.
+///
+/// Fire-path cost (stated for the delivery-path note): no new work on
+/// publish or deliver. The operation itself runs entirely on the
+/// management plane; publish and deliver keep paying nothing for
+/// sources (no consult, no lock, no allocation on either path).
+pub async fn run_source_operation(
+    State(state): State<ApiState>,
+    Path((id, operation)): Path<(String, String)>,
+) -> Response {
+    apply_source_operation(&state, &id, &operation)
+}
+
+/// Shared dispatch behind the source operation route: existence check
+/// (unknown id is 404, changes nothing), operation validity check
+/// (unknown name is `BAD_REQUEST`, changes nothing), then the enable
+/// flip with the updated source and 200. Management-plane only; see
+/// the caller for the locking and fire-path notes.
+fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Response {
+    if state.sources.get(id).is_none() {
+        return ApiError::NotFound(format!("source {id:?} not found")).into_response();
+    }
+    let enable = match operation {
+        "start" => true,
+        "stop" => false,
+        _ => {
+            return ApiError::BadRequest(format!(
+                "unknown source operation {operation:?}: expected \"start\" or \"stop\" (field `operation`)"
+            ))
+            .into_response();
+        }
+    };
+    let Some(entry) = state.sources.set_enabled(id, enable) else {
+        return ApiError::NotFound(format!("source {id:?} not found")).into_response();
+    };
+    (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
 /// `GET /api/v5/sources_summary` (C07-22): aggregated counts over the
 /// real source store computed on demand from the live snapshot, never
 /// constants; an empty store returns zeroes, not an error. Not paged
@@ -227,4 +344,53 @@ pub async fn get_sources_summary(State(state): State<ApiState>) -> Response {
         "disabled": disabled,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, enable: bool) -> SourceEntry {
+        SourceEntry {
+            id: id.to_string(),
+            source_type: "mqtt".to_string(),
+            enable,
+        }
+    }
+
+    #[test]
+    fn get_reads_one_entry_and_misses_unknown() {
+        let store = SourceStore::new();
+        assert!(store.get("missing").is_none());
+        assert!(store.insert(entry("a", true)).is_ok());
+        let found = store.get("a").expect("stored source reads back");
+        assert_eq!(found.id, "a");
+        assert!(found.enable);
+        assert!(store.get("nope").is_none());
+    }
+
+    #[test]
+    fn set_enabled_flips_only_the_flag_and_misses_unknown() {
+        let store = SourceStore::new();
+        assert!(store.set_enabled("missing", false).is_none());
+        assert!(store.insert(entry("a", true)).is_ok());
+        let stopped = store.set_enabled("a", false).expect("known id flips");
+        assert!(!stopped.enable);
+        assert_eq!(stopped.id, "a");
+        assert_eq!(stopped.source_type, "mqtt");
+        assert!(!store.get("a").expect("reads back").enable);
+        let started = store.set_enabled("a", true).expect("known id flips");
+        assert!(started.enable);
+        assert!(store.get("a").expect("reads back").enable);
+        assert_eq!(store.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn remove_misses_unknown_after_delete() {
+        let store = SourceStore::new();
+        assert!(store.insert(entry("a", true)).is_ok());
+        assert!(store.remove("a"));
+        assert!(!store.remove("a"));
+        assert!(store.get("a").is_none());
+    }
 }
