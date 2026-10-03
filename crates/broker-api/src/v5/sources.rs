@@ -2,7 +2,9 @@
 //!
 //! Covers `GET /sources` (paged list, C07-12), `POST /sources`
 //! (validated create, C07-13), `DELETE /sources/:id` (drop one source,
-//! C07-14), `POST /sources/:id/:operation` (C07-20, run one lifecycle
+//! C07-14), `GET /sources/:id` (single read, C07-15),
+//! `PUT /sources/:id` (validated replace, C07-16),
+//! `POST /sources/:id/:operation` (C07-20, run one lifecycle
 //! operation against one source) and `GET /sources_summary` (C07-22,
 //! aggregated counts over the live store). Single-node,
 //! management-plane only: the list clones at most the capped entries
@@ -240,6 +242,21 @@ impl SourceStore {
         let entry = map.get_mut(id)?;
         entry.enable = enable;
         Some(entry.clone())
+    }
+
+    /// Replace the entry stored under `id` with a validated snapshot.
+    /// Returns false when the id is unknown (caller maps to `NOT_FOUND`
+    /// and creates nothing). The replace swaps one validated entry in
+    /// place and never grows the map toward [`MAX_SOURCES`], so an
+    /// update can never trip the store cap. Management-plane only;
+    /// publish and deliver never call this.
+    pub fn replace(&self, id: &str, entry: SourceEntry) -> bool {
+        let mut map = self.inner.write().expect("source store lock");
+        if !map.contains_key(id) {
+            return false;
+        }
+        map.insert(id.to_string(), entry);
+        true
     }
 
     /// Export the store as a validated config root: entries sorted by
@@ -485,6 +502,145 @@ pub async fn delete_source(State(state): State<ApiState>, Path(id): Path<String>
     }
 }
 
+/// `GET /api/v5/sources/:id`: read one source (C07-15).
+///
+/// A known id returns the documented source fields (`id`, `type`,
+/// `enable`); an unknown id returns 404 with the documented
+/// `{code, message}` shape, not an empty body. The pair is not paged;
+/// unknown query parameters are ignored (only the ignore sink is
+/// extracted). Management-plane only: one short read lock cloning at
+/// most one small record per request, and publish and deliver never
+/// touch this store.
+///
+/// Store wiring (rulebook section 2): the backing store is
+/// [`SourceStore`], shared with the kernel (`crates/broker-node/src/main.rs`,
+/// `serve_api` share) so management reads observe the kernel's directory;
+/// the driving broker events are source create/replace/delete writes
+/// through this same management plane. Declared `wired` in
+/// `tools/wiring.txt`.
+///
+/// Store bounds (stated here and enforced by construction): a read never
+/// grows the map, so the [`MAX_SOURCES`] cap from W3-26 applies unchanged
+/// and no new accumulation is introduced. Config persists across restart
+/// via the config core; the read itself persists nothing.
+///
+/// Fire-path cost: none. The read is never consulted per message; the
+/// publish path keeps paying nothing for sources (no consult, no lock,
+/// no allocation on either path).
+// TODO(parity): which per-entry fields does the documented single-read
+// shape require beyond `id`/`type`/`enable` (status, node rows, ...)? The
+// rulebook does not decide the exact shape; fields the broker cannot
+// supply are omitted rather than invented, until the checker pins it.
+pub async fn get_source(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    match state.sources.get(&id) {
+        Some(entry) => (StatusCode::OK, Json(entry.to_json())).into_response(),
+        None => ApiError::NotFound(format!("source {id:?} not found")).into_response(),
+    }
+}
+
+/// `PUT /api/v5/sources/:id`: validated replace of one source (C07-16).
+///
+/// The body gets the same validation as create: it must be a JSON
+/// object carrying a known `type` (unknown kind or a missing `type` is
+/// rejected with the documented error shape), and the same id-length
+/// bound applies to the path id. An unknown path id returns 404 and
+/// creates nothing. On success the stored entry is swapped for the
+/// validated snapshot and the new fields read back with 200.
+///
+/// The path id is authoritative: a body `id`/`name` that names a
+/// different source is rejected instead of renaming or forking the
+/// entry. An omitted `enable` defaults to `true`, mirroring create.
+/// The pair is not paged; unknown query parameters are ignored (no
+/// query is extracted). Management-plane only: one short write lock
+/// swapping a single validated entry (plus the registry save lock on
+/// persist); ingress consults a snapshot off the message path, and
+/// publish and deliver never touch this store.
+///
+/// Store wiring (rulebook section 2): same [`SourceStore`] as the read
+/// above (kernel-shared via `serve_api`); the driving broker event is
+/// this management replace itself. Config persists across restart via
+/// the config core (a commit or save failure answers 500 so the loss is
+/// never silent); the replace itself never grows the map toward
+/// [`MAX_SOURCES`], so no new accumulation is introduced.
+///
+/// Fire-path cost: none. The replace swaps a validated snapshot on the
+/// management plane; publish and deliver keep paying nothing for
+/// sources (no consult, no lock, no allocation on either path).
+// TODO(parity): may an update rename the source (body id differing
+// from the path id), or change only the config half? The rulebook does
+// not decide the exact PUT field set; the current choice keeps the path
+// id authoritative and replaces the whole entry in place until the
+// checker pins it.
+// TODO(parity): does an omitted `enable` keep the stored value or
+// default to `true`? The rulebook does not decide; the current choice
+// mirrors create (`true`) until the checker pins it.
+// TODO(parity): for an unknown id with an invalid body, is the answer
+// 404 or 400? The rulebook does not decide the precedence; the current
+// choice answers 404 first (existence before validation, mirroring the
+// connector update) and creates nothing either way.
+pub async fn update_source(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if state.sources.get(&id).is_none() {
+        return ApiError::NotFound(format!("source {id:?} not found")).into_response();
+    }
+    let Some(obj) = body.as_object() else {
+        return ApiError::BadRequest("request body must be a JSON object".to_string())
+            .into_response();
+    };
+    if let Some(body_id) = obj
+        .get("id")
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())
+    {
+        let trimmed = body_id.trim();
+        if !trimmed.is_empty() && trimmed != id {
+            return ApiError::BadRequest(format!(
+                "body id {trimmed:?} does not match path id {id:?} (field `id`)"
+            ))
+            .into_response();
+        }
+    }
+    if id.len() > MAX_SOURCE_ID_LEN {
+        return ApiError::BadRequest(format!(
+            "source id holds {} chars, at most {MAX_SOURCE_ID_LEN} (field `id`)",
+            id.len()
+        ))
+        .into_response();
+    }
+    let kind = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return ApiError::BadRequest("missing required field: type".to_string()).into_response();
+    }
+    if !is_known_source_type(&kind) {
+        return ApiError::BadRequest(format!("unknown source type: {kind}")).into_response();
+    }
+    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    let entry = SourceEntry {
+        id: id.clone(),
+        source_type: kind,
+        enable,
+    };
+    if !state.sources.replace(&id, entry.clone()) {
+        return ApiError::NotFound(format!("source {id:?} not found")).into_response();
+    }
+    if let Err(error) = state.sources.persist() {
+        return source_persist_error(error);
+    }
+    (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
 /// `POST /api/v5/sources/:id/:operation`: run one named lifecycle
 /// operation against one source (W3-23, C07-20).
 ///
@@ -659,6 +815,32 @@ mod tests {
         let started = store.set_enabled("a", true).expect("known id flips");
         assert!(started.enable);
         assert!(store.get("a").expect("reads back").enable);
+        assert_eq!(store.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn replace_swaps_in_place_and_misses_unknown() {
+        let store = SourceStore::new();
+        assert!(!store.replace(
+            "missing",
+            SourceEntry {
+                id: "missing".to_string(),
+                source_type: "mqtt".to_string(),
+                enable: true,
+            }
+        ));
+        assert!(store.insert(entry("a", true)).is_ok());
+        assert!(store.replace(
+            "a",
+            SourceEntry {
+                id: "a".to_string(),
+                source_type: "http".to_string(),
+                enable: false,
+            }
+        ));
+        let found = store.get("a").expect("replaced source reads back");
+        assert_eq!(found.source_type, "http");
+        assert!(!found.enable);
         assert_eq!(store.snapshot().len(), 1);
     }
 

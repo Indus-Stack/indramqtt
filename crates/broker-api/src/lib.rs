@@ -234,7 +234,9 @@ pub struct ApiState {
     pub sso_backends: Arc<crate::v5::sso::SsoStore>,
     /// Source instance directory for `GET /api/v5/sources` (W3-26,
     /// C07-12), `POST /api/v5/sources` (W3-26, C07-13),
-    /// `DELETE /api/v5/sources/{id}` (W3-26, C07-14) and
+    /// `DELETE /api/v5/sources/{id}` (W3-26, C07-14),
+    /// `GET /api/v5/sources/{id}` (W3-27, C07-15),
+    /// `PUT /api/v5/sources/{id}` (W3-27, C07-16) and
     /// `GET /api/v5/sources_summary` (W3-31, C07-22): bounded id-keyed
     /// map validated against the source-kind set, persisted across a
     /// restart via the config core. The routes read one bounded snapshot
@@ -13456,6 +13458,123 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["meta"]["count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn sources_single_read_and_replace_round_trip() {
+        // W3-27 (C07-15/C07-16) broker-through test: create a source via
+        // the W3-26 route, read it back and expect the documented
+        // fields; replace its config and read again expecting the new
+        // values; read an unknown id expecting 404. Every assertion goes
+        // through the HTTP router against the shared store (the same
+        // state the kernel shares in `crates/broker-node/src/main.rs`,
+        // `serve_api`), never at the store directly. Management-plane
+        // only; publish and deliver never touch the source directory.
+        // Before: both single routes returned 404.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown read is 404 with the documented shape, not an empty body.
+        let (status, body) = server
+            .get_auth("/api/v5/sources/no-such-source", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one source via the W3-26 route.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "w3-27-source", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Read hit carries the documented fields.
+        let (status, body) = server
+            .get_auth("/api/v5/sources/w3-27-source", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-27-source"));
+        assert_eq!(body["type"], json!("mqtt"));
+        assert_eq!(body["enable"], json!(true));
+        // Unknown query parameters are ignored on the single read.
+        let (status, _) = server
+            .get_auth("/api/v5/sources/w3-27-source?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        // Replace the stored config with the same validation as create.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/sources/w3-27-source",
+                json!({"type": "http", "enable": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-27-source"));
+        assert_eq!(body["type"], json!("http"));
+        assert_eq!(body["enable"], json!(false));
+        // Read again sees the new values.
+        let (status, body) = server
+            .get_auth("/api/v5/sources/w3-27-source", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], json!("http"));
+        assert_eq!(body["enable"], json!(false));
+        // Update of an unknown id is 404 and creates nothing.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/sources/no-such-source",
+                json!({"type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, _) = server
+            .get_auth("/api/v5/sources/no-such-source", &token)
+            .await;
+        assert_eq!(status, 404);
+        // Unknown kind and malformed bodies are rejected, leaving the
+        // stored entry untouched.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/sources/w3-27-source",
+                json!({"type": "no_such_kind_xyz"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/sources/w3-27-source",
+                json!({"enable": true}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/sources/w3-27-source", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], json!("http"));
+        // Mismatched body id is rejected instead of renaming.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/sources/w3-27-source",
+                json!({"id": "other-source", "type": "http"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Cleanup so the id does not leak into sibling tests sharing
+        // nothing but the name space of fresh servers.
+        let (status, _) = server
+            .delete_auth("/api/v5/sources/w3-27-source", &token)
+            .await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]

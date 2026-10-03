@@ -1,0 +1,82 @@
+[
+  {
+    "operation": "GET /sources/{id}",
+    "path_params": {"id": "conf-src-detail-1"},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/sources/conf-src-detail-1"}},
+      {"api": {"method": "POST", "path": "/sources", "body": {"name": "conf-src-detail-1", "type": "mqtt"}}}
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /sources/{id}",
+    "path_params": {"id": "conf-src-detail-1"},
+    "query": {"unknown": "param"},
+    "body": null,
+    "expect_status": 200,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/sources/conf-src-detail-1"}},
+      {"api": {"method": "POST", "path": "/sources", "body": {"name": "conf-src-detail-1", "type": "mqtt"}}}
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /sources/{id}",
+    "path_params": {"id": "no-such-source-detail"},
+    "query": {},
+    "body": null,
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /sources/{id}",
+    "path_params": {"id": "conf-src-detail-1"},
+    "query": {},
+    "body": {"name": "conf-src-detail-1", "type": "http", "enable": false},
+    "expect_status": 200,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/sources/conf-src-detail-1"}},
+      {"api": {"method": "POST", "path": "/sources", "body": {"name": "conf-src-detail-1", "type": "mqtt"}}}
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /sources/{id}",
+    "path_params": {"id": "no-such-source-detail"},
+    "query": {},
+    "body": {"name": "no-such-source-detail", "type": "http"},
+    "expect_status": 404,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /sources/{id}",
+    "path_params": {"id": "conf-src-detail-1"},
+    "query": {},
+    "body": {"name": "conf-src-detail-1", "type": "no_such_kind_xyz"},
+    "expect_status": 400,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/sources/conf-src-detail-1"}},
+      {"api": {"method": "POST", "path": "/sources", "body": {"name": "conf-src-detail-1", "type": "mqtt"}}}
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /sources/{id}",
+    "path_params": {"id": "conf-src-detail-1"},
+    "query": {},
+    "body": {"name": "conf-src-detail-1"},
+    "expect_status": 400,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/sources/conf-src-detail-1"}},
+      {"api": {"method": "POST", "path": "/sources", "body": {"name": "conf-src-detail-1", "type": "mqtt"}}}
+    ],
+    "cleanup": [
+      {"api": {"method": "DELETE", "path": "/sources/conf-src-detail-1"}}
+    ]
+  }
+]
