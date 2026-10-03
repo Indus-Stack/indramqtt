@@ -595,6 +595,15 @@ pub fn protected_router() -> Router<ApiState> {
             "/connectors/:id/:operation",
             post(rules::run_connector_operation),
         )
+        // Node-scoped connector lifecycle operation (W3-22, C07-09):
+        // single-node execution of the W3-20 operation path guarded by
+        // the shared node-scope helper (unknown nodes are NOT_FOUND).
+        // Management-plane only; publish and deliver never touch the
+        // store.
+        .route(
+            "/nodes/:node/connectors/:id/:operation",
+            post(rules::run_node_connector_operation),
+        )
         // Actions (W3-02, C06-02..C06-04; W3-03, C06-05/C06-06):
         // paged list, validated create and delete with rule-reference
         // refusal, plus single read and validated replace on the real

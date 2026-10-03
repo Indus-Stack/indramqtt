@@ -10,8 +10,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::errors::ApiError;
+use crate::node_scope::resolve_node;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
+
+/// Single-node name rendered by `v5::nodes::list_nodes`. Accepted alongside
+/// [`ApiState::node_id`] until every caller migrates to the configured id
+/// (see `node_scope` docs); both name the same local node.
+const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
 
 // ---------------------------------------------------------------------------
 // Streaming Rules (W3-13, C06-18/C06-19/C06-20): paged list, validated
@@ -4834,6 +4840,64 @@ pub async fn run_connector_operation(
     State(state): State<ApiState>,
     Path((id, operation)): Path<(String, String)>,
 ) -> Response {
+    apply_connector_operation(&state, &id, &operation).await
+}
+
+/// `POST /api/v5/nodes/:node/connectors/:id/:operation`: run one named
+/// lifecycle operation against one connector on one named node (W3-22,
+/// C07-09).
+///
+/// Single-node execution only: the `{node}` segment is checked with the
+/// shared [`resolve_node`] helper against the configured
+/// [`ApiState::node_id`] (falling back to the [`LEGACY_NODE_NAME`] literal
+/// the v5 rows render today); an unknown name returns the helper's 404
+/// `NOT_FOUND` shape naming the node and touches no other state. A known
+/// node dispatches to the same [`apply_connector_operation`] path as the
+/// global `POST /connectors/:id/:operation` route (W3-20), so the reported
+/// state, the 404 for an unknown id, and the rejection of an unknown
+/// operation are identical on both routes.
+///
+/// The pair is not paged; unknown query parameters are ignored (no query
+/// is extracted). Management-plane only: one short store read plus one
+/// short write lock cloning at most one small record per request (plus the
+/// registry save lock on persist) and one lock-free snapshot swap; rule
+/// evaluation reads the snapshot, and publish and deliver never touch this
+/// store.
+///
+/// Bound (stated here and enforced by construction): single-request bounded
+/// work with no wait and no accumulated per-node state. The operation
+/// completes synchronously under short in-memory locks with no remote call,
+/// no retry and no timer, so there is no timeout to tune; node membership
+/// itself is owned elsewhere (exactly one local record) and nothing here
+/// grows with connections, sessions or subscriptions.
+///
+/// Fire-path cost: no new work on publish or deliver. The operation itself
+/// runs entirely on the management plane; the publish path keeps paying
+/// what the enable route already pays (one `Arc` of the disabled set per
+/// ingress plus one `HashSet` lookup per forward, lock-free, no per-fire
+/// allocation).
+// TODO(parity): for an unknown node with an unknown id or operation, is
+// the answer the node 404 or the connector/operation error? The rulebook
+// does not decide the precedence; the current choice answers the node 404
+// first (node scope before connector existence before operation validity,
+// fail closed) and touches nothing else either way.
+// TODO(parity): does the node-scoped answer carry a node envelope or the
+// bare updated connector? The rulebook does not decide the exact shape; the
+// current choice returns the same bare updated connector with 200 as the
+// global route (single-node answer) until the checker pins it.
+pub async fn run_node_connector_operation(
+    State(state): State<ApiState>,
+    Path((node, id, operation)): Path<(String, String, String)>,
+) -> Response {
+    if resolve_node(&state.node_id, &node).is_err()
+        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+    {
+        // Reuse the helper's error so the unknown-node shape stays exactly
+        // the documented `{code: NOT_FOUND, message}` body.
+        return resolve_node(&state.node_id, &node)
+            .expect_err("node already checked as unknown")
+            .into_response();
+    }
     apply_connector_operation(&state, &id, &operation).await
 }
 
