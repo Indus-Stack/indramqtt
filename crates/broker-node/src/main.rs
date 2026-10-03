@@ -1999,12 +1999,13 @@ struct Shared {
     /// path seeds it from the registry and management reads take one
     /// bounded snapshot per request. Publish and deliver never touch it.
     sso_backends: Arc<broker_api::v5::sso::SsoStore>,
-    /// Source instance directory for W3-31 (`POST /sources`,
-    /// `DELETE /sources/{id}`, `GET /sources_summary`): shared with the
-    /// management API so validated creates and deletes are visible to
-    /// summary reads without a restart. One `Arc` clone at boot; the
-    /// summary takes one bounded snapshot clone per request.
-    /// Management-plane only; publish and deliver never touch it.
+    /// Source instance directory for W3-26 (`GET/POST /sources`,
+    /// `DELETE /sources/{id}`) and W3-31 (`GET /sources_summary`):
+    /// shared with the management API so validated creates and deletes
+    /// are visible to list and summary reads without a restart. One
+    /// `Arc` clone at boot; the kernel boot path seeds it from the
+    /// registry and management reads take one bounded snapshot per
+    /// request. Management-plane only; publish and deliver never touch it.
     sources: Arc<broker_api::v5::sources::SourceStore>,
     /// Action instance directory for W3-02 (`GET/POST /actions`,
     /// `DELETE /actions/:id`): shared with the management API so
@@ -5697,10 +5698,10 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // ran inside `ApiState::new`; sharing replaces that fresh instance
     // with the kernel's so no second copy diverges.
     state.sso_backends = shared.sso_backends.clone();
-    // Share the source instance directory (W3-31) so validated
-    // management creates/deletes are visible to `GET /sources_summary`
-    // reads without a restart. One `Arc` clone; management-plane only,
-    // the publish and deliver paths never touch it.
+    // Share the source instance directory (W3-26, W3-31) so validated
+    // management creates/deletes are visible to `GET /sources` and
+    // `GET /sources_summary` reads without a restart. One `Arc` clone;
+    // management-plane only, the publish and deliver paths never touch it.
     state.sources = shared.sources.clone();
     // Share the action instance directory (W3-02) so validated
     // management creates/deletes are visible to `GET /actions` reads
@@ -5923,6 +5924,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot is a no-op (today's empty behaviour: `GET /sso` reads
     // `[]`).
     shared.sso_backends.seed_from_registry(&shared.config);
+    // Source directory (W3-26): seed the shared directory in place (the
+    // same instance `serve_api` shares with `ApiState`), so management
+    // reads observe the persisted sources from the first connection and
+    // mutations persist through the bound registry. An empty snapshot is
+    // a no-op (today's empty behaviour: `GET /sources` reads an empty
+    // page).
+    shared.sources.seed_from_registry(&shared.config);
     // Action directory (W3-02): seed the shared directory in place (the
     // same instance `serve_api` shares with `ApiState`), so management
     // reads observe the persisted actions from the first connection and

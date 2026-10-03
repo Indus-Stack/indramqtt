@@ -153,6 +153,72 @@ pub fn is_known_action_type(kind: &str) -> bool {
     KNOWN_ACTION_TYPES.contains(&kind)
 }
 
+/// Source kinds the kernel can instantiate as ingress.
+///
+/// Mirrors the source-type registry: every executable action kind plus
+/// the `http`/`mqtt` ingress aliases. The unit-test `test` helper has no
+/// runtime and is excluded here; `SourcesConf::validate` uses this list
+/// so a persisted source is always creatable through the API and vice
+/// versa.
+pub const KNOWN_SOURCE_TYPES: &[&str] = &[
+    "alloydb",
+    "aws_iot",
+    "azure_blob",
+    "azure_eventhubs",
+    "azure_iot",
+    "bigquery",
+    "cassandra",
+    "clickhouse",
+    "cockroachdb",
+    "confluent",
+    "console",
+    "couchbase",
+    "databricks",
+    "datalayers",
+    "disk_log",
+    "doris",
+    "dynamodb",
+    "elasticsearch",
+    "gcp_iot",
+    "gcp_pubsub",
+    "greptimedb",
+    "http",
+    "influxdb",
+    "iotdb",
+    "kafka",
+    "kinesis",
+    "mongodb",
+    "mqtt",
+    "mqtt_bridge",
+    "mssql",
+    "mysql",
+    "oci_streaming",
+    "opc_ua",
+    "opentsdb",
+    "oracle",
+    "postgres",
+    "pulsar",
+    "rabbitmq",
+    "redis",
+    "redshift",
+    "rocketmq",
+    "s3",
+    "s3_tables",
+    "snowflake",
+    "sparkplug_b",
+    "tablestore",
+    "tdengine",
+    "timescaledb",
+    "timestream",
+    "webhook",
+];
+
+/// Returns true for a source kind the kernel can instantiate.
+#[must_use]
+pub fn is_known_source_type(kind: &str) -> bool {
+    KNOWN_SOURCE_TYPES.contains(&kind)
+}
+
 /// Returns true for an ACL action the kernel can evaluate
 /// (`publish`, `subscribe` or `all`, case-insensitive).
 #[must_use]
@@ -1802,6 +1868,101 @@ impl ActionsConf {
     }
 }
 
+/// Upper bound for stored ingress sources. Writes past this size are
+/// rejected instead of growing the list without limit. Reason: the
+/// management plane snapshots the whole directory per list request, so
+/// an unbounded list lets one management batch exhaust the kernel; 512
+/// covers the documented ingress catalogue with headroom while keeping
+/// list reads cheap (one short lock, at most the capped small entries).
+// TODO(parity): is 512 the documented source cap, or does the spec allow
+// more entries? The rulebook does not decide the exact bound; 512 is the
+// conservative choice until the conformance checker pins it.
+pub const MAX_SOURCES: usize = 512;
+
+/// Longest accepted source id (256 bytes). Reason: ids are map keys
+/// cloned into every list snapshot and persisted per entry, so an
+/// unbounded id lets one record bloat each list read; 256 covers
+/// operator naming with headroom while keeping per-request clones cheap.
+pub const MAX_SOURCE_ID_LEN: usize = 256;
+
+/// Serde default for a missing source enable flag: historical entries
+/// predate the flag and were always enabled.
+fn default_source_enabled() -> bool {
+    true
+}
+
+/// One stored ingress source: the operator-chosen id, the source kind
+/// it was validated against, and whether it participates. Only the
+/// registry is real in this task; ingress execution consults a snapshot
+/// off the message path and lands with the enable/lifecycle tasks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SourceEntry {
+    /// Source id; must be non-empty and unique within the root.
+    pub id: String,
+    /// Source kind; must name a known source type (field `source_type`).
+    pub source_type: String,
+    /// Whether the source participates (missing entries from
+    /// pre-persistence files load as `true`, the historical behaviour).
+    #[serde(default = "default_source_enabled")]
+    pub enable: bool,
+    /// Opaque kind-specific configuration as a JSON document; may be empty.
+    #[serde(default)]
+    pub config: String,
+}
+
+/// Root: stored ingress sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SourcesConf {
+    #[serde(default)]
+    pub sources: Vec<SourceEntry>,
+}
+
+impl SourcesConf {
+    /// Validates source ids (non-empty, bounded, unique), kinds (known)
+    /// and the registry length cap.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.sources.len() > MAX_SOURCES {
+            return Err(ConfigError::Invalid(format!(
+                "sources.sources holds {} entries, at most {} (field `sources`)",
+                self.sources.len(),
+                MAX_SOURCES
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.sources.len());
+        for (index, entry) in self.sources.iter().enumerate() {
+            if entry.id.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "sources.sources[{index}].id must not be empty (field `id`)"
+                )));
+            }
+            if entry.id.len() > MAX_SOURCE_ID_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "sources.sources[{index}].id {:?} is too long (field `id`)",
+                    entry.id
+                )));
+            }
+            if entry.source_type.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "sources.sources[{index}].source_type must not be empty (field `source_type`)"
+                )));
+            }
+            if !is_known_source_type(&entry.source_type) {
+                return Err(ConfigError::Invalid(format!(
+                    "sources.sources[{index}].source_type {:?} is unknown (field `source_type`)",
+                    entry.source_type
+                )));
+            }
+            if !seen.insert(entry.id.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "sources.sources[{index}].id {:?} is duplicated (field `id`)",
+                    entry.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Most entries accepted in one request-filter list inside the
 /// rule-engine settings (allow/deny CIDRs, deny hosts). Reason: the lists
 /// are cloned into every management snapshot and consulted per connector
@@ -2101,6 +2262,8 @@ pub struct FullSnapshot {
     #[serde(default)]
     pub actions: ActionsConf,
     #[serde(default)]
+    pub sources: SourcesConf,
+    #[serde(default)]
     pub rule_engine: RuleEngineConf,
 }
 
@@ -2120,6 +2283,7 @@ impl FullSnapshot {
         self.api_keys.validate()?;
         self.sso_backends.validate()?;
         self.actions.validate()?;
+        self.sources.validate()?;
         self.rule_engine.validate()?;
         Ok(())
     }
@@ -2154,6 +2318,8 @@ pub enum ConfigRoot {
     SsoBackends(SsoBackendsConf),
     /// Validated rule-engine action registry root.
     Actions(ActionsConf),
+    /// Validated ingress source registry root.
+    Sources(SourcesConf),
     /// Validated rule-engine settings root.
     RuleEngine(RuleEngineConf),
 }
@@ -2245,6 +2411,7 @@ impl ConfigRegistry {
             ConfigRoot::ApiKeys(conf) => self.commit_api_keys(conf),
             ConfigRoot::SsoBackends(conf) => self.commit_sso_backends(conf),
             ConfigRoot::Actions(conf) => self.commit_actions(conf),
+            ConfigRoot::Sources(conf) => self.commit_sources(conf),
             ConfigRoot::RuleEngine(conf) => self.commit_rule_engine(conf),
         }
     }
@@ -2392,6 +2559,17 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits a validated ingress source registry.
+    pub fn commit_sources(&self, conf: SourcesConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.sources = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Commits validated rule-engine settings.
     pub fn commit_rule_engine(&self, conf: RuleEngineConf) -> Result<(), ConfigError> {
         conf.validate()?;
@@ -2520,6 +2698,7 @@ mod tests {
             api_keys: ApiKeysConf::default(),
             sso_backends: SsoBackendsConf::default(),
             actions: ActionsConf::default(),
+            sources: SourcesConf::default(),
             rule_engine: RuleEngineConf::default(),
         }
     }

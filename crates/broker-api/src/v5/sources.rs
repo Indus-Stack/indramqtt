@@ -1,21 +1,24 @@
 //! Source instance store for the v5 management API.
 //!
-//! Covers `POST /sources` (register one source), `DELETE /sources/:id`
-//! (drop one source), `POST /sources/:id/:operation` (C07-20, run one
-//! lifecycle operation against one source) and `GET /sources_summary`
-//! (C07-22, aggregated counts over the live store). Single-node,
-//! management-plane only: the summary is computed on demand from a
-//! bounded snapshot clone, so aggregation never runs on the publish or
-//! deliver path and neither path references this store.
+//! Covers `GET /sources` (paged list, C07-12), `POST /sources`
+//! (validated create, C07-13), `DELETE /sources/:id` (drop one source,
+//! C07-14), `POST /sources/:id/:operation` (C07-20, run one lifecycle
+//! operation against one source) and `GET /sources_summary` (C07-22,
+//! aggregated counts over the live store). Single-node,
+//! management-plane only: the list clones at most the capped entries
+//! per request under a short lock and the summary is computed on demand
+//! from a bounded snapshot clone, so aggregation never runs on the
+//! publish or deliver path and neither path references this store.
 //!
 //! Runtime core: the lifecycle state is the stored `enable` flag. `start`
 //! sets it, `stop` clears it; later source tasks reuse [`SourceStore::get`]
 //! and [`SourceStore::set_enabled`] rather than reimplementing the flip.
 //! Ingress runs on its own runtime (a dedicated source task consulting a
 //! snapshot off the message path), never inline on publish or deliver.
-//! Transient run state is memory-only: nothing here persists across a
-//! restart (config persistence lands with the source store task, which
-//! reuses this same flag).
+//! The registry itself persists across a restart via the config core
+//! (`SourcesConf`, versioned file); every mutation exports the validated
+//! store and saves atomically, and a commit or save failure answers 500
+//! so the loss is never silent.
 //!
 //! Store bounds (both stated here and enforced below):
 //! - at most [`MAX_SOURCES`] entries (512: caps management-plane memory
@@ -23,9 +26,11 @@
 //!   `BAD_REQUEST` instead of growing without limit);
 //! - `id` is capped at [`MAX_SOURCE_ID_LEN`] chars (256: bounds map-key
 //!   memory per entry; longer ids are rejected with `BAD_REQUEST`);
+//! - list paging reuses the shared extractor (default limit 100, max
+//!   1000); the default store is empty;
 //! - every entry is three small fields (`id`, `type`, `enable`), so
-//!   per-entry memory is constant and a summary snapshot clones at most
-//!   the capped list once per request under a short lock.
+//!   per-entry memory is constant and a list/summary snapshot clones at
+//!   most the capped list once per request under a short lock.
 // TODO(parity): which operation names does the documented spec serve
 // beyond `start`/`stop` (for example `restart`)? The rulebook does not
 // decide the exact verb set; the current choice serves exactly
@@ -53,10 +58,11 @@ use axum::{
     Json,
 };
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::errors::ApiError;
 use crate::node_scope::resolve_node;
+use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
 /// Single-node name rendered by `v5::nodes::list_nodes`. Accepted alongside
@@ -66,14 +72,14 @@ const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
 
 /// Upper bound for stored sources. Creates past this size are rejected
 /// with `BAD_REQUEST` instead of growing the map without limit. Reason:
-/// the summary handler clones the whole snapshot once per request, so
-/// the catalogue must stay small and bounded; 512 covers the documented
+/// the list handler clones the whole snapshot once per request, so the
+/// catalogue must stay small and bounded; 512 covers the documented
 /// ingress catalogue with headroom while keeping per-request clones
 /// cheap.
-pub const MAX_SOURCES: usize = 512;
+pub const MAX_SOURCES: usize = broker_config::MAX_SOURCES;
 /// Longest accepted source `id`. Reason: bounds map-key memory per
 /// entry so one create cannot balloon the store.
-const MAX_SOURCE_ID_LEN: usize = 256;
+const MAX_SOURCE_ID_LEN: usize = broker_config::MAX_SOURCE_ID_LEN;
 
 /// One stored source: operator-chosen id, the ingress kind it was
 /// validated against, and whether it is enabled (disabled sources stop
@@ -102,15 +108,22 @@ pub enum SourceInsertError {
     Full,
 }
 
-/// Bounded in-memory source directory keyed by id.
+/// Bounded in-memory source directory keyed by id, persisted through
+/// the config core.
 ///
 /// Single-node map behind one lock; every method finishes quickly.
-/// Management writes take the write lock; the summary read takes one
-/// short lock and clones at most [`MAX_SOURCES`] small entries, so a
-/// management read never blocks messaging (and publish/deliver never
-/// touch this store at all).
+/// Management writes take the write lock plus the registry save lock on
+/// persist; the list read takes one short lock and clones at most
+/// [`MAX_SOURCES`] small entries, so a management read never blocks
+/// messaging (and publish/deliver never touch this store at all).
 pub struct SourceStore {
     inner: RwLock<HashMap<String, SourceEntry>>,
+    /// Kernel config registry receiving every mutation (`None` in unit
+    /// tests and standalone state, which stay memory-only).
+    registry: RwLock<Option<Arc<broker_config::ConfigRegistry>>>,
+    /// Serialises export-commit-save so concurrent mutations cannot
+    /// interleave into a lost update on disk.
+    save_lock: Mutex<()>,
 }
 
 impl SourceStore {
@@ -118,6 +131,44 @@ impl SourceStore {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            registry: RwLock::new(None),
+            save_lock: Mutex::new(()),
+        }
+    }
+
+    /// Seed from the registry's current snapshot and persist every later
+    /// mutation back through it. Kernel boot path; an empty snapshot
+    /// yields today's empty behaviour.
+    pub fn from_registry(registry: &Arc<broker_config::ConfigRegistry>) -> Self {
+        let store = Self::new();
+        store.seed_from_snapshot(&registry.snapshot().sources);
+        *store.registry.write().expect("source store lock") = Some(Arc::clone(registry));
+        store
+    }
+
+    /// Attach the registry and replace the current contents with its
+    /// snapshot, in place on the same instance. Kernel boot path: the
+    /// shared instance `serve_api` hands to `ApiState` must observe the
+    /// persisted sources from the first connection, so seeding runs on
+    /// the shared instance itself. An empty snapshot is a no-op
+    /// (today's empty behaviour).
+    pub fn seed_from_registry(&self, registry: &Arc<broker_config::ConfigRegistry>) {
+        self.seed_from_snapshot(&registry.snapshot().sources);
+        *self.registry.write().expect("source store lock") = Some(Arc::clone(registry));
+    }
+
+    fn seed_from_snapshot(&self, conf: &broker_config::SourcesConf) {
+        let mut map = self.inner.write().expect("source store lock");
+        map.clear();
+        for entry in &conf.sources {
+            map.insert(
+                entry.id.clone(),
+                SourceEntry {
+                    id: entry.id.clone(),
+                    source_type: entry.source_type.clone(),
+                    enable: entry.enable,
+                },
+            );
         }
     }
 
@@ -190,6 +241,43 @@ impl SourceStore {
         entry.enable = enable;
         Some(entry.clone())
     }
+
+    /// Export the store as a validated config root: entries sorted by
+    /// id so the persisted file is deterministic. Each entry carries
+    /// the id, kind and enable flag; kind-specific body fields are not
+    /// stored (the create call keeps only the shared `id`/`type`/`enable`
+    /// envelope, and nothing derived is persisted).
+    fn export_conf(&self) -> broker_config::SourcesConf {
+        let map = self.inner.read().expect("source store lock");
+        let mut entries: Vec<broker_config::SourceEntry> = map
+            .values()
+            .map(|entry| broker_config::SourceEntry {
+                id: entry.id.clone(),
+                source_type: entry.source_type.clone(),
+                enable: entry.enable,
+                config: "{}".to_string(),
+            })
+            .collect();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        broker_config::SourcesConf { sources: entries }
+    }
+
+    /// Commit the exported root and atomically save it. Any commit or
+    /// save failure surfaces so callers answer 500 and the loss is
+    /// never silent (the in-memory mutation stays: commit precedes the
+    /// atomic save). Stores without a registry (unit tests, standalone
+    /// state) are memory-only and persist as a no-op.
+    fn persist(&self) -> Result<(), broker_config::ConfigError> {
+        let registry = self.registry.read().expect("source store lock").clone();
+        let Some(registry) = registry else {
+            return Ok(());
+        };
+        let _guard = self.save_lock.lock().expect("source store lock");
+        let conf = self.export_conf();
+        registry.commit_sources(conf)?;
+        registry.save()?;
+        Ok(())
+    }
 }
 
 impl Default for SourceStore {
@@ -260,10 +348,70 @@ pub async fn list_source_types(Query(_ignored): Query<HashMap<String, String>>) 
         .into_response()
 }
 
+/// Map a store persistence failure onto a 500: the in-memory mutation
+/// applied but the commit or atomic save failed, so the loss must never
+/// be silent.
+fn source_persist_error(error: broker_config::ConfigError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "code": "INTERNAL_ERROR",
+            "message": format!("cannot persist sources: {error}")
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /api/v5/sources`: paged list over the real store with the
+/// standard page envelope (`data` plus `meta {page, limit, count,
+/// hasnext}`); an empty store returns an empty page, not an error.
+/// Unknown query parameters are ignored (only `page`/`limit` are
+/// extracted). Management-plane only; publish and deliver never touch
+/// this store.
+///
+/// Store wiring (rulebook section 2): the backing store is
+/// [`SourceStore`], shared with the kernel (`crates/broker-node/src/main.rs`,
+/// `serve_api` share) so management reads observe the kernel's directory;
+/// the driving broker events are source create/delete/operation writes
+/// through this same management plane. Declared `wired` in
+/// `tools/wiring.txt`.
+///
+/// Store bounds (stated here and enforced by construction): at most
+/// [`MAX_SOURCES`] entries (512: caps management-plane memory; creates
+/// past the cap are rejected); list paging reuses the shared extractor
+/// (default limit 100, max 1000); one bounded snapshot clone per request.
+///
+/// Fire-path cost: none. The list is never consulted per message; the
+/// publish path keeps paying nothing for sources (no consult, no lock,
+/// no allocation on either path).
+// TODO(parity): which per-entry fields does the documented list shape
+// require beyond `id`/`type`/`enable` (status, node rows, ...)? The
+// rulebook does not decide the exact shape; fields the broker cannot
+// supply are omitted rather than invented, until the checker pins it.
+pub async fn list_sources(State(state): State<ApiState>, params: PageParams) -> Response {
+    let entries = state.sources.snapshot();
+    let rows: Vec<serde_json::Value> = entries.iter().map(SourceEntry::to_json).collect();
+    let count = rows.len();
+    let page_rows = paginate(&rows, params.page, params.limit);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "data": page_rows,
+            "meta": meta_page(params.page, params.limit, count),
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /api/v5/sources`: register one source after validating the
 /// body against the named kind. A duplicate id is rejected cleanly,
 /// never overwritten. Management-plane only; publish and deliver never
 /// touch this store.
+// TODO(parity): what per-kind config validation does create require
+// beyond the kind being known? The rulebook does not decide the exact
+// per-kind schemas; the current choice validates the kind against the
+// W3-25 kind registry and keeps the shared `id`/`type`/`enable` envelope
+// until the checker pins it.
 pub async fn create_source(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
@@ -307,7 +455,12 @@ pub async fn create_source(
         source_type: kind,
         enable,
     }) {
-        Ok(entry) => (axum::http::StatusCode::CREATED, Json(entry.to_json())).into_response(),
+        Ok(entry) => {
+            if let Err(error) = state.sources.persist() {
+                return source_persist_error(error);
+            }
+            (axum::http::StatusCode::CREATED, Json(entry.to_json())).into_response()
+        }
         Err(SourceInsertError::Duplicate) => {
             ApiError::AlreadyExists(format!("source {id:?} already exists")).into_response()
         }
@@ -323,6 +476,9 @@ pub async fn create_source(
 /// Management-plane only; publish and deliver never touch this store.
 pub async fn delete_source(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     if state.sources.remove(&id) {
+        if let Err(error) = state.sources.persist() {
+            return source_persist_error(error);
+        }
         axum::http::StatusCode::NO_CONTENT.into_response()
     } else {
         ApiError::NotFound(format!("source {id:?} not found")).into_response()
@@ -348,10 +504,10 @@ pub async fn delete_source(State(state): State<ApiState>, Path(id): Path<String>
 /// ingress runs on its own runtime off the message path, and publish
 /// and deliver never touch this store.
 ///
-/// Lifecycle state is memory-only: the enable flag does not persist
-/// across a restart (config persistence lands with the source store
-/// task, which reuses this same flag), and no history is kept, so an
-/// operation never grows anything.
+/// Lifecycle state persists with the source record (the enable flag in
+/// the config core); transient run state is not kept, so nothing extra
+/// needs clearing across a restart (boot rebuilds the directory from the
+/// persisted flags).
 ///
 /// Fire-path cost (stated for the delivery-path note): no new work on
 /// publish or deliver. The operation itself runs entirely on the
@@ -386,6 +542,9 @@ fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Respon
     let Some(entry) = state.sources.set_enabled(id, enable) else {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
     };
+    if let Err(error) = state.sources.persist() {
+        return source_persist_error(error);
+    }
     (StatusCode::OK, Json(entry.to_json())).into_response()
 }
 
@@ -510,5 +669,37 @@ mod tests {
         assert!(store.remove("a"));
         assert!(!store.remove("a"));
         assert!(store.get("a").is_none());
+    }
+
+    #[test]
+    fn export_round_trips_through_validated_config() {
+        let store = SourceStore::new();
+        assert!(store.insert(entry("src-1", true)).is_ok());
+        let conf = store.export_conf();
+        conf.validate().expect("exported sources must validate");
+        assert_eq!(conf.sources.len(), 1);
+        assert_eq!(conf.sources[0].id, "src-1");
+        assert_eq!(conf.sources[0].source_type, "mqtt");
+    }
+
+    #[test]
+    fn export_rejects_unknown_kind_at_commit() {
+        let conf = broker_config::SourcesConf {
+            sources: vec![broker_config::SourceEntry {
+                id: "src-1".to_string(),
+                source_type: "no_such_kind_xyz".to_string(),
+                enable: true,
+                config: "{}".to_string(),
+            }],
+        };
+        assert!(conf.validate().is_err());
+    }
+
+    #[test]
+    fn known_source_type_follows_the_w3_25_registry() {
+        assert!(is_known_source_type("mqtt"));
+        assert!(is_known_source_type("kafka"));
+        assert!(!is_known_source_type("no_such_kind_xyz"));
+        assert!(!is_known_source_type(""));
     }
 }

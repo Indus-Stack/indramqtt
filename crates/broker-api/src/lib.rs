@@ -232,11 +232,13 @@ pub struct ApiState {
     /// `serve_api` share below). Management-plane only; publish and
     /// deliver never touch this store.
     pub sso_backends: Arc<crate::v5::sso::SsoStore>,
-    /// Source instance directory for `POST /api/v5/sources`,
-    /// `DELETE /api/v5/sources/{id}` and `GET /api/v5/sources_summary`
-    /// (W3-31, C07-22): bounded id-keyed map validated against the
-    /// source-kind set. The routes read one bounded snapshot per
-    /// request; the kernel boot path shares the same instance
+    /// Source instance directory for `GET /api/v5/sources` (W3-26,
+    /// C07-12), `POST /api/v5/sources` (W3-26, C07-13),
+    /// `DELETE /api/v5/sources/{id}` (W3-26, C07-14) and
+    /// `GET /api/v5/sources_summary` (W3-31, C07-22): bounded id-keyed
+    /// map validated against the source-kind set, persisted across a
+    /// restart via the config core. The routes read one bounded snapshot
+    /// per request; the kernel boot path shares the same instance
     /// (`crates/broker-node/src/main.rs`, `serve_api` share below) so
     /// management reads observe the kernel's directory. The summary
     /// counts are computed on demand from the live snapshot, never
@@ -403,6 +405,12 @@ impl ApiState {
             authn_node_cache
                 .apply_settings(current.node_cache.enable, current.node_cache.max_count);
         }
+        // Boot seeding (W3-26): route the loaded sources into a shared
+        // directory so management reads observe the persisted sources
+        // from the first connection. An empty snapshot is a no-op
+        // (today's empty behaviour: an empty store lists as an empty
+        // page).
+        let sources = Arc::new(crate::v5::sources::SourceStore::from_registry(&config));
         // Boot seeding (W3-10): route the loaded rule-engine settings
         // into a shared store so management reads observe the persisted
         // knobs from the first connection, and hot-apply every validated
@@ -457,7 +465,7 @@ impl ApiState {
             api_keys,
             audit: Arc::new(crate::v5::audit::AuditLog::new()),
             sso_backends,
-            sources: Arc::new(crate::v5::sources::SourceStore::new()),
+            sources,
             actions,
             rule_engine_config,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
@@ -13365,6 +13373,132 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["total"], json!(0));
         assert_eq!(body["enabled"], json!(0));
         assert_eq!(body["disabled"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn sources_list_create_delete_round_trip() {
+        // W3-26 (C07-12..C07-14) broker-through test: create a source,
+        // list and expect it present with paging metadata; create the
+        // same id again and expect rejection; delete it and expect a
+        // second delete to be 404. Every assertion goes through the HTTP
+        // router against the shared store, never at the store directly.
+        // Management-plane only; publish and deliver never touch the
+        // source directory.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Empty store returns an empty page, not an error.
+        let (status, body) = server.get_auth("/api/v5/sources", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["limit"], json!(100));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+        // Unknown query parameters are ignored.
+        let (status, _) = server
+            .get_auth("/api/v5/sources?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        // Unknown source kind is rejected with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "bad-kind-source", "type": "no_such_kind_xyz"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "unknown source kind must be 400");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Create one source.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "w3-26-source", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(body["id"], json!("w3-26-source"));
+        assert_eq!(body["type"], json!("mqtt"));
+        // List shows it with paging metadata.
+        let (status, body) = server.get_auth("/api/v5/sources", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+        let ids: Vec<String> = body["data"]
+            .as_array()
+            .expect("list data is an array")
+            .iter()
+            .filter_map(|row| row.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(ids.contains(&"w3-26-source".to_string()));
+        // Duplicate create is rejected cleanly, never overwritten.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "w3-26-source", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "duplicate source id must be rejected");
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        // Delete hit, then miss.
+        let (status, _) = server
+            .delete_auth("/api/v5/sources/w3-26-source", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .delete_auth("/api/v5/sources/w3-26-source", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Store is empty again.
+        let (status, body) = server.get_auth("/api/v5/sources", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn sources_survive_restart() {
+        // W3-26 persistence across a restart through the config core:
+        // register through the broker, reload the same data dir in a
+        // fresh server, and read the source back from the list.
+        let dir = unique_data_dir("w3-26-sources");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "restart-src", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/sources", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        let ids: Vec<String> = body["data"]
+            .as_array()
+            .expect("list data is an array")
+            .iter()
+            .filter_map(|row| row.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(ids.contains(&"restart-src".to_string()));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

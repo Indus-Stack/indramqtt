@@ -678,12 +678,16 @@ pub fn protected_router() -> Router<ApiState> {
         // deliver never touch the registry.
         .route("/source_types", get(sources::list_source_types))
         // Source instances plus the aggregated summary (W3-26 store,
-        // W3-31 C07-22): validated register with duplicate rejection, a
-        // delete with a 404 for unknown ids, and counts computed on
-        // demand from the live snapshot (zeroes when empty, never an
-        // error). Management-plane only; publish and deliver never
-        // touch the store.
-        .route("/sources", post(sources::create_source))
+        // W3-31 C07-22): paged list with the standard page envelope,
+        // validated register with duplicate rejection, a delete with a
+        // 404 for unknown ids, and counts computed on demand from the
+        // live snapshot (zeroes when empty, never an error).
+        // Management-plane only; publish and deliver never touch the
+        // store.
+        .route(
+            "/sources",
+            get(sources::list_sources).post(sources::create_source),
+        )
         .route("/sources/:id", delete(sources::delete_source))
         // Source lifecycle operation (W3-23, C07-20): `start`/`stop`
         // dispatch on the source runtime core (enable flip in the live
