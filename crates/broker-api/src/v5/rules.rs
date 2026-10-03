@@ -792,7 +792,7 @@ fn persist_connectors(
     Ok(())
 }
 
-/// Probe the connector target the way `create_connector` does: entries
+/// Probe the connector target the way boot replay does: entries
 /// without a `server`/`url`/… target never probe and count as reachable;
 /// otherwise a 1.5 s TCP connect decides.
 async fn probe_connector_reachable(body: &serde_json::Value) -> bool {
@@ -1170,26 +1170,58 @@ pub async fn list_connectors(
         .into_response()
 }
 
-pub async fn get_connector(Path(id): Path<String>) -> Response {
-    let clean_id = id.split(':').next_back().unwrap_or(&id);
-    let connectors = CONNECTORS.read().unwrap();
-    if let Some(conn) = connectors.iter().find(|c| {
-        c.get("id").and_then(|v| v.as_str()) == Some(&id)
-            || c.get("name").and_then(|v| v.as_str()) == Some(&id)
-            || c.get("id").and_then(|v| v.as_str()) == Some(clean_id)
-            || c.get("name").and_then(|v| v.as_str()) == Some(clean_id)
-    }) {
-        return (StatusCode::OK, Json(conn.clone())).into_response();
+/// `GET /api/v5/connectors/:id`: read one connector (C07-04).
+///
+/// A known id returns the documented fields (`id`, `name`, `type`,
+/// `enable` plus the stored kind-specific config) with live health
+/// (`status`/`node_status` recomputed from the connector manager, never
+/// the write-time snapshot); an unknown id returns 404 with the
+/// documented `{code, message}` shape, not an empty body. Matching is
+/// exact only: the path id must equal the stored `id` or `name`
+/// exactly, so a near-miss such as `x:<id>` is a 404. The pair is not
+/// paged; unknown query parameters are ignored (the ignored query sink
+/// below). Management-plane only: one short store lock cloning at most
+/// one small entry per request plus lock-free manager lookups, and
+/// publish and deliver never touch this store (dispatch reads the
+/// manager directly, never this map).
+///
+/// Bound (stated here and enforced by construction): a read never grows
+/// the map, so the [`MAX_CONNECTORS`] cap from W3-17 applies unchanged
+/// and no new accumulation is introduced. Connectors persist across
+/// restart via the config core; live health does not (recomputed here
+/// per read from the manager).
+///
+/// Fire-path cost (stated for the delivery-path note): no new work on
+/// publish or deliver. This handler takes no lock on the fire path at
+/// all; the fire path loads the manager directly.
+// TODO(parity): which per-kind config fields does the documented spec
+// require beyond the kind being known plus the credential gates? The
+// rulebook does not decide the exact per-kind schemas; the current
+// choice stores remaining fields opaquely until the checker pins it.
+pub async fn get_connector(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    // Exact id matching only: the path id must equal the stored `id` or
+    // `name` exactly. No suffix splitting: `a:b` must not read `b`.
+    let stored = {
+        let connectors = CONNECTORS.read().unwrap();
+        connectors
+            .iter()
+            .find(|c| {
+                c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
+            })
+            .cloned()
+    };
+    match stored {
+        Some(body) => {
+            let live = connector_live_view(&body, &state.engine);
+            (StatusCode::OK, Json(live)).into_response()
+        }
+        None => ApiError::NotFound(format!("connector {id:?} not found")).into_response(),
     }
-
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "code": "NOT_FOUND",
-            "message": "Connector not found"
-        })),
-    )
-        .into_response()
 }
 
 async fn register_live_sink(
@@ -4235,7 +4267,7 @@ fn connector_id_exists(name: &str) -> bool {
 /// non-built-in kinds store config and health first and never claim
 /// execution they lack (their live status reads back `disconnected` until
 /// their follow-up build registers them). Management-plane only: one
-/// short lock per request plus one bounded probe dial at most; publish
+/// short lock per request plus lock-free manager registration; publish
 /// and deliver never touch this map (dispatch reads the manager
 /// directly, never this map).
 ///
@@ -4301,7 +4333,7 @@ pub async fn create_connector(
     // the store would poison every later connector POST/PUT/DELETE, whose
     // persistence export re-validates the whole store and fails on the
     // duplicated id. The documented conflict code is `ALREADY_EXISTS`.
-    // This early read-check also skips the wasted probe and live-sink
+    // This early read-check also skips the wasted live-sink
     // registration below; the write-locked re-check before the push
     // closes the check-then-insert race for the in-memory store.
     if connector_id_exists(&name) {
@@ -4309,7 +4341,7 @@ pub async fn create_connector(
             .into_response();
     }
     // Store-cap bound (management-plane, fail closed): an obviously full
-    // store fails without a needless probe or registration attempt.
+    // store fails without a needless registration attempt.
     {
         let live = CONNECTORS.read().unwrap().len();
         if live >= MAX_CONNECTORS {
@@ -4337,11 +4369,14 @@ pub async fn create_connector(
             .into_response();
     }
 
-    let is_reachable = probe_connector_reachable(&body).await;
-    if is_reachable {
-        register_live_sink(&state.engine, &conn_type, &name, &body).await;
-    }
-    // Live health, never the probe snapshot alone: a kind with no
+    // Register the live sink on the create event through the same
+    // path boot replay uses: delivery dials its target lazily at send
+    // time, so registration never depends on a point-in-time
+    // reachability probe. A kind with no execution path registers
+    // nothing, so it honestly reads back `disconnected` (stored config
+    // first, no claimed execution).
+    register_live_sink(&state.engine, &conn_type, &name, &body).await;
+    // Live health, never a write-time snapshot: a kind with no
     // execution path registers nothing, so it honestly reads back
     // `disconnected` (stored config first, no claimed execution).
     let live = state.engine.connectors().get(&name).is_some();
@@ -4394,67 +4429,152 @@ pub async fn create_connector(
     (StatusCode::CREATED, Json(body)).into_response()
 }
 
+/// `PUT /api/v5/connectors/:id`: validated replace of one connector (C07-05).
+///
+/// The body gets the same validation as create: it must be a JSON object
+/// carrying a known `type` (unknown kind or a missing `type` is rejected
+/// with the documented error shape), the same id-length bound applies to
+/// the path id, and the same required-credential gate applies (an update
+/// that drops a credential or identity is rejected with the field named).
+/// An unknown path id returns 404 and creates nothing. On success the
+/// stored entry is swapped for the validated snapshot and the new fields
+/// read back with 200, with live health recomputed from the manager.
+///
+/// The path id is authoritative: a body `id`/`name` that names a
+/// different connector is rejected instead of renaming or forking the
+/// entry. An omitted `enable` defaults to `true`, mirroring create. The
+/// pair is not paged; unknown query parameters are ignored (the ignored
+/// query sink below). Management-plane only: one short write lock
+/// swapping a single validated entry (plus the registry save lock on
+/// persist and lock-free manager swaps for the live sink); rule
+/// evaluation keeps reading its snapshot and publish and deliver never
+/// touch this store.
+///
+/// Bound (stated here and enforced by construction): a replace never
+/// grows the map, so the [`MAX_CONNECTORS`] cap from W3-17 applies
+/// unchanged and no new accumulation is introduced. Connectors persist
+/// across restart via the config core; live health does not (recomputed
+/// per read from the manager).
+///
+/// Fire-path cost (stated for the delivery-path note): no new work on
+/// publish or deliver. This handler swaps one validated snapshot on the
+/// management plane; the fire path loads the manager directly.
+// TODO(parity): may an update rename the connector (body id differing
+// from the path id), or change only the config half? The rulebook does
+// not decide the exact PUT field set; the current choice keeps the path
+// id authoritative and replaces the whole entry in place until the
+// checker pins it.
+// TODO(parity): does an omitted `enable` keep the stored value or
+// default to `true`? The rulebook does not decide; the current choice
+// mirrors create (`true`) until the checker pins it.
+// TODO(parity): for an unknown id with an invalid body, is the answer
+// 404 or 400? The rulebook does not decide the precedence; the current
+// choice answers 404 first (existence before validation, mirroring the
+// action update) and creates nothing either way.
 pub async fn update_connector(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
-    let clean_id = id.split(':').next_back().unwrap_or(&id).to_string();
-    let found = {
-        let connectors = CONNECTORS.read().unwrap();
-        connectors.iter().any(|c| {
-            c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-                || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
-                || c.get("id").and_then(|v| v.as_str()) == Some(clean_id.as_str())
-                || c.get("name").and_then(|v| v.as_str()) == Some(clean_id.as_str())
-        })
-    };
-    if !found {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "code": "NOT_FOUND",
-                "message": "Connector not found"
-            })),
-        )
+    // Exact id matching only: the path id must equal the stored `id` or
+    // `name` exactly. No suffix splitting: `a:b` must not update `b`.
+    // Existence before validation: an unknown id is 404 and creates
+    // nothing, even when the body is also invalid.
+    let exists = CONNECTORS.read().unwrap().iter().any(|c| {
+        c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+            || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
+    });
+    if !exists {
+        return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
+    }
+    let Some(obj) = body.as_object() else {
+        return ApiError::BadRequest("request body must be a JSON object".to_string())
             .into_response();
+    };
+    if let Some(body_id) = obj
+        .get("id")
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())
+    {
+        let trimmed = body_id.trim();
+        if !trimmed.is_empty() && trimmed != id {
+            return ApiError::BadRequest(format!(
+                "body id {trimmed:?} does not match path id {id:?} (field `id`)"
+            ))
+            .into_response();
+        }
     }
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "id".to_string(),
-            serde_json::Value::String(clean_id.clone()),
-        );
+    if id.len() > MAX_CONNECTOR_ID_LEN {
+        return ApiError::BadRequest(format!(
+            "connector id holds {} chars, at most {MAX_CONNECTOR_ID_LEN} (field `id`)",
+            id.len()
+        ))
+        .into_response();
     }
-    let conn_type = body
+    let conn_type = obj
         .get("type")
         .and_then(|v| v.as_str())
-        .unwrap_or("http")
+        .unwrap_or("")
+        .trim()
         .to_string();
+    if conn_type.is_empty() {
+        return ApiError::BadRequest("missing required field: type".to_string()).into_response();
+    }
+    if !broker_config::is_known_connector_type(&conn_type) {
+        return ApiError::BadRequest(format!("unknown connector type: {conn_type}"))
+            .into_response();
+    }
     // Fail closed (S1-01): same required-field gate as create; an update
     // that drops a credential or identity is rejected with the field named.
     if let Some(missing) = missing_connector_field(&conn_type, &body) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": format!(
-                    "missing required field: {missing} for connector type {conn_type}"
-                ),
-            })),
-        )
-            .into_response();
+        return ApiError::BadRequest(format!(
+            "missing required field: {missing} for connector type {conn_type}"
+        ))
+        .into_response();
     }
-    register_live_sink(&state.engine, &conn_type, &clean_id, &body).await;
-
+    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    // Swap the live sink first: drop every registration for this id
+    // (bare plus any `kind:id` alias, mirroring delete) so a kind change
+    // leaves no stale alias behind, then re-register through the same
+    // path create uses. Registration never depends on a point-in-time
+    // reachability probe (delivery dials lazily at send time); a kind
+    // with no execution path registers nothing and honestly reads back
+    // `disconnected`.
+    for registered in state.engine.connectors().ids() {
+        if registered == id || registered.ends_with(&format!(":{id}")) {
+            state.engine.connectors().unregister(&registered);
+        }
+    }
+    register_live_sink(&state.engine, &conn_type, &id, &body).await;
+    // Live health, never a write-time snapshot: a kind with no
+    // execution path registers nothing, so it honestly reads back
+    // `disconnected` (stored config first, no claimed execution).
+    let live = state.engine.connectors().get(&id).is_some();
+    let status_str = connector_status(live);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
+        obj.insert("name".to_string(), serde_json::Value::String(id.clone()));
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String(conn_type.clone()),
+        );
+        obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String(status_str.to_string()),
+        );
+        obj.insert("node_status".to_string(), connector_node_status(status_str));
+    }
     {
         let mut connectors = CONNECTORS.write().unwrap();
         if let Some(pos) = connectors.iter().position(|c| {
             c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
                 || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
-                || c.get("id").and_then(|v| v.as_str()) == Some(clean_id.as_str())
-                || c.get("name").and_then(|v| v.as_str()) == Some(clean_id.as_str())
         }) {
             connectors[pos] = body.clone();
+        } else {
+            return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
         }
     }
     // A persist failure is a 500 (the in-memory replacement stays but the
@@ -4469,9 +4589,7 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
     // Exact id matching only: the path id must equal the stored `id` or
     // `name` exactly. The previous `split(':')` suffix match is gone: it
     // let `a:b` delete `b`, which is never correct for operator-owned ids.
-    // TODO(parity): `get_connector`/`update_connector` below still match
-    // the legacy suffix form until their own tasks land; delete is exact
-    // from here on.
+    // Read (C07-04) and replace (C07-05) match exactly the same way.
     let exists = CONNECTORS.read().unwrap().iter().any(|c| {
         c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
             || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())

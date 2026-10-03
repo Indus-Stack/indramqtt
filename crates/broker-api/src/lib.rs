@@ -6225,6 +6225,177 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn w318_connector_detail_read_update_round_trip() {
+        // W3-18 (C07-04/C07-05) failing test: create a connector, read it
+        // back expecting documented fields, update the config and read
+        // again expecting new values; near-miss id expects 404 (no fuzzy
+        // match); unknown id expects 404; invalid bodies are rejected.
+        // Before: fuzzy suffix match (`x:id` read `id`) and update without
+        // create-like validation. Broker-through: every step goes through
+        // the HTTP router on the live engine; create/update register the
+        // live sink (asserted via the manager, driven by the create/update
+        // event) and reads render live health from the manager, never a
+        // write-time snapshot. Management-plane only; publish and deliver
+        // never touch the connector map (dispatch reads the manager
+        // directly, never this map).
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Scrub leftovers from earlier runs sharing the process-global
+        // store so exact-match assertions stay deterministic.
+        for stale in ["w318-detail-conn"] {
+            let _ = server
+                .delete_auth(&format!("/api/v5/connectors/{stale}"), &token)
+                .await;
+        }
+
+        // Create: validated write with documented fields and live health.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w318-detail-conn", "type": "http",
+                       "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "create must succeed, got: {created}");
+        assert_eq!(created["id"], json!("w318-detail-conn"));
+        assert_eq!(created["type"], json!("http"));
+        assert!(created.get("status").and_then(|v| v.as_str()).is_some());
+        assert!(created.get("node_status").is_some());
+        // Live linkage: create registered the sink through the same path
+        // boot replay uses (`crates/broker-api/src/v5/rules.rs`,
+        // `register_live_sink`; the sink lives in
+        // `crates/broker-connectors/src/lib.rs`, `ConnectorManager::register`
+        // at line 543, consulted on the fire path at
+        // `crates/broker-connectors/src/lib.rs`, `ConnectorManager::send`
+        // at line 583 via `dispatch_ingress`).
+        assert!(
+            state.engine.connectors().get("w318-detail-conn").is_some(),
+            "create must register a live sink"
+        );
+
+        // Read hit: documented fields with live health.
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w318-detail-conn", &token)
+            .await;
+        assert_eq!(status, 200, "read hit must succeed, got: {body}");
+        assert_eq!(body["id"], json!("w318-detail-conn"));
+        assert_eq!(body["type"], json!("http"));
+        assert_eq!(body["url"], json!("http://127.0.0.1:9"));
+        assert!(body.get("status").and_then(|v| v.as_str()).is_some());
+        assert!(body.get("node_status").is_some());
+
+        // Unknown query parameters are ignored, never an error.
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/w318-detail-conn?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+
+        // Near-miss ids never fuzzy-match: the legacy `prefix:id` suffix
+        // form is a 404 with the documented error code. Note: a literal
+        // trailing space cannot travel in an HTTP request-target (hyper
+        // rejects it with 400 before routing), so the trailing-space
+        // near-miss is sent percent-encoded (`%20`); axum decodes it to
+        // `"w318-detail-conn "` before the exact-match lookup.
+        for near_miss in [
+            "x:w318-detail-conn",
+            "W318-DETAIL-CONN",
+            "w318-detail-conn%20",
+        ] {
+            let (status, body) = server
+                .get_auth(&format!("/api/v5/connectors/{near_miss}"), &token)
+                .await;
+            assert_eq!(
+                status, 404,
+                "near-miss read {near_miss:?} must miss, got: {body}"
+            );
+            assert_eq!(body["code"], json!("NOT_FOUND"));
+        }
+
+        // Unknown id is 404 with the documented error code.
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w318-no-such", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Update round trip: validated replace, new values read back.
+        let (status, updated) = server
+            .put_auth(
+                "/api/v5/connectors/w318-detail-conn",
+                json!({"name": "w318-detail-conn", "type": "http",
+                       "url": "http://127.0.0.1:10",
+                       "description": "updated by w318"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "update must succeed, got: {updated}");
+        assert_eq!(updated["id"], json!("w318-detail-conn"));
+        assert_eq!(updated["url"], json!("http://127.0.0.1:10"));
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w318-detail-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["url"], json!("http://127.0.0.1:10"));
+        assert_eq!(body["description"], json!("updated by w318"));
+
+        // Update of an unknown id is 404 and creates nothing.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/w318-no-such",
+                json!({"name": "w318-no-such", "type": "http",
+                       "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404, "unknown update must miss, got: {body}");
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/w318-no-such", &token)
+            .await;
+        assert_eq!(status, 404, "failed update must create nothing");
+
+        // Invalid bodies are rejected with the documented error shape and
+        // leave the stored entry untouched.
+        for (label, bad) in [
+            (
+                "unknown kind",
+                json!({"name": "w318-detail-conn", "type": "no_such_kind_xyz"}),
+            ),
+            ("missing type", json!({"name": "w318-detail-conn"})),
+            (
+                "body id mismatch",
+                json!({"id": "w318-other", "name": "w318-other", "type": "http"}),
+            ),
+        ] {
+            let (status, body) = server
+                .put_auth("/api/v5/connectors/w318-detail-conn", bad, &token)
+                .await;
+            assert_eq!(
+                status, 400,
+                "invalid update ({label}) must be rejected, got: {body}"
+            );
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w318-detail-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["url"],
+            json!("http://127.0.0.1:10"),
+            "rejected updates must not mutate the entry"
+        );
+
+        // Cleanup so the shared global store stays tidy.
+        let _ = server
+            .delete_auth("/api/v5/connectors/w318-detail-conn", &token)
+            .await;
+    }
+
     fn fill_pending_challenges(tokens: &crate::v5::auth::ApiTokens, count: usize) {
         for i in 0..count {
             let inserted = tokens.insert_challenge(
