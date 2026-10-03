@@ -474,6 +474,12 @@ pub async fn create_source(
         enable,
     }) {
         Ok(entry) => {
+            // W3-29: register a zeroed per-source metric record and mirror
+            // the flag into the engine's lock-free ingress snapshot so the
+            // first publish after this create attributes through lock-free
+            // atomics (management-plane swaps; the publish path only loads).
+            state.engine.ensure_source_metrics(&id);
+            state.engine.set_source_enabled(&id, enable);
             if let Err(error) = state.sources.persist() {
                 return source_persist_error(error);
             }
@@ -494,6 +500,12 @@ pub async fn create_source(
 /// Management-plane only; publish and deliver never touch this store.
 pub async fn delete_source(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     if state.sources.remove(&id) {
+        // W3-29: drop the per-source metric record so the id reads as
+        // unknown (404) until re-created, which starts again at zero; drop
+        // the id from the ingress snapshot so a later re-create with the
+        // same id starts enabled.
+        state.engine.remove_source_metrics(&id);
+        state.engine.remove_source(&id);
         if let Err(error) = state.sources.persist() {
             return source_persist_error(error);
         }
@@ -636,6 +648,12 @@ pub async fn update_source(
     if !state.sources.replace(&id, entry.clone()) {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
     }
+    // W3-29: keep the metric record registered across replaces (counters
+    // survive a config replace; only delete or reset zeroes them) and
+    // mirror the flag into the ingress snapshot (same lock-free path as
+    // the enable route below).
+    state.engine.ensure_source_metrics(&id);
+    state.engine.set_source_enabled(&id, entry.enable);
     if let Err(error) = state.sources.persist() {
         return source_persist_error(error);
     }
@@ -699,6 +717,11 @@ fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Respon
     let Some(entry) = state.sources.set_enabled(id, enable) else {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
     };
+    // Mirror into the ingress snapshot before persisting: the in-memory
+    // flag is already flipped, so the next ingress must observe it even if
+    // the disk save below fails (the store itself keeps the mutation on a
+    // persist failure and answers 500, never silently).
+    state.engine.set_source_enabled(id, enable);
     if let Err(error) = state.sources.persist() {
         return source_persist_error(error);
     }
@@ -826,10 +849,105 @@ pub async fn set_source_enabled(
     let Some(entry) = state.sources.set_enabled(&id, enable) else {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
     };
+    // Mirror into the ingress snapshot before persisting: the in-memory
+    // flag is already flipped, so the next ingress must observe it even if
+    // the disk save below fails (the store itself keeps the mutation on a
+    // persist failure and answers 500, never silently).
+    state.engine.set_source_enabled(&id, enable);
     if let Err(error) = state.sources.persist() {
         return source_persist_error(error);
     }
     (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
+/// `GET /api/v5/sources/:id/metrics`: live per-source counters (W3-29,
+/// C07-18).
+///
+/// A known id returns the live counters attributed on the ingress path
+/// (`received` while enabled, `dropped` while stopped) with zero defaults
+/// at creation and after a restart. An unknown id returns 404 with the
+/// documented `{code, message}` shape, not an empty body. The pair is not
+/// paged; unknown query parameters are ignored (no query beyond the ignore
+/// sink is extracted). Management-plane only: one short store read plus
+/// lock-free atomic loads; the publish path bumps the same atomics and
+/// never takes this store's lock.
+///
+/// The counter set is fixed per source (two atomics, no history), so a
+/// read never grows anything; gauges (`inflight`, `queuing`), rates
+/// (`rate`, `rate_max`, `rate_last5m`), `retried` and the `dropped.*`
+/// breakdown are omitted because the broker does not track per-source
+/// queue depth, retry state or drop causes, and a constant standing in for
+/// a measurement would be worse than a missing field.
+///
+/// Fire-path cost (stated for the delivery-path note): the publish path
+/// holds one `Arc` of the metric map plus one `Arc` of the disabled set
+/// per ingress, then one `HashSet` lookup plus one relaxed `fetch_add`
+/// per registered source — lock-free atomics only, no lock, no queue, no
+/// per-fire allocation; text rendering stays here in the handler.
+// TODO(parity): which counter names plus envelope shapes does the documented
+// spec require beyond `received`/`dropped` (matched, success, failed, rates,
+// node rows, ...)? The rulebook does not decide the exact shape; the current
+// choice reports the honest live subset the ingress path can attribute
+// (`id` plus `metrics {received, dropped}`) and omits the rest rather than
+// inventing constants, until the checker pins it.
+pub async fn get_source_metrics(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    if state.sources.get(&id).is_none() {
+        return ApiError::NotFound(format!("source {id:?} not found")).into_response();
+    }
+    // The record is registered on create/boot, but a standalone engine or
+    // a race keeps this fail-closed at zero rather than 500.
+    let (received, dropped) = state
+        .engine
+        .source_metrics_snapshot_for(&id)
+        .unwrap_or((0, 0));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": id,
+            "metrics": {
+                "received": received,
+                "dropped": dropped,
+            },
+        })),
+    )
+        .into_response()
+}
+
+/// `PUT /api/v5/sources/:id/metrics/reset`: zero one source's counters
+/// (W3-29, C07-19).
+///
+/// Resets the live counters to zero and reports success with 204 and no
+/// body. Resetting an unknown id is 404 with the documented `{code,
+/// message}` shape, not an empty body. Counters resume from zero on the
+/// next ingress; the reset itself persists only as the zeroed values (the
+/// map is memory-only and restarts at zero by design). The pair is not
+/// paged; unknown query parameters are ignored. Management-plane only: one
+/// short store read plus lock-free atomic stores; increments stay lock-free
+/// atomics and publish/deliver never touch this store.
+// TODO(parity): does the spec report a reset as an empty 204 or as a 200
+// with a body? The rulebook does not decide the exact success shape; the
+// current choice answers 204 with no body, mirroring the sibling rule and
+// action resets, until the checker pins it.
+pub async fn reset_source_metrics(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    if state.sources.get(&id).is_none() {
+        return ApiError::NotFound(format!("source {id:?} not found")).into_response();
+    }
+    if !state.engine.reset_source_metrics(&id) {
+        // The source exists but its record is missing (standalone engine
+        // or a boot race): register a zeroed record and report success so
+        // the reset is still observable as zeroes on the next read.
+        state.engine.ensure_source_metrics(&id);
+        state.engine.reset_source_metrics(&id);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `GET /api/v5/sources_summary` (C07-22): aggregated counts over the

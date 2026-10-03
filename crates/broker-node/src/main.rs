@@ -5931,6 +5931,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a no-op (today's empty behaviour: `GET /sources` reads an empty
     // page).
     shared.sources.seed_from_registry(&shared.config);
+    // Source metrics (W3-29, C07-18/19): mirror the persisted enable flags
+    // into the engine's lock-free ingress snapshot and register a zeroed
+    // per-source metric record for every stored source, so a restart keeps
+    // stopped sources shedding and the first publish after a restart
+    // attributes from zero. Metrics are memory-only by design; an empty
+    // store is a no-op. One snapshot swap each at boot; the publish path
+    // only loads afterwards.
+    {
+        let enables: Vec<(String, bool)> = shared
+            .sources
+            .snapshot()
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.enable))
+            .collect();
+        shared.engine.sync_source_enables(&enables);
+        let ids: Vec<String> = enables.iter().map(|(id, _)| id.clone()).collect();
+        shared.engine.sync_source_metrics(&ids);
+    }
     // Action directory (W3-02): seed the shared directory in place (the
     // same instance `serve_api` shares with `ApiState`), so management
     // reads observe the persisted actions from the first connection and

@@ -713,6 +713,17 @@ pub fn protected_router() -> Router<ApiState> {
             "/sources/:id/enable/:enable",
             put(sources::set_source_enabled),
         )
+        // Per-source metrics (W3-29, C07-18/C07-19): live lock-free
+        // counters attributed on the ingress path, plus a reset that
+        // zeroes them. Unknown ids are 404 with the documented shape;
+        // neither route is paged and unknown query keys are ignored.
+        // Management-plane only; increments stay lock-free atomics and
+        // publish/deliver never touch the source store.
+        .route("/sources/:id/metrics", get(sources::get_source_metrics))
+        .route(
+            "/sources/:id/metrics/reset",
+            put(sources::reset_source_metrics),
+        )
         // Node-scoped source lifecycle operation (W3-24, C07-10):
         // single-node execution of the W3-23 operation path guarded by
         // the shared node-scope helper (unknown nodes are NOT_FOUND).

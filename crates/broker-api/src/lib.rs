@@ -413,6 +413,23 @@ impl ApiState {
         // (today's empty behaviour: an empty store lists as an empty
         // page).
         let sources = Arc::new(crate::v5::sources::SourceStore::from_registry(&config));
+        // Boot seeding (W3-29): mirror the persisted source enable flags
+        // into the engine's lock-free ingress snapshot so a restart keeps
+        // stopped sources shedding from the first publish, and register a
+        // zeroed per-source metric record for every stored source so the
+        // first publish after a restart attributes from zero. Metrics are
+        // memory-only by design (source config itself persists via W3-26);
+        // an empty store is a no-op.
+        {
+            let enables: Vec<(String, bool)> = sources
+                .snapshot()
+                .iter()
+                .map(|entry| (entry.id.clone(), entry.enable))
+                .collect();
+            engine.sync_source_enables(&enables);
+            let ids: Vec<String> = enables.iter().map(|(id, _)| id.clone()).collect();
+            engine.sync_source_metrics(&ids);
+        }
         // Boot seeding (W3-10): route the loaded rule-engine settings
         // into a shared store so management reads observe the persisted
         // knobs from the first connection, and hot-apply every validated
@@ -12948,6 +12965,143 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, _) = server
             .delete_auth("/api/v5/actions/w3-05-action", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn source_metrics_move_on_real_ingress_and_reset_zeroes() {
+        // W3-29 (C07-18/C07-19) broker-through test: create a source via
+        // the W3-26 route, read zeroed metrics, drive real ingress through
+        // `dispatch_ingress` (the broker's rule path, also used by
+        // `crates/broker-node` ingress), read attributed counts, stop the
+        // source and observe shed counts, reset and expect zeroes; unknown
+        // ids are 404. Before: both routes were 404.
+        // The per-source counters live in `broker-rules`
+        // (`RuleEngine::source_metrics`, bumped in `attribute_source_ingress`
+        // on every `dispatch_ingress`), driven by the publish event.
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown ids miss with the documented shape, not an empty body.
+        let (status, body) = server
+            .get_auth("/api/v5/sources/no-such-source/metrics", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/sources/no-such-source/metrics/reset",
+                Some(json!({})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one source via the W3-26 route; metrics start at zero.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "w3-29-source", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .get_auth("/api/v5/sources/w3-29-source/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-29-source"));
+        assert_eq!(body["metrics"]["received"], json!(0));
+        assert_eq!(body["metrics"]["dropped"], json!(0));
+        // Unknown query parameters are ignored on both routes.
+        let (status, _) = server
+            .get_auth("/api/v5/sources/w3-29-source/metrics?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        // Drive real ingress through the source: one publish through
+        // `dispatch_ingress` (the broker's rule path), never constants.
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w3/29/ingress").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        // Counters moved only through the real ingress, never constants.
+        let (status, body) = server
+            .get_auth("/api/v5/sources/w3-29-source/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["received"], json!(1));
+        assert_eq!(body["metrics"]["dropped"], json!(0));
+        // Stopped sources shed into `dropped`: flip via the W3-28 enable
+        // route (which mirrors into the engine snapshot), publish again,
+        // and expect the drop counter to move while `received` holds.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/sources/w3-29-source/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        let (status, body) = server
+            .get_auth("/api/v5/sources/w3-29-source/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["received"], json!(1));
+        assert_eq!(body["metrics"]["dropped"], json!(1));
+        // Reset zeroes and reports success; the next read is zero.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/sources/w3-29-source/metrics/reset",
+                Some(json!({})),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/sources/w3-29-source/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["metrics"]["received"], json!(0));
+        assert_eq!(body["metrics"]["dropped"], json!(0));
+        // Cleanup: delete the source (which drops its metric record, so a
+        // later re-create starts at zero).
+        let (status, _) = server
+            .delete_auth("/api/v5/sources/w3-29-source", &token)
             .await;
         assert_eq!(status, 204);
     }

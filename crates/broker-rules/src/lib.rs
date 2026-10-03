@@ -634,6 +634,62 @@ impl ActionMetrics {
     }
 }
 
+/// Fixed per-source metric counters for one source id (W3-29, C07-18/19).
+///
+/// One record per source id, created by the management plane when the
+/// source is created and dropped when the source is deleted. Both fields
+/// are lock-free atomics bumped on the ingress path
+/// ([`RuleEngine::dispatch_ingress`], driven by every broker publish);
+/// the publish path pays one `HashMap` lookup plus one relaxed
+/// `fetch_add` per registered source, no lock, no per-fire allocation.
+/// Text rendering stays in the management handler. Memory-only by design:
+/// a restart rebuilds the map at zero (source config itself persists
+/// elsewhere). The set is fixed (`received`/`dropped`, default zero); no
+/// unbounded history is kept.
+///
+/// `received` counts ingress observed while the source is enabled;
+/// `dropped` counts ingress observed while the source is stopped (the
+/// enable flag gates ingress, so stopped sources shed instead of
+/// absorbing). Gauges (`inflight`, `queuing`), rates (`rate`, `rate_max`,
+/// `rate_last5m`), `retried` and the `dropped.*` breakdown are deliberately
+/// omitted: the broker does not track per-source queue depth, retry state
+/// or drop causes, and a constant standing in for a measurement would be
+/// worse than a missing field.
+// TODO(parity): which counter names plus envelope shapes does the documented
+// spec require beyond `received`/`dropped` (matched, success, failed, rates,
+// node rows, ...)? The rulebook does not decide the exact shape; the current
+// choice reports the honest live subset the ingress path can attribute and
+// omits the rest rather than inventing constants, until the checker pins it.
+#[derive(Debug, Default)]
+pub struct SourceMetrics {
+    /// Ingress messages attributed to this source while enabled.
+    pub received: AtomicU64,
+    /// Ingress messages shed because the source was stopped.
+    pub dropped: AtomicU64,
+}
+
+impl SourceMetrics {
+    /// Zeroed counters for a freshly created source.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lock-free snapshot of the two counters for management reads.
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.received.load(Ordering::Relaxed),
+            self.dropped.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Zero both counters in place; the record stays registered so the
+    /// next ingress resumes from zero.
+    pub fn reset(&self) {
+        self.received.store(0, Ordering::Relaxed);
+        self.dropped.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Throttle state for one (rule id, connector id) pair: when the last
 /// forward-failure line was logged and how many failures were suppressed
 /// since then.
@@ -754,6 +810,24 @@ pub struct RuleEngine {
     /// the same as the disabled snapshot above — the publish path must
     /// never take a management lock.
     action_metrics: Arc<arc_swap::ArcSwap<HashMap<String, Arc<ActionMetrics>>>>,
+    /// Lock-free snapshot of stopped source ids (W3-29, C07-18/19): the
+    /// management plane swaps the whole set on every source
+    /// create/update/delete/enable/operation, and the publish path loads
+    /// one `Arc` per ingress with no store lock. A single `bool` per source
+    /// lives here as set membership (absent means enabled); no list or
+    /// cache grows on the message path. Reason for `ArcSwap`: the same as
+    /// the action snapshot above — the publish path must never take the
+    /// management store lock.
+    source_disabled: Arc<arc_swap::ArcSwap<HashSet<String>>>,
+    /// Lock-free per-source metric records keyed by source id (W3-29,
+    /// C07-18/19): the management plane swaps the whole map on source
+    /// create/delete, and the publish path loads one `Arc` per ingress
+    /// with no store lock, then bumps lock-free atomics. One fixed-size
+    /// record per source (at most the source-store cap of entries), so no
+    /// list or history grows on the message path. Reason for `ArcSwap`:
+    /// the same as the disabled snapshot above — the publish path must
+    /// never take a management lock.
+    source_metrics: Arc<arc_swap::ArcSwap<HashMap<String, Arc<SourceMetrics>>>>,
     /// Embedded rule runtime transport: one [`rekuiper_core::StreamBus`]
     /// per engine plus its send handle for [`runtime::RULE_INGRESS_STREAM`].
     /// Every windowed rule's task subscribes; the publish path hands each
@@ -1023,6 +1097,8 @@ impl RuleEngine {
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let action_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
         let action_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
+        let source_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
+        let source_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
         let stream_bus = StreamBus::new();
         let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
@@ -1039,6 +1115,8 @@ impl RuleEngine {
             }),
             action_disabled,
             action_metrics,
+            source_disabled,
+            source_metrics,
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
@@ -1067,6 +1145,8 @@ impl RuleEngine {
         let forward_throttle = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let action_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
         let action_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
+        let source_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
+        let source_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
         let stream_bus = StreamBus::new();
         let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
@@ -1083,6 +1163,8 @@ impl RuleEngine {
             }),
             action_disabled,
             action_metrics,
+            source_disabled,
+            source_metrics,
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
@@ -1843,6 +1925,141 @@ impl RuleEngine {
         }
     }
 
+    /// Record one source's enable flag in the lock-free ingress snapshot
+    /// (W3-29, C07-18/19). Management-plane only: the source store owns
+    /// the flag and persistence, this snapshot only mirrors it so the
+    /// publish path never takes the store lock. Enabling removes the id,
+    /// disabling inserts it; unknown ids can be recorded (harmless: no
+    /// record exists to attribute to until one does).
+    pub fn set_source_enabled(&self, id: &str, enabled: bool) {
+        if self.is_source_enabled(id) == enabled {
+            return;
+        }
+        let current = self.source_disabled_snapshot();
+        let mut next = current.as_ref().clone();
+        if enabled {
+            next.remove(id);
+        } else {
+            next.insert(id.to_string());
+        }
+        self.source_disabled.store(Arc::new(next));
+    }
+
+    /// Drop one source id from the ingress snapshot (W3-29, C07-18/19).
+    /// Management-plane only: called after the source store deletes the
+    /// entry so a later re-create with the same id starts enabled.
+    pub fn remove_source(&self, id: &str) {
+        let current = self.source_disabled.load_full();
+        if !current.contains(id) {
+            return;
+        }
+        let mut next = current.as_ref().clone();
+        next.remove(id);
+        self.source_disabled.store(Arc::new(next));
+    }
+
+    /// Replace the whole ingress snapshot from `(id, enable)` pairs
+    /// (W3-29, C07-18/19). Boot path: rebuilds the snapshot from the
+    /// source store after a restart so the persisted flags take effect
+    /// from the first publish. Management-plane/boot only; the publish
+    /// path only loads.
+    pub fn sync_source_enables(&self, enables: &[(String, bool)]) {
+        let mut disabled = HashSet::with_capacity(enables.len());
+        for (id, enabled) in enables {
+            if !enabled {
+                disabled.insert(id.clone());
+            }
+        }
+        self.source_disabled.store(Arc::new(disabled));
+    }
+
+    /// Lock-free snapshot of stopped source ids for the publish path
+    /// (W3-29, C07-18/19): one `Arc` clone, no lock, no allocation beyond
+    /// the refcount bump. Stopped sources shed ingress into `dropped`.
+    pub fn source_disabled_snapshot(&self) -> Arc<HashSet<String>> {
+        self.source_disabled.load_full()
+    }
+
+    /// Whether one source currently absorbs ingress (W3-29, C07-18/19).
+    /// Management-plane/tests helper; the publish path uses
+    /// [`RuleEngine::source_disabled_snapshot`] once per ingress instead.
+    pub fn is_source_enabled(&self, id: &str) -> bool {
+        !self.source_disabled_snapshot().contains(id)
+    }
+
+    /// Ensure a zeroed per-source metric record exists for `id` (W3-29,
+    /// C07-18/19). Management-plane only: called when a source is
+    /// created (or on boot for every stored source). Swaps the whole map;
+    /// the publish path only loads. Existing counters are kept.
+    pub fn ensure_source_metrics(&self, id: &str) {
+        let current = self.source_metrics.load_full();
+        if current.contains_key(id) {
+            return;
+        }
+        let mut next = current.as_ref().clone();
+        next.entry(id.to_string())
+            .or_insert_with(|| Arc::new(SourceMetrics::new()));
+        self.source_metrics.store(Arc::new(next));
+    }
+
+    /// Drop the per-source metric record for `id` (W3-29, C07-18/19).
+    /// Management-plane only: called after the source store deletes the
+    /// entry, so a later re-create starts at zero. Unknown ids are a
+    /// no-op.
+    pub fn remove_source_metrics(&self, id: &str) {
+        let current = self.source_metrics.load_full();
+        if !current.contains_key(id) {
+            return;
+        }
+        let mut next = current.as_ref().clone();
+        next.remove(id);
+        self.source_metrics.store(Arc::new(next));
+    }
+
+    /// Rebuild the whole metric map from the live source ids (W3-29,
+    /// C07-18/19). Boot path: every stored source gets a zeroed record so
+    /// the first publish after a restart attributes from zero. Metrics
+    /// never persist: the map is always rebuilt at zero, never loaded from
+    /// disk. Management-plane/boot only; the publish path only loads.
+    pub fn sync_source_metrics(&self, ids: &[String]) {
+        let mut next = HashMap::with_capacity(ids.len());
+        for id in ids {
+            next.insert(id.clone(), Arc::new(SourceMetrics::new()));
+        }
+        self.source_metrics.store(Arc::new(next));
+    }
+
+    /// Lock-free snapshot of the per-source metric map for the publish
+    /// path (W3-29, C07-18/19): one `Arc` clone, no lock, no allocation
+    /// beyond the refcount bump. Callers hold the snapshot across one
+    /// ingress and bump atomics through it.
+    pub fn source_metrics_snapshot(&self) -> Arc<HashMap<String, Arc<SourceMetrics>>> {
+        self.source_metrics.load_full()
+    }
+
+    /// Lock-free read of one source's counters for management handlers.
+    /// Returns `None` when the id has no record (caller maps to 404).
+    /// One `Arc` clone plus one `HashMap` lookup plus two relaxed
+    /// loads; no lock, no allocation beyond the refcount bump.
+    pub fn source_metrics_snapshot_for(&self, id: &str) -> Option<(u64, u64)> {
+        let snapshot = self.source_metrics.load_full();
+        snapshot.get(id).map(|record| record.snapshot())
+    }
+
+    /// Zero one source's counters in place (W3-29, C07-19). Returns false
+    /// when the id has no record (caller maps to 404 and creates
+    /// nothing). Lock-free atomic stores; the record stays registered.
+    pub fn reset_source_metrics(&self, id: &str) -> bool {
+        let snapshot = self.source_metrics.load_full();
+        match snapshot.get(id) {
+            Some(record) => {
+                record.reset();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Lock-free snapshot of the rule-engine settings for the publish path
     /// (W3-10): one `Arc` clone, no lock, no allocation beyond the
     /// refcount bump. The engine reads this snapshot per ingress, never
@@ -2158,6 +2375,17 @@ impl RuleEngine {
         // bump). Forward outcomes attribute through it below and in
         // `BrokerRuleSink::emit` for window flushes.
         let action_metrics = self.action_metrics_snapshot();
+        // W3-29: one lock-free `Arc` clone each of the per-source metric
+        // map and the stopped-source set per ingress (no store lock, no
+        // allocation beyond the refcount bumps). Every registered source
+        // observes every ingress: enabled sources count `received`,
+        // stopped sources shed into `dropped`. Sources observe raw
+        // ingress, so this runs whether or not any rule matches.
+        let source_metrics = self.source_metrics_snapshot();
+        if !source_metrics.is_empty() {
+            let source_disabled = self.source_disabled_snapshot();
+            attribute_source_ingress(&source_metrics, &source_disabled);
+        }
         for rule in &matched {
             rule.matched_cnt.fetch_add(1, Ordering::Relaxed);
         }
@@ -2233,6 +2461,26 @@ impl RuleEngine {
             let _ = self.input.try_push(durability);
         }
         matched.len()
+    }
+}
+
+/// Attribute one broker ingress to every registered source (W3-29,
+/// C07-18/19): enabled sources count `received`, stopped sources shed into
+/// `dropped`. Runs on the publish path inside
+/// [`RuleEngine::dispatch_ingress`], so it pays no lock and no per-fire
+/// allocation: one `HashSet` lookup plus one relaxed `fetch_add` per
+/// registered source (at most the source-store cap of records). The caller
+/// holds the lock-free snapshots across the call.
+fn attribute_source_ingress(
+    source_metrics: &HashMap<String, Arc<SourceMetrics>>,
+    source_disabled: &HashSet<String>,
+) {
+    for (id, record) in source_metrics.iter() {
+        if source_disabled.contains(id) {
+            record.dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            record.received.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
