@@ -672,6 +672,11 @@ pub fn protected_router() -> Router<ApiState> {
         // against the named kind and dials where the kind supports it.
         // Management-plane only; publish and deliver never touch it.
         .route("/sources_probe", post(rules::probe_source))
+        // Source-type catalogue (W3-25, C07-11): bare list over the real
+        // source-type registry in `broker-connectors`. Not paged; unknown
+        // query keys are ignored. Management-plane only; publish and
+        // deliver never touch the registry.
+        .route("/source_types", get(sources::list_source_types))
         // Source instances plus the aggregated summary (W3-26 store,
         // W3-31 C07-22): validated register with duplicate rejection, a
         // delete with a 404 for unknown ids, and counts computed on

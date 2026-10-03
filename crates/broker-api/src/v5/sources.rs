@@ -47,7 +47,7 @@
 // second read.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -199,11 +199,65 @@ impl Default for SourceStore {
 }
 
 /// Source kinds mirror the connector backend families (ingress versus
-/// egress over the same backends), so validation reuses the connector
-/// registry rather than a second list that could drift from the
-/// runtimes (same set the stateless source probe checks).
+/// egress over the same backends), so validation reads the shared W3-25
+/// source-type registry rather than a second list that could drift from
+/// the runtimes (same set the catalogue serves and the stateless source
+/// probe checks). A kind is listed only if its runtime exists; the `test`
+/// helper has none and is rejected.
 fn is_known_source_type(kind: &str) -> bool {
-    broker_config::is_known_connector_type(kind)
+    broker_connectors::is_known_source_type(kind)
+}
+
+/// `GET /api/v5/source_types` (C07-11): catalogue of supported source
+/// kinds with the documented per-entry fields.
+///
+/// Returns the bare list (not paged): an empty registry reads as `[]`,
+/// never an error. Unknown query parameters are ignored (only the ignore
+/// sink is extracted). A kind is listed only if its runtime exists (the
+/// shared W3-25 registry in `broker-connectors`: every executable sink
+/// kind plus the `http`/`mqtt` ingress aliases, never the `test`
+/// helper), so adding a runtime elsewhere automatically extends the
+/// served list. Management-plane only: reads a static registry, takes no
+/// lock, and publish/deliver never touch it.
+///
+/// Store wiring (rulebook section 2): no store. The catalogue is the
+/// source-type registry itself, shared with the [`is_known_source_type`]
+/// predicate above (and the source store validation plus the stateless
+/// probe) so the served list and the checks cannot drift. There is no
+/// broker event driving it beyond serving the management read, and
+/// nothing outside `crates/broker-api` writes or consults it, so
+/// `tools/wiring_check.sh` needs no new entry (it only tracks
+/// `Arc<crate::v5::...>` store fields on `ApiState`, of which this task
+/// adds none).
+///
+/// Store bounds (stated here and enforced by construction):
+/// - at most [`broker_connectors::MAX_SOURCE_TYPES`] entries (64: caps
+///   management-plane memory; the built-in set is exactly
+///   [`broker_connectors::SOURCE_TYPE_COUNT`]);
+/// - an empty catalogue reads as an empty list (`[]`), never an error;
+/// - reads clone at most one small document per kind (three short
+///   strings) with no lock held.
+///
+/// Fire-path cost: none. The catalogue is never consulted per message;
+/// the publish path keeps paying what message ingress already pays (the
+/// rule match in `dispatch_ingress`) with no new lock, allocation or
+/// queue from this route.
+// TODO(parity): which per-entry fields does the documented catalogue shape
+// require beyond `kind`/`description`/`configuration` (columns, schema,
+// ...)? The rulebook does not decide the exact shape; fields the broker
+// cannot supply are omitted rather than invented, until the checker pins
+// it.
+// TODO(parity): which kinds have dedicated ingress readers versus the
+// generic enable-flag runtime? The rulebook does not decide the exact
+// ingress split; the current choice lists every backend family the kernel
+// can instantiate minus the `test` helper, until the checker pins it.
+pub async fn list_source_types(Query(_ignored): Query<HashMap<String, String>>) -> Response {
+    let catalogue = broker_connectors::source_types_catalogue();
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(catalogue).unwrap_or_default()),
+    )
+        .into_response()
 }
 
 /// `POST /api/v5/sources`: register one source after validating the

@@ -5385,12 +5385,12 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
 pub const SOURCE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Source-kind validation for the probe (the W3-25 kind set): a kind is
-/// listed only if the kernel can instantiate it. Source kinds mirror the
-/// connector backend families (ingress versus egress over the same backends),
-/// so this reuses the connector registry rather than a second list that
-/// could drift from the runtimes.
+/// listed only if the kernel can instantiate it. Reads the shared W3-25
+/// source-type registry in `broker-connectors` (same set the catalogue
+/// serves and the source store validates against) so the three cannot
+/// drift.
 fn is_known_source_type(kind: &str) -> bool {
-    broker_config::is_known_connector_type(kind)
+    broker_connectors::is_known_source_type(kind)
 }
 
 /// Stateless source probe: validates the config against the named kind and

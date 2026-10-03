@@ -1741,3 +1741,177 @@ const _: () = assert!(
 pub fn action_types_catalogue() -> Vec<ActionTypeInfo> {
     ACTION_TYPES_CATALOGUE.to_vec()
 }
+
+/// Upper bound on the source-types catalogue size (spec C07-11).
+///
+/// Reason: the list handler clones the whole snapshot once per request,
+/// so the catalogue must stay small and bounded; 64 covers the built-in
+/// ingress set (the executable sink set plus the `http`/`mqtt` ingress
+/// aliases) with headroom while keeping per-request clones cheap. The
+/// default is finite (exactly [`SOURCE_TYPE_COUNT`]); the operator never
+/// opts into unlimited because writes are out of scope (read-only route).
+pub const MAX_SOURCE_TYPES: usize = 64;
+
+/// Stated count of the built-in source set served today. Reason: one entry
+/// per source kind the kernel can instantiate (the executable sink set
+/// plus the `http`/`mqtt` ingress aliases, minus the `test` helper which
+/// has no runtime); the count documents the bound the handler enforces.
+pub const SOURCE_TYPE_COUNT: usize = ACTION_TYPES_CATALOGUE.len() + 2;
+
+/// Catalogue entry for one source type (ingress kind) with configuration
+/// shape hints. This is a static snapshot of what the kernel can
+/// instantiate as a source; it does not depend on runtime registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceTypeInfo {
+    /// Stable kind name (e.g., "mqtt", "http", "kafka").
+    pub kind: &'static str,
+    /// Human-readable description of the ingress kind.
+    pub description: &'static str,
+    /// Configuration shape hints: each accepted config key mapped to a
+    /// one-line description. Empty means the kind needs no extra keys
+    /// beyond the shared `id`/`type`/`enable` envelope.
+    #[serde(serialize_with = "serialize_config_map")]
+    pub configuration: &'static [(&'static str, &'static str)],
+}
+
+// Compile-time guard that the bound covers the served registry: the
+// action set plus the two ingress aliases must fit in the cap.
+const _: () = assert!(
+    ACTION_TYPES_CATALOGUE.len() + 2 <= MAX_SOURCE_TYPES,
+    "source types catalogue exceeds its bound"
+);
+
+/// Extra ingress aliases served only as sources, not as actions.
+/// `http` shares the webhook dial path (`HttpWebhookSink` in this crate);
+/// `mqtt` ingress is the broker's own message ingress
+/// (`RuleEngine::dispatch_ingress` in `broker-rules`, driven by every
+/// published message via the kernel ingress pipeline). Both are real
+/// runtimes: `http` dials its `url` on probe, `mqtt` validates by kind
+/// alone, and both flip the W3-23 enable flag in the live source store.
+const SOURCE_TYPE_ALIASES: &[SourceTypeInfo] = &[
+    SourceTypeInfo {
+        kind: "http",
+        description: "HTTP ingress source",
+        configuration: &[("url", "Source URL")],
+    },
+    SourceTypeInfo {
+        kind: "mqtt",
+        description: "MQTT ingress source",
+        configuration: &[
+            ("server", "Source broker address"),
+            ("topic", "Topic filter to subscribe"),
+        ],
+    },
+];
+
+/// Returns the complete catalogue of source types the kernel can instantiate.
+///
+/// Built from the real registries, not a second list that could drift:
+/// every executable sink kind in [`ACTION_TYPES_CATALOGUE`] plus the two
+/// ingress aliases above. A kind is listed only if its runtime exists —
+/// a connector module (or the shared webhook dial path for `http`, the
+/// broker ingress for `mqtt`) plus the W3-23 enable-flag runtime and the
+/// W3-30 probe dial hook. The unit-test `test` helper has no runtime and
+/// is never listed. The catalogue is bounded (max [`MAX_SOURCE_TYPES`])
+/// and does not grow at runtime.
+// TODO(parity): which kinds have dedicated ingress readers (per-kind poll
+// loops) versus the generic store enable-flag runtime? The rulebook does
+// not decide the exact ingress split; the current choice lists every
+// backend family the kernel can instantiate (ingress versus egress over
+// the same backends, sharing the enable-flag runtime and the probe dial
+// hook) minus the `test` helper, until the checker pins it.
+pub fn source_types_catalogue() -> Vec<SourceTypeInfo> {
+    let mut out = Vec::with_capacity(ACTION_TYPES_CATALOGUE.len() + SOURCE_TYPE_ALIASES.len());
+    for entry in ACTION_TYPES_CATALOGUE {
+        out.push(SourceTypeInfo {
+            kind: entry.kind,
+            description: entry.description,
+            configuration: entry.configuration,
+        });
+    }
+    out.extend_from_slice(SOURCE_TYPE_ALIASES);
+    out
+}
+
+/// Whether `kind` names a source type the kernel can instantiate.
+///
+/// Shared by the catalogue, the source store validation and the stateless
+/// source probe so the three cannot drift: the served list and both
+/// checks read the same registries.
+pub fn is_known_source_type(kind: &str) -> bool {
+    if SOURCE_TYPE_ALIASES.iter().any(|entry| entry.kind == kind) {
+        return true;
+    }
+    ACTION_TYPES_CATALOGUE
+        .iter()
+        .any(|entry| entry.kind == kind)
+}
+
+#[cfg(test)]
+mod source_types_tests {
+    use super::*;
+
+    #[test]
+    fn test_source_types_catalogue_basics() {
+        let catalogue = source_types_catalogue();
+        assert!(!catalogue.is_empty(), "catalogue must not be empty");
+        assert_eq!(catalogue.len(), SOURCE_TYPE_COUNT);
+        assert!(
+            catalogue.len() <= MAX_SOURCE_TYPES,
+            "catalogue must not exceed {MAX_SOURCE_TYPES}"
+        );
+        let kinds: std::collections::HashSet<&str> = catalogue.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds.len(), catalogue.len(), "kinds must be unique");
+    }
+
+    #[test]
+    fn test_source_types_catalogue_lists_runnable_kinds_only() {
+        // Every listed kind must have a runtime behind it (the shared
+        // predicate), and the `test` helper (no runtime) must stay out.
+        // `http` and `mqtt` are ingress aliases with real runtimes and
+        // must be listed; invented names must stay out.
+        let catalogue = source_types_catalogue();
+        for entry in &catalogue {
+            assert!(
+                is_known_source_type(entry.kind),
+                "catalogue lists unrunnable kind '{}'",
+                entry.kind
+            );
+            assert!(!entry.description.trim().is_empty());
+        }
+        assert!(is_known_source_type("mqtt"));
+        assert!(is_known_source_type("http"));
+        assert!(is_known_source_type("kafka"));
+        assert!(is_known_source_type("mqtt_bridge"));
+        assert!(!is_known_source_type("test"));
+        assert!(!is_known_source_type("no_such_kind_xyz"));
+        assert!(!is_known_source_type(""));
+        assert!(!is_known_source_type("pgsql"));
+        let kinds: std::collections::HashSet<&str> = catalogue.iter().map(|e| e.kind).collect();
+        assert!(kinds.contains("mqtt"));
+        assert!(kinds.contains("http"));
+        assert!(kinds.contains("kafka"));
+        assert!(!kinds.contains("test"));
+        assert!(!kinds.contains("pgsql"));
+    }
+
+    #[test]
+    fn test_source_types_serialization_is_object_map() {
+        let catalogue = source_types_catalogue();
+        let json = serde_json::to_value(&catalogue).unwrap();
+        let arr = json.as_array().unwrap();
+        assert!(!arr.is_empty());
+        for entry in arr {
+            assert!(entry["kind"].is_string());
+            assert!(entry["description"].is_string());
+            assert!(
+                entry["configuration"].is_object(),
+                "configuration must serialize as a JSON object"
+            );
+            assert!(
+                entry.get("tier").is_none(),
+                "tier field must not be in the response"
+            );
+        }
+    }
+}

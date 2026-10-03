@@ -15900,4 +15900,119 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 200);
         assert_eq!(again, body);
     }
+
+    #[tokio::test]
+    async fn source_types_catalogue_lists_runnable_kinds() {
+        // W3-25 failing test: GET /source_types returns the catalogue of
+        // supported source kinds with per-entry kind plus configuration
+        // shape hints; every listed kind has a runtime behind it and an
+        // unknown query parameter is ignored. Before: route returned 404.
+        // Broker-through: the request goes through the served management
+        // API on `ApiState` (the same state the kernel shares in
+        // `crates/broker-node/src/main.rs`, `serve_api`); the catalogue
+        // itself is a static snapshot owned by `broker-connectors`
+        // (`source_types_catalogue` in
+        // `crates/broker-connectors/src/lib.rs`), read only on this
+        // management GET and never consulted on publish or deliver.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, body) = server.get_auth("/api/v5/source_types", &token).await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("catalogue is a list");
+        assert!(!entries.is_empty(), "catalogue must not be empty");
+        assert!(
+            entries.len() <= broker_connectors::MAX_SOURCE_TYPES,
+            "catalogue is bounded"
+        );
+        for entry in entries {
+            assert!(entry["kind"].is_string(), "entry carries kind: {entry:?}");
+            assert!(
+                entry["description"].is_string(),
+                "entry carries description: {entry:?}"
+            );
+            assert!(
+                entry["configuration"].is_object(),
+                "entry carries configuration shape hints: {entry:?}"
+            );
+            assert!(
+                entry.get("tier").is_none(),
+                "tier field must not be in the response: {entry:?}"
+            );
+            let kind = entry["kind"].as_str().expect("kind is a string");
+            assert!(
+                broker_connectors::is_known_source_type(kind),
+                "catalogue lists unrunnable kind '{kind}'"
+            );
+        }
+        let kinds: std::collections::HashSet<&str> =
+            entries.iter().filter_map(|e| e["kind"].as_str()).collect();
+        assert_eq!(kinds.len(), entries.len(), "kinds must be unique");
+        for expected in ["mqtt", "http", "kafka", "mqtt_bridge"] {
+            assert!(kinds.contains(expected), "catalogue lists '{expected}'");
+        }
+        for wrong in ["test", "pgsql", "no_such_source_kind_xyz"] {
+            assert!(
+                !kinds.contains(wrong),
+                "catalogue has no unrunnable '{wrong}'"
+            );
+        }
+
+        // Unknown query parameters are ignored, never an error.
+        let (status, again) = server
+            .get_auth("/api/v5/source_types?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(again, body);
+
+        // Every listed kind has a runtime behind it: a source of the
+        // listed `mqtt` kind registers through the broker API (the W3-23
+        // enable-flag runtime), then cleans up.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "w325-probe-src", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .delete_auth("/api/v5/sources/w325-probe-src", &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // The catalogue is never consulted per message: a published
+        // message still reaches the rule trigger path after the reads.
+        state
+            .engine
+            .create_rule(
+                "w325-rule".to_string(),
+                broker_protocol::TopicFilter::new("w325/#").expect("filter"),
+                None,
+                true,
+                vec![broker_rules::RuleAction::Log],
+            )
+            .expect("rule creates");
+        struct W325Sink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for W325Sink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(W325Sink);
+        let topic = broker_protocol::Topic::new("w325/probe").expect("topic");
+        let payload = bytes::Bytes::from_static(b"{}");
+        let matched = state
+            .engine
+            .dispatch_ingress(&topic, &payload, broker_protocol::QoS::AtMostOnce, &sink)
+            .await;
+        assert_eq!(matched, 1);
+    }
 }
