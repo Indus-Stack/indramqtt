@@ -4419,6 +4419,12 @@ pub async fn create_connector(
         }
         store.push(body.clone());
     }
+    // W3-19: mirror the flag into the engine's lock-free dispatch
+    // snapshot so rule evaluation observes a created-disabled connector
+    // as skipped from the first publish without taking this store's
+    // lock on the message path.
+    let created_enable = body.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    state.engine.set_action_enabled(&name, created_enable);
 
     // A persist failure is a 500 (the in-memory entry stays but the disk
     // save failed); the loss must never be silent.
@@ -4577,6 +4583,9 @@ pub async fn update_connector(
             return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
         }
     }
+    // W3-19: mirror the flag into the dispatch snapshot (same lock-free
+    // path as the enable route below).
+    state.engine.set_action_enabled(&id, enable);
     // A persist failure is a 500 (the in-memory replacement stays but the
     // disk save failed); the loss must never be silent.
     if let Err(error) = persist_connectors(&state.config) {
@@ -4654,12 +4663,118 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
     if !removed {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
+    // The id no longer names anything: drop it from the dispatch
+    // snapshot so a later re-create with the same id starts enabled
+    // (mirrors the W3-04 action delete path; unknown ids are a no-op).
+    state.engine.remove_action(&id);
     // Unknown ids persist nothing; a persist failure after a real removal
     // is a 500 (the in-memory removal stays but the disk save failed).
     if let Err(error) = persist_connectors(&state.config) {
         return connector_persist_error(error);
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `PUT /api/v5/connectors/:id/enable/:enable`: flip one connector's
+/// enable flag (W3-19, C07-06).
+///
+/// An unknown id returns 404 with the documented `{code, message}` shape
+/// and persists nothing. A malformed enable value is rejected with the
+/// documented error shape and persists nothing. On success the stored
+/// flag is flipped, the change is mirrored into the engine's lock-free
+/// dispatch snapshot (disabled forwards are skipped at fire time before
+/// reaching `ConnectorManager::send`), the mutation persists through the
+/// config core like every other connector write, and the updated
+/// connector reads back with 200 so the flag change is visible on the
+/// next read.
+///
+/// The pair is not paged; unknown query parameters are ignored (no query
+/// is extracted). Management-plane only: one short write lock plus the
+/// registry save lock on persist, and one lock-free snapshot swap; rule
+/// evaluation reads the snapshot, and publish and deliver never touch
+/// this store.
+///
+/// Bound (stated here and enforced by construction): a single boolean
+/// per connector; no new list, no new accumulation. The flag persists
+/// across restart with the connector record via the config core.
+///
+/// Fire-path cost (stated for the delivery-path note): no new work on
+/// publish or deliver. The enable read stays the one `Arc` clone of the
+/// shared dispatch snapshot per ingress plus one `HashSet` lookup per
+/// forward that the W3-04 action flag already pays; connector ids share
+/// that snapshot (absent means enabled), so a disabled connector costs
+/// the same single lookup and never touches the connector store.
+// TODO(parity): which spellings does the enable path accept (`true`/
+/// `false` only, or also `1`/`0`, `on`/`off`, mixed case)? The rulebook
+// does not decide; the current choice accepts exactly `true`/`false`
+// case-insensitively and rejects everything else with `BAD_REQUEST`
+// (mirroring the W3-04 action enable route) until the checker pins it.
+// TODO(parity): for an unknown id with a malformed enable value, is the
+// answer 404 or 400? The rulebook does not decide the precedence; the
+// current choice answers 404 first (existence before validation,
+// mirroring the action update and enable routes) and persists nothing
+// either way.
+// TODO(parity): does the enable route answer 200 with the updated
+// connector or 204 with no body? The rulebook does not decide the exact
+// shape; the current choice returns the updated connector with 200
+// (mirroring the action enable route) so the flag change is visible
+// without a second read.
+// TODO(parity): do connector ids and action ids share one disable
+// namespace in the dispatch snapshot, or does the checker address them
+// separately? The rulebook does not decide; the current choice shares
+// the W3-04 snapshot (one lookup per forward covers both) until the
+// checker pins it.
+pub async fn set_connector_enabled(
+    State(state): State<ApiState>,
+    Path((id, enable_raw)): Path<(String, String)>,
+) -> Response {
+    // Exact id matching only, mirroring read/replace/delete: the path id
+    // must equal the stored `id` or `name` exactly. Existence before
+    // validation: an unknown id is 404 and persists nothing, even when
+    // the flag is also malformed.
+    let exists = CONNECTORS.read().unwrap().iter().any(|c| {
+        c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+            || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
+    });
+    if !exists {
+        return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
+    }
+    let enable = match enable_raw.trim().to_ascii_lowercase().as_str() {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return ApiError::BadRequest(format!(
+                "invalid enable value {enable_raw:?}: expected \"true\" or \"false\" (field `enable`)"
+            ))
+            .into_response();
+        }
+    };
+    let updated = {
+        let mut connectors = CONNECTORS.write().unwrap();
+        let Some(pos) = connectors.iter().position(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
+        }) else {
+            return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
+        };
+        // Flip only the single boolean; id, kind and params are
+        // untouched, so the update can never trip the store cap or change
+        // validation.
+        if let Some(obj) = connectors[pos].as_object_mut() {
+            obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
+        }
+        connectors[pos].clone()
+    };
+    // Mirror into the dispatch snapshot before persisting: the in-memory
+    // flag is already flipped, so evaluation must observe it even if the
+    // disk save below fails (the store itself keeps the mutation on a
+    // persist failure and answers 500, never silently).
+    state.engine.set_action_enabled(&id, enable);
+    if let Err(error) = persist_connectors(&state.config) {
+        return connector_persist_error(error);
+    }
+    let live = connector_live_view(&updated, &state.engine);
+    (StatusCode::OK, Json(live)).into_response()
 }
 
 fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {

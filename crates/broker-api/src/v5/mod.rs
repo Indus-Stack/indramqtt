@@ -577,6 +577,14 @@ pub fn protected_router() -> Router<ApiState> {
                 .delete(rules::delete_connector),
         )
         .route("/connectors_probe", post(rules::probe_connector))
+        // Connector enable flag (W3-19, C07-06): flips one connector's
+        // enable bit with the flag honoured by rule dispatch via the
+        // engine's lock-free snapshot. Management-plane only; publish and
+        // deliver never touch the store.
+        .route(
+            "/connectors/:id/enable/:enable",
+            put(rules::set_connector_enabled),
+        )
         // Actions (W3-02, C06-02..C06-04; W3-03, C06-05/C06-06):
         // paged list, validated create and delete with rule-reference
         // refusal, plus single read and validated replace on the real

@@ -369,6 +369,17 @@ impl ApiState {
                 .collect();
             engine.sync_action_enables(&enables);
         }
+        // Boot seeding (W3-19): mirror the persisted connector enable
+        // flags into the same lock-free dispatch snapshot so a restart
+        // keeps disabled connectors skipped from the first publish. The
+        // connector store owns the flag and persistence; this only
+        // mirrors it so the publish path never takes the store lock. An
+        // empty store is a no-op (today's empty behaviour).
+        for entry in &config.snapshot().connectors.connectors {
+            if !entry.enable {
+                engine.set_action_enabled(&entry.id, false);
+            }
+        }
         // Boot seeding (W3-05): register a zeroed per-action metric record
         // for every stored action so the first publish after a restart
         // attributes from zero. Metrics are memory-only by design (action
@@ -11525,6 +11536,240 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, _) = server
             .delete_auth("/api/v5/actions/w3-04-action", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn connector_enable_flag_round_trip_and_dispatch_skip() {
+        // W3-19 (C07-06) broker-through test: create a connector via the
+        // W3-17 route, disable it through the enable route and read back
+        // disabled, re-enable and read back enabled; unknown ids are 404
+        // and malformed flags are 400, both with the documented shape.
+        // Then a rule forwarding to the shared id fires while enabled
+        // and is skipped at fire time while disabled, through the
+        // engine's lock-free dispatch snapshot (one publish through
+        // `dispatch_ingress` per case). Management-plane only otherwise;
+        // publish and deliver never touch the connector store directly.
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown id is 404 with the documented shape, not an empty body.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/connectors/no-such-connector/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one connector via the W3-17 route (defaults to enabled).
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w3-19-conn", "type": "http", "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Malformed flag is rejected with the documented shape (an empty
+        // segment never reaches the handler: the router has no such route
+        // and answers 404, so only non-empty spellings are exercised here).
+        for bad in ["maybe", "1", "0", "on", "TRUEE", "enabled"] {
+            let (status, body) = server
+                .send(
+                    "PUT",
+                    &format!("/api/v5/connectors/w3-19-conn/enable/{bad}"),
+                    None,
+                    Some(&token),
+                )
+                .await;
+            assert_eq!(status, 400, "flag {bad:?} must be rejected");
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+        // Disable: flag change is visible on the next read.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/connectors/w3-19-conn/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w3-19-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        // Re-enable: visible on the next read.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/connectors/w3-19-conn/enable/true",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w3-19-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // Rule dispatch through the broker: the connector id shares the
+        // engine's lock-free dispatch snapshot with action ids, so a rule
+        // forwarding to this id fires while enabled and skips while
+        // disabled. The counting sink is registered under the shared id
+        // (an action with the same id exists so the rule validates), the
+        // rule is created through the HTTP router, and each publish goes
+        // through `dispatch_ingress` (the broker's rule path), never
+        // `sink.send` directly.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-19-conn", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state
+            .engine
+            .connectors()
+            .register("w3-19-conn", counter.clone());
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "w3-19-rule",
+                    "sql": "SELECT * FROM \"w3/19/enable\"",
+                    "actions": ["w3-19-conn"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w3/19/enable").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "enabled connector must fire"
+        );
+        // Disable again: the next publish skips the forward.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/connectors/w3-19-conn/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert!(!state.engine.is_action_enabled("w3-19-conn"));
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "disabled connector must be skipped at fire time"
+        );
+        // Re-enable: firing resumes without re-registering anything.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/connectors/w3-19-conn/enable/true",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert!(state.engine.is_action_enabled("w3-19-conn"));
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            2,
+            "re-enabled connector must fire again"
+        );
+        // Cleanup: rule, then action, then connector (the rule holds the
+        // reference the connector delete guard checks).
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/w3-19-conn", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/w3-19-conn", &token)
             .await;
         assert_eq!(status, 204);
     }
