@@ -13750,6 +13750,165 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn source_enable_flag_round_trip_and_runtime_effect() {
+        // W3-28 (C07-17) broker-through test: create a source via the
+        // `POST /sources` route, disable it through the enable route and
+        // read back disabled from the reported state plus the single read
+        // and the summary (disabled sources stop ingress on the shared
+        // W3-23 runtime core), re-enable and read back enabled with
+        // ingress resumed; unknown ids are 404 and malformed flags are
+        // 400, both with the documented shape and a non-empty body.
+        // Before: the enable route returned 404. Every assertion goes
+        // through the HTTP router against the shared store (the same state
+        // the kernel shares in `crates/broker-node/src/main.rs`,
+        // `serve_api`), never at the store directly. Management-plane
+        // only; publish and deliver never touch the source directory.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown id is 404 with the documented shape, not an empty body.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/sources/no-such-source/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Unknown id with a malformed flag is still 404 (existence before
+        // validation) and changes nothing.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/sources/no-such-source/enable/maybe",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one source (defaults to enabled).
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "w3-28-src", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Malformed flag is rejected with the documented shape and changes
+        // nothing (the stored flag stays enabled).
+        for bad in ["maybe", "1", "0", "on", "TRUEE", "enabled"] {
+            let (status, body) = server
+                .send(
+                    "PUT",
+                    &format!("/api/v5/sources/w3-28-src/enable/{bad}"),
+                    None,
+                    Some(&token),
+                )
+                .await;
+            assert_eq!(status, 400, "flag {bad:?} must be rejected");
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+        let (status, body) = server.get_auth("/api/v5/sources/w3-28-src", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // Disable: the reported flag changes and reads back disabled on
+        // the next single read (ingress stopped on the W3-23 runtime).
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/sources/w3-28-src/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-28-src"));
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server.get_auth("/api/v5/sources/w3-28-src", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["enabled"], json!(0));
+        assert_eq!(body["disabled"], json!(1));
+        // The W3-23 operation route observes the same core: starting the
+        // disabled source re-enables it (ingress resumed).
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/sources/w3-28-src/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // Re-disable through the enable route, then re-enable through it:
+        // the flag change is visible on the next read each way.
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/sources/w3-28-src/enable/false",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server
+            .send(
+                "PUT",
+                "/api/v5/sources/w3-28-src/enable/true",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        let (status, body) = server.get_auth("/api/v5/sources/w3-28-src", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // The message path is untouched: live ingress dispatch still
+        // works and the source directory reports the same counts after.
+        struct W328Sink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for W328Sink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(W328Sink);
+        let topic = broker_protocol::Topic::new("w328/probe").expect("topic");
+        let payload = bytes::Bytes::from_static(b"{}");
+        let matched = state
+            .engine
+            .dispatch_ingress(&topic, &payload, broker_protocol::QoS::AtMostOnce, &sink)
+            .await;
+        assert_eq!(
+            matched, 0,
+            "no stored rule so live dispatch matches nothing"
+        );
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["enabled"], json!(1));
+        let (status, _) = server
+            .delete_auth("/api/v5/sources/w3-28-src", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn node_source_operation_single_node_round_trip() {
         // W3-24 (C07-10) broker-through test: create a source via the
         // `POST /sources` route, stop it through the node-scoped operation

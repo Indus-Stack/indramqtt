@@ -678,7 +678,7 @@ pub fn protected_router() -> Router<ApiState> {
         // deliver never touch the registry.
         .route("/source_types", get(sources::list_source_types))
         // Source instances plus the aggregated summary (W3-26 store,
-        // W3-27 C07-15/C07-16, W3-31 C07-22): paged list with the standard page envelope,
+        // W3-27 C07-15/C07-16, W3-28 C07-17, W3-31 C07-22): paged list with the standard page envelope,
         // validated register with duplicate rejection, a single read with
         // a 404 for unknown ids, a validated replace with a 404 that
         // creates nothing, a delete with a
@@ -704,6 +704,14 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/sources/:id/:operation",
             post(sources::run_source_operation),
+        )
+        // Source enable flag (W3-28, C07-17): flips one source's enable
+        // bit on the same W3-23 runtime core (disabled sources stop
+        // ingress). Management-plane only; publish and deliver never
+        // touch the store.
+        .route(
+            "/sources/:id/enable/:enable",
+            put(sources::set_source_enabled),
         )
         // Node-scoped source lifecycle operation (W3-24, C07-10):
         // single-node execution of the W3-23 operation path guarded by

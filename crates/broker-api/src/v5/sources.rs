@@ -5,7 +5,8 @@
 //! C07-14), `GET /sources/:id` (single read, C07-15),
 //! `PUT /sources/:id` (validated replace, C07-16),
 //! `POST /sources/:id/:operation` (C07-20, run one lifecycle
-//! operation against one source) and `GET /sources_summary` (C07-22,
+//! operation against one source), `PUT /sources/:id/enable/:enable`
+//! (C07-17, flip one source's enable flag on the same runtime core) and `GET /sources_summary` (C07-22,
 //! aggregated counts over the live store). Single-node,
 //! management-plane only: the list clones at most the capped entries
 //! per request under a short lock and the summary is computed on demand
@@ -760,6 +761,75 @@ pub async fn run_node_source_operation(
             .into_response();
     }
     apply_source_operation(&state, &id, &operation)
+}
+
+/// `PUT /api/v5/sources/:id/enable/:enable`: flip one source's enable
+/// flag (W3-28, C07-17).
+///
+/// An unknown id returns 404 with the documented `{code, message}` shape
+/// and persists nothing. A malformed enable value is rejected with the
+/// documented error shape and persists nothing. On success the stored
+/// flag is flipped through the same [`SourceStore::set_enabled`] core the
+/// W3-23 operation route uses (the lifecycle state is the stored flag, so
+/// the write drives that runtime: disabled sources stop ingress), the
+/// mutation persists through the config core with the source record like
+/// every other source write, and the updated source reads back with 200
+/// so the flag change is visible on the next read.
+///
+/// The pair is not paged; unknown query parameters are ignored (no query
+/// is extracted). Management-plane only: one short read lock for the
+/// existence check plus one short write lock cloning at most one small
+/// record per request (plus the registry save lock on persist); ingress
+/// consults a snapshot off the message path, and publish and deliver never
+/// touch this store.
+///
+/// Bound (stated here and enforced by construction): a single boolean
+/// per source; no new list, no new accumulation. The flag persists across
+/// restart with the source record via the config core.
+///
+/// Fire-path cost: none. The enable read stays off the message path;
+/// publish and deliver keep paying nothing for sources (no consult, no
+/// lock, no allocation on either path).
+// TODO(parity): which spellings does the enable path accept (`true`/
+// `false` only, or also `1`/`0`, `on`/`off`, mixed case)? The rulebook
+// does not decide; the current choice accepts exactly `true`/`false`
+// case-insensitively and rejects everything else with `BAD_REQUEST`
+// (mirroring the action and connector enable routes) until the checker
+// pins it.
+// TODO(parity): for an unknown id with a malformed enable value, is the
+// answer 404 or 400? The rulebook does not decide the precedence; the
+// current choice answers 404 first (existence before validation,
+// mirroring the source update and operation routes) and persists nothing
+// either way.
+// TODO(parity): does the enable route answer 200 with the updated source
+// or 204 with no body? The rulebook does not decide the exact shape; the
+// current choice returns the updated source with 200 (mirroring the
+// source operation route) so the flag change is visible without a second
+// read.
+pub async fn set_source_enabled(
+    State(state): State<ApiState>,
+    Path((id, enable_raw)): Path<(String, String)>,
+) -> Response {
+    if state.sources.get(&id).is_none() {
+        return ApiError::NotFound(format!("source {id:?} not found")).into_response();
+    }
+    let enable = match enable_raw.trim().to_ascii_lowercase().as_str() {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return ApiError::BadRequest(format!(
+                "invalid enable value {enable_raw:?}: expected \"true\" or \"false\" (field `enable`)"
+            ))
+            .into_response();
+        }
+    };
+    let Some(entry) = state.sources.set_enabled(&id, enable) else {
+        return ApiError::NotFound(format!("source {id:?} not found")).into_response();
+    };
+    if let Err(error) = state.sources.persist() {
+        return source_persist_error(error);
+    }
+    (StatusCode::OK, Json(entry.to_json())).into_response()
 }
 
 /// `GET /api/v5/sources_summary` (C07-22): aggregated counts over the
