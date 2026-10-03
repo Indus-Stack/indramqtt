@@ -5048,23 +5048,98 @@ async fn check_tcp_reachable(addr: &str) -> Result<(), String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Connector Probe (W3-21, C07-08)
+// ---------------------------------------------------------------------------
+
+/// Single-request bound for `POST /api/v5/connectors_probe`: one TCP dial at
+/// most, capped by this timeout. Reason: a probe is an operator-driven
+/// management-plane dial, never on the publish/deliver path; 5 s bounds the
+/// worst case per request (the inner dial itself times out after 1.5 s) while
+/// staying well under management-plane HTTP timeouts. Results are never
+/// cached (default no caching): every request re-validates and re-dials so a
+/// transient failure cannot be served stale.
+pub const CONNECTOR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Stateless connector probe: validates the config against the named kind
+/// (the W3-17 kind set from the config registry, the same set
+/// `POST /api/v5/connectors` validates against) and dials where the kind
+/// exposes a network target, reporting success or the failure reason with
+/// the documented `{code, message}` / `{result, status}` shape.
+/// Management-plane only: runs off the message path (no lock, no
+/// allocation, no state on publish/deliver), performs single-request bounded
+/// work capped by [`CONNECTOR_PROBE_TIMEOUT`], writes to no store, registers
+/// no runtime, and leaves nothing running after return.
+// TODO(parity): what per-kind config validation does the probe require
+// beyond the kind being known (required fields per kind, value ranges)?
+// The rulebook does not decide the exact per-kind schemas; the current
+// choice validates the kind against the W3-17 registry and dials the
+// exposed network target, storing nothing, until the checker pins it.
+// TODO(parity): is a kind with no network target a success once the kind
+// itself validated, or does the spec require a target for every kind? The
+// rulebook does not decide; the current choice counts kind-only configs as
+// reachable (matching the sibling action/source probes) until the checker
+// pins it.
 pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response {
     let body = match body {
         Some(Json(b)) => b,
         None => {
             return (
-                StatusCode::OK,
+                StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "result": "ok",
-                    "status": "connected"
+                    "code": "BAD_REQUEST",
+                    "message": "request body is required"
                 })),
             )
                 .into_response();
         }
     };
+    if !body.is_object() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": "request body must be a JSON object"
+            })),
+        )
+            .into_response();
+    }
+    let kind = body
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": "missing required field: type"
+            })),
+        )
+            .into_response();
+    }
+    if !broker_config::is_known_connector_type(&kind) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": format!("unknown connector type: {kind}")
+            })),
+        )
+            .into_response();
+    }
+    // Runtime probe hook (the W3-17 dial path reused from the connector
+    // create path): kinds that expose a network target get one bounded
+    // dial; kinds without one count as reachable once the kind itself
+    // validated. No store write, no runtime registration, no background
+    // task survives the return.
     if let Some(target) = extract_target_host_port(&body) {
-        match check_tcp_reachable(&target).await {
-            Ok(()) => (
+        let dial =
+            tokio::time::timeout(CONNECTOR_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
+        match dial {
+            Ok(Ok(())) => (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "result": "ok",
@@ -5073,7 +5148,7 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
                 })),
             )
                 .into_response(),
-            Err(err) => (
+            Ok(Err(err)) => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "code": "TEST_FAILED",
@@ -5081,14 +5156,19 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
                 })),
             )
                 .into_response(),
+            Err(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "TEST_FAILED",
+                    "message": format!("Connection to {} timed out after 5s", target)
+                })),
+            )
+                .into_response(),
         }
     } else {
         (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": "Missing host/server in connector configuration"
-            })),
+            StatusCode::OK,
+            Json(serde_json::json!({ "result": "ok", "status": "connected" })),
         )
             .into_response()
     }

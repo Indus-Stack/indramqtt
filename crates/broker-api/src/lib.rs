@@ -15146,6 +15146,86 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn connectors_probe_is_stateless_with_documented_shapes() {
+        // W3-21 (C07-08) broker-through test: a valid probe succeeds without
+        // creating a connector, a bad config fails with the documented error
+        // shape, and an unknown kind is rejected. Before: validation was
+        // incomplete (no kind check, missing bodies read as success) and a
+        // kind with nothing to dial read as a failure. Management-plane only;
+        // publish and deliver never touch the probe path.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Connector count before the probes: the store is process-global,
+        // so sibling tests may hold entries; the probe must not add any.
+        let (status, before) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        let count_before = before["meta"]["count"].as_u64().unwrap_or(0);
+        // Valid probe: known kind with nothing to dial, so reachable by
+        // validation alone. Must not create a connector: the list count is
+        // unchanged afterwards and the probe id reads back 404.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "console", "name": "w321-probe-no-create"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"], json!("ok"));
+        let (status, after) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            after["meta"]["count"], before["meta"]["count"],
+            "probe must not create a connector"
+        );
+        let (status, _) = server
+            .get_auth("/api/v5/connectors/w321-probe-no-create", &token)
+            .await;
+        assert_eq!(status, 404, "probe must leave no state behind");
+        // Bad config: known kind with a closed port reports the failure.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "http", "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "bad probe config must be 400");
+        assert_eq!(body["code"], json!("TEST_FAILED"));
+        // Unknown kind is rejected with the documented error shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "no_such_kind_xyz"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "unknown connector kind must be 400");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unknown connector type"),
+            "unknown kind names the kind: {body:?}"
+        );
+        // Malformed body is rejected with the documented error shape.
+        let (status, body) = server
+            .post_auth("/api/v5/connectors_probe", json!({}), &token)
+            .await;
+        assert_eq!(status, 400, "malformed probe body must be 400");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Probe leaves no state behind even after failures.
+        let (status, body) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["meta"]["count"].as_u64().unwrap_or(0),
+            count_before,
+            "probe must leave no state"
+        );
+    }
+
+    #[tokio::test]
     async fn audit_log_lists_management_operations_with_paging_and_time_filter() {
         // W2-28 failing test: perform two management operations, query
         // the audit log expecting both entries with paging metadata;
