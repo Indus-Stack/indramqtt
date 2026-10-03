@@ -13497,6 +13497,141 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn node_source_operation_single_node_round_trip() {
+        // W3-24 (C07-10) broker-through test: create a source via the
+        // `POST /sources` route, stop it through the node-scoped operation
+        // route and read back disabled from the reported state plus the
+        // summary, start it and read back enabled; an unknown node is
+        // NOT_FOUND, an unknown id is 404 and an unknown operation is
+        // rejected, all with the documented shape and a non-empty body.
+        // Before: the node-scoped route returned 404. Every assertion goes
+        // through the HTTP router against the shared store (the same state
+        // the kernel shares in `crates/broker-node/src/main.rs`,
+        // `serve_api`), never at the store directly. Management-plane
+        // only; a live ingress dispatch through the engine still matches
+        // nothing afterwards, so publish and deliver never touch the
+        // source directory.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let local = "indra-node-1";
+        let legacy = "indramqtt@127.0.0.1";
+        // Unknown node is NOT_FOUND with a non-empty body naming the node,
+        // even when the id and operation are also unknown (node scope is
+        // checked first, fail closed).
+        for unknown in ["no-such-node-xyz", ""] {
+            let path = format!("/api/v5/nodes/{unknown}/sources/no-such-source/start");
+            let (status, body) = server.send("POST", &path, None, Some(&token)).await;
+            assert_eq!(status, 404, "unknown node {unknown:?} must be 404");
+            assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+            assert!(
+                body["message"].is_string()
+                    && !body["message"].as_str().expect("message").is_empty(),
+                "unknown-node body must not be empty: {body}"
+            );
+        }
+        // Unknown id on the known node is 404 with the documented shape,
+        // not an empty body.
+        let (status, body) = server
+            .send(
+                "POST",
+                &format!("/api/v5/nodes/{local}/sources/no-such-source/start"),
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert!(!body.to_string().is_empty());
+        // Create one source via the W3-26 route (defaults to enabled).
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"name": "w3-24-src", "type": "mqtt"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Unknown operation on the known node is rejected with the
+        // documented shape and persists nothing (the flag stays enabled).
+        let (status, body) = server
+            .send(
+                "POST",
+                &format!("/api/v5/nodes/{local}/sources/w3-24-src/frobnicate"),
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 400, "unknown operation must be rejected");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(!body.to_string().is_empty());
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["enabled"], json!(1));
+        // Stop through the node route: the reported state flips to
+        // disabled. The legacy node name names the same local node.
+        let (status, body) = server
+            .send(
+                "POST",
+                &format!("/api/v5/nodes/{local}/sources/w3-24-src/stop"),
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("w3-24-src"));
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], json!(0));
+        assert_eq!(body["disabled"], json!(1));
+        let (status, body) = server
+            .send(
+                "POST",
+                &format!("/api/v5/nodes/{legacy}/sources/w3-24-src/start"),
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200, "legacy node name must resolve");
+        assert_eq!(body["id"], json!("w3-24-src"));
+        assert_eq!(body["enable"], json!(true));
+        // The message path is untouched: live ingress dispatch still works
+        // and the source directory reports the same counts after.
+        struct W324Sink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for W324Sink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let sink: std::sync::Arc<dyn broker_rules::BrokerSink> = std::sync::Arc::new(W324Sink);
+        let topic = broker_protocol::Topic::new("w324/probe").expect("topic");
+        let payload = bytes::Bytes::from_static(b"{}");
+        let matched = state
+            .engine
+            .dispatch_ingress(&topic, &payload, broker_protocol::QoS::AtMostOnce, &sink)
+            .await;
+        assert_eq!(
+            matched, 0,
+            "no stored rule so live dispatch matches nothing"
+        );
+        let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1));
+        let (status, _) = server
+            .delete_auth("/api/v5/sources/w3-24-src", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn removed_schema_registry_routes_return_404() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;

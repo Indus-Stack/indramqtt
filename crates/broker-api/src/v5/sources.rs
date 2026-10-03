@@ -56,7 +56,13 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::errors::ApiError;
+use crate::node_scope::resolve_node;
 use crate::ApiState;
+
+/// Single-node name rendered by `v5::nodes::list_nodes`. Accepted alongside
+/// [`ApiState::node_id`] until every caller migrates to the configured id
+/// (see `node_scope` docs); both name the same local node.
+const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
 
 /// Upper bound for stored sources. Creates past this size are rejected
 /// with `BAD_REQUEST` instead of growing the map without limit. Reason:
@@ -327,6 +333,64 @@ fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Respon
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
     };
     (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
+/// `POST /api/v5/nodes/:node/sources/:id/:operation`: run one named
+/// lifecycle operation against one source on one named node (W3-24,
+/// C07-10).
+///
+/// Single-node execution only: the `{node}` segment is checked with the
+/// shared [`resolve_node`] helper against the configured
+/// [`ApiState::node_id`] (falling back to the [`LEGACY_NODE_NAME`] literal
+/// the v5 rows render today); an unknown name returns the helper's 404
+/// `NOT_FOUND` shape naming the node and touches no other state. A known
+/// node dispatches to the same [`apply_source_operation`] path as the
+/// global `POST /sources/:id/:operation` route (W3-23), so the reported
+/// state, the 404 for an unknown id, and the rejection of an unknown
+/// operation are identical on both routes.
+///
+/// The pair is not paged; unknown query parameters are ignored (no query
+/// is extracted). Management-plane only: one short store read plus one
+/// short write lock cloning at most one small record per request;
+/// ingress runs on its own runtime off the message path, and publish
+/// and deliver never touch this store.
+///
+/// Bound (stated here and enforced by construction): single-request bounded
+/// work with no wait and no accumulated per-node state. The operation
+/// completes synchronously under short in-memory locks with no remote call,
+/// no retry, no timer and no broker-side timeout to tune (there is no wait
+/// to bound: the handler never blocks, so a single request costs at most
+/// one short read lock plus one short write lock cloning one small record);
+/// node membership itself is owned elsewhere
+/// (exactly one local record) and nothing here grows with connections,
+/// sessions or subscriptions.
+///
+/// Fire-path cost: no new work on publish or deliver. The operation itself
+/// runs entirely on the management plane; publish and deliver keep paying
+/// nothing for sources (no consult, no lock, no allocation on either path).
+// TODO(parity): for an unknown node with an unknown id or operation, is
+// the answer the node 404 or the source/operation error? The rulebook does
+// not decide the precedence; the current choice answers the node 404 first
+// (node scope before source existence before operation validity, fail
+// closed) and touches nothing else either way.
+// TODO(parity): does the node-scoped answer carry a node envelope or the
+// bare updated source? The rulebook does not decide the exact shape; the
+// current choice returns the same bare updated source with 200 as the
+// global route (single-node answer) until the checker pins it.
+pub async fn run_node_source_operation(
+    State(state): State<ApiState>,
+    Path((node, id, operation)): Path<(String, String, String)>,
+) -> Response {
+    if resolve_node(&state.node_id, &node).is_err()
+        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+    {
+        // Reuse the helper's error so the unknown-node shape stays exactly
+        // the documented `{code: NOT_FOUND, message}` body.
+        return resolve_node(&state.node_id, &node)
+            .expect_err("node already checked as unknown")
+            .into_response();
+    }
+    apply_source_operation(&state, &id, &operation)
 }
 
 /// `GET /api/v5/sources_summary` (C07-22): aggregated counts over the

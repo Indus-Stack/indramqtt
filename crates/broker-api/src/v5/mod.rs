@@ -689,6 +689,15 @@ pub fn protected_router() -> Router<ApiState> {
             "/sources/:id/:operation",
             post(sources::run_source_operation),
         )
+        // Node-scoped source lifecycle operation (W3-24, C07-10):
+        // single-node execution of the W3-23 operation path guarded by
+        // the shared node-scope helper (unknown nodes are NOT_FOUND).
+        // Management-plane only; publish and deliver never touch the
+        // store.
+        .route(
+            "/nodes/:node/sources/:id/:operation",
+            post(sources::run_node_source_operation),
+        )
         .route("/sources_summary", get(sources::get_sources_summary))
         // Schema API for dynamic UI forms
         .route("/schemas", get(schemas::list_schemas))
