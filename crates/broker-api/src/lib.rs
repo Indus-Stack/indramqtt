@@ -11775,6 +11775,259 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn connector_operation_start_stop_round_trip() {
+        // W3-20 (C07-07) broker-through test: create a connector via the
+        // W3-17 route, stop it through the operation route and read back
+        // disabled, start it and read back enabled; an unknown operation
+        // is rejected and an unknown id is 404, both with the documented
+        // shape and a non-empty body. Then a rule forwarding to the
+        // connector id fires while started and is skipped at fire time
+        // while stopped, through the engine's lock-free dispatch snapshot
+        // (one publish through `dispatch_ingress` per case, the broker's
+        // rule path also used by `crates/broker-node` ingress). Every
+        // assertion goes through the HTTP router against the shared store,
+        // never at the store directly. Management-plane only otherwise;
+        // publish and deliver never touch the connector store directly.
+        // The connector id shares the dispatch snapshot with action ids
+        // (`crates/broker-rules/src/lib.rs`, `RuleEngine::set_action_enabled`
+        // at line 1717 consulted on the publish event by
+        // `dispatch_ingress`/fire path), driven by the publish event.
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Unknown id is 404 with the documented shape, not an empty body.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/no-such-connector/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Unknown id with an unknown operation is still 404 (existence
+        // before validation) and persists nothing.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/no-such-connector/frobnicate",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Create one connector via the W3-17 route (defaults to enabled).
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "w3-20-conn", "type": "http", "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Unknown operation is rejected with the documented shape and
+        // persists nothing (the stored flag is untouched).
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/w3-20-conn/frobnicate",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 400, "unknown operation must be rejected");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w3-20-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // Stop: the reported state changes to disabled on the next read.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/w3-20-conn/stop",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w3-20-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        // Start: the reported state changes back to enabled.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/w3-20-conn/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/w3-20-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // Rule dispatch through the broker: the connector id shares the
+        // engine's lock-free dispatch snapshot with action ids, so a rule
+        // forwarding to this id fires while started and skips while
+        // stopped. An action with the same id exists so the rule validates
+        // (the W3-02 linkage), the counting sink is registered under the
+        // shared id, the rule is created through the HTTP router, and each
+        // publish goes through `dispatch_ingress` (the broker's rule path),
+        // never `sink.send` directly.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "w3-20-conn", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state
+            .engine
+            .connectors()
+            .register("w3-20-conn", counter.clone());
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "w3-20-rule",
+                    "sql": "SELECT * FROM \"w3/20/operation\"",
+                    "actions": ["w3-20-conn"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("w3/20/operation").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "started connector must fire"
+        );
+        // Stop again: the next publish skips the forward.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/w3-20-conn/stop",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "stopped connector must be skipped at fire time"
+        );
+        // Start again: firing resumes without re-registering anything.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/w3-20-conn/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 200);
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            2,
+            "re-started connector must fire again"
+        );
+        // Cleanup: rule, then action, then connector (the rule holds the
+        // reference the connector delete guard checks).
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/w3-20-conn", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/w3-20-conn", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
     async fn action_operation_start_stop_round_trip() {
         // W3-06 (C06-10) broker-through test: create an action via the
         // W3-02 route, stop it through the operation route and read back

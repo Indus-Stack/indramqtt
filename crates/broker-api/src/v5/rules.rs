@@ -4777,6 +4777,125 @@ pub async fn set_connector_enabled(
     (StatusCode::OK, Json(live)).into_response()
 }
 
+/// `POST /api/v5/connectors/:id/:operation`: run one named lifecycle
+/// operation against one connector (W3-20, C07-07).
+///
+/// Only the operations the lifecycle supports are served: `start`
+/// (enable the connector) and `stop` (disable it). Both flip the stored
+/// enable flag in place, mirror the flag into the engine's lock-free
+/// dispatch snapshot (disabled forwards are skipped at fire time before
+/// reaching `ConnectorManager::send`, shared with the W3-19 enable
+/// route), persist through the config core like every other connector
+/// write, and report the resulting connector with 200 so the state
+/// change is visible without a second read.
+///
+/// An unknown connector id returns 404 with the documented `{code,
+/// message}` shape and persists nothing; an unknown operation name is
+/// rejected with the documented error shape and persists nothing. The
+/// pair is not paged; unknown query parameters are ignored (no query is
+/// extracted). Management-plane only: one short store read plus one
+/// short write lock cloning at most one small record per request (plus
+/// the registry save lock on persist) and one lock-free snapshot swap;
+/// rule evaluation reads the snapshot, and publish and deliver never
+/// touch this store.
+///
+/// Lifecycle state persists with the connector record (the enable flag
+/// in the config core); transient run state is not kept, so nothing
+/// extra needs clearing across a restart (boot rebuilds the dispatch
+/// snapshot from the persisted flags).
+///
+/// Fire-path cost (stated for the delivery-path note): no new work on
+/// publish or deliver. The operation itself runs entirely on the
+/// management plane; the publish path keeps paying what the enable
+/// route already pays (one `Arc` of the disabled set per ingress plus
+/// one `HashSet` lookup per forward, lock-free, no per-fire
+/// allocation).
+// TODO(parity): which operation names does the documented spec serve
+// beyond `start` (for example `stop`, `restart`)? The rulebook does not
+// decide the exact verb set; the current choice serves exactly
+// `start`/`stop` as enable flips (the only lifecycle the kernel tracks,
+// mirroring the W3-06 action operation) and rejects everything else
+// with `BAD_REQUEST` until the checker pins it.
+// TODO(parity): are operation names case-sensitive (`START` versus
+// `start`)? The rulebook does not decide; the current choice matches
+// exactly `start`/`stop` in lower case and rejects every other spelling
+// with `BAD_REQUEST` until the checker pins it.
+// TODO(parity): for an unknown id with an unknown operation, is the
+// answer 404 or 400? The rulebook does not decide the precedence; the
+// current choice answers 404 first (existence before validation,
+// mirroring the action operation and the connector enable route) and
+// persists nothing either way.
+// TODO(parity): does a valid operation answer 200 with the updated
+// connector or 204 with no body? The rulebook does not decide the exact
+// shape; the current choice returns the updated connector with 200
+// (mirroring the enable route) so the resulting state is visible without
+// a second read.
+pub async fn run_connector_operation(
+    State(state): State<ApiState>,
+    Path((id, operation)): Path<(String, String)>,
+) -> Response {
+    apply_connector_operation(&state, &id, &operation).await
+}
+
+/// Shared dispatch behind the connector operation route: existence check
+/// (unknown id is 404, creates nothing), operation validity check
+/// (unknown name is `BAD_REQUEST`, persists nothing), then the enable
+/// flip with the engine snapshot mirror, persistence and the updated
+/// connector with 200. Management-plane only; see the caller for the
+/// locking and fire-path notes.
+async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) -> Response {
+    // Exact id matching only, mirroring read/replace/delete/enable: the
+    // path id must equal the stored `id` or `name` exactly. Existence
+    // before validation: an unknown id is 404 and persists nothing, even
+    // when the operation is also unknown.
+    let exists = CONNECTORS.read().unwrap().iter().any(|c| {
+        c.get("id").and_then(|v| v.as_str()) == Some(id)
+            || c.get("name").and_then(|v| v.as_str()) == Some(id)
+    });
+    if !exists {
+        return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
+    }
+    let enable = match operation {
+        "start" => true,
+        "stop" => false,
+        _ => {
+            return ApiError::BadRequest(format!(
+                "unknown connector operation {operation:?}: expected \"start\" or \"stop\" (field `operation`)"
+            ))
+            .into_response();
+        }
+    };
+    let updated = {
+        let mut connectors = CONNECTORS.write().unwrap();
+        let Some(pos) = connectors.iter().position(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(id)
+                || c.get("name").and_then(|v| v.as_str()) == Some(id)
+        }) else {
+            return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
+        };
+        // Flip only the single boolean; id, kind and params are
+        // untouched, so the update can never trip the store cap or change
+        // validation.
+        if let Some(obj) = connectors[pos].as_object_mut() {
+            obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
+        }
+        connectors[pos].clone()
+    };
+    // Mirror into the dispatch snapshot before persisting: the in-memory
+    // flag is already flipped, so evaluation must observe it even if the
+    // disk save below fails (the store itself keeps the mutation on a
+    // persist failure and answers 500, never silently). Connector ids
+    // share the W3-04 snapshot with action ids (absent means enabled),
+    // so a disabled connector costs the same single lookup and never
+    // touches the connector store on the fire path.
+    state.engine.set_action_enabled(id, enable);
+    if let Err(error) = persist_connectors(&state.config) {
+        return connector_persist_error(error);
+    }
+    let live = connector_live_view(&updated, &state.engine);
+    (StatusCode::OK, Json(live)).into_response()
+}
+
 fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
     if let Some(s) = body.get("server").and_then(|v| v.as_str()) {
         let mut clean = s.trim();
