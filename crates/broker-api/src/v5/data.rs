@@ -70,6 +70,7 @@ const KNOWN_ROOTS: &[&str] = &[
     "actions",
     "sources",
     "rule_engine",
+    "transformations",
 ];
 
 // Live tables the export serves. Each name maps to a live store read.
@@ -210,6 +211,19 @@ fn redacted_root(name: &str, snapshot: &FullSnapshot) -> Value {
             })).collect::<Vec<_>>(),
         }),
         "rule_engine" => json!(snapshot.rule_engine),
+        "transformations" => json!({
+            "transformations": snapshot.transformations.transformations.iter().map(|entry| json!({
+                "name": entry.name,
+                "topics": entry.topics,
+                "failure_action": entry.failure_action,
+                "enable": entry.enable,
+                "operations": entry.operations.iter().map(|op| json!({
+                    "key": op.key,
+                    "value": op.value,
+                })).collect::<Vec<_>>(),
+                "config": entry.config,
+            })).collect::<Vec<_>>(),
+        }),
         _ => Value::Null,
     }
 }

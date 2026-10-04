@@ -116,6 +116,196 @@ pub trait EventInput: Send + Sync {
     async fn push(&self, event: StreamEvent) -> Result<PushOutcome, RuleEngineError>;
 }
 
+/// One ordered message-transformation step (W3-32): the live form of one
+/// chain entry. `topics` holds the parsed filters the step applies to;
+/// `operations` holds the ordered field sets; `failure_action` selects
+/// the behaviour when a `topic` set produces an invalid topic (`drop`
+/// and `disconnect` both shed the message, `ignore` keeps the previous
+/// topic). Disabled steps are skipped in order.
+#[derive(Debug, Clone)]
+pub struct TransformStep {
+    /// Chain key; unique within the chain.
+    pub name: String,
+    /// Filters the step applies to, in stored order.
+    pub topics: Vec<TopicFilter>,
+    /// Failure behaviour (`drop`, `disconnect` or `ignore`).
+    pub failure_action: String,
+    /// Whether the step participates.
+    pub enable: bool,
+    /// Ordered field sets applied in order on matching messages.
+    pub operations: Vec<TransformOperation>,
+}
+
+/// One field set inside a step: set `key` (`payload` or `topic`) to the
+/// template `value` (`${payload}` and `${topic}` expand to the current
+/// values).
+#[derive(Debug, Clone)]
+pub struct TransformOperation {
+    /// Message field to set.
+    pub key: String,
+    /// Template for the new value.
+    pub value: String,
+}
+
+/// Render one operation template: `${topic}` expands to the current
+/// topic name and `${payload}` expands to the current payload text.
+/// Pure string work; no lock, no I/O.
+fn render_transform_template(value: &str, topic: &str, payload: &str) -> String {
+    // `${topic}` first so a payload carrying the topic marker still
+    // expands once per marker kind.
+    value
+        .replace("${topic}", topic)
+        .replace("${payload}", payload)
+}
+
+/// Run one ingress through the ordered chain snapshot (W3-32).
+/// Returns the (possibly rewritten) topic and payload plus whether the
+/// message is shed (`true` means drop it: no retain, no rules, no
+/// fan-out). Steps apply in chain order; each matching enabled step
+/// applies its operations in order. Pure function over the snapshot:
+/// no lock. The hot path skips this call when the snapshot is empty,
+/// so the clone below never runs per ingress; non-empty ingress
+/// clones once then allocates only for rewritten values.
+pub fn apply_transform_steps(
+    steps: &[TransformStep],
+    topic: &Topic,
+    payload: &Bytes,
+) -> (Topic, Bytes, bool) {
+    if steps.is_empty() {
+        return (topic.clone(), payload.clone(), false);
+    }
+    let mut cur_topic = topic.clone();
+    let mut cur_payload = payload.clone();
+    for step in steps {
+        if !step.enable {
+            continue;
+        }
+        if !step.topics.iter().any(|filter| filter.matches(&cur_topic)) {
+            continue;
+        }
+        for op in &step.operations {
+            if op.key == "payload" {
+                let payload_text = String::from_utf8_lossy(&cur_payload).into_owned();
+                let rendered =
+                    render_transform_template(&op.value, cur_topic.as_str(), &payload_text);
+                cur_payload = Bytes::from(rendered.into_bytes());
+            } else if op.key == "topic" {
+                let payload_text = String::from_utf8_lossy(&cur_payload).into_owned();
+                let rendered =
+                    render_transform_template(&op.value, cur_topic.as_str(), &payload_text);
+                match Topic::new(rendered) {
+                    Ok(next) => cur_topic = next,
+                    Err(_) => {
+                        // Fail closed: an invalid rewritten topic never
+                        // fans out. `ignore` keeps the previous topic
+                        // and continues; `drop` and `disconnect` shed
+                        // the message.
+                        // TODO(parity): does `disconnect` close the
+                        // publisher connection or only shed the
+                        // message? The rulebook does not decide; the
+                        // current choice sheds the message like `drop`
+                        // until the checker pins it.
+                        if step.failure_action == "ignore" {
+                            continue;
+                        }
+                        return (cur_topic, cur_payload, true);
+                    }
+                }
+            }
+        }
+    }
+    (cur_topic, cur_payload, false)
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+
+    fn step(name: &str, topics: &[&str], value: &str) -> TransformStep {
+        TransformStep {
+            name: name.to_string(),
+            topics: topics
+                .iter()
+                .map(|t| TopicFilter::new((*t).to_string()).expect("valid filter"))
+                .collect(),
+            failure_action: "drop".to_string(),
+            enable: true,
+            operations: vec![TransformOperation {
+                key: "payload".to_string(),
+                value: value.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn chain_order_defines_execution_order() {
+        let topic = Topic::new("live/1".to_string()).expect("valid topic");
+        let payload = Bytes::from("m");
+        let steps = vec![
+            step("t-a", &["live/#"], "${payload}[t-a]"),
+            step("t-b", &["live/#"], "${payload}[t-b]"),
+        ];
+        let (_, out, shed) = apply_transform_steps(&steps, &topic, &payload);
+        assert!(!shed);
+        assert_eq!(String::from_utf8_lossy(&out), "m[t-a][t-b]");
+        let reversed = vec![
+            step("t-b", &["live/#"], "${payload}[t-b]"),
+            step("t-a", &["live/#"], "${payload}[t-a]"),
+        ];
+        let (_, out, shed) = apply_transform_steps(&reversed, &topic, &payload);
+        assert!(!shed);
+        assert_eq!(String::from_utf8_lossy(&out), "m[t-b][t-a]");
+    }
+
+    #[test]
+    fn non_matching_and_disabled_steps_are_skipped() {
+        let topic = Topic::new("live/1".to_string()).expect("valid topic");
+        let payload = Bytes::from("m");
+        let mut steps = vec![
+            step("other", &["other/#"], "${payload}[x]"),
+            step("live", &["live/#"], "${payload}[y]"),
+        ];
+        steps[1].enable = false;
+        let (_, out, shed) = apply_transform_steps(&steps, &topic, &payload);
+        assert!(!shed);
+        assert_eq!(String::from_utf8_lossy(&out), "m");
+    }
+
+    #[test]
+    fn invalid_topic_rewrite_sheds_unless_ignored() {
+        let topic = Topic::new("live/1".to_string()).expect("valid topic");
+        let payload = Bytes::from("m");
+        let bad = TransformStep {
+            name: "bad".to_string(),
+            topics: vec![TopicFilter::new("live/#".to_string()).expect("valid filter")],
+            failure_action: "drop".to_string(),
+            enable: true,
+            operations: vec![TransformOperation {
+                key: "topic".to_string(),
+                value: String::new(),
+            }],
+        };
+        let (_, _, shed) = apply_transform_steps(std::slice::from_ref(&bad), &topic, &payload);
+        assert!(shed, "invalid rewrite with `drop` sheds the message");
+        let mut ignored = bad.clone();
+        ignored.failure_action = "ignore".to_string();
+        let (out_topic, _, shed) =
+            apply_transform_steps(std::slice::from_ref(&ignored), &topic, &payload);
+        assert!(!shed);
+        assert_eq!(out_topic.as_str(), "live/1");
+    }
+
+    #[test]
+    fn empty_chain_costs_no_rewrite() {
+        let topic = Topic::new("live/1".to_string()).expect("valid topic");
+        let payload = Bytes::from("m");
+        let (out_topic, out_payload, shed) = apply_transform_steps(&[], &topic, &payload);
+        assert!(!shed);
+        assert_eq!(out_topic.as_str(), "live/1");
+        assert_eq!(out_payload, payload);
+    }
+}
+
 /// Direct in-memory sink for rules to publish messages back into the broker
 /// without paying the cost of establishing an external loopback network connection.
 #[async_trait]
@@ -858,6 +1048,14 @@ pub struct RuleEngine {
     /// the publish path must never take a management lock, and the sys
     /// check below stays a lock-free `Arc` clone plus one prefix test.
     engine_config: Arc<arc_swap::ArcSwap<broker_config::RuleEngineConf>>,
+    /// Lock-free message-transformation chain for the ingress path
+    /// (W3-32): the management plane swaps the whole ordered chain on
+    /// every transform create/replace, and the publish path loads one
+    /// `Arc` per ingress with no store lock. At most the chain cap of
+    /// small steps, so no list grows on the message path. Reason for
+    /// `ArcSwap`: the publish path must never take the management
+    /// store lock; matching stays filter tests plus template renders.
+    transforms: Arc<arc_swap::ArcSwap<Vec<TransformStep>>>,
 }
 
 /// Shared flush context: what a rule-task sink worker needs at emit time.
@@ -1128,6 +1326,7 @@ impl RuleEngine {
             engine_config: Arc::new(arc_swap::ArcSwap::from(Arc::new(
                 broker_config::RuleEngineConf::default(),
             ))),
+            transforms: Arc::new(arc_swap::ArcSwap::from(Arc::new(Vec::new()))),
         }
     }
 
@@ -1176,6 +1375,7 @@ impl RuleEngine {
             engine_config: Arc::new(arc_swap::ArcSwap::from(Arc::new(
                 broker_config::RuleEngineConf::default(),
             ))),
+            transforms: Arc::new(arc_swap::ArcSwap::from(Arc::new(Vec::new()))),
         }
     }
 
@@ -2078,6 +2278,23 @@ impl RuleEngine {
     /// one atomic store.
     pub fn apply_engine_config(&self, conf: broker_config::RuleEngineConf) {
         self.engine_config.store(Arc::new(conf));
+    }
+
+    /// Swap the ingress transformation chain (W3-32). Management-plane
+    /// and boot only: every validated transform create/replace swaps the
+    /// whole ordered chain, and boot rebuilds it once from the registry
+    /// so persisted entries apply from the first publish. The publish
+    /// path only loads. One atomic store per swap.
+    pub fn sync_transforms(&self, steps: Vec<TransformStep>) {
+        self.transforms.store(Arc::new(steps));
+    }
+
+    /// Lock-free snapshot of the transformation chain for the publish
+    /// path (W3-32): one `Arc` clone, no lock, no allocation beyond the
+    /// refcount bump. Callers hold the snapshot across one ingress and
+    /// run [`apply_transform_steps`] over it.
+    pub fn transform_snapshot(&self) -> Arc<Vec<TransformStep>> {
+        self.transforms.load_full()
     }
 
     /// Feed matching windowed ingress into the embedded rule runtime:

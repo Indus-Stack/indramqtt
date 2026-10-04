@@ -40,6 +40,7 @@ pub mod sso;
 pub mod status;
 pub mod trace;
 pub mod tracing;
+pub mod transformations;
 
 use crate::ApiState;
 use axum::{
@@ -791,4 +792,18 @@ pub fn protected_router() -> Router<ApiState> {
         // the live stores with validate-all-before-apply semantics.
         // Management-plane only; publish and deliver never touch it.
         .route("/data/import", post(backup::import_data))
+        // Message transformation chain (W3-32, C08-01..C08-03): ordered
+        // list, validated append and whole-chain replace on the real
+        // chain store with execution hooked into ingress via the
+        // engine's lock-free snapshot. List reads the bare chain in
+        // execution order (`[]` when empty, never an error, never
+        // paged); unknown query keys are ignored. Management-plane
+        // only; publish loads the engine snapshot and never takes the
+        // store lock.
+        .route(
+            "/message_transformations",
+            get(transformations::list_transformations)
+                .post(transformations::create_transformation)
+                .put(transformations::replace_transformations),
+        )
 }

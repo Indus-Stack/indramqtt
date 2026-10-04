@@ -270,6 +270,14 @@ pub struct ApiState {
     /// snapshot per ingress and never takes a management lock.
     /// Management-plane only; publish and deliver never touch this store.
     pub rule_engine_config: Arc<broker_rules::EngineConfigStore>,
+    /// Ordered message-transformation chain for `GET`/`POST`/`PUT
+    /// /api/v5/message_transformations` (W3-32, C08-01..C08-03):
+    /// bounded ordered chain validated per entry, persisted across a
+    /// restart via the config core, executed in order on matching
+    /// ingress through the engine's lock-free snapshot. The routes read
+    /// one bounded snapshot per request; the publish path loads one
+    /// `Arc` per ingress and never takes this store's lock.
+    pub transformations: Arc<crate::v5::transformations::TransformChainStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -446,6 +454,14 @@ impl ApiState {
                 },
             ));
         }
+        // Boot seeding (W3-32): route the loaded transformation chain
+        // into a shared chain so management reads observe the persisted
+        // order from the first connection, and mirror it once into the
+        // engine's lock-free ingress snapshot so the first publish
+        // rewrites without a restart. An empty snapshot is a no-op.
+        let transformations =
+            Arc::new(crate::v5::transformations::TransformChainStore::from_registry(&config));
+        engine.sync_transforms(transformations.steps_snapshot());
         Self {
             engine,
             sessions,
@@ -487,6 +503,7 @@ impl ApiState {
             sources,
             actions,
             rule_engine_config,
+            transformations,
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -567,6 +584,7 @@ impl ApiState {
             sources: Arc::new(crate::v5::sources::SourceStore::new()),
             actions: Arc::new(crate::v5::actions::ActionStore::new()),
             rule_engine_config,
+            transformations: Arc::new(crate::v5::transformations::TransformChainStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }

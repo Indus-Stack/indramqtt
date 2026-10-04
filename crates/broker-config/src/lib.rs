@@ -1963,6 +1963,224 @@ impl SourcesConf {
     }
 }
 
+/// Upper bound for stored message transformations. Writes past this
+/// size are rejected instead of growing the list without limit. Reason:
+/// the management plane snapshots the whole chain per list request and
+/// the publish path clones one snapshot per ingress, so the chain must
+/// stay small and bounded; 64 covers the documented chain with headroom
+/// while keeping per-request clones cheap.
+// TODO(parity): is 64 the documented chain cap? The rulebook does not
+// decide the exact bound; 64 is the conservative choice until the
+// conformance checker pins it.
+pub const MAX_TRANSFORMATIONS: usize = 64;
+
+/// Longest accepted transformation name (256 bytes). Reason: names are
+/// map keys cloned into every list snapshot and persisted per entry, so
+/// an unbounded name lets one record bloat each list read; 256 covers
+/// operator naming with headroom while keeping per-request clones cheap.
+pub const MAX_TRANSFORMATION_NAME_LEN: usize = 256;
+
+/// Most topic filters accepted in one transformation (16). Reason: the
+/// publish path tests each filter per ingress, so the list stays small
+/// and bounded; 16 covers operator routing with headroom while keeping
+/// per-ingress matching cheap.
+pub const MAX_TRANSFORMATION_TOPICS: usize = 16;
+
+/// Longest accepted transformation topic filter (256 bytes). Reason:
+/// filters clone into every list snapshot and persist per entry, so an
+/// unbounded filter lets one record bloat each list read; 256 covers
+/// topic filters with headroom while keeping snapshots small.
+pub const MAX_TRANSFORMATION_TOPIC_LEN: usize = 256;
+
+/// Most operations accepted in one transformation (16). Reason: the
+/// publish path renders each operation per matching ingress, so the
+/// list stays small and bounded; 16 covers chained rewrites with
+/// headroom while keeping per-ingress work cheap.
+pub const MAX_TRANSFORMATION_OPERATIONS: usize = 16;
+
+/// Longest accepted operation template (1024 bytes). Reason: templates
+/// render per matching ingress and clone into every snapshot, so an
+/// unbounded template lets one record bloat reads and the fire path;
+/// 1024 covers rewrite templates with headroom while keeping rows small.
+pub const MAX_TRANSFORMATION_VALUE_LEN: usize = 1024;
+
+/// Longest accepted opaque transformation config document (4096 bytes).
+/// Reason: the document clones into every list snapshot and persists
+/// per entry, so an unbounded document lets one record bloat each
+/// read; 4096 covers decoder settings with headroom while keeping
+/// snapshots small.
+pub const MAX_TRANSFORMATION_CONFIG_LEN: usize = 4096;
+
+/// Serde default for a missing transformation enable flag: historical
+/// entries predate the flag and were always enabled.
+fn default_transformation_enabled() -> bool {
+    true
+}
+
+/// One operation inside a stored transformation: set `key` to `value`.
+/// `key` names the message field (`payload` or `topic`); `value` is a
+/// template where `${payload}` expands to the current payload text and
+/// `${topic}` expands to the current topic name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformationOperation {
+    /// Message field to set; must be non-empty (field `key`).
+    pub key: String,
+    /// Template for the new value (field `value`).
+    pub value: String,
+}
+
+/// One stored message transformation: the operator-chosen name, the
+/// topic filters it applies to, the failure behaviour, whether it
+/// participates, the ordered operations, and the remaining fields as an
+/// opaque JSON document (may be empty).
+// TODO(parity): which per-entry fields does the documented shape require
+// beyond name/topics/failure_action/enable/operations (decoders,
+// encoders, description, tags, log settings)? The rulebook does not
+// decide the exact shape; fields the broker cannot execute are stored
+// opaquely and reported back rather than invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformationEntry {
+    /// Transformation name; must be non-empty and unique within the root.
+    pub name: String,
+    /// Topic filters the transformation applies to; at least one entry.
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// Failure behaviour: `drop`, `disconnect` or `ignore`.
+    #[serde(default = "default_transformation_failure_action")]
+    pub failure_action: String,
+    /// Whether the entry participates (missing entries from
+    /// pre-persistence files load as `true`, the historical behaviour).
+    #[serde(default = "default_transformation_enabled")]
+    pub enable: bool,
+    /// Ordered operations applied in order on matching messages.
+    #[serde(default)]
+    pub operations: Vec<TransformationOperation>,
+    /// Opaque remaining configuration as a JSON document; may be empty.
+    #[serde(default)]
+    pub config: String,
+}
+
+/// Serde default for a missing failure behaviour: drop the message
+/// rather than deliver it untransformed (fail closed).
+fn default_transformation_failure_action() -> String {
+    "drop".to_string()
+}
+
+/// Returns true for a transformation failure behaviour the kernel stores.
+#[must_use]
+pub fn is_known_transformation_failure_action(action: &str) -> bool {
+    matches!(action, "drop" | "disconnect" | "ignore")
+}
+
+/// Root: stored message transformations in chain order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformationsConf {
+    #[serde(default)]
+    pub transformations: Vec<TransformationEntry>,
+}
+
+impl TransformationsConf {
+    /// Validates names (non-empty, bounded, unique), topics (at least one
+    /// valid filter each), failure behaviours (known), operations (known
+    /// keys, string values) and the chain length cap.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.transformations.len() > MAX_TRANSFORMATIONS {
+            return Err(ConfigError::Invalid(format!(
+                "transformations.transformations holds {} entries, at most {} (field `transformations`)",
+                self.transformations.len(),
+                MAX_TRANSFORMATIONS
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.transformations.len());
+        for (index, entry) in self.transformations.iter().enumerate() {
+            if entry.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].name must not be empty (field `name`)"
+                )));
+            }
+            if entry.name.len() > MAX_TRANSFORMATION_NAME_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].name {:?} is too long (field `name`)",
+                    entry.name
+                )));
+            }
+            if entry.topics.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].topics must not be empty (field `topics`)"
+                )));
+            }
+            if entry.topics.len() > MAX_TRANSFORMATION_TOPICS {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].topics holds {} entries, at most {} (field `topics`)",
+                    entry.topics.len(),
+                    MAX_TRANSFORMATION_TOPICS
+                )));
+            }
+            for topic in &entry.topics {
+                if topic.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].topics entry must not be empty (field `topics`)"
+                    )));
+                }
+                if topic.len() > MAX_TRANSFORMATION_TOPIC_LEN {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].topics entry holds {} bytes, at most {} (field `topics`)",
+                        topic.len(),
+                        MAX_TRANSFORMATION_TOPIC_LEN
+                    )));
+                }
+            }
+            if !is_known_transformation_failure_action(&entry.failure_action) {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].failure_action {:?} is unknown (field `failure_action`)",
+                    entry.failure_action
+                )));
+            }
+            if entry.operations.len() > MAX_TRANSFORMATION_OPERATIONS {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].operations holds {} entries, at most {} (field `operations`)",
+                    entry.operations.len(),
+                    MAX_TRANSFORMATION_OPERATIONS
+                )));
+            }
+            for (op_index, op) in entry.operations.iter().enumerate() {
+                if op.key.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].operations[{op_index}].key must not be empty (field `key`)"
+                    )));
+                }
+                if !matches!(op.key.as_str(), "payload" | "topic") {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].operations[{op_index}].key {:?} is unknown (field `key`)",
+                        op.key
+                    )));
+                }
+                if op.value.len() > MAX_TRANSFORMATION_VALUE_LEN {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].operations[{op_index}].value holds {} bytes, at most {} (field `value`)",
+                        op.value.len(),
+                        MAX_TRANSFORMATION_VALUE_LEN
+                    )));
+                }
+            }
+            if entry.config.len() > MAX_TRANSFORMATION_CONFIG_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].config holds {} bytes, at most {} (field `config`)",
+                    entry.config.len(),
+                    MAX_TRANSFORMATION_CONFIG_LEN
+                )));
+            }
+            if !seen.insert(entry.name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].name {:?} is duplicated (field `name`)",
+                    entry.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Most entries accepted in one request-filter list inside the
 /// rule-engine settings (allow/deny CIDRs, deny hosts). Reason: the lists
 /// are cloned into every management snapshot and consulted per connector
@@ -2265,6 +2483,8 @@ pub struct FullSnapshot {
     pub sources: SourcesConf,
     #[serde(default)]
     pub rule_engine: RuleEngineConf,
+    #[serde(default)]
+    pub transformations: TransformationsConf,
 }
 
 impl FullSnapshot {
@@ -2285,6 +2505,7 @@ impl FullSnapshot {
         self.actions.validate()?;
         self.sources.validate()?;
         self.rule_engine.validate()?;
+        self.transformations.validate()?;
         Ok(())
     }
 }
@@ -2322,6 +2543,8 @@ pub enum ConfigRoot {
     Sources(SourcesConf),
     /// Validated rule-engine settings root.
     RuleEngine(RuleEngineConf),
+    /// Validated message transformation chain root.
+    Transformations(TransformationsConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2413,6 +2636,7 @@ impl ConfigRegistry {
             ConfigRoot::Actions(conf) => self.commit_actions(conf),
             ConfigRoot::Sources(conf) => self.commit_sources(conf),
             ConfigRoot::RuleEngine(conf) => self.commit_rule_engine(conf),
+            ConfigRoot::Transformations(conf) => self.commit_transformations(conf),
         }
     }
 
@@ -2581,6 +2805,17 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits a validated message transformation chain.
+    pub fn commit_transformations(&self, conf: TransformationsConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.transformations = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Serialises the current snapshot to TOML and writes it atomically.
     ///
     /// The snapshot is written to a unique temp file in the same
@@ -2700,6 +2935,7 @@ mod tests {
             actions: ActionsConf::default(),
             sources: SourcesConf::default(),
             rule_engine: RuleEngineConf::default(),
+            transformations: TransformationsConf::default(),
         }
     }
 
