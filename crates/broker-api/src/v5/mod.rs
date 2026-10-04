@@ -844,4 +844,19 @@ pub fn protected_router() -> Router<ApiState> {
             "/message_transformations/transformation/:name/enable/:enable",
             post(transformations::set_transformation_enabled),
         )
+        // Per-transformation metrics (W3-36, C08-09/C08-10): live
+        // lock-free counters attributed on the ingress path, plus a
+        // reset that zeroes them. Unknown names are 404 with the
+        // documented shape; neither route is paged and unknown query
+        // keys are ignored. Management-plane only; increments stay
+        // lock-free atomics and publish/deliver never touch the chain
+        // store.
+        .route(
+            "/message_transformations/transformation/:name/metrics",
+            get(transformations::get_transformation_metrics),
+        )
+        .route(
+            "/message_transformations/transformation/:name/metrics/reset",
+            post(transformations::reset_transformation_metrics),
+        )
 }

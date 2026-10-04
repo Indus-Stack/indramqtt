@@ -464,9 +464,22 @@ impl ApiState {
         // order from the first connection, and mirror it once into the
         // engine's lock-free ingress snapshot so the first publish
         // rewrites without a restart. An empty snapshot is a no-op.
+        // Boot seeding (W3-36): register a zeroed per-transformation
+        // metric record for every stored name so the first publish
+        // after a restart attributes from zero. Metrics stay memory-only
+        // by design (chain config persists via W3-32); an empty chain
+        // is a no-op.
         let transformations =
             Arc::new(crate::v5::transformations::TransformChainStore::from_registry(&config));
         engine.sync_transforms(transformations.steps_snapshot());
+        {
+            let names: Vec<String> = transformations
+                .snapshot()
+                .iter()
+                .map(|record| record.name.clone())
+                .collect();
+            engine.sync_transform_metrics(&names);
+        }
         Self {
             engine,
             sessions,

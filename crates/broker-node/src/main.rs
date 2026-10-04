@@ -4420,7 +4420,8 @@ async fn ingress_pipeline_with_publisher(
     // rules, no fan-out. Per-message cost: one `Arc` clone plus one
     // length check when the chain is empty, without cloning topic or
     // payload; matching steps add one filter test per filter plus one
-    // template render per operation.
+    // template render per operation. Per-transform metrics (W3-36)
+    // add one `Arc` clone of the metric map plus lookups and bumps.
     // TODO(parity): is transforms-before-retained-and-rules the
     // documented order? The rulebook does not decide; the current
     // choice applies transforms first until the checker pins it.
@@ -4428,8 +4429,13 @@ async fn ingress_pipeline_with_publisher(
     let transformed: Option<(Topic, Bytes)> = if snapshot.is_empty() {
         None
     } else {
-        let (work_topic, work_payload, shed) =
-            broker_rules::apply_transform_steps(&snapshot, topic, payload);
+        let metric_snapshot = shared.engine.transform_metrics_snapshot();
+        let (work_topic, work_payload, shed) = broker_rules::apply_transform_steps_with_metrics(
+            &snapshot,
+            &metric_snapshot,
+            topic,
+            payload,
+        );
         if shed {
             return Vec::new();
         }
@@ -6018,6 +6024,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let steps = shared.transformations.steps_snapshot();
         shared.engine.sync_transforms(steps);
+        // Transformation metrics (W3-36): register a zeroed record for
+        // every stored name so the first publish after a restart
+        // attributes from zero. Metrics stay memory-only by design.
+        let names: Vec<String> = shared
+            .transformations
+            .snapshot()
+            .iter()
+            .map(|record| record.name.clone())
+            .collect();
+        shared.engine.sync_transform_metrics(&names);
     }
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
@@ -9885,6 +9901,91 @@ mod tests {
         let (topic, _, _, retain) = decode_publish_meta_parts(&held.metadata);
         assert_eq!(topic, "chain/order");
         assert!(retain, "retained replay carries retain");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transform_metrics_move_on_real_publish_and_reset() {
+        use broker_api::v5::transformations::{TransformOperation, TransformRecord};
+
+        let shared = Shared::new();
+        shared
+            .transformations
+            .insert(TransformRecord {
+                name: "w3-36-live".to_string(),
+                topics: vec!["metrics/live/#".to_string()],
+                failure_action: "drop".to_string(),
+                enable: true,
+                operations: vec![TransformOperation {
+                    key: "payload".to_string(),
+                    value: "${payload}[m]".to_string(),
+                }],
+                params: serde_json::json!({}),
+            })
+            .expect("transform inserts");
+        // Same wiring the management create handler drives: metric
+        // record plus engine snapshot.
+        shared.engine.ensure_transform_metrics("w3-36-live");
+        shared
+            .engine
+            .sync_transforms(shared.transformations.steps_snapshot());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server_shared = shared.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = server_shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let sub = bind_client(addr, 531, "metrics-watcher", true).await;
+        sub.send(subscribe_frame(
+            531,
+            2,
+            encode_subscribe_meta(7, "metrics-watcher", &[("metrics/live", 0)]),
+        ))
+        .await
+        .expect("subscribe");
+        assert_eq!(
+            sub.recv().await.expect("suback").header.opcode,
+            OpCode::SubAckOut
+        );
+        let publ = bind_client(addr, 532, "metrics-publisher", true).await;
+        let (meta, payload) = encode_publish_meta("metrics/live", 0, 0, false, b"m");
+        publ.send(publish_frame(532, 2, meta, payload))
+            .await
+            .expect("publish");
+        let live = sub.recv().await.expect("recv transformed");
+        assert_eq!(live.header.opcode, OpCode::PublishOut);
+        assert_eq!(live.payload, Bytes::from_static(b"m[m]"));
+        // The broker event (publish through the ingress pipeline)
+        // attributes the run on the engine record.
+        let (matched, succeeded, failed) = shared
+            .engine
+            .transform_metrics_snapshot_for("w3-36-live")
+            .expect("known name has a record");
+        assert_eq!(matched, 1);
+        assert_eq!(succeeded, 1);
+        assert_eq!(failed, 0);
+        // Reset zeroes the counters; unknown names hold no record.
+        assert!(shared.engine.reset_transform_metrics("w3-36-live"));
+        let (matched, succeeded, failed) = shared
+            .engine
+            .transform_metrics_snapshot_for("w3-36-live")
+            .expect("record stays after reset");
+        assert_eq!((matched, succeeded, failed), (0, 0, 0));
+        assert!(!shared.engine.reset_transform_metrics("no-such-transform"));
+        assert!(shared
+            .engine
+            .transform_metrics_snapshot_for("no-such-transform")
+            .is_none());
 
         server.abort();
     }

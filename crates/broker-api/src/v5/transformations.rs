@@ -11,8 +11,8 @@
 //!
 //! Execution: stored steps run in chain order on matching messages
 //! before retained writes and rule dispatch, so retained state and rules
-//! observe the transformed message. Per-transform metrics do not exist;
-//! counters stay memory-only elsewhere and are out of scope.
+//! observe the transformed message. Per-transform metrics count runs on
+//! the ingress path; they stay memory-only and reset on restart.
 //!
 //! Store bounds (stated here and enforced below):
 //! - at most [`MAX_TRANSFORMATIONS`] entries (64: caps management-plane
@@ -547,6 +547,7 @@ pub async fn create_transformation(State(state): State<ApiState>, body: Bytes) -
     };
     match state.transformations.insert(entry) {
         Ok(stored) => {
+            state.engine.ensure_transform_metrics(&stored.name);
             sync_engine(&state);
             if let Err(error) = state.transformations.persist() {
                 return transform_persist_error(error);
@@ -614,6 +615,15 @@ pub async fn replace_transformations(State(state): State<ApiState>, body: Bytes)
         }
     }
     state.transformations.replace_all(entries);
+    {
+        let names: Vec<String> = state
+            .transformations
+            .snapshot()
+            .iter()
+            .map(|record| record.name.clone())
+            .collect();
+        state.engine.reconcile_transform_metrics(&names);
+    }
     sync_engine(&state);
     if let Err(error) = state.transformations.persist() {
         return transform_persist_error(error);
@@ -759,6 +769,7 @@ pub async fn delete_transformation(
     if !state.transformations.remove(&name) {
         return ApiError::NotFound(format!("transformation {name:?} not found")).into_response();
     }
+    state.engine.remove_transform_metrics(&name);
     sync_engine(&state);
     if let Err(error) = state.transformations.persist() {
         return transform_persist_error(error);
@@ -827,6 +838,102 @@ pub async fn set_transformation_enabled(
         return transform_persist_error(error);
     }
     (StatusCode::OK, Json(entry.to_json())).into_response()
+}
+
+/// `GET /api/v5/message_transformations/transformation/:name/metrics`:
+/// live per-transformation counters (W3-36, C08-09).
+///
+/// A known name returns the live counters attributed on the ingress
+/// path (`matched` runs, `succeeded` clean runs, `failed` sheds) with
+/// zero defaults at creation and after a restart. An unknown name
+/// returns 404 with the documented `{code, message}` shape, not an
+/// empty body. The pair is not paged; unknown query parameters are
+/// ignored. Management-plane only: one short store read plus
+/// lock-free atomic loads; the publish path bumps the same atomics
+/// and never takes this store lock.
+///
+/// The counter set is fixed per name (three atomics, no history), so
+/// a read never grows anything. Rates, node rows and gauges are
+/// omitted because the broker does not track them and a constant
+/// would stand in for a measurement.
+///
+/// Fire-path cost (stated for the delivery-path note): the publish
+/// path holds one `Arc` each of the chain and the metric map per
+/// ingress plus one `HashMap` lookup and relaxed `fetch_add` calls
+/// per matching step — lock-free atomics only, no lock, no queue,
+/// no per-fire allocation; text rendering stays here in the handler.
+///
+/// Tenant behaviour: the read selects no session, so no path leaves
+/// a tenant.
+// TODO(parity): which counter names plus envelope shapes does the documented
+// spec require beyond `matched`/`succeeded`/`failed` (rates, node rows,
+// ...)? The rulebook does not decide the exact shape; the current choice
+// reports the honest live subset the ingress path attributes (`name`
+// plus `metrics {matched, succeeded, failed}`) and omits the rest
+// rather than inventing constants, until the checker pins it.
+pub async fn get_transformation_metrics(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    if state.transformations.get(&name).is_none() {
+        return ApiError::NotFound(format!("transformation {name:?} not found")).into_response();
+    }
+    // The record is registered on create/boot, but a standalone engine
+    // or a race keeps this fail-closed at zero rather than 500.
+    let (matched, succeeded, failed) = state
+        .engine
+        .transform_metrics_snapshot_for(&name)
+        .unwrap_or((0, 0, 0));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "name": name,
+            "metrics": {
+                "matched": matched,
+                "succeeded": succeeded,
+                "failed": failed,
+            },
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/v5/message_transformations/transformation/:name/metrics/reset`:
+/// zero one transformation counters (W3-36, C08-10).
+///
+/// Resets the live counters to zero and reports success with 204 and
+/// no body. Resetting an unknown name is 404 with the documented
+/// `{code, message}` shape, not an empty body. Counters resume from
+/// zero on the next ingress; the reset persists only as the zeroed
+/// values (the map is memory-only and restarts at zero by design).
+/// The pair is not paged; unknown query parameters are ignored.
+/// Management-plane only: one short store read plus lock-free atomic
+/// stores; increments stay lock-free atomics and publish/deliver
+/// never touch this store.
+///
+/// Tenant behaviour: the reset selects no session, so no path leaves
+/// a tenant.
+// TODO(parity): does the spec report a reset as an empty 204 or as a
+// 200 with a body? The rulebook does not decide the exact success
+// shape; the current choice answers 204 with no body, mirroring the
+// sibling rule and action resets, until the checker pins it.
+pub async fn reset_transformation_metrics(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    if state.transformations.get(&name).is_none() {
+        return ApiError::NotFound(format!("transformation {name:?} not found")).into_response();
+    }
+    if !state.engine.reset_transform_metrics(&name) {
+        // The entry exists but its record is missing (standalone
+        // engine or a boot race): register a zeroed record and report
+        // success so the reset shows as zeroes on the next read.
+        state.engine.ensure_transform_metrics(&name);
+        state.engine.reset_transform_metrics(&name);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Validate a reorder body into the ordered name list.
@@ -2224,5 +2331,207 @@ mod tests {
         assert!(!restarted.get("persist-enable").expect("reads back").enable);
         assert!(!restarted.steps_snapshot()[0].enable);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn metrics_body(name: &str, topic: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "topics": [topic],
+            "failure_action": "drop",
+            "operations": [{"key": "payload", "value": "${payload}-m"}],
+        })
+    }
+
+    async fn metrics_parts(state: &ApiState, name: &str) -> (StatusCode, serde_json::Value) {
+        response_parts(
+            get_transformation_metrics(
+                State(state.clone()),
+                Path(name.to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await
+    }
+
+    async fn run_live_ingress(state: &ApiState, topic: &str, payload: &str) {
+        let live_topic = broker_protocol::Topic::new(topic.to_string()).expect("valid topic");
+        let live_payload = Bytes::from(payload.to_string().into_bytes());
+        let steps = state.engine.transform_snapshot();
+        let metric_snapshot = state.engine.transform_metrics_snapshot();
+        let (_, _, shed) = broker_rules::apply_transform_steps_with_metrics(
+            &steps,
+            &metric_snapshot,
+            &live_topic,
+            &live_payload,
+        );
+        assert!(!shed);
+    }
+
+    #[tokio::test]
+    async fn metrics_move_on_real_execution_and_reset_zeroes() {
+        let state = standalone_state();
+        let created = metrics_body("w3-36-one", "metrics/live/#");
+        let (status, _) =
+            response_parts(create_transformation(State(state.clone()), make_body(&created)).await)
+                .await;
+        assert_eq!(status, StatusCode::CREATED);
+        // Fresh entries read zeroes through the production entry.
+        let (status, read) = metrics_parts(&state, "w3-36-one").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["name"], serde_json::json!("w3-36-one"));
+        assert_eq!(read["metrics"]["matched"], serde_json::json!(0));
+        assert_eq!(read["metrics"]["succeeded"], serde_json::json!(0));
+        assert_eq!(read["metrics"]["failed"], serde_json::json!(0));
+        // Real executions move the counters (same function ingress uses).
+        run_live_ingress(&state, "metrics/live/1", "m").await;
+        run_live_ingress(&state, "metrics/live/2", "m").await;
+        // Off-topic ingress moves nothing.
+        let off_topic = broker_protocol::Topic::new("other/1".to_string()).expect("valid topic");
+        let steps = state.engine.transform_snapshot();
+        let metric_snapshot = state.engine.transform_metrics_snapshot();
+        let (_, _, shed) = broker_rules::apply_transform_steps_with_metrics(
+            &steps,
+            &metric_snapshot,
+            &off_topic,
+            &Bytes::from("m"),
+        );
+        assert!(!shed);
+        let (status, moved) = metrics_parts(&state, "w3-36-one").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(moved["metrics"]["matched"], serde_json::json!(2));
+        assert_eq!(moved["metrics"]["succeeded"], serde_json::json!(2));
+        assert_eq!(moved["metrics"]["failed"], serde_json::json!(0));
+        // Reset through the production entry zeroes the counters.
+        let response = reset_transformation_metrics(
+            State(state.clone()),
+            Path("w3-36-one".to_string()),
+            Query(Default::default()),
+        )
+        .await;
+        let (status, empty) = response_parts(response).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(empty, serde_json::Value::Null);
+        let (status, zeroed) = metrics_parts(&state, "w3-36-one").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(zeroed["metrics"]["matched"], serde_json::json!(0));
+        assert_eq!(zeroed["metrics"]["succeeded"], serde_json::json!(0));
+        assert_eq!(zeroed["metrics"]["failed"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn metrics_unknown_name_is_404_and_ignores_unknown_query() {
+        let state = standalone_state();
+        let (status, err) = metrics_parts(&state, "no-such-transform").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        let (status, err) = response_parts(
+            reset_transformation_metrics(
+                State(state.clone()),
+                Path("no-such-transform".to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        // Unknown query keys change nothing on a hit.
+        let (status, _) = response_parts(
+            create_transformation(
+                State(state.clone()),
+                make_body(&metrics_body("w3-36-q", "metrics/q/#")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let query: Query<HashMap<String, String>> = Query(
+            [("unknown".to_string(), "x".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let (status, read) = response_parts(
+            get_transformation_metrics(State(state.clone()), Path("w3-36-q".to_string()), query)
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["name"], serde_json::json!("w3-36-q"));
+        let query: Query<HashMap<String, String>> = Query(
+            [("unknown".to_string(), "x".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let (status, _) = response_parts(
+            reset_transformation_metrics(State(state.clone()), Path("w3-36-q".to_string()), query)
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn metrics_follow_create_delete_and_replace() {
+        let state = standalone_state();
+        for name in ["w3-36-a", "w3-36-b"] {
+            let (status, _) = response_parts(
+                create_transformation(
+                    State(state.clone()),
+                    make_body(&metrics_body(name, "metrics/keep/#")),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        run_live_ingress(&state, "metrics/keep/1", "m").await;
+        let (_, moved) = metrics_parts(&state, "w3-36-a").await;
+        assert_eq!(moved["metrics"]["matched"], serde_json::json!(1));
+        // Delete drops the record; a re-create starts at zero.
+        let response = delete_transformation(
+            State(state.clone()),
+            Path("w3-36-a".to_string()),
+            Query(Default::default()),
+        )
+        .await;
+        let (status, _) = response_parts(response).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state
+            .engine
+            .transform_metrics_snapshot_for("w3-36-a")
+            .is_none());
+        let (status, _) = response_parts(
+            create_transformation(
+                State(state.clone()),
+                make_body(&metrics_body("w3-36-a", "metrics/keep/#")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, fresh) = metrics_parts(&state, "w3-36-a").await;
+        assert_eq!(fresh["metrics"]["matched"], serde_json::json!(0));
+        // Replace keeps survivors and drops removed names.
+        run_live_ingress(&state, "metrics/keep/2", "m").await;
+        let replaced = serde_json::json!([
+            {"name": "w3-36-a", "topics": ["metrics/keep/#"],
+             "failure_action": "drop",
+             "operations": [{"key": "payload", "value": "${payload}-m"}]},
+            {"name": "w3-36-c", "topics": ["metrics/keep/#"],
+             "failure_action": "drop",
+             "operations": [{"key": "payload", "value": "${payload}-m"}]},
+        ]);
+        let (status, _) = response_parts(
+            replace_transformations(State(state.clone()), make_body(&replaced)).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, kept) = metrics_parts(&state, "w3-36-a").await;
+        assert_eq!(kept["metrics"]["matched"], serde_json::json!(1));
+        let (_, fresh) = metrics_parts(&state, "w3-36-c").await;
+        assert_eq!(fresh["metrics"]["matched"], serde_json::json!(0));
+        let (status, _) = metrics_parts(&state, "w3-36-b").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
