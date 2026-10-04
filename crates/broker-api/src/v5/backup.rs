@@ -59,6 +59,7 @@ const KNOWN_ROOTS: &[&str] = &[
     "actions",
     "sources",
     "rule_engine",
+    "transformations",
 ];
 
 // Live tables the export writes. Each name maps to one tables part.
@@ -319,6 +320,30 @@ struct FileSourceRef {
     source_type: String,
     #[serde(default = "default_true")]
     enable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileTransformOperation {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileTransformRef {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    topics: Vec<String>,
+    #[serde(default)]
+    failure_action: String,
+    #[serde(default = "default_true")]
+    enable: bool,
+    #[serde(default)]
+    operations: Vec<FileTransformOperation>,
+    #[serde(default)]
+    config: String,
 }
 
 fn default_true() -> bool {
@@ -912,6 +937,73 @@ fn materialize(state: &ApiState, parsed: &ParsedBackup) -> Result<Materialized, 
                 if file_refs != live_refs {
                     return Err(ApiError::ValidationFailed(
                         "sources does not match live state: the backup carries no secrets to restore it"
+                            .to_string(),
+                    ));
+                }
+            }
+            "transformations" => {
+                let items = value
+                    .get("transformations")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        ApiError::BadRequest(
+                            "transformations part misses `transformations`".to_string(),
+                        )
+                    })?;
+                let mut file_refs: Vec<String> = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let row: FileTransformRef =
+                        serde_json::from_value(item.clone()).map_err(|error| {
+                            ApiError::BadRequest(format!(
+                                "transformations.transformations[{index}] is not a transformation: {error}"
+                            ))
+                        })?;
+                    let mut topics = row.topics.clone();
+                    topics.sort();
+                    let ops = row
+                        .operations
+                        .iter()
+                        .map(|op| format!("{}={}", op.key, op.value))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    file_refs.push(format!(
+                        "{}\0{}\0{}\0{}\0{}\0{}",
+                        row.name,
+                        topics.join(","),
+                        row.failure_action,
+                        row.enable,
+                        ops,
+                        row.config
+                    ));
+                }
+                let live_refs: Vec<String> = previous
+                    .transformations
+                    .transformations
+                    .iter()
+                    .map(|entry| {
+                        let mut topics = entry.topics.clone();
+                        topics.sort();
+                        let ops = entry
+                            .operations
+                            .iter()
+                            .map(|op| format!("{}={}", op.key, op.value))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!(
+                            "{}\0{}\0{}\0{}\0{}\0{}",
+                            entry.name,
+                            topics.join(","),
+                            entry.failure_action,
+                            entry.enable,
+                            ops,
+                            entry.config
+                        )
+                    })
+                    .collect();
+                // Chain order defines execution order, so compare in order.
+                if file_refs != live_refs {
+                    return Err(ApiError::ValidationFailed(
+                        "transformations does not match live state: the backup carries no secrets to restore it"
                             .to_string(),
                     ));
                 }

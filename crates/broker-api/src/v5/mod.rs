@@ -34,6 +34,7 @@ pub mod rule_engine;
 pub mod rule_events;
 pub mod rule_test;
 pub mod rules;
+pub mod schema_registry;
 pub mod schemas;
 pub mod slow_subscriptions;
 pub mod sources;
@@ -41,6 +42,7 @@ pub mod sso;
 pub mod status;
 pub mod trace;
 pub mod tracing;
+pub mod transformations;
 
 use crate::ApiState;
 use axum::{
@@ -794,4 +796,84 @@ pub fn protected_router() -> Router<ApiState> {
         // the live stores with validate-all-before-apply semantics.
         // Management-plane only; publish and deliver never touch it.
         .route("/data/import", post(backup::import_data))
+        // Message transformation chain (W3-32, C08-01..C08-03): ordered
+        // list, validated append and whole-chain replace on the real
+        // chain store with execution hooked into ingress via the
+        // engine's lock-free snapshot. List reads the bare chain in
+        // execution order (`[]` when empty, never an error, never
+        // paged); unknown query keys are ignored. Management-plane
+        // only; publish loads the engine snapshot and never takes the
+        // store lock.
+        .route(
+            "/message_transformations",
+            get(transformations::list_transformations)
+                .post(transformations::create_transformation)
+                .put(transformations::replace_transformations),
+        )
+        // Transformation dry-run (W3-33, C08-04): stateless probe of
+        // the supplied chain against one sample message through the
+        // real executor. Writes nothing and publishes nothing.
+        // Management-plane only; publish loads the engine snapshot
+        // and never takes the store lock.
+        .route(
+            "/message_transformations/dryrun",
+            post(transformations::dryrun_transformations),
+        )
+        // Transformation reorder (W3-34, C08-05): replace the stored
+        // chain order with the supplied name order, validated before
+        // anything applies. Answers 204; the new order shows on the
+        // next list read and drives execution order. Nothing is
+        // created or deleted. Management-plane only; publish loads
+        // the engine snapshot and never takes the store lock.
+        .route(
+            "/message_transformations/reorder",
+            post(transformations::reorder_transformations),
+        )
+        // Single transformation read and delete (W3-35, C08-06/C08-07):
+        // per-name read with 404 for unknown names, and per-name
+        // delete with 204 on success and 404 for unknown names. Neither
+        // route is paged; unknown query keys are ignored.
+        // Management-plane only; publish loads the engine snapshot
+        // and never takes the store lock.
+        .route(
+            "/message_transformations/transformation/:name",
+            get(transformations::get_transformation).delete(transformations::delete_transformation),
+        )
+        // Single transformation enable flag (W3-35, C08-08): flips one
+        // entry flag with 404 for unknown names and 400 for a malformed
+        // flag. Disabled steps skip at execution time through the engine
+        // snapshot. Management-plane only; publish loads the snapshot
+        // and never takes the store lock.
+        .route(
+            "/message_transformations/transformation/:name/enable/:enable",
+            post(transformations::set_transformation_enabled),
+        )
+        // Per-transformation metrics (W3-36, C08-09/C08-10): live
+        // lock-free counters attributed on the ingress path, plus a
+        // reset that zeroes them. Unknown names are 404 with the
+        // documented shape; neither route is paged and unknown query
+        // keys are ignored. Management-plane only; increments stay
+        // lock-free atomics and publish/deliver never touch the chain
+        // store.
+        .route(
+            "/message_transformations/transformation/:name/metrics",
+            get(transformations::get_transformation_metrics),
+        )
+        .route(
+            "/message_transformations/transformation/:name/metrics/reset",
+            post(transformations::reset_transformation_metrics),
+        )
+        // Schema registry (W3-37, C08-11..C08-13): paged list, checked
+        // create and drop on a real store. List uses the standard page
+        // envelope. Create parses the schema. Delete misses are 404.
+        // Management plane only. Publish and deliver take no lock here.
+        .route(
+            "/schema_registry",
+            get(schema_registry::list_schemas_registry)
+                .post(schema_registry::create_schema_registry),
+        )
+        .route(
+            "/schema_registry/:name",
+            delete(schema_registry::delete_schema_registry),
+        )
 }

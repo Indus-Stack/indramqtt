@@ -1972,6 +1972,462 @@ impl SourcesConf {
     }
 }
 
+/// Upper bound for stored message transformations. Writes past this
+/// size are rejected instead of growing the list without limit. Reason:
+/// the management plane snapshots the whole chain per list request and
+/// the publish path clones one snapshot per ingress, so the chain must
+/// stay small and bounded; 64 covers the documented chain with headroom
+/// while keeping per-request clones cheap.
+// TODO(parity): is 64 the documented chain cap? The rulebook does not
+// decide the exact bound; 64 is the conservative choice until the
+// conformance checker pins it.
+pub const MAX_TRANSFORMATIONS: usize = 64;
+
+/// Longest accepted transformation name (256 bytes). Reason: names are
+/// map keys cloned into every list snapshot and persisted per entry, so
+/// an unbounded name lets one record bloat each list read; 256 covers
+/// operator naming with headroom while keeping per-request clones cheap.
+pub const MAX_TRANSFORMATION_NAME_LEN: usize = 256;
+
+/// Most topic filters accepted in one transformation (16). Reason: the
+/// publish path tests each filter per ingress, so the list stays small
+/// and bounded; 16 covers operator routing with headroom while keeping
+/// per-ingress matching cheap.
+pub const MAX_TRANSFORMATION_TOPICS: usize = 16;
+
+/// Longest accepted transformation topic filter (256 bytes). Reason:
+/// filters clone into every list snapshot and persist per entry, so an
+/// unbounded filter lets one record bloat each list read; 256 covers
+/// topic filters with headroom while keeping snapshots small.
+pub const MAX_TRANSFORMATION_TOPIC_LEN: usize = 256;
+
+/// Most operations accepted in one transformation (16). Reason: the
+/// publish path renders each operation per matching ingress, so the
+/// list stays small and bounded; 16 covers chained rewrites with
+/// headroom while keeping per-ingress work cheap.
+pub const MAX_TRANSFORMATION_OPERATIONS: usize = 16;
+
+/// Longest accepted operation template (1024 bytes). Reason: templates
+/// render per matching ingress and clone into every snapshot, so an
+/// unbounded template lets one record bloat reads and the fire path;
+/// 1024 covers rewrite templates with headroom while keeping rows small.
+pub const MAX_TRANSFORMATION_VALUE_LEN: usize = 1024;
+
+/// Longest accepted opaque transformation config document (4096 bytes).
+/// Reason: the document clones into every list snapshot and persists
+/// per entry, so an unbounded document lets one record bloat each
+/// read; 4096 covers decoder settings with headroom while keeping
+/// snapshots small.
+pub const MAX_TRANSFORMATION_CONFIG_LEN: usize = 4096;
+
+/// Serde default for a missing transformation enable flag: historical
+/// entries predate the flag and were always enabled.
+fn default_transformation_enabled() -> bool {
+    true
+}
+
+/// One operation inside a stored transformation: set `key` to `value`.
+/// `key` names the message field (`payload` or `topic`); `value` is a
+/// template where `${payload}` expands to the current payload text and
+/// `${topic}` expands to the current topic name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformationOperation {
+    /// Message field to set; must be non-empty (field `key`).
+    pub key: String,
+    /// Template for the new value (field `value`).
+    pub value: String,
+}
+
+/// One stored message transformation: the operator-chosen name, the
+/// topic filters it applies to, the failure behaviour, whether it
+/// participates, the ordered operations, and the remaining fields as an
+/// opaque JSON document (may be empty).
+// TODO(parity): which per-entry fields does the documented shape require
+// beyond name/topics/failure_action/enable/operations (decoders,
+// encoders, description, tags, log settings)? The rulebook does not
+// decide the exact shape; fields the broker cannot execute are stored
+// opaquely and reported back rather than invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformationEntry {
+    /// Transformation name; must be non-empty and unique within the root.
+    pub name: String,
+    /// Topic filters the transformation applies to; at least one entry.
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// Failure behaviour: `drop`, `disconnect` or `ignore`.
+    #[serde(default = "default_transformation_failure_action")]
+    pub failure_action: String,
+    /// Whether the entry participates (missing entries from
+    /// pre-persistence files load as `true`, the historical behaviour).
+    #[serde(default = "default_transformation_enabled")]
+    pub enable: bool,
+    /// Ordered operations applied in order on matching messages.
+    #[serde(default)]
+    pub operations: Vec<TransformationOperation>,
+    /// Opaque remaining configuration as a JSON document; may be empty.
+    #[serde(default)]
+    pub config: String,
+}
+
+/// Serde default for a missing failure behaviour: drop the message
+/// rather than deliver it untransformed (fail closed).
+fn default_transformation_failure_action() -> String {
+    "drop".to_string()
+}
+
+/// Returns true for a transformation failure behaviour the kernel stores.
+#[must_use]
+pub fn is_known_transformation_failure_action(action: &str) -> bool {
+    matches!(action, "drop" | "disconnect" | "ignore")
+}
+
+/// Root: stored message transformations in chain order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransformationsConf {
+    #[serde(default)]
+    pub transformations: Vec<TransformationEntry>,
+}
+
+impl TransformationsConf {
+    /// Validates names (non-empty, bounded, unique), topics (at least one
+    /// valid filter each), failure behaviours (known), operations (known
+    /// keys, string values) and the chain length cap.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.transformations.len() > MAX_TRANSFORMATIONS {
+            return Err(ConfigError::Invalid(format!(
+                "transformations.transformations holds {} entries, at most {} (field `transformations`)",
+                self.transformations.len(),
+                MAX_TRANSFORMATIONS
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.transformations.len());
+        for (index, entry) in self.transformations.iter().enumerate() {
+            if entry.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].name must not be empty (field `name`)"
+                )));
+            }
+            if entry.name.len() > MAX_TRANSFORMATION_NAME_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].name {:?} is too long (field `name`)",
+                    entry.name
+                )));
+            }
+            if entry.topics.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].topics must not be empty (field `topics`)"
+                )));
+            }
+            if entry.topics.len() > MAX_TRANSFORMATION_TOPICS {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].topics holds {} entries, at most {} (field `topics`)",
+                    entry.topics.len(),
+                    MAX_TRANSFORMATION_TOPICS
+                )));
+            }
+            for topic in &entry.topics {
+                if topic.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].topics entry must not be empty (field `topics`)"
+                    )));
+                }
+                if topic.len() > MAX_TRANSFORMATION_TOPIC_LEN {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].topics entry holds {} bytes, at most {} (field `topics`)",
+                        topic.len(),
+                        MAX_TRANSFORMATION_TOPIC_LEN
+                    )));
+                }
+            }
+            if !is_known_transformation_failure_action(&entry.failure_action) {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].failure_action {:?} is unknown (field `failure_action`)",
+                    entry.failure_action
+                )));
+            }
+            if entry.operations.len() > MAX_TRANSFORMATION_OPERATIONS {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].operations holds {} entries, at most {} (field `operations`)",
+                    entry.operations.len(),
+                    MAX_TRANSFORMATION_OPERATIONS
+                )));
+            }
+            for (op_index, op) in entry.operations.iter().enumerate() {
+                if op.key.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].operations[{op_index}].key must not be empty (field `key`)"
+                    )));
+                }
+                if !matches!(op.key.as_str(), "payload" | "topic") {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].operations[{op_index}].key {:?} is unknown (field `key`)",
+                        op.key
+                    )));
+                }
+                if op.value.len() > MAX_TRANSFORMATION_VALUE_LEN {
+                    return Err(ConfigError::Invalid(format!(
+                        "transformations.transformations[{index}].operations[{op_index}].value holds {} bytes, at most {} (field `value`)",
+                        op.value.len(),
+                        MAX_TRANSFORMATION_VALUE_LEN
+                    )));
+                }
+            }
+            if entry.config.len() > MAX_TRANSFORMATION_CONFIG_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].config holds {} bytes, at most {} (field `config`)",
+                    entry.config.len(),
+                    MAX_TRANSFORMATION_CONFIG_LEN
+                )));
+            }
+            if !seen.insert(entry.name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "transformations.transformations[{index}].name {:?} is duplicated (field `name`)",
+                    entry.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Most schemas kept in the registry (256). Reason: the list clones the full
+/// set per read, so the set stays small; 256 covers operator use with room.
+pub const MAX_SCHEMAS: usize = 256;
+
+/// Longest accepted schema name (256 bytes). Reason: names are map keys and
+/// clone per read, so one long name cannot bloat reads.
+pub const MAX_SCHEMA_NAME_LEN: usize = 256;
+
+/// Most bytes accepted in one schema document (1 MiB). Reason: documents
+/// clone per read and persist per entry, so one large document cannot bloat
+/// reads or the state file; 1 MiB holds large schemas with room.
+pub const MAX_SCHEMA_BYTES: usize = 1_048_576;
+
+/// Longest accepted schema description (1024 bytes). Reason: descriptions
+/// clone per read, so one long text cannot bloat reads.
+pub const MAX_SCHEMA_DESC_LEN: usize = 1024;
+
+/// Schema kinds the registry stores.
+pub const KNOWN_SCHEMA_TYPES: &[&str] = &["json", "avro"];
+
+// TODO(parity): which schema kinds does the spec list beyond json and avro
+// (protobuf, ...)? The rulebook does not decide the set; the current choice
+// stores json and avro only until the checker pins it.
+
+/// True for a schema kind the registry stores.
+#[must_use]
+pub fn is_known_schema_type(kind: &str) -> bool {
+    KNOWN_SCHEMA_TYPES.contains(&kind)
+}
+
+/// True for a JSON Schema type name.
+#[must_use]
+pub fn is_known_json_schema_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+    )
+}
+
+/// Check one Avro record document. The document must be an object with
+/// type record, a non-empty name and a non-empty fields array. Each field
+/// must carry a name and a type. Return the parsed value on success.
+pub fn validate_avro_document(value: &serde_json::Value) -> Result<(), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "schema must be a JSON object".to_string())?;
+    match obj.get("type").and_then(|v| v.as_str()) {
+        Some("record") => {}
+        _ => return Err("avro schema needs `\"type\": \"record\"`".to_string()),
+    }
+    match obj.get("name").and_then(|v| v.as_str()) {
+        Some(name) if !name.trim().is_empty() => {}
+        _ => return Err("avro schema needs a non-empty `name`".to_string()),
+    }
+    let fields = obj
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "avro schema needs a `fields` array".to_string())?;
+    if fields.is_empty() {
+        return Err("avro schema `fields` must not be empty".to_string());
+    }
+    for (index, field) in fields.iter().enumerate() {
+        let entry = field
+            .as_object()
+            .ok_or_else(|| format!("avro `fields[{index}]` must be an object"))?;
+        match entry.get("name").and_then(|v| v.as_str()) {
+            Some(name) if !name.trim().is_empty() => {}
+            _ => return Err(format!("avro `fields[{index}]` needs a `name`")),
+        }
+        if !entry.contains_key("type") {
+            return Err(format!("avro `fields[{index}]` needs a `type`"));
+        }
+    }
+    Ok(())
+}
+
+/// Check one JSON Schema document. The document must be a non-empty object.
+/// It must carry at least one schema keyword. A present `type` must name a
+/// known JSON type. A present `properties` must be an object.
+pub fn validate_json_schema_document(value: &serde_json::Value) -> Result<(), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "schema must be a JSON object".to_string())?;
+    if obj.is_empty() {
+        return Err("json schema must not be empty".to_string());
+    }
+    let has_keyword = [
+        "type",
+        "properties",
+        "$schema",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "enum",
+        "$ref",
+        "items",
+        "required",
+    ]
+    .iter()
+    .any(|key| obj.contains_key(*key));
+    if !has_keyword {
+        return Err("json schema needs a type keyword".to_string());
+    }
+    if let Some(type_value) = obj.get("type") {
+        if let Some(name) = type_value.as_str() {
+            if !is_known_json_schema_type(name) {
+                return Err(format!("json schema `type` {name:?} is unknown"));
+            }
+        } else if let Some(names) = type_value.as_array() {
+            if names.is_empty() {
+                return Err("json schema `type` must not be empty".to_string());
+            }
+            for name in names {
+                match name.as_str() {
+                    Some(text) if is_known_json_schema_type(text) => {}
+                    _ => return Err("json schema `type` holds unknown entry".to_string()),
+                }
+            }
+        } else {
+            return Err("json schema `type` must be a string".to_string());
+        }
+    }
+    if let Some(props) = obj.get("properties") {
+        if !props.is_object() {
+            return Err("json schema `properties` must be an object".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Check one schema document for the named kind. Parse already happened;
+/// this only checks the shape. Return an error string on failure.
+pub fn validate_schema_document(kind: &str, value: &serde_json::Value) -> Result<(), String> {
+    match kind {
+        "avro" => validate_avro_document(value),
+        "json" => validate_json_schema_document(value),
+        _ => Err(format!("unknown schema type: {kind}")),
+    }
+}
+
+/// One stored schema: the operator-chosen name, the kind it was checked
+/// against, an optional description, and the schema document as JSON text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SchemaEntry {
+    /// Schema name; must be non-empty and unique within the root.
+    pub name: String,
+    /// Schema kind; must name a known kind (field `type`).
+    pub schema_type: String,
+    /// Optional description; at most [`MAX_SCHEMA_DESC_LEN`] bytes.
+    #[serde(default)]
+    pub description: String,
+    /// Schema document as JSON text; at most [`MAX_SCHEMA_BYTES`] bytes.
+    #[serde(default)]
+    pub schema: String,
+}
+
+/// Root: stored schemas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SchemasConf {
+    #[serde(default)]
+    pub schemas: Vec<SchemaEntry>,
+}
+
+impl SchemasConf {
+    /// Check names (non-empty, bounded, unique), kinds (known), sizes
+    /// (bounded) and documents (parsed per kind).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.schemas.len() > MAX_SCHEMAS {
+            return Err(ConfigError::Invalid(format!(
+                "schemas.schemas holds {} entries, at most {} (field `schemas`)",
+                self.schemas.len(),
+                MAX_SCHEMAS
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.schemas.len());
+        for (index, entry) in self.schemas.iter().enumerate() {
+            if entry.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].name must not be empty (field `name`)"
+                )));
+            }
+            if entry.name.len() > MAX_SCHEMA_NAME_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].name {:?} is too long (field `name`)",
+                    entry.name
+                )));
+            }
+            if entry.schema_type.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema_type must not be empty (field `type`)"
+                )));
+            }
+            if !is_known_schema_type(entry.schema_type.trim()) {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema_type {:?} is unknown (field `type`)",
+                    entry.schema_type
+                )));
+            }
+            if entry.description.len() > MAX_SCHEMA_DESC_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].description holds {} bytes, at most {} (field `description`)",
+                    entry.description.len(),
+                    MAX_SCHEMA_DESC_LEN
+                )));
+            }
+            if entry.schema.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema must not be empty (field `schema`)"
+                )));
+            }
+            if entry.schema.len() > MAX_SCHEMA_BYTES {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema holds {} bytes, at most {} (field `schema`)",
+                    entry.schema.len(),
+                    MAX_SCHEMA_BYTES
+                )));
+            }
+            let parsed: serde_json::Value = serde_json::from_str(&entry.schema).map_err(|err| {
+                ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema is not valid JSON: {err} (field `schema`)"
+                ))
+            })?;
+            validate_schema_document(entry.schema_type.trim(), &parsed).map_err(|reason| {
+                ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema is invalid: {reason} (field `schema`)"
+                ))
+            })?;
+            if !seen.insert(entry.name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].name {:?} is duplicated (field `name`)",
+                    entry.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Most entries accepted in one request-filter list inside the
 /// rule-engine settings (allow/deny CIDRs, deny hosts). Reason: the lists
 /// are cloned into every management snapshot and consulted per connector
@@ -2274,6 +2730,10 @@ pub struct FullSnapshot {
     pub sources: SourcesConf,
     #[serde(default)]
     pub rule_engine: RuleEngineConf,
+    #[serde(default)]
+    pub transformations: TransformationsConf,
+    #[serde(default)]
+    pub schemas: SchemasConf,
 }
 
 impl FullSnapshot {
@@ -2294,6 +2754,8 @@ impl FullSnapshot {
         self.actions.validate()?;
         self.sources.validate()?;
         self.rule_engine.validate()?;
+        self.transformations.validate()?;
+        self.schemas.validate()?;
         Ok(())
     }
 
@@ -2337,6 +2799,10 @@ pub enum ConfigRoot {
     Sources(SourcesConf),
     /// Validated rule-engine settings root.
     RuleEngine(RuleEngineConf),
+    /// Validated message transformation chain root.
+    Transformations(TransformationsConf),
+    /// Validated schema registry root.
+    Schemas(SchemasConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2442,6 +2908,8 @@ impl ConfigRegistry {
             ConfigRoot::Actions(conf) => self.commit_actions(conf),
             ConfigRoot::Sources(conf) => self.commit_sources(conf),
             ConfigRoot::RuleEngine(conf) => self.commit_rule_engine(conf),
+            ConfigRoot::Transformations(conf) => self.commit_transformations(conf),
+            ConfigRoot::Schemas(conf) => self.commit_schemas(conf),
         }
     }
 
@@ -2801,6 +3269,28 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits a validated message transformation chain.
+    pub fn commit_transformations(&self, conf: TransformationsConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.transformations = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Commits a validated schema registry.
+    pub fn commit_schemas(&self, conf: SchemasConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.schemas = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Serialises the current snapshot to TOML and writes it atomically.
     ///
     /// The snapshot is written to a unique temp file in the same
@@ -2920,6 +3410,8 @@ mod tests {
             actions: ActionsConf::default(),
             sources: SourcesConf::default(),
             rule_engine: RuleEngineConf::default(),
+            transformations: TransformationsConf::default(),
+            schemas: SchemasConf::default(),
         }
     }
 

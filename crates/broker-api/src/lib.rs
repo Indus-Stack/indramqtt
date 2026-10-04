@@ -290,6 +290,26 @@ pub struct ApiState {
     /// defaults. One short read lock per explain request; never touched on
     /// the per-message path.
     pub startup_config: Arc<std::sync::RwLock<Option<Arc<broker_config::layers::LayeredConfig>>>>,
+    /// Ordered message-transformation chain for `GET`/`POST`/`PUT
+    /// /api/v5/message_transformations` (W3-32, C08-01..C08-03) plus
+    /// the stateless dry-run probe
+    /// `POST /api/v5/message_transformations/dryrun` (W3-33, C08-04)
+    /// and the order replace
+    /// `POST /api/v5/message_transformations/reorder` (W3-34, C08-05):
+    /// bounded ordered chain validated per entry, persisted across a
+    /// restart via the config core, executed in order on matching
+    /// ingress through the engine's lock-free snapshot. The routes read
+    /// one bounded snapshot per request; the publish path loads one
+    /// `Arc` per ingress and never takes this store's lock. The probe
+    /// uses only the supplied chain and writes nothing.
+    pub transformations: Arc<crate::v5::transformations::TransformChainStore>,
+    /// Schema registry for `GET`/`POST /api/v5/schema_registry` (W3-37,
+    /// C08-11/C08-12) and `DELETE /api/v5/schema_registry/:name` (W3-37,
+    /// C08-13): bounded map with checked writes, kept across restarts
+    /// through the config core. Routes read one bounded snapshot per
+    /// request. No publish path reads this store. Publish and deliver take
+    /// no lock here.
+    pub schema_registry: Arc<crate::v5::schema_registry::SchemaRegistryStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -468,6 +488,27 @@ impl ApiState {
                 },
             ));
         }
+        // Boot seeding (W3-32): route the loaded transformation chain
+        // into a shared chain so management reads observe the persisted
+        // order from the first connection, and mirror it once into the
+        // engine's lock-free ingress snapshot so the first publish
+        // rewrites without a restart. An empty snapshot is a no-op.
+        // Boot seeding (W3-36): register a zeroed per-transformation
+        // metric record for every stored name so the first publish
+        // after a restart attributes from zero. Metrics stay memory-only
+        // by design (chain config persists via W3-32); an empty chain
+        // is a no-op.
+        let transformations =
+            Arc::new(crate::v5::transformations::TransformChainStore::from_registry(&config));
+        engine.sync_transforms(transformations.steps_snapshot());
+        {
+            let names: Vec<String> = transformations
+                .snapshot()
+                .iter()
+                .map(|record| record.name.clone())
+                .collect();
+            engine.sync_transform_metrics(&names);
+        }
         Self {
             engine,
             sessions,
@@ -477,7 +518,7 @@ impl ApiState {
             conns,
             admin_users: Arc::new(AdminUsers::from_registry(&config)),
             tokens: Arc::new(ApiTokens::new()),
-            config,
+            config: Arc::clone(&config),
             node_id,
             edge_tx,
             bans: Arc::new(crate::v5::banned::BanStore::new()),
@@ -512,6 +553,10 @@ impl ApiState {
             operator_api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
             listeners: Arc::new(broker_config::schema::ListenersConf::default()),
             startup_config: Arc::new(std::sync::RwLock::new(None)),
+            transformations,
+            schema_registry: Arc::new(
+                crate::v5::schema_registry::SchemaRegistryStore::from_registry(&config),
+            ),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -595,6 +640,8 @@ impl ApiState {
             operator_api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
             listeners: Arc::new(broker_config::schema::ListenersConf::default()),
             startup_config: Arc::new(std::sync::RwLock::new(None)),
+            transformations: Arc::new(crate::v5::transformations::TransformChainStore::new()),
+            schema_registry: Arc::new(crate::v5::schema_registry::SchemaRegistryStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -14714,17 +14761,174 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn removed_schema_registry_routes_return_404() {
+        // W3-37 owns `GET+POST /schema_registry` and
+        // `DELETE /schema_registry/:name`. The validation routes stay
+        // removed until their own task lands.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         for path in [
-            "/api/v5/schema_registry",
-            "/api/v5/schema_registry/x",
             "/api/v5/schema_validations",
             "/api/v5/schema_validations/validation/x/metrics",
         ] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
+    }
+
+    #[tokio::test]
+    async fn schema_registry_list_create_delete_round_trip() {
+        // W3-37 broker test. Create one schema. List shows it.
+        // Duplicate create fails. Delete works. Second delete is 404.
+        // Each step uses the HTTP router. No step touches the store directly.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Empty registry returns an empty page.
+        let (status, body) = server.get_auth("/api/v5/schema_registry", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["limit"], json!(100));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+        // Unknown query keys are ignored.
+        let (status, _) = server
+            .get_auth("/api/v5/schema_registry?unknown=param", &token)
+            .await;
+        assert_eq!(status, 200);
+        // Bad kind fails with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/schema_registry",
+                json!({
+                    "name": "bad-kind",
+                    "type": "nope",
+                    "schema": {"type": "object"},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Bad shape fails with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/schema_registry",
+                json!({
+                    "name": "bad-shape",
+                    "type": "json",
+                    "schema": {"foo": 1},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Create one schema.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/schema_registry",
+                json!({
+                    "name": "w3-37-schema",
+                    "type": "json",
+                    "description": "temp reading",
+                    "schema": {"type": "object", "properties": {"temp": {"type": "number"}}},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(body["name"], json!("w3-37-schema"));
+        assert_eq!(body["type"], json!("json"));
+        // List shows it with paging metadata.
+        let (status, body) = server.get_auth("/api/v5/schema_registry", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["meta"]["hasnext"], json!(false));
+        let names: Vec<String> = body["data"]
+            .as_array()
+            .expect("list data is an array")
+            .iter()
+            .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(names.contains(&"w3-37-schema".to_string()));
+        // Duplicate create fails cleanly.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/schema_registry",
+                json!({
+                    "name": "w3-37-schema",
+                    "type": "json",
+                    "schema": {"type": "object"},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        // Delete works. Second delete is 404.
+        let (status, _) = server
+            .delete_auth("/api/v5/schema_registry/w3-37-schema", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .delete_auth("/api/v5/schema_registry/w3-37-schema", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Store is empty again.
+        let (status, body) = server.get_auth("/api/v5/schema_registry", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn schema_registry_survives_restart() {
+        // W3-37 persistence test. Register through the broker.
+        // Reload the same dir. Read the schema back from the list.
+        let dir = unique_data_dir("w3-37-schemas");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/schema_registry",
+                json!({
+                    "name": "restart-schema",
+                    "type": "avro",
+                    "schema": {
+                        "type": "record",
+                        "name": "Reading",
+                        "fields": [{"name": "id", "type": "string"}],
+                    },
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        drop(server);
+        drop(registry);
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/schema_registry", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["meta"]["count"], json!(1));
+        let names: Vec<String> = body["data"]
+            .as_array()
+            .expect("list data is an array")
+            .iter()
+            .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(names.contains(&"restart-schema".to_string()));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -16743,6 +16947,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn connectors_probe_is_stateless_with_documented_shapes() {
+        // Hold the serial guard: the connector store is process-global,
+        // so a sibling create must not run during the count check.
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         // W3-21 (C07-08) broker-through test: a valid probe succeeds without
         // creating a connector, a bad config fails with the documented error
         // shape, and an unknown kind is rejected. Before: validation was

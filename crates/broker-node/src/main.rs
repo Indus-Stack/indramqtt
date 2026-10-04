@@ -3222,6 +3222,19 @@ struct Shared {
     /// lock. Management-plane only; publish and deliver never touch this
     /// store.
     rule_engine_config: Arc<broker_rules::EngineConfigStore>,
+    /// Ordered message-transformation chain for W3-32 through W3-34
+    /// (`GET`/`POST`/`PUT /message_transformations` plus dry-run and
+    /// reorder): shared with the
+    /// management API so validated writes are visible to reads without a
+    /// restart. One `Arc` clone at boot; the ingress pipeline loads the
+    /// engine snapshot per message and never takes this store lock.
+    transformations: Arc<broker_api::v5::transformations::TransformChainStore>,
+    /// Schema registry for W3-37 (`GET`/`POST /schema_registry`,
+    /// `DELETE /schema_registry/:name`): shared with the management API
+    /// so checked writes show in reads without a restart. One `Arc` clone
+    /// at boot. Reads take one short lock per request. No publish path
+    /// reads this store. Publish and deliver take no lock here.
+    schema_registry: Arc<broker_api::v5::schema_registry::SchemaRegistryStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -3499,6 +3512,8 @@ impl Shared {
             sources: Arc::new(broker_api::v5::sources::SourceStore::new()),
             actions: Arc::new(broker_api::v5::actions::ActionStore::new()),
             rule_engine_config,
+            transformations: Arc::new(broker_api::v5::transformations::TransformChainStore::new()),
+            schema_registry: Arc::new(broker_api::v5::schema_registry::SchemaRegistryStore::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -6283,7 +6298,40 @@ async fn ingress_pipeline_with_publisher(
     publisher: Option<&str>,
     publisher_tenant: &str,
 ) -> Vec<(u64, BrokerFrame)> {
-    // Retained state tracks raw ingress: store (or clear on empty
+    // Message transformations (W3-32) run first on ingress, before
+    // retained writes and rule dispatch, so retained state and rules
+    // observe the transformed message. Order assumption: transforms,
+    // then retained, then rules, then fan-out. A shed message (`drop`
+    // or `disconnect` failure behaviour) stops here: no retain, no
+    // rules, no fan-out. Per-message cost: one `Arc` clone plus one
+    // length check when the chain is empty, without cloning topic or
+    // payload; matching steps add one filter test per filter plus one
+    // template render per operation. Per-transform metrics (W3-36)
+    // add one `Arc` clone of the metric map plus lookups and bumps.
+    // TODO(parity): is transforms-before-retained-and-rules the
+    // documented order? The rulebook does not decide; the current
+    // choice applies transforms first until the checker pins it.
+    let snapshot = shared.engine.transform_snapshot();
+    let transformed: Option<(Topic, Bytes)> = if snapshot.is_empty() {
+        None
+    } else {
+        let metric_snapshot = shared.engine.transform_metrics_snapshot();
+        let (work_topic, work_payload, shed) = broker_rules::apply_transform_steps_with_metrics(
+            &snapshot,
+            &metric_snapshot,
+            topic,
+            payload,
+        );
+        if shed {
+            return Vec::new();
+        }
+        Some((work_topic, work_payload))
+    };
+    let (topic, payload): (&Topic, &Bytes) = match transformed.as_ref() {
+        Some((work_topic, work_payload)) => (work_topic, work_payload),
+        None => (topic, payload),
+    };
+    // Retained state tracks transformed ingress: store (or clear on empty
     // payload) before rules and fan-out observe the message. Enforces
     // the same configurable limits as the management publish path
     // (W1-28): oversized payloads past max_payload_size are delivered
@@ -7944,6 +7992,18 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Seeding already ran inside `ApiState::new`; sharing replaces that
     // fresh instance with the kernel's so no second copy diverges.
     state.rule_engine_config = shared.rule_engine_config.clone();
+    // Share the transformation chain (W3-32) so validated management
+    // writes are visible to `GET /message_transformations` reads without
+    // a restart. One `Arc` clone; the ingress pipeline loads the engine
+    // snapshot per message and never takes this store lock. Seeding
+    // already ran inside `ApiState::new`; sharing replaces that fresh
+    // instance with the kernel's so no second copy diverges.
+    state.transformations = shared.transformations.clone();
+    // Share the schema registry (W3-37) so checked writes show in
+    // `GET /schema_registry` reads without a restart. One `Arc` clone.
+    // Reads take one short lock per request. No publish path reads this
+    // store. Publish and deliver take no lock here.
+    state.schema_registry = shared.schema_registry.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -8240,6 +8300,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .engine
         .apply_engine_config(shared.rule_engine_config.get());
+    // Transformation chain (W3-32): seed the shared chain in place (the
+    // same instance `serve_api` shares with `ApiState`), so management
+    // reads observe the persisted order from the first connection, then
+    // mirror it once into the engine's lock-free ingress snapshot so the
+    // first publish rewrites without a restart. An empty snapshot is a
+    // no-op (today's empty behaviour: no rewrites).
+    shared.transformations.seed_from_registry(&shared.config);
+    {
+        let steps = shared.transformations.steps_snapshot();
+        shared.engine.sync_transforms(steps);
+        // Transformation metrics (W3-36): register a zeroed record for
+        // every stored name so the first publish after a restart
+        // attributes from zero. Metrics stay memory-only by design.
+        let names: Vec<String> = shared
+            .transformations
+            .snapshot()
+            .iter()
+            .map(|record| record.name.clone())
+            .collect();
+        shared.engine.sync_transform_metrics(&names);
+    }
+    // Schema registry (W3-37): seed the shared directory in place (the
+    // same instance `serve_api` shares with `ApiState`), so reads show
+    // kept schemas from the first connection. An empty snapshot is a
+    // no-op (empty reads as an empty page).
+    shared.schema_registry.seed_from_registry(&shared.config);
     // Rule spill buffer (B4-07): opt-in via `rules_engine.spill_dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.
@@ -12495,6 +12581,312 @@ mod tests {
             nothing.is_err(),
             "cleared retained state must not be delivered"
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transform_chain_rewrites_payload_in_chain_order() {
+        use broker_api::v5::transformations::{TransformOperation, TransformRecord};
+
+        fn record(name: &str, value: &str) -> TransformRecord {
+            TransformRecord {
+                name: name.to_string(),
+                topics: vec!["chain/order".to_string()],
+                failure_action: "drop".to_string(),
+                enable: true,
+                operations: vec![TransformOperation {
+                    key: "payload".to_string(),
+                    value: value.to_string(),
+                }],
+                params: serde_json::json!({}),
+            }
+        }
+
+        let shared = Shared::new();
+        // Two stored transforms append in chain order through the
+        // production store plus the engine snapshot (the same path the
+        // management handlers drive).
+        shared
+            .transformations
+            .insert(record("t-a", "${payload}[t-a]"))
+            .expect("first transform inserts");
+        shared
+            .transformations
+            .insert(record("t-b", "${payload}[t-b]"))
+            .expect("second transform inserts");
+        // A duplicate name is rejected and overwrites nothing.
+        assert!(shared.transformations.insert(record("t-a", "x")).is_err());
+        shared
+            .engine
+            .sync_transforms(shared.transformations.steps_snapshot());
+        // Keep one handle outside the server task so the test can
+        // replace the chain later; the store is shared, so the replace
+        // is visible to the serving task without a restart.
+        let driver = shared.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let sub = bind_client(addr, 511, "chain-watcher", true).await;
+        sub.send(subscribe_frame(
+            511,
+            2,
+            encode_subscribe_meta(7, "chain-watcher", &[("chain/order", 0)]),
+        ))
+        .await
+        .expect("subscribe");
+        let suback = sub.recv().await.expect("recv suback");
+        assert_eq!(suback.header.opcode, OpCode::SubAckOut);
+
+        let publ = bind_client(addr, 512, "chain-publisher", true).await;
+        let (meta, payload) = encode_publish_meta("chain/order", 0, 0, false, b"m");
+        publ.send(publish_frame(512, 2, meta, payload))
+            .await
+            .expect("publish");
+        let first = sub.recv().await.expect("recv transformed");
+        assert_eq!(first.header.opcode, OpCode::PublishOut);
+        assert_eq!(
+            first.payload,
+            Bytes::from_static(b"m[t-a][t-b]"),
+            "chain order defines execution order"
+        );
+
+        // Replace with the reordered chain (the same `replace_all` plus
+        // `sync_transforms` pair the PUT handler runs): the new order
+        // takes effect on the next publish.
+        driver.transformations.replace_all(vec![
+            record("t-b", "${payload}[t-b]"),
+            record("t-a", "${payload}[t-a]"),
+        ]);
+        driver
+            .engine
+            .sync_transforms(driver.transformations.steps_snapshot());
+        let (meta, payload) = encode_publish_meta("chain/order", 0, 0, false, b"m");
+        publ.send(publish_frame(512, 3, meta, payload))
+            .await
+            .expect("publish after reorder");
+        let second = sub.recv().await.expect("recv reordered");
+        assert_eq!(second.header.opcode, OpCode::PublishOut);
+        assert_eq!(
+            second.payload,
+            Bytes::from_static(b"m[t-b][t-a]"),
+            "reordered chain runs in the new order"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transform_runs_before_retained_and_rules() {
+        use broker_api::v5::transformations::{TransformOperation, TransformRecord};
+        use broker_rules::RuleAction;
+
+        let shared = Shared::new();
+        shared
+            .transformations
+            .insert(TransformRecord {
+                name: "t-both".to_string(),
+                topics: vec!["chain/order".to_string()],
+                failure_action: "drop".to_string(),
+                enable: true,
+                operations: vec![TransformOperation {
+                    key: "payload".to_string(),
+                    value: "${payload}[t]".to_string(),
+                }],
+                params: serde_json::json!({}),
+            })
+            .expect("transform inserts");
+        shared
+            .engine
+            .sync_transforms(shared.transformations.steps_snapshot());
+        shared
+            .engine
+            .create_rule(
+                "transform-rule".to_string(),
+                TopicFilter::new("chain/order").unwrap(),
+                None,
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new("chain/alerts").unwrap(),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("rule creates");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let sub = bind_client(addr, 521, "chain-watcher", true).await;
+        sub.send(subscribe_frame(
+            521,
+            2,
+            encode_subscribe_meta(7, "chain-watcher", &[("chain/order", 0)]),
+        ))
+        .await
+        .expect("subscribe");
+        assert_eq!(
+            sub.recv().await.expect("suback").header.opcode,
+            OpCode::SubAckOut
+        );
+        let alerts = bind_client(addr, 522, "alert-watcher", true).await;
+        alerts
+            .send(subscribe_frame(
+                522,
+                2,
+                encode_subscribe_meta(7, "alert-watcher", &[("chain/alerts", 0)]),
+            ))
+            .await
+            .expect("subscribe alerts");
+        assert_eq!(
+            alerts.recv().await.expect("suback").header.opcode,
+            OpCode::SubAckOut
+        );
+
+        let publ = bind_client(addr, 523, "chain-publisher", true).await;
+        let (meta, payload) = encode_publish_meta("chain/order", 0, 0, false, b"m");
+        publ.send(publish_frame(523, 2, meta, payload))
+            .await
+            .expect("publish");
+        let live = sub.recv().await.expect("recv transformed");
+        assert_eq!(live.payload, Bytes::from_static(b"m[t]"));
+        let fired = alerts.recv().await.expect("recv rule republish");
+        assert_eq!(fired.header.opcode, OpCode::PublishOut);
+        assert_eq!(
+            fired.payload,
+            Bytes::from_static(b"m[t]"),
+            "rules observe the transformed payload"
+        );
+
+        let (meta, payload) = encode_publish_meta("chain/order", 0, 0, true, b"r");
+        publ.send(publish_frame(523, 3, meta, payload))
+            .await
+            .expect("publish retained");
+        let retained_live = sub.recv().await.expect("recv retained live");
+        assert_eq!(retained_live.payload, Bytes::from_static(b"r[t]"));
+        let _ = alerts.recv().await.expect("recv rule republish");
+        let late = bind_client(addr, 524, "late-watcher", true).await;
+        late.send(subscribe_frame(
+            524,
+            2,
+            encode_subscribe_meta(8, "late-watcher", &[("chain/order", 0)]),
+        ))
+        .await
+        .expect("subscribe late");
+        assert_eq!(
+            late.recv().await.expect("suback").header.opcode,
+            OpCode::SubAckOut
+        );
+        let held = late.recv().await.expect("recv retained");
+        assert_eq!(held.payload, Bytes::from_static(b"r[t]"));
+        let (topic, _, _, retain) = decode_publish_meta_parts(&held.metadata);
+        assert_eq!(topic, "chain/order");
+        assert!(retain, "retained replay carries retain");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transform_metrics_move_on_real_publish_and_reset() {
+        use broker_api::v5::transformations::{TransformOperation, TransformRecord};
+
+        let shared = Shared::new();
+        shared
+            .transformations
+            .insert(TransformRecord {
+                name: "w3-36-live".to_string(),
+                topics: vec!["metrics/live/#".to_string()],
+                failure_action: "drop".to_string(),
+                enable: true,
+                operations: vec![TransformOperation {
+                    key: "payload".to_string(),
+                    value: "${payload}[m]".to_string(),
+                }],
+                params: serde_json::json!({}),
+            })
+            .expect("transform inserts");
+        // Same wiring the management create handler drives: metric
+        // record plus engine snapshot.
+        shared.engine.ensure_transform_metrics("w3-36-live");
+        shared
+            .engine
+            .sync_transforms(shared.transformations.steps_snapshot());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server_shared = shared.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let shared = server_shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, shared).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let sub = bind_client(addr, 531, "metrics-watcher", true).await;
+        sub.send(subscribe_frame(
+            531,
+            2,
+            encode_subscribe_meta(7, "metrics-watcher", &[("metrics/live", 0)]),
+        ))
+        .await
+        .expect("subscribe");
+        assert_eq!(
+            sub.recv().await.expect("suback").header.opcode,
+            OpCode::SubAckOut
+        );
+        let publ = bind_client(addr, 532, "metrics-publisher", true).await;
+        let (meta, payload) = encode_publish_meta("metrics/live", 0, 0, false, b"m");
+        publ.send(publish_frame(532, 2, meta, payload))
+            .await
+            .expect("publish");
+        let live = sub.recv().await.expect("recv transformed");
+        assert_eq!(live.header.opcode, OpCode::PublishOut);
+        assert_eq!(live.payload, Bytes::from_static(b"m[m]"));
+        // The broker event (publish through the ingress pipeline)
+        // attributes the run on the engine record.
+        let (matched, succeeded, failed) = shared
+            .engine
+            .transform_metrics_snapshot_for("w3-36-live")
+            .expect("known name has a record");
+        assert_eq!(matched, 1);
+        assert_eq!(succeeded, 1);
+        assert_eq!(failed, 0);
+        // Reset zeroes the counters; unknown names hold no record.
+        assert!(shared.engine.reset_transform_metrics("w3-36-live"));
+        let (matched, succeeded, failed) = shared
+            .engine
+            .transform_metrics_snapshot_for("w3-36-live")
+            .expect("record stays after reset");
+        assert_eq!((matched, succeeded, failed), (0, 0, 0));
+        assert!(!shared.engine.reset_transform_metrics("no-such-transform"));
+        assert!(shared
+            .engine
+            .transform_metrics_snapshot_for("no-such-transform")
+            .is_none());
 
         server.abort();
     }

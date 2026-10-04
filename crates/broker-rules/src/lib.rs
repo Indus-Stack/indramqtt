@@ -118,6 +118,323 @@ pub trait EventInput: Send + Sync {
     async fn push(&self, event: StreamEvent) -> Result<PushOutcome, RuleEngineError>;
 }
 
+/// One ordered message-transformation step (W3-32): the live form of one
+/// chain entry. `topics` holds the parsed filters the step applies to;
+/// `operations` holds the ordered field sets; `failure_action` selects
+/// the behaviour when a `topic` set produces an invalid topic (`drop`
+/// and `disconnect` both shed the message, `ignore` keeps the previous
+/// topic). Disabled steps are skipped in order.
+#[derive(Debug, Clone)]
+pub struct TransformStep {
+    /// Chain key; unique within the chain.
+    pub name: String,
+    /// Filters the step applies to, in stored order.
+    pub topics: Vec<TopicFilter>,
+    /// Failure behaviour (`drop`, `disconnect` or `ignore`).
+    pub failure_action: String,
+    /// Whether the step participates.
+    pub enable: bool,
+    /// Ordered field sets applied in order on matching messages.
+    pub operations: Vec<TransformOperation>,
+}
+
+/// One field set inside a step: set `key` (`payload` or `topic`) to the
+/// template `value` (`${payload}` and `${topic}` expand to the current
+/// values).
+#[derive(Debug, Clone)]
+pub struct TransformOperation {
+    /// Message field to set.
+    pub key: String,
+    /// Template for the new value.
+    pub value: String,
+}
+
+/// Render one operation template: `${topic}` expands to the current
+/// topic name and `${payload}` expands to the current payload text.
+/// Pure string work; no lock, no I/O.
+fn render_transform_template(value: &str, topic: &str, payload: &str) -> String {
+    // `${topic}` first so a payload carrying the topic marker still
+    // expands once per marker kind.
+    value
+        .replace("${topic}", topic)
+        .replace("${payload}", payload)
+}
+
+/// Run one ingress through the ordered chain snapshot (W3-32).
+/// Returns the (possibly rewritten) topic and payload plus whether the
+/// message is shed (`true` means drop it: no retain, no rules, no
+/// fan-out). Steps apply in chain order; each matching enabled step
+/// applies its operations in order. Pure function over the snapshot:
+/// no lock. The hot path skips this call when the snapshot is empty,
+/// so the clone below never runs per ingress; non-empty ingress
+/// clones once then allocates only for rewritten values.
+pub fn apply_transform_steps(
+    steps: &[TransformStep],
+    topic: &Topic,
+    payload: &Bytes,
+) -> (Topic, Bytes, bool) {
+    if steps.is_empty() {
+        return (topic.clone(), payload.clone(), false);
+    }
+    let mut cur_topic = topic.clone();
+    let mut cur_payload = payload.clone();
+    for step in steps {
+        if !step.enable {
+            continue;
+        }
+        if !step.topics.iter().any(|filter| filter.matches(&cur_topic)) {
+            continue;
+        }
+        for op in &step.operations {
+            if op.key == "payload" {
+                let payload_text = String::from_utf8_lossy(&cur_payload).into_owned();
+                let rendered =
+                    render_transform_template(&op.value, cur_topic.as_str(), &payload_text);
+                cur_payload = Bytes::from(rendered.into_bytes());
+            } else if op.key == "topic" {
+                let payload_text = String::from_utf8_lossy(&cur_payload).into_owned();
+                let rendered =
+                    render_transform_template(&op.value, cur_topic.as_str(), &payload_text);
+                match Topic::new(rendered) {
+                    Ok(next) => cur_topic = next,
+                    Err(_) => {
+                        // Fail closed: an invalid rewritten topic never
+                        // fans out. `ignore` keeps the previous topic
+                        // and continues; `drop` and `disconnect` shed
+                        // the message.
+                        // TODO(parity): does `disconnect` close the
+                        // publisher connection or only shed the
+                        // message? The rulebook does not decide; the
+                        // current choice sheds the message like `drop`
+                        // until the checker pins it.
+                        if step.failure_action == "ignore" {
+                            continue;
+                        }
+                        return (cur_topic, cur_payload, true);
+                    }
+                }
+            }
+        }
+    }
+    (cur_topic, cur_payload, false)
+}
+
+/// Run one ingress through the chain and attribute per-name counters.
+///
+/// Same rewrite as [`apply_transform_steps`], plus lock-free bumps
+/// through `metrics`. A step bumps `matched` when it runs (enabled
+/// plus filter hit), then bumps `succeeded` or `failed`. Skipped steps
+/// (disabled or no filter hit) bump nothing. A shed stops the chain.
+/// Steps without a record (standalone engine, boot race) run without
+/// bumps. The probe path uses the pure form and never calls this.
+/// No lock, no queue, no per-fire allocation beyond lookups and bumps.
+pub fn apply_transform_steps_with_metrics(
+    steps: &[TransformStep],
+    metrics: &HashMap<String, Arc<TransformMetrics>>,
+    topic: &Topic,
+    payload: &Bytes,
+) -> (Topic, Bytes, bool) {
+    if steps.is_empty() {
+        return (topic.clone(), payload.clone(), false);
+    }
+    let mut cur_topic = topic.clone();
+    let mut cur_payload = payload.clone();
+    for step in steps {
+        if !step.enable {
+            continue;
+        }
+        if !step.topics.iter().any(|filter| filter.matches(&cur_topic)) {
+            continue;
+        }
+        let record = metrics.get(&step.name);
+        // Count the run before the operations apply.
+        if let Some(record) = record {
+            record.matched.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut shed_here = false;
+        for op in &step.operations {
+            if op.key == "payload" {
+                let payload_text = String::from_utf8_lossy(&cur_payload).into_owned();
+                let rendered =
+                    render_transform_template(&op.value, cur_topic.as_str(), &payload_text);
+                cur_payload = Bytes::from(rendered.into_bytes());
+            } else if op.key == "topic" {
+                let payload_text = String::from_utf8_lossy(&cur_payload).into_owned();
+                let rendered =
+                    render_transform_template(&op.value, cur_topic.as_str(), &payload_text);
+                match Topic::new(rendered) {
+                    Ok(next) => cur_topic = next,
+                    Err(_) => {
+                        // Fail closed: an invalid rewritten topic never
+                        // fans out. `ignore` keeps the previous topic
+                        // and continues; `drop` and `disconnect` shed
+                        // the message.
+                        if step.failure_action == "ignore" {
+                            continue;
+                        }
+                        shed_here = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if shed_here {
+            if let Some(record) = record {
+                record.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            return (cur_topic, cur_payload, true);
+        }
+        if let Some(record) = record {
+            record.succeeded.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    (cur_topic, cur_payload, false)
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+
+    fn step(name: &str, topics: &[&str], value: &str) -> TransformStep {
+        TransformStep {
+            name: name.to_string(),
+            topics: topics
+                .iter()
+                .map(|t| TopicFilter::new((*t).to_string()).expect("valid filter"))
+                .collect(),
+            failure_action: "drop".to_string(),
+            enable: true,
+            operations: vec![TransformOperation {
+                key: "payload".to_string(),
+                value: value.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn chain_order_defines_execution_order() {
+        let topic = Topic::new("live/1".to_string()).expect("valid topic");
+        let payload = Bytes::from("m");
+        let steps = vec![
+            step("t-a", &["live/#"], "${payload}[t-a]"),
+            step("t-b", &["live/#"], "${payload}[t-b]"),
+        ];
+        let (_, out, shed) = apply_transform_steps(&steps, &topic, &payload);
+        assert!(!shed);
+        assert_eq!(String::from_utf8_lossy(&out), "m[t-a][t-b]");
+        let reversed = vec![
+            step("t-b", &["live/#"], "${payload}[t-b]"),
+            step("t-a", &["live/#"], "${payload}[t-a]"),
+        ];
+        let (_, out, shed) = apply_transform_steps(&reversed, &topic, &payload);
+        assert!(!shed);
+        assert_eq!(String::from_utf8_lossy(&out), "m[t-b][t-a]");
+    }
+
+    #[test]
+    fn non_matching_and_disabled_steps_are_skipped() {
+        let topic = Topic::new("live/1".to_string()).expect("valid topic");
+        let payload = Bytes::from("m");
+        let mut steps = vec![
+            step("other", &["other/#"], "${payload}[x]"),
+            step("live", &["live/#"], "${payload}[y]"),
+        ];
+        steps[1].enable = false;
+        let (_, out, shed) = apply_transform_steps(&steps, &topic, &payload);
+        assert!(!shed);
+        assert_eq!(String::from_utf8_lossy(&out), "m");
+    }
+
+    #[test]
+    fn invalid_topic_rewrite_sheds_unless_ignored() {
+        let topic = Topic::new("live/1".to_string()).expect("valid topic");
+        let payload = Bytes::from("m");
+        let bad = TransformStep {
+            name: "bad".to_string(),
+            topics: vec![TopicFilter::new("live/#".to_string()).expect("valid filter")],
+            failure_action: "drop".to_string(),
+            enable: true,
+            operations: vec![TransformOperation {
+                key: "topic".to_string(),
+                value: String::new(),
+            }],
+        };
+        let (_, _, shed) = apply_transform_steps(std::slice::from_ref(&bad), &topic, &payload);
+        assert!(shed, "invalid rewrite with `drop` sheds the message");
+        let mut ignored = bad.clone();
+        ignored.failure_action = "ignore".to_string();
+        let (out_topic, _, shed) =
+            apply_transform_steps(std::slice::from_ref(&ignored), &topic, &payload);
+        assert!(!shed);
+        assert_eq!(out_topic.as_str(), "live/1");
+    }
+
+    #[test]
+    fn empty_chain_costs_no_rewrite() {
+        let topic = Topic::new("live/1".to_string()).expect("valid topic");
+        let payload = Bytes::from("m");
+        let (out_topic, out_payload, shed) = apply_transform_steps(&[], &topic, &payload);
+        assert!(!shed);
+        assert_eq!(out_topic.as_str(), "live/1");
+        assert_eq!(out_payload, payload);
+    }
+
+    #[test]
+    fn metrics_attribute_only_runs_and_sheds() {
+        let topic = Topic::new("live/1".to_string()).expect("valid topic");
+        let payload = Bytes::from("m");
+        let mut steps = vec![
+            step("hit", &["live/#"], "${payload}[h]"),
+            step("miss", &["other/#"], "${payload}[x]"),
+        ];
+        steps.push(TransformStep {
+            name: "skip".to_string(),
+            topics: vec![TopicFilter::new("live/#".to_string()).expect("valid filter")],
+            failure_action: "drop".to_string(),
+            enable: false,
+            operations: vec![TransformOperation {
+                key: "payload".to_string(),
+                value: "${payload}[s]".to_string(),
+            }],
+        });
+        let mut metrics = HashMap::new();
+        for name in ["hit", "miss", "skip"] {
+            metrics.insert(name.to_string(), Arc::new(TransformMetrics::new()));
+        }
+        let (_, out, shed) = apply_transform_steps_with_metrics(&steps, &metrics, &topic, &payload);
+        assert!(!shed);
+        assert_eq!(String::from_utf8_lossy(&out), "m[h]");
+        assert_eq!(metrics["hit"].snapshot(), (1, 1, 0));
+        assert_eq!(metrics["miss"].snapshot(), (0, 0, 0));
+        assert_eq!(metrics["skip"].snapshot(), (0, 0, 0));
+        // A shed counts failed and stops the chain.
+        let bad = TransformStep {
+            name: "bad".to_string(),
+            topics: vec![TopicFilter::new("live/#".to_string()).expect("valid filter")],
+            failure_action: "drop".to_string(),
+            enable: true,
+            operations: vec![TransformOperation {
+                key: "topic".to_string(),
+                value: String::new(),
+            }],
+        };
+        let mut shed_metrics = HashMap::new();
+        shed_metrics.insert("bad".to_string(), Arc::new(TransformMetrics::new()));
+        shed_metrics.insert("later".to_string(), Arc::new(TransformMetrics::new()));
+        let chained = vec![bad, step("later", &["live/#"], "${payload}[l]")];
+        let (_, _, shed) =
+            apply_transform_steps_with_metrics(&chained, &shed_metrics, &topic, &payload);
+        assert!(shed);
+        assert_eq!(shed_metrics["bad"].snapshot(), (1, 0, 1));
+        assert_eq!(shed_metrics["later"].snapshot(), (0, 0, 0));
+        // Steps without a record still rewrite without bumps.
+        let (_, out, shed) =
+            apply_transform_steps_with_metrics(&steps, &HashMap::new(), &topic, &payload);
+        assert!(!shed);
+        assert_eq!(String::from_utf8_lossy(&out), "m[h]");
+    }
+}
+
 /// Direct in-memory sink for rules to publish messages back into the broker
 /// without paying the cost of establishing an external loopback network connection.
 #[async_trait]
@@ -692,6 +1009,61 @@ impl SourceMetrics {
     }
 }
 
+/// Fixed per-transformation metric counters for one name (W3-36, C08-09/10).
+///
+/// One record per transformation name, created by the management plane
+/// when the entry is created and dropped when the entry is deleted.
+/// All three fields are lock-free atomics bumped on the ingress path;
+/// the publish path pays one `HashMap` lookup plus relaxed `fetch_add`
+/// calls per matching step, no lock, no per-fire allocation. Text
+/// rendering stays in the management handler. Memory-only by design:
+/// a restart rebuilds the map at zero (chain config persists elsewhere).
+/// The set is fixed (`matched`/`succeeded`/`failed`, default zero);
+/// no unbounded history is kept.
+///
+/// `matched` counts ingress where the step runs (enabled plus filter
+/// hit). `succeeded` counts runs that apply without shedding.
+/// `failed` counts runs that shed the message. A shed stops the chain,
+/// so later steps observe nothing for that ingress.
+// TODO(parity): which counter names plus envelope shapes does the documented
+// spec require beyond `matched`/`succeeded`/`failed` (rates, node rows,
+// ...)? The rulebook does not decide the exact shape; the current choice
+// reports the honest live subset the ingress path attributes and omits
+// the rest rather than inventing constants, until the checker pins it.
+#[derive(Debug, Default)]
+pub struct TransformMetrics {
+    /// Ingress runs attributed to this name (enabled plus filter hit).
+    pub matched: AtomicU64,
+    /// Runs that apply without shedding.
+    pub succeeded: AtomicU64,
+    /// Runs that shed the message.
+    pub failed: AtomicU64,
+}
+
+impl TransformMetrics {
+    /// Zeroed counters for a freshly created transformation.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lock-free snapshot of the three counters for management reads.
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.matched.load(Ordering::Relaxed),
+            self.succeeded.load(Ordering::Relaxed),
+            self.failed.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Zero all three counters in place; the record stays registered so
+    /// the next ingress resumes from zero.
+    pub fn reset(&self) {
+        self.matched.store(0, Ordering::Relaxed);
+        self.succeeded.store(0, Ordering::Relaxed);
+        self.failed.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Throttle state for one (rule id, connector id) pair: when the last
 /// forward-failure line was logged and how many failures were suppressed
 /// since then.
@@ -871,6 +1243,23 @@ pub struct RuleEngine {
     /// the publish path must never take a management lock, and the sys
     /// check below stays a lock-free `Arc` clone plus one prefix test.
     engine_config: Arc<arc_swap::ArcSwap<broker_config::RuleEngineConf>>,
+    /// Lock-free message-transformation chain for the ingress path
+    /// (W3-32): the management plane swaps the whole ordered chain on
+    /// every transform create/replace, and the publish path loads one
+    /// `Arc` per ingress with no store lock. At most the chain cap of
+    /// small steps, so no list grows on the message path. Reason for
+    /// `ArcSwap`: the publish path must never take the management
+    /// store lock; matching stays filter tests plus template renders.
+    transforms: Arc<arc_swap::ArcSwap<Vec<TransformStep>>>,
+    /// Lock-free per-transformation metric records keyed by name (W3-36,
+    /// C08-09/10): the management plane swaps the whole map on
+    /// transform create/delete/replace, and the publish path loads one
+    /// `Arc` per ingress with no store lock, then bumps lock-free
+    /// atomics. One fixed-size record per name (at most the chain cap
+    /// of entries), so no list or history grows on the message path.
+    /// Reason for `ArcSwap`: the same as the chain above — the publish
+    /// path must never take a management lock.
+    transform_metrics: Arc<arc_swap::ArcSwap<HashMap<String, Arc<TransformMetrics>>>>,
 }
 
 /// Shared flush context: what a rule-task sink worker needs at emit time.
@@ -1125,6 +1514,7 @@ impl RuleEngine {
         let action_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
         let source_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
         let source_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
+        let transform_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
         let stream_bus = StreamBus::new();
         let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
@@ -1155,6 +1545,8 @@ impl RuleEngine {
             engine_config: Arc::new(arc_swap::ArcSwap::from(Arc::new(
                 broker_config::RuleEngineConf::default(),
             ))),
+            transforms: Arc::new(arc_swap::ArcSwap::from(Arc::new(Vec::new()))),
+            transform_metrics,
         }
     }
 
@@ -1174,6 +1566,7 @@ impl RuleEngine {
         let action_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
         let source_disabled = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashSet::new())));
         let source_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
+        let transform_metrics = Arc::new(arc_swap::ArcSwap::from(Arc::new(HashMap::new())));
         let stream_bus = StreamBus::new();
         let ingress_sender = stream_bus.get_or_create(runtime::RULE_INGRESS_STREAM);
         Self {
@@ -1204,6 +1597,8 @@ impl RuleEngine {
             engine_config: Arc::new(arc_swap::ArcSwap::from(Arc::new(
                 broker_config::RuleEngineConf::default(),
             ))),
+            transforms: Arc::new(arc_swap::ArcSwap::from(Arc::new(Vec::new()))),
+            transform_metrics,
         }
     }
 
@@ -2168,6 +2563,112 @@ impl RuleEngine {
     /// one atomic store.
     pub fn apply_engine_config(&self, conf: broker_config::RuleEngineConf) {
         self.engine_config.store(Arc::new(conf));
+    }
+
+    /// Swap the ingress transformation chain (W3-32). Management-plane
+    /// and boot only: every validated transform create/replace swaps the
+    /// whole ordered chain, and boot rebuilds it once from the registry
+    /// so persisted entries apply from the first publish. The publish
+    /// path only loads. One atomic store per swap.
+    pub fn sync_transforms(&self, steps: Vec<TransformStep>) {
+        self.transforms.store(Arc::new(steps));
+    }
+
+    /// Lock-free snapshot of the transformation chain for the publish
+    /// path (W3-32): one `Arc` clone, no lock, no allocation beyond the
+    /// refcount bump. Callers hold the snapshot across one ingress and
+    /// run [`apply_transform_steps`] over it.
+    pub fn transform_snapshot(&self) -> Arc<Vec<TransformStep>> {
+        self.transforms.load_full()
+    }
+
+    /// Ensure a zeroed per-transformation metric record exists for `name`
+    /// (W3-36, C08-09/10). Management-plane only: called when a
+    /// transformation is created (or on boot for every stored name).
+    /// Swaps the whole map; the publish path only loads. Keeps counters.
+    pub fn ensure_transform_metrics(&self, name: &str) {
+        let current = self.transform_metrics.load_full();
+        if current.contains_key(name) {
+            return;
+        }
+        let mut next = current.as_ref().clone();
+        next.entry(name.to_string())
+            .or_insert_with(|| Arc::new(TransformMetrics::new()));
+        self.transform_metrics.store(Arc::new(next));
+    }
+
+    /// Drop the per-transformation metric record for `name` (W3-36,
+    /// C08-09/10). Management-plane only: called after the chain store
+    /// deletes the entry, so a later re-create starts at zero. Unknown
+    /// names are a no-op.
+    pub fn remove_transform_metrics(&self, name: &str) {
+        let current = self.transform_metrics.load_full();
+        if !current.contains_key(name) {
+            return;
+        }
+        let mut next = current.as_ref().clone();
+        next.remove(name);
+        self.transform_metrics.store(Arc::new(next));
+    }
+
+    /// Rebuild the whole metric map from the live names (W3-36,
+    /// C08-09/10). Boot path: every stored name gets a zeroed record so
+    /// the first publish after a restart attributes from zero. Metrics
+    /// never persist: the map rebuilds at zero, never loads from disk.
+    /// Management-plane/boot only; the publish path only loads.
+    pub fn sync_transform_metrics(&self, names: &[String]) {
+        let mut next = HashMap::with_capacity(names.len());
+        for name in names {
+            next.insert(name.clone(), Arc::new(TransformMetrics::new()));
+        }
+        self.transform_metrics.store(Arc::new(next));
+    }
+
+    /// Reconcile the metric map with the live names (W3-36, C08-09/10).
+    /// Replace path: keeps counters for surviving names, creates zeroed
+    /// records for new names, drops removed names. Management-plane only.
+    pub fn reconcile_transform_metrics(&self, names: &[String]) {
+        let current = self.transform_metrics.load_full();
+        let mut next = HashMap::with_capacity(names.len());
+        for name in names {
+            if let Some(record) = current.get(name) {
+                next.insert(name.clone(), Arc::clone(record));
+            } else {
+                next.insert(name.clone(), Arc::new(TransformMetrics::new()));
+            }
+        }
+        self.transform_metrics.store(Arc::new(next));
+    }
+
+    /// Lock-free snapshot of the per-transformation metric map for the
+    /// publish path (W3-36, C08-09/10): one `Arc` clone, no lock, no
+    /// allocation beyond the refcount bump. Callers hold the snapshot
+    /// across one ingress and bump atomics through it.
+    pub fn transform_metrics_snapshot(&self) -> Arc<HashMap<String, Arc<TransformMetrics>>> {
+        self.transform_metrics.load_full()
+    }
+
+    /// Lock-free read of one name counters for management handlers.
+    /// Returns `None` when the name has no record (caller maps to 404).
+    /// One `Arc` clone plus one `HashMap` lookup plus three relaxed
+    /// loads; no lock, no allocation beyond the refcount bump.
+    pub fn transform_metrics_snapshot_for(&self, name: &str) -> Option<(u64, u64, u64)> {
+        let snapshot = self.transform_metrics.load_full();
+        snapshot.get(name).map(|record| record.snapshot())
+    }
+
+    /// Zero one name counters in place (W3-36, C08-10). Returns false
+    /// when the name has no record (caller maps to 404 and creates
+    /// nothing). Lock-free atomic stores; the record stays registered.
+    pub fn reset_transform_metrics(&self, name: &str) -> bool {
+        let snapshot = self.transform_metrics.load_full();
+        match snapshot.get(name) {
+            Some(record) => {
+                record.reset();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Feed matching windowed ingress into the embedded rule runtime:
