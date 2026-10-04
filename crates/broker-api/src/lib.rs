@@ -271,12 +271,15 @@ pub struct ApiState {
     /// Management-plane only; publish and deliver never touch this store.
     pub rule_engine_config: Arc<broker_rules::EngineConfigStore>,
     /// Ordered message-transformation chain for `GET`/`POST`/`PUT
-    /// /api/v5/message_transformations` (W3-32, C08-01..C08-03):
+    /// /api/v5/message_transformations` (W3-32, C08-01..C08-03) plus
+    /// the stateless dry-run probe
+    /// `POST /api/v5/message_transformations/dryrun` (W3-33, C08-04):
     /// bounded ordered chain validated per entry, persisted across a
     /// restart via the config core, executed in order on matching
     /// ingress through the engine's lock-free snapshot. The routes read
     /// one bounded snapshot per request; the publish path loads one
-    /// `Arc` per ingress and never takes this store's lock.
+    /// `Arc` per ingress and never takes this store's lock. The probe
+    /// uses only the supplied chain and writes nothing.
     pub transformations: Arc<crate::v5::transformations::TransformChainStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
@@ -16701,6 +16704,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn connectors_probe_is_stateless_with_documented_shapes() {
+        // Hold the serial guard: the connector store is process-global,
+        // so a sibling create must not run during the count check.
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         // W3-21 (C07-08) broker-through test: a valid probe succeeds without
         // creating a connector, a bad config fails with the documented error
         // shape, and an unknown kind is rejected. Before: validation was

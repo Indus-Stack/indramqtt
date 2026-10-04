@@ -81,6 +81,26 @@ const MAX_TRANSFORMATION_VALUE_LEN: usize = broker_config::MAX_TRANSFORMATION_VA
 /// into every snapshot, so one large document cannot bloat each read.
 const MAX_TRANSFORMATION_CONFIG_LEN: usize = broker_config::MAX_TRANSFORMATION_CONFIG_LEN;
 
+/// Single-request body bound for the dry-run probe: 256 KiB. Reason: a
+/// sample message plus a chain fit, while one request cannot bloat
+/// the kernel.
+pub const MAX_DRYRUN_BODY_BYTES: usize = 256 * 1024;
+
+/// Longest accepted dry-run sample payload: 256 KiB. Reason: the
+/// sample mirrors a real ingress payload, and the output derives
+/// from it, so both stay bounded by one cap.
+pub const MAX_DRYRUN_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// Single-request evaluation bound for the dry-run probe: 5 s.
+/// Reason: the probe runs off the message path, and a bounded
+/// input evaluates in milliseconds, so the bound caps the worst
+/// case well under management HTTP timeouts.
+// TODO(parity): does the documented dry-run define its own timeout
+// or payload cap? The rulebook does not decide the exact bound;
+// the current choice states 5 s and 256 KiB until the checker
+// pins it.
+pub const DRYRUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One field set inside a transformation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransformOperation {
@@ -495,6 +515,261 @@ pub async fn replace_transformations(State(state): State<ApiState>, body: Bytes)
     let chain = state.transformations.snapshot();
     let rows: Vec<serde_json::Value> = chain.iter().map(TransformRecord::to_json).collect();
     (StatusCode::OK, Json(rows)).into_response()
+}
+
+/// `POST /api/v5/message_transformations/dryrun`: stateless probe.
+///
+/// Runs the supplied chain against one sample message through the
+/// real executor ([`broker_rules::apply_transform_steps`]), the same
+/// function ingress uses, and answers 200 with the transformed
+/// output. A shed message still answers 200 with `dropped: true`
+/// plus the reason. A malformed body answers 400 with the documented
+/// `{code, message}` shape. The probe writes no store, publishes
+/// nothing, writes no retained state, and never touches the stored
+/// chain. Unknown ids do not apply: only the supplied chain runs.
+/// The route takes no paging parameters; unknown query keys are
+/// ignored. Management-plane only; publish and deliver never touch
+/// this path.
+///
+/// Store wiring (rulebook section 2): no store. The handler adds no
+/// `Arc<crate::v5::...>` field on `ApiState`, nothing outside
+/// `crates/broker-api` writes or consults anything here, and no
+/// broker event drives it beyond serving the probe, so
+/// `tools/wiring_check.sh` needs no new entry. The backing executor
+/// is the live transform step runner
+/// (`crates/broker-rules/src/lib.rs`, `apply_transform_steps`), and
+/// the driving broker event for the shared live chain stays the
+/// ingress transform step (`crates/broker-node/src/main.rs`, ingress
+/// pipeline) loading the engine snapshot; this probe never loads or
+/// stores that snapshot.
+///
+/// Fire-path cost: none. The probe runs synchronously per request
+/// off the message path; the publish path keeps loading one `Arc`
+/// per ingress with no new lock, allocation, or queue from this
+/// route. The probe holds no lock across evaluation and caches
+/// nothing: every request re-parses and re-evaluates.
+///
+/// Tenant behaviour: the probe renders strings only and selects no
+/// session, so no path leaves a tenant.
+// TODO(parity): which exact request keys does the documented probe
+// require (chain key, sample nesting)? The rulebook does not decide
+// the exact shape; the current choice accepts `transformations` plus
+// `chain`/`transformation`/`transforms` aliases and flat or nested
+// topic/payload until the checker pins it.
+// TODO(parity): which exact success keys does the documented probe
+// require beyond the transformed output (`payload` versus `output`,
+// `dropped` versus `shed`, reason key)? The rulebook does not decide
+// the exact shape; the current choice serves `topic`, `payload`,
+// `output` (mirrors `payload`), `dropped`, `shed` (mirrors
+// `dropped`), and `reason` (null when kept) until the checker pins it.
+// TODO(parity): which reason detail does a shed message require
+// (per-step name versus generic notice)? The rulebook does not decide;
+// the current choice reports a generic notice until the checker pins it.
+pub async fn dryrun_transformations(
+    State(_state): State<ApiState>,
+    Query(_ignored): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    if body.len() > MAX_DRYRUN_BODY_BYTES {
+        return ApiError::BadRequest(format!(
+            "dry-run body is too large: {} bytes exceeds {MAX_DRYRUN_BODY_BYTES} bytes",
+            body.len()
+        ))
+        .into_response();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid dry-run body: {e}")).into_response();
+        }
+    };
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => {
+            return ApiError::BadRequest("dry-run body must be a JSON object".to_string())
+                .into_response();
+        }
+    };
+    let chain_items = match extract_dryrun_chain(obj) {
+        Ok(items) => items,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    if chain_items.len() > MAX_TRANSFORMATIONS {
+        return ApiError::BadRequest(format!(
+            "dry-run chain holds {} entries, at most {MAX_TRANSFORMATIONS}",
+            chain_items.len()
+        ))
+        .into_response();
+    }
+    let mut records = Vec::with_capacity(chain_items.len());
+    for (index, item) in chain_items.iter().enumerate() {
+        match parse_transform_request(item) {
+            Ok(record) => records.push(record),
+            Err(msg) => {
+                return ApiError::BadRequest(format!("transformations[{index}]: {msg}"))
+                    .into_response();
+            }
+        }
+    }
+    let topic_raw = match extract_dryrun_topic(obj) {
+        Some(t) => t,
+        None => {
+            return ApiError::BadRequest("field `topic` is required".to_string()).into_response()
+        }
+    };
+    let topic = match broker_protocol::Topic::new(topic_raw.clone()) {
+        Ok(t) => t,
+        Err(_) => {
+            return ApiError::BadRequest(format!("field `topic` {topic_raw:?} is not valid"))
+                .into_response();
+        }
+    };
+    let payload = match extract_dryrun_payload(obj) {
+        Some(p) => p,
+        None => {
+            return ApiError::BadRequest("field `payload` is required".to_string()).into_response();
+        }
+    };
+    if payload.len() > MAX_DRYRUN_PAYLOAD_BYTES {
+        return ApiError::BadRequest(format!(
+            "dry-run payload holds {} bytes, at most {MAX_DRYRUN_PAYLOAD_BYTES}",
+            payload.len()
+        ))
+        .into_response();
+    }
+    let steps: Vec<broker_rules::TransformStep> =
+        records.iter().map(TransformRecord::to_step).collect();
+    let evaluated = tokio::time::timeout(DRYRUN_TIMEOUT, async move {
+        broker_rules::apply_transform_steps(&steps, &topic, &payload)
+    })
+    .await;
+    let (out_topic, out_payload, shed) = match evaluated {
+        Ok(output) => output,
+        Err(_) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({
+                    "code": "TIMEOUT",
+                    "message": format!(
+                        "dry-run timed out after {}s",
+                        DRYRUN_TIMEOUT.as_secs()
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if out_payload.len() > MAX_DRYRUN_PAYLOAD_BYTES {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "topic": out_topic.as_str(),
+                "payload": "",
+                "output": "",
+                "dropped": true,
+                "shed": true,
+                "reason": format!(
+                    "dry-run output holds {} bytes, at most {MAX_DRYRUN_PAYLOAD_BYTES}",
+                    out_payload.len()
+                ),
+            })),
+        )
+            .into_response();
+    }
+    let payload_text = String::from_utf8_lossy(&out_payload).into_owned();
+    let reason = if shed {
+        serde_json::Value::String("message dropped by transformation chain".to_string())
+    } else {
+        serde_json::Value::Null
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "topic": out_topic.as_str(),
+            "payload": payload_text,
+            "output": payload_text,
+            "dropped": shed,
+            "shed": shed,
+            "reason": reason,
+        })),
+    )
+        .into_response()
+}
+
+/// Pick the supplied chain from the accepted request keys.
+fn extract_dryrun_chain(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    for key in ["transformations", "chain", "transforms"] {
+        if let Some(items) = obj.get(key) {
+            return items
+                .as_array()
+                .cloned()
+                .ok_or_else(|| format!("field `{key}` must be an array of transformations"));
+        }
+    }
+    if let Some(single) = obj.get("transformation") {
+        if let Some(items) = single.as_array() {
+            return Ok(items.clone());
+        }
+        if single.is_object() {
+            return Ok(vec![single.clone()]);
+        }
+        return Err("field `transformation` must be an object or an array".to_string());
+    }
+    Err("field `transformations` is required".to_string())
+}
+
+/// Pick the sample topic from the flat or nested request shape.
+fn extract_dryrun_topic(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    if let Some(topic) = obj.get("topic").and_then(|v| v.as_str()) {
+        if !topic.trim().is_empty() {
+            return Some(topic.to_string());
+        }
+    }
+    for nest in ["message", "sample", "context"] {
+        if let Some(inner) = obj.get(nest).and_then(|v| v.as_object()) {
+            if let Some(topic) = inner.get("topic").and_then(|v| v.as_str()) {
+                if !topic.trim().is_empty() {
+                    return Some(topic.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Render the sample payload to bytes. Strings pass through as-is;
+/// other JSON values serialise to their compact form.
+fn dryrun_payload_bytes(value: &serde_json::Value) -> Option<Bytes> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(Bytes::from(s.clone().into_bytes())),
+        other => Some(Bytes::from(
+            serde_json::to_string(other)
+                .unwrap_or_default()
+                .into_bytes(),
+        )),
+    }
+}
+
+/// Pick the sample payload from the flat or nested request shape.
+fn extract_dryrun_payload(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Bytes> {
+    if let Some(value) = obj.get("payload") {
+        if let Some(bytes) = dryrun_payload_bytes(value) {
+            return Some(bytes);
+        }
+    }
+    for nest in ["message", "sample", "context"] {
+        if let Some(inner) = obj.get(nest).and_then(|v| v.as_object()) {
+            if let Some(value) = inner.get("payload") {
+                if let Some(bytes) = dryrun_payload_bytes(value) {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Validate one transformation body into a chain record.
@@ -983,5 +1258,153 @@ mod tests {
         assert_eq!(listed.as_array().expect("list is an array").len(), 1);
         assert_eq!(listed[0]["name"], serde_json::json!("keep"));
         assert_eq!(state.engine.transform_snapshot().len(), 1);
+    }
+
+    fn dryrun_body(value: &serde_json::Value) -> Bytes {
+        Bytes::from(serde_json::to_vec(value).expect("dry-run body is JSON"))
+    }
+
+    async fn dryrun_parts(
+        state: &ApiState,
+        value: &serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        response_parts(
+            dryrun_transformations(
+                State(state.clone()),
+                Query(Default::default()),
+                dryrun_body(value),
+            )
+            .await,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn dryrun_valid_chain_reports_output_and_keeps_stored_chain() {
+        let state = standalone_state();
+        let stored = serde_json::json!({
+            "name": "stored",
+            "topics": ["dry/#"],
+            "failure_action": "drop",
+            "operations": [{"key": "payload", "value": "${payload}-stored"}],
+        });
+        let (status, _) =
+            response_parts(create_transformation(State(state.clone()), make_body(&stored)).await)
+                .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let before = state.transformations.snapshot();
+        let engine_before = state.engine.transform_snapshot().len();
+        let probe = serde_json::json!({
+            "transformations": [{
+                "name": "probe",
+                "topics": ["dry/#"],
+                "failure_action": "drop",
+                "operations": [{"key": "payload", "value": "${payload}-probe"}],
+            }],
+            "topic": "dry/1",
+            "payload": "m",
+        });
+        let (status, out) = dryrun_parts(&state, &probe).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(out["topic"], serde_json::json!("dry/1"));
+        assert_eq!(out["payload"], serde_json::json!("m-probe"));
+        assert_eq!(out["output"], out["payload"]);
+        assert_eq!(out["dropped"], serde_json::json!(false));
+        assert_eq!(out["shed"], out["dropped"]);
+        // The stored chain is unchanged.
+        let after: Vec<String> = state
+            .transformations
+            .snapshot()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        let names: Vec<String> = before.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(after, names);
+        assert_eq!(state.engine.transform_snapshot().len(), engine_before);
+        // The live path still uses the stored chain.
+        let topic = broker_protocol::Topic::new("dry/1".to_string()).expect("valid topic");
+        let (_, live, shed) = broker_rules::apply_transform_steps(
+            &state.engine.transform_snapshot(),
+            &topic,
+            &Bytes::from("m"),
+        );
+        assert!(!shed);
+        assert_eq!(String::from_utf8_lossy(&live), "m-stored");
+    }
+
+    #[tokio::test]
+    async fn dryrun_shed_reports_dropped_with_reason() {
+        let state = standalone_state();
+        let probe = serde_json::json!({
+            "transformations": [{
+                "name": "bad-topic",
+                "topics": ["dry/#"],
+                "failure_action": "drop",
+                "operations": [{"key": "topic", "value": ""}],
+            }],
+            "topic": "dry/1",
+            "payload": "m",
+        });
+        let (status, out) = dryrun_parts(&state, &probe).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(out["dropped"], serde_json::json!(true));
+        assert_eq!(out["shed"], serde_json::json!(true));
+        assert!(out["reason"].as_str().is_some_and(|r| !r.is_empty()));
+        assert!(state.transformations.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dryrun_malformed_body_is_rejected_with_error_shape() {
+        let state = standalone_state();
+        let stored = serde_json::json!({
+            "name": "keep",
+            "topics": ["keep/#"],
+            "failure_action": "drop",
+            "operations": [],
+        });
+        let (status, _) =
+            response_parts(create_transformation(State(state.clone()), make_body(&stored)).await)
+                .await;
+        assert_eq!(status, StatusCode::CREATED);
+        for bad in [
+            serde_json::json!({"topic": "a/b", "payload": "m"}),
+            serde_json::json!({
+                "transformations": [{"name": "broken", "topics": ["#+bad"]}],
+                "topic": "a/b",
+                "payload": "m",
+            }),
+            serde_json::json!({
+                "transformations": [],
+                "payload": "m",
+            }),
+            serde_json::json!({
+                "transformations": [],
+                "topic": "a/b",
+            }),
+            serde_json::json!([]),
+        ] {
+            let (status, err) = dryrun_parts(&state, &bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(err["message"].is_string());
+        }
+        // A rejected probe stores nothing new.
+        assert_eq!(state.transformations.snapshot().len(), 1);
+        assert_eq!(state.engine.transform_snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dryrun_oversized_body_is_rejected_before_parsing() {
+        let state = standalone_state();
+        let big = "x".repeat(MAX_DRYRUN_BODY_BYTES + 1);
+        let raw = Bytes::from(format!(
+            "{{\"transformations\":[],\"topic\":\"t\",\"payload\":\"{big}\"}}"
+        ));
+        let (status, err) = response_parts(
+            dryrun_transformations(State(state.clone()), Query(Default::default()), raw).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
     }
 }

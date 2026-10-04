@@ -806,4 +806,13 @@ pub fn protected_router() -> Router<ApiState> {
                 .post(transformations::create_transformation)
                 .put(transformations::replace_transformations),
         )
+        // Transformation dry-run (W3-33, C08-04): stateless probe of
+        // the supplied chain against one sample message through the
+        // real executor. Writes nothing and publishes nothing.
+        // Management-plane only; publish loads the engine snapshot
+        // and never takes the store lock.
+        .route(
+            "/message_transformations/dryrun",
+            post(transformations::dryrun_transformations),
+        )
 }
