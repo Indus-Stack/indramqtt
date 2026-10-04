@@ -48,6 +48,12 @@ pub enum ApiError {
     ConnectionFailed(String),
     /// Missing, expired, or malformed bearer token / API key.
     Unauthorized(String),
+    /// Backup import validation failed (snapshot content invalid).
+    ValidationFailed(String),
+    /// Backup import apply or persist failed (internal error).
+    InternalError(String),
+    /// Backup import rejected because a store is not yet initialised.
+    StoreNotReady(String),
 }
 
 impl ApiError {
@@ -68,6 +74,9 @@ impl ApiError {
             Self::TestFailed(_) => "TEST_FAILED",
             Self::ConnectionFailed(_) => "CONNECTION_FAILED",
             Self::Unauthorized(_) => "UNAUTHORIZED",
+            Self::ValidationFailed(_) => "VALIDATION_FAILED",
+            Self::InternalError(_) => "INTERNAL_ERROR",
+            Self::StoreNotReady(_) => "STORE_NOT_READY",
         }
     }
 
@@ -87,7 +96,10 @@ impl ApiError {
             | Self::BadNode(message)
             | Self::TestFailed(message)
             | Self::ConnectionFailed(message)
-            | Self::Unauthorized(message) => message,
+            | Self::Unauthorized(message)
+            | Self::ValidationFailed(message)
+            | Self::InternalError(message)
+            | Self::StoreNotReady(message) => message,
         }
     }
 
@@ -101,12 +113,15 @@ impl ApiError {
             Self::BadRequest(_)
             | Self::AlreadyExists(_)
             | Self::TestFailed(_)
-            | Self::ConnectionFailed(_) => StatusCode::BAD_REQUEST,
+            | Self::ConnectionFailed(_)
+            | Self::ValidationFailed(_)
+            | Self::StoreNotReady(_) => StatusCode::BAD_REQUEST,
             Self::BadUsernameOrPwd(_) | Self::NamePwdError(_) | Self::Unauthorized(_) => {
                 StatusCode::UNAUTHORIZED
             }
             Self::NotAuthorized(_) | Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -128,6 +143,9 @@ impl ApiError {
             Self::TestFailed(_) => Self::TestFailed(message),
             Self::ConnectionFailed(_) => Self::ConnectionFailed(message),
             Self::Unauthorized(_) => Self::Unauthorized(message),
+            Self::ValidationFailed(_) => Self::ValidationFailed(message),
+            Self::InternalError(_) => Self::InternalError(message),
+            Self::StoreNotReady(_) => Self::StoreNotReady(message),
         }
     }
 }
@@ -177,6 +195,9 @@ mod tests {
             ApiError::TestFailed("rule did not match".to_string()),
             ApiError::ConnectionFailed("target unreachable".to_string()),
             ApiError::Unauthorized("no token".to_string()),
+            ApiError::ValidationFailed("validation failed".to_string()),
+            ApiError::InternalError("internal error".to_string()),
+            ApiError::StoreNotReady("store not ready".to_string()),
         ]
     }
 
@@ -197,6 +218,9 @@ mod tests {
             ("TEST_FAILED", StatusCode::BAD_REQUEST),
             ("CONNECTION_FAILED", StatusCode::BAD_REQUEST),
             ("UNAUTHORIZED", StatusCode::UNAUTHORIZED),
+            ("VALIDATION_FAILED", StatusCode::BAD_REQUEST),
+            ("INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR),
+            ("STORE_NOT_READY", StatusCode::BAD_REQUEST),
         ];
         let variants = every_variant();
         assert_eq!(variants.len(), expected.len());
@@ -282,6 +306,9 @@ mod tests {
             ApiError::TestFailed(_) => "TEST_FAILED",
             ApiError::ConnectionFailed(_) => "CONNECTION_FAILED",
             ApiError::Unauthorized(_) => "UNAUTHORIZED",
+            ApiError::ValidationFailed(_) => "VALIDATION_FAILED",
+            ApiError::InternalError(_) => "INTERNAL_ERROR",
+            ApiError::StoreNotReady(_) => "STORE_NOT_READY",
         }
     }
 

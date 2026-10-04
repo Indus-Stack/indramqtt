@@ -16,6 +16,7 @@ pub mod authz_node_status;
 pub mod authz_settings;
 pub mod authz_sources;
 pub mod auto_subscribe;
+pub mod backup;
 pub mod banned;
 pub mod clients;
 pub mod data;
@@ -786,4 +787,8 @@ pub fn protected_router() -> Router<ApiState> {
             "/data/files/:filename",
             get(data::download_backup_file).delete(data::delete_backup_file),
         )
+        // Data import (W5-29, C18-06): restore a named backup file into
+        // the live stores with validate-all-before-apply semantics.
+        // Management-plane only; publish and deliver never touch it.
+        .route("/data/import", post(backup::import_data))
 }

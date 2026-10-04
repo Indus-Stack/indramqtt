@@ -38,13 +38,13 @@ use crate::ApiState;
 /// `BAD_REQUEST` instead of growing the map without limit.
 pub const MAX_BANS: usize = 10_000;
 /// Longest accepted `who` value (client id, user name, address or pattern).
-const MAX_WHO_LEN: usize = 512;
+pub(crate) const MAX_WHO_LEN: usize = 512;
 /// Longest accepted `by`/`reason` detail strings.
 const MAX_DETAIL_LEN: usize = 1024;
 
 /// Ban kinds the list accepts. Exact identifiers plus pattern forms for
 /// client ids, user names and source addresses.
-const VALID_AS: &[&str] = &[
+pub(crate) const VALID_AS: &[&str] = &[
     "clientid",
     "username",
     "peerhost",

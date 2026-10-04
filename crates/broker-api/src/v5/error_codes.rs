@@ -70,9 +70,9 @@ pub struct ErrorCatalogEntry {
 /// documents; a new error variant grows this array with its own reason.
 /// The catalogue is code-defined, so the cap is enforced by
 /// construction and management memory cannot grow from this route. The
-/// default is finite (`14`); the operator cannot opt into more because
+/// default is finite (`17`); the operator cannot opt into more because
 /// writes are out of scope (read-only routes).
-const ERROR_CATALOG: [ErrorCatalogEntry; 14] = [
+const ERROR_CATALOG: [ErrorCatalogEntry; 17] = [
     ErrorCatalogEntry {
         code: "NOT_FOUND",
         status: 404,
@@ -143,13 +143,28 @@ const ERROR_CATALOG: [ErrorCatalogEntry; 14] = [
         status: 401,
         desc: "Bearer token or key is missing, expired, or malformed",
     },
+    ErrorCatalogEntry {
+        code: "VALIDATION_FAILED",
+        status: 400,
+        desc: "Backup import validation failed",
+    },
+    ErrorCatalogEntry {
+        code: "INTERNAL_ERROR",
+        status: 500,
+        desc: "Backup import apply or persist failed",
+    },
+    ErrorCatalogEntry {
+        code: "STORE_NOT_READY",
+        status: 400,
+        desc: "Backup import rejected because a store is not yet initialised",
+    },
 ];
 
 /// Stated count of the fixed bounded set served by these routes. Reason:
 /// one entry per shared error variant above is the whole vocabulary the
 /// management plane can render, so the count documents the bound the
 /// handlers enforce.
-pub const ERROR_CODE_COUNT: usize = 14;
+pub const ERROR_CODE_COUNT: usize = 17;
 
 // Compile-time guard that the bound covers the served catalogue.
 const _: () = assert!(ERROR_CATALOG.len() == ERROR_CODE_COUNT);
@@ -281,6 +296,9 @@ mod tests {
             "TEST_FAILED",
             "CONNECTION_FAILED",
             "UNAUTHORIZED",
+            "VALIDATION_FAILED",
+            "INTERNAL_ERROR",
+            "STORE_NOT_READY",
         ] {
             assert!(codes.contains(&expected), "catalogue holds {expected}");
             assert!(

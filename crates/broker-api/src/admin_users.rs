@@ -317,6 +317,21 @@ impl AdminUsers {
         store
     }
 
+    /// Replace the whole user map from a validated registry root.
+    /// The caller commits the root first; this only swaps memory.
+    /// Unknown verifiers lock their account, as in `from_snapshot`.
+    /// Stale attempt counters for removed users are dropped.
+    pub fn apply_snapshot_conf(&self, conf: &AdminUsersConf) {
+        let fresh = Self::from_snapshot(conf);
+        let names: std::collections::HashSet<String> =
+            fresh.users.read().unwrap().keys().cloned().collect();
+        *self.users.write().unwrap() = std::mem::take(&mut *fresh.users.write().unwrap());
+        self.mfa_attempts
+            .lock()
+            .unwrap()
+            .retain(|name, _| names.contains(name));
+    }
+
     /// Export the current contents as a validated config root, sorted by
     /// username so the persisted file is deterministic. MFA enrolment
     /// rides the same root so it survives a kernel restart byte-identically.

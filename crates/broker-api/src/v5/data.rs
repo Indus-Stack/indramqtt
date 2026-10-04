@@ -344,7 +344,7 @@ async fn enforce_bounds(dir: &std::path::Path) {
 }
 
 // Backup dir for this node. Files persist across restarts there.
-fn backup_dir(state: &ApiState) -> PathBuf {
+pub(crate) fn backup_dir(state: &ApiState) -> PathBuf {
     state.config.dir().join("backup")
 }
 
@@ -451,7 +451,7 @@ pub async fn export_data(State(state): State<ApiState>, body: Bytes) -> Response
 }
 
 // Accept one uploaded file name. Reject path parts and bad suffix.
-fn valid_backup_filename(name: &str) -> bool {
+pub(crate) fn valid_backup_filename(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_FILENAME_LEN {
         return false;
     }
