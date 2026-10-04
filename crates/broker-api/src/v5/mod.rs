@@ -825,4 +825,23 @@ pub fn protected_router() -> Router<ApiState> {
             "/message_transformations/reorder",
             post(transformations::reorder_transformations),
         )
+        // Single transformation read and delete (W3-35, C08-06/C08-07):
+        // per-name read with 404 for unknown names, and per-name
+        // delete with 204 on success and 404 for unknown names. Neither
+        // route is paged; unknown query keys are ignored.
+        // Management-plane only; publish loads the engine snapshot
+        // and never takes the store lock.
+        .route(
+            "/message_transformations/transformation/:name",
+            get(transformations::get_transformation).delete(transformations::delete_transformation),
+        )
+        // Single transformation enable flag (W3-35, C08-08): flips one
+        // entry flag with 404 for unknown names and 400 for a malformed
+        // flag. Disabled steps skip at execution time through the engine
+        // snapshot. Management-plane only; publish loads the snapshot
+        // and never takes the store lock.
+        .route(
+            "/message_transformations/transformation/:name/enable/:enable",
+            post(transformations::set_transformation_enabled),
+        )
 }

@@ -43,7 +43,7 @@
 // sheds the message like `drop` until the checker pins it.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -389,6 +389,41 @@ impl TransformChainStore {
         Ok(())
     }
 
+    /// Read one entry by name. Clones at most one small record under
+    /// a short read lock. Returns `None` for an unknown name.
+    /// Management-plane only; publish and deliver never call this.
+    pub fn get(&self, name: &str) -> Option<TransformRecord> {
+        self.inner
+            .read()
+            .expect("transform store lock")
+            .iter()
+            .find(|record| record.name == name)
+            .cloned()
+    }
+
+    /// Remove one entry by name. Returns false for an unknown name.
+    /// Order of the remaining entries stays unchanged.
+    pub fn remove(&self, name: &str) -> bool {
+        let mut chain = self.inner.write().expect("transform store lock");
+        let Some(pos) = chain.iter().position(|record| record.name == name) else {
+            return false;
+        };
+        chain.remove(pos);
+        true
+    }
+
+    /// Flip the enable flag of one entry in place. Returns the updated
+    /// record, or `None` for an unknown name. Touches only the flag;
+    /// name, filters and operations stay unchanged, so the update
+    /// never trips the chain cap. Management-plane only; publish and
+    /// deliver read the engine snapshot.
+    pub fn set_enabled(&self, name: &str, enable: bool) -> Option<TransformRecord> {
+        let mut chain = self.inner.write().expect("transform store lock");
+        let record = chain.iter_mut().find(|record| record.name == name)?;
+        record.enable = enable;
+        Some(record.clone())
+    }
+
     /// Export the store as a validated config root: entries in chain
     /// order so the persisted file keeps execution order. Each entry
     /// carries the name, filters, failure behaviour, enable flag, the
@@ -656,6 +691,142 @@ pub async fn reorder_transformations(State(state): State<ApiState>, body: Bytes)
         .into_response(),
         Err(TransformReorderError::Duplicate(msg)) => ApiError::BadRequest(msg).into_response(),
     }
+}
+
+/// `GET /api/v5/message_transformations/transformation/:name`: read one
+/// transformation.
+///
+/// A known name returns the stored entry with 200. An unknown name
+/// returns 404 with the documented `{code, message}` shape, not an
+/// empty body. The route is not paged; unknown query parameters are
+/// ignored. Management-plane only; publish and deliver never touch
+/// this store.
+///
+/// Store wiring (rulebook section 2): the backing store is the same
+/// [`TransformChainStore`] as the list/create/replace routes, shared
+/// with the kernel (`crates/broker-node/src/main.rs`, `serve_api`
+/// share); the driving broker event is the ingress transform step
+/// (`crates/broker-node/src/main.rs`, ingress pipeline) loading the
+/// engine snapshot. Declared `wired` in `tools/wiring.txt`.
+///
+/// Fire-path cost: none. The publish path loads one `Arc` per ingress
+/// with no new lock, allocation, or queue from this route. This route
+/// takes one short read lock and clones at most one small record.
+///
+/// Tenant behaviour: the read selects no session, so no path leaves
+/// a tenant.
+pub async fn get_transformation(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    match state.transformations.get(&name) {
+        Some(entry) => (StatusCode::OK, Json(entry.to_json())).into_response(),
+        None => ApiError::NotFound(format!("transformation {name:?} not found")).into_response(),
+    }
+}
+
+/// `DELETE /api/v5/message_transformations/transformation/:name`:
+/// drop one transformation.
+///
+/// A known name removes the entry and answers 204 with no body. An
+/// unknown name returns 404 with the documented `{code, message}`
+/// shape, not an empty body. Chain order of the remaining entries
+/// stays unchanged. The route is not paged; unknown query parameters
+/// are ignored. Management-plane only; publish and deliver never
+/// touch this store.
+///
+/// Store wiring (rulebook section 2): the backing store is the same
+/// [`TransformChainStore`] as the list/create/replace routes, shared
+/// with the kernel (`crates/broker-node/src/main.rs`, `serve_api`
+/// share); the driving broker event is the ingress transform step
+/// (`crates/broker-node/src/main.rs`, ingress pipeline) loading the
+/// engine snapshot. Declared `wired` in `tools/wiring.txt`.
+///
+/// Fire-path cost: none. The publish path keeps loading one `Arc` per
+/// ingress with no new lock, allocation, or queue from this route.
+/// This route takes the store write lock once, swaps the snapshot,
+/// and persists the chain; entries persist across a restart through
+/// the same export path as replace.
+///
+/// Tenant behaviour: the delete selects no session, so no path
+/// leaves a tenant.
+pub async fn delete_transformation(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    if !state.transformations.remove(&name) {
+        return ApiError::NotFound(format!("transformation {name:?} not found")).into_response();
+    }
+    sync_engine(&state);
+    if let Err(error) = state.transformations.persist() {
+        return transform_persist_error(error);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /api/v5/message_transformations/transformation/:name/enable/:enable`:
+/// flip one transformation flag.
+///
+/// An unknown name returns 404 with the documented `{code, message}`
+/// shape and persists nothing. A malformed enable value is rejected
+/// with the documented error shape and persists nothing. On success
+/// the stored flag flips, the change mirrors into the engine lock-free
+/// snapshot (disabled steps skip at execution time), the mutation
+/// persists with the chain record, and the updated entry reads back
+/// with 200. The route is not paged; unknown query parameters are
+/// ignored. Management-plane only; publish and deliver never touch
+/// this store.
+///
+/// Bound: one boolean per entry; no new list, no new accumulation.
+/// The flag persists across a restart with the entry record.
+///
+/// Fire-path cost: none. The publish path keeps loading one `Arc` per
+/// ingress with no new lock, allocation, or queue from this route.
+/// This route takes the store write lock once and swaps the snapshot.
+///
+/// Tenant behaviour: the flip selects no session, so no path leaves
+/// a tenant.
+// TODO(parity): which spellings does the enable path accept (`true`/
+// `false` only, or also `1`/`0`, `on`/`off`, mixed case)? The rulebook
+// does not decide; the current choice accepts exactly `true`/`false`
+// case-insensitively and rejects the rest with `BAD_REQUEST` until the
+// checker pins it.
+// TODO(parity): for an unknown name with a malformed enable value, is
+// the answer 404 or 400? The rulebook does not decide the precedence;
+// the current choice answers 404 first (existence before validation)
+// and persists nothing either way.
+// TODO(parity): does the enable route answer 200 with the updated entry
+// or 204 with no body? The rulebook does not decide the exact shape;
+// the current choice returns the updated entry with 200 so the flag
+// change shows without a second read.
+pub async fn set_transformation_enabled(
+    State(state): State<ApiState>,
+    Path((name, enable_raw)): Path<(String, String)>,
+    Query(_ignored): Query<HashMap<String, String>>,
+) -> Response {
+    if state.transformations.get(&name).is_none() {
+        return ApiError::NotFound(format!("transformation {name:?} not found")).into_response();
+    }
+    let enable = match enable_raw.trim().to_ascii_lowercase().as_str() {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return ApiError::BadRequest(format!(
+                "invalid enable value {enable_raw:?}: expected \"true\" or \"false\" (field `enable`)"
+            ))
+            .into_response();
+        }
+    };
+    let Some(entry) = state.transformations.set_enabled(&name, enable) else {
+        return ApiError::NotFound(format!("transformation {name:?} not found")).into_response();
+    };
+    sync_engine(&state);
+    if let Err(error) = state.transformations.persist() {
+        return transform_persist_error(error);
+    }
+    (StatusCode::OK, Json(entry.to_json())).into_response()
 }
 
 /// Validate a reorder body into the ordered name list.
@@ -1806,5 +1977,252 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+    }
+
+    fn single_body(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "topics": ["single/#"],
+            "failure_action": "drop",
+            "operations": [{"key": "payload", "value": "${payload}-t"}],
+        })
+    }
+
+    async fn single_output(state: &ApiState, topic: &str, payload: &str) -> String {
+        let topic = broker_protocol::Topic::new(topic.to_string()).expect("valid topic");
+        let (_, out, shed) = broker_rules::apply_transform_steps(
+            &state.engine.transform_snapshot(),
+            &topic,
+            &Bytes::from(payload.to_string().into_bytes()),
+        );
+        assert!(!shed);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[tokio::test]
+    async fn single_round_trip_disables_skips_and_deletes() {
+        let state = standalone_state();
+        let created = single_body("w3-35-one");
+        let (status, _) =
+            response_parts(create_transformation(State(state.clone()), make_body(&created)).await)
+                .await;
+        assert_eq!(status, StatusCode::CREATED);
+        // Read back through the production entry.
+        let (status, read) = response_parts(
+            get_transformation(
+                State(state.clone()),
+                Path("w3-35-one".to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["name"], serde_json::json!("w3-35-one"));
+        assert_eq!(read["enable"], serde_json::json!(true));
+        // Live message runs the stored step.
+        assert_eq!(single_output(&state, "single/1", "m").await, "m-t");
+        // Disable through the production entry; the step skips.
+        let (status, flipped) = response_parts(
+            set_transformation_enabled(
+                State(state.clone()),
+                Path(("w3-35-one".to_string(), "false".to_string())),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(flipped["enable"], serde_json::json!(false));
+        assert_eq!(single_output(&state, "single/1", "m").await, "m");
+        // Delete through the production entry.
+        let response = delete_transformation(
+            State(state.clone()),
+            Path("w3-35-one".to_string()),
+            Query(Default::default()),
+        )
+        .await;
+        let (status, empty) = response_parts(response).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(empty, serde_json::Value::Null);
+        // Second read and second delete both miss with the error shape.
+        let (status, err) = response_parts(
+            get_transformation(
+                State(state.clone()),
+                Path("w3-35-one".to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        let (status, err) = response_parts(
+            delete_transformation(
+                State(state.clone()),
+                Path("w3-35-one".to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn single_miss_uses_error_shape_and_ignores_unknown_query() {
+        let state = standalone_state();
+        let (status, err) = response_parts(
+            get_transformation(
+                State(state.clone()),
+                Path("no-such-transform".to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        assert!(err["message"].is_string());
+        // Unknown query keys change nothing on a hit.
+        let (status, _) = response_parts(
+            create_transformation(State(state.clone()), make_body(&single_body("q-1"))).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let query: Query<HashMap<String, String>> = Query(
+            [("unknown".to_string(), "x".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let (status, read) = response_parts(
+            get_transformation(State(state.clone()), Path("q-1".to_string()), query).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["name"], serde_json::json!("q-1"));
+        let query: Query<HashMap<String, String>> = Query(
+            [("unknown".to_string(), "x".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let (status, flipped) = response_parts(
+            set_transformation_enabled(
+                State(state.clone()),
+                Path(("q-1".to_string(), "true".to_string())),
+                query,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(flipped["enable"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn enable_rejects_malformed_flag_and_unknown_name() {
+        let state = standalone_state();
+        let (status, _) = response_parts(
+            create_transformation(State(state.clone()), make_body(&single_body("e-1"))).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        for bad in ["maybe", "1", "on", "", "TRUEE"] {
+            let (status, err) = response_parts(
+                set_transformation_enabled(
+                    State(state.clone()),
+                    Path(("e-1".to_string(), bad.to_string())),
+                    Query(Default::default()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "flag {bad:?} must fail");
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        }
+        // The flag stays unchanged after rejected writes.
+        let (status, read) = response_parts(
+            get_transformation(
+                State(state.clone()),
+                Path("e-1".to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read["enable"], serde_json::json!(true));
+        // Unknown names miss even with a valid or malformed flag.
+        for flag in ["false", "maybe"] {
+            let (status, err) = response_parts(
+                set_transformation_enabled(
+                    State(state.clone()),
+                    Path(("no-such-transform".to_string(), flag.to_string())),
+                    Query(Default::default()),
+                )
+                .await,
+            )
+            .await;
+            if flag == "false" {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+            } else {
+                // Existence wins over validation; nothing persists either way.
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+            }
+        }
+    }
+
+    #[test]
+    fn single_store_ops_touch_only_one_entry() {
+        let store = TransformChainStore::new();
+        assert!(store.get("missing").is_none());
+        assert!(!store.remove("missing"));
+        assert!(store.set_enabled("missing", false).is_none());
+        for name in ["s-a", "s-b"] {
+            store
+                .insert(parse_transform_request(&single_body(name)).expect("valid"))
+                .expect("insert");
+        }
+        let disabled = store.set_enabled("s-a", false).expect("known name flips");
+        assert!(!disabled.enable);
+        assert!(!store.get("s-a").expect("reads back").enable);
+        assert!(store.get("s-b").expect("reads back").enable);
+        assert!(store.remove("s-a"));
+        assert!(store.get("s-a").is_none());
+        assert_eq!(store.snapshot().len(), 1);
+        assert_eq!(store.snapshot()[0].name, "s-b");
+    }
+
+    #[test]
+    fn enable_flag_persists_across_registry_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-transform-enable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|span| span.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let registry =
+            std::sync::Arc::new(broker_config::ConfigRegistry::load(&dir).expect("load"));
+        let store = TransformChainStore::from_registry(&registry);
+        store
+            .insert(parse_transform_request(&single_body("persist-enable")).expect("valid"))
+            .expect("insert");
+        store
+            .set_enabled("persist-enable", false)
+            .expect("flip applies");
+        store.persist().expect("save");
+        let reloaded =
+            std::sync::Arc::new(broker_config::ConfigRegistry::load(&dir).expect("reload"));
+        assert!(!reloaded.snapshot().transformations.transformations[0].enable);
+        let restarted = TransformChainStore::from_registry(&reloaded);
+        assert!(!restarted.get("persist-enable").expect("reads back").enable);
+        assert!(!restarted.steps_snapshot()[0].enable);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
