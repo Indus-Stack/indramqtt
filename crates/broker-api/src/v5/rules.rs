@@ -801,7 +801,7 @@ fn persist_connectors(
 /// Probe the connector target the way boot replay does: entries
 /// without a `server`/`url`/… target never probe and count as reachable;
 /// otherwise a 1.5 s TCP connect decides.
-async fn probe_connector_reachable(body: &serde_json::Value) -> bool {
+pub(crate) async fn probe_connector_reachable(body: &serde_json::Value) -> bool {
     match extract_target_host_port(body) {
         Some(target) => check_tcp_reachable(&target).await.is_ok(),
         None => true,
@@ -1015,6 +1015,112 @@ fn missing_connector_field(conn_type: &str, body: &serde_json::Value) -> Option<
 ///
 /// An invalid snapshot or an unparsable stored params document fails boot
 /// loudly instead of being skipped silently.
+/// Build the observable connector document for one registry entry,
+/// preserving secret references (never resolving values into the store).
+///
+/// A bare `file:`/`env:` reference is kept verbatim in `config` (and
+/// mirrored in `url` so probe/live paths see it without inventing a
+/// target); a JSON object config is flattened so each string leaf stays
+/// a separate redactable value; anything else is kept opaque in
+/// `config`. The store keeps references; responses redact them.
+fn connector_store_doc(entry: &broker_config::ConnectorEntry) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let trimmed = entry.config.trim();
+    if !trimmed.is_empty() && !broker_config::secrets::is_secret_ref(trimmed) {
+        if let Ok(serde_json::Value::Object(obj)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            for (key, value) in obj {
+                map.insert(key, value);
+            }
+        } else {
+            map.insert(
+                "config".to_string(),
+                serde_json::Value::String(entry.config.clone()),
+            );
+        }
+    }
+    // Authoritative identity/enable from the registry entry win over any
+    // keys the stored params carried.
+    map.insert(
+        "id".to_string(),
+        serde_json::Value::String(entry.id.clone()),
+    );
+    map.insert(
+        "name".to_string(),
+        serde_json::Value::String(entry.id.clone()),
+    );
+    map.insert(
+        "type".to_string(),
+        serde_json::Value::String(entry.connector_type.clone()),
+    );
+    map.insert("enable".to_string(), serde_json::Value::Bool(entry.enable));
+    if !trimmed.is_empty() && broker_config::secrets::is_secret_ref(trimmed) {
+        map.insert(
+            "config".to_string(),
+            serde_json::Value::String(trimmed.to_string()),
+        );
+        // Mirror the bare reference as `url` so probe and live-sink paths
+        // see the reference without an invented target; resolution happens
+        // at use time, the store keeps the reference.
+        if !map.contains_key("url") {
+            map.insert(
+                "url".to_string(),
+                serde_json::Value::String(trimmed.to_string()),
+            );
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Reconcile the process-global connector list with a freshly committed
+/// snapshot (reload/restore path): upsert every candidate entry (reference
+/// form, status recomputed with the same probe create uses) and drop ids
+/// the candidate removed. Entries never in `previous` are left alone, so
+/// parallel test servers sharing the global store stay deterministic.
+pub(crate) async fn reconcile_connectors_store(
+    previous: &broker_config::ConnectorsConf,
+    candidate: &broker_config::ConnectorsConf,
+) {
+    use std::collections::HashSet;
+    let candidate_ids: HashSet<&str> = candidate
+        .connectors
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect();
+    for entry in &previous.connectors {
+        if candidate_ids.contains(entry.id.as_str()) {
+            continue;
+        }
+        let mut store = CONNECTORS.write().unwrap();
+        store.retain(|doc| {
+            doc.get("id").and_then(|v| v.as_str()) != Some(entry.id.as_str())
+                && doc.get("name").and_then(|v| v.as_str()) != Some(entry.id.as_str())
+        });
+    }
+    for entry in &candidate.connectors {
+        let mut doc = connector_store_doc(entry);
+        let reachable = probe_connector_reachable(&doc).await;
+        let status = connector_status(reachable);
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert(
+                "status".to_string(),
+                serde_json::Value::String(status.to_string()),
+            );
+            obj.insert("node_status".to_string(), connector_node_status(status));
+        }
+        let mut store = CONNECTORS.write().unwrap();
+        if let Some(pos) = store.iter().position(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(entry.id.as_str())
+                || c.get("name").and_then(|v| v.as_str()) == Some(entry.id.as_str())
+        }) {
+            store[pos] = doc;
+        } else {
+            store.push(doc);
+        }
+    }
+}
+
 pub fn seed_connectors_from_registry(
     config: &Arc<broker_config::ConfigRegistry>,
     engine: &broker_rules::RuleEngine,
@@ -1028,12 +1134,9 @@ pub fn seed_connectors_from_registry(
     }
     let mut restored = Vec::with_capacity(snapshot.connectors.connectors.len());
     for entry in &snapshot.connectors.connectors {
-        let params: serde_json::Value = serde_json::from_str(&entry.config).unwrap_or_else(|_| {
-            panic!(
-                "invalid stored connector params for {}: not a JSON document",
-                entry.id
-            )
-        });
+        // Bare `file:`/`env:` references are valid stored configs (M1-05):
+        // keep the reference form instead of panicking on non-JSON.
+        let params = connector_store_doc(entry);
         restored.push((entry.id.clone(), entry.connector_type.clone(), params));
     }
     // `register_live_sink` is async (the `disk_log` arm opens its
@@ -1130,6 +1233,36 @@ fn connector_live_view(
     out
 }
 
+/// Redact secret references in a connector document for any observable
+/// response: every `file:`/`env:` string leaf renders as its
+/// `<redacted:...>` marker naming the reference, never the value. The
+/// store keeps the reference; only the response is redacted.
+fn redact_connector_doc(value: &serde_json::Value) -> serde_json::Value {
+    fn walk(node: &mut serde_json::Value) {
+        match node {
+            serde_json::Value::String(text) => {
+                if broker_config::secrets::is_secret_ref(text.trim()) {
+                    *text = broker_config::secrets::redact_value(text.trim());
+                }
+            }
+            serde_json::Value::Array(entries) => {
+                for entry in entries {
+                    walk(entry);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (_, entry) in map.iter_mut() {
+                    walk(entry);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = value.clone();
+    walk(&mut out);
+    out
+}
+
 /// `GET /api/v5/connectors` (C07-01): paged list over the real store with
 /// the standard page envelope (`data` plus `meta {page, limit, count,
 /// hasnext}`); an empty store returns an empty page, not an error.
@@ -1148,7 +1281,7 @@ pub async fn list_connectors(
     let store = CONNECTORS.read().unwrap();
     let mut rows: Vec<serde_json::Value> = store
         .iter()
-        .map(|body| connector_live_view(body, &state.engine))
+        .map(|body| redact_connector_doc(&connector_live_view(body, &state.engine)))
         .collect();
     rows.sort_by(|a, b| {
         let a_id = a
@@ -1223,20 +1356,58 @@ pub async fn get_connector(
     };
     match stored {
         Some(body) => {
-            let live = connector_live_view(&body, &state.engine);
+            let live = redact_connector_doc(&connector_live_view(&body, &state.engine));
             (StatusCode::OK, Json(live)).into_response()
         }
         None => ApiError::NotFound(format!("connector {id:?} not found")).into_response(),
     }
 }
 
-async fn register_live_sink(
+pub(crate) async fn register_live_sink(
     engine: &broker_rules::RuleEngine,
     conn_type: &str,
     name: &str,
     body: &serde_json::Value,
 ) {
     match conn_type {
+        // Offline kinds: always live, no network probe. The snapshot keeps
+        // the reference form while the sink holds no credential material.
+        "console" | "logger" | "test" => {
+            let sink = Arc::new(broker_connectors::ConsoleLoggerSink::new(name.to_string()));
+            engine.connectors().register(name, sink.clone());
+            engine
+                .connectors()
+                .register(format!("{conn_type}:{name}"), sink);
+        }
+        "webhook" => {
+            // Connector URLs may be secret references; resolve at use time
+            // so the snapshot keeps the reference while the live sink dials
+            // the real target. Unresolvable targets fail closed (no sink).
+            // No invented default: a missing URL stays persist-only instead
+            // of dialling a loopback the operator never configured.
+            let Some(raw_url) = body
+                .get("url")
+                .or_else(|| body.get("endpoint"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return;
+            };
+            let url = broker_connectors::resolve_field_secret(raw_url);
+            if url.trim().is_empty() {
+                return;
+            }
+            let sink = Arc::new(broker_connectors::HttpWebhookSink::new(
+                url,
+                reqwest::header::HeaderMap::new(),
+                reqwest::Client::new(),
+            ));
+            engine.connectors().register(name, sink.clone());
+            engine
+                .connectors()
+                .register(format!("webhook:{name}"), sink);
+        }
         "redis" => {
             let servers = body
                 .get("servers")
@@ -1249,7 +1420,7 @@ async fn register_live_sink(
             } else {
                 format!("redis://:{}@{}", pass, servers)
             };
-            if let Ok(transport) = broker_connectors::redis::TcpRedisTransport::new(&endpoint) {
+            if let Ok(transport) = broker_connectors::redis::DriverRedisTransport::new(&endpoint) {
                 let config = broker_connectors::redis::RedisSinkConfig {
                     endpoint,
                     command: broker_connectors::redis::RedisCommandKind::HSet {
@@ -1308,12 +1479,12 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
-            let config = broker_connectors::alloydb::AlloydbConfig {
+            let config = broker_connectors_enterprise::alloydb::AlloydbConfig {
                 host,
                 port,
                 database: database.to_string(),
                 username: username.to_string(),
-                auth: broker_connectors::alloydb::AlloydbAuth::Password {
+                auth: broker_connectors_enterprise::alloydb::AlloydbAuth::Password {
                     password: password.to_string(),
                 },
                 table: table.to_string(),
@@ -1325,10 +1496,12 @@ async fn register_live_sink(
                 ca_bundle_pem: None,
                 tls_ca_file: None,
             };
-            let transport = Arc::new(broker_connectors::alloydb::PgDriverAlloydbTransport::new(
-                &config,
-            ));
-            if let Ok(sink) = broker_connectors::alloydb::AlloydbSink::new(config, transport) {
+            let transport = Arc::new(
+                broker_connectors_enterprise::alloydb::PgDriverAlloydbTransport::new(&config),
+            );
+            if let Ok(sink) =
+                broker_connectors_enterprise::alloydb::AlloydbSink::new(config, transport)
+            {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -1337,12 +1510,22 @@ async fn register_live_sink(
             }
         }
         "http" => {
-            let url = body
+            // No invented loopback default: a missing URL registers a sink
+            // with an empty target that fails closed on send (never dials
+            // an operator-unconfigured address) while preserving the
+            // long-standing live-sink contract for target-less `http`
+            // connectors (probe reports reachable, create/boot expect a
+            // live sink). Reason: an empty target fails the send instead
+            // of sending somewhere unintended.
+            let raw_url = body
                 .get("url")
                 .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:8080");
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
+            let url = broker_connectors::resolve_field_secret(raw_url);
             let sink = Arc::new(broker_connectors::HttpWebhookSink::new(
-                url.to_string(),
+                url,
                 reqwest::header::HeaderMap::new(),
                 reqwest::Client::new(),
             ));
@@ -1355,21 +1538,19 @@ async fn register_live_sink(
                 .or_else(|| body.get("servers"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("127.0.0.1:9092");
-            if let Ok(transport) = broker_connectors::kafka::TcpKafkaTransport::new(
-                servers,
-                format!("indramqtt-{}", name),
-                "1",
-            ) {
-                let config = broker_connectors::kafka::KafkaSinkConfig {
-                    bootstrap_servers: servers.to_string(),
-                    topic_template: "events-${topic}".to_string(),
-                    partition_key_field: None,
-                    partitions: 1,
-                    client_id: format!("indramqtt-{}", name),
-                    acks: "1".to_string(),
-                    batch_max_records: 1,
-                    batch_max_bytes: 65536,
-                };
+            let config = broker_connectors::kafka::KafkaSinkConfig {
+                bootstrap_servers: servers.to_string(),
+                topic_template: "events-${topic}".to_string(),
+                partition_key_field: None,
+                partitions: 1,
+                client_id: format!("indramqtt-{}", name),
+                acks: "1".to_string(),
+                batch_max_records: 1,
+                batch_max_bytes: 65536,
+            };
+            // Production write path on the maintained `rdkafka` driver;
+            // the hand-written TCP framing stays for offline unit tests.
+            if let Ok(transport) = broker_connectors::kafka::RdkafkaKafkaTransport::new(&config) {
                 if let Ok(sink) =
                     broker_connectors::kafka::KafkaSink::new(config, Arc::new(transport))
                 {
@@ -1399,7 +1580,8 @@ async fn register_live_sink(
                 "postgres://{}:{}@{}/{}",
                 username, password, server, database
             );
-            if let Ok(transport) = broker_connectors::postgres::TcpPgTransport::new(&conn_url, 1) {
+            if let Ok(transport) = broker_connectors::postgres::DriverPgTransport::new(&conn_url, 1)
+            {
                 let config = broker_connectors::postgres::PostgreSqlSinkConfig {
                     connection_url: conn_url,
                     sql_template: "INSERT INTO test_telemetry (clientid, topic, payload, timestamp) VALUES ('rule-engine', $1, $3, 0)".to_string(),
@@ -1437,7 +1619,8 @@ async fn register_live_sink(
             } else {
                 format!("mysql://{}:{}@{}/{}", username, password, server, database)
             };
-            if let Ok(transport) = broker_connectors::mysql::TcpMySqlTransport::new(&conn_url, 1) {
+            if let Ok(transport) = broker_connectors::mysql::DriverMySqlTransport::new(&conn_url, 1)
+            {
                 let config = broker_connectors::mysql::MySqlSinkConfig {
                     connection_url: conn_url,
                     sql_template:
@@ -1478,7 +1661,7 @@ async fn register_live_sink(
                 format!("amqp://{}:{}@{}/", username, password, endpoint)
             };
             if let Ok(transport) =
-                broker_connectors::rabbitmq::TcpRabbitTransport::new(&full_endpoint)
+                broker_connectors::rabbitmq::LapinRabbitTransport::new(&full_endpoint)
             {
                 let config = broker_connectors::rabbitmq::RabbitMqSinkConfig {
                     endpoint: full_endpoint,
@@ -1528,16 +1711,31 @@ async fn register_live_sink(
                 format: "JSONEachRow".to_string(),
                 batch_size: 1,
                 batch_timeout_ms: 10,
+                username: body
+                    .get("username")
+                    .or_else(|| body.get("user"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default")
+                    .to_string(),
+                password: body
+                    .get("password")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 request_timeout_ms,
             };
-            if let Ok(sink) =
-                broker_connectors::clickhouse::ClickHouseSink::new(config, reqwest::Client::new())
-            {
-                let sink = Arc::new(sink);
-                engine.connectors().register(name, sink.clone());
-                engine
-                    .connectors()
-                    .register(format!("clickhouse:{}", name), sink);
+            if let Ok(driver) = broker_connectors::DriverClickHouseTransport::new(&config) {
+                let transport: std::sync::Arc<dyn broker_connectors::ClickHouseTransport> =
+                    std::sync::Arc::new(driver);
+                if let Ok(sink) =
+                    broker_connectors::clickhouse::ClickHouseSink::new(config, transport)
+                {
+                    let sink = Arc::new(sink);
+                    engine.connectors().register(name, sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("clickhouse:{}", name), sink);
+                }
             }
         }
         "mqtt_bridge" | "bridge" => {
@@ -1574,7 +1772,7 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 protocol: broker_connectors::MqttBridgeProtocol::V311,
             };
-            if let Ok(transport) = broker_connectors::TcpMqttBridgeTransport::new(&config) {
+            if let Ok(transport) = broker_connectors::RumqttcMqttBridgeTransport::new(&config) {
                 if let Ok(sink) =
                     broker_connectors::MqttBridgeSink::new(config, Arc::new(transport))
                 {
@@ -1664,11 +1862,11 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
-            let config = broker_connectors::MongoDbSinkConfig {
+            let config = broker_connectors_enterprise::MongoDbSinkConfig {
                 connection_string: conn_str,
                 database: database.to_string(),
                 collection_template: collection.to_string(),
-                operation: broker_connectors::MongoOperation::InsertOne,
+                operation: broker_connectors_enterprise::MongoOperation::InsertOne,
                 batch_size: Some(1),
                 batch_bytes: Some(4_194_304),
                 linger_ms: Some(10),
@@ -1677,9 +1875,12 @@ async fn register_live_sink(
                 max_backoff_ms: Some(3_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::NativeMongoDbTransport::new(&config) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::DriverMongoDbTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::MongoDbSink::new(config, transport) {
+                if let Ok(sink) = broker_connectors_enterprise::MongoDbSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -1712,12 +1913,12 @@ async fn register_live_sink(
             let username = body.get("username").and_then(|v| v.as_str());
             let password = body.get("password").and_then(|v| v.as_str());
             let auth = if let (Some(u), Some(p)) = (username, password) {
-                broker_connectors::CassandraAuth::Password {
+                broker_connectors_enterprise::CassandraAuth::Password {
                     username: u.to_string(),
                     password: p.to_string(),
                 }
             } else {
-                broker_connectors::CassandraAuth::None
+                broker_connectors_enterprise::CassandraAuth::None
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -1725,12 +1926,12 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
             let cql = format!("INSERT INTO {}.{} (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)", keyspace, table);
-            let config = broker_connectors::CassandraSinkConfig {
+            let config = broker_connectors_enterprise::CassandraSinkConfig {
                 contact_points,
                 keyspace: keyspace.to_string(),
                 table_template: table.to_string(),
                 auth,
-                consistency: broker_connectors::CqlConsistency::One,
+                consistency: broker_connectors_enterprise::CqlConsistency::One,
                 partition_key_template: "${client_id}".to_string(),
                 cql_statement_template: cql,
                 ttl_secs: None,
@@ -1742,9 +1943,13 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::ScyllaCassandraTransport::new(&config) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::ScyllaCassandraTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::CassandraSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors_enterprise::CassandraSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -1772,7 +1977,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
-            let config = broker_connectors::CockroachDbConfig {
+            let config = broker_connectors_enterprise::CockroachDbConfig {
                 connection_string: conn_str.to_string(),
                 table: table.to_string(),
                 upsert_conflict_columns: Vec::new(),
@@ -1781,8 +1986,10 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            let transport = Arc::new(broker_connectors::TcpCockroachDbTransport::new(&config));
-            if let Ok(sink) = broker_connectors::CockroachDbSink::new(config, transport) {
+            let transport =
+                Arc::new(broker_connectors_enterprise::PgDriverCockroachDbTransport::new(&config));
+            if let Ok(sink) = broker_connectors_enterprise::CockroachDbSink::new(config, transport)
+            {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -1830,12 +2037,12 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
-            let config = broker_connectors::CouchbaseSinkConfig {
+            let config = broker_connectors_enterprise::CouchbaseSinkConfig {
                 connection_string: conn_str,
                 bucket: bucket.to_string(),
                 scope,
                 collection,
-                auth: broker_connectors::CouchbaseAuth {
+                auth: broker_connectors_enterprise::CouchbaseAuth {
                     username: username.to_string(),
                     password: password.to_string(),
                 },
@@ -1844,7 +2051,7 @@ async fn register_live_sink(
                     .and_then(|v| v.as_str())
                     .unwrap_or("${client_id}::${timestamp}")
                     .to_string(),
-                operation: broker_connectors::CouchbaseOperation::Upsert,
+                operation: broker_connectors_enterprise::CouchbaseOperation::Upsert,
                 expiry_secs: None,
                 batch_size: Some(1),
                 batch_bytes: Some(2_097_152),
@@ -1854,9 +2061,13 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::NativeCouchbaseTransport::new(&config) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::DriverCouchbaseTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::CouchbaseSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors_enterprise::CouchbaseSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -1906,16 +2117,16 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
-            let config = broker_connectors::MssqlSinkConfig {
+            let config = broker_connectors_enterprise::MssqlSinkConfig {
                 host,
                 port,
                 database: database.to_string(),
                 table_template: table.to_string(),
-                auth: broker_connectors::MssqlAuth::SqlPassword {
+                auth: broker_connectors_enterprise::MssqlAuth::SqlPassword {
                     username: username.to_string(),
                     password: password.to_string(),
                 },
-                query_mode: broker_connectors::MssqlQueryMode::InsertJson,
+                query_mode: broker_connectors_enterprise::MssqlQueryMode::InsertJson,
                 trust_server_certificate: true,
                 batch_size: Some(1),
                 batch_bytes: Some(2_097_152),
@@ -1925,9 +2136,10 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::NativeMssqlTransport::new(&config) {
+            if let Ok(transport) = broker_connectors_enterprise::NativeMssqlTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::MssqlSink::new(config, transport) {
+                if let Ok(sink) = broker_connectors_enterprise::MssqlSink::new(config, transport) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -1963,7 +2175,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
-            let config = broker_connectors::oracle::OracleSinkConfig {
+            let config = broker_connectors_enterprise::oracle::OracleSinkConfig {
                 url: url.to_string(),
                 schema: schema.to_string(),
                 table: table.to_string(),
@@ -1975,8 +2187,11 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            let transport = Arc::new(broker_connectors::oracle::HttpOracleTransport::new(&config));
-            if let Ok(sink) = broker_connectors::oracle::OracleSink::new(config, transport) {
+            let transport =
+                Arc::new(broker_connectors_enterprise::oracle::HttpOracleTransport::new(&config));
+            if let Ok(sink) =
+                broker_connectors_enterprise::oracle::OracleSink::new(config, transport)
+            {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -2030,12 +2245,12 @@ async fn register_live_sink(
             let mut tags_template = std::collections::HashMap::new();
             tags_template.insert("location".to_string(), "room1".to_string());
 
-            let config = broker_connectors::tdengine::TdengineSinkConfig {
+            let config = broker_connectors_enterprise::tdengine::TdengineSinkConfig {
                 endpoint,
                 database: database.to_string(),
                 stable_name: stable.to_string(),
                 subtable_template: subtable.to_string(),
-                auth: broker_connectors::tdengine::TdengineAuth::Basic {
+                auth: broker_connectors_enterprise::tdengine::TdengineAuth::Basic {
                     username: username.to_string(),
                     password: password.to_string(),
                 },
@@ -2054,10 +2269,11 @@ async fn register_live_sink(
                 .build()
                 .unwrap_or_default();
             if let Ok(transport) =
-                broker_connectors::tdengine::HttpTdengineTransport::new(&config, client)
+                broker_connectors_enterprise::tdengine::HttpTdengineTransport::new(&config, client)
             {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::tdengine::TdengineSink::new(config, transport)
+                if let Ok(sink) =
+                    broker_connectors_enterprise::tdengine::TdengineSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -2162,16 +2378,16 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::iotdb::IotDbSinkConfig {
+            let config = broker_connectors_enterprise::iotdb::IotDbSinkConfig {
                 endpoint,
                 device_path_template: device_path.to_string(),
-                auth: broker_connectors::iotdb::IotDbAuth {
+                auth: broker_connectors_enterprise::iotdb::IotDbAuth {
                     username: username.to_string(),
                     password: password.to_string(),
                 },
                 is_aligned: false,
                 measurements: vec!["temperature".to_string()],
-                data_types: vec![broker_connectors::iotdb::IotDbDataType::Float],
+                data_types: vec![broker_connectors_enterprise::iotdb::IotDbDataType::Float],
                 batch_size: Some(1),
                 batch_bytes: Some(2_097_152),
                 linger_ms: Some(10),
@@ -2185,10 +2401,12 @@ async fn register_live_sink(
                 .build()
                 .unwrap_or_default();
             if let Ok(transport) =
-                broker_connectors::iotdb::HttpIotDbTransport::new(&config, client)
+                broker_connectors_enterprise::iotdb::HttpIotDbTransport::new(&config, client)
             {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::iotdb::IotDbSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors_enterprise::iotdb::IotDbSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2318,13 +2536,13 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::doris::DorisSinkConfig {
+            let config = broker_connectors_enterprise::doris::DorisSinkConfig {
                 fe_host,
                 http_port,
                 database,
                 table_template: table,
-                auth: broker_connectors::doris::DorisAuth { username, password },
-                format: broker_connectors::doris::DorisFormat::Json,
+                auth: broker_connectors_enterprise::doris::DorisAuth { username, password },
+                format: broker_connectors_enterprise::doris::DorisFormat::Json,
                 jsonpaths: None,
                 strip_outer_array: true,
                 max_filter_ratio: Some(0.0),
@@ -2336,15 +2554,21 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
+            // No-redirect client: the transport replays auth + label
+            // itself on the FE 307 -> BE hop (a stock client strips
+            // Authorization when the BE is a different origin).
             let client = reqwest::Client::builder()
                 .timeout(config.timeout())
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default();
             if let Ok(transport) =
-                broker_connectors::doris::HttpDorisTransport::new(&config, client)
+                broker_connectors_enterprise::doris::HttpDorisTransport::new(&config, client)
             {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::doris::DorisSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors_enterprise::doris::DorisSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2388,7 +2612,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::datalayers::DatalayersConfig {
+            let config = broker_connectors_enterprise::datalayers::DatalayersConfig {
                 endpoint,
                 database,
                 table,
@@ -2400,10 +2624,11 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            let transport = Arc::new(broker_connectors::datalayers::HttpDatalayersTransport::new(
-                &config,
-            ));
-            if let Ok(sink) = broker_connectors::datalayers::DatalayersSink::new(config, transport)
+            let transport = Arc::new(
+                broker_connectors_enterprise::datalayers::HttpDatalayersTransport::new(&config),
+            );
+            if let Ok(sink) =
+                broker_connectors_enterprise::datalayers::DatalayersSink::new(config, transport)
             {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
@@ -2457,12 +2682,8 @@ async fn register_live_sink(
                 max_retries: 3,
                 request_timeout_ms: timeout_ms,
             };
-            let client = reqwest::Client::builder()
-                .timeout(config.timeout())
-                .build()
-                .unwrap_or_default();
             if let Ok(transport) =
-                broker_connectors::elasticsearch::HttpElasticsearchTransport::new(&config, client)
+                broker_connectors::elasticsearch::DriverElasticsearchTransport::new(&config)
             {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
@@ -2513,11 +2734,11 @@ async fn register_live_sink(
                 .to_string();
             let token = body.get("token").and_then(|v| v.as_str());
             let auth = if let Some(t) = token {
-                broker_connectors::pulsar::PulsarAuth::Token {
+                broker_connectors_enterprise::pulsar::PulsarAuth::Token {
                     token: t.to_string(),
                 }
             } else {
-                broker_connectors::pulsar::PulsarAuth::None
+                broker_connectors_enterprise::pulsar::PulsarAuth::None
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -2525,7 +2746,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::pulsar::PulsarSinkConfig {
+            let config = broker_connectors_enterprise::pulsar::PulsarSinkConfig {
                 service_url,
                 tenant,
                 namespace,
@@ -2541,9 +2762,13 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::pulsar::TcpPulsarTransport::new(&config) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::pulsar::TcpPulsarTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::pulsar::PulsarSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors_enterprise::pulsar::PulsarSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2583,7 +2808,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::rocketmq::RocketMqSinkConfig {
+            let config = broker_connectors_enterprise::rocketmq::RocketMqSinkConfig {
                 endpoints: vec![endpoint],
                 topic,
                 tag_template: None,
@@ -2596,9 +2821,12 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::rocketmq::TcpRocketMqTransport::new(&config) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::rocketmq::TcpRocketMqTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::rocketmq::RocketMqSink::new(config, transport)
+                if let Ok(sink) =
+                    broker_connectors_enterprise::rocketmq::RocketMqSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -2650,11 +2878,13 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::confluent::ConfluentKafkaConfig {
+            let config = broker_connectors_enterprise::confluent::ConfluentKafkaConfig {
                 bootstrap_servers: vec![bootstrap],
                 api_key: api_key.to_string(),
                 api_secret: api_secret.to_string(),
-                auth_mechanism: broker_connectors::confluent::SaslMechanism::Plain,
+                auth_mechanism: broker_connectors_enterprise::confluent::SaslMechanism::Plain,
+                security_protocol:
+                    broker_connectors_enterprise::confluent::ConfluentSecurityProtocol::SaslSsl,
                 topic_template: topic,
                 partition_key_template: Some("${client_id}".to_string()),
                 schema_registry: None,
@@ -2663,12 +2893,13 @@ async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::confluent::TcpConfluentTransport::new(&config)
+            if let Ok(transport) =
+                broker_connectors_enterprise::confluent::RdkafkaConfluentTransport::new(&config)
             {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
-                    broker_connectors::confluent::ConfluentKafkaSink::new(config, transport)
-                {
+                if let Ok(sink) = broker_connectors_enterprise::confluent::ConfluentKafkaSink::new(
+                    config, transport,
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2699,15 +2930,18 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
+            // Bounded by default: 64 MiB active segment caps the recovery
+            // scan, 10 retained segments cap total disk (~640 MiB + active)
+            // so a forgotten connector cannot fill the disk.
             let config = broker_connectors::disk_log::DiskLogSinkConfig {
                 directory: dir.to_string(),
                 filename_prefix: prefix.to_string(),
                 filename_extension: ext.to_string(),
                 format: broker_connectors::disk_log::DiskLogFormat::Ndjson,
-                max_file_size_bytes: None,
+                max_file_size_bytes: Some(67_108_864),
                 max_file_age_secs: None,
                 compression: broker_connectors::disk_log::DiskLogCompression::None,
-                max_backup_files: None,
+                max_backup_files: Some(10),
                 max_retention_days: None,
                 sync_mode: broker_connectors::disk_log::DiskSyncMode::EveryBatch,
                 timeout_ms,
@@ -2715,7 +2949,7 @@ async fn register_live_sink(
             if let Ok(writer) = broker_connectors::disk_log::FileDiskLogWriter::open(&config).await
             {
                 if let Ok(sink) =
-                    broker_connectors::disk_log::DiskLogSink::new(config, Arc::new(writer))
+                    broker_connectors::disk_log::DiskLogSink::open(config, Arc::new(writer)).await
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -2749,25 +2983,31 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::opc_ua::OpcUaSinkConfig {
+            let config = broker_connectors_enterprise::opc_ua::OpcUaSinkConfig {
                 endpoint_url,
-                security_policy: broker_connectors::opc_ua::OpcUaSecurityPolicy::None,
-                security_mode: broker_connectors::opc_ua::OpcUaSecurityMode::None,
-                auth: broker_connectors::opc_ua::OpcUaAuth::Anonymous,
-                node_subscriptions: vec![broker_connectors::opc_ua::NodeSubscriptionConfig {
-                    node_id: node_id.to_string(),
-                    sampling_interval_ms: 1000,
-                    publish_topic_template: "opcua/${node.sanitized_id}".to_string(),
-                    write_topic_pattern: Some("#".to_string()),
-                }],
+                security_policy: broker_connectors_enterprise::opc_ua::OpcUaSecurityPolicy::None,
+                security_mode: broker_connectors_enterprise::opc_ua::OpcUaSecurityMode::None,
+                auth: broker_connectors_enterprise::opc_ua::OpcUaAuth::Anonymous,
+                node_subscriptions: vec![
+                    broker_connectors_enterprise::opc_ua::NodeSubscriptionConfig {
+                        node_id: node_id.to_string(),
+                        sampling_interval_ms: 1000,
+                        publish_topic_template: "opcua/${node.sanitized_id}".to_string(),
+                        write_topic_pattern: Some("#".to_string()),
+                    },
+                ],
                 buffer_capacity: None,
                 batch_size: Some(1),
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::opc_ua::TcpOpcUaTransport::new(&config) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::opc_ua::TcpOpcUaTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::opc_ua::OpcUaSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors_enterprise::opc_ua::OpcUaSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2790,16 +3030,18 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::sparkplug_b::SparkplugSinkConfig {
+            let config = broker_connectors_enterprise::sparkplug_b::SparkplugSinkConfig {
                 topic_prefix,
-                tier: broker_connectors::sparkplug_b::SPARKPLUG_TIER.to_string(),
+                tier: broker_connectors_enterprise::sparkplug_b::SPARKPLUG_TIER.to_string(),
                 batch_size: Some(1),
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            let transport =
-                Arc::new(broker_connectors::sparkplug_b::MemorySparkplugTransport::new());
-            if let Ok(sink) = broker_connectors::sparkplug_b::SparkplugBSink::new(config, transport)
+            let transport = Arc::new(
+                broker_connectors_enterprise::sparkplug_b::MemorySparkplugTransport::new(),
+            );
+            if let Ok(sink) =
+                broker_connectors_enterprise::sparkplug_b::SparkplugBSink::new(config, transport)
             {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
@@ -2857,9 +3099,7 @@ async fn register_live_sink(
                 batch_timeout_ms: 10,
                 timeout_ms,
             };
-            if let Ok(transport) =
-                broker_connectors::s3::HttpS3Transport::new(&config, reqwest::Client::new())
-            {
+            if let Ok(transport) = broker_connectors::s3::SdkS3Transport::new(&config) {
                 let transport = Arc::new(transport);
                 if let Ok(sink) = broker_connectors::s3::S3Sink::new(config, transport) {
                     let sink = Arc::new(sink);
@@ -2912,7 +3152,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::s3_tables::S3TablesSinkConfig {
+            let config = broker_connectors_enterprise::s3_tables::S3TablesSinkConfig {
                 table_bucket_arn: arn.to_string(),
                 namespace: namespace.to_string(),
                 table_name: table.to_string(),
@@ -2921,19 +3161,23 @@ async fn register_live_sink(
                 secret_access_key: secret_key.to_string(),
                 session_token: None,
                 endpoint,
-                target_format: broker_connectors::s3_tables::S3TablesFormat::NdjsonCompressed,
+                target_format:
+                    broker_connectors_enterprise::s3_tables::S3TablesFormat::NdjsonCompressed,
                 partition_spec: Vec::new(),
                 batch_size: Some(1),
                 buffer_capacity: None,
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::s3_tables::HttpS3TablesTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::s3_tables::HttpS3TablesTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::s3_tables::S3TablesSink::new(config, transport)
+                if let Ok(sink) =
+                    broker_connectors_enterprise::s3_tables::S3TablesSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -2975,7 +3219,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::kinesis::KinesisSinkConfig {
+            let config = broker_connectors_enterprise::kinesis::KinesisSinkConfig {
                 stream_name: stream.to_string(),
                 region: region.to_string(),
                 endpoint,
@@ -2992,12 +3236,14 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::kinesis::HttpKinesisTransport::new(
+            if let Ok(transport) = broker_connectors_enterprise::kinesis::HttpKinesisTransport::new(
                 &config,
                 reqwest::Client::new(),
             ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::kinesis::KinesisSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors_enterprise::kinesis::KinesisSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3039,14 +3285,14 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::dynamodb::DynamoDbSinkConfig {
+            let config = broker_connectors_enterprise::dynamodb::DynamoDbSinkConfig {
                 table_name: table.to_string(),
                 region: region.to_string(),
                 endpoint,
                 access_key_id: access_key.to_string(),
                 secret_access_key: secret_key.to_string(),
                 session_token: None,
-                partition_key: broker_connectors::dynamodb::DynamoKeyConfig {
+                partition_key: broker_connectors_enterprise::dynamodb::DynamoKeyConfig {
                     name: partition_key_name.to_string(),
                     template: "${timestamp}".to_string(),
                     key_type: "S".to_string(),
@@ -3063,12 +3309,12 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::dynamodb::HttpDynamoDbTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::dynamodb::SdkDynamoDbTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::dynamodb::DynamoDbSink::new(config, transport)
+                if let Ok(sink) =
+                    broker_connectors_enterprise::dynamodb::DynamoDbSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -3117,7 +3363,7 @@ async fn register_live_sink(
             let mut measures = std::collections::HashMap::new();
             measures.insert("temperature".to_string(), "DOUBLE".to_string());
 
-            let config = broker_connectors::timestream::TimestreamSinkConfig {
+            let config = broker_connectors_enterprise::timestream::TimestreamSinkConfig {
                 database_name: database.to_string(),
                 table_name: table.to_string(),
                 region: region.to_string(),
@@ -3125,7 +3371,8 @@ async fn register_live_sink(
                 access_key_id: access_key.to_string(),
                 secret_access_key: secret_key.to_string(),
                 session_token: None,
-                time_unit: broker_connectors::timestream::TimestreamTimeUnit::Milliseconds,
+                time_unit:
+                    broker_connectors_enterprise::timestream::TimestreamTimeUnit::Milliseconds,
                 measure_name_template: Some("${topic}".to_string()),
                 dimensions,
                 multi_measure_mappings: measures,
@@ -3137,13 +3384,15 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::timestream::HttpTimestreamTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::timestream::HttpTimestreamTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
-                    broker_connectors::timestream::TimestreamSink::new(config, transport)
+                    broker_connectors_enterprise::timestream::TimestreamSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -3191,7 +3440,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::redshift::RedshiftSinkConfig {
+            let config = broker_connectors_enterprise::redshift::RedshiftSinkConfig {
                 database: database.to_string(),
                 table_template: table.to_string(),
                 cluster_identifier: None,
@@ -3211,12 +3460,15 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::redshift::HttpRedshiftTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::redshift::HttpRedshiftTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::redshift::RedshiftSink::new(config, transport)
+                if let Ok(sink) =
+                    broker_connectors_enterprise::redshift::RedshiftSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -3274,19 +3526,20 @@ async fn register_live_sink(
             let connect_timeout_ms = body.get("connect_timeout_ms").and_then(|v| v.as_u64());
             let handshake_timeout_ms = body.get("handshake_timeout_ms").and_then(|v| v.as_u64());
 
-            let config = broker_connectors::aws_iot::AwsIotConfig {
+            let config = broker_connectors_enterprise::aws_iot::AwsIotConfig {
                 endpoint: endpoint.to_string(),
                 region: region.to_string(),
                 client_id: client_id.to_string(),
-                auth: broker_connectors::aws_iot::AwsIotAuth::Mtls {
+                auth: broker_connectors_enterprise::aws_iot::AwsIotAuth::Mtls {
                     ca_cert_pem,
                     client_cert_pem,
                     client_key_pem,
                 },
-                topic_mappings: vec![broker_connectors::aws_iot::BridgeTopicMapping {
+                topic_mappings: vec![broker_connectors_enterprise::aws_iot::BridgeTopicMapping {
                     local_topic: "#".to_string(),
                     remote_topic: "aws/telemetry/${client_id}".to_string(),
-                    direction: broker_connectors::aws_iot::BridgeDirection::LocalToRemote,
+                    direction:
+                        broker_connectors_enterprise::aws_iot::BridgeDirection::LocalToRemote,
                 }],
                 shadow_sync: None,
                 buffer_capacity: None,
@@ -3299,9 +3552,13 @@ async fn register_live_sink(
                 ca_bundle_pem,
                 alpn_protocols: None,
             };
-            if let Ok(transport) = broker_connectors::aws_iot::TlsAwsIotTransport::new(&config) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::aws_iot::TlsAwsIotTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::aws_iot::AwsIotSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors_enterprise::aws_iot::AwsIotSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3340,7 +3597,7 @@ async fn register_live_sink(
             let auth = body
                 .get("auth")
                 .and_then(|v| {
-                    serde_json::from_value::<broker_connectors::azure_blob::AzureBlobAuth>(
+                    serde_json::from_value::<broker_connectors_enterprise::azure_blob::AzureBlobAuth>(
                         v.clone(),
                     )
                     .ok()
@@ -3350,7 +3607,7 @@ async fn register_live_sink(
                         .or_else(|| body.get("accountKey"))
                         .and_then(|v| v.as_str())
                         .map(
-                            |s| broker_connectors::azure_blob::AzureBlobAuth::SharedKey {
+                            |s| broker_connectors_enterprise::azure_blob::AzureBlobAuth::SharedKey {
                                 account_key: s.to_string(),
                             },
                         )
@@ -3361,7 +3618,7 @@ async fn register_live_sink(
                             .or_else(|| o.get("accountKey"))
                             .and_then(|v| v.as_str())
                             .map(
-                                |s| broker_connectors::azure_blob::AzureBlobAuth::SharedKey {
+                                |s| broker_connectors_enterprise::azure_blob::AzureBlobAuth::SharedKey {
                                     account_key: s.to_string(),
                                 },
                             )
@@ -3371,7 +3628,7 @@ async fn register_live_sink(
                     body.get("sas_token")
                         .or_else(|| body.get("sas"))
                         .and_then(|v| v.as_str())
-                        .map(|s| broker_connectors::azure_blob::AzureBlobAuth::SasToken {
+                        .map(|s| broker_connectors_enterprise::azure_blob::AzureBlobAuth::SasToken {
                             sas_token: s.to_string(),
                         })
                         .or_else(|| {
@@ -3380,7 +3637,7 @@ async fn register_live_sink(
                                     .or_else(|| o.get("sas"))
                                     .and_then(|v| v.as_str())
                                     .map(|s| {
-                                        broker_connectors::azure_blob::AzureBlobAuth::SasToken {
+                                        broker_connectors_enterprise::azure_blob::AzureBlobAuth::SasToken {
                                             sas_token: s.to_string(),
                                         }
                                     })
@@ -3392,7 +3649,7 @@ async fn register_live_sink(
                         .or_else(|| body.get("bearer_token"))
                         .and_then(|v| v.as_str())
                         .map(
-                            |s| broker_connectors::azure_blob::AzureBlobAuth::BearerToken {
+                            |s| broker_connectors_enterprise::azure_blob::AzureBlobAuth::BearerToken {
                                 token: s.to_string(),
                             },
                         )
@@ -3402,7 +3659,7 @@ async fn register_live_sink(
                                     .or_else(|| o.get("bearer_token"))
                                     .and_then(|v| v.as_str())
                                     .map(|s| {
-                                        broker_connectors::azure_blob::AzureBlobAuth::BearerToken {
+                                        broker_connectors_enterprise::azure_blob::AzureBlobAuth::BearerToken {
                                             token: s.to_string(),
                                         }
                                     })
@@ -3413,26 +3670,28 @@ async fn register_live_sink(
                 return;
             };
 
-            let config = broker_connectors::azure_blob::AzureBlobSinkConfig {
+            let config = broker_connectors_enterprise::azure_blob::AzureBlobSinkConfig {
                 account_name: account_name.to_string(),
                 container_name: container_name.to_string(),
                 endpoint,
                 auth,
                 blob_path_template: blob_path.to_string(),
-                compression: broker_connectors::azure_blob::AzureBlobCompression::None,
+                compression: broker_connectors_enterprise::azure_blob::AzureBlobCompression::None,
                 max_records_per_blob: Some(1),
                 max_bytes_per_blob: Some(1_048_576),
                 flush_interval_secs: 1,
                 buffer_capacity: None,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::azure_blob::HttpAzureBlobTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::azure_blob::HttpAzureBlobTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
-                    broker_connectors::azure_blob::AzureBlobSink::new(config, transport)
+                    broker_connectors_enterprise::azure_blob::AzureBlobSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -3480,7 +3739,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::azure_eventhubs::AzureEventHubsSinkConfig {
+            let config = broker_connectors_enterprise::azure_eventhubs::AzureEventHubsSinkConfig {
                 namespace: namespace.to_string(),
                 event_hub: event_hub.to_string(),
                 endpoint,
@@ -3498,14 +3757,16 @@ async fn register_live_sink(
                 timeout_ms,
             };
             if let Ok(transport) =
-                broker_connectors::azure_eventhubs::HttpAzureEventHubsTransport::new(
+                broker_connectors_enterprise::azure_eventhubs::HttpAzureEventHubsTransport::new(
                     &config,
                     reqwest::Client::new(),
                 )
             {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
-                    broker_connectors::azure_eventhubs::AzureEventHubsSink::new(config, transport)
+                    broker_connectors_enterprise::azure_eventhubs::AzureEventHubsSink::new(
+                        config, transport,
+                    )
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -3598,11 +3859,11 @@ async fn register_live_sink(
                 .or_else(|| body.get("token_ttl_secs"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::azure_iot::AzureIotConfig {
+            let config = broker_connectors_enterprise::azure_iot::AzureIotConfig {
                 iot_hub_name: hub_name.to_string(),
                 device_id: device_id.to_string(),
                 module_id,
-                auth: broker_connectors::azure_iot::AzureIotAuth::SharedAccessKey {
+                auth: broker_connectors_enterprise::azure_iot::AzureIotAuth::SharedAccessKey {
                     key: shared_access_key.to_string(),
                     key_name: Some(key_name),
                 },
@@ -3619,10 +3880,12 @@ async fn register_live_sink(
                 ca_bundle_pem,
                 sas_ttl_secs,
             };
-            if let Ok(transport) = broker_connectors::azure_iot::TlsAzureIotTransport::new(&config)
+            if let Ok(transport) =
+                broker_connectors_enterprise::azure_iot::TlsAzureIotTransport::new(&config)
             {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::azure_iot::AzureIotSink::new(config, transport)
+                if let Ok(sink) =
+                    broker_connectors_enterprise::azure_iot::AzureIotSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -3656,11 +3919,11 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::gcp_pubsub::GcpPubSubSinkConfig {
+            let config = broker_connectors_enterprise::gcp_pubsub::GcpPubSubSinkConfig {
                 project_id: project_id.to_string(),
                 topic_id: topic_id.to_string(),
                 endpoint,
-                auth: broker_connectors::gcp_pubsub::GcpAuth::None,
+                auth: broker_connectors_enterprise::gcp_pubsub::GcpAuth::None,
                 ordering_key_template: None,
                 attributes: std::collections::HashMap::new(),
                 batch_size: Some(1),
@@ -3671,13 +3934,12 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::gcp_pubsub::HttpGcpPubSubTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::gcp_pubsub::SdkGcpPubSubTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
-                    broker_connectors::gcp_pubsub::GcpPubSubSink::new(config, transport)
+                    broker_connectors_enterprise::gcp_pubsub::GcpPubSubSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -3755,12 +4017,12 @@ async fn register_live_sink(
                 .and_then(|v| v.as_u64())
                 .or(Some(2_000));
 
-            let config = broker_connectors::bigquery::BigQuerySinkConfig {
+            let config = broker_connectors_enterprise::bigquery::BigQuerySinkConfig {
                 project_id: project_id.to_string(),
                 dataset_id: dataset_id.to_string(),
                 table_template: table.to_string(),
                 endpoint,
-                auth: broker_connectors::gcp_pubsub::GcpAuth::None,
+                auth: broker_connectors_enterprise::gcp_pubsub::GcpAuth::None,
                 ignore_unknown_values,
                 skip_invalid_rows,
                 template_suffix,
@@ -3772,12 +4034,13 @@ async fn register_live_sink(
                 max_backoff_ms,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::bigquery::SdkBigQueryTransport::new(
+            if let Ok(transport) = broker_connectors_enterprise::bigquery::SdkBigQueryTransport::new(
                 &config,
                 reqwest::Client::new(),
             ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::bigquery::BigQuerySink::new(config, transport)
+                if let Ok(sink) =
+                    broker_connectors_enterprise::bigquery::BigQuerySink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -3844,13 +4107,23 @@ async fn register_live_sink(
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
+            // The operator's extra CA bundle rides the same path the
+            // stored connector body keeps: without it a private-CA
+            // bridge fails closed at TLS verification.
+            let ca_bundle_pem = body
+                .get("ca_bundle_pem")
+                .or_else(|| body.get("ca_bundle"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             let algorithm = match body.get("algorithm").and_then(|v| v.as_str()) {
-                Some("ES256") | Some("es256") => broker_connectors::gcp_iot::GcpIotAlgorithm::Es256,
-                _ => broker_connectors::gcp_iot::GcpIotAlgorithm::Rs256,
+                Some("ES256") | Some("es256") => {
+                    broker_connectors_enterprise::gcp_iot::GcpIotAlgorithm::Es256
+                }
+                _ => broker_connectors_enterprise::gcp_iot::GcpIotAlgorithm::Rs256,
             };
 
-            let config = broker_connectors::gcp_iot::GcpIotConfig {
+            let config = broker_connectors_enterprise::gcp_iot::GcpIotConfig {
                 project_id: project_id.to_string(),
                 cloud_region: cloud_region.to_string(),
                 registry_id: registry_id.to_string(),
@@ -3864,10 +4137,15 @@ async fn register_live_sink(
                 linger_ms: Some(10),
                 max_retries: Some(3),
                 timeout_ms,
+                ca_bundle_pem,
             };
-            if let Ok(transport) = broker_connectors::gcp_iot::TcpGcpIotTransport::new(endpoint) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::gcp_iot::TlsGcpIotTransport::new(&config)
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::gcp_iot::GcpIotSink::new(config, transport) {
+                if let Ok(sink) =
+                    broker_connectors_enterprise::gcp_iot::GcpIotSink::new(config, transport)
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3927,7 +4205,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::databricks::DatabricksSinkConfig {
+            let config = broker_connectors_enterprise::databricks::DatabricksSinkConfig {
                 host: host.to_string(),
                 token: token.to_string(),
                 catalog: catalog.to_string(),
@@ -3944,13 +4222,15 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::databricks::HttpDatabricksTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::databricks::HttpDatabricksTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
-                    broker_connectors::databricks::DatabricksSink::new(config, transport)
+                    broker_connectors_enterprise::databricks::DatabricksSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -4022,7 +4302,7 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::snowflake::SnowflakeSinkConfig {
+            let config = broker_connectors_enterprise::snowflake::SnowflakeSinkConfig {
                 account: account.to_string(),
                 user: user.to_string(),
                 database: database.to_string(),
@@ -4041,13 +4321,15 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::snowflake::HttpSnowflakeTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::snowflake::HttpSnowflakeTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
-                    broker_connectors::snowflake::SnowflakeSink::new(config, transport)
+                    broker_connectors_enterprise::snowflake::SnowflakeSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -4109,34 +4391,41 @@ async fn register_live_sink(
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors::tablestore::TablestoreSinkConfig {
+            let config = broker_connectors_enterprise::tablestore::TablestoreSinkConfig {
                 endpoint: endpoint.to_string(),
                 instance_name: instance_name.to_string(),
                 table_name: table_name.to_string(),
                 access_key_id: access_key_id.to_string(),
                 access_key_secret: access_key_secret.to_string(),
-                primary_keys: vec![broker_connectors::tablestore::PrimaryKeyMapping {
-                    name: "device_id".to_string(),
-                    source: "${client_id}".to_string(),
-                    data_type: broker_connectors::tablestore::PrimaryKeyType::String,
-                }],
-                attribute_columns: vec![broker_connectors::tablestore::AttributeColumnMapping {
-                    name: "temperature".to_string(),
-                    source: "${payload.temperature}".to_string(),
-                    data_type: broker_connectors::tablestore::AttributeColumnType::Double,
-                }],
+                primary_keys: vec![
+                    broker_connectors_enterprise::tablestore::PrimaryKeyMapping {
+                        name: "device_id".to_string(),
+                        source: "${client_id}".to_string(),
+                        data_type: broker_connectors_enterprise::tablestore::PrimaryKeyType::String,
+                    },
+                ],
+                attribute_columns: vec![
+                    broker_connectors_enterprise::tablestore::AttributeColumnMapping {
+                        name: "temperature".to_string(),
+                        source: "${payload.temperature}".to_string(),
+                        data_type:
+                            broker_connectors_enterprise::tablestore::AttributeColumnType::Double,
+                    },
+                ],
                 batch_size: Some(1),
                 buffer_capacity: None,
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::tablestore::HttpTablestoreTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::tablestore::HttpTablestoreTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
+            {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
-                    broker_connectors::tablestore::TablestoreSink::new(config, transport)
+                    broker_connectors_enterprise::tablestore::TablestoreSink::new(config, transport)
                 {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -4217,7 +4506,7 @@ async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .unwrap_or("${topic}");
 
-            let config = broker_connectors::oci_streaming::OciStreamingSinkConfig {
+            let config = broker_connectors_enterprise::oci_streaming::OciStreamingSinkConfig {
                 endpoint: endpoint.to_string(),
                 stream_pool_id: stream_pool_id.to_string(),
                 stream_id: stream_id.to_string(),
@@ -4235,14 +4524,16 @@ async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::oci_streaming::HttpOciStreamingTransport::new(
-                &config,
-                reqwest::Client::new(),
-            ) {
+            if let Ok(transport) =
+                broker_connectors_enterprise::oci_streaming::HttpOciStreamingTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
-                    broker_connectors::oci_streaming::OciStreamingSink::new(config, transport)
-                {
+                if let Ok(sink) = broker_connectors_enterprise::oci_streaming::OciStreamingSink::new(
+                    config, transport,
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine

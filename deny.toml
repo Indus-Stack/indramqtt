@@ -10,6 +10,7 @@ targets = [
 version = 2
 allow = [
     "MIT",
+    "MIT-0",
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
@@ -27,6 +28,9 @@ exceptions = [
     { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-core" },
     { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-sql" },
     { allow = ["MIT", "Apache-2.0"], crate = "rekuiper-conf" },
+    # Mozilla root-certificate data. The licence covers the data, puts no
+    # condition on our code, and is scoped to this crate alone.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
     # Keccak hash via the MongoDB driver. CC0-1.0 is a public-domain
     # dedication with no conditions; scoped to this crate alone.
     { allow = ["CC0-1.0"], crate = "tiny-keccak" },

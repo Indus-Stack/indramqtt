@@ -20,12 +20,13 @@ use crate::ApiState;
 
 /// Credentials presented on a management API request.
 ///
-/// The reference specification accepts `Authorization: Bearer <dashboard token>` and
-/// `Authorization: Basic <api_key:api_secret>` on `/api/v5`. Key records
-/// are managed by the `api_keys` store (`crate::v5::api_keys`, W2-25);
-/// Basic enforcement itself is owned elsewhere, so Basic credentials
-/// never resolve here yet. The single [`resolve_credentials`] function
-/// stays the one place that changes when enforcement lands.
+/// The management API accepts `Authorization: Bearer <dashboard token>`
+/// and `Authorization: Bearer <operator API key>` (M1-06: the minimum
+/// backing store in [`crate::api_keys::ApiKeyStore`]), plus
+/// `Authorization: Basic <api_key:api_secret>` on `/api/v5`. Basic
+/// credentials have no store yet and never resolve; the single
+/// [`resolve_credentials`] function stays the one place that changes when
+/// the full key lifecycle lands.
 #[derive(Debug)]
 pub enum Credentials {
     Bearer(String),
@@ -60,14 +61,19 @@ pub fn parse_credentials(headers: &HeaderMap) -> Option<Credentials> {
 
 /// Resolve credentials to an authenticated identity.
 ///
-/// Bearer tokens go through the token store (fresh roles, tokens of
-/// deleted users revoked). Basic API key checks against the key records
-/// (`crate::v5::api_keys::ApiKeyStore::verify`) are owned by the
-/// enforcement lane and always resolve to unknown here. Keep all
-/// credential resolution here so enforcement plugs in later without
-/// touching routes or handlers.
+/// Bearer tokens go through the token store first (fresh roles, tokens of
+/// deleted users revoked); a token that is not a dashboard token is then
+/// checked against the operator API-key store (M1-06 minimum for
+/// `indra ctl`). Basic API keys have no store yet and always resolve to
+/// unknown. Keep all credential resolution here so the full key lifecycle
+/// plugs in later without touching routes or handlers.
 pub fn resolve_credentials(state: &ApiState, headers: &HeaderMap) -> Option<TokenInfo> {
-    authenticated_user(state, headers)
+    match parse_credentials(headers)? {
+        Credentials::Bearer(token) => {
+            authenticated_user(state, headers).or_else(|| state.operator_api_keys.resolve(&token))
+        }
+        Credentials::Basic { .. } => None,
+    }
 }
 
 fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {

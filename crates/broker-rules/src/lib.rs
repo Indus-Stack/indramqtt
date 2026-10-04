@@ -1,3 +1,5 @@
+#![allow(future_incompatible)]
+
 use async_trait::async_trait;
 use broker_connectors::ConnectorManager;
 use broker_protocol::{QoS, Topic, TopicFilter};
@@ -703,6 +705,14 @@ struct ThrottleEntry {
 /// window; later failures inside the window are only counted.
 const FORWARD_FAILURE_LOG_WINDOW_MS: u64 = 10_000;
 
+/// Wall-clock milliseconds.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Returns `Some(suppressed)` when the caller must log (first failure, or
 /// the window elapsed since the previous line), `None` when the failure
 /// must only be counted.
@@ -790,6 +800,9 @@ pub struct RuleEngine {
     input: Arc<BoundedEventInput>,
     connectors: Arc<ConnectorManager>,
     flush_ctx: Arc<FlushContext>,
+    /// The window executor of the enterprise crate, if one is installed.
+    /// The kernel installs it at boot.
+    window_executor: RwLock<Option<Arc<dyn WindowExecutor>>>,
     /// Lock-free snapshot of disabled action ids (W3-04, C06-07): the
     /// management plane swaps the whole set on every action
     /// create/update/delete/enable, and the publish path loads one `Arc`
@@ -1026,14 +1039,6 @@ impl runtime::RuleOutputSink for BrokerRuleSink {
 /// [`runtime::RULE_TASK_FEED_DEPTH`]: the rule-task feed bound.
 pub const DEFAULT_WINDOW_CHANNEL_DEPTH: usize = 65_536;
 
-/// Wall-clock milliseconds.
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// True for system-message topics (`$SYS` and `$SYS/...`), which the rule
 /// engine skips while `ignore_sys_message` holds (W3-10). Pure prefix test
 /// on the topic string: no lock, no allocation.
@@ -1056,13 +1061,34 @@ fn window_length_ms(unit: &TimeUnit, length: u64) -> u64 {
     length.saturating_mul(per_unit).max(1)
 }
 
+/// Seam for enterprise windowed execution, implemented outside this
+/// crate so the community rule path carries no dependency edge to the
+/// window workers. The kernel installs the enterprise implementation at
+/// boot; every method is a no-op-safe delegation point owned by the
+/// engine's rule lifecycle (create, remove, snapshot seed, ingress).
+pub trait WindowExecutor: Send + Sync {
+    /// Route one matching record into this rule's window worker.
+    fn route_record(&self, rule: &Rule, topic: &Topic, payload: &Bytes);
+    /// Ensure a background worker exists for an Enterprise window rule.
+    fn ensure_worker(&self, rule: &Rule);
+    /// Abort the worker for one rule id, if any.
+    fn remove_worker(&self, rule_id: &str);
+    /// Abort every worker (snapshot replace path).
+    fn abort_all(&self);
+    /// Live window worker count (observability/testing hook).
+    fn worker_count(&self) -> usize;
+}
+
 impl RuleEngine {
     /// Create an engine with a bounded ingress queue (`capacity` floors at
     /// 1). The queue backs future async ingestion; the hot path calls
     /// [`RuleEngine::dispatch_ingress`] synchronously for determinism.
     /// Rule-task feed channels use [`DEFAULT_WINDOW_CHANNEL_DEPTH`].
     pub fn new(queue_capacity: usize, policy: BackpressurePolicy) -> Self {
-        Self::new_with_window_depth(queue_capacity, policy, DEFAULT_WINDOW_CHANNEL_DEPTH)
+        Self::with_input(
+            BoundedEventInput::new(queue_capacity, policy),
+            DEFAULT_WINDOW_CHANNEL_DEPTH,
+        )
     }
 
     /// Create an engine whose ingress queue spills to disk under
@@ -1120,6 +1146,7 @@ impl RuleEngine {
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
+            window_executor: RwLock::new(None),
             runtime_feed_dropped: AtomicU64::new(0),
             window_channel_depth: window_channel_depth.max(1),
             forward_throttle,
@@ -1168,6 +1195,7 @@ impl RuleEngine {
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
+            window_executor: RwLock::new(None),
             runtime_feed_dropped: AtomicU64::new(0),
             window_channel_depth: window_channel_depth.max(1),
             forward_throttle,
@@ -1279,6 +1307,55 @@ impl RuleEngine {
             .read()
             .get(id)
             .map(|task| task.feed_tx.max_capacity())
+    }
+
+    /// Install the enterprise window executor (the kernel does this at
+    /// boot before any rule is created). Replaces any previous one.
+    pub fn set_window_executor(&self, executor: Arc<dyn WindowExecutor>) {
+        *self.window_executor.write() = Some(executor);
+    }
+
+    /// Live window worker count (observability/testing hook). Zero when
+    /// no executor is installed.
+    pub fn window_worker_count(&self) -> usize {
+        self.window_executor
+            .read()
+            .as_ref()
+            .map(|executor| executor.worker_count())
+            .unwrap_or(0)
+    }
+
+    /// Dispatch one flushed window aggregate row through this rule's
+    /// actions. Called by the window executor per result row: the rule is
+    /// resolved here (a rule removed mid-flush drops its late rows with a
+    /// warning), delivery QoS is capped at [`QoS::ExactlyOnce`] so the
+    /// action QoS applies verbatim, and counters, connectors, throttle
+    /// and sink are the engine's own, exactly as on the inline path.
+    pub async fn dispatch_window_row(&self, rule_id: &str, topic: &Topic, payload: Bytes) {
+        let Some(rule) = self.get_rule(rule_id) else {
+            tracing::warn!(
+                rule_id = %rule_id,
+                "window row dropped: rule no longer exists"
+            );
+            return;
+        };
+        let sink = self.broker_sink();
+        let disabled = self.flush_ctx.action_disabled.load_full();
+        let action_metrics = self.flush_ctx.action_metrics.load_full();
+        run_actions(
+            rule_id,
+            &rule.actions,
+            topic,
+            payload,
+            QoS::ExactlyOnce,
+            &self.connectors,
+            sink.as_ref(),
+            &ActionCounters::from_rule(&rule),
+            &self.forward_throttle,
+            &disabled,
+            &action_metrics,
+        )
+        .await;
     }
 
     /// Build and store a rule, assigning its id (`rule-<n>`).
@@ -1492,6 +1569,19 @@ impl RuleEngine {
         self.seed_from_snapshot(&registry.snapshot().rules)?;
         *self.registry.write() = Some(Arc::clone(registry));
         Ok(())
+    }
+
+    /// Replace all rules with one validated snapshot root (M1-05 runtime
+    /// apply path for the `rules` root).
+    ///
+    /// Runs the same validated create path as boot; driven afterwards by
+    /// publish ingress (each ingress evaluates this store). Window workers
+    /// of replaced rules are aborted so no orphan task survives.
+    pub fn apply_snapshot_conf(
+        &self,
+        conf: &broker_config::RulesConf,
+    ) -> Result<(), RuleEngineError> {
+        self.seed_from_snapshot(conf)
     }
 
     /// Replace all rules with the snapshot contents through the validated
@@ -2937,7 +3027,7 @@ async fn flush_rule_window(
 /// first record instead of stale/empty state from another thread. Without
 /// the guard the window path would evaluate with whatever context the
 /// flushing thread last saw.
-fn aggregate_partitioned(
+pub fn aggregate_partitioned(
     stmt: &SelectStmt,
     records: Vec<(Topic, HashMap<String, serde_json::Value>)>,
     rule_id: &str,
@@ -3992,6 +4082,73 @@ fn apply_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn ingress(
+        engine: &RuleEngine,
+        sink: &Arc<dyn BrokerSink>,
+        payload: &'static [u8],
+    ) -> usize {
+        engine
+            .dispatch_ingress(
+                &Topic::new("sensors/kitchen").unwrap(),
+                &Bytes::from_static(payload),
+                QoS::AtMostOnce,
+                sink,
+            )
+            .await
+    }
+
+    fn published_rows(sink: &RecordingSink) -> Vec<serde_json::Value> {
+        sink.published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, payload, _, _)| serde_json::from_slice(payload).expect("row is JSON"))
+            .collect()
+    }
+
+    /// Build an engine with one rule; returns engine, sink handle, and
+    /// the stored rule (for tier assertions). Mirrors production wiring:
+    /// the same sink serves inline dispatch and window flushes.
+    fn window_rule(
+        sql: Option<&str>,
+        actions: Vec<RuleAction>,
+    ) -> (RuleEngine, Arc<RecordingSink>, Arc<dyn BrokerSink>, Rule) {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let rule = engine
+            .create_rule(
+                "window-probe".to_string(),
+                TopicFilter::new("sensors/+").unwrap(),
+                sql.map(str::to_string),
+                true,
+                actions,
+            )
+            .expect("rule creates");
+        let sink = Arc::new(RecordingSink::default());
+        let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+        engine.set_broker_sink(sink_obj.clone());
+        (engine, sink, sink_obj, rule)
+    }
+
+    fn republish_action() -> Vec<RuleAction> {
+        vec![RuleAction::Republish {
+            topic: Topic::new("alerts/agg").unwrap(),
+            qos: QoS::AtMostOnce,
+        }]
+    }
+
+    async fn wait_rows(sink: &Arc<RecordingSink>, n: usize) {
+        for _ in 0..60 {
+            if sink.published.lock().unwrap().len() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "timed out waiting for {n} rows (got {})",
+            sink.published.lock().unwrap().len()
+        );
+    }
     use std::sync::Mutex as StdMutex;
 
     struct MockInput {
@@ -5133,73 +5290,6 @@ mod tests {
     // INDRA-211/212/213: tiering, window workers, aggregations, flush.
     // ------------------------------------------------------------------
 
-    /// Build an engine with one rule; returns engine, sink handle, and
-    /// the stored rule (for tier assertions). Mirrors production wiring:
-    /// the same sink serves inline dispatch and window flushes.
-    fn window_rule(
-        sql: Option<&str>,
-        actions: Vec<RuleAction>,
-    ) -> (RuleEngine, Arc<RecordingSink>, Arc<dyn BrokerSink>, Rule) {
-        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
-        let rule = engine
-            .create_rule(
-                "window-probe".to_string(),
-                TopicFilter::new("sensors/+").unwrap(),
-                sql.map(str::to_string),
-                true,
-                actions,
-            )
-            .expect("rule creates");
-        let sink = Arc::new(RecordingSink::default());
-        let sink_obj: Arc<dyn BrokerSink> = sink.clone();
-        engine.set_broker_sink(sink_obj.clone());
-        (engine, sink, sink_obj, rule)
-    }
-
-    async fn ingress(
-        engine: &RuleEngine,
-        sink: &Arc<dyn BrokerSink>,
-        payload: &'static [u8],
-    ) -> usize {
-        engine
-            .dispatch_ingress(
-                &Topic::new("sensors/kitchen").unwrap(),
-                &Bytes::from_static(payload),
-                QoS::AtMostOnce,
-                sink,
-            )
-            .await
-    }
-
-    fn published_rows(sink: &RecordingSink) -> Vec<serde_json::Value> {
-        sink.published
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, payload, _, _)| serde_json::from_slice(payload).expect("row is JSON"))
-            .collect()
-    }
-
-    async fn wait_rows(sink: &Arc<RecordingSink>, n: usize) {
-        for _ in 0..60 {
-            if sink.published.lock().unwrap().len() >= n {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        panic!(
-            "timed out waiting for {n} rows (got {})",
-            sink.published.lock().unwrap().len()
-        );
-    }
-
-    fn republish_action() -> Vec<RuleAction> {
-        vec![RuleAction::Republish {
-            topic: Topic::new("alerts/agg").unwrap(),
-            qos: QoS::AtMostOnce,
-        }]
-    }
-
     #[test]
     fn test_tier_classification() {
         let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
@@ -5962,21 +6052,26 @@ mod tests {
         );
         engine.connectors().register("mysql-an", mysql.clone());
 
-        // ClickHouse (axum fake).
-        let ch_body = Arc::new(parking_lot::Mutex::new(String::new()));
-        let ch_port = serve_capture("/", ch_body.clone()).await;
+        // ClickHouse (mock driver transport, offline).
+        let ch_transport = Arc::new(broker_connectors::MockClickHouseTransport::new(
+            "indra",
+            "mqtt_events",
+            "JSONEachRow",
+        ));
         let clickhouse = Arc::new(
             ClickHouseSink::new(
                 ClickHouseSinkConfig {
-                    endpoint: format!("http://127.0.0.1:{ch_port}"),
+                    endpoint: "http://127.0.0.1:8123".to_string(),
                     database: "indra".to_string(),
                     table: "mqtt_events".to_string(),
                     format: "JSONEachRow".to_string(),
                     batch_size: 100,
                     batch_timeout_ms: 100,
+                    username: "default".to_string(),
+                    password: String::new(),
                     request_timeout_ms: None,
                 },
-                reqwest::Client::new(),
+                ch_transport.clone(),
             )
             .expect("valid sink"),
         );
@@ -6067,11 +6162,11 @@ mod tests {
             projected
         );
 
-        let ch_lines: Vec<String> = ch_body.lock().lines().map(str::to_string).collect();
-        assert_eq!(ch_lines.len(), 1);
-        let ch_row: serde_json::Value = serde_json::from_str(&ch_lines[0]).unwrap();
-        assert_eq!(ch_row["topic"], "sensors/kitchen");
-        assert_eq!(ch_row["payload"], projected.to_string());
+        let ch_captured = ch_transport.captured();
+        assert_eq!(ch_captured.len(), 1);
+        assert_eq!(ch_captured[0].rows.len(), 1);
+        assert_eq!(ch_captured[0].rows[0].topic, "sensors/kitchen");
+        assert_eq!(ch_captured[0].rows[0].payload, projected.to_string());
 
         let influx_lines: Vec<String> = influx_body.lock().lines().map(str::to_string).collect();
         assert_eq!(influx_lines.len(), 1);
@@ -6098,200 +6193,8 @@ mod tests {
         assert_eq!(kafka_transport.records_flat().len(), 1);
         assert_eq!(redis_transport.commands().len(), 1);
         assert_eq!(mysql_transport.batches().len(), 1);
-        assert_eq!(ch_body.lock().lines().count(), 1);
+        assert_eq!(ch_transport.captured().len(), 1);
         assert_eq!(influx_body.lock().lines().count(), 1);
-    }
-
-    /// Sprint 18 e2e (INDRA-216): streaming SQL rules with `INTO
-    /// connector(...)` fan out to the object-storage and search sinks.
-    /// A stateless cold-storage rule feeds mock S3, a stateless log
-    /// rule feeds mock Elasticsearch, and a count-window metrics rule
-    /// feeds the mock TimescaleDB hypertable. No broker anywhere.
-    #[tokio::test]
-    async fn test_into_fans_out_to_s3_elasticsearch_timescaledb() {
-        use broker_connectors::{
-            ElasticsearchSink, ElasticsearchSinkConfig, MockElasticsearchTransport,
-            MockS3Transport, MockTimescaleTransport, S3Sink, S3SinkConfig, TimescaleDbSink,
-            TimescaleDbSinkConfig,
-        };
-
-        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
-
-        // S3 cold storage (auto-flush every row).
-        let s3_transport = Arc::new(MockS3Transport::new());
-        let s3 = Arc::new(
-            S3Sink::new(
-                S3SinkConfig {
-                    endpoint: "http://127.0.0.1:9000".to_string(),
-                    bucket: "telemetry-cold-store".to_string(),
-                    region: "us-east-1".to_string(),
-                    access_key_id: String::new(),
-                    secret_access_key: String::new(),
-                    key_template:
-                        "telemetry/year=${YYYY}/month=${MM}/day=${DD}/${topic}_${seq}.ndjson"
-                            .to_string(),
-                    compression: broker_connectors::S3Compression::None,
-                    batch_size: 1,
-                    batch_bytes: 5 * 1024 * 1024,
-                    batch_timeout_ms: 60_000,
-                    timeout_ms: None,
-                },
-                s3_transport.clone(),
-            )
-            .expect("valid sink"),
-        );
-        engine
-            .connectors()
-            .register("s3-telemetry-archive", s3.clone());
-
-        // Elasticsearch log search (auto-flush every row).
-        let es_transport = Arc::new(MockElasticsearchTransport::new());
-        let es = Arc::new(
-            ElasticsearchSink::new(
-                ElasticsearchSinkConfig {
-                    endpoint: "http://127.0.0.1:9200".to_string(),
-                    index_template: "iot-telemetry-${YYYY.MM.dd}".to_string(),
-                    doc_id_template: None,
-                    auth: broker_connectors::ElasticsearchAuth::None,
-                    batch_size: 1,
-                    batch_timeout_ms: 100,
-                    max_retries: 3,
-                    request_timeout_ms: None,
-                },
-                es_transport.clone(),
-            )
-            .expect("valid sink"),
-        );
-        engine.connectors().register("es-cluster", es.clone());
-
-        // TimescaleDB metrics hypertable (auto-flush every row).
-        let ts_transport = Arc::new(MockTimescaleTransport::new());
-        let ts = Arc::new(
-            TimescaleDbSink::new(
-                TimescaleDbSinkConfig {
-                    connection_url: "postgresql://u:p@unused:5432/timeseries".to_string(),
-                    hypertable: "sensor_metrics".to_string(),
-                    time_column: "time".to_string(),
-                    sql_template: "INSERT INTO sensor_metrics (time, device_id, topic, metrics) \
-                         VALUES ($1, $2, $3, $4::jsonb) \
-                         ON CONFLICT (time, device_id) DO UPDATE SET metrics = EXCLUDED.metrics"
-                        .to_string(),
-                    pool_size: 1,
-                    batch_size: 1,
-                    batch_timeout_ms: 50,
-                },
-                ts_transport.clone(),
-            )
-            .expect("valid sink"),
-        );
-        engine
-            .connectors()
-            .register("timescale-metrics", ts.clone());
-
-        // One INTO rule per sink, mirroring the directive's SQL shapes
-        // (count windows keep the test fast; tumbling time windows use
-        // the same dispatch path).
-        for (id, sql) in [
-            (
-                "cold-store",
-                r#"SELECT * FROM "sensors/#" INTO connector("s3-telemetry-archive")"#,
-            ),
-            (
-                "log-search",
-                r#"SELECT device_id, message FROM "logs/+" INTO connector("es-cluster")"#,
-            ),
-            (
-                "metrics",
-                r#"SELECT avg(temp) AS avg_temp FROM "sensors/+" GROUP BY COUNTWINDOW(2) INTO connector("timescale-metrics")"#,
-            ),
-        ] {
-            engine
-                .create_rule(
-                    id.to_string(),
-                    TopicFilter::new(if id == "log-search" {
-                        "logs/+"
-                    } else {
-                        "sensors/+"
-                    })
-                    .unwrap(),
-                    Some(sql.to_string()),
-                    true,
-                    vec![],
-                )
-                .expect("rule creates");
-        }
-
-        let sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
-        // Two sensor rows close one count window; one log row feeds ES.
-        for payload in [
-            &br#"{ "device_id": "d7", "temp": 20.0 }"#[..],
-            &br#"{ "device_id": "d7", "temp": 22.0 }"#[..],
-        ] {
-            engine
-                .dispatch_ingress(
-                    &Topic::new("sensors/kitchen").unwrap(),
-                    &Bytes::from_static(payload),
-                    QoS::AtMostOnce,
-                    &sink,
-                )
-                .await;
-        }
-        engine
-            .dispatch_ingress(
-                &Topic::new("logs/app").unwrap(),
-                &Bytes::from_static(br#"{ "device_id": "d7", "message": "ok" }"#),
-                QoS::AtMostOnce,
-                &sink,
-            )
-            .await;
-
-        // S3 + ES flushed inline (batch_size 1); the window flush
-        // arrives in the background.
-        for _ in 0..200 {
-            if !ts_transport.batches().is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        // S3: two partitioned ndjson objects with full projected rows.
-        let puts = s3_transport.puts();
-        assert_eq!(puts.len(), 2);
-        assert!(puts[0].key.starts_with("telemetry/year="));
-        assert!(puts[0].key.contains("sensors/kitchen"));
-        assert!(puts[0].key.ends_with(".ndjson"));
-        let row: serde_json::Value =
-            serde_json::from_str(String::from_utf8(puts[0].body.clone()).unwrap().trim_end())
-                .unwrap();
-        assert_eq!(row["topic"], "sensors/kitchen");
-        assert_eq!(row["payload"]["temp"], 20.0);
-
-        // Elasticsearch: one _bulk with the projected log document.
-        let captured = es_transport.captured();
-        assert_eq!(captured.len(), 1);
-        let body = String::from_utf8(captured[0].body.clone()).unwrap();
-        assert!(body.ends_with('\n'));
-        let mut body_lines = body.lines();
-        let action: serde_json::Value = serde_json::from_str(body_lines.next().unwrap()).unwrap();
-        assert!(action["index"]["_index"]
-            .as_str()
-            .unwrap()
-            .starts_with("iot-telemetry-"));
-        let doc: serde_json::Value = serde_json::from_str(body_lines.next().unwrap()).unwrap();
-        assert!(body_lines.next().is_none());
-        assert_eq!(doc["topic"], "logs/app");
-        assert_eq!(doc["payload"]["message"], "ok");
-        assert!(doc["payload"].get("temp").is_none());
-
-        // TimescaleDB: one window row (avg 21.0); no device_id in the
-        // projection, so the topic backs the device column.
-        let batches = ts_transport.batches();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].rows.len(), 1);
-        assert_eq!(batches[0].rows[0][1], b"sensors/kitchen".to_vec());
-        assert_eq!(batches[0].rows[0][2], b"sensors/kitchen".to_vec());
-        let metrics: serde_json::Value = serde_json::from_slice(&batches[0].rows[0][3]).unwrap();
-        assert_eq!(metrics, serde_json::json!({"avg_temp": 21.0}));
     }
 
     /// Industrial e2e (INDRA-217): one Sparkplug telemetry ingress
@@ -6302,8 +6205,10 @@ mod tests {
     async fn test_into_fans_out_to_industrial_sinks() {
         use broker_connectors::{
             DiskLogSink, DiskLogSinkConfig, HttpSink, HttpSinkConfig, MemoryDiskLogWriter,
-            MemoryMqttBridgeTransport, MemorySparkplugTransport, MockHttpTransport, MqttBridgeSink,
-            MqttBridgeSinkConfig, SparkplugBSink, SparkplugSinkConfig,
+            MemoryMqttBridgeTransport, MockHttpTransport, MqttBridgeSink, MqttBridgeSinkConfig,
+        };
+        use broker_connectors_enterprise::{
+            MemorySparkplugTransport, SparkplugBSink, SparkplugSinkConfig,
         };
 
         let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
@@ -6326,6 +6231,7 @@ mod tests {
                     max_retries: Some(3),
                     initial_backoff_ms: Some(1),
                     max_backoff_ms: Some(2),
+                    buffer_capacity: Some(10_000),
                 },
                 hook_transport.clone(),
             )
@@ -6484,15 +6390,15 @@ mod tests {
         let frames = spb_transport.frames();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].topic, "spBv1.0/plant1/DDATA/edge7/plc3");
-        let back = broker_connectors::decode_payload(&frames[0].payload).unwrap();
-        let metrics: HashMap<String, broker_connectors::SpbValue> = back
+        let back = broker_connectors_enterprise::decode_payload(&frames[0].payload).unwrap();
+        let metrics: HashMap<String, broker_connectors_enterprise::SpbValue> = back
             .metrics
             .into_iter()
             .map(|metric| (metric.name.clone().unwrap(), metric.value))
             .collect();
         assert_eq!(
             metrics["Temperature"],
-            broker_connectors::SpbValue::Double(82.5)
+            broker_connectors_enterprise::SpbValue::Double(82.5)
         );
 
         // Below-threshold telemetry fires nothing anywhere.
@@ -6517,7 +6423,7 @@ mod tests {
     /// and Pulsar mocks. All transports are in-memory.
     #[tokio::test]
     async fn test_into_fans_out_to_cloud_sinks() {
-        use broker_connectors::{
+        use broker_connectors_enterprise::{
             AzureEventHubsSink, AzureEventHubsSinkConfig, GcpPubSubSink, GcpPubSubSinkConfig,
             KinesisSink, KinesisSinkConfig, MemoryPulsarTransport, MockAzureEventHubsTransport,
             MockGcpPubSubTransport, MockKinesisTransport, PulsarSink, PulsarSinkConfig,
@@ -6560,7 +6466,7 @@ mod tests {
                     project_id: "my-iot-project".to_string(),
                     topic_id: "telemetry-events".to_string(),
                     endpoint: None,
-                    auth: broker_connectors::GcpAuth::None,
+                    auth: broker_connectors_enterprise::GcpAuth::None,
                     ordering_key_template: Some("${client_id}".to_string()),
                     attributes: HashMap::from([("source".to_string(), "indramqtt".to_string())]),
                     batch_size: Some(1),
@@ -6615,7 +6521,7 @@ mod tests {
                     tenant: "public".to_string(),
                     namespace: "default".to_string(),
                     topic: "${topic}".to_string(),
-                    auth: broker_connectors::PulsarAuth::None,
+                    auth: broker_connectors_enterprise::PulsarAuth::None,
                     partition_key_template: Some("${client_id}".to_string()),
                     properties: HashMap::new(),
                     batch_size: Some(1),
@@ -6752,7 +6658,7 @@ mod tests {
     /// are in-memory; the RSA key is a fixed test key (never deployed).
     #[tokio::test]
     async fn test_into_fans_out_to_iot_industrial_sinks() {
-        use broker_connectors::{
+        use broker_connectors_enterprise::{
             AwsIotAuth, AwsIotConfig, AwsIotSink, AzureIotAuth, AzureIotConfig, AzureIotSink,
             BridgeTopicMapping, GcpIotAlgorithm, GcpIotConfig, GcpIotSink, MemoryOpcUaTransport,
             MockAwsIotTransport, MockAzureIotTransport, MockGcpIotTransport,
@@ -6839,7 +6745,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     topic_mappings: vec![BridgeTopicMapping {
                         local_topic: "sensors/+".to_string(),
                         remote_topic: "indra/up".to_string(),
-                        direction: broker_connectors::BridgeDirection::LocalToRemote,
+                        direction: broker_connectors_enterprise::BridgeDirection::LocalToRemote,
                     }],
                     shadow_sync: None,
                     batch_size: Some(1),
@@ -6909,6 +6815,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     linger_ms: Some(10),
                     max_retries: Some(5),
                     timeout_ms: None,
+                    ca_bundle_pem: None,
                 },
                 gcp_transport.clone(),
             )
@@ -7081,7 +6988,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// mocks with zero drops. All transports are in-memory.
     #[tokio::test]
     async fn test_into_fans_out_to_database_sinks() {
-        use broker_connectors::{
+        use broker_connectors_enterprise::{
             CassandraSink, CassandraSinkConfig, CouchbaseSink, CouchbaseSinkConfig,
             MockCassandraTransport, MockCouchbaseTransport, MockMongoDbTransport,
             MockMssqlTransport, MongoDbSink, MongoDbSinkConfig, MssqlSink, MssqlSinkConfig,
@@ -7097,7 +7004,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     connection_string: "mongodb://u:p@unused:27017".to_string(),
                     database: "telemetry".to_string(),
                     collection_template: "readings".to_string(),
-                    operation: broker_connectors::MongoOperation::InsertOne,
+                    operation: broker_connectors_enterprise::MongoOperation::InsertOne,
                     batch_size: Some(1),
                     batch_bytes: None,
                     linger_ms: Some(20),
@@ -7121,8 +7028,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     port: None,
                     database: "telemetry".to_string(),
                     table_template: "dbo.SensorEvents".to_string(),
-                    auth: broker_connectors::MssqlAuth::Integrated,
-                    query_mode: broker_connectors::MssqlQueryMode::InsertJson,
+                    auth: broker_connectors_enterprise::MssqlAuth::Integrated,
+                    query_mode: broker_connectors_enterprise::MssqlQueryMode::InsertJson,
                     trust_server_certificate: true,
                     batch_size: Some(1),
                     batch_bytes: None,
@@ -7146,8 +7053,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     contact_points: vec!["10.0.0.1:9042".to_string()],
                     keyspace: "telemetry".to_string(),
                     table_template: "events".to_string(),
-                    auth: broker_connectors::CassandraAuth::None,
-                    consistency: broker_connectors::CqlConsistency::LocalQuorum,
+                    auth: broker_connectors_enterprise::CassandraAuth::None,
+                    consistency: broker_connectors_enterprise::CqlConsistency::LocalQuorum,
                     partition_key_template: "${client_id}".to_string(),
                     cql_statement_template: "INSERT INTO telemetry.events (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)".to_string(),
                     ttl_secs: None,
@@ -7177,12 +7084,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     bucket: "telemetry".to_string(),
                     scope: None,
                     collection: None,
-                    auth: broker_connectors::CouchbaseAuth {
+                    auth: broker_connectors_enterprise::CouchbaseAuth {
                         username: "Administrator".to_string(),
                         password: "secret".to_string(),
                     },
                     doc_id_template: "${client_id}::${timestamp}".to_string(),
-                    operation: broker_connectors::CouchbaseOperation::Upsert,
+                    operation: broker_connectors_enterprise::CouchbaseOperation::Upsert,
                     expiry_secs: None,
                     batch_size: Some(1),
                     batch_bytes: None,
@@ -7244,18 +7151,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let document = &captured[0].docs[0].document;
         assert!(matches!(
             document.get("_id"),
-            Some(broker_connectors::BsonValue::ObjectId(_))
+            Some(broker_connectors_enterprise::BsonValue::ObjectId(_))
         ));
         assert_eq!(
             document.get("temp"),
-            Some(&broker_connectors::BsonValue::Double(22.5))
+            Some(&broker_connectors_enterprise::BsonValue::Double(22.5))
         );
         assert_eq!(
             document.get("_mqtt").and_then(|meta| match meta {
-                broker_connectors::BsonValue::Document(meta) => meta.get("topic").cloned(),
+                broker_connectors_enterprise::BsonValue::Document(meta) =>
+                    meta.get("topic").cloned(),
                 _ => None,
             }),
-            Some(broker_connectors::BsonValue::String(
+            Some(broker_connectors_enterprise::BsonValue::String(
                 "sensors/kitchen".to_string()
             ))
         );
@@ -7280,7 +7188,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(captured[0].batch[0].values[0], b"device-42");
         assert_eq!(
             captured[0].batch[0].partition_token,
-            broker_connectors::murmur3_token(b"device-42")
+            broker_connectors_enterprise::murmur3_token(b"device-42")
         );
 
         // Couchbase: one document under client_id::timestamp.
@@ -7318,7 +7226,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// mocks with zero drops. All transports are in-memory.
     #[tokio::test]
     async fn test_into_fans_out_to_timeseries_sinks() {
-        use broker_connectors::{
+        use broker_connectors_enterprise::{
             DynamoDbSink, DynamoDbSinkConfig, IotDbSink, IotDbSinkConfig, MockDynamoDbTransport,
             MockIotDbTransport, MockTdengineTransport, MockTimestreamTransport, TdengineSink,
             TdengineSinkConfig, TimestreamSink, TimestreamSinkConfig,
@@ -7336,7 +7244,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     database: "power".to_string(),
                     stable_name: "meters".to_string(),
                     subtable_template: "d_${client_id}".to_string(),
-                    auth: broker_connectors::TdengineAuth::Basic {
+                    auth: broker_connectors_enterprise::TdengineAuth::Basic {
                         username: "root".to_string(),
                         password: "taosdata".to_string(),
                     },
@@ -7372,15 +7280,15 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     endpoint: "http://127.0.0.1:18080/rest/v2".to_string(),
                     device_path_template: "root.factory.${payload.plant_id}.${client_id}"
                         .to_string(),
-                    auth: broker_connectors::IotDbAuth {
+                    auth: broker_connectors_enterprise::IotDbAuth {
                         username: "root".to_string(),
                         password: "root".to_string(),
                     },
                     is_aligned: false,
                     measurements: vec!["temperature".to_string(), "humidity".to_string()],
                     data_types: vec![
-                        broker_connectors::IotDbDataType::Double,
-                        broker_connectors::IotDbDataType::Double,
+                        broker_connectors_enterprise::IotDbDataType::Double,
+                        broker_connectors_enterprise::IotDbDataType::Double,
                     ],
                     batch_size: Some(1),
                     batch_bytes: None,
@@ -7412,7 +7320,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                         "device_id".to_string(),
                         "${client_id}".to_string(),
                     )]),
-                    time_unit: broker_connectors::TimestreamTimeUnit::Milliseconds,
+                    time_unit: broker_connectors_enterprise::TimestreamTimeUnit::Milliseconds,
                     measure_name_template: Some("sensor_metrics".to_string()),
                     multi_measure_mappings: HashMap::from([
                         ("temperature".to_string(), "DOUBLE".to_string()),
@@ -7445,7 +7353,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     access_key_id: "AKID".to_string(),
                     secret_access_key: "secret".to_string(),
                     session_token: None,
-                    partition_key: broker_connectors::DynamoKeyConfig {
+                    partition_key: broker_connectors_enterprise::DynamoKeyConfig {
                         name: "device_id".to_string(),
                         template: "${client_id}".to_string(),
                         key_type: "S".to_string(),
@@ -7569,7 +7477,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// and Redshift mocks with zero drops. All transports in-memory.
     #[tokio::test]
     async fn test_into_fans_out_to_lakehouse_sinks() {
-        use broker_connectors::{
+        use broker_connectors_enterprise::{
             BigQuerySink, BigQuerySinkConfig, DatabricksSink, DatabricksSinkConfig, DorisSink,
             DorisSinkConfig, MockBigQueryTransport, MockDatabricksTransport, MockDorisTransport,
             MockRedshiftTransport, MockSnowflakeTransport, RedshiftSink, RedshiftSinkConfig,
@@ -7663,11 +7571,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     http_port: 8030,
                     database: "telemetry".to_string(),
                     table_template: "events".to_string(),
-                    auth: broker_connectors::DorisAuth {
+                    auth: broker_connectors_enterprise::DorisAuth {
                         username: "root".to_string(),
                         password: String::new(),
                     },
-                    format: broker_connectors::DorisFormat::Json,
+                    format: broker_connectors_enterprise::DorisFormat::Json,
                     jsonpaths: None,
                     strip_outer_array: true,
                     max_filter_ratio: Some(0.0),
@@ -7694,7 +7602,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     dataset_id: "telemetry".to_string(),
                     table_template: "sensor_logs".to_string(),
                     endpoint: None,
-                    auth: broker_connectors::GcpAuth::None,
+                    auth: broker_connectors_enterprise::GcpAuth::None,
                     ignore_unknown_values: true,
                     skip_invalid_rows: false,
                     template_suffix: None,
@@ -7852,7 +7760,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     #[tokio::test]
     async fn test_bigquery_sdk_sink_via_rule_against_fake() {
         use axum::{extract::State, http::StatusCode, routing::post, Router};
-        use broker_connectors::{BigQuerySink, BigQuerySinkConfig, SdkBigQueryTransport, Sink};
+        use broker_connectors::Sink;
+        use broker_connectors_enterprise::{
+            BigQuerySink, BigQuerySinkConfig, SdkBigQueryTransport,
+        };
 
         #[derive(Default)]
         struct FakeBigQuery {
@@ -7897,7 +7808,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             dataset_id: "telemetry".to_string(),
             table_template: "sensor_logs".to_string(),
             endpoint: Some(endpoint),
-            auth: broker_connectors::GcpAuth::None,
+            auth: broker_connectors_enterprise::GcpAuth::None,
             ignore_unknown_values: true,
             skip_invalid_rows: false,
             template_suffix: None,
@@ -7988,7 +7899,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             dataset_id: "telemetry".to_string(),
             table_template: "sensor_logs".to_string(),
             endpoint: Some(partial_endpoint),
-            auth: broker_connectors::GcpAuth::None,
+            auth: broker_connectors_enterprise::GcpAuth::None,
             ignore_unknown_values: true,
             skip_invalid_rows: false,
             template_suffix: None,
@@ -8182,13 +8093,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// Confluent and RocketMQ mocks. All transports are in-memory.
     #[tokio::test]
     async fn test_into_fans_out_to_storage_messaging_sinks() {
-        use broker_connectors::{
+        use broker_connectors_enterprise::{
             AttributeColumnMapping, AttributeColumnType, AzureBlobAuth, AzureBlobSink,
-            AzureBlobSinkConfig, ConfluentKafkaConfig, ConfluentKafkaSink, IcebergPartitionField,
-            IcebergTransform, MemoryConfluentTransport, MockAzureBlobTransport,
-            MockRocketMqTransport, MockS3TablesTransport, MockTablestoreTransport,
-            PrimaryKeyMapping, PrimaryKeyType, RocketMqSink, RocketMqSinkConfig, S3TablesSink,
-            S3TablesSinkConfig, SaslMechanism, TablestoreSink, TablestoreSinkConfig,
+            AzureBlobSinkConfig, ConfluentKafkaConfig, ConfluentKafkaSink,
+            ConfluentSecurityProtocol, IcebergPartitionField, IcebergTransform,
+            MemoryConfluentTransport, MockAzureBlobTransport, MockRocketMqTransport,
+            MockS3TablesTransport, MockTablestoreTransport, PrimaryKeyMapping, PrimaryKeyType,
+            RocketMqSink, RocketMqSinkConfig, S3TablesSink, S3TablesSinkConfig, SaslMechanism,
+            TablestoreSink, TablestoreSinkConfig,
         };
 
         let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
@@ -8208,7 +8120,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     blob_path_template:
                         "telemetry/year=${date.year}/month=${date.month}/day=${date.day}/${batch_id}.json"
                             .to_string(),
-                    compression: broker_connectors::AzureBlobCompression::None,
+                    compression: broker_connectors_enterprise::AzureBlobCompression::None,
                     max_records_per_blob: Some(1),
                     max_bytes_per_blob: None,
                     flush_interval_secs: 60,
@@ -8277,7 +8189,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                             transform: IcebergTransform::Identity,
                         },
                     ],
-                    target_format: broker_connectors::S3TablesFormat::NdjsonCompressed,
+                    target_format: broker_connectors_enterprise::S3TablesFormat::NdjsonCompressed,
                     batch_size: Some(1),
                     buffer_capacity: None,
                     linger_ms: Some(10),
@@ -8302,6 +8214,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     api_key: "confluent-key".to_string(),
                     api_secret: "confluent-secret".to_string(),
                     auth_mechanism: SaslMechanism::Plain,
+                    security_protocol: ConfluentSecurityProtocol::SaslSsl,
                     topic_template: "telemetry-${topic_segment_2}".to_string(),
                     partition_key_template: Some("${client_id}".to_string()),
                     schema_registry: None,
@@ -8389,11 +8302,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(batches[0].len(), 1);
         assert_eq!(
             batches[0][0].primary_keys[0].1,
-            broker_connectors::OtsValue::String("sensor-42".to_string())
+            broker_connectors_enterprise::OtsValue::String("sensor-42".to_string())
         );
         assert_eq!(
             batches[0][0].attributes[0].1,
-            broker_connectors::OtsValue::Double(150.0)
+            broker_connectors_enterprise::OtsValue::Double(150.0)
         );
 
         // S3 Tables: one gzip data file on the day/device partition.
@@ -8451,8 +8364,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// x-ms-version 2021-08-06.
     #[tokio::test]
     async fn test_azure_blob_rest_write_via_dispatch_against_loopback() {
-        use broker_connectors::{
-            AzureBlobAuth, AzureBlobSink, AzureBlobSinkConfig, HttpAzureBlobTransport, Sink as _,
+        use broker_connectors::Sink as _;
+        use broker_connectors_enterprise::{
+            AzureBlobAuth, AzureBlobSink, AzureBlobSinkConfig, HttpAzureBlobTransport,
             AZURE_STORAGE_VERSION,
         };
 
@@ -8518,7 +8432,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 account_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_string(),
             },
             blob_path_template: "telemetry/${batch_id}.json".to_string(),
-            compression: broker_connectors::AzureBlobCompression::None,
+            compression: broker_connectors_enterprise::AzureBlobCompression::None,
             max_records_per_blob: Some(1),
             max_bytes_per_blob: None,
             flush_interval_secs: 60,
@@ -8588,8 +8502,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// the stored key on every attempt.
     #[tokio::test]
     async fn test_azure_eventhubs_rest_write_via_dispatch_against_loopback() {
-        use broker_connectors::{
-            AzureEventHubsSink, AzureEventHubsSinkConfig, HttpAzureEventHubsTransport, Sink as _,
+        use broker_connectors::Sink as _;
+        use broker_connectors_enterprise::{
+            AzureEventHubsSink, AzureEventHubsSinkConfig, HttpAzureEventHubsTransport,
         };
 
         #[derive(Debug, Default)]
@@ -8700,12 +8615,15 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     #[tokio::test]
     async fn test_into_fans_out_to_databases_and_timeseries_sinks() {
         use broker_connectors::{
+            GreptimeDbConfig, GreptimeDbSink, GreptimeFormat, GreptimePrecision,
+            MockGreptimeDbTransport, MockOpenTsdbTransport, OpenTsdbCompression, OpenTsdbConfig,
+            OpenTsdbProtocol, OpenTsdbSink,
+        };
+        use broker_connectors_enterprise::{
             AlloydbAuth, AlloydbColumnMapping, AlloydbConfig, AlloydbSink, CockroachDbConfig,
-            CockroachDbSink, DatalayersConfig, DatalayersSink, GreptimeDbConfig, GreptimeDbSink,
-            GreptimeFormat, GreptimePrecision, MockAlloydbTransport, MockCockroachDbTransport,
-            MockDatalayersTransport, MockGreptimeDbTransport, MockOpenTsdbTransport,
-            MockOracleTransport, OpenTsdbCompression, OpenTsdbConfig, OpenTsdbProtocol,
-            OpenTsdbSink, OracleSink, OracleSinkConfig,
+            CockroachDbSink, DatalayersConfig, DatalayersSink, MockAlloydbTransport,
+            MockCockroachDbTransport, MockDatalayersTransport, MockOracleTransport, OracleSink,
+            OracleSinkConfig,
         };
 
         let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
@@ -9379,5 +9297,327 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             String::from_utf8_lossy(&pinned_tag.stdout)
         );
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// Qualification (QUAL-NONE: a generic webhook is a test-owned
+    /// endpoint, not a server product, so no container is needed) for
+    /// the enterprise HTTP webhook sink on the maintained `reqwest`
+    /// driver.
+    ///
+    /// Serves its own loopback receiver (ephemeral `axum` server with
+    /// HMAC verification plus scripted `429`-then-`200` and `500`
+    /// faults), registers the sink with the engine's connector
+    /// manager, creates `ForwardConnector` rules, publishes 500 events
+    /// through [`RuleEngine::dispatch_ingress`] (never `sink.send`
+    /// directly), asserts byte-identical bodies with valid HMAC headers
+    /// and exact counts, proves `429`-then-`200` retries to success,
+    /// and proves a persistent `500` aborts with the buffer retained.
+    /// Runs offline: needs only loopback, never skips. Bind failure
+    /// panics (fail closed).
+    ///
+    /// Run with e.g.:
+    /// `cargo test -p broker-rules --lib tests::test_qualify_webhook_write_path_through_rule_engine -- --nocapture`
+    #[tokio::test]
+    async fn test_qualify_webhook_write_path_through_rule_engine() {
+        use axum::{extract::State, http::StatusCode, routing::post, Router};
+        use broker_connectors::{
+            ConnectorError, HmacAlgorithm, HmacEncoding, HttpAuth, HttpBodyFormat,
+            HttpHmacSignature, HttpMethod, HttpSink, HttpSinkConfig, ReqwestHttpTransport,
+            Sink as _,
+        };
+        use std::collections::HashMap;
+        use std::sync::{
+            atomic::{AtomicU64, Ordering as AtomicOrdering},
+            Mutex as StdMutex,
+        };
+
+        const SECRET: &str = "qual-hmac-secret";
+        const EVENTS: usize = 500;
+
+        #[derive(Debug, Default)]
+        struct QualState {
+            bodies: StdMutex<Vec<Vec<u8>>>,
+            signatures: StdMutex<Vec<String>>,
+            bad_hmac: AtomicU64,
+            flaky_calls: AtomicU64,
+            dead_calls: AtomicU64,
+        }
+
+        fn expected_signature(body: &[u8]) -> String {
+            HttpHmacSignature {
+                header_name: "X-Signature-SHA256".to_string(),
+                algorithm: HmacAlgorithm::Sha256,
+                secret: SECRET.to_string(),
+                encoding: HmacEncoding::Hex,
+            }
+            .sign(body)
+        }
+
+        async fn hook_handler(
+            State(state): State<Arc<QualState>>,
+            headers: axum::http::HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            let signature = headers
+                .get("X-Signature-SHA256")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            if signature != expected_signature(&body) {
+                state.bad_hmac.fetch_add(1, AtomicOrdering::SeqCst);
+                return (StatusCode::BAD_REQUEST, "bad hmac".to_string());
+            }
+            state.signatures.lock().unwrap().push(signature);
+            state.bodies.lock().unwrap().push(body.to_vec());
+            (StatusCode::OK, "ok".to_string())
+        }
+
+        async fn flaky_handler(
+            State(state): State<Arc<QualState>>,
+            headers: axum::http::HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            let call = state.flaky_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if call == 0 {
+                return (StatusCode::TOO_MANY_REQUESTS, "slow down".to_string());
+            }
+            hook_handler(State(state), headers, body).await
+        }
+
+        async fn dead_handler(
+            State(state): State<Arc<QualState>>,
+            _headers: axum::http::HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            state.dead_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            state.bodies.lock().unwrap().push(body.to_vec());
+            (StatusCode::INTERNAL_SERVER_ERROR, "nope".to_string())
+        }
+
+        let state = Arc::new(QualState::default());
+        let app = Router::new()
+            .route("/hook", post(hook_handler))
+            .route("/flaky", post(flaky_handler))
+            .route("/dead", post(dead_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("qual bind loopback");
+        let port = listener.local_addr().expect("qual addr").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("qual serve");
+        });
+
+        fn qual_config(url: &str) -> HttpSinkConfig {
+            HttpSinkConfig {
+                url: url.to_string(),
+                method: HttpMethod::Post,
+                headers: HashMap::new(),
+                auth: HttpAuth::None,
+                body_format: HttpBodyFormat::RawJson,
+                signature: Some(HttpHmacSignature {
+                    header_name: "X-Signature-SHA256".to_string(),
+                    algorithm: HmacAlgorithm::Sha256,
+                    secret: SECRET.to_string(),
+                    encoding: HmacEncoding::Hex,
+                }),
+                batch_size: Some(EVENTS),
+                batch_bytes: Some(1_048_576),
+                linger_ms: Some(50),
+                timeout_ms: Some(5_000),
+                max_retries: Some(3),
+                initial_backoff_ms: Some(100),
+                max_backoff_ms: Some(2_000),
+                buffer_capacity: Some(10_000),
+            }
+        }
+
+        // 500 events end to end over the real `reqwest` driver, through
+        // the broker's rule path (rule registered with the connector
+        // manager, message published through the rule engine).
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        let config = qual_config(&format!("http://127.0.0.1:{port}/hook"));
+        let transport = Arc::new(
+            ReqwestHttpTransport::new(&config, reqwest::Client::new()).expect("qual transport"),
+        );
+        let sink = Arc::new(HttpSink::new(config, transport).expect("qual sink"));
+        assert_eq!(sink.kind(), "webhook");
+        engine.connectors().register("qual-http", sink.clone());
+        engine
+            .create_rule(
+                "qual-http-rule".to_string(),
+                TopicFilter::new("sensors/qual").unwrap(),
+                None,
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "qual-http".to_string(),
+                }],
+            )
+            .expect("qual rule creates");
+        let broker_sink: Arc<dyn BrokerSink> = Arc::new(RecordingSink::default());
+
+        let topic = Topic::new("sensors/qual").unwrap();
+        let mut expected_bodies = Vec::with_capacity(EVENTS);
+        for seq in 0..EVENTS {
+            let payload = format!(r#"{{"seq":{seq},"device":"dev-{:02}"}}"#, seq % 16);
+            // The sink forwards the projected JSON verbatim, so the wire
+            // body is the canonical re-serialization of the payload.
+            let document: serde_json::Value =
+                serde_json::from_str(&payload).expect("qual payload parses");
+            expected_bodies.push(serde_json::to_vec(&document).expect("qual body encodes"));
+            let matched = engine
+                .dispatch_ingress(
+                    &topic,
+                    &Bytes::from(payload),
+                    QoS::AtLeastOnce,
+                    &broker_sink,
+                )
+                .await;
+            assert_eq!(matched, 1, "qual rule must fire once per event");
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), EVENTS as u64, "qual row count");
+        assert_eq!(sink.sent_requests(), EVENTS as u64, "qual request count");
+        assert_eq!(sink.buffered_rows(), 0);
+        eprintln!("qual rows sent: records={EVENTS}");
+
+        // Byte-identical bodies with valid HMAC headers, exact counts, no
+        // tolerance: every key present, none extra, none mutated.
+        let captured = state.bodies.lock().unwrap().clone();
+        assert_eq!(captured.len(), EVENTS, "qual captured count");
+        for (index, (got, want)) in captured.iter().zip(expected_bodies.iter()).enumerate() {
+            assert_eq!(got, want, "qual body byte mismatch at {index}");
+        }
+        assert_eq!(
+            state.bad_hmac.load(AtomicOrdering::SeqCst),
+            0,
+            "every request must carry a valid HMAC header"
+        );
+        assert_eq!(
+            state.signatures.lock().unwrap().len(),
+            EVENTS,
+            "every request must carry the signature header"
+        );
+        eprintln!("qual rows asserted: count={EVENTS} byte-identical with valid HMAC");
+
+        // 429-then-200 retries to success on the same body, through the
+        // rule path as well.
+        let flaky_config = HttpSinkConfig {
+            url: format!("http://127.0.0.1:{port}/flaky"),
+            batch_size: Some(10),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            ..qual_config(&format!("http://127.0.0.1:{port}/flaky"))
+        };
+        let flaky_transport = Arc::new(
+            ReqwestHttpTransport::new(&flaky_config, reqwest::Client::new())
+                .expect("qual flaky transport"),
+        );
+        let flaky_sink =
+            Arc::new(HttpSink::new(flaky_config, flaky_transport).expect("qual flaky sink"));
+        engine
+            .connectors()
+            .register("qual-flaky", flaky_sink.clone());
+        engine
+            .create_rule(
+                "qual-flaky-rule".to_string(),
+                TopicFilter::new("sensors/qual-flaky").unwrap(),
+                None,
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "qual-flaky".to_string(),
+                }],
+            )
+            .expect("qual flaky rule creates");
+        let flaky_topic = Topic::new("sensors/qual-flaky").unwrap();
+        let bodies_before = state.bodies.lock().unwrap().len();
+        let matched = engine
+            .dispatch_ingress(
+                &flaky_topic,
+                &Bytes::from_static(br#"{"seq":"retry-probe"}"#),
+                QoS::AtLeastOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(matched, 1, "qual flaky rule must fire");
+        flaky_sink.flush().await.expect("429-then-200 must succeed");
+        assert_eq!(
+            state.flaky_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "one 429 plus one 200"
+        );
+        assert_eq!(flaky_sink.sent_requests(), 1);
+        assert_eq!(flaky_sink.sent_records(), 1);
+        assert_eq!(flaky_sink.buffered_rows(), 0);
+        // The retried body arrived intact with a valid HMAC.
+        let after_retry = state.bodies.lock().unwrap().clone();
+        assert_eq!(after_retry.len(), bodies_before + 1);
+        let probe: serde_json::Value =
+            serde_json::from_slice(&after_retry[bodies_before]).expect("retry body parses");
+        assert_eq!(probe, serde_json::json!({"seq": "retry-probe"}));
+        eprintln!("qual retry asserted: 429-then-200 delivered once with valid HMAC");
+
+        // Persistent 500 aborts: retries exhausted, buffer retained for
+        // inspection, fail-fast breaker engaged.
+        let dead_config = HttpSinkConfig {
+            url: format!("http://127.0.0.1:{port}/dead"),
+            batch_size: Some(10),
+            max_retries: Some(1),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            ..qual_config(&format!("http://127.0.0.1:{port}/dead"))
+        };
+        let dead_transport = Arc::new(
+            ReqwestHttpTransport::new(&dead_config, reqwest::Client::new())
+                .expect("qual dead transport"),
+        );
+        let dead_sink =
+            Arc::new(HttpSink::new(dead_config, dead_transport).expect("qual dead sink"));
+        engine.connectors().register("qual-dead", dead_sink.clone());
+        engine
+            .create_rule(
+                "qual-dead-rule".to_string(),
+                TopicFilter::new("sensors/qual-dead").unwrap(),
+                None,
+                true,
+                vec![RuleAction::ForwardConnector {
+                    connector_id: "qual-dead".to_string(),
+                }],
+            )
+            .expect("qual dead rule creates");
+        let dead_topic = Topic::new("sensors/qual-dead").unwrap();
+        let matched = engine
+            .dispatch_ingress(
+                &dead_topic,
+                &Bytes::from_static(br#"{"seq":"abort-probe"}"#),
+                QoS::AtLeastOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(matched, 1, "qual dead rule must fire");
+        let err = dead_sink.flush().await.expect_err("500 must abort");
+        assert!(
+            matches!(err, ConnectorError::Connection(_)),
+            "exhausted 500s are backpressure, got {err:?}"
+        );
+        assert_eq!(
+            state.dead_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "initial attempt plus one retry"
+        );
+        assert_eq!(dead_sink.buffered_rows(), 1);
+        let calls = state.dead_calls.load(AtomicOrdering::SeqCst);
+        assert!(dead_sink.flush().await.is_err());
+        assert_eq!(
+            state.dead_calls.load(AtomicOrdering::SeqCst),
+            calls,
+            "breaker must fail fast without touching the transport"
+        );
+        eprintln!("qual abort asserted: persistent 500 aborts with buffer retained");
+
+        // Cleanup: stop the loopback receiver (nothing else to remove;
+        // no table, bucket, or container was created).
+        server.abort();
+        eprintln!("qual done: rows={EVENTS} cleaned loopback receiver");
     }
 }

@@ -986,9 +986,9 @@ async fn rollback(
         .config
         .commit(ConfigRoot::RuleEngine(previous.rule_engine.clone()));
     let _ = state.config.save();
-    state.auth.seed_from_registry(&state.config);
+    let _ = state.auth.seed_from_registry(&state.config);
     let _ = state.engine.seed_from_registry(&state.config);
-    state.admin_users.apply_snapshot_conf(&previous.admin_users);
+    let _ = state.admin_users.apply_snapshot_conf(&previous.admin_users);
     state.authn_node_cache.seed_from_registry(&state.config);
     state.authn_settings.seed_from_registry(&state.config);
     state.authz_node_cache.seed_from_registry(&state.config);
@@ -1104,7 +1104,12 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
     // Reseed each live owner from the committed registry, mirroring
     // kernel boot. A refusal restores every part already applied.
     if pending.mqtt_users.is_some() {
-        state.auth.seed_from_registry(&state.config);
+        if let Err(error) = state.auth.seed_from_registry(&state.config) {
+            rollback(state, &previous, &previous_bans, &previous_retained).await;
+            return Err(ApiError::InternalError(format!(
+                "mqtt_users backend refused: {error}"
+            )));
+        }
     }
     if pending.rules.is_some() {
         if let Err(error) = state.engine.seed_from_registry(&state.config) {
@@ -1115,9 +1120,15 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
         }
     }
     if pending.admin_users.is_some() {
-        state
+        if let Err(error) = state
             .admin_users
-            .apply_snapshot_conf(&state.config.snapshot().admin_users);
+            .apply_snapshot_conf(&state.config.snapshot().admin_users)
+        {
+            rollback(state, &previous, &previous_bans, &previous_retained).await;
+            return Err(ApiError::InternalError(format!(
+                "admin_users backend refused: {error}"
+            )));
+        }
     }
     if pending.authn_node_cache.is_some() {
         state.authn_node_cache.seed_from_registry(&state.config);

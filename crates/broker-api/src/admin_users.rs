@@ -317,19 +317,27 @@ impl AdminUsers {
         store
     }
 
-    /// Replace the whole user map from a validated registry root.
-    /// The caller commits the root first; this only swaps memory.
-    /// Unknown verifiers lock their account, as in `from_snapshot`.
-    /// Stale attempt counters for removed users are dropped.
-    pub fn apply_snapshot_conf(&self, conf: &AdminUsersConf) {
+    /// Replace users with one validated snapshot root in place (M1-05
+    /// runtime apply path for the `admin_users` root).
+    ///
+    /// Driven afterwards by management login (each login consults this
+    /// store). An empty snapshot restores the default admin, matching boot.
+    /// Undecodable verifiers lock their accounts instead of dropping them,
+    /// matching [`AdminUsers::from_snapshot`].
+    pub fn apply_snapshot_conf(&self, conf: &AdminUsersConf) -> Result<(), AdminUserError> {
+        conf.validate()
+            .map_err(|err| AdminUserError::Persist(err.to_string()))?;
         let fresh = Self::from_snapshot(conf);
-        let names: std::collections::HashSet<String> =
-            fresh.users.read().unwrap().keys().cloned().collect();
-        *self.users.write().unwrap() = std::mem::take(&mut *fresh.users.write().unwrap());
+        let fresh_users = fresh.users.into_inner().unwrap();
+        // Remove the MFA attempt counters of the users that the new
+        // snapshot does not contain.
         self.mfa_attempts
             .lock()
             .unwrap()
-            .retain(|name, _| names.contains(name));
+            .retain(|name, _| fresh_users.contains_key(name));
+        let mut users = self.users.write().unwrap();
+        *users = fresh_users;
+        Ok(())
     }
 
     /// Export the current contents as a validated config root, sorted by
