@@ -2181,6 +2181,244 @@ impl TransformationsConf {
     }
 }
 
+/// Most schemas kept in the registry (256). Reason: the list clones the full
+/// set per read, so the set stays small; 256 covers operator use with room.
+pub const MAX_SCHEMAS: usize = 256;
+
+/// Longest accepted schema name (256 bytes). Reason: names are map keys and
+/// clone per read, so one long name cannot bloat reads.
+pub const MAX_SCHEMA_NAME_LEN: usize = 256;
+
+/// Most bytes accepted in one schema document (1 MiB). Reason: documents
+/// clone per read and persist per entry, so one large document cannot bloat
+/// reads or the state file; 1 MiB holds large schemas with room.
+pub const MAX_SCHEMA_BYTES: usize = 1_048_576;
+
+/// Longest accepted schema description (1024 bytes). Reason: descriptions
+/// clone per read, so one long text cannot bloat reads.
+pub const MAX_SCHEMA_DESC_LEN: usize = 1024;
+
+/// Schema kinds the registry stores.
+pub const KNOWN_SCHEMA_TYPES: &[&str] = &["json", "avro"];
+
+// TODO(parity): which schema kinds does the spec list beyond json and avro
+// (protobuf, ...)? The rulebook does not decide the set; the current choice
+// stores json and avro only until the checker pins it.
+
+/// True for a schema kind the registry stores.
+#[must_use]
+pub fn is_known_schema_type(kind: &str) -> bool {
+    KNOWN_SCHEMA_TYPES.contains(&kind)
+}
+
+/// True for a JSON Schema type name.
+#[must_use]
+pub fn is_known_json_schema_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+    )
+}
+
+/// Check one Avro record document. The document must be an object with
+/// type record, a non-empty name and a non-empty fields array. Each field
+/// must carry a name and a type. Return the parsed value on success.
+pub fn validate_avro_document(value: &serde_json::Value) -> Result<(), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "schema must be a JSON object".to_string())?;
+    match obj.get("type").and_then(|v| v.as_str()) {
+        Some("record") => {}
+        _ => return Err("avro schema needs `\"type\": \"record\"`".to_string()),
+    }
+    match obj.get("name").and_then(|v| v.as_str()) {
+        Some(name) if !name.trim().is_empty() => {}
+        _ => return Err("avro schema needs a non-empty `name`".to_string()),
+    }
+    let fields = obj
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "avro schema needs a `fields` array".to_string())?;
+    if fields.is_empty() {
+        return Err("avro schema `fields` must not be empty".to_string());
+    }
+    for (index, field) in fields.iter().enumerate() {
+        let entry = field
+            .as_object()
+            .ok_or_else(|| format!("avro `fields[{index}]` must be an object"))?;
+        match entry.get("name").and_then(|v| v.as_str()) {
+            Some(name) if !name.trim().is_empty() => {}
+            _ => return Err(format!("avro `fields[{index}]` needs a `name`")),
+        }
+        if !entry.contains_key("type") {
+            return Err(format!("avro `fields[{index}]` needs a `type`"));
+        }
+    }
+    Ok(())
+}
+
+/// Check one JSON Schema document. The document must be a non-empty object.
+/// It must carry at least one schema keyword. A present `type` must name a
+/// known JSON type. A present `properties` must be an object.
+pub fn validate_json_schema_document(value: &serde_json::Value) -> Result<(), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "schema must be a JSON object".to_string())?;
+    if obj.is_empty() {
+        return Err("json schema must not be empty".to_string());
+    }
+    let has_keyword = [
+        "type",
+        "properties",
+        "$schema",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "enum",
+        "$ref",
+        "items",
+        "required",
+    ]
+    .iter()
+    .any(|key| obj.contains_key(*key));
+    if !has_keyword {
+        return Err("json schema needs a type keyword".to_string());
+    }
+    if let Some(type_value) = obj.get("type") {
+        if let Some(name) = type_value.as_str() {
+            if !is_known_json_schema_type(name) {
+                return Err(format!("json schema `type` {name:?} is unknown"));
+            }
+        } else if let Some(names) = type_value.as_array() {
+            if names.is_empty() {
+                return Err("json schema `type` must not be empty".to_string());
+            }
+            for name in names {
+                match name.as_str() {
+                    Some(text) if is_known_json_schema_type(text) => {}
+                    _ => return Err("json schema `type` holds unknown entry".to_string()),
+                }
+            }
+        } else {
+            return Err("json schema `type` must be a string".to_string());
+        }
+    }
+    if let Some(props) = obj.get("properties") {
+        if !props.is_object() {
+            return Err("json schema `properties` must be an object".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Check one schema document for the named kind. Parse already happened;
+/// this only checks the shape. Return an error string on failure.
+pub fn validate_schema_document(kind: &str, value: &serde_json::Value) -> Result<(), String> {
+    match kind {
+        "avro" => validate_avro_document(value),
+        "json" => validate_json_schema_document(value),
+        _ => Err(format!("unknown schema type: {kind}")),
+    }
+}
+
+/// One stored schema: the operator-chosen name, the kind it was checked
+/// against, an optional description, and the schema document as JSON text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SchemaEntry {
+    /// Schema name; must be non-empty and unique within the root.
+    pub name: String,
+    /// Schema kind; must name a known kind (field `type`).
+    pub schema_type: String,
+    /// Optional description; at most [`MAX_SCHEMA_DESC_LEN`] bytes.
+    #[serde(default)]
+    pub description: String,
+    /// Schema document as JSON text; at most [`MAX_SCHEMA_BYTES`] bytes.
+    #[serde(default)]
+    pub schema: String,
+}
+
+/// Root: stored schemas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SchemasConf {
+    #[serde(default)]
+    pub schemas: Vec<SchemaEntry>,
+}
+
+impl SchemasConf {
+    /// Check names (non-empty, bounded, unique), kinds (known), sizes
+    /// (bounded) and documents (parsed per kind).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.schemas.len() > MAX_SCHEMAS {
+            return Err(ConfigError::Invalid(format!(
+                "schemas.schemas holds {} entries, at most {} (field `schemas`)",
+                self.schemas.len(),
+                MAX_SCHEMAS
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.schemas.len());
+        for (index, entry) in self.schemas.iter().enumerate() {
+            if entry.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].name must not be empty (field `name`)"
+                )));
+            }
+            if entry.name.len() > MAX_SCHEMA_NAME_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].name {:?} is too long (field `name`)",
+                    entry.name
+                )));
+            }
+            if entry.schema_type.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema_type must not be empty (field `type`)"
+                )));
+            }
+            if !is_known_schema_type(entry.schema_type.trim()) {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema_type {:?} is unknown (field `type`)",
+                    entry.schema_type
+                )));
+            }
+            if entry.description.len() > MAX_SCHEMA_DESC_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].description holds {} bytes, at most {} (field `description`)",
+                    entry.description.len(),
+                    MAX_SCHEMA_DESC_LEN
+                )));
+            }
+            if entry.schema.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema must not be empty (field `schema`)"
+                )));
+            }
+            if entry.schema.len() > MAX_SCHEMA_BYTES {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema holds {} bytes, at most {} (field `schema`)",
+                    entry.schema.len(),
+                    MAX_SCHEMA_BYTES
+                )));
+            }
+            let parsed: serde_json::Value = serde_json::from_str(&entry.schema).map_err(|err| {
+                ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema is not valid JSON: {err} (field `schema`)"
+                ))
+            })?;
+            validate_schema_document(entry.schema_type.trim(), &parsed).map_err(|reason| {
+                ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].schema is invalid: {reason} (field `schema`)"
+                ))
+            })?;
+            if !seen.insert(entry.name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "schemas.schemas[{index}].name {:?} is duplicated (field `name`)",
+                    entry.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Most entries accepted in one request-filter list inside the
 /// rule-engine settings (allow/deny CIDRs, deny hosts). Reason: the lists
 /// are cloned into every management snapshot and consulted per connector
@@ -2485,6 +2723,8 @@ pub struct FullSnapshot {
     pub rule_engine: RuleEngineConf,
     #[serde(default)]
     pub transformations: TransformationsConf,
+    #[serde(default)]
+    pub schemas: SchemasConf,
 }
 
 impl FullSnapshot {
@@ -2506,6 +2746,7 @@ impl FullSnapshot {
         self.sources.validate()?;
         self.rule_engine.validate()?;
         self.transformations.validate()?;
+        self.schemas.validate()?;
         Ok(())
     }
 }
@@ -2545,6 +2786,8 @@ pub enum ConfigRoot {
     RuleEngine(RuleEngineConf),
     /// Validated message transformation chain root.
     Transformations(TransformationsConf),
+    /// Validated schema registry root.
+    Schemas(SchemasConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2637,6 +2880,7 @@ impl ConfigRegistry {
             ConfigRoot::Sources(conf) => self.commit_sources(conf),
             ConfigRoot::RuleEngine(conf) => self.commit_rule_engine(conf),
             ConfigRoot::Transformations(conf) => self.commit_transformations(conf),
+            ConfigRoot::Schemas(conf) => self.commit_schemas(conf),
         }
     }
 
@@ -2816,6 +3060,17 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits a validated schema registry.
+    pub fn commit_schemas(&self, conf: SchemasConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.schemas = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Serialises the current snapshot to TOML and writes it atomically.
     ///
     /// The snapshot is written to a unique temp file in the same
@@ -2936,6 +3191,7 @@ mod tests {
             sources: SourcesConf::default(),
             rule_engine: RuleEngineConf::default(),
             transformations: TransformationsConf::default(),
+            schemas: SchemasConf::default(),
         }
     }
 

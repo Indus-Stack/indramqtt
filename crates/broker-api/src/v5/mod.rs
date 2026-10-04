@@ -33,6 +33,7 @@ pub mod rule_engine;
 pub mod rule_events;
 pub mod rule_test;
 pub mod rules;
+pub mod schema_registry;
 pub mod schemas;
 pub mod slow_subscriptions;
 pub mod sources;
@@ -858,5 +859,18 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/message_transformations/transformation/:name/metrics/reset",
             post(transformations::reset_transformation_metrics),
+        )
+        // Schema registry (W3-37, C08-11..C08-13): paged list, checked
+        // create and drop on a real store. List uses the standard page
+        // envelope. Create parses the schema. Delete misses are 404.
+        // Management plane only. Publish and deliver take no lock here.
+        .route(
+            "/schema_registry",
+            get(schema_registry::list_schemas_registry)
+                .post(schema_registry::create_schema_registry),
+        )
+        .route(
+            "/schema_registry/:name",
+            delete(schema_registry::delete_schema_registry),
         )
 }

@@ -670,6 +670,7 @@ dependencies = [
  "arc-swap",
  "base64 0.22.1",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "toml",
 ]

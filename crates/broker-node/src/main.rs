@@ -2030,6 +2030,12 @@ struct Shared {
     /// restart. One `Arc` clone at boot; the ingress pipeline loads the
     /// engine snapshot per message and never takes this store lock.
     transformations: Arc<broker_api::v5::transformations::TransformChainStore>,
+    /// Schema registry for W3-37 (`GET`/`POST /schema_registry`,
+    /// `DELETE /schema_registry/:name`): shared with the management API
+    /// so checked writes show in reads without a restart. One `Arc` clone
+    /// at boot. Reads take one short lock per request. No publish path
+    /// reads this store. Publish and deliver take no lock here.
+    schema_registry: Arc<broker_api::v5::schema_registry::SchemaRegistryStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -2286,6 +2292,7 @@ impl Shared {
             actions: Arc::new(broker_api::v5::actions::ActionStore::new()),
             rule_engine_config,
             transformations: Arc::new(broker_api::v5::transformations::TransformChainStore::new()),
+            schema_registry: Arc::new(broker_api::v5::schema_registry::SchemaRegistryStore::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -5765,6 +5772,11 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // already ran inside `ApiState::new`; sharing replaces that fresh
     // instance with the kernel's so no second copy diverges.
     state.transformations = shared.transformations.clone();
+    // Share the schema registry (W3-37) so checked writes show in
+    // `GET /schema_registry` reads without a restart. One `Arc` clone.
+    // Reads take one short lock per request. No publish path reads this
+    // store. Publish and deliver take no lock here.
+    state.schema_registry = shared.schema_registry.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -6035,6 +6047,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         shared.engine.sync_transform_metrics(&names);
     }
+    // Schema registry (W3-37): seed the shared directory in place (the
+    // same instance `serve_api` shares with `ApiState`), so reads show
+    // kept schemas from the first connection. An empty snapshot is a
+    // no-op (empty reads as an empty page).
+    shared.schema_registry.seed_from_registry(&shared.config);
     // Rule spill buffer (B4-07): opt-in via `--rule-spill-dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.
