@@ -6,6 +6,7 @@
 //! `GET /api/v5/data/files` lists the stored files with paging.
 //! `POST /api/v5/data/files` stores one uploaded file.
 //! `DELETE /api/v5/data/files/{filename}` removes one stored file.
+//! `GET /api/v5/data/files/{filename}` serves one stored file.
 //! Files collect in `<data-dir>/backup`. The store keeps at most
 //! `MAX_EXPORT_FILES` files and `MAX_EXPORT_BYTES` bytes, and it drops
 //! files older than `RETENTION_DAYS` days. The store deletes the oldest
@@ -16,7 +17,7 @@
 //! check use the same ban store. A blocking thread builds the archive.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -26,12 +27,14 @@ use bytes::Bytes;
 use flate2::{write::GzEncoder, Compression};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tar::Builder;
 
 use crate::errors::ApiError;
+use crate::node_scope::resolve_node;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
@@ -43,6 +46,10 @@ const MAX_EXPORT_BYTES: u64 = 256 * 1024 * 1024;
 const RETENTION_DAYS: u64 = 7;
 // Retention in seconds, derived from the day bound above.
 const RETENTION_SECS: u64 = RETENTION_DAYS * 86_400;
+// Download content type. Reason: the spec serves raw file bytes.
+const BACKUP_DOWNLOAD_CONTENT_TYPE: &str = "application/octet-stream";
+// Legacy node name. Reason: v5 rows render this name today.
+const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
 // Longest accepted file name. Reason: the filesystem caps one name.
 const MAX_FILENAME_LEN: usize = 255;
 
@@ -608,6 +615,59 @@ pub async fn delete_backup_file(
         )
             .into_response(),
     }
+}
+
+// `GET /api/v5/data/files/{filename}`: serve one stored file.
+//
+// Read the same backup dir the export, upload and delete routes use.
+// A known name returns its bytes with the download content type.
+// An unknown name returns 404 `NOT_FOUND`. A bad name returns 400
+// `BAD_REQUEST`. An unknown `node` query value returns 404 `NOT_FOUND`.
+//
+// Management-plane only; publish and deliver never touch it. One
+// bounded read serves one request; the file stays below the store cap.
+pub async fn download_backup_file(
+    State(state): State<ApiState>,
+    Path(filename): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(node) = query.get("node") {
+        if resolve_node(&state.node_id, node).is_err()
+            && resolve_node(LEGACY_NODE_NAME, node).is_err()
+        {
+            return resolve_node(&state.node_id, node)
+                .expect_err("node already checked as unknown")
+                .into_response();
+        }
+    }
+    if !valid_backup_filename(&filename) {
+        return ApiError::BadRequest("filename must end with .tar.gz".to_string()).into_response();
+    }
+    let path = backup_dir(&state).join(&filename);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ApiError::NotFound(format!("backup file {filename:?} not found"))
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"code": "EXPORT_FAILED", "message": format!("cannot read backup: {error}")})),
+            )
+                .into_response();
+        }
+    };
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    (
+        StatusCode::OK,
+        [
+            ("content-type", BACKUP_DOWNLOAD_CONTENT_TYPE.to_string()),
+            ("content-disposition", disposition),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 #[cfg(test)]
