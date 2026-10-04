@@ -18,6 +18,7 @@ pub mod authz_sources;
 pub mod auto_subscribe;
 pub mod banned;
 pub mod clients;
+pub mod data;
 pub mod error_codes;
 pub mod features;
 pub mod gateways;
@@ -768,4 +769,7 @@ pub fn protected_router() -> Router<ApiState> {
         // filtered by the installed licence on the real licence store.
         // Management-plane only; publish and deliver never touch it.
         .route("/features", get(features::list_features))
+        // Data Backup (W5-26, C18-01): export snapshot of config and data.
+        // Management-plane only; runs off the message path.
+        .route("/data/export", post(data::export_data))
 }
