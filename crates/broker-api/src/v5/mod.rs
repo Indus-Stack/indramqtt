@@ -772,4 +772,14 @@ pub fn protected_router() -> Router<ApiState> {
         // Data Backup (W5-26, C18-01): export snapshot of config and data.
         // Management-plane only; runs off the message path.
         .route("/data/export", post(data::export_data))
+        // Backup file collection (W5-27, C18-02..C18-04): paged list of
+        // stored files, upload of one file, delete of one file. All
+        // three serve the same backup dir as the export route, so files
+        // persist across a restart within the same bounds.
+        // Management-plane only; runs off the message path.
+        .route(
+            "/data/files",
+            get(data::list_backup_files).post(data::upload_backup_file),
+        )
+        .route("/data/files/:filename", delete(data::delete_backup_file))
 }

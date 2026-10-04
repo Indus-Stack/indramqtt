@@ -4343,6 +4343,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_files_round_trip_through_api() {
+        // Upload one file through the API. List it with paging data.
+        // Upload it again for a conflict. Delete it. Delete it again
+        // for a 404. An empty store reads as an empty page.
+        use base64::Engine as _;
+        let dir = unique_data_dir("data-files-roundtrip");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server.get_auth("/api/v5/data/files", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["limit"], json!(100));
+        let content = base64::engine::general_purpose::STANDARD.encode(b"w5-27 round-trip bytes");
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/data/files",
+                json!({"filename": "w5-27-roundtrip.tar.gz", "content": content}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        assert!(dir.join("backup").join("w5-27-roundtrip.tar.gz").is_file());
+        let (status, body) = server.get_auth("/api/v5/data/files", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("file list reads");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["filename"], json!("w5-27-roundtrip.tar.gz"));
+        assert!(data[0]["size"].as_u64().expect("size reads") > 0);
+        assert!(data[0]["created_at"].as_str().is_some());
+        assert!(data[0]["node"].as_str().is_some());
+        assert_eq!(body["meta"]["count"], json!(1));
+        let (status, body) = server
+            .get_auth("/api/v5/data/files?page=1&limit=1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("page reads").len(), 1);
+        assert_eq!(body["meta"]["page"], json!(1));
+        assert_eq!(body["meta"]["limit"], json!(1));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/files",
+                json!({"filename": "w5-27-roundtrip.tar.gz", "content": content}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        let (status, _) = server
+            .delete_auth("/api/v5/data/files/w5-27-roundtrip.tar.gz", &token)
+            .await;
+        assert_eq!(status, 204);
+        assert!(!dir.join("backup").join("w5-27-roundtrip.tar.gz").is_file());
+        let (status, body) = server.get_auth("/api/v5/data/files", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        let (status, body) = server
+            .delete_auth("/api/v5/data/files/w5-27-roundtrip.tar.gz", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn data_files_reject_malformed_uploads() {
+        // Bad names and bad bytes fail as client errors.
+        use base64::Engine as _;
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let good = base64::engine::general_purpose::STANDARD.encode(b"w5-27 malformed probe");
+        for bad in [
+            json!({"filename": "", "content": good}),
+            json!({"filename": "../escape.tar.gz", "content": good}),
+            json!({"filename": "bad.txt", "content": good}),
+            json!({"filename": "w5-27-bad.tar.gz", "content": ""}),
+            json!({"filename": "w5-27-bad.tar.gz", "content": "!!!not-base64!!!"}),
+            json!({"filename": "w5-27-bad.tar.gz"}),
+            json!({"content": good}),
+        ] {
+            let (status, body) = server.post_auth("/api/v5/data/files", bad, &token).await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+    }
+
+    #[tokio::test]
+    async fn data_files_paging_honours_limit() {
+        // Three uploads list as pages of two plus one.
+        use base64::Engine as _;
+        let dir = unique_data_dir("data-files-paging");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        for name in ["w5-27-p0.tar.gz", "w5-27-p1.tar.gz", "w5-27-p2.tar.gz"] {
+            let content =
+                base64::engine::general_purpose::STANDARD.encode(format!("bytes for {name}"));
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/data/files",
+                    json!({"filename": name, "content": content}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 204);
+        }
+        let (status, body) = server
+            .get_auth("/api/v5/data/files?page=1&limit=2", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("page reads").len(), 2);
+        assert_eq!(body["meta"]["count"], json!(3));
+        let (status, body) = server
+            .get_auth("/api/v5/data/files?page=2&limit=2", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("page reads").len(), 1);
+        assert_eq!(body["meta"]["count"], json!(3));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn data_files_survive_restart() {
+        // Upload one file. Start the broker again on the same data
+        // dir. The file lists again.
+        use base64::Engine as _;
+        let dir = unique_data_dir("data-files-restart");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let content = base64::engine::general_purpose::STANDARD.encode(b"w5-27 restart bytes");
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/data/files",
+                json!({"filename": "w5-27-restart.tar.gz", "content": content}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        drop(server);
+        drop(registry);
+        assert!(dir.join("backup").join("w5-27-restart.tar.gz").is_file());
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        // The admin password persisted, so log in with the changed password.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, body) = server.get_auth("/api/v5/data/files", &token).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("file list reads");
+        assert!(data
+            .iter()
+            .any(|entry| entry["filename"] == json!("w5-27-restart.tar.gz")));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn banned_duplicate_create_reports_conflict() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;

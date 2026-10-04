@@ -1,19 +1,22 @@
-//! Backup export for the v5 REST API.
+//! Backup files for the v5 REST API.
 //!
 //! `POST /api/v5/data/export` writes one backup file. The file holds a
 //! redacted config snapshot plus live table rows. The file excludes
 //! secrets: each secret field shows its owner reference only.
+//! `GET /api/v5/data/files` lists the stored files with paging.
+//! `POST /api/v5/data/files` stores one uploaded file.
+//! `DELETE /api/v5/data/files/{filename}` removes one stored file.
 //! Files collect in `<data-dir>/backup`. The store keeps at most
 //! `MAX_EXPORT_FILES` files and `MAX_EXPORT_BYTES` bytes, and it drops
 //! files older than `RETENTION_DAYS` days. The store deletes the oldest
 //! files first.
-//! Files live on disk, so they survive a restart. The handler reads one
-//! lock-free registry snapshot plus short management locks. It reads the
+//! Files live on disk, so they survive a restart. The handlers read one
+//! lock-free registry snapshot plus short management locks. They read the
 //! ban store under its write lock. The CONNECT check and the publish
 //! check use the same ban store. A blocking thread builds the archive.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -23,12 +26,13 @@ use bytes::Bytes;
 use flate2::{write::GzEncoder, Compression};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tar::Builder;
 
 use crate::errors::ApiError;
+use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
 // Max export files kept on disk. Reason: the spec caps the file store.
@@ -39,6 +43,8 @@ const MAX_EXPORT_BYTES: u64 = 256 * 1024 * 1024;
 const RETENTION_DAYS: u64 = 7;
 // Retention in seconds, derived from the day bound above.
 const RETENTION_SECS: u64 = RETENTION_DAYS * 86_400;
+// Longest accepted file name. Reason: the filesystem caps one name.
+const MAX_FILENAME_LEN: usize = 255;
 
 // Config snapshot roots the export serves.
 const KNOWN_ROOTS: &[&str] = &[
@@ -263,6 +269,7 @@ fn build_archive(payload: &ExportPayload) -> std::io::Result<Vec<u8>> {
 }
 
 // One file entry seen in the backup dir.
+#[derive(Clone)]
 struct BackupFile {
     name: String,
     size: u64,
@@ -270,7 +277,7 @@ struct BackupFile {
 }
 
 // Scan the backup dir. Missing dir reads as empty, never an error.
-async fn scan_backups(dir: &Path) -> Vec<BackupFile> {
+async fn scan_backups(dir: &std::path::Path) -> Vec<BackupFile> {
     let mut out = Vec::new();
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return out;
@@ -303,7 +310,7 @@ async fn scan_backups(dir: &Path) -> Vec<BackupFile> {
 }
 
 // Drop oldest files until count, bytes and age fit the bounds.
-async fn enforce_bounds(dir: &Path) {
+async fn enforce_bounds(dir: &std::path::Path) {
     let mut files = scan_backups(dir).await;
     let cutoff = now_secs().saturating_sub(RETENTION_SECS);
     let mut live: Vec<BackupFile> = Vec::with_capacity(files.len());
@@ -434,6 +441,173 @@ pub async fn export_data(State(state): State<ApiState>, body: Bytes) -> Response
     enforce_bounds(&dir).await;
 
     (StatusCode::OK, Json(json!({ "filename": filename }))).into_response()
+}
+
+// Accept one uploaded file name. Reject path parts and bad suffix.
+fn valid_backup_filename(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_FILENAME_LEN {
+        return false;
+    }
+    if !name.ends_with(".tar.gz") {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    if name.contains("..") {
+        return false;
+    }
+    if name.starts_with('.') {
+        return false;
+    }
+    true
+}
+
+// Format one epoch time as RFC 3339. Use epoch on bad input.
+fn created_at_rfc3339(secs: u64) -> String {
+    match chrono::DateTime::from_timestamp(secs as i64, 0) {
+        Some(time) => time.with_timezone(&chrono::Utc).to_rfc3339(),
+        None => chrono::DateTime::from_timestamp(0, 0)
+            .expect("epoch exists")
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339(),
+    }
+}
+
+// `GET /api/v5/data/files`: paged list of stored backup files.
+//
+// Serve the real files from the backup dir. Sort by age, oldest
+// first. An empty dir reads as an empty page, never an error.
+// Management-plane only; publish and deliver never touch it.
+pub async fn list_backup_files(State(state): State<ApiState>, params: PageParams) -> Response {
+    let dir = backup_dir(&state);
+    let files = scan_backups(&dir).await;
+    let total = files.len();
+    let page_items = paginate(&files, params.page, params.limit);
+    let data: Vec<Value> = page_items
+        .iter()
+        .map(|file| {
+            json!({
+                "filename": file.name,
+                "size": file.size,
+                "created_at": created_at_rfc3339(file.modified_secs),
+                "node": state.node_id,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": data,
+            "meta": meta_page(params.page, params.limit, total),
+        })),
+    )
+        .into_response()
+}
+
+// `POST /api/v5/data/files`: store one uploaded backup file.
+//
+// Take JSON `{filename, content}` where `content` holds base64
+// bytes. Write through a temp file, then rename. A known name
+// fails with `ALREADY_EXISTS`. Bad names or bad bytes fail with
+// `BAD_REQUEST`. Management-plane only; publish never touches it.
+pub async fn upload_backup_file(State(state): State<ApiState>, body: Bytes) -> Response {
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return ApiError::BadRequest("request body must be JSON".to_string()).into_response();
+        }
+    };
+    let filename = value
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let encoded = value
+        .get("content")
+        .or_else(|| value.get("file"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !valid_backup_filename(&filename) {
+        return ApiError::BadRequest("filename must end with .tar.gz".to_string()).into_response();
+    }
+    if encoded.is_empty() {
+        return ApiError::BadRequest("content must not be empty".to_string()).into_response();
+    }
+    use base64::Engine as _;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(encoded.trim()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return ApiError::BadRequest("content must be base64".to_string()).into_response();
+        }
+    };
+    if bytes.is_empty() {
+        return ApiError::BadRequest("content must not be empty".to_string()).into_response();
+    }
+    // One file cannot pass the store cap. Reason: the spec caps
+    // total disk use, so one file above it never fits.
+    if bytes.len() as u64 > MAX_EXPORT_BYTES {
+        return ApiError::BadRequest("content passes the store cap".to_string()).into_response();
+    }
+    let dir = backup_dir(&state);
+    if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"code": "EXPORT_FAILED", "message": format!("cannot use backup dir: {error}")})),
+        )
+            .into_response();
+    }
+    let target = dir.join(&filename);
+    if tokio::fs::metadata(&target).await.is_ok() {
+        return ApiError::AlreadyExists(format!("backup file {filename:?} already exists"))
+            .into_response();
+    }
+    // Write to a temp file first, then rename. Readers never see a
+    // half-written file.
+    let tmp = dir.join(format!("{filename}.part"));
+    if let Err(error) = tokio::fs::write(&tmp, &bytes).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"code": "EXPORT_FAILED", "message": format!("cannot write backup: {error}")})),
+        )
+            .into_response();
+    }
+    if let Err(error) = tokio::fs::rename(&tmp, &target).await {
+        tokio::fs::remove_file(&tmp).await.ok();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"code": "EXPORT_FAILED", "message": format!("cannot publish backup: {error}")})),
+        )
+            .into_response();
+    }
+    enforce_bounds(&dir).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// `DELETE /api/v5/data/files/{filename}`: remove one stored file.
+//
+// A known name deletes and answers 204. An unknown name answers
+// 404 with the documented shape. A bad name answers 400.
+// Management-plane only; publish and deliver never touch it.
+pub async fn delete_backup_file(
+    State(state): State<ApiState>,
+    Path(filename): Path<String>,
+) -> Response {
+    if !valid_backup_filename(&filename) {
+        return ApiError::BadRequest("filename must end with .tar.gz".to_string()).into_response();
+    }
+    let path = backup_dir(&state).join(&filename);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ApiError::NotFound(format!("backup file {filename:?} not found")).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"code": "EXPORT_FAILED", "message": format!("cannot delete backup: {error}")})),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
