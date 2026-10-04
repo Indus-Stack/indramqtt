@@ -2023,8 +2023,9 @@ struct Shared {
     /// lock. Management-plane only; publish and deliver never touch this
     /// store.
     rule_engine_config: Arc<broker_rules::EngineConfigStore>,
-    /// Ordered message-transformation chain for W3-32
-    /// (`GET`/`POST`/`PUT /message_transformations`): shared with the
+    /// Ordered message-transformation chain for W3-32 through W3-34
+    /// (`GET`/`POST`/`PUT /message_transformations` plus dry-run and
+    /// reorder): shared with the
     /// management API so validated writes are visible to reads without a
     /// restart. One `Arc` clone at boot; the ingress pipeline loads the
     /// engine snapshot per message and never takes this store lock.

@@ -273,7 +273,9 @@ pub struct ApiState {
     /// Ordered message-transformation chain for `GET`/`POST`/`PUT
     /// /api/v5/message_transformations` (W3-32, C08-01..C08-03) plus
     /// the stateless dry-run probe
-    /// `POST /api/v5/message_transformations/dryrun` (W3-33, C08-04):
+    /// `POST /api/v5/message_transformations/dryrun` (W3-33, C08-04)
+    /// and the order replace
+    /// `POST /api/v5/message_transformations/reorder` (W3-34, C08-05):
     /// bounded ordered chain validated per entry, persisted across a
     /// restart via the config core, executed in order on matching
     /// ingress through the engine's lock-free snapshot. The routes read

@@ -815,4 +815,14 @@ pub fn protected_router() -> Router<ApiState> {
             "/message_transformations/dryrun",
             post(transformations::dryrun_transformations),
         )
+        // Transformation reorder (W3-34, C08-05): replace the stored
+        // chain order with the supplied name order, validated before
+        // anything applies. Answers 204; the new order shows on the
+        // next list read and drives execution order. Nothing is
+        // created or deleted. Management-plane only; publish loads
+        // the engine snapshot and never takes the store lock.
+        .route(
+            "/message_transformations/reorder",
+            post(transformations::reorder_transformations),
+        )
 }

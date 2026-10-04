@@ -1,9 +1,10 @@
 //! Ordered message-transformation chain for the v5 management API.
 //!
 //! Covers `GET /message_transformations` (ordered list),
-//! `POST /message_transformations` (append one entry) and
-//! `PUT /message_transformations` (replace the whole chain) on a real
-//! backend. Single-node, management-plane only: handlers clone at most
+//! `POST /message_transformations` (append one entry),
+//! `PUT /message_transformations` (replace the whole chain) and
+//! `POST /message_transformations/reorder` (replace the chain order)
+//! on a real backend. Single-node, management-plane only: handlers clone at most
 //! the capped chain once per request under a short lock; the ingress
 //! path loads one lock-free snapshot per message and never takes the
 //! chain write lock.
@@ -206,6 +207,19 @@ pub enum TransformInsertError {
     Full,
 }
 
+/// Why `reorder` refused a new order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransformReorderError {
+    /// Unknown and omitted names in one order.
+    Invalid(String),
+    /// Names with no stored entry.
+    Unknown(Vec<String>),
+    /// Stored names missing from the order.
+    Incomplete(Vec<String>),
+    /// One name listed twice.
+    Duplicate(String),
+}
+
 /// Bounded ordered transformation chain, persisted through the config
 /// core. Chain order defines execution order; creates append, whole
 /// replaces swap the order.
@@ -316,6 +330,63 @@ impl TransformChainStore {
     /// partially applies.
     pub fn replace_all(&self, entries: Vec<TransformRecord>) {
         *self.inner.write().expect("transform store lock") = entries;
+    }
+
+    /// Reorder the stored chain to the supplied name order.
+    ///
+    /// Validates the full order before applying anything: an unknown
+    /// name, a stored name missing from the order, or a duplicated
+    /// name applies nothing and reports the cause. On success the
+    /// stored order swaps at once; the caller then syncs the engine
+    /// snapshot and persists, as the replace handler does. Entries
+    /// stay untouched: nothing is created or deleted.
+    pub fn reorder(&self, names: Vec<String>) -> Result<(), TransformReorderError> {
+        let mut seen = std::collections::HashSet::with_capacity(names.len());
+        for name in &names {
+            if !seen.insert(name.clone()) {
+                return Err(TransformReorderError::Duplicate(format!(
+                    "order names transformation {name:?} more than once"
+                )));
+            }
+        }
+        let reordered = {
+            let current = self.inner.read().expect("transform store lock");
+            let unknown: Vec<String> = names
+                .iter()
+                .filter(|name| !current.iter().any(|record| &record.name == *name))
+                .cloned()
+                .collect();
+            let missing: Vec<String> = current
+                .iter()
+                .filter(|record| !names.contains(&record.name))
+                .map(|record| record.name.clone())
+                .collect();
+            if !unknown.is_empty() && !missing.is_empty() {
+                return Err(TransformReorderError::Invalid(format!(
+                    "unknown transformation name(s): {}; order omits stored name(s): {}",
+                    unknown.join(", "),
+                    missing.join(", "),
+                )));
+            }
+            if !unknown.is_empty() {
+                return Err(TransformReorderError::Unknown(unknown));
+            }
+            if !missing.is_empty() {
+                return Err(TransformReorderError::Incomplete(missing));
+            }
+            let mut next = Vec::with_capacity(current.len());
+            for name in &names {
+                let record = current
+                    .iter()
+                    .find(|record| &record.name == name)
+                    .cloned()
+                    .expect("names validated against current chain");
+                next.push(record);
+            }
+            next
+        };
+        *self.inner.write().expect("transform store lock") = reordered;
+        Ok(())
     }
 
     /// Export the store as a validated config root: entries in chain
@@ -515,6 +586,118 @@ pub async fn replace_transformations(State(state): State<ApiState>, body: Bytes)
     let chain = state.transformations.snapshot();
     let rows: Vec<serde_json::Value> = chain.iter().map(TransformRecord::to_json).collect();
     (StatusCode::OK, Json(rows)).into_response()
+}
+
+/// `POST /api/v5/message_transformations/reorder`: replace the chain
+/// order with the supplied name order.
+///
+/// The body must be a JSON object with an `order` array of names
+/// (`{"order": ["b", "a"]}`). The full order gets validated before
+/// anything applies: an unknown name, a stored name missing from the
+/// order, a duplicated name, or a malformed body fails with
+/// `BAD_REQUEST` and leaves the old order in place. On success answers
+/// 204 with no body; the new order shows on the next list read and
+/// drives execution order. Nothing is created or deleted.
+/// Management-plane only; publish and deliver never touch this store.
+///
+/// Store wiring (rulebook section 2): the backing store is the same
+/// [`TransformChainStore`] as the list/create/replace routes, shared
+/// with the kernel (`crates/broker-node/src/main.rs`, `serve_api`
+/// share); the driving broker event is the ingress transform step
+/// (`crates/broker-node/src/main.rs`, ingress pipeline) loading the
+/// engine snapshot. Declared `wired` in `tools/wiring.txt`.
+///
+/// Fire-path cost: none. The publish path keeps loading one `Arc` per
+/// ingress with no new lock, allocation, or queue from this route.
+/// This route takes the store write lock once, swaps the order, and
+/// syncs the engine snapshot; order persists across a restart with
+/// the chain through the same export path as replace.
+///
+/// Tenant behaviour: the reorder selects no session, so no path
+/// leaves a tenant.
+// TODO(parity): does the documented body also accept a bare array or
+// per-entry objects (`[{"name": "b"}]`)? The rulebook does not decide
+// the exact shape; the current choice accepts only `{"order": [...]}`
+// with string entries until the checker pins it.
+// TODO(parity): which detail keys do the documented errors carry
+// beyond `code` and `message` (unknown-name, omitted-name and
+// duplicate lists)? The rulebook does not decide the exact shape; the
+// current choice reports the names inside `message` until the checker
+// pins it.
+pub async fn reorder_transformations(State(state): State<ApiState>, body: Bytes) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid reorder body: {e}")).into_response();
+        }
+    };
+    let names = match parse_reorder_request(&value) {
+        Ok(names) => names,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    match state.transformations.reorder(names) {
+        Ok(()) => {
+            sync_engine(&state);
+            if let Err(error) = state.transformations.persist() {
+                return transform_persist_error(error);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(TransformReorderError::Invalid(msg)) => ApiError::BadRequest(msg).into_response(),
+        Err(TransformReorderError::Unknown(unknown)) => ApiError::BadRequest(format!(
+            "unknown transformation name(s): {}",
+            unknown.join(", ")
+        ))
+        .into_response(),
+        Err(TransformReorderError::Incomplete(missing)) => ApiError::BadRequest(format!(
+            "order omits stored transformation name(s): {}",
+            missing.join(", ")
+        ))
+        .into_response(),
+        Err(TransformReorderError::Duplicate(msg)) => ApiError::BadRequest(msg).into_response(),
+    }
+}
+
+/// Validate a reorder body into the ordered name list.
+///
+/// The body must be a JSON object carrying an `order` array of
+/// non-empty string names. Extra top-level keys are ignored. The list
+/// must hold at most [`MAX_TRANSFORMATIONS`] names: a longer list can
+/// never match the capped chain, so it fails here instead of growing
+/// the request without bound.
+fn parse_reorder_request(value: &serde_json::Value) -> Result<Vec<String>, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "reorder body must be a JSON object".to_string())?;
+    let items = obj
+        .get("order")
+        .ok_or_else(|| "field `order` is required".to_string())?;
+    let items = items
+        .as_array()
+        .ok_or_else(|| "field `order` must be an array of names".to_string())?;
+    if items.len() > MAX_TRANSFORMATIONS {
+        return Err(format!(
+            "field `order` holds {} entries, at most {MAX_TRANSFORMATIONS}",
+            items.len()
+        ));
+    }
+    let mut names = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let name = item
+            .as_str()
+            .ok_or_else(|| format!("field `order[{index}]` must be a string"))?;
+        if name.trim().is_empty() {
+            return Err(format!("field `order[{index}]` must not be empty"));
+        }
+        if name.len() > MAX_TRANSFORMATION_NAME_LEN {
+            return Err(format!(
+                "field `order[{index}]` holds {} chars, at most {MAX_TRANSFORMATION_NAME_LEN}",
+                name.len()
+            ));
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
 }
 
 /// `POST /api/v5/message_transformations/dryrun`: stateless probe.
@@ -1258,6 +1441,223 @@ mod tests {
         assert_eq!(listed.as_array().expect("list is an array").len(), 1);
         assert_eq!(listed[0]["name"], serde_json::json!("keep"));
         assert_eq!(state.engine.transform_snapshot().len(), 1);
+    }
+
+    fn reorder_body(names: &[&str]) -> Bytes {
+        let order: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| serde_json::Value::String(name.to_string()))
+            .collect();
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({ "order": order })).expect("order is JSON"),
+        )
+    }
+
+    async fn listed_names(state: &ApiState) -> Vec<String> {
+        let (status, listed) = response_parts(
+            list_transformations(State(state.clone()), Query(Default::default())).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        listed
+            .as_array()
+            .expect("list is a bare array")
+            .iter()
+            .map(|row| row["name"].as_str().expect("name is a string").to_string())
+            .collect()
+    }
+
+    async fn live_output(state: &ApiState, topic: &str, payload: &str) -> (String, bool) {
+        let topic = broker_protocol::Topic::new(topic.to_string()).expect("valid topic");
+        let (_, out_payload, shed) = broker_rules::apply_transform_steps(
+            &state.engine.transform_snapshot(),
+            &topic,
+            &Bytes::from(payload.to_string().into_bytes()),
+        );
+        (String::from_utf8_lossy(&out_payload).into_owned(), shed)
+    }
+
+    #[tokio::test]
+    async fn reorder_flips_list_and_execution_order() {
+        let state = standalone_state();
+        for name in ["re-a", "re-b"] {
+            let body = serde_json::json!({
+                "name": name,
+                "topics": ["reorder/live/#"],
+                "failure_action": "drop",
+                "operations": [{"key": "payload", "value": format!("${{payload}}[{name}]")}],
+            });
+            let (status, _) =
+                response_parts(create_transformation(State(state.clone()), make_body(&body)).await)
+                    .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        assert_eq!(
+            listed_names(&state).await,
+            vec!["re-a".to_string(), "re-b".to_string()]
+        );
+        // Reorder through the production entry: answers 204 with no body.
+        let response =
+            reorder_transformations(State(state.clone()), reorder_body(&["re-b", "re-a"])).await;
+        let (status, empty) = response_parts(response).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(empty, serde_json::Value::Null);
+        // The new order shows on the next list read.
+        assert_eq!(
+            listed_names(&state).await,
+            vec!["re-b".to_string(), "re-a".to_string()]
+        );
+        // The engine snapshot follows, so the next message runs flipped.
+        let step_names: Vec<String> = state
+            .engine
+            .transform_snapshot()
+            .iter()
+            .map(|step| step.name.clone())
+            .collect();
+        assert_eq!(step_names, vec!["re-b".to_string(), "re-a".to_string()]);
+        let (out, shed) = live_output(&state, "reorder/live/1", "m").await;
+        assert!(!shed);
+        assert_eq!(out, "m[re-b][re-a]", "chain order defines execution order");
+    }
+
+    #[tokio::test]
+    async fn reorder_unknown_name_is_rejected_with_order_unchanged() {
+        let state = standalone_state();
+        for name in ["keep-a", "keep-b"] {
+            let body = serde_json::json!({
+                "name": name,
+                "topics": ["reorder/keep/#"],
+                "failure_action": "drop",
+                "operations": [{"key": "payload", "value": format!("${{payload}}[{name}]")}],
+            });
+            let (status, _) =
+                response_parts(create_transformation(State(state.clone()), make_body(&body)).await)
+                    .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        // One stored name plus one unknown name: the whole write fails.
+        let (status, err) = response_parts(
+            reorder_transformations(State(state.clone()), reorder_body(&["keep-b", "nowhere"]))
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(err["message"].is_string());
+        // The old order is unchanged on the list and on live messages.
+        assert_eq!(
+            listed_names(&state).await,
+            vec!["keep-a".to_string(), "keep-b".to_string()]
+        );
+        let step_names: Vec<String> = state
+            .engine
+            .transform_snapshot()
+            .iter()
+            .map(|step| step.name.clone())
+            .collect();
+        assert_eq!(step_names, vec!["keep-a".to_string(), "keep-b".to_string()]);
+        let (out, shed) = live_output(&state, "reorder/keep/1", "m").await;
+        assert!(!shed);
+        assert_eq!(out, "m[keep-a][keep-b]");
+    }
+
+    #[tokio::test]
+    async fn reorder_malformed_and_partial_orders_are_rejected_without_change() {
+        let state = standalone_state();
+        for name in ["m-a", "m-b"] {
+            let body = serde_json::json!({
+                "name": name,
+                "topics": ["reorder/malformed/#"],
+                "failure_action": "drop",
+                "operations": [],
+            });
+            let (status, _) =
+                response_parts(create_transformation(State(state.clone()), make_body(&body)).await)
+                    .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        let long_name = "n".repeat(MAX_TRANSFORMATION_NAME_LEN + 1);
+        let long_order: Vec<serde_json::Value> = (0..(MAX_TRANSFORMATIONS + 1))
+            .map(|i| serde_json::json!(format!("m-{i}")))
+            .collect();
+        for bad in [
+            serde_json::json!({"order": "m-a"}),
+            serde_json::json!({"order": [{"name": "m-a"}]}),
+            serde_json::json!({"order": ["m-a", 7]}),
+            serde_json::json!({"order": ["m-a", "  "]}),
+            serde_json::json!({"order": [long_name]}),
+            serde_json::json!({"order": long_order}),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!("m-a"),
+            // Stored name omitted: partial order.
+            serde_json::json!({"order": ["m-a"]}),
+            // Empty order on a non-empty chain.
+            serde_json::json!({"order": []}),
+            // Duplicated name.
+            serde_json::json!({"order": ["m-a", "m-a", "m-b"]}),
+        ] {
+            let (status, err) = response_parts(
+                reorder_transformations(State(state.clone()), make_body(&bad)).await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body {bad} must fail");
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        }
+        // Every rejected write left the old order in place.
+        assert_eq!(
+            listed_names(&state).await,
+            vec!["m-a".to_string(), "m-b".to_string()]
+        );
+        assert_eq!(state.engine.transform_snapshot().len(), 2);
+    }
+
+    #[test]
+    fn reorder_persists_across_registry_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-transform-reorder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|span| span.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let registry =
+            std::sync::Arc::new(broker_config::ConfigRegistry::load(&dir).expect("load"));
+        let store = TransformChainStore::from_registry(&registry);
+        for name in ["p-a", "p-b"] {
+            let entry = parse_transform_request(&serde_json::json!({
+                "name": name,
+                "topics": ["persist/#"],
+                "failure_action": "drop",
+                "operations": [],
+            }))
+            .expect("valid");
+            store.insert(entry).expect("insert");
+        }
+        store
+            .reorder(vec!["p-b".to_string(), "p-a".to_string()])
+            .expect("reorder applies");
+        store.persist().expect("save");
+        let reloaded =
+            std::sync::Arc::new(broker_config::ConfigRegistry::load(&dir).expect("reload"));
+        let names: Vec<String> = reloaded
+            .snapshot()
+            .transformations
+            .transformations
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(names, vec!["p-b".to_string(), "p-a".to_string()]);
+        let restarted = TransformChainStore::from_registry(&reloaded);
+        let live: Vec<String> = restarted
+            .snapshot()
+            .iter()
+            .map(|record| record.name.clone())
+            .collect();
+        assert_eq!(live, names);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn dryrun_body(value: &serde_json::Value) -> Bytes {
