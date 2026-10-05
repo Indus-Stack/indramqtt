@@ -287,11 +287,60 @@ struct FileApiKeyRef {
     #[serde(default)]
     name: String,
     #[serde(default)]
+    key_id: String,
+    #[serde(default)]
     scopes: Vec<String>,
+    #[serde(default)]
+    scopes_set: bool,
     #[serde(default)]
     description: String,
     #[serde(default)]
     created_at: String,
+    #[serde(default = "default_true")]
+    enable: bool,
+    #[serde(default)]
+    expired_at: Option<u64>,
+    #[serde(default)]
+    role: String,
+}
+
+/// One comparable line for an API key row. A key identifier that is empty
+/// stands for the name, an empty role stands for `administrator`, and a
+/// scope list with entries is explicit even when the flag is missing (the
+/// rules of an older release).
+#[allow(clippy::too_many_arguments)]
+fn api_key_ref(
+    name: &str,
+    key_id: &str,
+    scopes: &[String],
+    scopes_set: bool,
+    description: &str,
+    created_at: &str,
+    enable: bool,
+    expired_at: Option<u64>,
+    role: &str,
+) -> String {
+    let mut sorted = scopes.to_vec();
+    sorted.sort();
+    let explicit = scopes_set || !sorted.is_empty();
+    let key_id = if key_id.is_empty() { name } else { key_id };
+    let role = if role.is_empty() {
+        "administrator"
+    } else {
+        role
+    };
+    [
+        name.to_string(),
+        key_id.to_string(),
+        explicit.to_string(),
+        sorted.join(","),
+        description.to_string(),
+        created_at.to_string(),
+        enable.to_string(),
+        expired_at.map_or_else(|| "infinity".to_string(), |at| at.to_string()),
+        role.to_string(),
+    ]
+    .join("\u{1f}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -810,14 +859,16 @@ fn materialize(state: &ApiState, parsed: &ParsedBackup) -> Result<Materialized, 
                                 "api_keys.keys[{index}] is not a key: {error}"
                             ))
                         })?;
-                    let mut scopes = row.scopes.clone();
-                    scopes.sort();
-                    file_refs.push(format!(
-                        "{}\0{}\0{}\0{}",
-                        row.name,
-                        scopes.join(","),
-                        row.description,
-                        row.created_at
+                    file_refs.push(api_key_ref(
+                        &row.name,
+                        &row.key_id,
+                        &row.scopes,
+                        row.scopes_set,
+                        &row.description,
+                        &row.created_at,
+                        row.enable,
+                        row.expired_at,
+                        &row.role,
                     ));
                 }
                 let mut live_refs: Vec<String> = previous
@@ -825,14 +876,16 @@ fn materialize(state: &ApiState, parsed: &ParsedBackup) -> Result<Materialized, 
                     .keys
                     .iter()
                     .map(|entry| {
-                        let mut scopes = entry.scopes.clone();
-                        scopes.sort();
-                        format!(
-                            "{}\0{}\0{}\0{}",
-                            entry.name,
-                            scopes.join(","),
-                            entry.description,
-                            entry.created_at
+                        api_key_ref(
+                            &entry.name,
+                            &entry.key_id,
+                            &entry.scopes,
+                            entry.scopes_set,
+                            &entry.description,
+                            &entry.created_at,
+                            entry.enable,
+                            entry.expired_at,
+                            &entry.role,
                         )
                     })
                     .collect();

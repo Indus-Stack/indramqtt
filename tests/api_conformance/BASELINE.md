@@ -150,3 +150,15 @@ and fail closed on all later mutations. Repro on a fresh stack: create the
 same connector name twice, then any connector mutation 500s. The committed
 cases avoid tripping this (delete-before-create in setup); the second live
 run above (31 pass) is unaffected by it.
+
+## Known defects of the specification
+
+These rows fail the checker because the specification is wrong. The broker
+follows the real behaviour that the management console proves. The checker
+is not changed.
+
+- `GET /api_key`, response 200. The specification declares one JSON object
+  (the schema of one key record). The management console reads a bare
+  array: `const data: APIKey[] = await http.get('/api_key')` in the API module of the console (`loadAPIKeyList`),
+  and it maps over that array. The broker returns a bare array of key
+  records, so the checker reports a type error for this row.

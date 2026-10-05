@@ -1568,12 +1568,12 @@ impl AuthzSourcesConf {
 // the conservative choice until the conformance checker pins it.
 pub const MAX_API_KEYS: usize = 1024;
 
-/// Longest accepted API key name (128 bytes). Reason: names are map keys
-/// cloned into every list snapshot and persisted per entry, so an
-/// unbounded name lets one record bloat each list read; 128 covers
-/// operator and automation naming with headroom while keeping
-/// per-request clones cheap.
-pub const MAX_API_KEY_NAME_LEN: usize = 128;
+/// Longest accepted API key name (256 bytes, the limit of the reference
+/// API). Reason: names are map keys cloned into every list snapshot and
+/// persisted per entry, so an unbounded name lets one record bloat each
+/// list read; 256 is the documented limit and keeps per-request clones
+/// cheap.
+pub const MAX_API_KEY_NAME_LEN: usize = 256;
 
 /// Longest accepted per-scope token in an API key record (64 bytes).
 /// Reason: scopes are cloned into every list snapshot and persisted per
@@ -1593,29 +1593,79 @@ pub const MAX_API_KEY_SCOPES: usize = 32;
 ///
 /// `key_hash` holds the hex SHA-256 of the minted secret (never
 /// plaintext); the registry treats it as an opaque non-empty string.
-/// `scopes` carries the granted scope set verbatim; `description` is
-/// free-form operator text. `created_at` renders the mint time in the
-/// same UTC `+00:00` shape the ban list uses, or an empty string when
-/// the record predates the field.
-// TODO(parity): which per-key fields does the listing require beyond
-// name/scopes (expiry, enabled flag, creation time)? The rulebook does
-// not decide the exact record shape; fields the broker does not track
-// are omitted rather than invented.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// `key_id` is the public identifier of the key: the user name in Basic
+/// authentication. An empty `key_id` (a record from an older release)
+/// means that the name is the identifier.
+/// `scopes` carries the granted scope set verbatim; it is the explicit
+/// list only when `scopes_set` is true or the list is not empty. A record
+/// with `scopes_set` false and an empty list has no scope policy: the
+/// role decides. `description` is free-form operator text. `created_at`
+/// renders the mint time in the same UTC `+00:00` shape the ban list
+/// uses, or an empty string when the record predates the field.
+/// `enable` false makes the broker refuse the key at authentication.
+/// `expired_at` is the expiry time in epoch seconds; `None` never
+/// expires. `role` is `administrator`, `viewer` or `publisher`; an empty
+/// text means `administrator`.
+///
+/// Each field that an older release did not write has a serde default, so
+/// an old file loads with the behaviour that the key had before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKeyEntry {
     /// Key name; must be non-empty and unique within the root.
     pub name: String,
     /// Hex SHA-256 of the minted secret; must be non-empty.
     pub key_hash: String,
+    /// Public key identifier (the Basic user name); empty means the name.
+    #[serde(default)]
+    pub key_id: String,
     /// Granted scope set (may be empty).
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// True when `scopes` is an explicit list, even an empty one (an empty
+    /// explicit list denies each scope).
+    #[serde(default)]
+    pub scopes_set: bool,
     /// Free-form description shown by the key list.
     #[serde(default)]
     pub description: String,
     /// Mint time (`YYYY-MM-DDTHH:MM:SS+00:00`) or empty when unknown.
     #[serde(default)]
     pub created_at: String,
+    /// False when the key is disabled.
+    #[serde(default = "default_api_key_enable")]
+    pub enable: bool,
+    /// Expiry time in epoch seconds; `None` never expires.
+    #[serde(default)]
+    pub expired_at: Option<u64>,
+    /// `administrator`, `viewer` or `publisher`; empty means
+    /// `administrator`.
+    #[serde(default = "default_api_key_role")]
+    pub role: String,
+}
+
+fn default_api_key_enable() -> bool {
+    true
+}
+
+fn default_api_key_role() -> String {
+    "administrator".to_string()
+}
+
+impl Default for ApiKeyEntry {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            key_hash: String::new(),
+            key_id: String::new(),
+            scopes: Vec::new(),
+            scopes_set: false,
+            description: String::new(),
+            created_at: String::new(),
+            enable: default_api_key_enable(),
+            expired_at: None,
+            role: default_api_key_role(),
+        }
+    }
 }
 
 /// Root: management API key records.
@@ -1667,6 +1717,20 @@ impl ApiKeysConf {
                         "api_keys.keys[{index}].scopes holds an invalid scope (field `scopes`)"
                     )));
                 }
+            }
+            if entry.key_id.len() > MAX_API_KEY_NAME_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "api_keys.keys[{index}].key_id is too long (field `key_id`)"
+                )));
+            }
+            if !matches!(
+                entry.role.as_str(),
+                "" | "administrator" | "viewer" | "publisher"
+            ) {
+                return Err(ConfigError::Invalid(format!(
+                    "api_keys.keys[{index}].role {:?} is not known (field `role`)",
+                    entry.role
+                )));
             }
             if !seen.insert(entry.name.clone()) {
                 return Err(ConfigError::Invalid(format!(

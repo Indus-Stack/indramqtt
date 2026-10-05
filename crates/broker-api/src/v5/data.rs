@@ -185,9 +185,14 @@ fn redacted_root(name: &str, snapshot: &FullSnapshot) -> Value {
         "api_keys" => json!({
             "keys": snapshot.api_keys.keys.iter().map(|entry| json!({
                 "name": entry.name,
+                "key_id": entry.key_id,
                 "scopes": entry.scopes,
+                "scopes_set": entry.scopes_set,
                 "description": entry.description,
                 "created_at": entry.created_at,
+                "enable": entry.enable,
+                "expired_at": entry.expired_at,
+                "role": entry.role,
             })).collect::<Vec<_>>(),
         }),
         "sso_backends" => json!({
@@ -781,9 +786,14 @@ mod tests {
         snapshot.api_keys.keys.push(broker_config::ApiKeyEntry {
             name: "key-1".to_string(),
             key_hash: SENTINEL.to_string(),
-            scopes: Vec::new(),
+            key_id: "0123456789abcdef".to_string(),
+            scopes: vec!["audit".to_string()],
+            scopes_set: true,
             description: String::new(),
             created_at: String::new(),
+            enable: false,
+            expired_at: Some(4_102_444_800),
+            role: "viewer".to_string(),
         });
         snapshot
             .sso_backends
@@ -819,6 +829,18 @@ mod tests {
         assert!(users.to_string().contains("sensor"));
         let connectors = redacted_root("connectors", &snapshot);
         assert!(connectors.to_string().contains("pg"));
+
+        // The non-secret fields of an API key stay in; the hash does not.
+        let keys = redacted_root("api_keys", &snapshot);
+        let row = &keys["keys"][0];
+        assert_eq!(row["name"], json!("key-1"));
+        assert_eq!(row["key_id"], json!("0123456789abcdef"));
+        assert_eq!(row["scopes"], json!(["audit"]));
+        assert_eq!(row["scopes_set"], json!(true));
+        assert_eq!(row["enable"], json!(false));
+        assert_eq!(row["expired_at"], json!(4_102_444_800u64));
+        assert_eq!(row["role"], json!("viewer"));
+        assert!(row.get("key_hash").is_none());
     }
 
     // The archive holds every payload part under the backup base dir.

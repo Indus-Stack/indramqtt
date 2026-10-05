@@ -15,16 +15,21 @@ use axum::{
 };
 
 use crate::admin_users::AdminRole;
+use crate::v5::api_keys::{KeyDecision, KeyGrant, KeyRole, ResolvedApiKey};
 use crate::v5::auth::{authenticated_user, TokenInfo};
 use crate::ApiState;
 
 /// Credentials presented on a management API request.
 ///
-/// The management API accepts three bearer credentials: the token of a
-/// user who logged in, the secret of an API key that `POST /api_key`
-/// made ([`crate::v5::api_keys::ApiKeyStore`]), and an operator key from
-/// the environment of the process ([`crate::api_keys::ApiKeyStore`]).
-/// `Authorization: Basic` is parsed, but it never gives an identity.
+/// The management API accepts these credentials:
+/// - the token of a user who logged in (`Authorization: Bearer`);
+/// - an API key that `POST /api_key` made
+///   ([`crate::v5::api_keys::ApiKeyStore`]): `Authorization: Basic
+///   base64(api_key:api_secret)` as in the reference API, or the secret
+///   as `Authorization: Bearer <api_secret>` as an extension;
+/// - an operator key from the environment of the process
+///   ([`crate::api_keys::ApiKeyStore`]), as a bearer credential.
+///
 /// [`resolve_credentials`] is the one place that gives an identity.
 #[derive(Debug)]
 pub enum Credentials {
@@ -58,15 +63,15 @@ pub fn parse_credentials(headers: &HeaderMap) -> Option<Credentials> {
     None
 }
 
-/// The identity of a request, and the scopes when the credential is an
+/// The identity of a request, and the grant when the credential is an
 /// API key of the key store.
 #[derive(Debug, Clone)]
 pub struct ResolvedIdentity {
     pub info: TokenInfo,
     /// `Some` for an API key that `POST /api_key` made. The middleware
-    /// applies these scopes to the request path. `None` for a user
-    /// token and for an operator key from the environment.
-    pub key_scopes: Option<Vec<String>>,
+    /// applies the role and the scopes to the request path. `None` for a
+    /// user token and for an operator key from the environment.
+    pub key_grant: Option<KeyGrant>,
 }
 
 /// The lifetime of the identity of one API-key request. The key does
@@ -76,43 +81,62 @@ const API_KEY_IDENTITY_TTL: std::time::Duration = std::time::Duration::from_secs
 
 /// Resolve credentials to an authenticated identity.
 ///
-/// The order is: the token of a user (the role is read again from the
-/// user store, and the token of a removed user does not work), then an
-/// API key of the key store, then an operator key from the environment.
-/// An API key of the key store has the name `api-key:<name>` in the
-/// audit log. Its role is administrator, and its scopes limit the paths
-/// (see [`crate::v5::api_keys::key_may_call`]). An operator key from the
-/// environment has no scopes and no path limit: the person who sets the
-/// environment of the process controls the broker already.
+/// The order for a Bearer credential is: the token of a user (the role is
+/// read again from the user store, and the token of a removed user does
+/// not work), then an API key of the key store, then an operator key from
+/// the environment. A Basic credential is an API key of the key store:
+/// the user name is the `api_key` identifier and the password is the
+/// `api_secret`. The key store gives no identity to a disabled key or to
+/// an expired key.
+///
+/// An API key of the key store has the name `api-key:<name>` in the audit
+/// log. A `viewer` key has the viewer role of a user who logged in, and
+/// any other key has the administrator role. The role and the scopes
+/// limit the paths (see [`crate::v5::api_keys::key_decision`]). An
+/// operator key from the environment has no scopes and no path limit: the
+/// person who sets the environment of the process controls the broker
+/// already.
 pub fn resolve_credentials(state: &ApiState, headers: &HeaderMap) -> Option<ResolvedIdentity> {
     match parse_credentials(headers)? {
         Credentials::Bearer(token) => {
             if let Some(info) = authenticated_user(state, headers) {
                 return Some(ResolvedIdentity {
                     info,
-                    key_scopes: None,
+                    key_grant: None,
                 });
             }
             if let Some(key) = state.api_keys.resolve(&token) {
-                return Some(ResolvedIdentity {
-                    info: TokenInfo {
-                        username: format!("api-key:{}", key.name),
-                        role: AdminRole::Administrator,
-                        expires_at: std::time::Instant::now() + API_KEY_IDENTITY_TTL,
-                        must_change_password: false,
-                    },
-                    key_scopes: Some(key.scopes),
-                });
+                return Some(key_identity(key));
             }
             state
                 .operator_api_keys
                 .resolve(&token)
                 .map(|info| ResolvedIdentity {
                     info,
-                    key_scopes: None,
+                    key_grant: None,
                 })
         }
-        Credentials::Basic { .. } => None,
+        Credentials::Basic { username, secret } => state
+            .api_keys
+            .resolve_basic(&username, &secret)
+            .map(key_identity),
+    }
+}
+
+/// The identity of a request that an API key of the key store signed.
+fn key_identity(key: ResolvedApiKey) -> ResolvedIdentity {
+    let role = match key.grant.role {
+        KeyRole::Viewer => AdminRole::Viewer,
+        KeyRole::Administrator | KeyRole::Publisher => AdminRole::Administrator,
+    };
+    ResolvedIdentity {
+        info: TokenInfo {
+            username: format!("api-key:{}", key.name),
+            role,
+            expires_at: std::time::Instant::now() + API_KEY_IDENTITY_TTL,
+            must_change_password: false,
+        },
+        key_grant: Some(key.grant),
     }
 }
 
@@ -157,7 +181,24 @@ fn scope_forbidden() -> Response {
         StatusCode::FORBIDDEN,
         Json(serde_json::json!({
             "code": "FORBIDDEN",
-            "message": "this API key does not have the scope for this path"
+            "message": "this API key does not have the right to call this path"
+        })),
+    )
+        .into_response()
+}
+
+/// The answer to a key that calls an operation which the reference lists
+/// for a bearer token only. `POST /logout` documents 401 and the other
+/// operations document 403 or nothing, thus they get 403.
+fn login_only(path: &str) -> Response {
+    if path.trim_end_matches('/') == "/api/v5/logout" {
+        return unauthorized("this operation needs the token of a user who logged in");
+    }
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "code": "FORBIDDEN",
+            "message": "this operation needs the token of a user who logged in"
         })),
     )
         .into_response()
@@ -255,9 +296,11 @@ pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next:
     };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    if let Some(scopes) = &identity.key_scopes {
-        if !crate::v5::api_keys::key_may_call(scopes, &path) {
-            return scope_forbidden();
+    if let Some(grant) = &identity.key_grant {
+        match crate::v5::api_keys::key_decision(grant, &path) {
+            KeyDecision::Allowed => {}
+            KeyDecision::LoginOnly => return login_only(&path),
+            KeyDecision::Forbidden => return scope_forbidden(),
         }
     }
     let info = identity.info;
@@ -345,6 +388,12 @@ mod tests {
         assert!(parse_credentials(&HeaderMap::new()).is_none());
         assert!(parse_credentials(&headers_with("Bearer ")).is_none());
         assert!(parse_credentials(&headers_with("Basic !!!not-base64!!!")).is_none());
+    }
+
+    #[test]
+    fn a_basic_credential_with_an_empty_user_name_is_refused() {
+        // ":secret" in base64.
+        assert!(parse_credentials(&headers_with("Basic OnNlY3JldA==")).is_none());
     }
 
     #[test]

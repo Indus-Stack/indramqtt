@@ -2287,9 +2287,23 @@ mod tests {
             body: Option<Value>,
             token: Option<&str>,
         ) -> (u16, Value) {
+            let authorization = token.map(|token| format!("Bearer {token}"));
+            self.send_with_authorization(method, path, body, authorization.as_deref())
+                .await
+        }
+
+        /// Send a request with a complete `Authorization` header value,
+        /// for example `Basic ...`.
+        async fn send_with_authorization(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<Value>,
+            authorization: Option<&str>,
+        ) -> (u16, Value) {
             let mut head = format!("{method} {path} HTTP/1.0\r\nHost: test\r\n");
-            if let Some(token) = token {
-                head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            if let Some(authorization) = authorization {
+                head.push_str(&format!("Authorization: {authorization}\r\n"));
             }
             if let Some(body) = body {
                 let raw_body = serde_json::to_string(&body).expect("encode body");
@@ -2305,6 +2319,26 @@ mod tests {
 
         async fn post(&self, path: &str, body: Value) -> (u16, Value) {
             self.send("POST", path, Some(body), None).await
+        }
+
+        /// `GET` with the Basic credentials of an API key.
+        async fn get_basic(&self, path: &str, key_id: &str, secret: &str) -> (u16, Value) {
+            let authorization = basic_authorization(key_id, secret);
+            self.send_with_authorization("GET", path, None, Some(&authorization))
+                .await
+        }
+
+        /// `POST` with the Basic credentials of an API key.
+        async fn post_basic(
+            &self,
+            path: &str,
+            body: Value,
+            key_id: &str,
+            secret: &str,
+        ) -> (u16, Value) {
+            let authorization = basic_authorization(key_id, secret);
+            self.send_with_authorization("POST", path, Some(body), Some(&authorization))
+                .await
         }
 
         async fn post_auth(&self, path: &str, body: Value, token: &str) -> (u16, Value) {
@@ -2446,65 +2480,202 @@ mod tests {
         assert_eq!(status, 400);
     }
 
-    /// The secret of a key from `POST /api_key` is a bearer credential.
-    /// The scopes of the key limit the paths, no key can manage keys or
-    /// users, and a removed key does not work.
+    /// The `Authorization: Basic` value for an API key.
+    fn basic_authorization(key_id: &str, secret: &str) -> String {
+        use base64::Engine;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{key_id}:{secret}"));
+        format!("Basic {encoded}")
+    }
+
+    /// Makes a key through the API and returns the identifier and the
+    /// secret.
+    async fn make_key(server: &TestServer, token: &str, body: Value) -> (String, String) {
+        let (status, created) = server.post_auth("/api/v5/api_key", body, token).await;
+        assert_eq!(status, 200, "create: {created}");
+        (
+            created["api_key"].as_str().expect("identifier").to_string(),
+            created["api_secret"].as_str().expect("secret").to_string(),
+        )
+    }
+
+    /// The secret of a key from `POST /api_key` works as the password of
+    /// Basic authentication (user name: the `api_key` identifier) and as
+    /// a bearer credential. The scopes of the key limit the paths, the
+    /// operations that the reference lists for a bearer token only refuse
+    /// a key, and a removed, disabled or expired key does not work.
     #[tokio::test]
     async fn an_api_key_authenticates_with_its_scopes() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/api_key",
-                json!({"name": "scoped", "scopes": ["monitoring"]}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 201, "create: {body}");
-        let scoped = body["api_key"].as_str().expect("secret").to_string();
-        let (status, body) = server
-            .post_auth("/api/v5/api_key", json!({"name": "full"}), &token)
-            .await;
-        assert_eq!(status, 201, "create: {body}");
-        let full = body["api_key"].as_str().expect("secret").to_string();
+        let (scoped_id, scoped) = make_key(
+            &server,
+            &token,
+            json!({"name": "scoped", "scopes": ["monitoring"]}),
+        )
+        .await;
+        let (full_id, full) = make_key(&server, &token, json!({"name": "full"})).await;
 
-        // The scoped key can read its group and nothing else.
+        // The scoped key can read its group and nothing else, with Basic
+        // and with Bearer.
         let (status, _) = server.get_auth("/api/v5/stats", &scoped).await;
+        assert_eq!(status, 200);
+        let (status, _) = server.get_basic("/api/v5/stats", &scoped_id, &scoped).await;
         assert_eq!(status, 200);
         let (status, body) = server.get_auth("/api/v5/clients", &scoped).await;
         assert_eq!(status, 403, "another scope: {body}");
         assert_eq!(body["code"], json!("FORBIDDEN"));
+        let (status, _) = server
+            .get_basic("/api/v5/clients", &scoped_id, &scoped)
+            .await;
+        assert_eq!(status, 403);
 
-        // The key without scopes can call each group.
-        let (status, _) = server.get_auth("/api/v5/stats", &full).await;
+        // The key with no scope list can call each group.
+        let (status, _) = server.get_basic("/api/v5/stats", &full_id, &full).await;
         assert_eq!(status, 200);
-        let (status, _) = server.get_auth("/api/v5/clients", &full).await;
+        let (status, _) = server.get_basic("/api/v5/clients", &full_id, &full).await;
         assert_eq!(status, 200);
 
-        // No key can make a key, read the keys or read the users.
-        for key in [&scoped, &full] {
+        // Basic needs the identifier and the secret together.
+        let (status, _) = server
+            .get_basic("/api/v5/stats", &full_id, "wrong-secret")
+            .await;
+        assert_eq!(status, 401);
+        let (status, _) = server.get_basic("/api/v5/stats", &scoped_id, &full).await;
+        assert_eq!(status, 401, "the secret of another key");
+        let (status, _) = server.get_basic("/api/v5/stats", "full", &full).await;
+        assert_eq!(status, 401, "the name is not the identifier");
+        let (status, _) = server.get_auth("/api/v5/stats", "scoped").await;
+        assert_eq!(status, 401, "the name is not a secret");
+
+        // The reference lists these operations for a bearer token only:
+        // no key can call them, whatever the scheme.
+        for (key_id, secret) in [(&scoped_id, &scoped), (&full_id, &full)] {
+            for path in [
+                "/api/v5/api_key",
+                "/api/v5/api_key_scopes",
+                "/api/v5/users",
+                "/api/v5/user_scopes",
+            ] {
+                let (status, body) = server.get_basic(path, key_id, secret).await;
+                assert_eq!(status, 403, "GET {path} with Basic: {body}");
+                assert_eq!(body["code"], json!("FORBIDDEN"));
+                let (status, _) = server.get_auth(path, secret).await;
+                assert_eq!(status, 403, "GET {path} with Bearer");
+            }
             let (status, _) = server
-                .post_auth("/api/v5/api_key", json!({"name": "more"}), key)
+                .post_basic("/api/v5/api_key", json!({"name": "more"}), key_id, secret)
                 .await;
             assert_eq!(status, 403);
-            let (status, _) = server.get_auth("/api/v5/api_key", key).await;
+            let (status, _) = server
+                .post_basic("/api/v5/users", json!({}), key_id, secret)
+                .await;
             assert_eq!(status, 403);
-            let (status, _) = server.get_auth("/api/v5/users", key).await;
-            assert_eq!(status, 403);
+            // Logout documents 401.
+            let (status, _) = server
+                .post_basic("/api/v5/logout", json!({}), key_id, secret)
+                .await;
+            assert_eq!(status, 401);
         }
         let (status, list) = server.get_auth("/api/v5/api_key", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(list["meta"]["count"], json!(2), "no key made a key: {list}");
+        assert_eq!(
+            list.as_array().map(Vec::len),
+            Some(2),
+            "no key made a key: {list}"
+        );
 
-        // A text that is not a secret, and the name of a key, do not work.
-        let (status, _) = server.get_auth("/api/v5/stats", "scoped").await;
+        // The operations that the reference lists for Basic accept a key
+        // without a scope list. The catalogue has no scope for them, thus
+        // a key with a scope list cannot call them.
+        let (status, body) = server
+            .get_basic("/api/v5/api_key/scoped", &full_id, &full)
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["name"], json!("scoped"));
+        assert!(body.get("api_secret").is_none());
+        let (status, _) = server.get_basic("/api/v5/sso", &full_id, &full).await;
+        assert_eq!(status, 200);
+        let (status, _) = server.get_basic("/api/v5/sso", &scoped_id, &scoped).await;
+        assert_eq!(status, 403);
+        let (status, _) = server
+            .get_basic("/api/v5/api_key/full", &scoped_id, &scoped)
+            .await;
+        assert_eq!(status, 403);
+
+        // A disabled key does not work, and works again when enabled.
+        let (status, body) = server
+            .put_auth("/api/v5/api_key/scoped", json!({"enable": false}), &token)
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["enable"], json!(false));
+        let (status, _) = server.get_auth("/api/v5/stats", &scoped).await;
         assert_eq!(status, 401);
+        let (status, _) = server.get_basic("/api/v5/stats", &scoped_id, &scoped).await;
+        assert_eq!(status, 401);
+        let (status, _) = server
+            .put_auth("/api/v5/api_key/scoped", json!({"enable": true}), &token)
+            .await;
+        assert_eq!(status, 200);
+        let (status, _) = server.get_auth("/api/v5/stats", &scoped).await;
+        assert_eq!(status, 200);
+
+        // An expired key does not work, and the read shows `expired`.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/api_key/scoped",
+                json!({"expired_at": "2020-01-01T00:00:00Z"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["expired"], json!(true));
+        let (status, _) = server.get_auth("/api/v5/stats", &scoped).await;
+        assert_eq!(status, 401);
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/api_key/scoped",
+                json!({"expired_at": "infinity"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server.get_auth("/api/v5/api_key/scoped", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["expired"], json!(false));
+        assert_eq!(body["expired_at"], json!("infinity"));
+        let (status, _) = server.get_auth("/api/v5/stats", &scoped).await;
+        assert_eq!(status, 200);
+
+        // A key with the role `viewer` can read and cannot write.
+        let (viewer_id, viewer) = make_key(
+            &server,
+            &token,
+            json!({"name": "watcher", "role": "viewer"}),
+        )
+        .await;
+        let (status, _) = server.get_basic("/api/v5/stats", &viewer_id, &viewer).await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post_basic("/api/v5/publish", json!({}), &viewer_id, &viewer)
+            .await;
+        assert_eq!(status, 403, "a viewer key cannot write: {body}");
+
+        // A key with an empty scope list can call nothing.
+        let (nothing_id, nothing) =
+            make_key(&server, &token, json!({"name": "nothing", "scopes": []})).await;
+        let (status, _) = server
+            .get_basic("/api/v5/stats", &nothing_id, &nothing)
+            .await;
+        assert_eq!(status, 403);
 
         // A removed key does not work.
         let (status, _) = server.delete_auth("/api/v5/api_key/scoped", &token).await;
         assert_eq!(status, 204);
         let (status, _) = server.get_auth("/api/v5/stats", &scoped).await;
+        assert_eq!(status, 401);
+        let (status, _) = server.get_basic("/api/v5/stats", &scoped_id, &scoped).await;
         assert_eq!(status, 401);
         let (status, _) = server.get_auth("/api/v5/stats", &full).await;
         assert_eq!(status, 200);
@@ -15511,11 +15682,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
-        // Empty store reads as an empty page, never an error.
+        // Empty store reads as an empty array, never an error.
         let (status, body) = server.get_auth("/api/v5/api_key", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
-        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body, json!([]));
 
         // Mint one key: the secret is returned exactly once.
         let (status, created) = server
@@ -15525,10 +15695,31 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         assert_eq!(created["name"], json!("w225-broker-key"));
-        let secret = created["api_key"].as_str().expect("secret returned once");
+        let secret = created["api_secret"]
+            .as_str()
+            .expect("secret returned once");
         assert!(!secret.is_empty());
+        let key_id = created["api_key"].as_str().expect("identifier");
+        assert_eq!(key_id.len(), 16);
+        for field in [
+            "desc",
+            "enable",
+            "expired",
+            "expired_at",
+            "created_at",
+            "role",
+            "scopes",
+        ] {
+            assert!(created.get(field).is_some(), "create renders {field}");
+        }
+        assert_eq!(created["enable"], json!(true));
+        assert_eq!(created["expired"], json!(false));
+        assert_eq!(created["expired_at"], json!("infinity"));
+        assert_eq!(created["role"], json!("administrator"));
+        assert_eq!(created["scopes"], json!(["monitoring"]));
+        assert!(created.get("namespace").is_none());
 
         // Malformed bodies are client errors.
         let (status, _) = server
@@ -15545,18 +15736,38 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(duplicate["code"], json!("ALREADY_EXISTS"));
+        assert_eq!(duplicate["code"], json!("BAD_REQUEST"));
+
+        // The name rule of the reference: a letter first, then letters,
+        // digits, `-` and `_`.
+        for bad_name in ["1key", "-key", "has space", "has/slash"] {
+            let (status, body) = server
+                .post_auth("/api/v5/api_key", json!({"name": bad_name}), &token)
+                .await;
+            assert_eq!(status, 400, "name {bad_name}: {body}");
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+        // A namespace is not available on this node.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/api_key",
+                json!({"name": "namespaced", "namespace": "ns1"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
 
         // Listing carries metadata without secrets.
         let (status, listed) = server.get_auth("/api/v5/api_key", &token).await;
         assert_eq!(status, 200);
-        let data = listed["data"].as_array().expect("data is a list");
+        let data = listed.as_array().expect("the body is a bare array");
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["name"], json!("w225-broker-key"));
-        assert!(data[0].get("api_key").is_none());
+        assert_eq!(data[0]["api_key"], json!(key_id));
+        assert!(data[0].get("api_secret").is_none());
         assert!(data[0].get("secret").is_none());
         assert!(data[0].get("key_hash").is_none());
-        assert_eq!(listed["meta"]["count"], json!(1));
 
         // Revoke the key and confirm unknown names 404 with the
         // documented shape.
@@ -15573,7 +15784,72 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Empty again after revocation.
         let (status, body) = server.get_auth("/api/v5/api_key", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
+        assert_eq!(body, json!([]));
+    }
+
+    /// The management console creates, lists and edits keys with these
+    /// value forms: `scopes: "unset"`, an ISO time with milliseconds for
+    /// `expired_at` (or no `expired_at` for "never"), and it sends the
+    /// listed values back on an update. Each value must round-trip.
+    #[tokio::test]
+    async fn the_console_forms_of_an_api_key_round_trip() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/api_key",
+                json!({
+                    "name": "console_key",
+                    "desc": "from the console",
+                    "enable": true,
+                    "role": "viewer",
+                    "scopes": "unset",
+                    "expired_at": "2099-01-02T23:59:59.000Z",
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "{created}");
+        assert_eq!(created["scopes"], json!("unset"));
+        assert_eq!(created["role"], json!("viewer"));
+        assert_eq!(created["desc"], json!("from the console"));
+
+        // The list is a bare array. The console sends a listed row back.
+        let (status, listed) = server.get_auth("/api/v5/api_key", &token).await;
+        assert_eq!(status, 200);
+        let row = listed.as_array().expect("array")[0].clone();
+        assert_eq!(row["expired"], json!(false));
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/api_key/console_key",
+                json!({
+                    "enable": false,
+                    "desc": row["desc"],
+                    "role": row["role"],
+                    "scopes": row["scopes"],
+                    "expired_at": row["expired_at"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["enable"], json!(false));
+        assert_eq!(body["expired_at"], row["expired_at"]);
+        assert_eq!(body["scopes"], json!("unset"));
+
+        // The console omits `expired_at` to say "never expires".
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/api_key/console_key",
+                json!({"enable": true, "desc": "", "role": "administrator", "scopes": ["audit"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["expired_at"], json!("infinity"));
+        assert_eq!(body["role"], json!("administrator"));
+        assert_eq!(body["scopes"], json!(["audit"]));
     }
 
     #[tokio::test]
@@ -15595,11 +15871,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/api_key",
-                json!({"name": "w226-broker-key", "scopes": ["monitoring"], "description": "before"}),
+                json!({"name": "w226-broker-key", "scopes": ["monitoring"], "desc": "before"}),
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
 
         // Read it back: metadata only, never the secret.
         let (status, body) = server
@@ -15608,8 +15884,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 200);
         assert_eq!(body["name"], json!("w226-broker-key"));
         assert_eq!(body["scopes"], json!(["monitoring"]));
-        assert_eq!(body["description"], json!("before"));
-        assert!(body.get("api_key").is_none());
+        assert_eq!(body["desc"], json!("before"));
+        assert!(body["api_key"].is_string());
+        assert!(body.get("api_secret").is_none());
         assert!(body.get("secret").is_none());
         assert!(body.get("key_hash").is_none());
 
@@ -15637,22 +15914,23 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, updated) = server
             .put_auth(
                 "/api/v5/api_key/w226-broker-key",
-                json!({"scopes": ["connections", "publish"], "description": "after"}),
+                json!({"scopes": ["connections", "publish"], "desc": "after"}),
                 &token,
             )
             .await;
         assert_eq!(status, 200);
         assert_eq!(updated["name"], json!("w226-broker-key"));
         assert_eq!(updated["scopes"], json!(["connections", "publish"]));
-        assert_eq!(updated["description"], json!("after"));
-        assert!(updated.get("api_key").is_none());
+        assert_eq!(updated["desc"], json!("after"));
+        assert!(updated["api_key"].is_string());
+        assert!(updated.get("api_secret").is_none());
         assert!(updated.get("key_hash").is_none());
         let (status, reread) = server
             .get_auth("/api/v5/api_key/w226-broker-key", &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(reread["scopes"], json!(["connections", "publish"]));
-        assert_eq!(reread["description"], json!("after"));
+        assert_eq!(reread["desc"], json!("after"));
 
         // Bad values are client errors and apply nothing.
         let (status, _) = server
@@ -15698,11 +15976,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .put_auth(
                 "/api/v5/api_key/w226-persist",
-                json!({"scopes": ["connections"], "description": "kept"}),
+                json!({"scopes": ["connections"], "desc": "kept"}),
                 &token,
             )
             .await;
@@ -15727,8 +16005,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["scopes"], json!(["connections"]));
-        assert_eq!(body["description"], json!("kept"));
-        assert!(body.get("api_key").is_none());
+        assert_eq!(body["desc"], json!("kept"));
+        assert!(body["api_key"].is_string());
+        assert!(body.get("api_secret").is_none());
         drop(server);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -17588,7 +17867,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .post_auth(
                 "/api/v5/api_key",
@@ -17596,7 +17875,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
 
         // Query the log: both entries read back with paging metadata.
         let (status, body) = server.get_auth("/api/v5/audit", &token).await;
