@@ -6,6 +6,27 @@ This roadmap outlines our completed milestones, active capabilities, and future 
 
 ---
 
+## Stable Release and Licence
+
+- **Stable release:** the target for the first stable release (1.0) is April 2027.
+- **Open source:** all stable releases of IndraMQTT will be open source.
+- **Licence:** since October 2026, all the code in this repository is under MIT OR Apache-2.0. There is no enterprise edition.
+- **Licence functions:** the code still contains licence functions from the earlier model (trial period, licence key, the names "community" and "enterprise"). We remove them step by step before the stable release.
+
+### Path to the stable release
+
+This is a plan. The order can change.
+
+| Period | Work |
+| :--- | :--- |
+| October to November 2026 | MQTT listener of the kernel for TCP and TLS (done, off by default). WebSocket, secure WebSocket, PSK, client certificates and UNSUBSCRIBE on the kernel listener. MQTT over QUIC. A wider broker comparison with more brokers. |
+| December 2026 to January 2027 | The end-to-end test suite on the kernel listener. The kernel listener becomes the default and the Erlang edge is deprecated. Tenant management. Connections stay open during a planned restart. |
+| February to April 2027 | Connections stay open after a crash, and TLS with kTLS. Removal of the Erlang edge. Removal of the last licence functions. Connector qualification against real servers. Cluster and soak tests. Security review. Documentation. Stable release 1.0. |
+
+The steps of the move to one Rust process are in the section "One Rust Process" below.
+
+---
+
 ## 1. Platform Milestones
 
 ```mermaid
@@ -70,6 +91,20 @@ gantt
 
 ---
 
+## One Rust Process (in work)
+
+The broker moves from an Erlang edge plus a Rust kernel to one Rust process. The reason and the measured loads are in the README.
+
+1. MQTT listener of the kernel for TCP and TLS (done, off by default).
+2. WebSocket, secure WebSocket, PSK, client certificates and UNSUBSCRIBE on the kernel listener.
+3. MQTT over QUIC on the kernel listener.
+4. The end-to-end test suite on the kernel listener.
+5. The kernel listener becomes the default. The Erlang edge is deprecated.
+6. Connections stay open during a restart: planned restart for TCP and WebSocket, then the crash case, then TLS with kTLS.
+7. The Erlang edge is removed.
+
+---
+
 ## 4. Deferred Milestones
 
 - **Category A: AI & LLM Suite (`INDRA-141..INDRA-146`)**: OpenAI, Anthropic, Gemini, MCP Bridge, MCP over MQTT, Realtime AI. Bypassed per project directive.
@@ -77,4 +112,4 @@ gantt
 
 ---
 
-For inquiries, enterprise feature requests, or partnership discussions, visit [indramqtt.com](https://indramqtt.com) or reach out to [sales@i-dacs.com](mailto:sales@i-dacs.com).
+For inquiries, feature requests, or partnership discussions, visit [indramqtt.com](https://indramqtt.com) or reach out to [sales@i-dacs.com](mailto:sales@i-dacs.com).

@@ -20,13 +20,12 @@ use crate::ApiState;
 
 /// Credentials presented on a management API request.
 ///
-/// The management API accepts `Authorization: Bearer <dashboard token>`
-/// and `Authorization: Bearer <operator API key>` (M1-06: the minimum
-/// backing store in [`crate::api_keys::ApiKeyStore`]), plus
-/// `Authorization: Basic <api_key:api_secret>` on `/api/v5`. Basic
-/// credentials have no store yet and never resolve; the single
-/// [`resolve_credentials`] function stays the one place that changes when
-/// the full key lifecycle lands.
+/// The management API accepts three bearer credentials: the token of a
+/// user who logged in, the secret of an API key that `POST /api_key`
+/// made ([`crate::v5::api_keys::ApiKeyStore`]), and an operator key from
+/// the environment of the process ([`crate::api_keys::ApiKeyStore`]).
+/// `Authorization: Basic` is parsed, but it never gives an identity.
+/// [`resolve_credentials`] is the one place that gives an identity.
 #[derive(Debug)]
 pub enum Credentials {
     Bearer(String),
@@ -59,18 +58,59 @@ pub fn parse_credentials(headers: &HeaderMap) -> Option<Credentials> {
     None
 }
 
+/// The identity of a request, and the scopes when the credential is an
+/// API key of the key store.
+#[derive(Debug, Clone)]
+pub struct ResolvedIdentity {
+    pub info: TokenInfo,
+    /// `Some` for an API key that `POST /api_key` made. The middleware
+    /// applies these scopes to the request path. `None` for a user
+    /// token and for an operator key from the environment.
+    pub key_scopes: Option<Vec<String>>,
+}
+
+/// The lifetime of the identity of one API-key request. The key does
+/// not expire. Each request finds the key again, thus this time must
+/// only be longer than one request.
+const API_KEY_IDENTITY_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Resolve credentials to an authenticated identity.
 ///
-/// Bearer tokens go through the token store first (fresh roles, tokens of
-/// deleted users revoked); a token that is not a dashboard token is then
-/// checked against the operator API-key store (M1-06 minimum for
-/// `indra ctl`). Basic API keys have no store yet and always resolve to
-/// unknown. Keep all credential resolution here so the full key lifecycle
-/// plugs in later without touching routes or handlers.
-pub fn resolve_credentials(state: &ApiState, headers: &HeaderMap) -> Option<TokenInfo> {
+/// The order is: the token of a user (the role is read again from the
+/// user store, and the token of a removed user does not work), then an
+/// API key of the key store, then an operator key from the environment.
+/// An API key of the key store has the name `api-key:<name>` in the
+/// audit log. Its role is administrator, and its scopes limit the paths
+/// (see [`crate::v5::api_keys::key_may_call`]). An operator key from the
+/// environment has no scopes and no path limit: the person who sets the
+/// environment of the process controls the broker already.
+pub fn resolve_credentials(state: &ApiState, headers: &HeaderMap) -> Option<ResolvedIdentity> {
     match parse_credentials(headers)? {
         Credentials::Bearer(token) => {
-            authenticated_user(state, headers).or_else(|| state.operator_api_keys.resolve(&token))
+            if let Some(info) = authenticated_user(state, headers) {
+                return Some(ResolvedIdentity {
+                    info,
+                    key_scopes: None,
+                });
+            }
+            if let Some(key) = state.api_keys.resolve(&token) {
+                return Some(ResolvedIdentity {
+                    info: TokenInfo {
+                        username: format!("api-key:{}", key.name),
+                        role: AdminRole::Administrator,
+                        expires_at: std::time::Instant::now() + API_KEY_IDENTITY_TTL,
+                        must_change_password: false,
+                    },
+                    key_scopes: Some(key.scopes),
+                });
+            }
+            state
+                .operator_api_keys
+                .resolve(&token)
+                .map(|info| ResolvedIdentity {
+                    info,
+                    key_scopes: None,
+                })
         }
         Credentials::Basic { .. } => None,
     }
@@ -107,6 +147,17 @@ fn password_change_required() -> Response {
         Json(serde_json::json!({
             "code": "PASSWORD_CHANGE_REQUIRED",
             "message": "password change required before using the API"
+        })),
+    )
+        .into_response()
+}
+
+fn scope_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "code": "FORBIDDEN",
+            "message": "this API key does not have the scope for this path"
         })),
     )
         .into_response()
@@ -179,19 +230,37 @@ fn hex_val(byte: u8) -> Option<u8> {
     }
 }
 
+/// True for the three routes with which a user enrols MFA. A viewer can
+/// call them, and the route functions let a viewer name only that viewer
+/// (see `v5::mfa::caller_may_target`).
+fn is_mfa_self_service(method: &axum::http::Method, path: &str) -> bool {
+    *method == axum::http::Method::POST
+        && matches!(
+            path,
+            "/api/v5/sso/mfa/setup" | "/api/v5/sso/mfa/setup_info" | "/api/v5/sso/mfa/verify"
+        )
+}
+
 /// Require authentication on every route behind this layer.
 ///
 /// Exemptions are structural: public routes (login, health, dashboard
 /// assets, `/ws/mqtt`) never pass through here. Inside, the only
 /// exemptions are logout and current_user plus a user's own password
 /// change while `must_change_password` is set, and GET-only access for
-/// viewers.
+/// viewers. A viewer can also call the three MFA enrolment routes for
+/// that viewer.
 pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next: Next) -> Response {
-    let Some(info) = resolve_credentials(&state, req.headers()) else {
+    let Some(identity) = resolve_credentials(&state, req.headers()) else {
         return unauthorized("missing or invalid credentials");
     };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    if let Some(scopes) = &identity.key_scopes {
+        if !crate::v5::api_keys::key_may_call(scopes, &path) {
+            return scope_forbidden();
+        }
+    }
+    let info = identity.info;
     // `resolve_credentials` already loaded the user fresh from the store
     // (revoking tokens of deleted users), so `info` carries the current
     // role and `must_change_password` with no second `admin_users.get`.
@@ -205,7 +274,10 @@ pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next:
         return password_change_required();
     }
     if info.role == AdminRole::Viewer
-        && !(method == axum::http::Method::GET || is_logout || own_change)
+        && !(method == axum::http::Method::GET
+            || is_logout
+            || own_change
+            || is_mfa_self_service(&method, &path))
     {
         return forbidden();
     }

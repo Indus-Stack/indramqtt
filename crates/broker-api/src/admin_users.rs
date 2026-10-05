@@ -207,6 +207,9 @@ pub struct AdminUsers {
     /// verify, one entry per known user at most (memory-only).
     /// Management-plane only: publish and deliver never touch this map.
     mfa_attempts: Mutex<HashMap<String, MfaAttempt>>,
+    /// Failed password logins for each known user. The same bound and
+    /// the same cool-down as the MFA attempts.
+    login_attempts: Mutex<HashMap<String, MfaAttempt>>,
 }
 
 impl AdminUsers {
@@ -222,6 +225,7 @@ impl AdminUsers {
             registry: None,
             save_lock: Mutex::new(()),
             mfa_attempts: Mutex::new(HashMap::new()),
+            login_attempts: Mutex::new(HashMap::new()),
         };
         store
             .users
@@ -243,6 +247,7 @@ impl AdminUsers {
             registry: None,
             save_lock: Mutex::new(()),
             mfa_attempts: Mutex::new(HashMap::new()),
+            login_attempts: Mutex::new(HashMap::new()),
         };
         if conf.users.is_empty() {
             store
@@ -334,6 +339,10 @@ impl AdminUsers {
         self.mfa_attempts
             .lock()
             .unwrap()
+            .retain(|name, _| fresh_users.contains_key(name));
+        self.login_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|name, _| fresh_users.contains_key(name));
         let mut users = self.users.write().unwrap();
         *users = fresh_users;
@@ -559,6 +568,66 @@ impl AdminUsers {
             }
         }
         self.persist()
+    }
+
+    /// True when the user has too many failed password logins and the
+    /// cool-down is not complete. An unknown user is never locked: no
+    /// entry is kept for a name that is not a user, thus the map stays in
+    /// [`MAX_ADMIN_USERS`] entries.
+    pub fn login_locked(&self, username: &str) -> bool {
+        let mut attempts = self
+            .login_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        match attempts
+            .get(username)
+            .and_then(|attempt| attempt.locked_until)
+        {
+            Some(until) if until > now => true,
+            Some(_) => {
+                // The cool-down is complete: the user gets new attempts.
+                attempts.remove(username);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Records one failed password login of a known user. After
+    /// [`MFA_VERIFY_MAX_ATTEMPTS`] failures in sequence, the user cannot
+    /// log in for [`MFA_VERIFY_LOCKOUT_SECS`] seconds. A name that is not
+    /// a user is not recorded.
+    pub fn record_login_failure(&self, username: &str) {
+        let known = self
+            .users
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(username);
+        if !known {
+            return;
+        }
+        let mut attempts = self
+            .login_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = attempts.entry(username.to_string()).or_insert(MfaAttempt {
+            consecutive_failures: 0,
+            locked_until: None,
+        });
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        if entry.consecutive_failures >= MFA_VERIFY_MAX_ATTEMPTS {
+            entry.locked_until =
+                Some(Instant::now() + Duration::from_secs(MFA_VERIFY_LOCKOUT_SECS));
+        }
+    }
+
+    /// Removes the failed-login count of a user after a correct login.
+    pub fn clear_login_failures(&self, username: &str) {
+        self.login_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(username);
     }
 
     /// Constant-time check of `password` against the stored `StoredKey`.

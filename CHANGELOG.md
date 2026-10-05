@@ -9,14 +9,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased] - Sprint 20
 
 ### Added
+- **MQTT listeners of the kernel**: with `listeners.tcp.native = true` or `listeners.tls.native = true`, the kernel accepts the MQTT clients of that listener itself, without the edge process in the data path. The default is `false`. The kernel listener handles MQTT 3.1.1 and MQTT 5, applies `listeners.tcp.max_connections`, limits a CONNECT packet to 64 KiB and other packets to 1 MiB, and closes a client that does not read for 30 seconds. UNSUBSCRIBE, WebSocket and PSK are not available on this listener yet.
+- **Broker comparison**: [`benchmark/`](benchmark/README.md) contains the method, the tool and the raw results of the comparison at 1 CPU and 1 GB.
 - **Amazon Kinesis Sink (`INDRA-197`)**: High-throughput `PutRecords` batch ingestion with SigV4 signing, dynamic partition key derivation, and partial-failure exponential retry.
 - **Google Cloud Pub/Sub Sink (`INDRA-199`)**: `v1.publisher.publish` batch sink with ordering keys, dynamic attributes, and OAuth2/JWT authentication.
 - **Azure Event Hubs Sink (`INDRA-198`)**: Batch event ingestion with Shared Access Signature (SAS) token generation and partition key hashing.
 - **Apache Pulsar Producer Sink (`INDRA-153`)**: Multi-tenant (`tenant/namespace/topic`) partitioned producer with keyed routing and sequence tracking.
 - **Cloud Streaming Studio (`INDRA-218`)**: REST API and Web Dashboard forms for all 4 cloud bridges.
 
+- **API keys as bearer credentials**: the secret of a key from `POST /api/v5/api_key` now authenticates a request as `Authorization: Bearer <secret>`. A key with scopes can call only the paths of those scopes. A key with no scopes can call each path that a key can call. No key can manage API keys, administrator users or single sign-on. A create or an update refuses a scope that is not in `GET /api/v5/api_key_scopes`.
+- **Licence endpoints of the reference API**: `GET/POST /api/v5/license`, `GET/PUT /api/v5/license/setting` and `GET /api/v5/license/session_hwm_history`. The broker is open source: the licence document is fixed, it does not expire, and its limits are 10,000,000,000. The broker applies no limit from it. The session history is the highest number of connected sessions for each day, kept for 24 months.
+- **MFA at login**: a user with MFA must send the code as `mfa_token` in the login request. Without the code, or with an incorrect code, the answer is 401 with the code `BAD_MFA_TOKEN`. A viewer can enrol MFA for that viewer.
+- **Login lockout**: five incorrect passwords in sequence lock the user for 60 seconds. The answer is 401 with the code `LOGIN_LOCKED`.
+- **Login error code**: an incorrect user name or password gets the code `BAD_USERNAME_OR_PWD`. Before this change the code was `NAME_PWD_ERROR`.
+
 ### Changed
+- **Licence**: all the code in this repository is now under MIT OR Apache-2.0. The enterprise licence file and the licensing guide are removed. The crates `broker-cluster`, `broker-connectors-enterprise` and `broker-rules-enterprise` use the licence of the workspace. The licence functions in the code (trial period, licence key, tier names) stay for now. They are removed step by step before the stable release.
+- **README**: the README is written again in Simplified Technical English. It has the roadmap to the stable release.
+- **Direction**: the Erlang edge will be deprecated. The MQTT listener of the kernel will get the functions of the edge and then become the default. A later release removes the edge.
+- **Release profile**: a panic now unwinds. A panic in the task of one connection ends only that connection, and the kernel releases its session. Before this change, one panic stopped the broker.
+- **Subscription statistics**: the count of subscriptions and topics runs when a statistic is read. Before this change, it ran for each connect, subscribe and disconnect, and the work increased with the square of the number of connections. A maximum can miss a peak that is between two reads.
 - **Kafka connector `health_check_topic` default**: the schema default is now `indramqtt_health_check`. Anyone who set the topic explicitly is unaffected; to keep the previous topic, set `health_check_topic` explicitly in the connector configuration.
+
+### Unstable
+- **Single sign-on**: the login endpoints of single sign-on answer 501. They did not connect to an identity provider. The endpoints that store a backend stay.
+
+### Fixed
+- **Messages that did not arrive in a large fan-out**: the kernel wrote one batch for each wake of a link and then waited. A publish to more subscribers than one batch holds left messages in the queues, and the kernel counted them as delivered. The kernel now writes until the queues are empty.
 
 ---
 

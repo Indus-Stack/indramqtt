@@ -66,6 +66,10 @@ PY
 EOF
 
 API_KEY_GOOD=boot-smoke-key-0001
+# With SMOKE_NATIVE=1 the kernel owns the plaintext MQTT listener
+# (listeners.tcp.native = true). Without it the edge owns the listener.
+# The MQTT checks are the same for the two modes.
+if [ "${SMOKE_NATIVE:-0}" = 1 ]; then NATIVE=true; else NATIVE=false; fi
 mkdir -p "$ROOT/cfg" "$ROOT/data"
 cat > "$ROOT/cfg/indra.toml" <<EOF
 [node]
@@ -75,6 +79,7 @@ brokerlink_bind = "127.0.0.1:$LINK_PORT"
 
 [listeners.tcp]
 bind = "127.0.0.1:$MQTT_PORT"
+native = $NATIVE
 
 [listeners.ws]
 bind = "127.0.0.1:$WS_PORT"
@@ -226,6 +231,37 @@ except OSError:
 report("a publish goes to a subscriber through the edge and the kernel",
        suback[:1] == b"\x90" and delivered.endswith(b"smoke-ok"))
 
+# MQTT 5 delivery. Each MQTT 5 PUBLISH has a property length, also when
+# there are no properties. The check compares the full packet.
+def mqtt5_client(client_id):
+    sock = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x05\x02\x00\x3c\x00" + field(client_id)))
+    ack = receive(sock, 5)
+    return sock, len(ack) >= 4 and ack[0] == 0x20 and ack[3] == 0
+
+def subscribe5(sock, topic):
+    sock.sendall(packet(0x82, b"\x00\x02\x00" + field(topic) + b"\x00"))
+    ack = receive(sock, 5)
+    return len(ack) >= 6 and ack[0] == 0x90 and ack[4] == 0 and ack[5] == 0
+
+v5_topic = b"smoke/v5"
+v5_token = os.urandom(8).hex().encode()
+v5_sub, v5_ok = mqtt5_client(b"smoke-v5-sub")
+v5_ready = v5_ok and subscribe5(v5_sub, v5_topic)
+# The publisher sets the retain flag, thus the broker keeps the message.
+pub.sendall(packet(0x31, field(v5_topic) + v5_token))
+report("an MQTT 5 subscriber gets a publish with an empty property section",
+       v5_ready and receive(v5_sub, 5) == packet(0x30, field(v5_topic) + b"\x00" + v5_token))
+v5_late, v5_late_ok = mqtt5_client(b"smoke-v5-late")
+v5_late.sendall(packet(0x82, b"\x00\x02\x00" + field(v5_topic) + b"\x00"))
+v5_replay = b""
+for _ in range(2):
+    v5_replay += receive(v5_late, 5)
+    if v5_token in v5_replay:
+        break
+report("a new MQTT 5 subscription gets the retained message with the retain flag",
+       v5_late_ok and v5_replay.endswith(packet(0x31, field(v5_topic) + b"\x00" + v5_token)))
+
 # Tenants. The payload is random, thus the broker cannot know it.
 def tenant_client(client_id, username):
     sock = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)
@@ -234,6 +270,37 @@ def tenant_client(client_id, username):
 def subscribe(sock, topic):
     sock.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
     return sock.recv(5)[:1] == b"\x90"
+
+# Fan-out. One publish to many subscribers must reach each of them.
+# The count is larger than one write batch of the kernel for each link,
+# thus a kernel that writes one batch and then waits fails this check.
+import select
+fan_topic = b"smoke/fan"
+fan_token = os.urandom(6).hex().encode()
+fan_socks = []
+for index in range(400):
+    fan_sock = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)
+    if mqtt_connect(fan_sock, b"smoke-fan-%d" % index) and subscribe(fan_sock, fan_topic):
+        fan_socks.append(fan_sock)
+FAN_PUBLISHES = 4
+for _ in range(FAN_PUBLISHES):
+    pub.sendall(packet(0x30, field(fan_topic) + fan_token))
+fan_seen = {s: b"" for s in fan_socks}
+fan_deadline = time.time() + 10
+def fan_complete():
+    return all(data.count(fan_token) >= FAN_PUBLISHES for data in fan_seen.values())
+while time.time() < fan_deadline and not fan_complete():
+    readable, _, _ = select.select(fan_socks, [], [], 0.5)
+    for s in readable:
+        try:
+            fan_seen[s] += s.recv(4096)
+        except OSError:
+            pass
+fan_got = sum(data.count(fan_token) for data in fan_seen.values())
+report("each of 400 subscribers gets each of 4 publishes (%d of %d deliveries)" % (fan_got, 400 * FAN_PUBLISHES),
+       len(fan_socks) == 400 and fan_complete())
+for s in fan_socks:
+    s.close()
 
 secret = base64.b16encode(os.urandom(8))
 a_sub, a_ok = tenant_client(b"smoke-a-sub", b"alpha")
@@ -248,6 +315,25 @@ report("a subscriber gets the publish of a client in the same tenant",
        ready and in_tenant.endswith(secret))
 report("a subscriber does not get the publish of a client in a different tenant",
        ready and secret not in other_tenant)
+
+# Same client id in two tenants. Both connects succeed.
+# Both sockets stay open. A takeover between tenants fails.
+a_dup, a_dup_ok = tenant_client(b"smoke-dup", b"alpha")
+b_dup, b_dup_ok = tenant_client(b"smoke-dup", b"beta")
+b_pub, _ = tenant_client(b"smoke-b-pub", b"beta")
+dup_topic = b"smoke/dup"
+dup_ready = (a_dup_ok and b_dup_ok
+             and subscribe(a_dup, dup_topic) and subscribe(b_dup, dup_topic))
+a_pub.sendall(packet(0x30, field(dup_topic) + secret))
+a_dup_got = receive(a_dup, 5)
+b_dup_got = receive(b_dup, 2)
+report("two clients with the same client id stay connected in two tenants",
+       dup_ready and a_dup_got.endswith(secret) and secret not in b_dup_got)
+b_pub.sendall(packet(0x30, field(dup_topic) + secret))
+b_dup_got2 = receive(b_dup, 5)
+a_dup_got2 = receive(a_dup, 2)
+report("a takeover between tenants does not happen",
+       dup_ready and b_dup_got2.endswith(secret) and secret not in a_dup_got2)
 
 def upgrade(path):
     sock = wait_port(ws_port)

@@ -1,5 +1,16 @@
 //! Configured single-sign-on backends for the v5 management API.
 //!
+//! **Unstable. Not part of the first stable release.** The login flow in
+//! this module has the shape of the API, but it does not connect to an
+//! identity provider: the OIDC callback does not exchange the code and
+//! does not examine an identity token, and the SAML consumer examines a
+//! shared-secret signature that no identity provider makes. Thus the
+//! flow endpoints (`/sso/login/:backend`, `/sso/oidc/callback`,
+//! `/sso/saml/acs`, `/sso/token_exchange`) answer 501 unless
+//! [`SsoStore::set_unstable_flows`] turned them on. Production code does
+//! not turn them on. The supported login is the user name and the
+//! password with MFA, and the API keys.
+//!
 //! Covers `GET /sso` (ordered list, C05-11), `GET /sso/running`
 //! (enabled names, C05-17) and the per-backend `GET /sso/{backend}`
 //! (read one backend, C05-22), `PUT /sso/{backend}` (create or replace
@@ -223,6 +234,9 @@ pub struct SsoStore {
     /// Serialises export-commit-save so concurrent mutations cannot
     /// interleave into a lost update on disk.
     save_lock: Mutex<()>,
+    /// The login flow endpoints answer requests only when this is true.
+    /// The default is false. See the module documentation.
+    unstable_flows: std::sync::atomic::AtomicBool,
 }
 
 impl SsoStore {
@@ -233,7 +247,23 @@ impl SsoStore {
             pending: Mutex::new(HashMap::new()),
             registry: RwLock::new(None),
             save_lock: Mutex::new(()),
+            // The tests of this crate examine the flow code. A broker
+            // does not have the flow.
+            unstable_flows: std::sync::atomic::AtomicBool::new(cfg!(test)),
         }
+    }
+
+    /// Turns the unstable login flow endpoints on or off. Only tests
+    /// call this function.
+    pub fn set_unstable_flows(&self, enabled: bool) {
+        self.unstable_flows
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True when the unstable login flow endpoints answer requests.
+    pub fn unstable_flows_enabled(&self) -> bool {
+        self.unstable_flows
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Seed from a validated snapshot root. Memory-only.
@@ -858,6 +888,18 @@ pub async fn delete_sso_backend(
     }
 }
 
+/// The answer of a login flow endpoint while the flow is off.
+fn flow_not_available() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "code": "NOT_IMPLEMENTED",
+            "message": "single sign-on is unstable and is not available in this release",
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /sso/login/{backend}`: initiate a login against one configured
 /// backend.
 ///
@@ -895,6 +937,9 @@ pub async fn login(
     Path(backend): Path<String>,
     body: Bytes,
 ) -> Response {
+    if !state.sso_backends.unstable_flows_enabled() {
+        return flow_not_available();
+    }
     let Some(stored) = state.sso_backends.get(&backend) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1028,6 +1073,9 @@ pub async fn oidc_callback(
     State(state): State<ApiState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    if !state.sso_backends.unstable_flows_enabled() {
+        return flow_not_available();
+    }
     use crate::errors::ApiError;
     let bad_request = |message: String| ApiError::BadRequest(message).into_response();
     // Provider-denied flows arrive with `?error=...&state=...`: fail
@@ -1205,6 +1253,9 @@ pub async fn oidc_callback(
 // source; the current choice consumes the W2-33 pending login flow
 // (fail closed without one) until the checker pins it.
 pub async fn token_exchange(State(state): State<ApiState>, body: Bytes) -> Response {
+    if !state.sso_backends.unstable_flows_enabled() {
+        return flow_not_available();
+    }
     use crate::errors::ApiError;
     let bad_request = |message: String| ApiError::BadRequest(message).into_response();
     let value: serde_json::Value = match serde_json::from_slice(&body) {
@@ -1991,6 +2042,9 @@ pub async fn saml_acs(
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
+    if !state.sso_backends.unstable_flows_enabled() {
+        return flow_not_available();
+    }
     use crate::errors::ApiError;
     let bad_request = |message: String| ApiError::BadRequest(message).into_response();
     let fields = match parse_saml_acs_fields(&body) {

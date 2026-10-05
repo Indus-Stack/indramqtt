@@ -481,6 +481,15 @@ pub(crate) fn valid_backup_filename(name: &str) -> bool {
     if name.starts_with('.') {
         return false;
     }
+    // Only letters, digits, `.`, `_` and `-`. The name goes into a file
+    // path and into the `content-disposition` header of the download, and
+    // a quote mark or a control character must not get into the two.
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
     true
 }
 

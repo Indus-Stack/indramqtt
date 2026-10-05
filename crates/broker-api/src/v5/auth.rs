@@ -233,11 +233,76 @@ fn name_pwd_error() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(serde_json::json!({
-            "code": "NAME_PWD_ERROR",
+            "code": "BAD_USERNAME_OR_PWD",
             "message": "Bad username or password"
         })),
     )
         .into_response()
+}
+
+/// The answer when a user has too many failed logins. The reference API
+/// gives 401 with the code `LOGIN_LOCKED` for this.
+fn login_locked_error() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "code": "LOGIN_LOCKED",
+            "message": "too many failed logins; try again later"
+        })),
+    )
+        .into_response()
+}
+
+/// Examines the second factor of a login. A user without MFA passes. A
+/// user with MFA must give a correct code that was not used before.
+/// An absent code and an incorrect code get 401 with the code
+/// `BAD_MFA_TOKEN`, as in the reference API. A client that gets this
+/// code asks the user for the MFA code.
+fn check_login_mfa(state: &ApiState, username: &str, mfa_token: Option<&str>) -> Option<Response> {
+    let enabled = state
+        .admin_users
+        .mfa_status(username)
+        .is_some_and(|status| status.enabled);
+    if !enabled {
+        return None;
+    }
+    let code = mfa_token.map(str::trim).unwrap_or("");
+    if code.is_empty() {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "code": "BAD_MFA_TOKEN",
+                    "message": "this user must give an MFA code"
+                })),
+            )
+                .into_response(),
+        );
+    }
+    match state
+        .admin_users
+        .mfa_verify(username, code, crate::mfa_totp::unix_now_secs())
+    {
+        Ok(_) => None,
+        Err(crate::admin_users::MfaVerifyError::Locked) => Some(login_locked_error()),
+        Err(crate::admin_users::MfaVerifyError::Persist(reason)) => Some(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "code": "INTERNAL_ERROR", "message": reason })),
+            )
+                .into_response(),
+        ),
+        Err(_) => Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "code": "BAD_MFA_TOKEN",
+                    "message": "the MFA code is not correct"
+                })),
+            )
+                .into_response(),
+        ),
+    }
 }
 
 /// Map an `AdminUsers` error onto its HTTP status.
@@ -452,6 +517,9 @@ pub async fn scram_verify(
     // Verify against the stored SCRAM credentials. Unknown users fail here:
     // `scram_verify` returns `None` when the user does not exist. Login
     // never creates or modifies users.
+    if state.admin_users.login_locked(&ch.username) {
+        return login_locked_error();
+    }
     let server_sig =
         match state
             .admin_users
@@ -459,10 +527,11 @@ pub async fn scram_verify(
         {
             Some(sig) => sig,
             None => {
+                state.admin_users.record_login_failure(&ch.username);
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(serde_json::json!({
-                        "code": "NAME_PWD_ERROR",
+                        "code": "BAD_USERNAME_OR_PWD",
                         "message": "Invalid credentials"
                     })),
                 )
@@ -470,6 +539,10 @@ pub async fn scram_verify(
             }
         };
     let server_sig_b64 = BASE64.encode(server_sig);
+    if let Some(refusal) = check_login_mfa(&state, &ch.username, req.mfa_token.as_deref()) {
+        return refusal;
+    }
+    state.admin_users.clear_login_failures(&ch.username);
 
     let Some(view) = state.admin_users.get(&ch.username) else {
         return name_pwd_error();
@@ -494,6 +567,9 @@ pub async fn scram_verify(
 pub struct DirectLoginRequest {
     pub username: String,
     pub password: String,
+    /// The MFA code. Necessary when the user has MFA.
+    #[serde(default)]
+    pub mfa_token: Option<String>,
 }
 
 /// `POST /login`: verify dashboard credentials against the real
@@ -510,10 +586,10 @@ pub struct DirectLoginRequest {
 /// cookies: the token travels in the JSON body only.
 /// Management-plane only: one short store read plus one token-map lock
 /// per call; publish and deliver never touch either store.
-// TODO(parity): is `NAME_PWD_ERROR` the documented failure code here or
+// TODO(parity): is `BAD_USERNAME_OR_PWD` the documented failure code here or
 // is it `BAD_USERNAME_OR_PWD` (the shared error module names the latter
 // as the dashboard login code)? The rulebook does not decide the exact
-// code name; the current choice keeps `NAME_PWD_ERROR` (401, documented
+// code name; the current choice keeps `BAD_USERNAME_OR_PWD` (401, documented
 // `{code, message}` shape) until the checker pins it.
 pub async fn direct_login(State(state): State<ApiState>, body: Bytes) -> Response {
     let req: DirectLoginRequest = match serde_json::from_slice(&body) {
@@ -530,12 +606,20 @@ pub async fn direct_login(State(state): State<ApiState>, body: Bytes) -> Respons
         return ApiError::BadRequest("username and password must not be empty".to_string())
             .into_response();
     }
+    if state.admin_users.login_locked(&req.username) {
+        return login_locked_error();
+    }
     if !state
         .admin_users
         .verify_password(&req.username, &req.password)
     {
+        state.admin_users.record_login_failure(&req.username);
         return name_pwd_error();
     }
+    if let Some(refusal) = check_login_mfa(&state, &req.username, req.mfa_token.as_deref()) {
+        return refusal;
+    }
+    state.admin_users.clear_login_failures(&req.username);
 
     let Some(view) = state.admin_users.get(&req.username) else {
         return name_pwd_error();
@@ -703,7 +787,7 @@ const USER_SCOPES: [UserScopeEntry; 14] = [
     },
     UserScopeEntry {
         name: "license",
-        desc: "Manage licence installation and status",
+        desc: "Read the licence document and manage the licence settings",
         admin_only: false,
     },
     UserScopeEntry {
@@ -1112,7 +1196,7 @@ pub struct ChangePasswordReq {
 /// authorising the user's other management sessions immediately).
 /// Unknown usernames fail with `NOT_FOUND` (404, documented `{code,
 /// message}` shape); a wrong or missing `old_pwd` on a self change fails
-/// with `NAME_PWD_ERROR` (401, documented shape); a missing or weak
+/// with `BAD_USERNAME_OR_PWD` (401, documented shape); a missing or weak
 /// `new_pwd` fails with `BAD_REQUEST` (400, documented shape).
 /// Administrators may rotate any user's password without that user's old
 /// credential; viewers may only rotate their own and must prove the old
@@ -1140,7 +1224,7 @@ pub struct ChangePasswordReq {
 // TODO(parity): is a missing `old_pwd` on a self change malformed (400)
 // or wrong (401)? The rulebook does not decide the empty boundary; the
 // current choice answers both missing and wrong the same way (401
-// `NAME_PWD_ERROR`, fail closed, stores nothing) until the checker pins it.
+// `BAD_USERNAME_OR_PWD`, fail closed, stores nothing) until the checker pins it.
 pub async fn change_user_password(
     State(state): State<ApiState>,
     Extension(caller): Extension<TokenInfo>,
@@ -3195,7 +3279,7 @@ mod change_password_tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_documented_shape(&rejected, "NAME_PWD_ERROR");
+        assert_documented_shape(&rejected, "BAD_USERNAME_OR_PWD");
         let (status, logged_in, _) = parts(
             direct_login(
                 State(state.clone()),
@@ -3233,7 +3317,7 @@ mod change_password_tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_documented_shape(&wrong_old, "NAME_PWD_ERROR");
+        assert_documented_shape(&wrong_old, "BAD_USERNAME_OR_PWD");
         assert!(
             state
                 .admin_users

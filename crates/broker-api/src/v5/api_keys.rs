@@ -9,7 +9,19 @@
 //! clone at most the capped list once per request under a short lock;
 //! publish and deliver never touch this store, and key checks on the
 //! management plane use constant-time comparison off the hot path (see
-//! [`ApiKeyStore::verify`]).
+//! [`ApiKeyStore::resolve`]).
+//!
+//! Authentication: a client sends the secret of a key as
+//! `Authorization: Bearer <secret>`. The middleware
+//! ([`crate::api_auth::require_api_auth`]) finds the key with
+//! [`ApiKeyStore::resolve`] and applies the scopes of the key with
+//! [`key_may_call`]:
+//! - a key with no scopes can call each route that a key can call;
+//! - a key with scopes can call only the routes of those scopes;
+//! - no key can manage the API keys, the administrator users or the
+//!   single sign-on backends. Only a user who logged in can do that.
+//!   Thus a key cannot give itself more scopes;
+//! - a key cannot call a path that [`access_for_path`] does not know.
 //!
 //! Store bounds (stated here and enforced below):
 //! - at most [`MAX_API_KEYS`] key records; creates past the cap are
@@ -46,14 +58,6 @@
 // The rulebook does not decide the exact shapes; the current choice
 // answers create with 201 carrying `api_key` once and delete with 204
 // until the checker pins them.
-// TODO(parity): which scope defaults and vocabulary enforcement does
-// the spec require (default scope set for an omitted `scopes` field,
-// rejection of unknown scope names on create/update)? The rulebook
-// does not decide the exact set; the assignable vocabulary is pinned
-// by [`API_KEY_SCOPES`] below (served verbatim by the catalogue
-// route), while create/update still store the supplied scopes verbatim
-// (empty when omitted) and enforcement stays with the middleware lane
-// until the checker pins it.
 // TODO(parity): which name charset and duplicate status (400 versus
 // 409) does the documented `ALREADY_EXISTS` code carry? The rulebook
 // does not decide the exact duplicate semantics; the current choice
@@ -233,6 +237,32 @@ impl ApiKeyStore {
         }
     }
 
+    /// Finds the key that has this secret. Returns the name and the
+    /// scopes of the key, or `None` when no key has the secret.
+    ///
+    /// The function hashes the candidate one time and compares the hash
+    /// with each stored hash in constant time. It does not stop at the
+    /// first match, thus the time does not show which key matched. The
+    /// work is at most [`MAX_API_KEYS`] comparisons of 32 bytes under one
+    /// short read lock, for each management request that carries a key.
+    pub fn resolve(&self, secret: &str) -> Option<ResolvedApiKey> {
+        if secret.is_empty() {
+            return None;
+        }
+        let candidate = hash_secret(secret);
+        let map = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut found: Option<&ApiKeyRecord> = None;
+        for record in map.values() {
+            if constant_time_eq(&candidate, &record.key_hash) {
+                found = Some(record);
+            }
+        }
+        found.map(|record| ResolvedApiKey {
+            name: record.name.clone(),
+            scopes: record.scopes.clone(),
+        })
+    }
+
     /// Mint one key. Fails cleanly when `name` is already stored (caller
     /// maps to `ALREADY_EXISTS`) or the store is at [`MAX_API_KEYS`]
     /// (caller maps to `BAD_REQUEST`). Returns the metadata row plus the
@@ -392,6 +422,97 @@ impl Default for ApiKeyStore {
     }
 }
 
+/// The identity of a key that [`ApiKeyStore::resolve`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedApiKey {
+    /// The name of the key.
+    pub name: String,
+    /// The scopes of the key. An empty list gives each scope.
+    pub scopes: Vec<String>,
+}
+
+/// What a key needs to call a path of the management API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathAccess {
+    /// Each key can call the path. These paths give no control and show
+    /// no configuration.
+    AnyKey,
+    /// The key must have this scope, or no scopes.
+    Scope(&'static str),
+    /// No key can call the path. Only a user who logged in can call it.
+    /// A path that is not in the table is in this group.
+    UsersOnly,
+}
+
+/// Gives the access rule of a request path. The rule comes from the
+/// first segment after `/api/v5` or `/api/v1`.
+///
+/// The table must have an entry for each first segment that the router
+/// has. A segment without an entry gets [`PathAccess::UsersOnly`], thus
+/// a new route is closed for keys until it has an entry here.
+pub fn access_for_path(path: &str) -> PathAccess {
+    let trimmed = path.trim();
+    let native = trimmed.starts_with("/api/v1/");
+    let group = crate::v5::audit::operation_type_for_path(trimmed);
+    if native {
+        return match group.as_str() {
+            "nodes" => PathAccess::Scope("cluster_operations"),
+            "clients" => PathAccess::Scope("connections"),
+            "metrics" => PathAccess::Scope("monitoring"),
+            "connectors" | "rules" => PathAccess::Scope("data_integration"),
+            "auth" => PathAccess::Scope("access_control"),
+            "config" => PathAccess::Scope("system"),
+            _ => PathAccess::UsersOnly,
+        };
+    }
+    match group.as_str() {
+        "current_user" | "logout" | "status" | "error_codes" | "features" | "api_key_scopes"
+        | "user_scopes" => PathAccess::AnyKey,
+        "clients" | "clients_v2" | "subscriptions" | "topics" | "sessions_count" | "banned" => {
+            PathAccess::Scope("connections")
+        }
+        "publish" => PathAccess::Scope("publish"),
+        "rules"
+        | "rule_engine"
+        | "rule_events"
+        | "rule_test"
+        | "actions"
+        | "actions_probe"
+        | "actions_summary"
+        | "action_types"
+        | "connectors"
+        | "connectors_probe"
+        | "sources"
+        | "sources_probe"
+        | "sources_summary"
+        | "source_types"
+        | "schema_registry"
+        | "schemas"
+        | "message_transformations" => PathAccess::Scope("data_integration"),
+        "authentication" | "authorization" => PathAccess::Scope("access_control"),
+        "gateways" => PathAccess::Scope("gateways"),
+        "metrics" | "monitor" | "monitor_current" | "stats" | "alarms" | "trace" | "tracing"
+        | "slow_subscriptions" => PathAccess::Scope("monitoring"),
+        "nodes" => PathAccess::Scope("cluster_operations"),
+        "listeners" | "mqtt" | "data" => PathAccess::Scope("system"),
+        "audit" => PathAccess::Scope("audit"),
+        "license" => PathAccess::Scope("license"),
+        _ => PathAccess::UsersOnly,
+    }
+}
+
+/// True when a key with these scopes can call the path. See
+/// [`access_for_path`] and the module documentation.
+pub fn key_may_call(scopes: &[String], path: &str) -> bool {
+    match access_for_path(path) {
+        PathAccess::AnyKey => true,
+        PathAccess::Scope(needed) => {
+            scopes.is_empty() || scopes.iter().any(|scope| scope == needed)
+        }
+        PathAccess::UsersOnly => false,
+    }
+}
+
 /// Why [`ApiKeyStore::create`] refused a mint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiKeyInsertError {
@@ -470,7 +591,7 @@ fn utc_rfc3339_now() -> String {
     epoch_to_rfc3339(secs)
 }
 
-fn epoch_to_rfc3339(secs: u64) -> String {
+pub(crate) fn epoch_to_rfc3339(secs: u64) -> String {
     let (year, month, day, hour, min, sec) = civil_from_epoch(secs);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}+00:00")
 }
@@ -491,7 +612,7 @@ fn civil_from_epoch(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 
 // Days since 1970-01-01 to year/month/day (Howard Hinnant's algorithm,
 // public-domain date arithmetic also used by the ban list's timestamps).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let day_of_era = (z - era * 146_097) as u64;
@@ -666,9 +787,10 @@ struct ScopeEntry {
 ///
 /// This is the single registry the key create/update validation shares
 /// with the catalogue route: [`is_known_api_key_scope`] consults this
-/// same list. Vocabulary enforcement itself (rejecting unknown names
-/// on write) is owned elsewhere; the catalogue route serves the list
-/// verbatim regardless of which scopes any stored key holds.
+/// same list. A create or an update refuses a scope that is not in the
+/// list, because [`key_may_call`] gives a key with scopes only the
+/// routes of those scopes, and a name with a spelling error would give
+/// a key that can call almost nothing.
 // TODO(parity): what are the exact operator-facing summaries per
 // scope? The rulebook does not decide the wording; the current choice
 // describes each scope's area in our own words and keeps the stable
@@ -712,17 +834,14 @@ const API_KEY_SCOPES: [ScopeEntry; 10] = [
     },
     ScopeEntry {
         name: "license",
-        desc: "Manage licence installation and status",
+        desc: "Read the licence document and manage the licence settings",
     },
 ];
 
 /// Whether `name` is one of the assignable catalogue scopes.
 ///
 /// Shared by the key create/update validation path and the catalogue
-/// route so both read the same registry. Advisory for now: writers
-/// still store scopes verbatim and enforcement stays with the
-/// middleware lane (see the module TODO); the catalogue route serves
-/// this list regardless.
+/// route so both read the same registry.
 pub fn is_known_api_key_scope(name: &str) -> bool {
     API_KEY_SCOPES.iter().any(|entry| entry.name == name)
 }
@@ -800,6 +919,11 @@ fn parse_create_request(
                 if scope.trim().is_empty() || scope.len() > broker_config::MAX_API_KEY_SCOPE_LEN {
                     return Err(format!("field `scopes[{index}]` is invalid"));
                 }
+                if !is_known_api_key_scope(scope) {
+                    return Err(format!(
+                        "field `scopes[{index}]` is not a known scope; see /api_key_scopes"
+                    ));
+                }
                 out.push(scope.to_string());
             }
             out
@@ -859,6 +983,11 @@ fn parse_update_request(
                     .ok_or_else(|| format!("field `scopes[{index}]` must be a string"))?;
                 if scope.trim().is_empty() || scope.len() > broker_config::MAX_API_KEY_SCOPE_LEN {
                     return Err(format!("field `scopes[{index}]` is invalid"));
+                }
+                if !is_known_api_key_scope(scope) {
+                    return Err(format!(
+                        "field `scopes[{index}]` is not a known scope; see /api_key_scopes"
+                    ));
                 }
                 out.push(scope.to_string());
             }
@@ -1111,7 +1240,7 @@ mod api_key_store_tests {
             Ok((None, None))
         );
         assert!(parse_update_request(
-            &serde_json::json!({"scopes": ["all"], "expiry": "tomorrow"})
+            &serde_json::json!({"scopes": ["monitoring"], "expiry": "tomorrow"})
         )
         .is_ok());
     }
@@ -1206,5 +1335,94 @@ mod api_key_store_tests {
             );
         }
         assert!(!is_known_api_key_scope("no-such-scope"));
+    }
+
+    #[test]
+    fn a_write_refuses_a_scope_that_is_not_in_the_list() {
+        assert!(parse_create_request(
+            &serde_json::json!({"name": "k", "scopes": ["monitoring", "audit"]})
+        )
+        .is_ok());
+        assert!(
+            parse_create_request(&serde_json::json!({"name": "k", "scopes": ["all"]})).is_err()
+        );
+        assert!(parse_update_request(&serde_json::json!({"scopes": ["Monitoring"]})).is_err());
+    }
+
+    #[test]
+    fn resolve_finds_the_key_of_a_secret_and_only_that_key() {
+        let store = ApiKeyStore::new();
+        let (_, first) = store
+            .create(
+                "first".to_string(),
+                vec!["audit".to_string()],
+                String::new(),
+            )
+            .expect("first key");
+        let (_, second) = store
+            .create("second".to_string(), Vec::new(), String::new())
+            .expect("second key");
+        let found = store.resolve(&first).expect("the first secret resolves");
+        assert_eq!(found.name, "first");
+        assert_eq!(found.scopes, vec!["audit".to_string()]);
+        let found = store.resolve(&second).expect("the second secret resolves");
+        assert_eq!(found.name, "second");
+        assert!(found.scopes.is_empty());
+        assert!(store.resolve("").is_none());
+        assert!(store.resolve("not-a-secret").is_none());
+        // The name of a key is not a credential.
+        assert!(store.resolve("first").is_none());
+        // A removed key does not resolve.
+        assert_eq!(store.remove("first"), Ok(true));
+        assert!(store.resolve(&first).is_none());
+        assert!(store.resolve(&second).is_some());
+    }
+
+    #[test]
+    fn a_scope_opens_only_its_paths() {
+        let audit = vec!["audit".to_string()];
+        assert!(key_may_call(&audit, "/api/v5/audit"));
+        assert!(!key_may_call(&audit, "/api/v5/clients"));
+        assert!(!key_may_call(&audit, "/api/v5/rules/r1"));
+        assert!(!key_may_call(&audit, "/api/v1/config/reload"));
+        // Paths that each key can call.
+        assert!(key_may_call(&audit, "/api/v5/current_user"));
+        assert!(key_may_call(&audit, "/api/v5/status"));
+
+        let none: Vec<String> = Vec::new();
+        assert!(key_may_call(&none, "/api/v5/clients/c1"));
+        assert!(key_may_call(&none, "/api/v5/data/export"));
+        assert!(key_may_call(&none, "/api/v1/config/reload"));
+        assert!(key_may_call(&none, "/schemas/s1"));
+
+        // No key can manage keys, users or single sign-on, and no key
+        // can call a path that the table does not know.
+        let every: Vec<String> = API_KEY_SCOPES
+            .iter()
+            .map(|entry| entry.name.to_string())
+            .collect();
+        for scopes in [&none, &every] {
+            for path in [
+                "/api/v5/api_key",
+                "/api/v5/api_key/other",
+                "/api/v5/users",
+                "/api/v5/users/admin/change_pwd",
+                "/api/v5/sso/oidc",
+                "/api/v1/licence/install",
+                "/api/v5/no_such_group",
+                "/api/v5/%75sers",
+                "/other",
+            ] {
+                assert!(!key_may_call(scopes, path), "{path} must be closed");
+            }
+        }
+        assert_eq!(
+            access_for_path("/api/v5/publish/bulk"),
+            PathAccess::Scope("publish")
+        );
+        assert_eq!(
+            access_for_path("/api/v1/auth/users"),
+            PathAccess::Scope("access_control")
+        );
     }
 }

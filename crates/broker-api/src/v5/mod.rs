@@ -382,6 +382,20 @@ pub fn protected_router() -> Router<ApiState> {
         // touch it. The route is not paged and takes no parameters;
         // unknown query parameters are ignored.
         .route("/api_key_scopes", get(api_keys::list_api_key_scopes))
+        // The licence endpoints of the reference API. The broker is open
+        // source: the document is fixed and no limit is applied.
+        .route(
+            "/license",
+            get(license::get_license).post(license::update_license),
+        )
+        .route(
+            "/license/setting",
+            get(license::get_license_setting).put(license::put_license_setting),
+        )
+        .route(
+            "/license/session_hwm_history",
+            get(license::get_session_hwm_history),
+        )
         // Management audit log (W2-28, C05-07): paged query over the
         // bounded management ring. Management-plane only; writes are
         // fire-and-forget from the auth middleware and publish/deliver
@@ -412,9 +426,9 @@ pub fn protected_router() -> Router<ApiState> {
         // fail closed with the documented `{code, message}` shape.
         // Management-plane only; publish and deliver never touch the
         // user map or the attempt counters.
-        .route("/sso/mfa/setup", post(mfa::setup))
-        .route("/sso/mfa/setup_info", post(mfa::setup_info))
-        .route("/sso/mfa/verify", post(mfa::verify))
+        .route("/sso/mfa/setup", post(mfa::setup_route))
+        .route("/sso/mfa/setup_info", post(mfa::setup_info_route))
+        .route("/sso/mfa/verify", post(mfa::verify_route))
         // Live Monitoring & Rates
         .route("/metrics", get(monitoring::get_metrics))
         .route(
@@ -744,27 +758,6 @@ pub fn protected_router() -> Router<ApiState> {
         // Schema API for dynamic UI forms
         .route("/schemas", get(schemas::list_schemas))
         .route("/schemas/:name", get(schemas::get_schema))
-        // License state and install (W5-10, C13-16/C13-17): live read
-        // plus validated install on the real licence store.
-        // Management-plane only; publish and deliver never touch it.
-        .route(
-            "/license",
-            get(license::get_license).post(license::install_license),
-        )
-        // Session HWM history (W5-12, C13-18): paged newest-first read
-        // over the bounded recorder on real session counts.
-        // Management-plane only; publish and deliver never touch it.
-        .route(
-            "/license/session_hwm_history",
-            get(license::get_session_hwm_history),
-        )
-        // License settings (W5-13, C13-19/C13-20): validated read plus
-        // validated update over the persisted single-record store.
-        // Management-plane only; publish and deliver never touch it.
-        .route(
-            "/license/setting",
-            get(license::get_license_setting).put(license::put_license_setting),
-        )
         // Fixed error-code catalogue (W5-22, C15-01/C15-02): static
         // code-defined list with the standard page envelope, plus a
         // per-code read with a 404 for unknown codes. Management-plane

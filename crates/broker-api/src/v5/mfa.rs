@@ -115,6 +115,70 @@ fn internal_error(message: String) -> Response {
         .into_response()
 }
 
+/// Examines the target of an MFA request. An administrator can name each
+/// user. A user who is not an administrator can name only that user:
+/// the secret of an enrolment is a credential, and a viewer must not
+/// get the secret of a different user or use up that user's attempts.
+/// A body that is not valid is not refused here: the handler gives the
+/// usual 400 for it.
+fn caller_may_target(caller: &crate::v5::auth::TokenInfo, body: &[u8]) -> Option<Response> {
+    if caller.role == crate::admin_users::AdminRole::Administrator {
+        return None;
+    }
+    let target = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| parse_username(&value).ok());
+    match target {
+        Some(username) if username != caller.username => Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "code": "FORBIDDEN",
+                    "message": "a user who is not an administrator can change only that user's MFA",
+                })),
+            )
+                .into_response(),
+        ),
+        _ => None,
+    }
+}
+
+/// The route of [`setup`]. It examines the caller first.
+pub async fn setup_route(
+    State(state): State<ApiState>,
+    axum::Extension(caller): axum::Extension<crate::v5::auth::TokenInfo>,
+    body: Bytes,
+) -> Response {
+    if let Some(refusal) = caller_may_target(&caller, &body) {
+        return refusal;
+    }
+    setup(State(state), body).await
+}
+
+/// The route of [`setup_info`]. It examines the caller first.
+pub async fn setup_info_route(
+    State(state): State<ApiState>,
+    axum::Extension(caller): axum::Extension<crate::v5::auth::TokenInfo>,
+    body: Bytes,
+) -> Response {
+    if let Some(refusal) = caller_may_target(&caller, &body) {
+        return refusal;
+    }
+    setup_info(State(state), body).await
+}
+
+/// The route of [`verify`]. It examines the caller first.
+pub async fn verify_route(
+    State(state): State<ApiState>,
+    axum::Extension(caller): axum::Extension<crate::v5::auth::TokenInfo>,
+    body: Bytes,
+) -> Response {
+    if let Some(refusal) = caller_may_target(&caller, &body) {
+        return refusal;
+    }
+    verify(State(state), body).await
+}
+
 /// `POST /sso/mfa/setup`: start per-user MFA enrolment.
 ///
 /// The body must be a JSON object with a non-empty string `username`.

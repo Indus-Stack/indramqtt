@@ -632,6 +632,12 @@ def main(argv=None):
                              "status": None, "errors": [], "warnings": []})
                 continue
             rows.append(check_one(spec, op, case, runner, authed))
+            if op["path"] == "/logout" and authed:
+                # The logout case ends the session of the checker. Log in
+                # again, or each later operation gets 401.
+                fresh, _ = do_login(args.base, args)
+                headers.clear()
+                headers.update(fresh)
     finally:
         runner.close_all()
     print_summary(rows)
