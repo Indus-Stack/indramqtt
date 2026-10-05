@@ -122,8 +122,8 @@ pub async fn list_client_rules(State(state): State<ApiState>, params: PageParams
 }
 
 /// `POST /authorization/sources/built_in_database/rules/clients`: add one
-/// client-scoped rule. Returns the stored entry with 201. Malformed
-/// bodies fail with `BAD_REQUEST`; a rule for the same client id and
+/// client-scoped rule. Returns 204 with no body, as the reference API
+/// documents. Malformed bodies fail with `BAD_REQUEST`; a rule for the same client id and
 /// topic scope fails with `ALREADY_EXISTS` instead of merging; a full
 /// table fails with `BAD_REQUEST`.
 ///
@@ -143,25 +143,7 @@ pub async fn create_client_rule(State(state): State<ApiState>, body: Bytes) -> R
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.add_client_rule(rule) {
-        Ok(()) => {
-            let stored = state
-                .auth
-                .client_rules(
-                    value
-                        .get("clientid")
-                        .or(value.get("client_id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default(),
-                )
-                .into_iter()
-                .last();
-            match stored {
-                Some(rule) => {
-                    (StatusCode::CREATED, Json(render_client_rule(&rule))).into_response()
-                }
-                None => StatusCode::CREATED.into_response(),
-            }
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(ClientRuleError::Duplicate) => {
             ApiError::AlreadyExists("client rule already exists".to_string()).into_response()
         }
@@ -514,8 +496,8 @@ pub async fn list_user_rules(State(state): State<ApiState>, params: PageParams) 
 }
 
 /// `POST /authorization/sources/built_in_database/rules/users`: add one
-/// user-scoped rule. Returns the stored entry with 201. Malformed
-/// bodies fail with `BAD_REQUEST`; a rule for the same username and
+/// user-scoped rule. Returns 204 with no body, as the reference API
+/// documents. Malformed bodies fail with `BAD_REQUEST`; a rule for the same username and
 /// topic scope fails with `ALREADY_EXISTS` instead of merging; a full
 /// table fails with `BAD_REQUEST`.
 ///
@@ -538,23 +520,7 @@ pub async fn create_user_rule(State(state): State<ApiState>, body: Bytes) -> Res
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.add_user_rule(rule) {
-        Ok(()) => {
-            let stored = state
-                .auth
-                .user_rules(
-                    value
-                        .get("username")
-                        .or(value.get("user_id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default(),
-                )
-                .into_iter()
-                .last();
-            match stored {
-                Some(rule) => (StatusCode::CREATED, Json(render_user_rule(&rule))).into_response(),
-                None => StatusCode::CREATED.into_response(),
-            }
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(ClientRuleError::Duplicate) => {
             ApiError::AlreadyExists("user rule already exists".to_string()).into_response()
         }
@@ -948,7 +914,7 @@ mod tests {
         assert_eq!(empty["meta"]["limit"], serde_json::json!(100));
         assert_eq!(empty["meta"]["hasnext"], serde_json::json!(false));
 
-        let (status, created, _) = parts(
+        let (status, _, _) = parts(
             create_client_rule(
                 State(state.clone()),
                 body(client_rule("w219-a", "w219/alpha/#")),
@@ -956,11 +922,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created["clientid"], serde_json::json!("w219-a"));
-        assert_eq!(created["topic"], serde_json::json!("w219/alpha/#"));
-        assert_eq!(created["permission"], serde_json::json!("allow"));
-        assert_eq!(created["action"], serde_json::json!("publish"));
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         // List carries the entry with the standard page envelope.
         let (status, listed, _) =
@@ -1041,7 +1003,7 @@ mod tests {
                 create_client_rule(State(state.clone()), body(client_rule(clientid, topic))).await,
             )
             .await;
-            assert_eq!(status, StatusCode::CREATED, "create {clientid}");
+            assert_eq!(status, StatusCode::NO_CONTENT, "create {clientid}");
         }
 
         let (status, page2, _) =
@@ -1073,7 +1035,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         let bad_bodies = [
             serde_json::json!({"topic": "w219/x/#", "permission": "allow", "action": "publish"}),
@@ -1122,7 +1084,7 @@ mod tests {
                 create_client_rule(State(state.clone()), body(client_rule(clientid, topic))).await,
             )
             .await;
-            assert_eq!(status, StatusCode::CREATED, "create {clientid}");
+            assert_eq!(status, StatusCode::NO_CONTENT, "create {clientid}");
         }
         let response = delete_client_rules(State(state.clone()), Path("w219-d1".to_string())).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1392,7 +1354,7 @@ mod tests {
             let (status, _, _) =
                 parts(create_client_rule(State(state.clone()), body(client_rule(id, topic))).await)
                     .await;
-            assert_eq!(status, StatusCode::CREATED, "seed {id}");
+            assert_eq!(status, StatusCode::NO_CONTENT, "seed {id}");
         }
         let (status, listed, _) =
             parts(list_user_rules(State(state.clone()), params(1, 100)).await).await;
@@ -1489,7 +1451,7 @@ mod tests {
         assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
         assert!(missing["message"].is_string());
 
-        let (status, created, _) = parts(
+        let (status, _, _) = parts(
             create_user_rule(
                 State(state.clone()),
                 body(user_rule("w221-u", "w221/alpha/#")),
@@ -1497,11 +1459,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created["username"], serde_json::json!("w221-u"));
-        assert_eq!(created["topic"], serde_json::json!("w221/alpha/#"));
-        assert_eq!(created["permission"], serde_json::json!("allow"));
-        assert_eq!(created["action"], serde_json::json!("publish"));
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         let (status, detail, _) = get_user_detail(&state, "w221-u").await;
         assert_eq!(status, StatusCode::OK);
@@ -1570,7 +1528,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         let bad_bodies = [
             serde_json::json!({"topic": "w221/x/#", "permission": "allow", "action": "publish"}),
@@ -1600,7 +1558,7 @@ mod tests {
         }
 
         // The `user_id` alias is accepted like the client `client_id` alias.
-        let (status, created, _) = parts(
+        let (status, _, _) = parts(
             create_user_rule(
                 State(state.clone()),
                 body(serde_json::json!({
@@ -1613,9 +1571,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created["username"], serde_json::json!("w221-alias"));
-        assert_eq!(created["permission"], serde_json::json!("deny"));
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         // The catch-all `*` belongs to the `/rules/all` table: a per-user
         // delete naming it is a miss, never a wipe of another table.

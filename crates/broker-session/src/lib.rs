@@ -2809,6 +2809,14 @@ impl SessionManager {
         self.connected_count.load(Ordering::SeqCst)
     }
 
+    /// Number of sessions held in memory, connected or detached.
+    /// Sums the length of each tenant map under one short read lock.
+    /// The tenant count is bounded by [`MAX_TENANTS`]. Management plane
+    /// only; never runs on the message path.
+    pub fn session_count(&self) -> usize {
+        self.sessions.read().values().map(HashMap::len).sum()
+    }
+
     /// Snapshot the subscription filters of one session, if known.
     /// Used by the kernel to sweep stale router entries on a clean-start
     /// bind (which discards any previous state, even a persistent one).

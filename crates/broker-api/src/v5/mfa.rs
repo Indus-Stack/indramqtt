@@ -319,9 +319,11 @@ pub async fn verify(State(state): State<ApiState>, body: Bytes) -> Response {
 /// 400 and enrols nothing. Unknown users fail with 404; a user with any
 /// existing enrolment (pending or enabled) fails with 409
 /// `ALREADY_EXISTS` and changes nothing, so enrolment never grows past
-/// the single secret slot. On success answers 200 with the provisioning
-/// fields (`username`, base32 `secret`, `provisioning_uri`) once; the
-/// user stays pending until a code verifies on the verification route.
+/// the single secret slot. On success answers 204 with no body, as the
+/// reference API documents. The user stays pending until a code verifies
+/// on the verification route. The user reads the secret and the
+/// provisioning URI from `POST /sso/mfa/setup`, which returns the same
+/// pending secret.
 /// The route is not paged. Secrets are never logged.
 /// Management-plane only: one short user-map write lock per call (plus
 /// the registry save lock on persist); publish and deliver never touch
@@ -350,8 +352,8 @@ pub async fn enrol(
     if let Err(message) = check_enrol_body(&body) {
         return ApiError::BadRequest(message).into_response();
     }
-    let secret = match state.admin_users.mfa_admin_enrol(&username) {
-        Ok(secret) => secret,
+    match state.admin_users.mfa_admin_enrol(&username) {
+        Ok(_) => {}
         Err(AdminUserError::NotFound) => {
             return ApiError::NotFound(format!("user {username:?} not found")).into_response();
         }
@@ -360,18 +362,8 @@ pub async fn enrol(
         }
         Err(error @ AdminUserError::Persist(_)) => return internal_error(error.to_string()),
         Err(error) => return ApiError::BadRequest(error.to_string()).into_response(),
-    };
-    let secret_b32 = crate::mfa_totp::base32_encode(&secret);
-    let uri = crate::mfa_totp::provisioning_uri(MFA_ISSUER, &username, &secret_b32);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "username": username,
-            "secret": secret_b32,
-            "provisioning_uri": uri,
-        })),
-    )
-        .into_response()
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Check the optional enrol body: empty enrols TOTP; a JSON object with
@@ -841,7 +833,7 @@ mod mfa_handler_tests {
         let state = standalone_state();
         create_user(&state, "w244-alice");
 
-        // Enrol returns the documented provisioning fields once.
+        // Enrol answers 204 with no body, as the reference API documents.
         let (status, enrolled, raw) = parts(
             enrol(
                 State(state.clone()),
@@ -851,20 +843,31 @@ mod mfa_handler_tests {
             .await,
         )
         .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(enrolled.is_null() && raw.is_empty(), "enrol has no body");
+        assert!(
+            state
+                .admin_users
+                .mfa_secret_for_test("w244-alice")
+                .is_some_and(|secret| !secret.is_empty()),
+            "enrolment stores a secret"
+        );
+
+        // The pending secret and the provisioning URI come from the setup
+        // route.
+        let (status, provisioning, _) = parts(
+            setup(
+                State(state.clone()),
+                body(serde_json::json!({"username": "w244-alice"})),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(enrolled["username"], serde_json::json!("w244-alice"));
-        assert!(
-            enrolled["secret"].as_str().is_some_and(|s| !s.is_empty()),
-            "enrol returns a secret"
-        );
-        assert!(
-            enrolled["provisioning_uri"].is_string(),
-            "enrol returns provisioning fields"
-        );
-        assert!(
-            !String::from_utf8_lossy(&raw).contains("MfaSecret1!"),
-            "enrol body carries no password"
-        );
+        assert!(provisioning["secret"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+        assert!(provisioning["provisioning_uri"].is_string());
 
         // The shared admin-user state reports the enrolment as pending.
         let (status, info, _) = parts(
@@ -953,8 +956,8 @@ mod mfa_handler_tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(enrolled["secret"].is_string());
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(enrolled.is_null());
 
         // Non-TOTP factors are out of scope and fail closed.
         create_user(&state, "w244-carol");

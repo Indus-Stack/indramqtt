@@ -1342,8 +1342,9 @@ async fn apply_materialized(state: &ApiState, pending: &Materialized) -> Result<
 // A corrupt file answers 400 and changes nothing. A part that fails
 // validation answers 400 `VALIDATION_FAILED` and changes nothing. An
 // apply or persist failure answers 500 and rolls back every part.
-// A successful restore shows in later reads and survives a restart
-// through each store's own persistence.
+// A successful restore answers 204 with no body, as the reference API
+// documents. It shows in later reads and survives a restart through each
+// store's own persistence.
 //
 // Management-plane only: short management locks, never the publish or
 // deliver path.
@@ -1403,11 +1404,7 @@ pub async fn import_data(State(state): State<ApiState>, body: Bytes) -> Response
         }
     };
     match apply_materialized(&state, &pending).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({"status": "restored", "filename": filename})),
-        )
-            .into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
     }
 }

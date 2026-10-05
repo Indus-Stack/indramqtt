@@ -884,11 +884,18 @@ fn describe_action(action: &serde_json::Value) -> String {
 }
 
 async fn cmd_status(ctl: &CtlArgs, key: &SecretString) -> Result<String, CtlError> {
-    let (_, body) = request(ctl, key, reqwest::Method::GET, "/api/v5/status", None).await?;
+    let (_, body) = request(
+        ctl,
+        key,
+        reqwest::Method::GET,
+        "/api/v5/status?format=json",
+        None,
+    )
+    .await?;
     if ctl.json {
         return Ok(render_json(&body));
     }
-    Ok(format!("status: {}\n", cell(body.get("status"))))
+    Ok(format!("status: {}\n", cell(body.get("app_status"))))
 }
 
 async fn cmd_clients_list(
@@ -2208,15 +2215,18 @@ mod tests {
         let human = run_ctl(&api.ctl(false, CtlCommand::Status))
             .await
             .expect("status succeeds");
-        assert!(human.contains("up"), "human form reports up: {human}");
+        assert!(
+            human.contains("running"),
+            "human form reports running: {human}"
+        );
         let json = run_ctl(&api.ctl(true, CtlCommand::Status))
             .await
             .expect("status --json succeeds");
         let body: serde_json::Value =
             serde_json::from_str(&json).expect("--json output parses as JSON");
-        assert_eq!(body["status"], serde_json::json!("up"));
+        assert_eq!(body["app_status"], serde_json::json!("running"));
         assert!(
-            human.contains("up") && body["status"] == serde_json::json!("up"),
+            human.contains("running") && body["app_status"] == serde_json::json!("running"),
             "both forms report the same running state"
         );
     }
@@ -2542,7 +2552,12 @@ mod tests {
             api_key_file: None,
             json: false,
             timeout: 5,
-            command: CtlCommand::Status,
+            // `status` needs no authentication, so a protected command
+            // checks the key.
+            command: CtlCommand::Topics {
+                page: DEFAULT_PAGE,
+                limit: DEFAULT_LIMIT,
+            },
         };
         let error = run_ctl(&wrong).await.expect_err("wrong key fails");
         assert_eq!(error.code, EXIT_AUTH);

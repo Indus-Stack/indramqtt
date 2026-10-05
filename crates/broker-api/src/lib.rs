@@ -321,6 +321,8 @@ impl ApiState {
         // very instance the caller shares (the kernel passes its BrokerLink
         // `MemoryAuth` here), so no second copy can diverge. An empty
         // snapshot is a no-op (today's empty behaviour).
+        // Start the uptime clock that `GET /nodes` reads.
+        crate::v5::nodes::mark_process_start();
         if let Err(error) = auth.seed_from_registry(&config) {
             panic!("invalid stored mqtt_users snapshot: {error}");
         }
@@ -556,6 +558,7 @@ impl ApiState {
     pub fn standalone(engine: Arc<RuleEngine>) -> Self {
         let (edge_tx, edge_rx) = tokio::sync::mpsc::unbounded_channel::<BrokerFrame>();
         drop(edge_rx);
+        crate::v5::nodes::mark_process_start();
         // Standalone settings store shares its subscriber with the very
         // node-cache instance below, so validated replaces keep the
         // cache's enabled flag and cap in sync without a restart.
@@ -720,6 +723,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/version", get(get_dashboard_version))
         .route("/ws/mqtt", get(ws::ws_mqtt_handler))
         .route("/healthz", get(|| async { "OK" }))
+        // Alias of `GET /api/v5/status` without the API prefix.
+        .route("/status", get(v5::status::get_status))
         .nest("/api/v5", v5::public_router())
         .merge(protected);
     public.with_state(state)
@@ -3338,7 +3343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_kick_mixed_known_unknown_reports_per_client() {
+    async fn bulk_kick_mixed_known_unknown_answers_204_and_skips_the_unknown() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
@@ -3348,23 +3353,16 @@ mod tests {
             *session.connected.write() = true;
         }
 
-        let (status, body) = server
+        // The reference API documents 204 for every bulk kick. An id with
+        // no live connection is skipped and does not change the answer.
+        let (status, _) = server
             .post_auth(
                 "/api/v5/clients/kickout/bulk",
                 json!(["w1-04-a", "w1-04-b", "w1-04-missing"]),
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        let results = body.as_array().expect("bulk result is a list");
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0]["clientid"], json!("w1-04-a"));
-        assert_eq!(results[0]["result"], json!("ok"));
-        assert_eq!(results[1]["clientid"], json!("w1-04-b"));
-        assert_eq!(results[1]["result"], json!("ok"));
-        assert_eq!(results[2]["clientid"], json!("w1-04-missing"));
-        assert_eq!(results[2]["code"], json!("CLIENTID_NOT_FOUND"));
-        assert!(results[2]["message"].is_string());
+        assert_eq!(status, 204);
 
         // Both known clients are disconnected and gone from the list.
         let (status, body) = server.get_auth("/api/v5/clients", &token).await;
@@ -6703,7 +6701,7 @@ mod tests {
             .await;
         assert_eq!(status, 200);
 
-        // Enrol returns the provisioning fields once.
+        // Enrol answers 204 with no body, as the reference API documents.
         let (status, enrolled) = server
             .post_auth(
                 "/api/v5/users/w244-http/mfa",
@@ -6711,17 +6709,27 @@ mod tests {
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(enrolled["username"], json!("w244-http"));
-        assert!(
-            enrolled["secret"].as_str().is_some_and(|s| !s.is_empty()),
-            "enrol returns a secret, got: {enrolled}"
-        );
-        assert!(
-            enrolled["provisioning_uri"].is_string(),
-            "enrol returns provisioning fields, got: {enrolled}"
-        );
+        assert_eq!(status, 204);
+        assert!(enrolled.is_null(), "enrol returns no body, got: {enrolled}");
         assert_eq!(state.auth.user_count(), 0);
+
+        // The secret and the provisioning URI come from the setup route.
+        let (status, provisioning) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "w244-http"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(provisioning["username"], json!("w244-http"));
+        assert!(
+            provisioning["secret"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "setup returns the pending secret, got: {provisioning}"
+        );
+        assert!(provisioning["provisioning_uri"].is_string());
 
         // The setup route sees the same enrolment as pending.
         let (status, info) = server
@@ -7630,9 +7638,8 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["type"], json!("file"));
-        assert_eq!(created["enable"], json!(true));
+        assert_eq!(status, 204);
+        assert!(created.is_null(), "create returns no body, got: {created}");
 
         // List again: the entry is present in stored order.
         let (status, body) = server
@@ -7716,7 +7723,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 204);
         drop(server);
         drop(registry);
         let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
@@ -7767,7 +7774,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 204);
         let (status, _) = server
             .put_auth(
                 "/api/v5/authorization/sources/built_in_database/rules/users/w222-http",
@@ -7831,7 +7838,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 204);
         let (status, body) = server
             .put_auth(
                 "/api/v5/authorization/sources/order",
@@ -8028,7 +8035,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         assert_eq!(created["id"], json!("password_based:built_in_database"));
         assert_eq!(created["mechanism"], json!("password_based"));
         assert_eq!(created["backend"], json!("built_in_database"));
@@ -8094,7 +8101,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, body) = server
             .get_auth("/api/v5/authentication?page=2&limit=1", &token)
             .await;
@@ -8126,7 +8133,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let mut refused = WsClient::connect(server.port).await;
         refused
             .send_bin(&mqtt_connect("w2-02-closed", None, None))
@@ -8148,7 +8155,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         drop(server);
         drop(registry);
         let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
@@ -8190,7 +8197,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .post_auth(
                 "/api/v5/authentication",
@@ -8198,7 +8205,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
 
         // Explicit order applies: mysql first.
         let (status, _) = server
@@ -8277,7 +8284,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .post_auth(
                 "/api/v5/authentication",
@@ -8285,7 +8292,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .put_auth(
                 "/api/v5/authentication/order",
@@ -8335,7 +8342,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .post_auth(
                 "/api/v5/authentication",
@@ -8343,7 +8350,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
 
         // Read one entry by id; the shape carries only the stored slot
         // fields, never invented measurements.
@@ -8372,17 +8379,14 @@ mod tests {
         assert!(body["message"].is_string());
 
         // Valid update replaces and reads back.
-        let (status, body) = server
+        let (status, _) = server
             .put_auth(
                 "/api/v5/authentication/password_based:mysql",
                 json!({"enable": false, "config": {"pool_size": 4}}),
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["id"], json!("password_based:mysql"));
-        assert_eq!(body["enable"], json!(false));
-        assert_eq!(body["config"], json!({"pool_size": 4}));
+        assert_eq!(status, 204);
         let (status, body) = server
             .get_auth("/api/v5/authentication/password_based:mysql", &token)
             .await;
@@ -8449,7 +8453,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         assert_eq!(recreated["id"], json!("password_based:mysql"));
 
         // Deleting the last remaining entry is refused instead of
@@ -8491,7 +8495,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .post_auth(
                 "/api/v5/authentication",
@@ -8499,7 +8503,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .put_auth(
                 "/api/v5/authentication/password_based:mysql",
@@ -8507,7 +8511,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         let (status, _) = server
             .delete_auth("/api/v5/authentication/password_based:mysql", &token)
             .await;
@@ -8561,11 +8565,11 @@ mod tests {
                     &token,
                 )
                 .await;
-            assert_eq!(status, 201, "create {backend}");
+            assert_eq!(status, 200, "create {backend}");
         }
 
-        // Move the last entry to the front; the response reports the new
-        // order as a bare JSON array.
+        // Move the last entry to the front. The answer is 204 with no
+        // body, as the reference API documents.
         let (status, body) = server
             .send(
                 "PUT",
@@ -8574,27 +8578,14 @@ mod tests {
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        let reported: Vec<String> = body
-            .as_array()
-            .expect("move reports the new order as an array")
-            .iter()
-            .map(|entry| {
-                entry["id"]
-                    .as_str()
-                    .expect("order entry carries an id")
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(
-            reported,
-            vec![
-                "password_based:redis".to_string(),
-                "password_based:built_in_database".to_string(),
-                "password_based:mysql".to_string(),
-            ]
-        );
-        // List reflects the same new order.
+        assert_eq!(status, 204);
+        assert!(body.is_null(), "move returns no body, got: {body}");
+        let reported: Vec<String> = vec![
+            "password_based:redis".to_string(),
+            "password_based:built_in_database".to_string(),
+            "password_based:mysql".to_string(),
+        ];
+        // List shows the new order.
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
         let listed: Vec<String> = body["data"]
@@ -8677,7 +8668,7 @@ mod tests {
                     &token,
                 )
                 .await;
-            assert_eq!(status, 201, "persist case create {backend}");
+            assert_eq!(status, 200, "persist case create {backend}");
         }
         let (status, _) = server
             .send(
@@ -8687,7 +8678,7 @@ mod tests {
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         drop(server);
         drop(registry);
         let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
@@ -8753,7 +8744,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, body) = server
             .get_auth(
                 "/api/v5/authentication/password_based:built_in_database/status",
@@ -8914,7 +8905,7 @@ mod tests {
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .post_auth(
                 "/api/v5/authentication/password_based:built_in_database/users",
@@ -12700,7 +12691,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             assert_eq!(body["code"], json!("BAD_REQUEST"));
         }
         // Disable: flag change is visible on the next read.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "PUT",
                 "/api/v5/actions/w3-04-action/enable/false",
@@ -12708,15 +12699,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(false));
+        assert_eq!(status, 204);
         let (status, body) = server
             .get_auth("/api/v5/actions/w3-04-action", &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(false));
         // Re-enable: visible on the next read.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "PUT",
                 "/api/v5/actions/w3-04-action/enable/true",
@@ -12724,8 +12714,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204);
         let (status, body) = server
             .get_auth("/api/v5/actions/w3-04-action", &token)
             .await;
@@ -12784,7 +12773,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -12808,7 +12797,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -12917,7 +12906,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             assert_eq!(body["code"], json!("BAD_REQUEST"));
         }
         // Disable: flag change is visible on the next read.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "PUT",
                 "/api/v5/connectors/w3-19-conn/enable/false",
@@ -12925,15 +12914,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(false));
+        assert_eq!(status, 204);
         let (status, body) = server
             .get_auth("/api/v5/connectors/w3-19-conn", &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(false));
         // Re-enable: visible on the next read.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "PUT",
                 "/api/v5/connectors/w3-19-conn/enable/true",
@@ -12941,8 +12929,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204);
         let (status, body) = server
             .get_auth("/api/v5/connectors/w3-19-conn", &token)
             .await;
@@ -13011,7 +12998,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         assert!(!state.engine.is_action_enabled("w3-19-conn"));
         state
             .engine
@@ -13036,7 +13023,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         assert!(state.engine.is_action_enabled("w3-19-conn"));
         state
             .engine
@@ -13172,7 +13159,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(true));
         // Stop: the reported state changes to disabled on the next read.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 "/api/v5/connectors/w3-20-conn/stop",
@@ -13180,15 +13167,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(false));
+        assert_eq!(status, 204);
         let (status, body) = server
             .get_auth("/api/v5/connectors/w3-20-conn", &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(false));
         // Start: the reported state changes back to enabled.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 "/api/v5/connectors/w3-20-conn/start",
@@ -13196,8 +13182,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204);
         let (status, body) = server
             .get_auth("/api/v5/connectors/w3-20-conn", &token)
             .await;
@@ -13266,7 +13251,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -13290,7 +13275,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -13434,7 +13419,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Stop through the node route: the reported state flips to
         // disabled on the next read. The legacy node name names the same
         // local node.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 &format!("/api/v5/nodes/{local}/connectors/w3-22-conn/stop"),
@@ -13442,9 +13427,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(false));
-        let (status, body) = server
+        assert_eq!(status, 204);
+        let (status, _) = server
             .send(
                 "POST",
                 &format!("/api/v5/nodes/{legacy}/connectors/w3-22-conn/start"),
@@ -13452,8 +13436,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200, "legacy node name must resolve");
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204, "legacy node name must resolve");
         // Rule dispatch through the broker: the connector id shares the
         // engine's lock-free dispatch snapshot with action ids, so a rule
         // forwarding to this id fires while started and skips while
@@ -13517,7 +13500,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -13541,7 +13524,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -13659,7 +13642,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(true));
         // Stop: the reported state changes to disabled on the next read.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 "/api/v5/actions/w3-06-action/stop",
@@ -13667,15 +13650,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(false));
+        assert_eq!(status, 204);
         let (status, body) = server
             .get_auth("/api/v5/actions/w3-06-action", &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(false));
         // Start: the reported state changes back to enabled.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 "/api/v5/actions/w3-06-action/start",
@@ -13683,8 +13665,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204);
         let (status, body) = server
             .get_auth("/api/v5/actions/w3-06-action", &token)
             .await;
@@ -13743,7 +13724,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -13767,7 +13748,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -13902,7 +13883,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Stop through the node route: the reported state flips to
         // disabled on the next read. The legacy node name names the same
         // local node.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 &format!("/api/v5/nodes/{local}/actions/w3-09-action/stop"),
@@ -13910,9 +13891,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(false));
-        let (status, body) = server
+        assert_eq!(status, 204);
+        let (status, _) = server
             .send(
                 "POST",
                 &format!("/api/v5/nodes/{legacy}/actions/w3-09-action/start"),
@@ -13920,8 +13900,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200, "legacy node name must resolve");
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204, "legacy node name must resolve");
         // Rule dispatch through the broker: a rule forwarding to the
         // action id fires while started and skips while stopped through
         // the node route. The counting sink is registered under the action
@@ -13975,7 +13954,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -13999,7 +13978,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -14333,7 +14312,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 204);
         state
             .engine
             .dispatch_ingress(
@@ -14698,11 +14677,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // validation alone. Must not create a source: the summary still
         // reports zeroes (W3-31 restores the source directory, so the
         // absence check reads the live summary, not a 404).
-        let (status, body) = server
+        let (status, _) = server
             .post_auth("/api/v5/sources_probe", json!({"type": "mqtt"}), &token)
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["result"], json!("ok"));
+        assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["total"], json!(0), "probe must not create a source");
@@ -15107,19 +15085,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["enabled"], json!(1));
         assert_eq!(body["disabled"], json!(0));
         // Stop: the reported runtime state changes to disabled.
-        let (status, body) = server
+        let (status, _) = server
             .send("POST", "/api/v5/sources/w3-23-src/stop", None, Some(&token))
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["id"], json!("w3-23-src"));
-        assert_eq!(body["enable"], json!(false));
+        assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["total"], json!(1));
         assert_eq!(body["enabled"], json!(0));
         assert_eq!(body["disabled"], json!(1));
         // Start: the reported runtime state changes back to enabled.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 "/api/v5/sources/w3-23-src/start",
@@ -15127,9 +15103,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["id"], json!("w3-23-src"));
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["total"], json!(1));
@@ -15237,7 +15211,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["enable"], json!(true));
         // Disable: the reported flag changes and reads back disabled on
         // the next single read (ingress stopped on the W3-23 runtime).
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "PUT",
                 "/api/v5/sources/w3-28-src/enable/false",
@@ -15245,9 +15219,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["id"], json!("w3-28-src"));
-        assert_eq!(body["enable"], json!(false));
+        assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources/w3-28-src", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(false));
@@ -15258,7 +15230,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["disabled"], json!(1));
         // The W3-23 operation route observes the same core: starting the
         // disabled source re-enables it (ingress resumed).
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 "/api/v5/sources/w3-28-src/start",
@@ -15266,11 +15238,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204);
         // Re-disable through the enable route, then re-enable through it:
         // the flag change is visible on the next read each way.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "PUT",
                 "/api/v5/sources/w3-28-src/enable/false",
@@ -15278,9 +15249,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(false));
-        let (status, body) = server
+        assert_eq!(status, 204);
+        let (status, _) = server
             .send(
                 "PUT",
                 "/api/v5/sources/w3-28-src/enable/true",
@@ -15288,8 +15258,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources/w3-28-src", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(true));
@@ -15403,7 +15372,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["enabled"], json!(1));
         // Stop through the node route: the reported state flips to
         // disabled. The legacy node name names the same local node.
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 &format!("/api/v5/nodes/{local}/sources/w3-24-src/stop"),
@@ -15411,14 +15380,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["id"], json!("w3-24-src"));
-        assert_eq!(body["enable"], json!(false));
+        assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["enabled"], json!(0));
         assert_eq!(body["disabled"], json!(1));
-        let (status, body) = server
+        let (status, _) = server
             .send(
                 "POST",
                 &format!("/api/v5/nodes/{legacy}/sources/w3-24-src/start"),
@@ -15426,9 +15393,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 Some(&token),
             )
             .await;
-        assert_eq!(status, 200, "legacy node name must resolve");
-        assert_eq!(body["id"], json!("w3-24-src"));
-        assert_eq!(body["enable"], json!(true));
+        assert_eq!(status, 204, "legacy node name must resolve");
         // The message path is untouched: live ingress dispatch still works
         // and the source directory reports the same counts after.
         struct W324Sink;
@@ -16653,7 +16618,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, created) = server
             .post_auth(
                 "/api/v5/authentication/password_based:built_in_database/users",
@@ -16694,7 +16659,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
 
         let (status, body) = server
             .post_auth(
@@ -16824,7 +16789,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, body) = server
             .post_auth(
                 "/api/v5/authentication/password_based:mysql/import_users",
@@ -16853,7 +16818,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .post_auth(
                 "/api/v5/authentication/password_based:built_in_database/import_users",
@@ -18140,7 +18105,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
+        assert_eq!(status, 200);
         let (status, _) = server
             .post_auth(
                 "/api/v5/authentication/password_based:built_in_database/users",
@@ -18223,16 +18188,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 404);
 
         // Import the exported file through the API.
-        let (status, body) = server
+        let (status, _) = server
             .post_auth(
                 "/api/v5/data/import",
                 json!({"filename": filename.as_str()}),
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["status"], json!("restored"));
-        assert_eq!(body["filename"], json!(filename.as_str()));
+        assert_eq!(status, 204);
 
         // The rule is back with its SQL; the ban is back; the ACL is back.
         let (status, fetched) = server
@@ -18590,15 +18553,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 204);
-        let (status, body) = server
+        let (status, _) = server
             .post_auth(
                 "/api/v5/data/import",
                 json!({"filename": "conf-retained-rt.tar.gz"}),
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["status"], json!("restored"));
+        assert_eq!(status, 204);
         let (status, fetched) = server
             .get_auth("/api/v5/mqtt/retainer/message/rt-import-new", &token)
             .await;

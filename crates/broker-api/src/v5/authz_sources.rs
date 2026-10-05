@@ -95,8 +95,8 @@ enum CreateError {
     UnknownType(String),
 }
 
-/// `POST /authorization/sources`: register one source. Returns the
-/// stored entry with 201. Malformed bodies fail with `BAD_REQUEST`; a
+/// `POST /authorization/sources`: register one source. Returns 204 with
+/// no body, as the reference API documents. Malformed bodies fail with `BAD_REQUEST`; a
 /// `type` that names no documented source fails with `NOT_FOUND`; an
 /// already-stored `type` fails with `ALREADY_EXISTS` instead of merging;
 /// a full registry fails with `BAD_REQUEST`.
@@ -117,7 +117,7 @@ pub async fn create_authz_source(State(state): State<ApiState>, body: Bytes) -> 
         }
     };
     match state.authz_sources.insert(entry) {
-        Ok(stored) => (StatusCode::CREATED, Json(render_entry(&stored))).into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(SourceInsertError::Duplicate) => {
             ApiError::AlreadyExists("authorization source already exists".to_string())
                 .into_response()
@@ -687,9 +687,9 @@ pub async fn get_authz_source(
 /// `type` that differs from the path type is rejected. Omitted
 /// `enable`/`config` keep their stored values, so a body carrying only
 /// the fields to change still replaces after full validation. On
-/// success returns 200 with the stored entry (plus live health and
-/// counters). The write persists across a restart through the config
-/// registry (counters do not: they restart at zero).
+/// success returns 204 with no body, as the reference API documents.
+/// The write persists across a restart through the config registry
+/// (counters do not: they restart at zero).
 /// Management-plane only: one short write lock per request (plus the
 /// registry save lock on persist); the publish and subscribe
 /// authorization consults read the built-in rule table, never this
@@ -720,17 +720,7 @@ pub async fn put_authz_source(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authz_sources.update(&source_type, entry) {
-        Ok(stored) => {
-            let counters = state
-                .authz_sources
-                .counter_snapshot(&source_type)
-                .unwrap_or(broker_auth::AuthzSourceCounterSnapshot {
-                    allow: 0,
-                    deny: 0,
-                    total: 0,
-                });
-            (StatusCode::OK, Json(render_detail(&stored, counters))).into_response()
-        }
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(SourceUpdateError::NotFound) => {
             ApiError::NotFound(format!("authorization source {source_type:?} not found"))
                 .into_response()
@@ -850,9 +840,9 @@ pub async fn reset_authz_source_metrics(
 /// moves nothing, and a bad position (missing key, unknown anchor, or
 /// an index at or past the registry length) fails with `BAD_REQUEST`
 /// and moves nothing. Moving to the entry's current position is a
-/// no-op success. On success returns 200 with the new ordered entries
-/// as a bare JSON array. The new order persists across a restart
-/// through the config registry.
+/// no-op success. On success returns 204 with no body, as the reference
+/// API documents. The new order persists across a restart through the
+/// config registry.
 /// Management-plane only: one short registry write lock per request
 /// (plus the registry save lock on persist); the publish and subscribe
 /// authorization consults read the built-in rule table, never this
@@ -864,11 +854,6 @@ pub async fn reset_authz_source_metrics(
 // `{"after": ...}` anchor pair, or a numeric index only? The rulebook
 // does not decide the exact envelope; the current choice accepts all
 // three shapes until the checker pins it.
-// TODO(parity): does a successful move report the new order as a 200
-// bare list, a 200 data/meta page, or a 204 with no body? The rulebook
-// does not decide the exact success shape; the current choice answers
-// 200 with the bare ordered entries, mirroring the sibling move, until
-// the checker pins it.
 pub async fn move_authz_source(
     State(state): State<ApiState>,
     Path(source_type): Path<String>,
@@ -891,10 +876,7 @@ pub async fn move_authz_source(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authz_sources.relocate(&source_type, position) {
-        Ok(order) => {
-            let data: Vec<serde_json::Value> = order.iter().map(render_entry).collect();
-            (StatusCode::OK, Json(data)).into_response()
-        }
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(broker_auth::SourceMoveError::NotFound) => {
             ApiError::NotFound(format!("authorization source {source_type:?} not found"))
                 .into_response()
@@ -1168,7 +1150,7 @@ mod tests {
 
         // Register one stored-only source; it reads back with its health
         // never claimed: type/enable only, no live status invented.
-        let (status, created, _) = parts(
+        let (status, _, _) = parts(
             create_authz_source(
                 State(state.clone()),
                 body(serde_json::json!({"type": "file"})),
@@ -1176,10 +1158,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created["type"], serde_json::json!("file"));
-        assert_eq!(created["enable"], serde_json::json!(true));
-        assert!(created.get("status").is_none(), "no live status is claimed");
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         // List now carries both entries in stored order.
         let (status, listed, _) =
@@ -1571,7 +1550,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         let (status, _, raw) = put_order(&state, order_body(&["file", "built_in_database"])).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -1630,7 +1609,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         let response = delete_authz_source(State(state.clone()), Path("file".to_string())).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1685,7 +1664,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         // Read hits with the stored config and live health; a
         // stored-only backend never claims to be live.
@@ -1722,7 +1701,7 @@ mod tests {
             .expect("empty table allows on the publish path");
 
         // Update with a valid config and read back.
-        let (status, updated, _) = parts(
+        let (status, _, raw) = parts(
             put_authz_source(
                 State(state.clone()),
                 Path("file".to_string()),
@@ -1734,13 +1713,8 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(updated["type"], serde_json::json!("file"));
-        assert_eq!(updated["enable"], serde_json::json!(false));
-        assert_eq!(
-            updated["config"]["path"],
-            serde_json::json!("/etc/authz/other.conf")
-        );
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "update answers 204 with no body");
         let (status, reread, _) =
             parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
         assert_eq!(status, StatusCode::OK);
@@ -1824,7 +1798,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::NO_CONTENT);
 
         let bad_bodies = [
             // A body `type` that differs from the path type is rejected.
@@ -1866,7 +1840,7 @@ mod tests {
 
         // A body carrying only the stored `type` is a no-op replace that
         // keeps the stored values.
-        let (status, same, _) = parts(
+        let (status, _, _) = parts(
             put_authz_source(
                 State(state.clone()),
                 Path("file".to_string()),
@@ -1875,6 +1849,9 @@ mod tests {
             .await,
         )
         .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, same, _) =
+            parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(same["enable"], serde_json::json!(true));
         assert_eq!(
@@ -2055,7 +2032,7 @@ mod tests {
                 .await,
             )
             .await;
-            assert_eq!(status, StatusCode::CREATED, "create {source_type}");
+            assert_eq!(status, StatusCode::NO_CONTENT, "create {source_type}");
         }
         assert_eq!(
             list_types(&state).await,
@@ -2067,20 +2044,17 @@ mod tests {
         );
 
         // Move the second stored source before the first via the anchor
-        // shape and expect the new order back.
-        let (status, moved, _) = move_call(
+        // shape. The answer is 204 with no body; the list shows the new
+        // order.
+        let (status, moved, raw) = move_call(
             &state,
             "file",
             serde_json::json!({"before": "built_in_database"}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        let moved_types: Vec<String> = moved
-            .as_array()
-            .expect("move reports bare order array")
-            .iter()
-            .map(|row| row["type"].as_str().expect("row has type").to_string())
-            .collect();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(moved.is_null() && raw.is_empty(), "move returns no body");
+        let moved_types = list_types(&state).await;
         assert_eq!(
             moved_types,
             vec![
@@ -2089,22 +2063,20 @@ mod tests {
                 "http".to_string(),
             ]
         );
-        assert_eq!(list_types(&state).await, moved_types);
 
         // The numeric-index shape moves back; the keyword shape reaches
-        // the end of the list.
-        let (status, moved, _) =
-            move_call(&state, "file", serde_json::json!({"position": 1})).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(moved[1]["type"], serde_json::json!("file"));
-        let (status, moved, _) = move_call(
+        // the front of the list.
+        let (status, _, _) = move_call(&state, "file", serde_json::json!({"position": 1})).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(list_types(&state).await[1], "file");
+        let (status, _, _) = move_call(
             &state,
             "built_in_database",
             serde_json::json!({"position": "front"}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(moved[0]["type"], serde_json::json!("built_in_database"));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(list_types(&state).await[0], "built_in_database");
 
         // Status carries the documented fields: identity plus liveness,
         // health rows and counters.
@@ -2180,7 +2152,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::NO_CONTENT);
         let before = list_types(&state).await;
 
         let bad_bodies = [

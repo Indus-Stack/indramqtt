@@ -58,7 +58,7 @@ pub async fn list_authn_chain(State(state): State<ApiState>, params: PageParams)
 }
 
 /// `POST /authentication`: append one authenticator. Returns the stored
-/// entry with 201. Malformed bodies fail with `BAD_REQUEST`; an existing
+/// entry with 200, as the reference API documents. Malformed bodies fail with `BAD_REQUEST`; an existing
 /// `id` fails with `ALREADY_EXISTS` instead of being overwritten; a full
 /// chain fails with `BAD_REQUEST`.
 pub async fn create_authn_chain(State(state): State<ApiState>, body: Bytes) -> Response {
@@ -74,7 +74,7 @@ pub async fn create_authn_chain(State(state): State<ApiState>, body: Bytes) -> R
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authn_chain.insert(entry) {
-        Ok(stored) => (StatusCode::CREATED, Json(render_entry(&stored))).into_response(),
+        Ok(stored) => (StatusCode::OK, Json(render_entry(&stored))).into_response(),
         Err(ChainInsertError::Duplicate) => {
             ApiError::AlreadyExists("authenticator already exists".to_string()).into_response()
         }
@@ -166,7 +166,8 @@ pub async fn get_authn_entry(
 /// `id` that differs from the path id is rejected. Omitted
 /// `mechanism`/`backend`/`enable`/`config` keep their stored values, so
 /// a body carrying only the fields to change still replaces after full
-/// validation. On success returns 200 with the stored entry. The write
+/// validation. On success returns 204 with no body, as the reference API
+/// documents. The write
 /// persists across a restart through the config registry.
 /// Management-plane only: one short write lock per request; the CONNECT
 /// path keeps reading its lock-free snapshot and publish/deliver never
@@ -196,7 +197,7 @@ pub async fn put_authn_entry(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authn_chain.update(&id, entry) {
-        Ok(stored) => (StatusCode::OK, Json(render_entry(&stored))).into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(ChainUpdateError::NotFound) => {
             ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
         }
@@ -250,7 +251,7 @@ pub async fn delete_authn_entry(
 }
 
 /// `PUT /authentication/{id}/position/{position}`: move one chain entry
-/// to a zero-based position and report the new order.
+/// to a zero-based position.
 ///
 /// The `{position}` path segment must parse as a non-negative integer;
 /// anything else fails with `BAD_REQUEST` and moves nothing. Positions
@@ -258,8 +259,8 @@ pub async fn delete_authn_entry(
 /// position at or past the chain length fails with `BAD_REQUEST` and
 /// moves nothing. Unknown ids fail with `NOT_FOUND` in the documented
 /// `{code, message}` shape and apply nothing. Moving to the entry's
-/// current index is a no-op success. On success returns 200 with the new
-/// ordered entries as a bare JSON array. The new order persists across a
+/// current index is a no-op success. On success returns 204 with no body,
+/// as the reference API documents. The new order persists across a
 /// restart through the config registry.
 /// Management-plane only: one short write lock per request; the CONNECT
 /// path keeps reading its lock-free snapshot and publish/deliver never
@@ -270,10 +271,6 @@ pub async fn delete_authn_entry(
 // `front`/`rear`/`before:<id>`/`after:<id>` keywords? The rulebook does
 // not decide the exact position vocabulary; the current choice implements
 // the task's stated zero-based index assumption until the checker pins it.
-// TODO(parity): does a successful move report the new order as a 200 bare
-// list, a 200 data/meta page, or a 204 with no body? The rulebook does not
-// decide the exact success shape; the current choice answers 200 with the
-// bare ordered entries until the checker pins it.
 pub async fn move_authn_position(
     State(state): State<ApiState>,
     axum::extract::Path((id, raw_position)): axum::extract::Path<(String, String)>,
@@ -288,10 +285,7 @@ pub async fn move_authn_position(
         }
     };
     match state.authn_chain.move_to_position(&id, position) {
-        Ok(order) => {
-            let data: Vec<serde_json::Value> = order.iter().map(render_entry).collect();
-            (StatusCode::OK, Json(data)).into_response()
-        }
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(ChainMoveError::NotFound) => {
             ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
         }

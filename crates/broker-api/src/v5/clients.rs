@@ -152,14 +152,7 @@ pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<Str
         .unwrap_or(false);
 
     if session.is_none() && !is_connected {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "code": "CLIENT_NOT_FOUND",
-                "message": "Client not found"
-            })),
-        )
-            .into_response();
+        return ApiError::ClientIdNotFound("Client not found".to_string()).into_response();
     }
 
     let keepalive = session
@@ -248,6 +241,9 @@ pub async fn kick_client(State(state): State<ApiState>, Path(client_id): Path<St
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// `POST /clients/kickout/bulk`: disconnect many clients. The reference
+/// API documents one success status, 204 with no body. An id that has no
+/// live connection is skipped.
 pub async fn batch_kick_clients(State(state): State<ApiState>, body: Bytes) -> Response {
     let client_ids: Vec<String> = match serde_json::from_slice(&body[..]) {
         Ok(ids) => ids,
@@ -258,32 +254,21 @@ pub async fn batch_kick_clients(State(state): State<ApiState>, body: Bytes) -> R
     };
     // Bounded fan-out over the request itself: one synchronous close
     // frame per id through the shared single-kick routine, no extra
-    // buffering beyond the result list and no spawned tasks. The result
-    // list is management-plane only; the per-message path stays free of
-    // new allocation (empty metadata and payload frames). Taken wills
-    // fire after their kick (a kick is an unexpected disconnect, MT-05).
-    let mut results = Vec::with_capacity(client_ids.len());
+    // buffering beyond the taken wills and no spawned tasks. The per-message
+    // path stays free of new allocation (empty metadata and payload
+    // frames). Taken wills fire after their kick (a kick is an unexpected
+    // disconnect, MT-05).
     let mut fired_wills = Vec::new();
     for client_id in &client_ids {
         let (closed, will) = kick_one(&state, client_id);
-        if closed {
-            results.push(serde_json::json!({"clientid": client_id, "result": "ok"}));
-            if let Some(will) = will {
-                fired_wills.push(will);
-            }
-        } else {
-            results.push(serde_json::json!({
-                "clientid": client_id,
-                "result": "not_found",
-                "code": "CLIENTID_NOT_FOUND",
-                "message": "client not found"
-            }));
+        if let (true, Some(will)) = (closed, will) {
+            fired_wills.push(will);
         }
     }
     for will in fired_wills {
         fire_kicked_will(&state, will).await;
     }
-    (StatusCode::OK, Json(results)).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Deliver a kicked client's taken will into its registration tenant

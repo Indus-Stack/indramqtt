@@ -5217,9 +5217,8 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
 /// flag is flipped, the change is mirrored into the engine's lock-free
 /// dispatch snapshot (disabled forwards are skipped at fire time before
 /// reaching `ConnectorManager::send`), the mutation persists through the
-/// config core like every other connector write, and the updated
-/// connector reads back with 200 so the flag change is visible on the
-/// next read.
+/// config core like every other connector write, and the answer is 204
+/// with no body, as the reference API documents.
 ///
 /// The pair is not paged; unknown query parameters are ignored (no query
 /// is extracted). Management-plane only: one short write lock plus the
@@ -5247,11 +5246,6 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
 // current choice answers 404 first (existence before validation,
 // mirroring the action update and enable routes) and persists nothing
 // either way.
-// TODO(parity): does the enable route answer 200 with the updated
-// connector or 204 with no body? The rulebook does not decide the exact
-// shape; the current choice returns the updated connector with 200
-// (mirroring the action enable route) so the flag change is visible
-// without a second read.
 // TODO(parity): do connector ids and action ids share one disable
 // namespace in the dispatch snapshot, or does the checker address them
 // separately? The rulebook does not decide; the current choice shares
@@ -5282,7 +5276,7 @@ pub async fn set_connector_enabled(
             .into_response();
         }
     };
-    let updated = {
+    {
         let mut connectors = CONNECTORS.write().unwrap();
         let Some(pos) = connectors.iter().position(|c| {
             c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
@@ -5296,8 +5290,7 @@ pub async fn set_connector_enabled(
         if let Some(obj) = connectors[pos].as_object_mut() {
             obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
         }
-        connectors[pos].clone()
-    };
+    }
     // Mirror into the dispatch snapshot before persisting: the in-memory
     // flag is already flipped, so evaluation must observe it even if the
     // disk save below fails (the store itself keeps the mutation on a
@@ -5306,8 +5299,7 @@ pub async fn set_connector_enabled(
     if let Err(error) = persist_connectors(&state.config) {
         return connector_persist_error(error);
     }
-    let live = connector_live_view(&updated, &state.engine);
-    (StatusCode::OK, Json(live)).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `POST /api/v5/connectors/:id/:operation`: run one named lifecycle
@@ -5358,11 +5350,6 @@ pub async fn set_connector_enabled(
 // current choice answers 404 first (existence before validation,
 // mirroring the action operation and the connector enable route) and
 // persists nothing either way.
-// TODO(parity): does a valid operation answer 200 with the updated
-// connector or 204 with no body? The rulebook does not decide the exact
-// shape; the current choice returns the updated connector with 200
-// (mirroring the enable route) so the resulting state is visible without
-// a second read.
 pub async fn run_connector_operation(
     State(state): State<ApiState>,
     Path((id, operation)): Path<(String, String)>,
@@ -5408,10 +5395,6 @@ pub async fn run_connector_operation(
 // does not decide the precedence; the current choice answers the node 404
 // first (node scope before connector existence before operation validity,
 // fail closed) and touches nothing else either way.
-// TODO(parity): does the node-scoped answer carry a node envelope or the
-// bare updated connector? The rulebook does not decide the exact shape; the
-// current choice returns the same bare updated connector with 200 as the
-// global route (single-node answer) until the checker pins it.
 pub async fn run_node_connector_operation(
     State(state): State<ApiState>,
     Path((node, id, operation)): Path<(String, String, String)>,
@@ -5431,8 +5414,8 @@ pub async fn run_node_connector_operation(
 /// Shared dispatch behind the connector operation route: existence check
 /// (unknown id is 404, creates nothing), operation validity check
 /// (unknown name is `BAD_REQUEST`, persists nothing), then the enable
-/// flip with the engine snapshot mirror, persistence and the updated
-/// connector with 200. Management-plane only; see the caller for the
+/// flip with the engine snapshot mirror, persistence and the 204 answer
+/// with no body. Management-plane only; see the caller for the
 /// locking and fire-path notes.
 async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) -> Response {
     // Exact id matching only, mirroring read/replace/delete/enable: the
@@ -5456,7 +5439,7 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
             .into_response();
         }
     };
-    let updated = {
+    {
         let mut connectors = CONNECTORS.write().unwrap();
         let Some(pos) = connectors.iter().position(|c| {
             c.get("id").and_then(|v| v.as_str()) == Some(id)
@@ -5470,8 +5453,7 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
         if let Some(obj) = connectors[pos].as_object_mut() {
             obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
         }
-        connectors[pos].clone()
-    };
+    }
     // Mirror into the dispatch snapshot before persisting: the in-memory
     // flag is already flipped, so evaluation must observe it even if the
     // disk save below fails (the store itself keeps the mutation on a
@@ -5483,8 +5465,7 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     if let Err(error) = persist_connectors(&state.config) {
         return connector_persist_error(error);
     }
-    let live = connector_live_view(&updated, &state.engine);
-    (StatusCode::OK, Json(live)).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
@@ -5921,9 +5902,9 @@ fn is_known_source_type(kind: &str) -> bool {
 }
 
 /// Stateless source probe: validates the config against the named kind and
-/// dials where the kind exposes a network target, reporting success or the
-/// failure reason with the documented `{code, message}` / `{result, status}`
-/// shape. Management-plane only: runs off the message path (no lock, no
+/// dials where the kind exposes a network target. Success answers 204 with
+/// no body, as the reference API documents. A failure answers with the
+/// documented `{code, message}` shape. Management-plane only: runs off the message path (no lock, no
 /// allocation, no state on publish/deliver), performs single-request bounded
 /// work capped by [`SOURCE_PROBE_TIMEOUT`], writes to no store, registers no
 /// runtime, and leaves nothing running after return.
@@ -5983,15 +5964,7 @@ pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
     if let Some(target) = extract_target_host_port(&body) {
         let dial = tokio::time::timeout(SOURCE_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
         match dial {
-            Ok(Ok(())) => (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "result": "ok",
-                    "status": "connected",
-                    "message": format!("Target endpoint {} reachable", target)
-                })),
-            )
-                .into_response(),
+            Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
             Ok(Err(err)) => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -6010,11 +5983,7 @@ pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
                 .into_response(),
         }
     } else {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({ "result": "ok", "status": "connected" })),
-        )
-            .into_response()
+        StatusCode::NO_CONTENT.into_response()
     }
 }
 

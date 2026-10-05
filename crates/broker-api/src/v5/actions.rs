@@ -615,8 +615,8 @@ pub async fn update_action(
 /// flag is flipped, the change is mirrored into the engine's lock-free
 /// dispatch snapshot (disabled forwards are skipped at fire time), the
 /// mutation persists through the config core like every other action
-/// write, and the updated action reads back with 200 so the flag change
-/// is visible on the next read.
+/// write, and the answer is 204 with no body, as the reference API
+/// documents.
 ///
 /// The pair is not paged; unknown query parameters are ignored (no query
 /// is extracted). Management-plane only: one short write lock plus the
@@ -632,10 +632,6 @@ pub async fn update_action(
 // answer 404 or 400? The rulebook does not decide the precedence; the
 // current choice answers 404 first (existence before validation,
 // mirroring the action update) and persists nothing either way.
-// TODO(parity): does the enable route answer 200 with the updated action
-// or 204 with no body? The rulebook does not decide the exact shape;
-// the current choice returns the updated action with 200 (mirroring the
-// action update) so the flag change is visible without a second read.
 pub async fn set_action_enabled(
     State(state): State<ApiState>,
     Path((id, enable_raw)): Path<(String, String)>,
@@ -653,9 +649,9 @@ pub async fn set_action_enabled(
             .into_response();
         }
     };
-    let Some(entry) = state.actions.set_enabled(&id, enable) else {
+    if state.actions.set_enabled(&id, enable).is_none() {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
-    };
+    }
     // Mirror into the dispatch snapshot before persisting: the in-memory
     // flag is already flipped, so evaluation must observe it even if the
     // disk save below fails (the store itself keeps the mutation on a
@@ -664,7 +660,7 @@ pub async fn set_action_enabled(
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
-    (StatusCode::OK, Json(entry.to_json())).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `GET /api/v5/actions/:id/metrics`: live per-action counters (W3-05,
@@ -764,8 +760,8 @@ pub async fn reset_action_metrics(
 /// enable flag in place, mirror the flag into the engine's lock-free
 /// dispatch snapshot (disabled forwards are skipped at fire time before
 /// reaching the connector), persist through the config core like every
-/// other action write, and report the resulting action with 200 so the
-/// state change is visible without a second read.
+/// other action write, and answer 204 with no body, as the reference API
+/// documents.
 ///
 /// An unknown action id returns 404 with the documented `{code, message}`
 /// shape and persists nothing; an unknown operation name is rejected
@@ -801,10 +797,6 @@ pub async fn reset_action_metrics(
 // current choice answers 404 first (existence before validation,
 // mirroring the action update and enable routes) and persists nothing
 // either way.
-// TODO(parity): does a valid operation answer 200 with the updated action
-// or 204 with no body? The rulebook does not decide the exact shape; the
-// current choice returns the updated action with 200 (mirroring the
-// enable route) so the resulting state is visible without a second read.
 pub async fn run_action_operation(
     State(state): State<ApiState>,
     Path((id, operation)): Path<(String, String)>,
@@ -850,10 +842,6 @@ pub async fn run_action_operation(
 // not decide the precedence; the current choice answers the node 404 first
 // (node scope before action existence before operation validity, fail
 // closed) and touches nothing else either way.
-// TODO(parity): does the node-scoped answer carry a node envelope or the
-// bare updated action? The rulebook does not decide the exact shape; the
-// current choice returns the same bare updated action with 200 as the
-// global route (single-node answer) until the checker pins it.
 pub async fn run_node_action_operation(
     State(state): State<ApiState>,
     Path((node, id, operation)): Path<(String, String, String)>,
@@ -874,7 +862,7 @@ pub async fn run_node_action_operation(
 /// routes: existence check (unknown id is 404, creates nothing), operation
 /// validity check (unknown name is `BAD_REQUEST`, persists nothing), then
 /// the enable flip with the engine snapshot mirror, persistence and the
-/// updated action with 200. Management-plane only; see the callers for the
+/// 204 answer with no body. Management-plane only; see the callers for the
 /// locking and fire-path notes.
 async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> Response {
     if state.actions.get(id).is_none() {
@@ -890,9 +878,9 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
             .into_response();
         }
     };
-    let Some(entry) = state.actions.set_enabled(id, enable) else {
+    if state.actions.set_enabled(id, enable).is_none() {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
-    };
+    }
     // Wire into the connector lifecycle underneath: the engine's
     // lock-free dispatch snapshot gates every `ForwardConnector` forward
     // before `ConnectorManager::send` (see `run_actions` in
@@ -903,7 +891,7 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
-    (StatusCode::OK, Json(entry.to_json())).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `GET /api/v5/actions_summary` (W3-08, C06-12): aggregated counts

@@ -785,8 +785,8 @@ pub async fn delete_transformation(
 /// with the documented error shape and persists nothing. On success
 /// the stored flag flips, the change mirrors into the engine lock-free
 /// snapshot (disabled steps skip at execution time), the mutation
-/// persists with the chain record, and the updated entry reads back
-/// with 200. The route is not paged; unknown query parameters are
+/// persists with the chain record, and the answer is 204 with no body,
+/// as the reference API documents. The route is not paged; unknown query parameters are
 /// ignored. Management-plane only; publish and deliver never touch
 /// this store.
 ///
@@ -808,10 +808,6 @@ pub async fn delete_transformation(
 // the answer 404 or 400? The rulebook does not decide the precedence;
 // the current choice answers 404 first (existence before validation)
 // and persists nothing either way.
-// TODO(parity): does the enable route answer 200 with the updated entry
-// or 204 with no body? The rulebook does not decide the exact shape;
-// the current choice returns the updated entry with 200 so the flag
-// change shows without a second read.
 pub async fn set_transformation_enabled(
     State(state): State<ApiState>,
     Path((name, enable_raw)): Path<(String, String)>,
@@ -830,14 +826,14 @@ pub async fn set_transformation_enabled(
             .into_response();
         }
     };
-    let Some(entry) = state.transformations.set_enabled(&name, enable) else {
+    if state.transformations.set_enabled(&name, enable).is_none() {
         return ApiError::NotFound(format!("transformation {name:?} not found")).into_response();
-    };
+    }
     sync_engine(&state);
     if let Err(error) = state.transformations.persist() {
         return transform_persist_error(error);
     }
-    (StatusCode::OK, Json(entry.to_json())).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `GET /api/v5/message_transformations/transformation/:name/metrics`:
@@ -2139,8 +2135,19 @@ mod tests {
             .await,
         )
         .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(flipped.is_null(), "enable answers 204 with no body");
+        let (status, read) = response_parts(
+            get_transformation(
+                State(state.clone()),
+                Path("w3-35-one".to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(flipped["enable"], serde_json::json!(false));
+        assert_eq!(read["enable"], serde_json::json!(false));
         assert_eq!(single_output(&state, "single/1", "m").await, "m");
         // Delete through the production entry.
         let response = delete_transformation(
@@ -2223,8 +2230,19 @@ mod tests {
             .await,
         )
         .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(flipped.is_null(), "enable answers 204 with no body");
+        let (status, read) = response_parts(
+            get_transformation(
+                State(state.clone()),
+                Path("q-1".to_string()),
+                Query(Default::default()),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(flipped["enable"], serde_json::json!(true));
+        assert_eq!(read["enable"], serde_json::json!(true));
     }
 
     #[tokio::test]

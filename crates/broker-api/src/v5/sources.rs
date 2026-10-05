@@ -665,10 +665,10 @@ pub async fn update_source(
 ///
 /// Only the operations the runtime supports are served: `start`
 /// (enable the source) and `stop` (disable it). Both flip the stored
-/// enable flag in place via [`SourceStore::set_enabled`] and report the
-/// resulting source with 200 so the state change is visible without a
-/// second read. Later source tasks reuse the same flip (and the same
-/// `get` existence check) rather than reimplementing the runtime.
+/// enable flag in place via [`SourceStore::set_enabled`] and answer 204
+/// with no body, as the reference API documents. Later source tasks
+/// reuse the same flip (and the same `get` existence check) rather than
+/// reimplementing the runtime.
 ///
 /// An unknown source id returns 404 with the documented error code, not
 /// an empty body, and changes nothing; an unknown operation name is
@@ -698,7 +698,7 @@ pub async fn run_source_operation(
 /// Shared dispatch behind the source operation route: existence check
 /// (unknown id is 404, changes nothing), operation validity check
 /// (unknown name is `BAD_REQUEST`, changes nothing), then the enable
-/// flip with the updated source and 200. Management-plane only; see
+/// flip and the 204 answer with no body. Management-plane only; see
 /// the caller for the locking and fire-path notes.
 fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Response {
     if state.sources.get(id).is_none() {
@@ -714,9 +714,9 @@ fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Respon
             .into_response();
         }
     };
-    let Some(entry) = state.sources.set_enabled(id, enable) else {
+    if state.sources.set_enabled(id, enable).is_none() {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
-    };
+    }
     // Mirror into the ingress snapshot before persisting: the in-memory
     // flag is already flipped, so the next ingress must observe it even if
     // the disk save below fails (the store itself keeps the mutation on a
@@ -725,7 +725,7 @@ fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Respon
     if let Err(error) = state.sources.persist() {
         return source_persist_error(error);
     }
-    (StatusCode::OK, Json(entry.to_json())).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `POST /api/v5/nodes/:node/sources/:id/:operation`: run one named
@@ -766,10 +766,6 @@ fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Respon
 // not decide the precedence; the current choice answers the node 404 first
 // (node scope before source existence before operation validity, fail
 // closed) and touches nothing else either way.
-// TODO(parity): does the node-scoped answer carry a node envelope or the
-// bare updated source? The rulebook does not decide the exact shape; the
-// current choice returns the same bare updated source with 200 as the
-// global route (single-node answer) until the checker pins it.
 pub async fn run_node_source_operation(
     State(state): State<ApiState>,
     Path((node, id, operation)): Path<(String, String, String)>,
@@ -796,8 +792,8 @@ pub async fn run_node_source_operation(
 /// W3-23 operation route uses (the lifecycle state is the stored flag, so
 /// the write drives that runtime: disabled sources stop ingress), the
 /// mutation persists through the config core with the source record like
-/// every other source write, and the updated source reads back with 200
-/// so the flag change is visible on the next read.
+/// every other source write, and the answer is 204 with no body, as the
+/// reference API documents.
 ///
 /// The pair is not paged; unknown query parameters are ignored (no query
 /// is extracted). Management-plane only: one short read lock for the
@@ -824,11 +820,6 @@ pub async fn run_node_source_operation(
 // current choice answers 404 first (existence before validation,
 // mirroring the source update and operation routes) and persists nothing
 // either way.
-// TODO(parity): does the enable route answer 200 with the updated source
-// or 204 with no body? The rulebook does not decide the exact shape; the
-// current choice returns the updated source with 200 (mirroring the
-// source operation route) so the flag change is visible without a second
-// read.
 pub async fn set_source_enabled(
     State(state): State<ApiState>,
     Path((id, enable_raw)): Path<(String, String)>,
@@ -846,9 +837,9 @@ pub async fn set_source_enabled(
             .into_response();
         }
     };
-    let Some(entry) = state.sources.set_enabled(&id, enable) else {
+    if state.sources.set_enabled(&id, enable).is_none() {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
-    };
+    }
     // Mirror into the ingress snapshot before persisting: the in-memory
     // flag is already flipped, so the next ingress must observe it even if
     // the disk save below fails (the store itself keeps the mutation on a
@@ -857,7 +848,7 @@ pub async fn set_source_enabled(
     if let Err(error) = state.sources.persist() {
         return source_persist_error(error);
     }
-    (StatusCode::OK, Json(entry.to_json())).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `GET /api/v5/sources/:id/metrics`: live per-source counters (W3-29,
