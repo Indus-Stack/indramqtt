@@ -86,8 +86,7 @@ const MAX_FILTER_LEN: usize = 512;
 /// Default capture window when `end_at` is absent: ten minutes.
 const DEFAULT_WINDOW_SECS: u64 = 600;
 
-/// Node name rendered in `log_size` (single node).
-const NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 /// Trace condition types the create path accepts.
 const VALID_TYPES: &[&str] = &["clientid", "topic", "ip_address", "ruleid"];
@@ -160,7 +159,7 @@ impl TraceSession {
         );
         obj.insert(
             "log_size".to_string(),
-            serde_json::json!({ (NODE_NAME): log_size }),
+            serde_json::json!({ (local_node_name()): log_size }),
         );
         serde_json::Value::Object(obj)
     }
@@ -1526,7 +1525,7 @@ mod tests {
             response_parts(create_trace(State(state.clone()), valid_body("trace-size")).await)
                 .await;
         assert_eq!(status, StatusCode::OK);
-        let initial = created["log_size"]["indramqtt@127.0.0.1"]
+        let initial = created["log_size"][local_node_name()]
             .as_u64()
             .expect("log_size renders a byte count");
         assert_eq!(
@@ -1539,7 +1538,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let items = listed.as_array().expect("list is an array");
         assert_eq!(items.len(), 1);
-        let reported = items[0]["log_size"]["indramqtt@127.0.0.1"]
+        let reported = items[0]["log_size"][local_node_name()]
             .as_u64()
             .expect("list renders a byte count");
         assert_eq!(reported, state.traces.log_len("trace-size") as u64);

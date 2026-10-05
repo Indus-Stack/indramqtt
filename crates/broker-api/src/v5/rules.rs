@@ -14,10 +14,7 @@ use crate::node_scope::resolve_node;
 use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
-/// Single-node name rendered by `v5::nodes::list_nodes`. Accepted alongside
-/// [`ApiState::node_id`] until every caller migrates to the configured id
-/// (see `node_scope` docs); both name the same local node.
-const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 // ---------------------------------------------------------------------------
 // Streaming Rules (W3-13, C06-18/C06-19/C06-20): paged list, validated
@@ -821,7 +818,7 @@ fn connector_status(reachable: bool) -> &'static str {
 /// Per-node display status for a connector entry (recomputed at read
 /// time, never persisted).
 fn connector_node_status(status: &str) -> serde_json::Value {
-    serde_json::json!([{ "node": "indramqtt@127.0.0.1", "status": status }])
+    serde_json::json!([{ "node": local_node_name(), "status": status }])
 }
 
 /// Required-field gate for connector registration (S1-01): no connector
@@ -1275,19 +1272,18 @@ fn redact_connector_doc(value: &serde_json::Value) -> serde_json::Value {
     out
 }
 
-/// `GET /api/v5/connectors` (C07-01): paged list over the real store with
-/// the standard page envelope (`data` plus `meta {page, limit, count,
-/// hasnext}`); an empty store returns an empty page, not an error.
+/// `GET /api/v5/connectors` (C07-01): every connector as a bare JSON
+/// array, as the reference API and the management console expect. An empty
+/// store reads as `[]`, never an error. The reference API documents no
+/// paging, so the route takes none.
 /// Each row renders live health from the connector manager, not the
 /// write-time snapshot. Unknown query parameters are ignored (the ignored
-/// query sink below; `page`/`limit` come from the shared extractor with
-/// default limit 100, max 1000). Management-plane only: one short lock
+/// query sink below). Management-plane only: one short lock
 /// cloning at most the capped list per request plus lock-free manager
 /// lookups for health; publish and deliver never touch this store (rule
 /// dispatch reads the manager directly, never this map).
 pub async fn list_connectors(
     State(state): State<ApiState>,
-    params: PageParams,
     Query(_ignored): Query<HashMap<String, String>>,
 ) -> Response {
     let store = CONNECTORS.read().unwrap();
@@ -1309,16 +1305,7 @@ pub async fn list_connectors(
         a_id.cmp(b_id)
     });
     drop(store);
-    let count = rows.len();
-    let page_rows = paginate(&rows, params.page, params.limit);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": page_rows,
-            "meta": meta_page(params.page, params.limit, count),
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(rows)).into_response()
 }
 
 /// `GET /api/v5/connectors/:id`: read one connector (C07-04).
@@ -5363,7 +5350,7 @@ pub async fn run_connector_operation(
 ///
 /// Single-node execution only: the `{node}` segment is checked with the
 /// shared [`resolve_node`] helper against the configured
-/// [`ApiState::node_id`] (falling back to the [`LEGACY_NODE_NAME`] literal
+/// [`ApiState::node_id`] (falling back to the [`local_node_name`] name
 /// the v5 rows render today); an unknown name returns the helper's 404
 /// `NOT_FOUND` shape naming the node and touches no other state. A known
 /// node dispatches to the same [`apply_connector_operation`] path as the
@@ -5400,7 +5387,7 @@ pub async fn run_node_connector_operation(
     Path((node, id, operation)): Path<(String, String, String)>,
 ) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.

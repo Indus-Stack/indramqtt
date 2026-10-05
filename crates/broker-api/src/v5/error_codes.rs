@@ -29,10 +29,9 @@
 //! - reads clone at most one page of small documents (each entry is two
 //!   short strings plus one integer) with no lock held.
 //!
-//! Paging (stated here): the list is paged via the shared [`PageParams`]
-//! extractor, so the default limit is 100 and the max is 1000 (see
-//! `crate::pagination::{DEFAULT_LIMIT, MAX_LIMIT}`); larger values are
-//! clamped, never rejected, and unknown query parameters are ignored.
+//! Paging (stated here): the list is a bare array and takes no paging
+//! parameters, as the reference API documents. Query parameters are
+//! ignored.
 // TODO(parity): which per-entry fields beyond `code`/`status`/`desc`
 // does the documented catalogue shape require? The rulebook does not
 // decide the exact shape; the current choice serves the stable code name,
@@ -48,7 +47,6 @@ use axum::{
 };
 
 use crate::errors::ApiError;
-use crate::pagination::{meta_page, paginate, PageParams};
 
 /// One catalogue entry: the stable code name, the numeric HTTP status
 /// our shared error mapping assigns to it, and a short operator-facing
@@ -70,9 +68,9 @@ pub struct ErrorCatalogEntry {
 /// documents; a new error variant grows this array with its own reason.
 /// The catalogue is code-defined, so the cap is enforced by
 /// construction and management memory cannot grow from this route. The
-/// default is finite (`17`); the operator cannot opt into more because
+/// default is finite (`20`); the operator cannot opt into more because
 /// writes are out of scope (read-only routes).
-const ERROR_CATALOG: [ErrorCatalogEntry; 17] = [
+const ERROR_CATALOG: [ErrorCatalogEntry; 20] = [
     ErrorCatalogEntry {
         code: "NOT_FOUND",
         status: 404,
@@ -144,6 +142,21 @@ const ERROR_CATALOG: [ErrorCatalogEntry; 17] = [
         desc: "Bearer token or key is missing, expired, or malformed",
     },
     ErrorCatalogEntry {
+        code: "USER_NOT_FOUND",
+        status: 404,
+        desc: "No dashboard user holds that name",
+    },
+    ErrorCatalogEntry {
+        code: "ERROR_PWD_NOT_MATCH",
+        status: 400,
+        desc: "The old password of a password change does not match",
+    },
+    ErrorCatalogEntry {
+        code: "NOT_ALLOWED",
+        status: 400,
+        desc: "The broker does not allow this change of a dashboard user",
+    },
+    ErrorCatalogEntry {
         code: "VALIDATION_FAILED",
         status: 400,
         desc: "Backup import validation failed",
@@ -164,7 +177,7 @@ const ERROR_CATALOG: [ErrorCatalogEntry; 17] = [
 /// one entry per shared error variant above is the whole vocabulary the
 /// management plane can render, so the count documents the bound the
 /// handlers enforce.
-pub const ERROR_CODE_COUNT: usize = 17;
+pub const ERROR_CODE_COUNT: usize = 20;
 
 // Compile-time guard that the bound covers the served catalogue.
 const _: () = assert!(ERROR_CATALOG.len() == ERROR_CODE_COUNT);
@@ -186,29 +199,14 @@ pub fn find_error_code(code: &str) -> Option<&'static ErrorCatalogEntry> {
     ERROR_CATALOG.iter().find(|entry| entry.code == code)
 }
 
-/// `GET /error_codes`: fixed catalogue with the standard page envelope
-/// (`data` plus `meta`).
-///
-/// An empty filter returns the full page, never an error; an
-/// out-of-range page reads as an empty page, never an error. The route
-/// is paged via the shared [`PageParams`] extractor (default limit 100,
-/// max 1000, clamped never rejected); unknown query parameters are
-/// ignored (the extractor reads only `page`/`limit` and never rejects).
+/// `GET /error_codes`: the fixed catalogue as a bare JSON array, as the
+/// reference API documents. The reference API documents no paging, so the
+/// route takes none; query parameters are ignored.
 /// Management-plane only: reads a code-defined list, takes no lock, and
 /// publish/deliver never touch it.
-pub async fn list_error_codes(params: PageParams) -> Response {
+pub async fn list_error_codes() -> Response {
     let rows: Vec<serde_json::Value> = ERROR_CATALOG.iter().map(render_entry).collect();
-    let total = rows.len();
-    let page_items = paginate(&rows, params.page, params.limit);
-    let data: Vec<serde_json::Value> = page_items.to_vec();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": data,
-            "meta": meta_page(params.page, params.limit, total),
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(rows)).into_response()
 }
 
 /// `GET /error_codes/:code`: single catalogue entry by its stable code
@@ -252,19 +250,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_returns_catalogue_with_paging_metadata() {
+    async fn list_returns_catalogue_as_a_bare_array() {
         // W5-22 broker-through: the read goes through the served handler
         // (the same handler the kernel serves in
         // `crates/broker-node/src/main.rs`, `serve_api`), not only
         // through the catalogue array. The list carries the catalogue
-        // entries with the standard paging metadata.
-        let (status, body) = response_parts(list_error_codes(PageParams::default()).await).await;
+        // entries as a bare array.
+        let (status, body) = response_parts(list_error_codes().await).await;
         assert_eq!(status, StatusCode::OK);
-        let data = body["data"].as_array().expect("data is a list");
+        let data = body.as_array().expect("the body is a list");
         assert_eq!(data.len(), ERROR_CODE_COUNT);
-        assert_eq!(body["meta"]["count"], serde_json::json!(ERROR_CODE_COUNT));
-        assert_eq!(body["meta"]["page"], serde_json::json!(1));
-        assert_eq!(body["meta"]["limit"], serde_json::json!(100));
         for row in data {
             assert!(row["code"].as_str().is_some_and(|c| !c.is_empty()));
             assert!(row["status"].is_u64(), "entry carries a status: {row}");
@@ -299,6 +294,9 @@ mod tests {
             "VALIDATION_FAILED",
             "INTERNAL_ERROR",
             "STORE_NOT_READY",
+            "USER_NOT_FOUND",
+            "ERROR_PWD_NOT_MATCH",
+            "NOT_ALLOWED",
         ] {
             assert!(codes.contains(&expected), "catalogue holds {expected}");
             assert!(
@@ -339,29 +337,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paging_slices_and_empty_page_is_not_an_error() {
-        // An empty filter returns the full page; an out-of-range page
-        // reads as an empty page, never an error.
-        let first = PageParams { page: 1, limit: 5 };
-        let (status, body) = response_parts(list_error_codes(first).await).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["data"].as_array().expect("list").len(), 5);
-        assert_eq!(body["meta"]["count"], serde_json::json!(ERROR_CODE_COUNT));
-        let beyond = PageParams {
-            page: 9999,
-            limit: 10,
-        };
-        let (status, empty) = response_parts(list_error_codes(beyond).await).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(empty["data"], serde_json::json!([]));
-        assert_eq!(empty["meta"]["count"], serde_json::json!(ERROR_CODE_COUNT));
-    }
-
-    #[tokio::test]
     async fn catalogue_is_static_across_reads() {
-        let (status, first) = response_parts(list_error_codes(PageParams::default()).await).await;
+        let (status, first) = response_parts(list_error_codes().await).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, second) = response_parts(list_error_codes(PageParams::default()).await).await;
+        let (status, second) = response_parts(list_error_codes().await).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(first, second);
     }
@@ -372,7 +351,7 @@ mod tests {
         // management publish through the rule engine and deliver path
         // still answer 200, so customer traffic keeps serving.
         let state = standalone_state();
-        let (status, _) = response_parts(list_error_codes(PageParams::default()).await).await;
+        let (status, _) = response_parts(list_error_codes().await).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) =
             response_parts(get_error_code(Path("BAD_REQUEST".to_string())).await).await;

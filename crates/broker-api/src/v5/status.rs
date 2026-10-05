@@ -57,7 +57,7 @@ pub struct StatusQuery {
 /// lines of plain text:
 ///
 /// ```text
-/// Node indramqtt@127.0.0.1 is started
+/// Node indra-node-1@host.example is started
 /// indramqtt is running
 /// ```
 ///
@@ -76,7 +76,7 @@ pub async fn get_status(
             APP_NOT_RUNNING,
         )
     };
-    let node = crate::v5::nodes::local_node_name();
+    let node = crate::node_scope::local_node_name();
     if query.format.as_deref() == Some("json") {
         let body = serde_json::json!({
             "rel_vsn": format!("v{}", env!("CARGO_PKG_VERSION")),
@@ -133,7 +133,7 @@ mod tests {
         let (status, content_type, text) = call(state, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(content_type.starts_with("text/plain"), "{content_type}");
-        let node = crate::v5::nodes::local_node_name();
+        let node = crate::node_scope::local_node_name();
         assert!(node.contains('@'), "node name has the name@host form");
         assert_eq!(
             text,
@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(body["app_status"], serde_json::json!("running"));
         assert_eq!(
             body["node_name"],
-            serde_json::json!(crate::v5::nodes::local_node_name())
+            serde_json::json!(crate::node_scope::local_node_name())
         );
         // The version is the build version. The example value of the
         // specification must never return.
@@ -190,7 +190,7 @@ mod tests {
         state.readiness.mark_not_ready();
         let (status, _, text) = call(state.clone(), None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        let node = crate::v5::nodes::local_node_name();
+        let node = crate::node_scope::local_node_name();
         assert_eq!(
             text,
             format!("Node {node} is stopped\nindramqtt is not_running\n")

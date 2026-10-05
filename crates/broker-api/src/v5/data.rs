@@ -49,7 +49,7 @@ const RETENTION_SECS: u64 = RETENTION_DAYS * 86_400;
 // Download content type. Reason: the spec serves raw file bytes.
 const BACKUP_DOWNLOAD_CONTENT_TYPE: &str = "application/octet-stream";
 // Legacy node name. Reason: v5 rows render this name today.
-const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 // Longest accepted file name. Reason: the filesystem caps one name.
 const MAX_FILENAME_LEN: usize = 255;
 
@@ -661,7 +661,7 @@ pub async fn download_backup_file(
 ) -> Response {
     if let Some(node) = query.get("node") {
         if resolve_node(&state.node_id, node).is_err()
-            && resolve_node(LEGACY_NODE_NAME, node).is_err()
+            && resolve_node(local_node_name(), node).is_err()
         {
             return resolve_node(&state.node_id, node)
                 .expect_err("node already checked as unknown")

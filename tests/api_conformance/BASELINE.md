@@ -162,3 +162,33 @@ is not changed.
   array: `const data: APIKey[] = await http.get('/api_key')` in the API module of the console (`loadAPIKeyList`),
   and it maps over that array. The broker returns a bare array of key
   records, so the checker reports a type error for this row.
+
+- `GET /audit`, response 200. The specification declares an array whose
+  items are objects with the keys `data` and `meta`. The management
+  console reads one object with `data` and `meta`:
+  `queryAuditLogs` in the API module of the console returns
+  `ListDataWithPagination<AuditLogItem>`, and the audit page reads
+  `res.data`. The broker returns one object with `data` and `meta`, so the
+  checker reports a type error for this row.
+- `GET /rule_events`, response 200. The specification declares one object
+  (the schema of one event). The management console reads an array of
+  events: `const events: RuleEvent[] = await http.get('/rule_events')` in
+  the rule input selector, and it filters and maps that array. The broker
+  returns a bare array of event records, so the checker reports a type
+  error for this row.
+- `GET /message_transformations`, response 200. The specification declares
+  an array of arrays of transformations. The management console reads a
+  flat array: `getMessageTransforms` returns `MessageTransform[]`. The
+  broker returns a flat array of transformation records, so the checker
+  reports a type error for this row.
+- `GET /message_transformations/transformation/{name}`, response 200. The
+  specification declares an array of transformations. The management
+  console reads one object: `getMessageTransformDetail` returns one
+  `MessageTransform`. The broker returns one transformation record, so the
+  checker reports a type error for this row.
+- `GET /schemas/{name}`, response 200. The specification declares a string.
+  The management console reads a JSON object: the schema form loader in the
+  console (`useSchemaForm`) fetches `/schemas/connectors` and
+  `/schemas/actions`, strips the label keys and reads paths inside the
+  object. The broker returns the schema object, so the checker reports a
+  type error for this row.

@@ -107,7 +107,7 @@ The code still contains licence functions from the earlier model. Examples are t
 - The end-to-end test suite uses the Erlang edge. The kernel listener has the boot test and unit tests only.
 - Most connectors have tests with a test transport only. [`crates/broker-connectors/CAPABILITY.md`](crates/broker-connectors/CAPABILITY.md) shows what each connector was tested with.
 - A default build does not contain all connectors. Build with `--features full` to get all of them. The container image contains all of them.
-- Single sign-on is not stable and is not available. You can store a backend, but the login endpoints answer 501. Log in with a user name and a password, with MFA when the user has it, or use an API key.
+- Single sign-on is not stable and is not available. You can store a backend, but the login endpoints answer the error that the reference API documents (404 or 400). Log in with a user name and a password, with MFA when the user has it, or use an API key.
 - Some settings of the management API are stored and shown, but the broker does not apply them yet: the authorization settings (`no_match`, `deny_action`), the authorization cache policy and the authorization sources that are not the built-in database. The broker denies a message when access rules exist and no rule matches.
 
 ---

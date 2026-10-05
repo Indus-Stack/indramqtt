@@ -29,11 +29,7 @@ use std::sync::RwLock;
 use crate::node_scope::resolve_node;
 use crate::ApiState;
 
-/// Single-node name rendered by `v5::nodes::list_nodes` and the other v5
-/// rows (`alarms`, `monitoring`, `clients`). Accepted alongside
-/// [`ApiState::node_id`] until every caller migrates to the configured id
-/// (see `node_scope` docs); both name the same local node.
-const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 /// Upper bound for stored history points. Recording past this size evicts
 /// the oldest point first instead of growing the buffer without limit.
@@ -214,11 +210,32 @@ impl MonitorHistory {
             .cloned()
     }
 
+    /// The two newest stored points, newest first. A missing point reads as
+    /// `None`. Constant-time: one short read lock and two clones.
+    /// Management-plane only; never touched on the per-message path.
+    pub fn newest_two(&self) -> (Option<MonitorSample>, Option<MonitorSample>) {
+        let buffer = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut newest_first = buffer.iter().rev();
+        (newest_first.next().cloned(), newest_first.next().cloned())
+    }
+
     /// Number of stored points (never above [`MAX_MONITOR_SAMPLES`]).
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.read().expect("monitor store lock").len()
     }
+}
+
+/// Events per second between two readings of one cumulative counter.
+///
+/// `secs` is the time between the readings. A zero `secs` counts as one
+/// second, because the points carry stamps of one second. A counter that
+/// went backwards (a restart of its owner) reads as no events. The result
+/// is rounded to the nearest whole event per second.
+pub fn rate_per_sec(newer: u64, older: u64, secs: u64) -> u64 {
+    let secs = secs.max(1);
+    let delta = newer.saturating_sub(older);
+    delta.saturating_add(secs / 2) / secs
 }
 
 impl Default for MonitorHistory {
@@ -273,7 +290,7 @@ pub async fn clear_monitor(State(state): State<ApiState>) -> Response {
 ///
 /// Single node, management-plane only: the named node is checked with the
 /// shared [`resolve_node`] helper against the configured [`ApiState::node_id`]
-/// (falling back to the [`LEGACY_NODE_NAME`] literal the v5 rows render
+/// (falling back to the [`local_node_name`] name the v5 rows render
 /// today); an unknown name returns the helper's 404 `NOT_FOUND` shape
 /// naming the node. A known name returns the same ordered array shape as
 /// [`list_monitor`] (same `?latest=N` window, same unknown-query-keys
@@ -285,7 +302,7 @@ pub async fn get_monitor_node(
     Query(query): Query<MonitorListQuery>,
 ) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -310,6 +327,31 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_per_sec_divides_by_the_window_and_rounds() {
+        assert_eq!(rate_per_sec(600, 100, 10), 50);
+        // 14 events in 10 s is 1.4 per second and rounds down.
+        assert_eq!(rate_per_sec(14, 0, 10), 1);
+        // 15 events in 10 s is 1.5 per second and rounds up.
+        assert_eq!(rate_per_sec(15, 0, 10), 2);
+        // A zero window counts as one second.
+        assert_eq!(rate_per_sec(7, 2, 0), 5);
+        // A counter that went backwards reads as no events.
+        assert_eq!(rate_per_sec(3, 90, 10), 0);
+    }
+
+    #[test]
+    fn newest_two_returns_the_last_points_newest_first() {
+        let history = MonitorHistory::new();
+        assert_eq!(history.newest_two(), (None, None));
+        for stamp in [10u64, 20, 30] {
+            history.capture_live(stamp, LiveCounters::default());
+        }
+        let (newest, previous) = history.newest_two();
+        assert_eq!(newest.map(|s| s.time_stamp), Some(30));
+        assert_eq!(previous.map(|s| s.time_stamp), Some(20));
+    }
 
     fn sample_at(time_stamp: u64, connections: u64) -> MonitorSample {
         MonitorSample::from_live(
@@ -462,7 +504,7 @@ mod tests {
         let state = standalone_state();
         state.monitor.record(sample_at(1_700_000_100, 3));
         state.monitor.record(sample_at(1_700_000_200, 5));
-        for known in [LEGACY_NODE_NAME, "indra-node-1"] {
+        for known in [local_node_name(), "indra-node-1"] {
             let response = get_monitor_node(
                 State(state.clone()),
                 Path(known.to_string()),

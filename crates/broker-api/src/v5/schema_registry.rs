@@ -33,7 +33,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::errors::ApiError;
-use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
 /// Most schemas kept in the registry. Past writes fail with `BAD_REQUEST`.
@@ -317,8 +316,10 @@ fn parse_schema_request(value: &serde_json::Value) -> Result<SchemaRecord, Strin
     })
 }
 
-/// `GET /api/v5/schema_registry`: paged list with the standard envelope.
-/// An empty registry returns an empty page. Unknown query keys are ignored.
+/// `GET /api/v5/schema_registry`: every schema as a bare JSON array, as
+/// the reference API and the management console expect. An empty registry
+/// reads as `[]`. The reference API documents no paging, so the route
+/// takes none. Unknown query keys are ignored.
 /// Management plane only. Publish and deliver never touch this store.
 ///
 /// Store wiring: the backing store is [`SchemaRegistryStore`], shared with
@@ -328,19 +329,10 @@ fn parse_schema_request(value: &serde_json::Value) -> Result<SchemaRecord, Strin
 ///
 /// Fire path cost: none. This route takes one short read lock per request.
 /// Publish and deliver take no lock here.
-pub async fn list_schemas_registry(State(state): State<ApiState>, params: PageParams) -> Response {
+pub async fn list_schemas_registry(State(state): State<ApiState>) -> Response {
     let records = state.schema_registry.snapshot();
     let rows: Vec<serde_json::Value> = records.iter().map(SchemaRecord::to_json).collect();
-    let count = rows.len();
-    let page_rows = paginate(&rows, params.page, params.limit);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": page_rows,
-            "meta": meta_page(params.page, params.limit, count),
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(rows)).into_response()
 }
 
 /// `POST /api/v5/schema_registry`: checked create.

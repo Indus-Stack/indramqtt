@@ -29,20 +29,8 @@ use axum::{
     Json,
 };
 
-use crate::node_scope::resolve_node;
+use crate::node_scope::{local_node_name, resolve_node};
 use crate::ApiState;
-
-/// Single-node name rendered by [`list_nodes`] and the other v5 rows
-/// (`alarms`, `monitoring`, `clients`). Accepted alongside
-/// [`ApiState::node_id`] until every caller migrates to the configured id
-/// (see `node_scope` docs); both name the same local node.
-const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
-
-/// Name of the local node in the `name@host` form, as `GET /nodes`
-/// renders it. Other endpoints that name the local node use this value.
-pub(crate) fn local_node_name() -> &'static str {
-    LEGACY_NODE_NAME
-}
 
 /// Compiler release and target triple of this build, written by `build.rs`.
 const BUILD_RUSTC: &str = env!("INDRA_BUILD_RUSTC");
@@ -63,7 +51,7 @@ pub(crate) fn mark_process_start() {
 }
 
 /// Milliseconds since [`mark_process_start`] first ran.
-fn uptime_ms() -> u64 {
+pub(crate) fn uptime_ms() -> u64 {
     let start = *PROCESS_START.get_or_init(Instant::now);
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -168,8 +156,7 @@ fn build_release() -> Option<String> {
 /// Build one node's record from live process and kernel state.
 ///
 /// `node_name` is the name rendered in the `node` field (the canonical
-/// [`LEGACY_NODE_NAME`] for the list, the requested name for a known
-/// detail read).
+/// [`local_node_name`] for the list and for a known detail read).
 ///
 /// Source of each field:
 /// - `node_status`: the readiness flag of the node (`running` while ready).
@@ -254,7 +241,7 @@ fn node_record(state: &ApiState, node_name: &str) -> serde_json::Value {
 /// Bounded: one record per request regardless of cluster or
 /// client scale. Management-plane only.
 pub async fn list_nodes(State(state): State<ApiState>) -> Response {
-    let node = node_record(&state, LEGACY_NODE_NAME);
+    let node = node_record(&state, local_node_name());
     (StatusCode::OK, Json(vec![node])).into_response()
 }
 
@@ -262,13 +249,13 @@ pub async fn list_nodes(State(state): State<ApiState>) -> Response {
 ///
 /// Single node, management-plane only: the named node is checked with the
 /// shared [`resolve_node`] helper against the configured [`ApiState::node_id`]
-/// (falling back to the [`LEGACY_NODE_NAME`] literal the v5 rows render
+/// (falling back to the [`local_node_name`] name the v5 rows render
 /// today); an unknown name returns the helper's 404 `NOT_FOUND` shape
 /// naming the node. A known name returns the same record shape as one
 /// [`list_nodes`] entry, with no work on the per-message path.
 pub async fn get_node(State(state): State<ApiState>, Path(node_name): Path<String>) -> Response {
     if resolve_node(&state.node_id, &node_name).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node_name).is_err()
+        && resolve_node(local_node_name(), &node_name).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -276,7 +263,7 @@ pub async fn get_node(State(state): State<ApiState>, Path(node_name): Path<Strin
             .expect_err("node already checked as unknown")
             .into_response();
     }
-    (StatusCode::OK, Json(node_record(&state, &node_name))).into_response()
+    (StatusCode::OK, Json(node_record(&state, local_node_name()))).into_response()
 }
 
 #[cfg(test)]
@@ -342,7 +329,7 @@ mod tests {
             "single-node membership is exactly one record"
         );
         let first = &rows[0];
-        assert_eq!(first["node"], serde_json::json!(LEGACY_NODE_NAME));
+        assert_eq!(first["node"], serde_json::json!(local_node_name()));
         assert_eq!(first["node_status"], serde_json::json!("running"));
         assert_eq!(first["role"], serde_json::json!("core"));
         for field in always_present_fields() {
@@ -554,11 +541,12 @@ mod tests {
         state.metrics.set_active_connections(2);
         let (_, list_body) = response_body(list_nodes(State(state.clone())).await).await;
         let listed = list_body[0].clone();
-        for known in [LEGACY_NODE_NAME, "indra-node-1"] {
+        for known in [local_node_name(), "indra-node-1"] {
             let response = get_node(State(state.clone()), Path(known.to_string())).await;
             let (status, body) = response_body(response).await;
             assert_eq!(status, StatusCode::OK, "known node {known}");
-            assert_eq!(body["node"], serde_json::json!(known));
+            // Every spelling of the node name shows the one canonical name.
+            assert_eq!(body["node"], serde_json::json!(local_node_name()));
             for field in always_present_fields() {
                 assert!(body.get(field).is_some(), "missing field {field}: {body}");
             }

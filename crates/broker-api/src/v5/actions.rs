@@ -54,13 +54,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::errors::ApiError;
 use crate::node_scope::resolve_node;
-use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
-/// Single-node name rendered by `v5::nodes::list_nodes`. Accepted alongside
-/// [`ApiState::node_id`] until every caller migrates to the configured id
-/// (see `node_scope` docs); both name the same local node.
-const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 /// Upper bound for stored actions. Creates past this size are rejected
 /// with `BAD_REQUEST` instead of growing the map without limit. Reason:
@@ -347,25 +343,15 @@ fn is_known_action_type(kind: &str) -> bool {
         .any(|entry| entry.kind == kind)
 }
 
-/// `GET /api/v5/actions`: paged list over the real store with the
-/// standard page envelope (`data` plus `meta {page, limit, count,
-/// hasnext}`); an empty store returns an empty page, not an error.
-/// Unknown query parameters are ignored (no query is extracted beyond
-/// `page`/`limit`). Management-plane only; publish and deliver never
-/// touch this store.
-pub async fn list_actions(State(state): State<ApiState>, params: PageParams) -> Response {
+/// `GET /api/v5/actions`: every action as a bare JSON array, as the
+/// reference API and the management console expect. An empty store reads
+/// as `[]`, never an error. The reference API documents no paging, so the
+/// route takes none. Unknown query parameters are ignored.
+/// Management-plane only; publish and deliver never touch this store.
+pub async fn list_actions(State(state): State<ApiState>) -> Response {
     let records = state.actions.snapshot();
     let rows: Vec<serde_json::Value> = records.iter().map(ActionRecord::to_json).collect();
-    let count = rows.len();
-    let page_rows = paginate(&rows, params.page, params.limit);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": page_rows,
-            "meta": meta_page(params.page, params.limit, count),
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(rows)).into_response()
 }
 
 /// `POST /api/v5/actions`: validate the body against the named action
@@ -810,7 +796,7 @@ pub async fn run_action_operation(
 ///
 /// Single-node execution only: the `{node}` segment is checked with the
 /// shared [`resolve_node`] helper against the configured
-/// [`ApiState::node_id`] (falling back to the [`LEGACY_NODE_NAME`] literal
+/// [`ApiState::node_id`] (falling back to the [`local_node_name`] name
 /// the v5 rows render today); an unknown name returns the helper's 404
 /// `NOT_FOUND` shape naming the node and touches no other state. A known
 /// node dispatches to the same [`apply_action_operation`] path as the
@@ -847,7 +833,7 @@ pub async fn run_node_action_operation(
     Path((node, id, operation)): Path<(String, String, String)>,
 ) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -894,30 +880,30 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `GET /api/v5/actions_summary` (W3-08, C06-12): aggregated counts
-/// over the real action store computed on demand from the live
-/// entries, never constants; an empty store returns zeroes, not an
-/// error. Not paged and not per-id, so there is no 404 path; unknown
-/// query parameters are ignored (no query is extracted).
-/// Management-plane only: one short read lock counting in place per
-/// request, and publish and deliver never touch this store.
+/// `GET /api/v5/actions_summary` (W3-08, C06-12): a bare JSON array with
+/// one summary row per action, as the reference API documents.
 ///
-/// The output shape is fixed (`total`, `enabled`, `disabled`); no
-/// history is kept.
-// TODO(parity): does the documented spec want totals by kind as well
-// as by state (for example a per-`type` breakdown)? The rulebook does
-// not decide the exact count fields; the current choice reports the
-// honest live subset that always tracks the store (`total`, `enabled`,
-// `disabled`, mirroring the sibling summary) and omits the rest rather
-// than inventing constants, until the checker pins it.
+/// Each row carries `name`, `type` and `enable`, read from the live store.
+/// The broker keeps no health state, no creation time and no rule links
+/// for an action, so the rows leave out `status`, `created_at`,
+/// `last_modified_at` and `rules` instead of inventing values. An empty
+/// store reads as `[]`. The query parameters `ns` and `only_global` are
+/// ignored. Management-plane only: one bounded snapshot clone per
+/// request, and publish and deliver never touch this store.
 pub async fn get_actions_summary(State(state): State<ApiState>) -> Response {
-    let (total, enabled, disabled) = state.actions.summary_counts();
-    Json(serde_json::json!({
-        "total": total,
-        "enabled": enabled,
-        "disabled": disabled,
-    }))
-    .into_response()
+    let rows: Vec<serde_json::Value> = state
+        .actions
+        .snapshot()
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "name": record.id,
+                "type": record.action_type,
+                "enable": record.enable,
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(rows)).into_response()
 }
 
 #[cfg(test)]

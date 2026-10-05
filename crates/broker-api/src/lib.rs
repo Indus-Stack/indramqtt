@@ -323,6 +323,8 @@ impl ApiState {
         // snapshot is a no-op (today's empty behaviour).
         // Start the uptime clock that `GET /nodes` reads.
         crate::v5::nodes::mark_process_start();
+        // Fix the node name that every endpoint renders.
+        crate::node_scope::init_local_node_name(&node_id);
         if let Err(error) = auth.seed_from_registry(&config) {
             panic!("invalid stored mqtt_users snapshot: {error}");
         }
@@ -3396,57 +3398,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_count_tracks_connects_and_disconnects() {
+    async fn sessions_count_counts_sessions_as_a_json_string() {
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
-        // Zero sessions read as zero, not an error.
+        // Zero sessions read as the string "0", not an error.
         let (status, body) = server.get_auth("/api/v5/sessions_count", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!({"count": 0}));
-        assert_eq!(state.sessions.connected_count(), 0);
+        assert_eq!(body, json!("0"));
 
-        // Two connected sessions read as two via the atomic counter.
+        // Two sessions read as the string "2".
         for (id, conn) in [("w1-13-a", 13_101u64), ("w1-13-b", 13_102u64)] {
             let (session, _) = state.sessions.get_or_create(id, true);
             state.sessions.bind_session(&session, conn);
         }
-        assert_eq!(state.sessions.connected_count(), 2);
         let (status, body) = server.get_auth("/api/v5/sessions_count", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!({"count": 2}));
+        assert_eq!(body, json!("2"));
 
-        // After one verified detach the count drops to one.
+        // A detached session has not expired, so it stays in the count.
         state.sessions.unbind_connection("w1-13-a", 13_101);
-        assert_eq!(state.sessions.connected_count(), 1);
         let (status, body) = server.get_auth("/api/v5/sessions_count", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!({"count": 1}));
+        assert_eq!(body, json!(state.sessions.session_count().to_string()));
 
-        // The documented node scope narrows: the local node keeps the
-        // count, another node narrows to zero.
+        // `since` is a number of seconds. The broker keeps no expired
+        // sessions, so the count does not change.
         let (status, body) = server
-            .get_auth("/api/v5/sessions_count?node=indra-node-1", &token)
+            .get_auth("/api/v5/sessions_count?since=1705391625", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!({"count": 1}));
+        assert_eq!(body, json!(state.sessions.session_count().to_string()));
         let (status, body) = server
-            .get_auth("/api/v5/sessions_count?node=indramqtt@127.0.0.1", &token)
+            .get_auth("/api/v5/sessions_count?since=yesterday", &token)
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body, json!({"count": 1}));
-        let (status, body) = server
-            .get_auth("/api/v5/sessions_count?node=no-such-node", &token)
-            .await;
-        assert_eq!(status, 200);
-        assert_eq!(body, json!({"count": 0}));
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
 
         // Unknown parameters are ignored, not rejected.
         let (status, body) = server
             .get_auth("/api/v5/sessions_count?unknown_param=1", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!({"count": 1}));
+        assert_eq!(body, json!(state.sessions.session_count().to_string()));
     }
 
     #[tokio::test]
@@ -3590,7 +3584,7 @@ mod tests {
             assert_eq!(entry["nl"], json!(0));
             assert_eq!(entry["rap"], json!(0));
             assert_eq!(entry["rh"], json!(0));
-            assert_eq!(entry["node"], json!("indramqtt@127.0.0.1"));
+            assert_eq!(entry["node"], json!(crate::node_scope::local_node_name()));
             assert!(entry["clientid"].is_string());
             assert!(entry["topic"].is_string());
         }
@@ -3684,7 +3678,7 @@ mod tests {
         assert_eq!(data[0]["topic"], json!("w1-15/alpha"));
         assert_eq!(data[1]["topic"], json!("w1-15/beta"));
         for entry in data {
-            assert_eq!(entry["node"], json!("indramqtt@127.0.0.1"));
+            assert_eq!(entry["node"], json!(crate::node_scope::local_node_name()));
             assert!(entry["topic"].is_string());
         }
 
@@ -3718,8 +3712,9 @@ mod tests {
             .get_auth("/api/v5/topics/w1-15%2Falpha", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["topic"], json!("w1-15/alpha"));
-        assert_eq!(body["node"], json!("indramqtt@127.0.0.1"));
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(body[0]["topic"], json!("w1-15/alpha"));
+        assert_eq!(body[0]["node"], json!(crate::node_scope::local_node_name()));
 
         // Detail miss returns the documented not-found shape; prefix and
         // filter forms never match.
@@ -3728,7 +3723,7 @@ mod tests {
                 .get_auth(&format!("/api/v5/topics/{missing}"), &token)
                 .await;
             assert_eq!(status, 404, "unknown topic must 404: {missing}");
-            assert_eq!(body["code"], json!("NOT_FOUND"));
+            assert_eq!(body["code"], json!("TOPIC_NOT_FOUND"));
             assert!(body["message"].is_string());
         }
     }
@@ -3776,7 +3771,7 @@ mod tests {
         assert_eq!(data[0]["name"], json!("w1-16-a-alarm"));
         assert_eq!(data[1]["name"], json!("w1-16-b-alarm"));
         for entry in data {
-            assert_eq!(entry["node"], json!("indramqtt@127.0.0.1"));
+            assert_eq!(entry["node"], json!(crate::node_scope::local_node_name()));
             assert!(entry["name"].is_string());
             assert!(entry["message"].is_string());
             assert!(entry["details"].is_object());
@@ -6433,11 +6428,13 @@ mod tests {
         assert_eq!(state.auth.user_count(), 0);
 
         // Listing serves the admin store with roles, sorted by username,
-        // in the standard page envelope (W2-41, C05-25).
+        // as a bare array, as the reference API documents (C05-25).
         let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(2));
-        let names: Vec<&str> = body["data"]
+        assert_eq!(body.as_array().map(Vec::len), Some(2));
+        assert_eq!(body[0]["backend"], json!("local"));
+        assert_eq!(body[0]["mfa"], json!("none"));
+        let names: Vec<&str> = body
             .as_array()
             .expect("users data array")
             .iter()
@@ -6668,7 +6665,7 @@ mod tests {
         let admin_token = body["token"].as_str().expect("admin token").to_string();
         let (status, body) = server.get_auth("/api/v5/users", &admin_token).await;
         assert_eq!(status, 200);
-        let names: Vec<&str> = body["data"]
+        let names: Vec<&str> = body
             .as_array()
             .expect("users data array")
             .iter()
@@ -6753,17 +6750,15 @@ mod tests {
         assert_eq!(status, 409);
         assert_eq!(err["code"], json!("ALREADY_EXISTS"));
 
-        // Delete disables; a second delete is a miss.
+        // Delete disables; a second delete changes nothing and answers 204.
         let (status, _) = server
             .delete_auth("/api/v5/users/w244-http/mfa", &admin_token)
             .await;
         assert_eq!(status, 204);
-        let (status, err) = server
+        let (status, _) = server
             .delete_auth("/api/v5/users/w244-http/mfa", &admin_token)
             .await;
-        assert_eq!(status, 404);
-        assert_eq!(err["code"], json!("NOT_FOUND"));
-        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert_eq!(status, 204);
 
         // Unknown users are 404 on both routes.
         let (status, err) = server
@@ -6774,12 +6769,12 @@ mod tests {
             )
             .await;
         assert_eq!(status, 404);
-        assert_eq!(err["code"], json!("NOT_FOUND"));
+        assert_eq!(err["code"], json!("USER_NOT_FOUND"));
         let (status, err) = server
             .delete_auth("/api/v5/users/w244-ghost/mfa", &admin_token)
             .await;
         assert_eq!(status, 404);
-        assert_eq!(err["code"], json!("NOT_FOUND"));
+        assert_eq!(err["code"], json!("USER_NOT_FOUND"));
         assert_eq!(state.auth.user_count(), 0);
 
         let (status, _) = server
@@ -7161,7 +7156,7 @@ mod tests {
         // List: paged collection with live health, not a raw dump.
         let (status, body) = server.get_auth("/api/v5/connectors", &token).await;
         assert_eq!(status, 200);
-        let data = body["data"].as_array().expect("data is a list");
+        let data = body.as_array().expect("data is a list");
         assert!(
             data.iter().any(|c| c["id"] == json!("w317-list-conn")),
             "list must contain the created connector, got: {body}"
@@ -7172,23 +7167,12 @@ mod tests {
             .expect("created row present");
         assert!(row.get("status").and_then(|v| v.as_str()).is_some());
         assert!(row.get("node_status").is_some());
-        assert_eq!(body["meta"]["page"], json!(1));
-        assert_eq!(body["meta"]["limit"], json!(100));
-        assert!(body["meta"]["count"].as_u64().unwrap_or(0) >= 1);
-        assert!(body.get("meta").and_then(|m| m.get("hasnext")).is_some());
 
         // Unknown query parameters are ignored, never an error.
         let (status, _) = server
             .get_auth("/api/v5/connectors?unknown=param", &token)
             .await;
         assert_eq!(status, 200);
-        let (status, paged) = server
-            .get_auth("/api/v5/connectors?page=1&limit=1", &token)
-            .await;
-        assert_eq!(status, 200);
-        assert_eq!(paged["meta"]["page"], json!(1));
-        assert_eq!(paged["meta"]["limit"], json!(1));
-        assert_eq!(paged["data"].as_array().expect("data").len(), 1);
 
         // Duplicate create is rejected cleanly, never overwritten.
         let (status, body) = server
@@ -8024,8 +8008,8 @@ mod tests {
         // Empty chain reads as an empty collection, not an error.
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
-        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body, json!([]));
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
 
         // Create one built-in entry.
         let (status, created) = server
@@ -8052,10 +8036,10 @@ mod tests {
         // List again: the entry is present in order.
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let data = body["data"].as_array().expect("data is a list");
+        let data = body.as_array().expect("data is a list");
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], json!("password_based:built_in_database"));
-        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
 
         // Re-creating the same id is a clean duplicate rejection, never
         // a silent overwrite.
@@ -8093,7 +8077,7 @@ mod tests {
         assert_eq!(status, 400);
         assert_eq!(body["code"], json!("BAD_REQUEST"));
 
-        // Second entry keeps insertion order; paging slices after filtering.
+        // Second entry keeps insertion order.
         let (status, _) = server
             .post_auth(
                 "/api/v5/authentication",
@@ -8102,16 +8086,11 @@ mod tests {
             )
             .await;
         assert_eq!(status, 200);
-        let (status, body) = server
-            .get_auth("/api/v5/authentication?page=2&limit=1", &token)
-            .await;
+        let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let data = body["data"].as_array().expect("data is a list");
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0]["id"], json!("password_based:mysql"));
-        assert_eq!(body["meta"]["page"], json!(2));
-        assert_eq!(body["meta"]["limit"], json!(1));
-        assert_eq!(body["meta"]["count"], json!(2));
+        let data = body.as_array().expect("data is a list");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[1]["id"], json!("password_based:mysql"));
     }
 
     #[tokio::test]
@@ -8173,7 +8152,7 @@ mod tests {
         let token = body["token"].as_str().expect("admin token").to_string();
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let data = body["data"].as_array().expect("data is a list");
+        let data = body.as_array().expect("data is a list");
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], json!("password_based:built_in_database"));
         drop(server);
@@ -8218,7 +8197,7 @@ mod tests {
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let data = body["data"].as_array().expect("data is a list");
+        let data = body.as_array().expect("data is a list");
         assert_eq!(data.len(), 2);
         assert_eq!(data[0]["id"], json!("password_based:mysql"));
         assert_eq!(data[1]["id"], json!("password_based:built_in_database"));
@@ -8241,7 +8220,7 @@ mod tests {
         assert!(body["message"].is_string());
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let data = body["data"].as_array().expect("data is a list");
+        let data = body.as_array().expect("data is a list");
         assert_eq!(data[0]["id"], json!("password_based:mysql"));
         assert_eq!(data[1]["id"], json!("password_based:built_in_database"));
 
@@ -8257,7 +8236,7 @@ mod tests {
         assert_eq!(body["code"], json!("BAD_REQUEST"));
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let data = body["data"].as_array().expect("data is a list");
+        let data = body.as_array().expect("data is a list");
         assert_eq!(data.len(), 2);
         assert_eq!(data[0]["id"], json!("password_based:mysql"));
 
@@ -8315,7 +8294,7 @@ mod tests {
         let token = body["token"].as_str().expect("admin token").to_string();
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let data = body["data"].as_array().expect("data is a list");
+        let data = body.as_array().expect("data is a list");
         assert_eq!(data.len(), 2);
         assert_eq!(data[0]["id"], json!("password_based:mysql"));
         assert_eq!(data[1]["id"], json!("password_based:built_in_database"));
@@ -8588,7 +8567,7 @@ mod tests {
         // List shows the new order.
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let listed: Vec<String> = body["data"]
+        let listed: Vec<String> = body
             .as_array()
             .expect("chain list is paged")
             .iter()
@@ -8610,7 +8589,7 @@ mod tests {
         assert!(body["message"].is_string());
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let unchanged: Vec<String> = body["data"]
+        let unchanged: Vec<String> = body
             .as_array()
             .expect("chain list")
             .iter()
@@ -8646,7 +8625,7 @@ mod tests {
         }
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let unchanged: Vec<String> = body["data"]
+        let unchanged: Vec<String> = body
             .as_array()
             .expect("chain list")
             .iter()
@@ -8693,7 +8672,7 @@ mod tests {
         let token = body["token"].as_str().expect("admin token").to_string();
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
         assert_eq!(status, 200);
-        let listed: Vec<String> = body["data"]
+        let listed: Vec<String> = body
             .as_array()
             .expect("reloaded chain list")
             .iter()
@@ -12381,11 +12360,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Empty store returns an empty page, not an error.
         let (status, body) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
-        assert_eq!(body["meta"]["page"], json!(1));
-        assert_eq!(body["meta"]["limit"], json!(100));
-        assert_eq!(body["meta"]["count"], json!(0));
-        assert_eq!(body["meta"]["hasnext"], json!(false));
+        assert_eq!(body, json!([]));
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
         // Unknown query parameters are ignored.
         let (status, _) = server
             .get_auth("/api/v5/actions?unknown=param", &token)
@@ -12415,9 +12391,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // List shows it with paging metadata.
         let (status, body) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(1));
-        assert_eq!(body["meta"]["hasnext"], json!(false));
-        let ids: Vec<String> = body["data"]
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        let ids: Vec<String> = body
             .as_array()
             .expect("list data is an array")
             .iter()
@@ -12447,7 +12422,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Store is empty again.
         let (status, body) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
     }
 
     #[tokio::test]
@@ -13361,7 +13336,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let local = "indra-node-1";
-        let legacy = "indramqtt@127.0.0.1";
+        let legacy = crate::node_scope::local_node_name();
         // Unknown node is NOT_FOUND with a non-empty body naming the node,
         // even when the id and operation are also unknown (node scope is
         // checked first, fail closed).
@@ -13825,7 +13800,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let local = "indra-node-1";
-        let legacy = "indramqtt@127.0.0.1";
+        let legacy = crate::node_scope::local_node_name();
         // Unknown node is NOT_FOUND with a non-empty body naming the node,
         // even when the id and operation are also unknown (node scope is
         // checked first, fail closed).
@@ -14020,9 +13995,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Empty store returns zeroes, not an error.
         let (status, body) = server.get_auth("/api/v5/actions_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(0));
-        assert_eq!(body["enabled"], json!(0));
-        assert_eq!(body["disabled"], json!(0));
+        assert_eq!(body, json!([]));
         // Two actions of different states: one enabled, one disabled.
         let (status, _) = server
             .post_auth(
@@ -14046,9 +14019,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/actions_summary?unknown=param", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(2));
-        assert_eq!(body["enabled"], json!(1));
-        assert_eq!(body["disabled"], json!(1));
+        let rows = body.as_array().expect("summary is a list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().filter(|r| r["enable"] == json!(true)).count(),
+            1
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r["enable"] == json!(false)).count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r["name"].is_string() && r["type"].is_string()));
         // Delete both; the summary returns to zeroes.
         let (status, _) = server
             .delete_auth("/api/v5/actions/sum-act-a", &token)
@@ -14060,9 +14043,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/actions_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(0));
-        assert_eq!(body["enabled"], json!(0));
-        assert_eq!(body["disabled"], json!(0));
+        assert_eq!(body, json!([]));
     }
 
     #[tokio::test]
@@ -14683,7 +14664,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(0), "probe must not create a source");
+        assert_eq!(
+            body.as_array().map(Vec::len),
+            Some(0),
+            "probe must not create a source"
+        );
         // Bad config: known kind with a closed port reports the failure.
         let (status, body) = server
             .post_auth(
@@ -14725,9 +14710,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Empty store returns zeroes, not an error.
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(0));
-        assert_eq!(body["enabled"], json!(0));
-        assert_eq!(body["disabled"], json!(0));
+        assert_eq!(body, json!([]));
         // Two sources of different states: one enabled, one disabled.
         let (status, _) = server
             .post_auth(
@@ -14751,9 +14734,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/sources_summary?unknown=param", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(2));
-        assert_eq!(body["enabled"], json!(1));
-        assert_eq!(body["disabled"], json!(1));
+        let rows = body.as_array().expect("summary is a list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().filter(|r| r["enable"] == json!(true)).count(),
+            1
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r["enable"] == json!(false)).count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r["name"].is_string() && r["type"].is_string()));
         // Delete of an unknown id is 404 with the documented shape.
         let (status, body) = server
             .delete_auth("/api/v5/sources/no-such-source", &token)
@@ -14771,9 +14764,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(0));
-        assert_eq!(body["enabled"], json!(0));
-        assert_eq!(body["disabled"], json!(0));
+        assert_eq!(body, json!([]));
     }
 
     #[tokio::test]
@@ -14790,11 +14781,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Empty store returns an empty page, not an error.
         let (status, body) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
-        assert_eq!(body["meta"]["page"], json!(1));
-        assert_eq!(body["meta"]["limit"], json!(100));
-        assert_eq!(body["meta"]["count"], json!(0));
-        assert_eq!(body["meta"]["hasnext"], json!(false));
+        assert_eq!(body, json!([]));
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
         // Unknown query parameters are ignored.
         let (status, _) = server
             .get_auth("/api/v5/sources?unknown=param", &token)
@@ -14824,9 +14812,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // List shows it with paging metadata.
         let (status, body) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(1));
-        assert_eq!(body["meta"]["hasnext"], json!(false));
-        let ids: Vec<String> = body["data"]
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        let ids: Vec<String> = body
             .as_array()
             .expect("list data is an array")
             .iter()
@@ -14856,7 +14843,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Store is empty again.
         let (status, body) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
     }
 
     #[tokio::test]
@@ -15007,8 +14994,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let token = body["token"].as_str().expect("admin token").to_string();
         let (status, body) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(1));
-        let ids: Vec<String> = body["data"]
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        let ids: Vec<String> = body
             .as_array()
             .expect("list data is an array")
             .iter()
@@ -15081,9 +15068,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["code"], json!("BAD_REQUEST"));
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(1));
-        assert_eq!(body["enabled"], json!(1));
-        assert_eq!(body["disabled"], json!(0));
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            body.as_array()
+                .map(|rows| rows.iter().filter(|r| r["enable"] == json!(true)).count()),
+            Some(1)
+        );
         // Stop: the reported runtime state changes to disabled.
         let (status, _) = server
             .send("POST", "/api/v5/sources/w3-23-src/stop", None, Some(&token))
@@ -15091,9 +15081,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(1));
-        assert_eq!(body["enabled"], json!(0));
-        assert_eq!(body["disabled"], json!(1));
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            body.as_array()
+                .map(|rows| rows.iter().filter(|r| r["enable"] == json!(true)).count()),
+            Some(0)
+        );
         // Start: the reported runtime state changes back to enabled.
         let (status, _) = server
             .send(
@@ -15106,9 +15099,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(1));
-        assert_eq!(body["enabled"], json!(1));
-        assert_eq!(body["disabled"], json!(0));
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            body.as_array()
+                .map(|rows| rows.iter().filter(|r| r["enable"] == json!(true)).count()),
+            Some(1)
+        );
         // The message path is untouched: live ingress dispatch still
         // works and the source directory reports the same counts after.
         struct W323Sink;
@@ -15137,7 +15133,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         );
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(1));
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
         let (status, _) = server
             .delete_auth("/api/v5/sources/w3-23-src", &token)
             .await;
@@ -15225,9 +15221,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["enable"], json!(false));
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(1));
-        assert_eq!(body["enabled"], json!(0));
-        assert_eq!(body["disabled"], json!(1));
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            body.as_array()
+                .map(|rows| rows.iter().filter(|r| r["enable"] == json!(true)).count()),
+            Some(0)
+        );
         // The W3-23 operation route observes the same core: starting the
         // disabled source re-enables it (ingress resumed).
         let (status, _) = server
@@ -15290,8 +15289,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         );
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(1));
-        assert_eq!(body["enabled"], json!(1));
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            body.as_array()
+                .map(|rows| rows.iter().filter(|r| r["enable"] == json!(true)).count()),
+            Some(1)
+        );
         let (status, _) = server
             .delete_auth("/api/v5/sources/w3-28-src", &token)
             .await;
@@ -15316,7 +15319,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let local = "indra-node-1";
-        let legacy = "indramqtt@127.0.0.1";
+        let legacy = crate::node_scope::local_node_name();
         // Unknown node is NOT_FOUND with a non-empty body naming the node,
         // even when the id and operation are also unknown (node scope is
         // checked first, fail closed).
@@ -15368,10 +15371,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert!(!body.to_string().is_empty());
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(1));
-        assert_eq!(body["enabled"], json!(1));
-        // Stop through the node route: the reported state flips to
-        // disabled. The legacy node name names the same local node.
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            body.as_array()
+                .map(|rows| rows.iter().filter(|r| r["enable"] == json!(true)).count()),
+            Some(1)
+        ); // Stop through the node route: the reported state flips to
+           // disabled. The legacy node name names the same local node.
         let (status, _) = server
             .send(
                 "POST",
@@ -15383,8 +15389,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["enabled"], json!(0));
-        assert_eq!(body["disabled"], json!(1));
+        assert_eq!(
+            body.as_array()
+                .map(|rows| rows.iter().filter(|r| r["enable"] == json!(true)).count()),
+            Some(0)
+        );
         let (status, _) = server
             .send(
                 "POST",
@@ -15422,7 +15431,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         );
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["total"], json!(1));
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
         let (status, _) = server
             .delete_auth("/api/v5/sources/w3-24-src", &token)
             .await;
@@ -15455,11 +15464,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Empty registry returns an empty page.
         let (status, body) = server.get_auth("/api/v5/schema_registry", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
-        assert_eq!(body["meta"]["page"], json!(1));
-        assert_eq!(body["meta"]["limit"], json!(100));
-        assert_eq!(body["meta"]["count"], json!(0));
-        assert_eq!(body["meta"]["hasnext"], json!(false));
+        assert_eq!(body, json!([]));
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
         // Unknown query keys are ignored.
         let (status, _) = server
             .get_auth("/api/v5/schema_registry?unknown=param", &token)
@@ -15512,9 +15518,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // List shows it with paging metadata.
         let (status, body) = server.get_auth("/api/v5/schema_registry", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(1));
-        assert_eq!(body["meta"]["hasnext"], json!(false));
-        let names: Vec<String> = body["data"]
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        let names: Vec<String> = body
             .as_array()
             .expect("list data is an array")
             .iter()
@@ -15548,7 +15553,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Store is empty again.
         let (status, body) = server.get_auth("/api/v5/schema_registry", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(0));
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
     }
 
     #[tokio::test]
@@ -15589,8 +15594,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let token = body["token"].as_str().expect("admin token").to_string();
         let (status, body) = server.get_auth("/api/v5/schema_registry", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(1));
-        let names: Vec<String> = body["data"]
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        let names: Vec<String> = body
             .as_array()
             .expect("list data is an array")
             .iter()
@@ -16972,7 +16977,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["clientid"], json!("w1-08-a"));
         assert_eq!(body["topic"], json!("w1-08/single"));
         assert_eq!(body["qos"], json!(1));
-        assert_eq!(body["node"], json!("indramqtt@127.0.0.1"));
+        assert_eq!(body["node"], json!(crate::node_scope::local_node_name()));
 
         let (status, body) = server
             .get_auth("/api/v5/clients/w1-08-a/subscriptions", &token)
@@ -17586,7 +17591,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(entry["nl"], json!(1));
         assert_eq!(entry["rap"], json!(0));
         assert_eq!(entry["rh"], json!(1));
-        assert_eq!(entry["node"], json!("indramqtt@127.0.0.1"));
+        assert_eq!(entry["node"], json!(crate::node_scope::local_node_name()));
         assert_eq!(entry["clientid"], json!("w1-09-opts"));
         let defaults = subs
             .iter()
@@ -17596,7 +17601,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(defaults["nl"], json!(0));
         assert_eq!(defaults["rap"], json!(0));
         assert_eq!(defaults["rh"], json!(0));
-        assert_eq!(defaults["node"], json!("indramqtt@127.0.0.1"));
+        assert_eq!(
+            defaults["node"],
+            json!(crate::node_scope::local_node_name())
+        );
         assert_eq!(defaults["clientid"], json!("w1-09-opts"));
     }
 
@@ -17686,11 +17694,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
         assert_eq!(
-            body["meta"]["count"],
-            json!(0),
+            body.as_array().map(Vec::len),
+            Some(0),
             "probe must not create an action"
         );
-        assert_eq!(body["data"], json!([]));
+        assert_eq!(body, json!([]));
         // Bad config: known kind with a closed port reports the failure.
         let (status, body) = server
             .post_auth(
@@ -17720,7 +17728,11 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Probe leaves no state behind even after failures.
         let (status, body) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(0), "probe must leave no state");
+        assert_eq!(
+            body.as_array().map(Vec::len),
+            Some(0),
+            "probe must leave no state"
+        );
     }
 
     #[tokio::test]
@@ -18366,7 +18378,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Both users are still there, including the administrator.
         let (status, body) = server.get_auth("/api/v5/users", &token).await;
         assert_eq!(status, 200);
-        let users = body["data"].as_array().expect("user list reads");
+        let users = body.as_array().expect("user list reads");
         assert!(users
             .iter()
             .any(|entry| entry["username"] == json!("admin")));

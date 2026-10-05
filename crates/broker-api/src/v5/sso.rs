@@ -6,7 +6,8 @@
 //! does not examine an identity token, and the SAML consumer examines a
 //! shared-secret signature that no identity provider makes. Thus the
 //! flow endpoints (`/sso/login/:backend`, `/sso/oidc/callback`,
-//! `/sso/saml/acs`, `/sso/token_exchange`) answer 501 unless
+//! `/sso/saml/acs`, `/sso/token_exchange`) answer the error that the
+//! reference API documents for each (404 or 400) unless
 //! [`SsoStore::set_unstable_flows`] turned them on. Production code does
 //! not turn them on. The supported login is the user name and the
 //! password with MFA, and the API keys.
@@ -889,12 +890,29 @@ pub async fn delete_sso_backend(
 }
 
 /// The answer of a login flow endpoint while the flow is off.
-fn flow_not_available() -> Response {
+///
+/// Each endpoint answers a status code and a body that the reference API
+/// documents for it. Login and the SAML consumer answer 404
+/// `BACKEND_NOT_FOUND`: no backend can run a flow in this release. The OIDC
+/// callback and the token exchange answer 400 `BAD_REQUEST`.
+#[derive(Clone, Copy)]
+enum FlowKind {
+    /// `POST /sso/login/{backend}` and `POST /sso/saml/acs`.
+    BackendFlow,
+    /// `GET /sso/oidc/callback` and `POST /sso/token_exchange`.
+    CodeFlow,
+}
+
+fn flow_not_available(kind: FlowKind) -> Response {
+    let (status, code) = match kind {
+        FlowKind::BackendFlow => (StatusCode::NOT_FOUND, "BACKEND_NOT_FOUND"),
+        FlowKind::CodeFlow => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+    };
     (
-        StatusCode::NOT_IMPLEMENTED,
+        status,
         Json(serde_json::json!({
-            "code": "NOT_IMPLEMENTED",
-            "message": "single sign-on is unstable and is not available in this release",
+            "code": code,
+            "message": "single sign-on is not available in this release",
         })),
     )
         .into_response()
@@ -938,7 +956,7 @@ pub async fn login(
     body: Bytes,
 ) -> Response {
     if !state.sso_backends.unstable_flows_enabled() {
-        return flow_not_available();
+        return flow_not_available(FlowKind::BackendFlow);
     }
     let Some(stored) = state.sso_backends.get(&backend) else {
         return (
@@ -1074,7 +1092,7 @@ pub async fn oidc_callback(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     if !state.sso_backends.unstable_flows_enabled() {
-        return flow_not_available();
+        return flow_not_available(FlowKind::CodeFlow);
     }
     use crate::errors::ApiError;
     let bad_request = |message: String| ApiError::BadRequest(message).into_response();
@@ -1254,7 +1272,7 @@ pub async fn oidc_callback(
 // (fail closed without one) until the checker pins it.
 pub async fn token_exchange(State(state): State<ApiState>, body: Bytes) -> Response {
     if !state.sso_backends.unstable_flows_enabled() {
-        return flow_not_available();
+        return flow_not_available(FlowKind::CodeFlow);
     }
     use crate::errors::ApiError;
     let bad_request = |message: String| ApiError::BadRequest(message).into_response();
@@ -2043,7 +2061,7 @@ pub async fn saml_acs(
     body: Bytes,
 ) -> Response {
     if !state.sso_backends.unstable_flows_enabled() {
-        return flow_not_available();
+        return flow_not_available(FlowKind::BackendFlow);
     }
     use crate::errors::ApiError;
     let bad_request = |message: String| ApiError::BadRequest(message).into_response();

@@ -240,6 +240,13 @@ fn name_pwd_error() -> Response {
         .into_response()
 }
 
+/// The answer of a password change when the old password does not match:
+/// 400 `ERROR_PWD_NOT_MATCH`, as the reference API documents for
+/// `POST /users/{username}/change_pwd`.
+fn old_pwd_mismatch() -> Response {
+    ApiError::ErrorPwdNotMatch("the old password does not match".to_string()).into_response()
+}
+
 /// The answer when a user has too many failed logins. The reference API
 /// gives 401 with the code `LOGIN_LOCKED` for this.
 fn login_locked_error() -> Response {
@@ -308,14 +315,14 @@ fn check_login_mfa(state: &ApiState, username: &str, mfa_token: Option<&str>) ->
 /// Map an `AdminUsers` error onto its HTTP status.
 fn admin_error(error: AdminUserError) -> Response {
     let (status, code) = match error {
-        AdminUserError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+        AdminUserError::NotFound => (StatusCode::NOT_FOUND, "USER_NOT_FOUND"),
         AdminUserError::AlreadyExists => (StatusCode::CONFLICT, "ALREADY_EXISTS"),
         AdminUserError::Persist(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+        AdminUserError::LastAdministrator => (StatusCode::BAD_REQUEST, "NOT_ALLOWED"),
         AdminUserError::InvalidUsername
         | AdminUserError::WeakPassword
         | AdminUserError::SameAsOld
-        | AdminUserError::TooManyUsers
-        | AdminUserError::LastAdministrator => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+        | AdminUserError::TooManyUsers => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
     };
     (
         status,
@@ -869,54 +876,44 @@ pub async fn user_scopes() -> Response {
 /// credentials stay in `MemoryAuth` behind the `/authentication/.../users`
 /// and v1 `/auth/users` endpoints.
 ///
-/// `GET /users`: paged dashboard users with the standard page envelope
-/// (`data` plus `meta {page, limit, count, hasnext}`, C05-25).
+/// `GET /users`: all dashboard users as a bare JSON array (C05-25).
 ///
-/// Reads the live admin-user map (sorted by username) and slices the
-/// requested page with the shared [`PageParams`] helper (defaults
-/// `page=1`, `limit=100`, clamped to `1..=1000`; malformed values fall
-/// back to defaults, never 400). An empty map reads as an empty page
-/// (`data: []`), never an error. Each row carries only the documented
-/// per-user fields the broker tracks (`username`, `role`,
-/// `description`); passwords are write-only and password hashes never
-/// render.
-/// Management-plane only: clones at most the sorted view list once per
-/// request under a short read lock and slices one page; the login and
-/// middleware consults keep reading under their own short locks
-/// (`AdminUsers::verify_password` on `POST /login`,
-/// `resolve_bearer` per authenticated request) and publish/deliver never
-/// touch this store. The map is bounded by
-/// [`crate::admin_users::MAX_ADMIN_USERS`] (1024 entries), so list reads
-/// stay paged and per-request clones stay cheap.
-// TODO(parity): which per-user fields beyond username/role/description
-// does the listing require (scopes, creation time, login-only flags)?
-// The rulebook does not decide the exact row shape and the broker tracks
-// neither field on this path, so the current choice omits fields the
-// broker cannot supply (never a constant standing in for a measurement)
-// until the checker pins them. Scope vocabulary and per-user MFA state
-// are owned by their own lanes.
-pub async fn list_users(State(state): State<ApiState>, params: PageParams) -> Response {
-    let users = state.admin_users.list();
-    let total = users.len();
-    let page_items = paginate(&users, params.page, params.limit);
-    let data: Vec<_> = page_items
+/// The reference API documents an array of user rows and no paging
+/// parameters, and the management console reads an array. The array is
+/// sorted by username. An empty store reads as `[]`, never an error. Each
+/// row carries `username`, `role`, `description`, `backend` (always
+/// `local`: the broker has one user store) and `mfa`. The value of `mfa`
+/// is `totp` for a user whose second factor is on, `disabled` for a user
+/// with a pending enrolment that no code has confirmed, and `none`
+/// otherwise. Passwords are write-only and password hashes never render.
+/// Management-plane only: clones the sorted view list once per request
+/// under short read locks; the login and middleware consults keep reading
+/// under their own short locks and publish/deliver never touch this
+/// store. The map is bounded by [`crate::admin_users::MAX_ADMIN_USERS`]
+/// (1024 entries), so the list stays small.
+// TODO(parity): the broker keeps no per-user scope list, so `scopes` is
+// left out of the row. The reference API marks the field optional.
+pub async fn list_users(State(state): State<ApiState>) -> Response {
+    let rows: Vec<_> = state
+        .admin_users
+        .list()
         .iter()
         .map(|u| {
+            let mfa = match state.admin_users.mfa_status(&u.username) {
+                Some(status) if status.enabled => "totp",
+                Some(status) if status.pending => "disabled",
+                _ => "none",
+            };
             serde_json::json!({
                 "username": u.username,
                 "role": role_str(&u.role),
                 "description": u.description,
+                "backend": "local",
+                "mfa": mfa,
             })
         })
         .collect();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": data,
-            "meta": meta_page(params.page, params.limit, total),
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(serde_json::Value::Array(rows))).into_response()
 }
 
 /// `POST /users`: add one dashboard user (C05-26).
@@ -1160,11 +1157,8 @@ pub async fn update_user(
 /// Management-plane only: one short user-map write lock per request (plus
 /// the registry save lock on persist); the login path keeps reading under
 /// short read locks and publish/deliver never touch this store.
-// TODO(parity): is the documented miss code `USER_NOT_FOUND` or
-// `NOT_FOUND`? The rulebook does not decide the exact code name; the
-// current choice keeps `NOT_FOUND` (404, documented `{code, message}`
-// shape, shared with the other dashboard miss paths) until the checker
-// pins it.
+// The miss code is `USER_NOT_FOUND`, as the reference API documents. The
+// removal of the last administrator fails with 400 `NOT_ALLOWED`.
 pub async fn delete_user(State(state): State<ApiState>, Path(username): Path<String>) -> Response {
     match state.admin_users.delete(&username) {
         Ok(()) => {
@@ -1194,9 +1188,9 @@ pub struct ChangePasswordReq {
 /// `crates/broker-config/src/lib.rs`), and revokes that user's other live
 /// tokens (`ApiTokens::revoke_user_except`, so a rotated credential stops
 /// authorising the user's other management sessions immediately).
-/// Unknown usernames fail with `NOT_FOUND` (404, documented `{code,
+/// Unknown usernames fail with `USER_NOT_FOUND` (404, documented `{code,
 /// message}` shape); a wrong or missing `old_pwd` on a self change fails
-/// with `BAD_USERNAME_OR_PWD` (401, documented shape); a missing or weak
+/// with `ERROR_PWD_NOT_MATCH` (400, documented shape); a missing or weak
 /// `new_pwd` fails with `BAD_REQUEST` (400, documented shape).
 /// Administrators may rotate any user's password without that user's old
 /// credential; viewers may only rotate their own and must prove the old
@@ -1223,8 +1217,8 @@ pub struct ChangePasswordReq {
 // (never leaks existence to viewers) until the checker pins it.
 // TODO(parity): is a missing `old_pwd` on a self change malformed (400)
 // or wrong (401)? The rulebook does not decide the empty boundary; the
-// current choice answers both missing and wrong the same way (401
-// `BAD_USERNAME_OR_PWD`, fail closed, stores nothing) until the checker pins it.
+// current choice answers both missing and wrong the same way (400
+// `ERROR_PWD_NOT_MATCH`, fail closed, stores nothing) until the checker pins it.
 pub async fn change_user_password(
     State(state): State<ApiState>,
     Extension(caller): Extension<TokenInfo>,
@@ -1248,10 +1242,10 @@ pub async fn change_user_password(
     }
     if is_self {
         let Some(old_pwd) = req.old_pwd.as_deref() else {
-            return name_pwd_error();
+            return old_pwd_mismatch();
         };
         if !state.admin_users.verify_password(&username, old_pwd) {
-            return name_pwd_error();
+            return old_pwd_mismatch();
         }
     }
     let Some(new_pwd) = req.new_pwd.as_deref() else {
@@ -2620,10 +2614,6 @@ mod dashboard_users_tests {
         Bytes::from(serde_json::to_vec(&value).expect("test body serialises"))
     }
 
-    fn params(page: u32, limit: u32) -> PageParams {
-        PageParams { page, limit }
-    }
-
     async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
@@ -2681,16 +2671,15 @@ mod dashboard_users_tests {
             );
         }
 
-        // List carries both users with the standard page envelope.
-        let (status, listed, raw) =
-            parts(list_users(State(state.clone()), params(1, 100)).await).await;
+        // List answers a bare array with all users.
+        let (status, listed, raw) = parts(list_users(State(state.clone())).await).await;
         assert_eq!(status, StatusCode::OK);
-        let data = listed["data"].as_array().expect("data array");
+        let data = listed.as_array().expect("bare array");
         assert_eq!(data.len(), 3, "default admin plus two created users");
-        assert_eq!(listed["meta"]["page"], serde_json::json!(1));
-        assert_eq!(listed["meta"]["limit"], serde_json::json!(100));
-        assert_eq!(listed["meta"]["count"], serde_json::json!(3));
-        assert_eq!(listed["meta"]["hasnext"], serde_json::json!(false));
+        for row in data {
+            assert_eq!(row["backend"], serde_json::json!("local"));
+            assert_eq!(row["mfa"], serde_json::json!("none"));
+        }
         let names: Vec<&str> = data
             .iter()
             .map(|row| row["username"].as_str().expect("row has username"))
@@ -2704,14 +2693,6 @@ mod dashboard_users_tests {
             !String::from_utf8_lossy(&raw).contains("AliceSecret1!"),
             "list body carries no plaintext"
         );
-
-        // Paging slices after sorting: page 2 with limit 2 holds the last user.
-        let (status, page2, _) = parts(list_users(State(state.clone()), params(2, 2)).await).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(page2["data"].as_array().expect("data").len(), 1);
-        assert_eq!(page2["data"][0]["username"], serde_json::json!("w241-bob"));
-        assert_eq!(page2["meta"]["count"], serde_json::json!(3));
-        assert_eq!(page2["meta"]["hasnext"], serde_json::json!(false));
 
         // Re-creating an existing username is rejected, never an update.
         let (status, duplicate, _) = parts(
@@ -2744,17 +2725,15 @@ mod dashboard_users_tests {
         // Delete one user; the list shrinks.
         let gone = delete_user(State(state.clone()), Path("w241-bob".to_string())).await;
         assert_eq!(gone.status(), StatusCode::NO_CONTENT);
-        let (status, listed, _) =
-            parts(list_users(State(state.clone()), params(1, 100)).await).await;
+        let (status, listed, _) = parts(list_users(State(state.clone())).await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(listed["data"].as_array().expect("data").len(), 2);
-        assert_eq!(listed["meta"]["count"], serde_json::json!(2));
+        assert_eq!(listed.as_array().expect("bare array").len(), 2);
 
         // Deleting an unknown username is a 404 with the documented shape.
         let (status, missing, _) =
             parts(delete_user(State(state.clone()), Path("w241-ghost".to_string())).await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert_eq!(missing["code"], serde_json::json!("USER_NOT_FOUND"));
         assert!(missing.get("message").is_some());
     }
 
@@ -2971,7 +2950,7 @@ mod dashboard_users_tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(missing["code"], serde_json::json!("NOT_FOUND"));
+        assert_eq!(missing["code"], serde_json::json!("USER_NOT_FOUND"));
         assert!(missing.get("message").is_some());
         assert!(
             state.admin_users.get("w242-ghost").is_none(),
@@ -3316,8 +3295,8 @@ mod change_password_tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_documented_shape(&wrong_old, "BAD_USERNAME_OR_PWD");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_documented_shape(&wrong_old, "ERROR_PWD_NOT_MATCH");
         assert!(
             state
                 .admin_users
@@ -3366,7 +3345,7 @@ mod change_password_tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_documented_shape(&missing, "NOT_FOUND");
+        assert_documented_shape(&missing, "USER_NOT_FOUND");
         assert!(
             state.admin_users.get("w243-ghost").is_none(),
             "unknown rotation creates nothing"

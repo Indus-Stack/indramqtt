@@ -332,6 +332,16 @@ impl TransformChainStore {
         *self.inner.write().expect("transform store lock") = entries;
     }
 
+    /// Replace the stored entry that has the same name as `entry`, in
+    /// place, so the chain order stays the same. Returns the stored entry,
+    /// or `None` when no entry has that name.
+    pub fn update(&self, entry: TransformRecord) -> Option<TransformRecord> {
+        let mut chain = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let slot = chain.iter_mut().find(|record| record.name == entry.name)?;
+        *slot = entry.clone();
+        Some(entry)
+    }
+
     /// Reorder the stored chain to the supplied name order.
     ///
     /// Validates the full order before applying anything: an unknown
@@ -564,7 +574,17 @@ pub async fn create_transformation(State(state): State<ApiState>, body: Bytes) -
     }
 }
 
-/// `PUT /api/v5/message_transformations`: replace the whole chain.
+/// `PUT /api/v5/message_transformations`: update one transformation.
+///
+/// The body is one transformation object, as the reference API documents.
+/// The entry with the same `name` is replaced in place, so the chain order
+/// stays. A malformed body fails with `BAD_REQUEST`; an unknown name fails
+/// with `NOT_FOUND`. On success answers 200 with the stored entry.
+///
+/// A JSON array body is an extension of this broker. It replaces the whole
+/// chain, as described next.
+///
+/// Replace the whole chain.
 /// The body must be a JSON array; every entry gets the same validation
 /// as create, and the whole write validates before anything applies:
 /// one bad entry rejects the entire write with `BAD_REQUEST` and leaves
@@ -580,6 +600,9 @@ pub async fn replace_transformations(State(state): State<ApiState>, body: Bytes)
                 .into_response();
         }
     };
+    if value.is_object() {
+        return update_one_transformation(&state, &value);
+    }
     let items = match value.as_array() {
         Some(items) => items,
         None => {
@@ -631,6 +654,25 @@ pub async fn replace_transformations(State(state): State<ApiState>, body: Bytes)
     let chain = state.transformations.snapshot();
     let rows: Vec<serde_json::Value> = chain.iter().map(TransformRecord::to_json).collect();
     (StatusCode::OK, Json(rows)).into_response()
+}
+
+/// Update the stored entry of the same name from one transformation
+/// object. See [`replace_transformations`].
+fn update_one_transformation(state: &ApiState, value: &serde_json::Value) -> Response {
+    let entry = match parse_transform_request(value) {
+        Ok(entry) => entry,
+        Err(msg) => return ApiError::BadRequest(msg).into_response(),
+    };
+    let name = entry.name.clone();
+    let Some(stored) = state.transformations.update(entry) else {
+        return ApiError::NotFound(format!("transformation {name:?} not found")).into_response();
+    };
+    state.engine.ensure_transform_metrics(&stored.name);
+    sync_engine(state);
+    if let Err(error) = state.transformations.persist() {
+        return transform_persist_error(error);
+    }
+    (StatusCode::OK, Json(stored.to_json())).into_response()
 }
 
 /// `POST /api/v5/message_transformations/reorder`: replace the chain
@@ -1681,6 +1723,54 @@ mod tests {
             "m[t-b][t-a]",
             "chain order defines execution order"
         );
+    }
+
+    #[tokio::test]
+    async fn put_with_one_object_updates_that_entry_in_place() {
+        let state = standalone_state();
+        for name in ["u-a", "u-b"] {
+            let body = serde_json::json!({
+                "name": name, "topics": ["upd/#"], "failure_action": "drop",
+                "operations": [{"key": "payload", "value": "${payload}-old"}],
+            });
+            let (status, _) =
+                response_parts(create_transformation(State(state.clone()), make_body(&body)).await)
+                    .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+        let changed = serde_json::json!({
+            "name": "u-a", "topics": ["upd/#"], "failure_action": "ignore",
+            "operations": [{"key": "payload", "value": "${payload}-new"}],
+        });
+        let (status, stored) = response_parts(
+            replace_transformations(State(state.clone()), make_body(&changed)).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(stored.is_object(), "one object answers one object");
+        assert_eq!(stored["name"], serde_json::json!("u-a"));
+        assert_eq!(stored["failure_action"], serde_json::json!("ignore"));
+        let names = listed_names(&state).await;
+        assert_eq!(names, vec!["u-a".to_string(), "u-b".to_string()]);
+        // An unknown name is a 404 and changes nothing.
+        let unknown = serde_json::json!({
+            "name": "u-none", "topics": ["upd/#"], "failure_action": "drop",
+            "operations": [],
+        });
+        let (status, err) = response_parts(
+            replace_transformations(State(state.clone()), make_body(&unknown)).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        assert_eq!(listed_names(&state).await.len(), 2);
+        // A malformed object is a 400.
+        let bad = serde_json::json!({"name": "u-a"});
+        let (status, err) =
+            response_parts(replace_transformations(State(state.clone()), make_body(&bad)).await)
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
     }
 
     #[tokio::test]

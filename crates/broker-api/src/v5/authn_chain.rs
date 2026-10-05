@@ -17,9 +17,8 @@
 //! Only the built-in database executes; every other backend's config is
 //! stored and reported, never claimed as live.
 // TODO(parity): which per-entry fields plus list envelope does the spec
-// require (bare list versus data/meta, status fields)? The rulebook does
-// not decide the exact shape; the current choice reuses the shared
-// pagination extractor (data plus meta) and reports
+// require (status fields)? The list is a bare array, as the reference API
+// and the management console expect. The rows report
 // id/mechanism/backend/enable only, omitting status fields the broker
 // cannot supply.
 
@@ -32,29 +31,18 @@ use axum::{
 use bytes::Bytes;
 
 use crate::errors::ApiError;
-use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 use broker_auth::{
     AuthnEntry, ChainInsertError, ChainMoveError, ChainRemoveError, ChainReorderError,
     ChainUpdateError,
 };
 
-/// `GET /authentication`: ordered page (`data` plus `meta`). An empty
-/// chain reads as an empty page, never an error. Malformed
-/// `page`/`limit` fall back to defaults via [`PageParams`].
-pub async fn list_authn_chain(State(state): State<ApiState>, params: PageParams) -> Response {
-    let all = state.authn_chain.list();
-    let total = all.len();
-    let page_items = paginate(&all, params.page, params.limit);
-    let data: Vec<serde_json::Value> = page_items.iter().map(render_entry).collect();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": data,
-            "meta": meta_page(params.page, params.limit, total),
-        })),
-    )
-        .into_response()
+/// `GET /authentication`: the ordered chain as a bare JSON array. An empty
+/// chain reads as `[]`, never an error. The reference API documents no
+/// paging, so the route takes none.
+pub async fn list_authn_chain(State(state): State<ApiState>) -> Response {
+    let data: Vec<serde_json::Value> = state.authn_chain.list().iter().map(render_entry).collect();
+    (StatusCode::OK, Json(data)).into_response()
 }
 
 /// `POST /authentication`: append one authenticator. Returns the stored

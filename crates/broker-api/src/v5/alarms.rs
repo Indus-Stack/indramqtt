@@ -40,8 +40,7 @@ const MAX_NAME_LEN: usize = 256;
 /// Longest accepted alarm `message`.
 const MAX_MESSAGE_LEN: usize = 1024;
 
-/// Node name rendered on every alarm row (single node).
-const NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 /// One active alarm: identifier (`name`), human detail (`message`),
 /// structured detail (`details`, always an object) and activation time
@@ -58,7 +57,7 @@ impl AlarmEntry {
     fn to_json(&self, now_us: u64) -> serde_json::Value {
         let duration = now_us.saturating_sub(self.activate_at_us);
         serde_json::json!({
-            "node": NODE_NAME,
+            "node": local_node_name(),
             "name": self.name,
             "message": self.message,
             "details": self.details,
@@ -85,7 +84,7 @@ impl DeactivatedAlarm {
     fn to_json(&self) -> serde_json::Value {
         let duration = self.deactivate_at_us.saturating_sub(self.activate_at_us);
         serde_json::json!({
-            "node": NODE_NAME,
+            "node": local_node_name(),
             "name": self.name,
             "message": self.message,
             "details": self.details,
@@ -492,7 +491,7 @@ mod tests {
             serde_json::json!({"high_watermark": 70}),
         );
         let rendered = entry.to_json(entry.activate_at_us + 10);
-        assert_eq!(rendered["node"], serde_json::json!(NODE_NAME));
+        assert_eq!(rendered["node"], serde_json::json!(local_node_name()));
         assert_eq!(rendered["name"], serde_json::json!("shape-alarm"));
         assert_eq!(rendered["message"], serde_json::json!("shape message"));
         assert_eq!(

@@ -1076,13 +1076,13 @@ async fn cmd_listeners(ctl: &CtlArgs, key: &SecretString) -> Result<String, CtlE
         .map(|row| {
             vec![
                 cell(row.get("id")),
-                cell(row.get("protocol")),
+                cell(row.get("type")),
                 cell(row.get("bind")),
-                cell(row.get("enabled")),
+                cell(row.get("enable")),
             ]
         })
         .collect();
-    Ok(render_table(&["ID", "PROTOCOL", "BIND", "ENABLED"], &rows))
+    Ok(render_table(&["ID", "TYPE", "BIND", "ENABLE"], &rows))
 }
 
 async fn cmd_rules_list(ctl: &CtlArgs, key: &SecretString) -> Result<String, CtlError> {
@@ -1256,12 +1256,8 @@ async fn cmd_connectors_list(ctl: &CtlArgs, key: &SecretString) -> Result<String
     if ctl.json {
         return Ok(render_json(&body));
     }
-    // The API returns one page: the rows are in `data`.
-    let data = body
-        .get("data")
-        .and_then(|rows| rows.as_array())
-        .cloned()
-        .unwrap_or_default();
+    // The API returns a bare array of connectors.
+    let data = body.as_array().cloned().unwrap_or_default();
     let rows: Vec<Vec<String>> = data
         .iter()
         .map(|row| {
@@ -2540,7 +2536,7 @@ mod tests {
             by_id("tcp:default")["bind"],
             serde_json::json!("127.0.0.1:11883")
         );
-        assert_eq!(by_id("ws:default")["enabled"], serde_json::json!(true));
+        assert_eq!(by_id("ws:default")["enable"], serde_json::json!(true));
     }
 
     #[tokio::test]
@@ -2955,9 +2951,9 @@ mod tests {
         .expect("connectors list --json succeeds");
         let listed: serde_json::Value = serde_json::from_str(&list).expect("list JSON parses");
         assert!(
-            listed["data"]
+            listed
                 .as_array()
-                .expect("the list page has a data array")
+                .expect("the connector list is a bare array")
                 .iter()
                 .any(|row| row["id"] == serde_json::json!(id)),
             "list contains the new connector"

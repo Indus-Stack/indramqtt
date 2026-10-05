@@ -73,7 +73,7 @@ fn client_detail_json(
     );
     map.insert(
         "node".to_string(),
-        serde_json::Value::from("indramqtt@127.0.0.1"),
+        serde_json::Value::from(crate::node_scope::local_node_name()),
     );
     serde_json::Value::Object(map)
 }
@@ -349,7 +349,7 @@ pub async fn get_client_subscriptions(
                 "nl": nl,
                 "rap": rap,
                 "rh": rh,
-                "node": "indramqtt@127.0.0.1",
+                "node": crate::node_scope::local_node_name(),
                 "clientid": client_id,
             })
         })
@@ -405,7 +405,7 @@ fn apply_single_subscribe(
         "nl": nl,
         "rap": rap,
         "rh": rh,
-        "node": "indramqtt@127.0.0.1",
+        "node": crate::node_scope::local_node_name(),
     }))
 }
 
@@ -862,7 +862,7 @@ pub async fn list_subscriptions(State(state): State<ApiState>, params: PageParam
                 "nl": entry.options.nl,
                 "rap": entry.options.rap,
                 "rh": entry.options.rh,
-                "node": "indramqtt@127.0.0.1"
+                "node": crate::node_scope::local_node_name()
             })
         })
         .collect();
@@ -891,7 +891,7 @@ pub async fn list_topics(State(state): State<ApiState>, params: PageParams) -> R
         .map(|t| {
             serde_json::json!({
                 "topic": t,
-                "node": "indramqtt@127.0.0.1"
+                "node": crate::node_scope::local_node_name()
             })
         })
         .collect();
@@ -909,56 +909,66 @@ pub async fn list_topics(State(state): State<ApiState>, params: PageParams) -> R
 ///
 /// Looks up the topic index with an exact match on the percent-decoded
 /// path parameter: no wildcard, prefix or filter matching. Known
-/// topics return the documented record; unknown topics return the
-/// documented not-found shape (`NOT_FOUND`, 404). Management-plane
+/// topics return a JSON array with one row per node that holds the topic
+/// (one row on this single node), as the reference API documents; unknown
+/// topics return the documented 404 `TOPIC_NOT_FOUND`. Management-plane
 /// read only: one short lock on the topic set, no work on fan-out or
 /// fan-in.
 pub async fn get_topic(State(state): State<ApiState>, Path(topic): Path<String>) -> Response {
     if !state.router.contains_topic(&topic) {
-        return ApiError::NotFound("topic not found".to_string()).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "code": "TOPIC_NOT_FOUND",
+                "message": "topic not found"
+            })),
+        )
+            .into_response();
     }
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        Json(serde_json::json!([{
             "topic": topic,
-            "node": "indramqtt@127.0.0.1"
-        })),
+            "node": crate::node_scope::local_node_name()
+        }])),
     )
         .into_response()
 }
 
-/// Documented `GET /sessions_count` scoping. Only `node` narrows the
-/// count; every other query key is ignored by the `Query` extractor so
-/// new parameters degrade to the full count instead of a 400.
+/// Query of `GET /sessions_count`. The reference API documents `since`, a
+/// UNIX time in seconds. Other query keys are ignored, so new parameters
+/// degrade to the plain count instead of a 400.
 #[derive(Deserialize, Default)]
 pub struct SessionsCountQuery {
     #[serde(default)]
-    pub node: Option<String>,
+    pub since: Option<String>,
 }
 
-/// Live-session count as a small `{"count": N}` object.
+/// `GET /sessions_count`: the number of sessions that have not expired.
 ///
-/// Constant-time read over indexed session state: one atomic maintained
-/// by the session manager, no scan of the session map. Counts connected
-/// sessions only. An explicit `node` value for another node narrows to
-/// zero on this single node; unknown query keys are ignored.
-/// Management-plane only; never touched on fan-out or fan-in.
+/// The reference API documents the body as a JSON string that holds the
+/// number, for example `"3"`. The count covers sessions held in memory,
+/// connected or detached. The broker keeps no history of expired sessions,
+/// so `since` adds no expired sessions: the count is the same for every
+/// valid `since`. A `since` that is not a whole number of seconds fails
+/// with 400 `BAD_REQUEST`.
+/// Management-plane only: one short read lock over the session maps;
+/// never touched on fan-out or fan-in.
 pub async fn get_sessions_count(
     State(state): State<ApiState>,
     Query(params): Query<SessionsCountQuery>,
 ) -> Response {
-    let total = state.sessions.connected_count();
-    let count = match params.node.as_deref() {
-        Some(want)
-            if !want.is_empty()
-                && want != state.node_id.as_str()
-                && want != "indramqtt@127.0.0.1" =>
-        {
-            0
+    if let Some(since) = params.since.as_deref() {
+        if since.parse::<u64>().is_err() {
+            return ApiError::BadRequest(
+                "query parameter `since` must be a non-negative whole number of seconds"
+                    .to_string(),
+            )
+            .into_response();
         }
-        _ => total,
-    };
-    (StatusCode::OK, Json(serde_json::json!({ "count": count }))).into_response()
+    }
+    let count = state.sessions.session_count();
+    (StatusCode::OK, Json(count.to_string())).into_response()
 }
 
 /// Management-plane publish fan-out shared by `POST /publish` and the

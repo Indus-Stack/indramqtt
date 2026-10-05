@@ -1,6 +1,6 @@
 //! Configured network listeners for the v5 REST API (M1-06).
 //!
-//! Covers `GET /listeners` (the configured edge and API listeners).
+//! Covers `GET /listeners` (the configured MQTT listeners).
 //! Management-plane only: nothing here runs on the per-message path, so
 //! reads never take a delivery lock and no new buffering is added to
 //! fan-out or fan-in.
@@ -17,60 +17,73 @@
 // only the configured list is served, fail-closed on unknown paths.
 //!
 //! Store bounds (both stated here and enforced below):
-//! - exactly five rows (tcp, tls, ws, wss, api), one small JSON object
+//! - exactly four rows (tcp, ssl, ws, wss), one small JSON object
 //!   each, regardless of connection, session or subscription scale;
-//! - per-request work is one `Arc` clone plus rendering five rows, so
+//! - per-request work is one `Arc` clone plus rendering four rows, so
 //!   handler cost stays constant no matter how many clients are connected.
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 
 use crate::ApiState;
 
-/// `GET /listeners`: the configured listeners as a bare array.
+/// One listener row in the shape that the reference API documents.
 ///
-/// One row per listener section (`tcp`, `tls`, `ws`, `wss`, `api`) with
-/// the configured `bind`, whether it is `enabled`, and the section's
-/// extra addressing (`path` for the WebSocket sections). Disabled rows
-/// are still listed so an operator can see what would start when
-/// enabled; rows never invent live socket state. Returns a bare array to
-/// match the list convention of the neighbouring collection routes.
-pub async fn list_listeners(State(state): State<ApiState>) -> impl IntoResponse {
+/// `id` has the form `{type}:{name}`. The broker has one listener for each
+/// type, and its name is `default`. The type `ssl` is the TLS listener.
+fn listener_row(kind: &str, bind: &str, enable: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("{kind}:default"),
+        "name": "default",
+        "type": kind,
+        "bind": bind,
+        "enable": enable,
+    })
+}
+
+/// `GET /listeners`: the configured MQTT listeners as a bare array.
+///
+/// One row per MQTT listener section (`tcp`, `ssl`, `ws`, `wss`), each
+/// with the fields `id`, `name`, `type`, `bind` and `enable`. Disabled rows
+/// are still listed so an operator can see what would start when enabled.
+/// The HTTP listener of the management API is not an MQTT listener. The
+/// reference API lists only the types `tcp`, `ssl`, `ws`, `wss` and `quic`,
+/// so that listener has no row.
+///
+/// The broker does not track the number of connections of one listener or
+/// the state of its socket, so the optional fields `status`,
+/// `node_status`, `number` and `acceptors` are left out and no value is
+/// invented. The route takes no `type` filter value other than the
+/// documented ones: a `type` query narrows the list to that type.
+pub async fn list_listeners(
+    State(state): State<ApiState>,
+    Query(query): Query<ListenersQuery>,
+) -> impl IntoResponse {
     let listeners = &state.listeners;
-    let rows = vec![
-        serde_json::json!({
-            "id": "tcp:default",
-            "protocol": "mqtt",
-            "bind": listeners.tcp.bind,
-            "enabled": listeners.tcp.enabled,
-        }),
-        serde_json::json!({
-            "id": "tls:default",
-            "protocol": "mqtts",
-            "bind": listeners.tls.bind,
-            "enabled": listeners.tls.enabled,
-        }),
-        serde_json::json!({
-            "id": "ws:default",
-            "protocol": "ws",
-            "bind": listeners.ws.bind,
-            "enabled": listeners.ws.enabled,
-            "path": listeners.ws.path,
-        }),
-        serde_json::json!({
-            "id": "wss:default",
-            "protocol": "wss",
-            "bind": listeners.wss.bind,
-            "enabled": listeners.wss.enabled,
-            "path": listeners.wss.path,
-        }),
-        serde_json::json!({
-            "id": "api:default",
-            "protocol": "http",
-            "bind": listeners.api.bind,
-            "enabled": listeners.api.enabled,
-        }),
-    ];
+    let rows: Vec<serde_json::Value> = vec![
+        listener_row("tcp", &listeners.tcp.bind, listeners.tcp.enabled),
+        listener_row("ssl", &listeners.tls.bind, listeners.tls.enabled),
+        listener_row("ws", &listeners.ws.bind, listeners.ws.enabled),
+        listener_row("wss", &listeners.wss.bind, listeners.wss.enabled),
+    ]
+    .into_iter()
+    .filter(|row| match query.kind.as_deref() {
+        Some(kind) if !kind.is_empty() => row["type"] == kind,
+        _ => true,
+    })
+    .collect();
     (StatusCode::OK, Json(rows))
+}
+
+/// Query of `GET /listeners`. The reference API documents `type`.
+#[derive(serde::Deserialize, Default)]
+pub struct ListenersQuery {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 #[cfg(test)]
@@ -96,38 +109,39 @@ mod tests {
         (status, body)
     }
 
+    async fn list_all(state: ApiState) -> (StatusCode, serde_json::Value) {
+        response_body(list_listeners(State(state), Query(ListenersQuery::default())).await).await
+    }
+
     #[tokio::test]
-    async fn list_reports_five_configured_rows_with_binds() {
+    async fn list_reports_four_configured_rows_with_binds() {
         let state = standalone_state();
-        let (status, body) = response_body(list_listeners(State(state)).await).await;
+        let (status, body) = list_all(state).await;
         assert_eq!(status, StatusCode::OK);
         let rows = body.as_array().expect("listeners list is an array");
-        assert_eq!(rows.len(), 5, "one row per listener section");
+        assert_eq!(rows.len(), 4, "one row per MQTT listener section");
         let ids: Vec<&str> = rows
             .iter()
             .map(|r| r["id"].as_str().expect("row carries id"))
             .collect();
         assert_eq!(
             ids,
-            vec![
-                "tcp:default",
-                "tls:default",
-                "ws:default",
-                "wss:default",
-                "api:default"
-            ]
+            vec!["tcp:default", "ssl:default", "ws:default", "wss:default"]
         );
         for row in rows {
             assert!(row["bind"].is_string(), "row carries bind: {row}");
-            assert!(row["enabled"].is_boolean(), "row carries enabled: {row}");
-            assert!(row["protocol"].is_string(), "row carries protocol: {row}");
+            assert!(row["enable"].is_boolean(), "row carries enable: {row}");
+            assert_eq!(row["name"], serde_json::json!("default"));
+            let kind = row["type"].as_str().expect("row carries type");
+            assert!(["tcp", "ssl", "ws", "wss"].contains(&kind), "type: {kind}");
+            assert_eq!(row["id"], serde_json::json!(format!("{kind}:default")));
         }
         // Default configuration: plaintext and WS on, TLS and WSS off.
         let by_id = |id: &str| rows.iter().find(|r| r["id"] == id).expect(id);
-        assert_eq!(by_id("tcp:default")["enabled"], serde_json::json!(true));
-        assert_eq!(by_id("tls:default")["enabled"], serde_json::json!(false));
-        assert_eq!(by_id("ws:default")["enabled"], serde_json::json!(true));
-        assert_eq!(by_id("wss:default")["enabled"], serde_json::json!(false));
+        assert_eq!(by_id("tcp:default")["enable"], serde_json::json!(true));
+        assert_eq!(by_id("ssl:default")["enable"], serde_json::json!(false));
+        assert_eq!(by_id("ws:default")["enable"], serde_json::json!(true));
+        assert_eq!(by_id("wss:default")["enable"], serde_json::json!(false));
         // No synthesised live state: rows carry configuration only.
         for row in rows {
             assert!(row.get("connections").is_none(), "no invented count: {row}");
@@ -147,7 +161,7 @@ mod tests {
         listeners.api.bind = "127.0.0.1:28083".to_string();
         listeners.ws.enabled = false;
         state.listeners = std::sync::Arc::new(listeners);
-        let (status, body) = response_body(list_listeners(State(state)).await).await;
+        let (status, body) = list_all(state).await;
         assert_eq!(status, StatusCode::OK);
         let rows = body.as_array().expect("listeners list is an array");
         let by_id = |id: &str| rows.iter().find(|r| r["id"] == id).expect(id);
@@ -155,10 +169,19 @@ mod tests {
             by_id("tcp:default")["bind"],
             serde_json::json!("127.0.0.1:11883")
         );
-        assert_eq!(
-            by_id("api:default")["bind"],
-            serde_json::json!("127.0.0.1:28083")
-        );
-        assert_eq!(by_id("ws:default")["enabled"], serde_json::json!(false));
+        assert_eq!(by_id("ws:default")["enable"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn type_query_narrows_the_list() {
+        let state = standalone_state();
+        let query = Query(ListenersQuery {
+            kind: Some("ws".to_string()),
+        });
+        let (status, body) = response_body(list_listeners(State(state), query).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().expect("listeners list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], serde_json::json!("ws:default"));
     }
 }

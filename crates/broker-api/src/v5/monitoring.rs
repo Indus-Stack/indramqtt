@@ -10,11 +10,7 @@ use axum::{
 use crate::node_scope::resolve_node;
 use crate::ApiState;
 
-/// Single-node name rendered by `v5::nodes::list_nodes` and the other v5
-/// rows (`alarms`, `monitoring`, `clients`). Accepted alongside
-/// [`ApiState::node_id`] until every caller migrates to the configured id
-/// (see `node_scope` docs); both name the same local node.
-const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 /// Live gauges for the current snapshot, read from the session
 /// directory and lock-free metrics. Management-plane only.
@@ -44,26 +40,24 @@ fn live_counters(state: &ApiState) -> crate::v5::monitor::LiveCounters {
     }
 }
 
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Documented `GET /monitor_current` snapshot: the latest sample as a
-/// single object with the same current-value fields as one `GET /monitor`
-/// history point.
+/// Documented `GET /monitor_current` snapshot: one object with the
+/// current gauges and the message rates of the last sampling window.
 ///
-/// Every value is numeric. Gauges (`connections`, `live_connections`,
-/// `topics`, `subscriptions`) and cumulative counters (`received`,
-/// `sent`, `dropped`, `rules_matched`) are read live from the session
-/// directory and lock-free metrics, so two reads with traffic in between
-/// never move those counters backwards. Fields with no kernel tracking yet
-/// (durable gauges, validation/transformation splits, persistence and
-/// action counters) are carried over from the newest history point when one
-/// exists, else zero, so the shape stays stable and the snapshot combines
-/// live counters with history without doing any sampling work here.
+/// Gauges (`connections`, `live_connections`, `topics`, `subscriptions`,
+/// `cluster_sessions`, `retained_msg_count`) are read live from the
+/// session directory, the lock-free metrics and the statistics store. The
+/// durable gauges have no kernel tracking and carry over from the newest
+/// history point, else zero.
+///
+/// Each `*_rate` field is the change of one cumulative counter between the
+/// two newest points of the monitor history, divided by the time between
+/// the points. The sampler in the kernel writes a point on a timer, so the
+/// rate covers one sampling window. Before two points exist, and after
+/// `DELETE /monitor`, every rate reads zero because no window has passed.
+/// Counters that no subsystem records yet (persistence, validation,
+/// transformation and action counters) keep their rate at zero. The fields
+/// `license_quota`, `shared_subscriptions` and `sessions_hist_hwmark` are
+/// left out because the broker keeps no such value.
 ///
 /// Never paged; always succeeds when the node is up. The query string is
 /// not read, so unknown query parameters are ignored instead of rejected.
@@ -75,24 +69,64 @@ pub async fn monitor_current(State(state): State<ApiState>) -> Response {
 }
 
 /// Shared snapshot read for `GET /monitor_current` and its node-scoped
-/// twin below. Combines live counters with the newest history point in
-/// constant time; no sampling work is added to the message path.
+/// twin below. Combines live gauges with the rates of the newest history
+/// window in constant time; no sampling work is added to the message path.
 fn current_snapshot_value(state: &ApiState) -> serde_json::Value {
-    let now = now_epoch_secs();
+    use crate::v5::monitor::rate_per_sec;
     let live = live_counters(state);
-    let mut sample = crate::v5::monitor::MonitorSample::from_live(now, live);
-    if let Some(prev) = state.monitor.latest() {
-        sample.subscriptions_durable = prev.subscriptions_durable;
-        sample.disconnected_durable_sessions = prev.disconnected_durable_sessions;
-        sample.persisted = prev.persisted;
-        sample.validation_succeeded = prev.validation_succeeded;
-        sample.validation_failed = prev.validation_failed;
-        sample.transformation_succeeded = prev.transformation_succeeded;
-        sample.transformation_failed = prev.transformation_failed;
-        sample.actions_executed = prev.actions_executed;
-        sample.actions_messages = prev.actions_messages;
-    }
-    sample.to_json()
+    let (newest, previous) = state.monitor.newest_two();
+    let mut body = serde_json::Map::with_capacity(24);
+    let mut put = |key: &str, value: u64| {
+        body.insert(key.to_string(), serde_json::Value::from(value));
+    };
+    put("connections", live.connections);
+    put("live_connections", live.live_connections);
+    put("topics", live.topics);
+    put("subscriptions", live.subscriptions);
+    put("cluster_sessions", state.sessions.session_count() as u64);
+    put("retained_msg_count", state.stats.snapshot().retained);
+    put(
+        "subscriptions_durable",
+        newest.as_ref().map_or(0, |s| s.subscriptions_durable),
+    );
+    put(
+        "disconnected_durable_sessions",
+        newest
+            .as_ref()
+            .map_or(0, |s| s.disconnected_durable_sessions),
+    );
+    // Rates need two points. Without them no window has passed.
+    let rate = |counter: fn(&crate::v5::monitor::MonitorSample) -> u64| -> u64 {
+        match (&newest, &previous) {
+            (Some(newer), Some(older)) => rate_per_sec(
+                counter(newer),
+                counter(older),
+                newer.time_stamp.saturating_sub(older.time_stamp),
+            ),
+            _ => 0,
+        }
+    };
+    put("received_msg_rate", rate(|s| s.received));
+    put("sent_msg_rate", rate(|s| s.sent));
+    put("dropped_msg_rate", rate(|s| s.dropped));
+    put("rules_matched_rate", rate(|s| s.rules_matched));
+    put("persisted_rate", rate(|s| s.persisted));
+    put("actions_executed_rate", rate(|s| s.actions_executed));
+    put("actions_messages_rate", rate(|s| s.actions_messages));
+    put(
+        "validation_succeeded_rate",
+        rate(|s| s.validation_succeeded),
+    );
+    put("validation_failed_rate", rate(|s| s.validation_failed));
+    put(
+        "transformation_succeeded_rate",
+        rate(|s| s.transformation_succeeded),
+    );
+    put(
+        "transformation_failed_rate",
+        rate(|s| s.transformation_failed),
+    );
+    serde_json::Value::Object(body)
 }
 
 /// `GET /monitor_current/nodes/{node}`: node-scoped read of the same
@@ -100,7 +134,7 @@ fn current_snapshot_value(state: &ApiState) -> serde_json::Value {
 ///
 /// Single node, management-plane only: the named node is checked with the
 /// shared [`resolve_node`] helper against the configured [`ApiState::node_id`]
-/// (falling back to the [`LEGACY_NODE_NAME`] literal the v5 rows render
+/// (falling back to the [`local_node_name`] name the v5 rows render
 /// today); an unknown name returns the helper's 404 `NOT_FOUND` shape
 /// naming the node. A known name returns the same single-object shape as
 /// [`monitor_current`] (same numeric fields, same history carry-over),
@@ -111,7 +145,7 @@ pub async fn monitor_current_node(
     Path(node): Path<String>,
 ) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -119,7 +153,14 @@ pub async fn monitor_current_node(
             .expect_err("node already checked as unknown")
             .into_response();
     }
-    (StatusCode::OK, Json(current_snapshot_value(&state))).into_response()
+    let mut body = current_snapshot_value(&state);
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "node_uptime".to_string(),
+            serde_json::Value::from(crate::v5::nodes::uptime_ms() / 1000),
+        );
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Documented `GET /stats` snapshot: aggregated resource and session statistics.
@@ -138,7 +179,7 @@ pub async fn get_stats(State(state): State<ApiState>) -> Response {
     if let Some(map) = snapshot.as_object_mut() {
         map.insert(
             "node".to_string(),
-            serde_json::Value::from(LEGACY_NODE_NAME),
+            serde_json::Value::from(local_node_name()),
         );
     }
     (StatusCode::OK, Json(vec![snapshot])).into_response()
@@ -268,7 +309,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
 ///
 /// Single node, management-plane only: the named node is checked with the
 /// shared [`resolve_node`] helper against the configured [`ApiState::node_id`]
-/// (falling back to the [`LEGACY_NODE_NAME`] literal the v5 rows render
+/// (falling back to the [`local_node_name`] name the v5 rows render
 /// today); an unknown name returns the helper's 404 `NOT_FOUND` shape
 /// naming the node. A known name returns the single-object snapshot from
 /// [`stats_snapshot_value`] over the shared gauge-plus-high-water-mark
@@ -277,7 +318,7 @@ fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
 /// per-message path.
 pub async fn get_stats_node(State(state): State<ApiState>, Path(node): Path<String>) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -568,7 +609,7 @@ pub async fn get_metrics(State(state): State<ApiState>) -> Response {
 ///
 /// Single node, management-plane only: the named node is checked with the
 /// shared [`resolve_node`] helper against the configured [`ApiState::node_id`]
-/// (falling back to the [`LEGACY_NODE_NAME`] literal the v5 rows render
+/// (falling back to the [`local_node_name`] name the v5 rows render
 /// today); an unknown name returns the helper's 404 `NOT_FOUND` shape
 /// naming the node. A known name returns the same flat object of named
 /// numeric counters as [`get_metrics`] (same documented names, same
@@ -576,7 +617,7 @@ pub async fn get_metrics(State(state): State<ApiState>) -> Response {
 /// and no work on the per-message path.
 pub async fn get_metrics_node(State(state): State<ApiState>, Path(node): Path<String>) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -610,36 +651,56 @@ mod tests {
         (status, body)
     }
 
-    fn documented_fields() -> [&'static str; 18] {
+    fn documented_fields() -> [&'static str; 19] {
         [
-            "time_stamp",
             "connections",
             "live_connections",
             "topics",
             "subscriptions",
+            "cluster_sessions",
+            "retained_msg_count",
             "subscriptions_durable",
             "disconnected_durable_sessions",
-            "received",
-            "sent",
-            "dropped",
-            "persisted",
-            "validation_succeeded",
-            "validation_failed",
-            "transformation_succeeded",
-            "transformation_failed",
-            "rules_matched",
-            "actions_executed",
-            "actions_messages",
+            "received_msg_rate",
+            "sent_msg_rate",
+            "dropped_msg_rate",
+            "rules_matched_rate",
+            "persisted_rate",
+            "actions_executed_rate",
+            "actions_messages_rate",
+            "validation_succeeded_rate",
+            "validation_failed_rate",
+            "transformation_succeeded_rate",
+            "transformation_failed_rate",
         ]
+    }
+
+    fn point(time_stamp: u64) -> crate::v5::monitor::MonitorSample {
+        crate::v5::monitor::MonitorSample {
+            time_stamp,
+            connections: 0,
+            live_connections: 0,
+            topics: 0,
+            subscriptions: 0,
+            subscriptions_durable: 4,
+            disconnected_durable_sessions: 5,
+            received: 0,
+            sent: 0,
+            dropped: 0,
+            persisted: 0,
+            validation_succeeded: 0,
+            validation_failed: 0,
+            transformation_succeeded: 0,
+            transformation_failed: 0,
+            rules_matched: 0,
+            actions_executed: 0,
+            actions_messages: 0,
+        }
     }
 
     #[tokio::test]
     async fn current_snapshot_has_documented_numeric_fields() {
         let state = standalone_state();
-        state.metrics.inc_messages_received();
-        state.metrics.inc_messages_forwarded_by(2);
-        state.metrics.inc_messages_dropped();
-        state.metrics.inc_rules_executed();
         state.metrics.set_active_connections(1);
 
         let (status, body) = snapshot_body(monitor_current(State(state)).await).await;
@@ -655,124 +716,66 @@ mod tests {
                 "field {field} must be numeric, got: {body}"
             );
         }
-        assert!(body["time_stamp"].as_u64().expect("time stamp") > 0);
-        assert_eq!(body["received"], serde_json::json!(1));
-        assert_eq!(body["sent"], serde_json::json!(2));
-        assert_eq!(body["dropped"], serde_json::json!(1));
-        assert_eq!(body["rules_matched"], serde_json::json!(1));
+        assert_eq!(body["connections"], serde_json::json!(1));
+        // The cumulative counters are not part of the documented shape.
+        for field in ["received", "sent", "dropped", "time_stamp"] {
+            assert!(body.get(field).is_none(), "unexpected field {field}");
+        }
     }
 
     #[tokio::test]
-    async fn current_snapshot_counters_are_non_decreasing() {
+    async fn rates_are_zero_before_two_points_exist() {
         let state = standalone_state();
-
-        let (_, first) = snapshot_body(monitor_current(State(state.clone())).await).await;
         state.metrics.inc_messages_received();
-        state.metrics.inc_messages_forwarded_by(3);
-        state.metrics.inc_rules_executed_by(2);
-        let (_, second) = snapshot_body(monitor_current(State(state.clone())).await).await;
-
-        for field in documented_fields() {
-            assert!(second.get(field).is_some(), "missing field {field}");
-            assert!(second[field].is_u64(), "field {field} must stay numeric");
-        }
-        for field in [
-            "received",
-            "sent",
-            "dropped",
-            "rules_matched",
-            "connections",
-            "live_connections",
-            "topics",
-            "subscriptions",
-        ] {
-            let before = first[field].as_u64().expect("first numeric");
-            let after = second[field].as_u64().expect("second numeric");
-            assert!(
-                after >= before,
-                "field {field} must not move backwards: {before} -> {after}"
-            );
-        }
-        assert!(second["received"].as_u64().expect("received") >= 1);
-        assert!(second["sent"].as_u64().expect("sent") >= 3);
-        assert!(second["rules_matched"].as_u64().expect("rules") >= 2);
-        assert!(
-            second["time_stamp"].as_u64().expect("stamp")
-                >= first["time_stamp"].as_u64().expect("first stamp")
-        );
+        let (_, empty) = snapshot_body(monitor_current(State(state.clone())).await).await;
+        assert_eq!(empty["received_msg_rate"], serde_json::json!(0));
+        state.monitor.record(point(1_700_000_100));
+        let (_, one) = snapshot_body(monitor_current(State(state)).await).await;
+        assert_eq!(one["received_msg_rate"], serde_json::json!(0));
     }
 
     #[tokio::test]
-    async fn current_snapshot_carries_newest_history_point() {
+    async fn rates_follow_the_newest_sampling_window() {
         let state = standalone_state();
-        let prev = crate::v5::monitor::MonitorSample {
-            time_stamp: 1_700_000_100,
-            connections: 0,
-            live_connections: 0,
-            topics: 0,
-            subscriptions: 0,
-            subscriptions_durable: 4,
-            disconnected_durable_sessions: 5,
-            received: 0,
-            sent: 0,
-            dropped: 0,
-            persisted: 6,
-            validation_succeeded: 7,
-            validation_failed: 8,
-            transformation_succeeded: 9,
-            transformation_failed: 10,
-            rules_matched: 0,
-            actions_executed: 11,
-            actions_messages: 12,
-        };
-        state.monitor.record(prev);
-        state.metrics.inc_messages_received();
+        let mut older = point(1_700_000_100);
+        older.received = 100;
+        older.sent = 200;
+        older.dropped = 5;
+        older.rules_matched = 10;
+        let mut newer = point(1_700_000_110);
+        newer.received = 600;
+        newer.sent = 1200;
+        newer.dropped = 5;
+        newer.rules_matched = 40;
+        newer.persisted = 20;
+        state.monitor.record(older);
+        state.monitor.record(newer);
 
         let (status, body) = snapshot_body(monitor_current(State(state)).await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["received"], serde_json::json!(1));
+        // 500 messages in 10 seconds.
+        assert_eq!(body["received_msg_rate"], serde_json::json!(50));
+        assert_eq!(body["sent_msg_rate"], serde_json::json!(100));
+        assert_eq!(body["dropped_msg_rate"], serde_json::json!(0));
+        assert_eq!(body["rules_matched_rate"], serde_json::json!(3));
+        assert_eq!(body["persisted_rate"], serde_json::json!(2));
+        // Gauges with no kernel tracking carry over from the newest point.
         assert_eq!(body["subscriptions_durable"], serde_json::json!(4));
         assert_eq!(body["disconnected_durable_sessions"], serde_json::json!(5));
-        assert_eq!(body["persisted"], serde_json::json!(6));
-        assert_eq!(body["validation_succeeded"], serde_json::json!(7));
-        assert_eq!(body["validation_failed"], serde_json::json!(8));
-        assert_eq!(body["transformation_succeeded"], serde_json::json!(9));
-        assert_eq!(body["transformation_failed"], serde_json::json!(10));
-        assert_eq!(body["actions_executed"], serde_json::json!(11));
-        assert_eq!(body["actions_messages"], serde_json::json!(12));
     }
 
     #[tokio::test]
     async fn node_snapshot_returns_same_shape_as_global() {
         let state = standalone_state();
-        state.metrics.inc_messages_received();
-        state.metrics.inc_messages_forwarded_by(2);
-        state.metrics.inc_messages_dropped();
-        state.metrics.inc_rules_executed();
         state.metrics.set_active_connections(1);
-        let prev = crate::v5::monitor::MonitorSample {
-            time_stamp: 1_700_000_100,
-            connections: 0,
-            live_connections: 0,
-            topics: 0,
-            subscriptions: 0,
-            subscriptions_durable: 4,
-            disconnected_durable_sessions: 5,
-            received: 0,
-            sent: 0,
-            dropped: 0,
-            persisted: 6,
-            validation_succeeded: 7,
-            validation_failed: 8,
-            transformation_succeeded: 9,
-            transformation_failed: 10,
-            rules_matched: 0,
-            actions_executed: 11,
-            actions_messages: 12,
-        };
-        state.monitor.record(prev);
+        let mut older = point(1_700_000_100);
+        older.received = 10;
+        let mut newer = point(1_700_000_102);
+        newer.received = 30;
+        state.monitor.record(older);
+        state.monitor.record(newer);
         let (_, global) = snapshot_body(monitor_current(State(state.clone())).await).await;
-        for known in [LEGACY_NODE_NAME, "indra-node-1"] {
+        for known in [local_node_name(), "indra-node-1"] {
             let response =
                 monitor_current_node(State(state.clone()), Path(known.to_string())).await;
             let (status, body) = snapshot_body(response).await;
@@ -788,13 +791,11 @@ mod tests {
                     "field {field} must be numeric, got: {body}"
                 );
             }
-            // Same live counters and history carry-over as the global read.
-            assert_eq!(body["received"], global["received"]);
-            assert_eq!(body["sent"], global["sent"]);
-            assert_eq!(body["dropped"], global["dropped"]);
-            assert_eq!(body["rules_matched"], global["rules_matched"]);
-            assert_eq!(body["subscriptions_durable"], serde_json::json!(4));
-            assert_eq!(body["actions_messages"], serde_json::json!(12));
+            assert!(body["node_uptime"].is_u64(), "node route adds node_uptime");
+            assert_eq!(body["received_msg_rate"], serde_json::json!(10));
+            for field in documented_fields() {
+                assert_eq!(body[field], global[field], "field {field}");
+            }
         }
     }
 
@@ -854,7 +855,7 @@ mod tests {
         state.metrics.inc_messages_dropped();
         let (_, global) = snapshot_body(get_metrics(State(state.clone())).await).await;
         let global_map = global.as_object().expect("global metrics is a flat object");
-        for known in [LEGACY_NODE_NAME, "indra-node-1"] {
+        for known in [local_node_name(), "indra-node-1"] {
             let response = get_metrics_node(State(state.clone()), Path(known.to_string())).await;
             let (status, body) = snapshot_body(response).await;
             assert_eq!(status, StatusCode::OK, "known node {known}");
@@ -927,7 +928,7 @@ mod tests {
         state.stats.set_subscriptions(7);
         state.stats.set_topics(2);
         state.stats.set_retained(1);
-        for known in [LEGACY_NODE_NAME, "indra-node-1"] {
+        for known in [local_node_name(), "indra-node-1"] {
             let response = get_stats_node(State(state.clone()), Path(known.to_string())).await;
             let (status, body) = snapshot_body(response).await;
             assert_eq!(status, StatusCode::OK, "known node {known}");
@@ -1032,7 +1033,7 @@ mod tests {
         let rows = body.as_array().expect("global stats is an array");
         assert_eq!(rows.len(), 1, "aggregated snapshot has one row: {body}");
         let row = &rows[0];
-        assert_eq!(row["node"], serde_json::json!(LEGACY_NODE_NAME));
+        assert_eq!(row["node"], serde_json::json!(local_node_name()));
         for name in documented_stat_names() {
             let value = row
                 .get(name)
@@ -1077,7 +1078,7 @@ mod tests {
         let (_, global) = snapshot_body(get_stats(State(state.clone())).await).await;
         let row = &global.as_array().expect("global stats is an array")[0];
         let (_, node) =
-            snapshot_body(get_stats_node(State(state), Path(LEGACY_NODE_NAME.to_string())).await)
+            snapshot_body(get_stats_node(State(state), Path(local_node_name().to_string())).await)
                 .await;
         for name in documented_stat_names() {
             assert_eq!(&row[name], &node[name], "{name} matches the node read");

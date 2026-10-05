@@ -29,8 +29,8 @@
 //!   `BAD_REQUEST` instead of growing without limit);
 //! - `id` is capped at [`MAX_SOURCE_ID_LEN`] chars (256: bounds map-key
 //!   memory per entry; longer ids are rejected with `BAD_REQUEST`);
-//! - list paging reuses the shared extractor (default limit 100, max
-//!   1000); the default store is empty;
+//! - the list is not paged, as the reference API documents; the default
+//!   store is empty;
 //! - every entry is three small fields (`id`, `type`, `enable`), so
 //!   per-entry memory is constant and a list/summary snapshot clones at
 //!   most the capped list once per request under a short lock.
@@ -65,13 +65,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::errors::ApiError;
 use crate::node_scope::resolve_node;
-use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
-/// Single-node name rendered by `v5::nodes::list_nodes`. Accepted alongside
-/// [`ApiState::node_id`] until every caller migrates to the configured id
-/// (see `node_scope` docs); both name the same local node.
-const LEGACY_NODE_NAME: &str = "indramqtt@127.0.0.1";
+use crate::node_scope::local_node_name;
 
 /// Upper bound for stored sources. Creates past this size are rejected
 /// with `BAD_REQUEST` instead of growing the map without limit. Reason:
@@ -380,12 +376,11 @@ fn source_persist_error(error: broker_config::ConfigError) -> Response {
         .into_response()
 }
 
-/// `GET /api/v5/sources`: paged list over the real store with the
-/// standard page envelope (`data` plus `meta {page, limit, count,
-/// hasnext}`); an empty store returns an empty page, not an error.
-/// Unknown query parameters are ignored (only `page`/`limit` are
-/// extracted). Management-plane only; publish and deliver never touch
-/// this store.
+/// `GET /api/v5/sources`: every source as a bare JSON array, as the
+/// reference API and the management console expect. An empty store reads
+/// as `[]`, never an error. The reference API documents no paging, so the
+/// route takes none. Unknown query parameters are ignored.
+/// Management-plane only; publish and deliver never touch this store.
 ///
 /// Store wiring (rulebook section 2): the backing store is
 /// [`SourceStore`], shared with the kernel (`crates/broker-node/src/main.rs`,
@@ -396,8 +391,7 @@ fn source_persist_error(error: broker_config::ConfigError) -> Response {
 ///
 /// Store bounds (stated here and enforced by construction): at most
 /// [`MAX_SOURCES`] entries (512: caps management-plane memory; creates
-/// past the cap are rejected); list paging reuses the shared extractor
-/// (default limit 100, max 1000); one bounded snapshot clone per request.
+/// past the cap are rejected); one bounded snapshot clone per request.
 ///
 /// Fire-path cost: none. The list is never consulted per message; the
 /// publish path keeps paying nothing for sources (no consult, no lock,
@@ -406,19 +400,10 @@ fn source_persist_error(error: broker_config::ConfigError) -> Response {
 // require beyond `id`/`type`/`enable` (status, node rows, ...)? The
 // rulebook does not decide the exact shape; fields the broker cannot
 // supply are omitted rather than invented, until the checker pins it.
-pub async fn list_sources(State(state): State<ApiState>, params: PageParams) -> Response {
+pub async fn list_sources(State(state): State<ApiState>) -> Response {
     let entries = state.sources.snapshot();
     let rows: Vec<serde_json::Value> = entries.iter().map(SourceEntry::to_json).collect();
-    let count = rows.len();
-    let page_rows = paginate(&rows, params.page, params.limit);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": page_rows,
-            "meta": meta_page(params.page, params.limit, count),
-        })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(rows)).into_response()
 }
 
 /// `POST /api/v5/sources`: register one source after validating the
@@ -734,7 +719,7 @@ fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Respon
 ///
 /// Single-node execution only: the `{node}` segment is checked with the
 /// shared [`resolve_node`] helper against the configured
-/// [`ApiState::node_id`] (falling back to the [`LEGACY_NODE_NAME`] literal
+/// [`ApiState::node_id`] (falling back to the [`local_node_name`] name
 /// the v5 rows render today); an unknown name returns the helper's 404
 /// `NOT_FOUND` shape naming the node and touches no other state. A known
 /// node dispatches to the same [`apply_source_operation`] path as the
@@ -771,7 +756,7 @@ pub async fn run_node_source_operation(
     Path((node, id, operation)): Path<(String, String, String)>,
 ) -> Response {
     if resolve_node(&state.node_id, &node).is_err()
-        && resolve_node(LEGACY_NODE_NAME, &node).is_err()
+        && resolve_node(local_node_name(), &node).is_err()
     {
         // Reuse the helper's error so the unknown-node shape stays exactly
         // the documented `{code: NOT_FOUND, message}` body.
@@ -941,21 +926,30 @@ pub async fn reset_source_metrics(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `GET /api/v5/sources_summary` (C07-22): aggregated counts over the
-/// real source store computed on demand from the live snapshot, never
-/// constants; an empty store returns zeroes, not an error. Not paged
-/// and not per-id, so there is no 404 path; unknown query parameters
-/// are ignored (no query is extracted). Management-plane only: one
-/// bounded snapshot clone per request, and publish and deliver never
-/// touch this store.
+/// `GET /api/v5/sources_summary` (C07-22): a bare JSON array with one
+/// summary row per source, as the reference API documents.
+///
+/// Each row carries `name`, `type` and `enable`, read from the live store.
+/// The broker keeps no health state, no creation time and no rule links
+/// for a source, so the rows leave out `status`, `created_at`,
+/// `last_modified_at` and `rules` instead of inventing values. An empty
+/// store reads as `[]`. The query parameters `ns` and `only_global` are
+/// ignored. Management-plane only: one bounded snapshot clone per
+/// request, and publish and deliver never touch this store.
 pub async fn get_sources_summary(State(state): State<ApiState>) -> Response {
-    let (total, enabled, disabled) = state.sources.summary_counts();
-    Json(serde_json::json!({
-        "total": total,
-        "enabled": enabled,
-        "disabled": disabled,
-    }))
-    .into_response()
+    let rows: Vec<serde_json::Value> = state
+        .sources
+        .snapshot()
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "name": entry.id,
+                "type": entry.source_type,
+                "enable": entry.enable,
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(rows)).into_response()
 }
 
 #[cfg(test)]

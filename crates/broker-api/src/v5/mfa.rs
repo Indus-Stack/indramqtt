@@ -355,7 +355,7 @@ pub async fn enrol(
     match state.admin_users.mfa_admin_enrol(&username) {
         Ok(_) => {}
         Err(AdminUserError::NotFound) => {
-            return ApiError::NotFound(format!("user {username:?} not found")).into_response();
+            return ApiError::UserNotFound(format!("user {username:?} not found")).into_response();
         }
         Err(AdminUserError::AlreadyExists) => {
             return already_exists(format!("user {username:?} already has MFA enrolled"));
@@ -394,10 +394,11 @@ fn check_enrol_body(body: &[u8]) -> Result<(), String> {
 /// dashboard user (C05-30).
 ///
 /// Clears the secret, the enabled flag and the last verified counter so
-/// re-enabling later requires a fresh enrolment. Unknown users, and
-/// known users with no enrolment, fail with 404 in the documented
-/// `{code, message}` shape and change nothing. On success answers 204
-/// with no body. The route is not paged. Codes and secrets are never
+/// re-enabling later requires a fresh enrolment. Unknown users fail with
+/// 404 `USER_NOT_FOUND` in the documented `{code, message}` shape and
+/// change nothing. A known user with no enrolment has MFA off already:
+/// the call changes nothing and answers 204. On success answers 204 with
+/// no body. The route is not paged. Codes and secrets are never
 /// logged.
 /// Management-plane only: one short user-map write lock per call (plus
 /// the registry save lock on persist); publish and deliver never touch
@@ -406,7 +407,13 @@ pub async fn disable(State(state): State<ApiState>, Path(username): Path<String>
     match state.admin_users.mfa_disable(&username) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(AdminUserError::NotFound) => {
-            ApiError::NotFound(format!("user {username:?} has no MFA enrolment")).into_response()
+            // The store answers `NotFound` for an unknown user and for a
+            // user with no enrolment. The second case has MFA off already.
+            if state.admin_users.get(&username).is_some() {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                ApiError::UserNotFound(format!("user {username:?} not found")).into_response()
+            }
         }
         Err(error @ AdminUserError::Persist(_)) => internal_error(error.to_string()),
         Err(error) => ApiError::BadRequest(error.to_string()).into_response(),
@@ -914,12 +921,12 @@ mod mfa_handler_tests {
         assert!(raw.is_empty(), "delete answers 204 with no body");
         assert_eq!(gone, serde_json::Value::Null);
 
-        // Deleting again is a miss with the documented shape.
-        let (status, err, _) =
+        // Deleting again changes nothing: MFA is off, so the answer is 204.
+        let (status, again, raw) =
             parts(disable(State(state.clone()), Path("w244-alice".to_string())).await).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
-        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "repeat delete answers 204 with no body");
+        assert_eq!(again, serde_json::Value::Null);
 
         // Unknown users are 404 with the documented shape on both routes.
         let (status, err, _) = parts(
@@ -932,12 +939,12 @@ mod mfa_handler_tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        assert_eq!(err["code"], serde_json::json!("USER_NOT_FOUND"));
         assert_eq!(err.as_object().expect("error is an object").len(), 2);
         let (status, err, _) =
             parts(disable(State(state.clone()), Path("w244-ghost".to_string())).await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
+        assert_eq!(err["code"], serde_json::json!("USER_NOT_FOUND"));
         assert_eq!(err.as_object().expect("error is an object").len(), 2);
     }
 
