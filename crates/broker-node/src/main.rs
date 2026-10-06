@@ -2131,24 +2131,42 @@ const MAX_CERT_FIELD_LEN: usize = 1024;
 /// bind-time allocation while covering multi-SAN certificates.
 const MAX_CERT_SANS: usize = 16;
 
+/// Bind flag for a credentials section in the bind tail.
+/// Reason: the bit removes the peer-as-username ambiguity.
+const BIND_FLAG_CREDS: u8 = 0x08;
+
+/// Bind flag for a peer-address section in the bind tail.
+/// Reason: the bit tells the peer section from credentials bytes.
+const BIND_FLAG_PEER: u8 = 0x10;
+
+/// Bind flag for a certificate section in the bind tail.
+/// Reason: the bit tells the certificate section from other bytes.
+const BIND_FLAG_CERT: u8 = 0x20;
+
 /// Decode `BindConnection` metadata.
 ///
 /// Layout: `ClientIdLen:16be | ClientId | Flags:8 | Keepalive:16be`,
 /// optionally followed by an F1-01 will section (present iff Flags bit 1
 /// is set) `WillQos:8 | WillRetain:8 | TopicLen:16be | Topic |
 /// PayloadLen:32be | Payload`, optionally followed by a credentials
-/// section `UserLen:16be | Username | PassLen:16be | Password` (absent
-/// entirely when the client connects anonymously), optionally followed by
-/// a peer-address section `PeerLen:16be | PeerIp` carrying the client IP
+/// section `UserLen:16be | Username | PassLen:16be | Password` (present
+/// iff Flags bit 3 is set; absent entirely when the client connects
+/// anonymously), followed by a peer-address section `PeerLen:16be |
+/// PeerIp` (present iff Flags bit 4 is set) carrying the client IP
 /// literal the edge saw on its socket (B1-03: drives `peerhost` /
-/// `peerhost_net` bans), optionally followed by a certificate section
+/// `peerhost_net` bans), followed by a certificate section
 /// `CertLen:16be | CnLen:16be | Cn | SubjectLen:16be | Subject |
-/// SanCount:16be | (SanLen:16be | San)*` carrying the TLS
-/// client-certificate fields the edge extracted where TLS terminates
-/// (MT-01: expression inputs for tenant assignment), optionally followed
-/// by a B4-05 alias section `ClientAliasMax:16be` carrying the client's
-/// receive limit (the kernel outbound bound; 0 or absent means the kernel
-/// never assigns an alias toward the client).
+/// SanCount:16be | (SanLen:16be | San)*` (present iff Flags bit 5 is
+/// set) carrying the TLS client-certificate fields the edge extracted
+/// where TLS terminates (MT-01: expression inputs for tenant
+/// assignment), optionally followed by a B4-05 alias section
+/// `ClientAliasMax:16be` carrying the client's receive limit (the
+/// kernel outbound bound; 0 or absent means the kernel never assigns
+/// an alias toward the client).
+/// Parse rule: flags decide. A set flag means the section is present.
+/// A clear flag means the section is absent. Binds without the new
+/// flags use the old position parse. Both decoders use this rule.
+/// A short section fails closed with a truncation error.
 /// Binds encoded before the peer/alias/will/cert sections existed carry
 /// no trailing bytes and still decode with `peerhost` unset, alias
 /// maximum 0, no will and no certificate. The keepalive is
@@ -2254,6 +2272,13 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     } else {
         None
     };
+    // TM-07: flags decide. A set section flag means the section is
+    // present. A clear flag means it is absent. Flagged binds parse
+    // by flags, so peer bytes never become a username. Binds without
+    // the flags keep the old position parse below.
+    if flags & (BIND_FLAG_CREDS | BIND_FLAG_PEER | BIND_FLAG_CERT) != 0 {
+        return decode_flagged_bind(client_id, flags, keepalive_secs, will, rest);
+    }
     // X1-01: Flags bit 2 marks a trailing v5 section
     // `AliasMax:16be | V5Payload | V5Len:16be'. The section is stripped
     // from the end first; the remainder (ending in the alias maximum)
@@ -2352,6 +2377,163 @@ fn decode_legacy_tail(rest: &[u8]) -> Result<(BindIdentity, u16), &'static str> 
         }
     }
     Err("bind meta length mismatch")
+}
+
+/// Decode a flagged bind tail. Flags decide each section.
+/// A short section fails closed with a truncation error.
+fn decode_flagged_bind(
+    client_id: &str,
+    flags: u8,
+    keepalive_secs: u16,
+    will: Option<BindWill>,
+    rest: &[u8],
+) -> Result<BindRequest, &'static str> {
+    // X1-01: strip the v5 section first when bit 2 is set.
+    // The remainder keeps the alias maximum for the tail decoder.
+    let (tail, v5) = if flags & 0x04 != 0 {
+        let (legacy_rest, parsed) = decode_bind_v5_section(rest)?;
+        (legacy_rest, Some(parsed))
+    } else {
+        (rest, None)
+    };
+    let (identity, client_alias_max) = decode_flagged_tail(tail, flags)?;
+    let (protocol_version, session_expiry, receive_maximum, max_packet_size, user_properties) =
+        match v5 {
+            Some(parsed) => (
+                parsed.version,
+                parsed.session_expiry,
+                parsed.receive_maximum,
+                parsed.max_packet_size,
+                Some(parsed.user_properties),
+            ),
+            None => (4, 0, u16::MAX, 0, None),
+        };
+    Ok(BindRequest {
+        client_id: client_id.to_string(),
+        clean_start: flags & 0x01 != 0,
+        keepalive_secs,
+        username: identity.username,
+        password: identity.password,
+        peerhost: identity.peerhost,
+        client_alias_max,
+        will,
+        cert_cn: identity.cert_cn,
+        cert_subject: identity.cert_subject,
+        cert_sans: identity.cert_sans,
+        protocol_version,
+        session_expiry,
+        receive_maximum,
+        max_packet_size,
+        user_properties,
+    })
+}
+
+/// Decode the flagged tail allowing the trailing alias section.
+/// Exact flagged parse first (no alias), else the last two bytes
+/// carry the alias maximum over a flagged prefix. Fail closed.
+fn decode_flagged_tail(rest: &[u8], flags: u8) -> Result<(BindIdentity, u16), &'static str> {
+    if let Ok(identity) = decode_flagged_identity(rest, flags) {
+        return Ok((identity, 0));
+    }
+    if rest.len() >= 2 {
+        let (prefix, suffix) = rest.split_at(rest.len() - 2);
+        if let Ok(identity) = decode_flagged_identity(prefix, flags) {
+            let client_alias_max =
+                protocol_v5::decode_alias_maximum(suffix).unwrap_or(protocol_v5::NO_TOPIC_ALIAS);
+            return Ok((identity, client_alias_max));
+        }
+    }
+    Err("bind meta length mismatch")
+}
+
+/// Decode flagged credentials, peer and certificate sections.
+/// A set flag needs its section. A clear flag needs no bytes.
+/// A short section fails with a truncation error.
+fn decode_flagged_identity(rest: &[u8], flags: u8) -> Result<BindIdentity, &'static str> {
+    let mut cursor = rest;
+    let (username, password) = if flags & BIND_FLAG_CREDS != 0 {
+        let (user, pass, tail) = take_flagged_creds(cursor)?;
+        cursor = tail;
+        (Some(user), Some(pass))
+    } else {
+        (None, None)
+    };
+    let peerhost = if flags & BIND_FLAG_PEER != 0 {
+        let (peer, tail) = take_flagged_peer(cursor)?;
+        cursor = tail;
+        Some(peer)
+    } else {
+        None
+    };
+    let (cert_cn, cert_subject, cert_sans) = if flags & BIND_FLAG_CERT != 0 {
+        let (cn, subject, sans, tail) = take_flagged_cert(cursor)?;
+        cursor = tail;
+        (cn, subject, sans)
+    } else {
+        (None, None, Vec::new())
+    };
+    if !cursor.is_empty() {
+        return Err("bind meta length mismatch");
+    }
+    Ok(BindIdentity {
+        username,
+        password,
+        peerhost,
+        cert_cn,
+        cert_subject,
+        cert_sans,
+    })
+}
+
+/// Take one flagged credentials section off the front.
+/// Empty password fails. Short input fails as truncated.
+fn take_flagged_creds(cursor: &[u8]) -> Result<(String, Vec<u8>, &[u8]), &'static str> {
+    if cursor.len() < 2 {
+        return Err("bind credentials truncated");
+    }
+    let user_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if cursor.len() < 2 + user_len + 2 {
+        return Err("bind credentials truncated");
+    }
+    let username =
+        std::str::from_utf8(&cursor[2..2 + user_len]).map_err(|_| "username not UTF-8")?;
+    let base = 2 + user_len;
+    let pass_len = u16::from_be_bytes([cursor[base], cursor[base + 1]]) as usize;
+    if pass_len == 0 || cursor.len() < base + 2 + pass_len {
+        return Err("bind credentials truncated");
+    }
+    let password = cursor[base + 2..base + 2 + pass_len].to_vec();
+    Ok((
+        username.to_string(),
+        password,
+        &cursor[base + 2 + pass_len..],
+    ))
+}
+
+/// Take one flagged peer section off the front.
+/// Only IP literals pass. Short input fails as truncated.
+fn take_flagged_peer(cursor: &[u8]) -> Result<(String, &[u8]), &'static str> {
+    let (peer, tail) = split_peer_prefix(cursor).ok_or("bind peer truncated")?;
+    Ok((peer, tail))
+}
+
+/// Decoded flagged certificate section plus the rest.
+type FlaggedCert<'a> = (Option<String>, Option<String>, Vec<String>, &'a [u8]);
+
+/// Take one flagged certificate section off the front.
+/// Short input fails as truncated.
+fn take_flagged_cert(cursor: &[u8]) -> Result<FlaggedCert<'_>, &'static str> {
+    if cursor.len() < 2 {
+        return Err("bind certificate truncated");
+    }
+    let cert_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if cursor.len() < 2 + cert_len {
+        return Err("bind certificate truncated");
+    }
+    let section = &cursor[..2 + cert_len];
+    let tail = &cursor[2 + cert_len..];
+    let (cn, subject, sans) = decode_cert_section(section).ok_or("bind certificate truncated")?;
+    Ok((cn, subject, sans, tail))
 }
 
 /// Decoded X1-01 v5 section: the negotiated version plus the CONNECT
@@ -2583,17 +2765,13 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
     if rest.len() < base + 2 + pass_len {
         return Err("bind credentials truncated");
     }
-    // Wire ambiguity (documented, not parsed around): an anonymous bind
-    // carrying peer plus certificate sections is byte-identical to
-    // credentials whose username is the peer literal and whose password
-    // is the certificate payload, and credentials win this parse. The
-    // edge sends no certificate section today, so no producer hits the
-    // ambiguous shape; certificate-only and credentialed
-    // credentials-plus-peer-plus-certificate binds decode correctly.
-    // TODO(parity): which side should win once the edge forwards
-    // certificates on anonymous binds? The rulebook does not decide the
-    // wire precedence; current choice keeps every bind the edge sends
-    // today decoding exactly as before.
+    // Parse rule: flags decide. Flagged binds never reach this
+    // legacy path, so peer bytes never become a username there.
+    // This legacy path keeps the old position parse for binds
+    // without the flags. Credentials win here, exactly as before.
+    // An anonymous bind carrying peer plus certificate sections is
+    // byte-identical to credentials whose username is the peer
+    // literal and whose password is the certificate payload.
     // B4-05 alias collision: an anonymous peer section plus the trailing
     // `ClientAliasMax:16be' of 0 is byte-identical to credentials with the
     // peer literal as username and an empty password (`PeerLen|Peer|0x0000'
@@ -10180,6 +10358,23 @@ mod tests {
         meta.extend_from_slice(username.as_bytes());
         meta.extend_from_slice(&(password.len() as u16).to_be_bytes());
         meta.extend_from_slice(password);
+        Bytes::from(meta)
+    }
+
+    /// Set section flags on an encoded bind (test mirror of the edge
+    /// flag patch). Bytes stay the same except the flag bits.
+    fn mark_bind_sections_flagged(mut meta: Vec<u8>, creds: bool, peer: bool, cert: bool) -> Bytes {
+        let id_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+        let flag_pos = 2 + id_len;
+        if creds {
+            meta[flag_pos] |= super::BIND_FLAG_CREDS;
+        }
+        if peer {
+            meta[flag_pos] |= super::BIND_FLAG_PEER;
+        }
+        if cert {
+            meta[flag_pos] |= super::BIND_FLAG_CERT;
+        }
         Bytes::from(meta)
     }
 
@@ -18331,6 +18526,199 @@ mod tests {
         let mut truncated = encode_bind_meta("dev-bad", true, 60).to_vec();
         truncated.extend_from_slice(&[0, 10, 0, 3, b'a', b'b']);
         assert!(decode_bind_meta(&Bytes::from(truncated)).is_err());
+    }
+
+    #[test]
+    fn bind_meta_explicit_sections_crosslang() {
+        // Same bytes as the edge cross-language test.
+        // Flags decide the parse. A short section fails closed.
+        let anon: &[u8] = &[0, 6, b't', b'm', b'0', b'7', b'-', b'a', 1, 0, 60];
+        let req = decode_bind_meta(anon).expect("anonymous decodes");
+        assert_eq!(req.client_id, "tm07-a");
+        assert!(req.username.is_none());
+        assert!(req.peerhost.is_none());
+        assert!(req.cert_cn.is_none());
+        // Credentialed bind with flags (clean plus creds = 9).
+        let creds: &[u8] = &[
+            0, 6, b't', b'm', b'0', b'7', b'-', b'b', 9, 0, 60, 0, 5, b'a', b'l', b'i', b'c', b'e',
+            0, 2, b'p', b'w',
+        ];
+        let req = decode_bind_meta(creds).expect("credentialed decodes");
+        assert_eq!(req.client_id, "tm07-b");
+        assert_eq!(req.username.as_deref(), Some("alice"));
+        assert_eq!(req.password, Some(b"pw".to_vec()));
+        assert!(req.peerhost.is_none());
+        // Same bytes without flags decode to the same fields.
+        let mut legacy = creds.to_vec();
+        legacy[8] = 1;
+        let old = decode_bind_meta(&legacy).expect("legacy credentialed decodes");
+        assert_eq!(old.username, req.username);
+        assert_eq!(old.password, req.password);
+        // Peer bind with flags (peer only = 16, clean is false).
+        let peer: &[u8] = &[
+            0, 6, b't', b'm', b'0', b'7', b'-', b'c', 16, 0, 30, 0, 9, b'1', b'2', b'7', b'.',
+            b'0', b'.', b'0', b'.', b'1',
+        ];
+        let req = decode_bind_meta(peer).expect("peer decodes");
+        assert_eq!(req.client_id, "tm07-c");
+        assert!(req.username.is_none());
+        assert_eq!(req.peerhost.as_deref(), Some("127.0.0.1"));
+        // Same peer bytes without flags decode to the same peer.
+        let mut legacy_peer = peer.to_vec();
+        legacy_peer[8] = 0;
+        let old = decode_bind_meta(&legacy_peer).expect("legacy peer decodes");
+        assert_eq!(old.peerhost, req.peerhost);
+        // Certificate bind with flags (clean plus all sections = 57).
+        let cert: &[u8] = &[
+            0, 6, b't', b'm', b'0', b'7', b'-', b'd', 57, 0, 60, 0, 3, b'b', b'o', b'b', 0, 6,
+            b's', b'e', b'c', b'r', b'e', b't', 0, 10, b'1', b'9', b'2', b'.', b'0', b'.', b'2',
+            b'.', b'1', b'0', 0, 9, 0, 3, b'c', b'n', b'1', 0, 0, 0, 0,
+        ];
+        let req = decode_bind_meta(cert).expect("certificate decodes");
+        assert_eq!(req.client_id, "tm07-d");
+        assert_eq!(req.username.as_deref(), Some("bob"));
+        assert_eq!(req.peerhost.as_deref(), Some("192.0.2.10"));
+        assert_eq!(req.cert_cn.as_deref(), Some("cn1"));
+        // Same certificate bytes without flags decode to the same fields.
+        let mut legacy_cert = cert.to_vec();
+        legacy_cert[8] = 1;
+        let old = decode_bind_meta(&legacy_cert).expect("legacy certificate decodes");
+        assert_eq!(old.username, req.username);
+        assert_eq!(old.peerhost, req.peerhost);
+        assert_eq!(old.cert_cn, req.cert_cn);
+        // The flagged encoder mirror sets the same flag bits.
+        let mirrored = mark_bind_sections_flagged(
+            encode_bind_meta_creds("tm07-b", true, 60, "alice", b"pw").to_vec(),
+            true,
+            false,
+            false,
+        );
+        assert_eq!(&mirrored[..], creds);
+        // A short section fails with the documented error.
+        let mut short = creds.to_vec();
+        short.pop();
+        assert!(decode_bind_meta(&short).is_err());
+        let mut short_cert = cert.to_vec();
+        short_cert.pop();
+        assert!(decode_bind_meta(&short_cert).is_err());
+    }
+
+    /// Build one flagged bind (test mirror of the edge flag patch).
+    /// Sets the section bits on the same bytes the edge sends.
+    fn encode_bind_meta_flagged(base: Bytes, creds: bool, peer: bool, cert: bool) -> Bytes {
+        mark_bind_sections_flagged(base.to_vec(), creds, peer, cert)
+    }
+
+    #[tokio::test]
+    async fn tm07_flagged_two_tenants_isolated_through_broker() {
+        // Two tenants connect with flagged binds through `apply_bind`
+        // (the production entry the edge drives at connect). Each
+        // tenant publishes a random value. Delivery stays in-tenant.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${clientid}")])
+            .expect("tenant rules store");
+        for (tenant, user, pw) in [
+            ("t-tm07-a", "alice", b"pw-a".as_slice()),
+            ("t-tm07-b", "bob", b"pw-b".as_slice()),
+        ] {
+            shared
+                .auth
+                .add_user_in_tenant(tenant, user, pw)
+                .expect("tenant user stores");
+            for action in [AclAction::Publish, AclAction::Subscribe] {
+                shared
+                    .auth
+                    .add_rule_in_tenant(tenant, AclRule::new("*", action, "tm07/#", true))
+                    .expect("tenant rule stores");
+            }
+        }
+        // Flagged credentialed binds with a peer section (bits set).
+        let base_a = encode_bind_meta_peer(
+            encode_bind_meta_creds("tm07-a", true, 60, "alice", b"pw-a"),
+            "127.0.0.1",
+        );
+        let meta_a = encode_bind_meta_flagged(base_a, true, true, false);
+        let base_b = encode_bind_meta_peer(
+            encode_bind_meta_creds("tm07-b", true, 60, "bob", b"pw-b"),
+            "127.0.0.1",
+        );
+        let meta_b = encode_bind_meta_flagged(base_b, true, true, false);
+        for (conn, meta) in [(401u64, meta_a), (402u64, meta_b)] {
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        for (conn, client) in [(401u64, "tm07-a"), (402u64, "tm07-b")] {
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("tm07/data", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+        }
+        // Random value the broker cannot know (nanos plus process id).
+        let secret = format!(
+            "tm07-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            std::process::id()
+        );
+        let (meta, payload) = encode_publish_meta("tm07/data", 0, 0, false, secret.as_bytes());
+        let (_, deliveries) = apply_publish(&publish_frame(401, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "same-tenant delivery works");
+        assert_eq!(deliveries[0].0, 401);
+        let (meta_b, payload_b) = encode_publish_meta("tm07/data", 0, 0, false, secret.as_bytes());
+        let (_, deliveries_b) =
+            apply_publish(&publish_frame(402, 2, meta_b, payload_b), &shared).await;
+        assert_eq!(deliveries_b.len(), 1, "other tenant self-delivers");
+        assert_eq!(deliveries_b[0].0, 402);
+        assert_ne!(
+            deliveries[0].0, deliveries_b[0].0,
+            "no cross-tenant delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn tm07_flagged_default_tenant_unchanged() {
+        // Default tenant still connects, publishes and delivers.
+        // The bind carries the flagged peer section (new bind path).
+        use broker_session::tenant::DEFAULT_TENANT_ID;
+        let shared = test_shared();
+        assert!(shared.tenant_registry.is_empty());
+        let base = encode_bind_meta_peer(encode_bind_meta("tm07-def", true, 60), "127.0.0.1");
+        let meta = encode_bind_meta_flagged(base, false, true, false);
+        let reply = apply_bind(&bind_frame(403, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let tenant = shared
+            .sessions
+            .get("tm07-def")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, DEFAULT_TENANT_ID);
+        let sub = subscribe_frame(
+            403,
+            1,
+            encode_subscribe_meta(1, "tm07-def", &[("tm07/def", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (meta, payload) = encode_publish_meta("tm07/def", 0, 0, false, b"ping");
+        let (_, deliveries) = apply_publish(&publish_frame(403, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0, 403);
     }
 
     #[tokio::test]

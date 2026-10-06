@@ -330,8 +330,12 @@ is_known_opcode(_) -> false.
 %%   +------------------+----------------+-------+------------+-----------+
 %% </pre>
 %% Flags bit 0 = clean_start, bit 1 = F1-01 will section present,
-%% bit 2 = X1-01 v5 section present. All other bits are reserved and
-%% must be 0.
+%% bit 2 = X1-01 v5 section present, bit 3 = credentials section
+%% present, bit 4 = peer section present, bit 5 = certificate section
+%% present. All other bits are reserved and must be 0.
+%% Parse rule: flags decide. A set flag means the section is present.
+%% A clear flag means the section is absent. Binds without the new
+%% flags use the old position parse. Both decoders use this rule.
 %% The optional trailing credentials section (present only for
 %% authenticated connects) is:
 %% {@code UserLen:16be | Username | PassLen:16be | Password}.
@@ -391,6 +395,15 @@ is_known_opcode(_) -> false.
 %% decoded CONNECT properties the kernel needs). Version-4 binds never
 %% set it and stay byte-identical to before.
 -define(BIND_FLAG_V5, 16#04).
+%% Flags bit marking a credentials section in the bind tail.
+%% Reason: the bit removes the peer-as-username ambiguity.
+-define(BIND_FLAG_CREDS, 16#08).
+%% Flags bit marking a peer-address section in the bind tail.
+%% Reason: the bit tells the peer section from credentials bytes.
+-define(BIND_FLAG_PEER, 16#10).
+%% Flags bit marking a certificate section in the bind tail.
+%% Reason: the bit tells the certificate section from other bytes.
+-define(BIND_FLAG_CERT, 16#20).
 
 -type v5_bind_info() :: #{version := 4 | 5,
                           session_expiry := 0..4294967295,
@@ -436,8 +449,9 @@ encode_bind_meta(ClientId, CleanStart, Keepalive)
 %% @private Encode the fixed bind head. Flags bit 0 is clean_start;
 %% Flags bit 1 marks a following F1-01 will section (see
 %% {@link encode_bind_meta/7}); Flags bit 2 marks a trailing X1-01 v5
-%% section (see {@link encode_bind_meta/9}). Version-4 binds never set
-%% bit 2 and stay byte-identical to before.
+%% section (see {@link encode_bind_meta/9}). Bits 3, 4 and 5 mark the
+%% credentials, peer and certificate sections. Version-4 binds carry
+%% the same bytes except the new flag bits.
 encode_head(ClientId, CleanStart, Keepalive, WillPresent) ->
     encode_head(ClientId, CleanStart, Keepalive, WillPresent, false).
 
@@ -451,6 +465,31 @@ encode_head(ClientId, CleanStart, Keepalive, WillPresent, V5Present)
     IdLen = byte_size(ClientId),
     true = (IdLen =< 65535) orelse erlang:error(badarg),
     <<IdLen:16/big, ClientId/binary, Flags:8, Keepalive:16/big>>.
+
+%% @private Set the section flags on an encoded bind. The bytes stay
+%% the same except the flag bits. The decoder reads the same bytes.
+mark_bind_sections(Bin, CredsPresent, PeerPresent, CertPresent) ->
+    <<IdLen:16/big, Rest/binary>> = Bin,
+    <<ClientId:IdLen/binary, Flags:8, Tail/binary>> = Rest,
+    NewFlags = Flags
+        bor (case CredsPresent of true -> ?BIND_FLAG_CREDS; false -> 0 end)
+        bor (case PeerPresent of true -> ?BIND_FLAG_PEER; false -> 0 end)
+        bor (case CertPresent of true -> ?BIND_FLAG_CERT; false -> 0 end),
+    <<IdLen:16/big, ClientId/binary, NewFlags:8, Tail/binary>>.
+
+%% @private True when the credentials pair carries a section.
+has_creds({User, Pass}) when is_binary(User), is_binary(Pass) -> true;
+has_creds(_) -> false.
+
+%% @private True when the peer value carries a section.
+has_peer(undefined) -> false;
+has_peer(Peer) when is_binary(Peer) -> true;
+has_peer(_) -> false.
+
+%% @private True when the certificate value carries a section.
+has_cert(undefined) -> false;
+has_cert(Cert) when is_map(Cert) -> true;
+has_cert(_) -> false.
 
 %% @private Encode the optional credentials tail (empty for anonymous).
 encode_creds_bin({undefined, undefined}) ->
@@ -474,8 +513,9 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, {undefined, undefined}) ->
     encode_bind_meta(ClientId, CleanStart, Keepalive);
 encode_bind_meta(ClientId, CleanStart, Keepalive, {User, Pass})
   when is_binary(User), is_binary(Pass) ->
-    <<(encode_head(ClientId, CleanStart, Keepalive, false))/binary,
-      (encode_creds_bin({User, Pass}))/binary>>;
+    Base = <<(encode_head(ClientId, CleanStart, Keepalive, false))/binary,
+             (encode_creds_bin({User, Pass}))/binary>>,
+    mark_bind_sections(Base, true, false, false);
 encode_bind_meta(_, _, _, _) ->
     erlang:error(badarg).
 
@@ -491,8 +531,9 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, undefined) ->
     encode_bind_meta(ClientId, CleanStart, Keepalive, Creds);
 encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp)
   when is_binary(PeerIp) ->
-    <<(encode_bind_meta(ClientId, CleanStart, Keepalive, Creds))/binary,
-      (encode_peer_bin(PeerIp))/binary>>;
+    Base = <<(encode_bind_meta(ClientId, CleanStart, Keepalive, Creds))/binary,
+             (encode_peer_bin(PeerIp))/binary>>,
+    mark_bind_sections(Base, has_creds(Creds), true, false);
 encode_bind_meta(_, _, _, _, _) ->
     erlang:error(badarg).
 
@@ -543,7 +584,8 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax)
   when is_integer(ClientAliasMax),
        ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
     Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer),
-    <<Base/binary, ClientAliasMax:16/big>>;
+    mark_bind_sections(<<Base/binary, ClientAliasMax:16/big>>,
+                       has_creds(Creds), has_peer(Peer), false);
 encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, undefined) ->
     encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp);
 encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, CertInfo)
@@ -551,7 +593,8 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, CertInfo)
     Base = encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp),
     Payload = encode_cert_payload(CertInfo),
     true = (byte_size(Payload) =< 65535) orelse erlang:error(badarg),
-    <<Base/binary, (byte_size(Payload)):16/big, Payload/binary>>;
+    mark_bind_sections(<<Base/binary, (byte_size(Payload)):16/big, Payload/binary>>,
+                       has_creds(Creds), has_peer(PeerIp), true);
 encode_bind_meta(_, _, _, _, _, _) ->
     erlang:error(badarg).
 
@@ -582,11 +625,12 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, ClientAliasMax,
                  #{topic := Topic, payload := Payload, qos := QoS, retain := Retain})
   when is_integer(ClientAliasMax),
        ClientAliasMax >= 0, ClientAliasMax =< 65535 ->
-    <<(encode_head(ClientId, CleanStart, Keepalive, true))/binary,
-      (encode_will_bin(Topic, Payload, QoS, Retain))/binary,
-      (encode_creds_bin(Creds))/binary,
-      (encode_peer_bin(Peer))/binary,
-      ClientAliasMax:16/big>>;
+    Base = <<(encode_head(ClientId, CleanStart, Keepalive, true))/binary,
+             (encode_will_bin(Topic, Payload, QoS, Retain))/binary,
+             (encode_creds_bin(Creds))/binary,
+             (encode_peer_bin(Peer))/binary,
+             ClientAliasMax:16/big>>,
+    mark_bind_sections(Base, has_creds(Creds), has_peer(Peer), false);
 encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, CertInfo, undefined)
   when CertInfo =:= undefined; is_map(CertInfo) ->
     encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, PeerIp, CertInfo);
@@ -634,7 +678,9 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, AliasMax, CertInf
             <<(byte_size(Payload0)):16/big, Payload0/binary>>;
         _ -> erlang:error(badarg)
     end,
-    <<Base0/binary, WillBin/binary, CredsBin/binary, PeerBin/binary, CertBin/binary, AliasMax:16/big>>.
+    mark_bind_sections(<<Base0/binary, WillBin/binary, CredsBin/binary,
+                         PeerBin/binary, CertBin/binary, AliasMax:16/big>>,
+                       has_creds(Creds), has_peer(Peer), has_cert(CertInfo)).
 
 %% @doc Encode BindConnection metadata with the X1-01 v5 section
 %% (canonical v5 form). `V5Info' is `undefined' or a map with
@@ -692,8 +738,9 @@ encode_bind_meta(ClientId, CleanStart, Keepalive, Creds, Peer, AliasMax, CertInf
     end,
     V5Payload = encode_v5_payload(Version, Expiry, RecvMax, MaxPkt, Users),
     true = (byte_size(V5Payload) =< ?MAX_V5_SECTION_LEN) orelse erlang:error(badarg),
-    <<Base0/binary, WillBin/binary, CredsBin/binary, PeerBin/binary, CertBin/binary,
-      AliasMax:16/big, V5Payload/binary, (byte_size(V5Payload)):16/big>>;
+    mark_bind_sections(<<Base0/binary, WillBin/binary, CredsBin/binary, PeerBin/binary, CertBin/binary,
+                         AliasMax:16/big, V5Payload/binary, (byte_size(V5Payload)):16/big>>,
+                       has_creds(Creds), has_peer(Peer), has_cert(CertInfo));
 encode_bind_meta(_, _, _, _, _, _, _, _, _) ->
     erlang:error(badarg).
 
@@ -799,13 +846,17 @@ is_peer_ip(_) ->
 %% trailing B4-05 `ClientAliasMax:16be' alias section (absent means 0),
 %% the optional F1-01 will section after the keepalive (Flags bit 1;
 %% absent means no will) and the optional X1-01 v5 section (Flags bit
-%% 2; absent means a version-4 bind with defaulted v5 fields). A
+%% 2; absent means a version-4 bind with defaulted v5 fields). Bits 3,
+%% 4 and 5 mark the credentials, peer and certificate sections. A
 %% trailing section that is neither valid credentials/peer bytes nor
 %% credentials/peer bytes plus the known sections is malformed (fail
-%% closed, never a guessed identity).
+%% closed, never a guessed identity). A short section fails with
+%% `malformed_bind_meta'.
 -spec decode_bind_meta(binary()) -> {ok, bind_meta()} | {error, term()}.
 decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
-    case peek_bind_flags(Rest, IdLen) of
+    case peek_bind_section_flags(Rest, IdLen) of
+        flagged ->
+            decode_bind_flagged(Rest, IdLen);
         v5 ->
             decode_bind_meta_v5(Rest, IdLen);
         _ ->
@@ -818,6 +869,186 @@ decode_bind_meta(<<IdLen:16/big, Rest/binary>>) ->
     end;
 decode_bind_meta(_) ->
     {error, malformed_bind_meta}.
+
+%% @private True when the bind head carries any section flag (bits 3,
+%% 4 or 5). Flags decide the parse. A set flag means the section is
+%% present. A clear flag means the section is absent. Binds without
+%% the flags use the old position parse.
+peek_bind_section_flags(Rest, IdLen) ->
+    case Rest of
+        <<_:IdLen/binary, Flags:8, _/binary>>
+          when Flags band (?BIND_FLAG_CREDS bor ?BIND_FLAG_PEER bor ?BIND_FLAG_CERT) =/= 0 ->
+            flagged;
+        _ ->
+            peek_bind_flags(Rest, IdLen)
+    end.
+
+%% @private Decode a flagged bind: the flags name each section. The
+%% peer bytes never become a username. A short section fails with
+%% `malformed_bind_meta'. The alias and v5 sections ride last.
+decode_bind_flagged(Rest, IdLen) ->
+    case Rest of
+        <<ClientId:IdLen/binary, Flags:8, Keepalive:16/big, Tail/binary>> ->
+            case decode_will_section(Tail, Flags) of
+                {ok, HeadWill, Sections} ->
+                    case strip_flagged_v5(Sections, Flags) of
+                        {ok, LegacyTail, V5} ->
+                            case decode_flagged_alias(LegacyTail, Flags) of
+                                {ok, User, Pass, Peer, Cn, Subject, Sans, TailWill, AliasMax} ->
+                                    MergedWill = merge_head_tail_will(HeadWill, TailWill),
+                                    Got = #{client_id => ClientId,
+                                            clean_start => (Flags band 16#01) =:= 16#01,
+                                            keepalive => Keepalive,
+                                            username => User,
+                                            password => Pass,
+                                            peerhost => Peer,
+                                            client_alias_max => AliasMax,
+                                            cert_cn => Cn,
+                                            cert_subject => Subject,
+                                            cert_sans => Sans,
+                                            will_topic => will_field(MergedWill, topic),
+                                            will_payload => will_field(MergedWill, payload),
+                                            will_qos => will_field(MergedWill, qos),
+                                            will_retain => will_field(MergedWill, retain)},
+                                    {ok, maps:merge(maps:merge(v5_bind_defaults(), Got),
+                                                    #{protocol_version => maps:get(version, V5),
+                                                      session_expiry => maps:get(session_expiry, V5),
+                                                      receive_maximum => maps:get(receive_max, V5),
+                                                      max_packet_size => maps:get(max_packet_size, V5),
+                                                      user_properties => maps:get(user_properties, V5)})};
+                                {error, _} = Err ->
+                                    Err
+                            end;
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end;
+        _ ->
+            {error, malformed_bind_meta}
+    end.
+
+%% @private Strip the v5 section when Flags bit 2 is set. No bit
+%% means no section. A short section fails closed.
+strip_flagged_v5(Tail, Flags) ->
+    case Flags band ?BIND_FLAG_V5 of
+        0 ->
+            {ok, Tail, #{version => 4, session_expiry => 0,
+                         receive_max => 65535, max_packet_size => 0,
+                         user_properties => []}};
+        _ ->
+            TSize = byte_size(Tail),
+            case TSize >= 2 + 13 + 2 of
+                false ->
+                    {error, malformed_bind_meta};
+                true ->
+                    V5Len = binary:decode_unsigned(binary:part(Tail, TSize - 2, 2), big),
+                    case V5Len >= 13 andalso V5Len =< ?MAX_V5_SECTION_LEN
+                         andalso TSize >= 2 + V5Len + 2 of
+                        false ->
+                            {error, malformed_bind_meta};
+                        true ->
+                            LegacySize = TSize - 2 - V5Len - 2,
+                            <<Legacy:LegacySize/binary, Alias:16/big,
+                              V5Payload:V5Len/binary, V5Len:16/big>> = Tail,
+                            case decode_v5_payload(V5Payload) of
+                                {ok, V5} ->
+                                    {ok, <<Legacy/binary, Alias:16/big>>, V5};
+                                {error, _} = Err -> Err
+                            end
+                    end
+            end
+    end.
+
+%% @private Decode the flagged tail with the alias inference. Exact
+%% parse first (no alias). Else the last two bytes are the alias.
+decode_flagged_alias(Tail, Flags) ->
+    case decode_flagged_sections(Tail, Flags) of
+        {ok, _, _, _, _, _, _, _} = Ok ->
+            {ok, User, Pass, Peer, Cn, Subject, Sans, Will} = Ok,
+            {ok, User, Pass, Peer, Cn, Subject, Sans, Will, 0};
+        {error, _} ->
+            Size = byte_size(Tail),
+            case Size >= 2 of
+                true ->
+                    PrefixSize = Size - 2,
+                    <<Prefix:PrefixSize/binary, AliasMax:16/big>> = Tail,
+                    case decode_flagged_sections(Prefix, Flags) of
+                        {ok, User, Pass, Peer, Cn, Subject, Sans, Will} ->
+                            {ok, User, Pass, Peer, Cn, Subject, Sans, Will, AliasMax};
+                        {error, _} = Err ->
+                            Err
+                    end;
+                false ->
+                    {error, malformed_bind_meta}
+            end
+    end.
+
+%% @private Decode flagged credentials, peer and certificate sections.
+%% Each set flag needs its section. Each clear flag needs no bytes.
+%% A short section fails with `malformed_bind_meta'.
+decode_flagged_sections(Tail, Flags) ->
+    Creds = (Flags band ?BIND_FLAG_CREDS) =/= 0,
+    Peer = (Flags band ?BIND_FLAG_PEER) =/= 0,
+    Cert = (Flags band ?BIND_FLAG_CERT) =/= 0,
+    case decode_flagged_creds(Tail, Creds) of
+        {ok, User, Pass, Rest1} ->
+            case decode_flagged_peer(Rest1, Peer) of
+                {ok, PeerHost, Rest2} ->
+                    case decode_flagged_cert(Rest2, Cert) of
+                        {ok, Cn, Subject, Sans, Rest3} ->
+                            case decode_will_tail(Rest3) of
+                                {ok, Will} ->
+                                    {ok, User, Pass, PeerHost, Cn, Subject, Sans, Will};
+                                error ->
+                                    {error, malformed_bind_meta}
+                            end;
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @private Read the credentials section when the flag is set.
+decode_flagged_creds(Tail, false) ->
+    {ok, undefined, undefined, Tail};
+decode_flagged_creds(<<ULen:16/big, Rest/binary>>, true) ->
+    case Rest of
+        <<User:ULen/binary, PLen:16/big, PassRest/binary>> when PLen > 0 ->
+            case PassRest of
+                <<Pass:PLen/binary, Tail/binary>> ->
+                    {ok, User, Pass, Tail};
+                _ ->
+                    {error, malformed_bind_meta}
+            end;
+        _ ->
+            {error, malformed_bind_meta}
+    end;
+decode_flagged_creds(_, true) ->
+    {error, malformed_bind_meta}.
+
+%% @private Read the peer section when the flag is set.
+decode_flagged_peer(Tail, false) ->
+    {ok, undefined, Tail};
+decode_flagged_peer(Tail, true) ->
+    case split_peer_prefix(Tail) of
+        {ok, Peer, Rest} -> {ok, Peer, Rest};
+        error -> {error, malformed_bind_meta}
+    end.
+
+%% @private Read the certificate section when the flag is set.
+decode_flagged_cert(Tail, false) ->
+    {ok, undefined, undefined, [], Tail};
+decode_flagged_cert(Tail, true) ->
+    case split_cert_prefix(Tail) of
+        {ok, Cn, Subject, Sans, Rest} -> {ok, Cn, Subject, Sans, Rest};
+        error -> {error, malformed_bind_meta}
+    end.
 
 %% @private True when the bind head carries Flags bit 2 (X1-01 v5
 %% section present). Anything too short for a head is legacy (and then

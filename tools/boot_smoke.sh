@@ -349,6 +349,90 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 10. Explicit bind sections keep tenants apart ---
+# Run this check before the first user exists. The broker stays open.
+# Unknown users connect. The check proves isolation on the new path.
+# Each connect uses the new bind path. The edge sets the section
+# flags. Each publish uses a random value. Delivery stays in-tenant.
+# The default tenant still delivers as before.
+python3 - "$MQTT_PORT" <<'PY'
+import os, socket, struct, sys
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    import time
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=2)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+def mqtt_connect(sock, client_id, username=None):
+    if username is None:
+        body = b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)
+    else:
+        body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(b"pw")
+    sock.sendall(packet(0x10, body))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+def wait_port2(port):
+    import time
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the edge does not listen")
+def connect(client_id, username=None):
+    sock = wait_port2(mqtt_port)
+    return sock, mqtt_connect(sock, client_id, username)
+def subscribe(sock, topic):
+    sock.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    return sock.recv(5)[:1] == b"\x90"
+secret = os.urandom(8).hex().encode()
+topic = b"smoke/bind/check"
+a_sub, a_ok = connect(b"bind-a-sub", b"bind-a")
+b_sub, b_ok = connect(b"bind-b-sub", b"bind-b")
+a_pub, a_pub_ok = connect(b"bind-a-pub", b"bind-a")
+ready = a_ok and b_ok and a_pub_ok and subscribe(a_sub, topic) and subscribe(b_sub, topic)
+if ready:
+    a_pub.sendall(packet(0x30, field(topic) + secret))
+    report("a subscriber gets the publish of its own tenant through the new bind path",
+           receive(a_sub, 5).endswith(secret))
+    report("a subscriber does not get the publish of another tenant through the new bind path",
+           secret not in receive(b_sub, 2))
+else:
+    report("a subscriber gets the publish of its own tenant through the new bind path", False)
+    report("a subscriber does not get the publish of another tenant through the new bind path", False)
+anon_secret = os.urandom(8).hex().encode()
+anon_sub, anon_ok = connect(b"bind-anon-sub")
+anon_pub, anon_pub_ok = connect(b"bind-anon-pub")
+anon_ready = anon_ok and anon_pub_ok
+if anon_ready:
+    anon_ready = subscribe(anon_sub, topic)
+if anon_ready:
+    anon_pub.sendall(packet(0x30, field(topic) + anon_secret))
+    report("the default tenant still delivers without credentials",
+           receive(anon_sub, 5).endswith(anon_secret))
+else:
+    report("the default tenant still delivers without credentials", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 # --- 5. Users and ACLs of each tenant stay after a restart ---
 # The tenant rule maps each username to its own tenant. The password is
 # random, thus the broker cannot know it. The broker restarts on the
