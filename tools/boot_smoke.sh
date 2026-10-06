@@ -556,6 +556,107 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 7. Tenant commands of the operator CLI ---
+# Two tenants come from `indra ctl tenants create`. Each tenant gets
+# one user with a random password the broker cannot know, plus publish
+# and subscribe rules from `indra ctl acls create`. Real clients
+# connect in each tenant. A publish in one tenant reaches its own
+# subscriber only.
+CLI_NS_A="t-cli-a"
+CLI_NS_B="t-cli-b"
+CLI_USER_A="cli-a"
+CLI_USER_B="cli-b"
+CLI_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+CLI_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+CLI_TOPIC="smoke/cli/check"
+CTL_API="http://127.0.0.1:$API_PORT"
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants create "$CLI_NS_A" > /dev/null
+check "indra ctl tenants create makes the first tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants create "$CLI_NS_B" > /dev/null
+check "indra ctl tenants create makes the second tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants list | grep -q "$CLI_NS_A"
+check "indra ctl tenants list shows the first tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants show "$CLI_NS_B" | grep -q "namespace: $CLI_NS_B"
+check "indra ctl tenants show reads the second tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" users create --username "$CLI_USER_A" --tenant "$CLI_NS_A" --password "$CLI_PASS_A" > /dev/null
+check "indra ctl users create makes a user in the first tenant" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" users create --username "$CLI_USER_B" --tenant "$CLI_NS_B" --password "$CLI_PASS_B" > /dev/null
+check "indra ctl users create makes a user in the second tenant" $?
+for action in publish subscribe; do
+    "$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" acls create --tenant "$CLI_NS_A" --client-pattern '*' --action "$action" --topic-pattern 'smoke/cli/#' --allow > /dev/null
+    check "indra ctl acls create adds the $action rule in the first tenant" $?
+    "$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" acls create --tenant "$CLI_NS_B" --client-pattern '*' --action "$action" --topic-pattern 'smoke/cli/#' --allow > /dev/null
+    check "indra ctl acls create adds the $action rule in the second tenant" $?
+done
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" acls list --tenant "$CLI_NS_A" | grep -q publish
+check "indra ctl acls list shows the rules of the first tenant" $?
+
+python3 - "$MQTT_PORT" "$CLI_USER_A" "$CLI_PASS_A" "$CLI_USER_B" "$CLI_PASS_B" "$CLI_TOPIC" <<'PY'
+import os, socket, struct, sys
+mqtt_port, username_a, password_a, username_b, password_b, topic = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            import time
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+secret = os.urandom(8).hex().encode()
+sub, ok = connect(b"cli-a-sub", username_a, password_a)
+other, other_ok = connect(b"cli-b-sub", username_b, password_b)
+ready = ok and other_ok
+if ok:
+    sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and sub.recv(5)[:1] == b"\x90"
+if other_ok:
+    other.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and other.recv(5)[:1] == b"\x90"
+pub, pub_ok = connect(b"cli-a-pub", username_a, password_a)
+ready = ready and pub_ok
+if ready:
+    pub.sendall(packet(0x30, field(topic) + secret))
+    report("a publish through CLI users reaches its own subscriber",
+           receive(sub, 5).endswith(secret))
+    report("a publish through CLI users does not leak to another tenant",
+           secret not in receive(other, 2))
+else:
+    report("a publish through CLI users reaches its own subscriber", False)
+    report("a publish through CLI users does not leak to another tenant", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants delete "$CLI_NS_B" --yes > /dev/null
+check "indra ctl tenants delete removes the second tenant" $?
+if "$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" tenants list | grep -q "$CLI_NS_B"; then
+    fail "the deleted tenant stays out of indra ctl tenants list"
+else
+    pass "the deleted tenant stays out of indra ctl tenants list"
+fi
+
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"
     exit 0
