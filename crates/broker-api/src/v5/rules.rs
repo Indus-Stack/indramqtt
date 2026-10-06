@@ -81,6 +81,7 @@ const MAX_RULE_ID_LEN: usize = broker_config::MAX_RULE_ID_LEN;
 /// Projection of the stored [`broker_rules::Rule`] for `/api/v5/rules`.
 /// Only real engine state: stored actions verbatim (empty stays empty),
 /// no invented `description`/`created_at`, no connector-id coercion.
+/// `tenant` names the owning tenant (`default` for pre-tenancy rules).
 fn rule_to_v5(rule: &broker_rules::Rule) -> serde_json::Value {
     let topic = rule.topic_filter.as_str().to_string();
     let sql = rule
@@ -91,11 +92,48 @@ fn rule_to_v5(rule: &broker_rules::Rule) -> serde_json::Value {
     serde_json::json!({
         "id": rule.id,
         "name": rule.name,
+        "tenant": rule.tenant,
         "sql": sql,
         "from": [topic],
         "enable": rule.enabled,
         "actions": actions,
     })
+}
+
+/// Resolve the rule tenant from a v5 body: absent or blank rides as
+/// the default tenant. A present but non-string tenant fails with
+/// 400. A malformed id fails with 400. An unknown tenant (no managed
+/// namespace) fails with 400 and stores nothing.
+fn resolve_rule_tenant(
+    state: &ApiState,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, Box<Response>> {
+    let raw = match obj.get("tenant") {
+        None => "",
+        Some(value) => {
+            let Some(text) = value.as_str() else {
+                return Err(Box::new(
+                    ApiError::BadRequest("field `tenant` must be a string".to_string())
+                        .into_response(),
+                ));
+            };
+            text
+        }
+    };
+    let tenant = broker_config::canonical_rule_tenant(raw);
+    if !broker_config::is_valid_rule_tenant(&tenant) {
+        return Err(Box::new(
+            ApiError::BadRequest(format!("tenant {tenant:?} is not valid (field `tenant`)"))
+                .into_response(),
+        ));
+    }
+    if !state.namespaces.contains(&tenant) {
+        return Err(Box::new(
+            ApiError::BadRequest(format!("unknown tenant {tenant:?} (field `tenant`)"))
+                .into_response(),
+        ));
+    }
+    Ok(tenant)
 }
 
 pub async fn list_rules(State(state): State<ApiState>, params: PageParams) -> Response {
@@ -129,7 +167,9 @@ fn rule_persist_error(error: broker_rules::RuleEngineError) -> Response {
 /// bodies rejected with the documented error shape); a duplicate id is
 /// rejected cleanly, never overwritten. An explicit `id` is stored
 /// verbatim so duplicates are detectable; without one the engine assigns
-/// `rule-<n>`. A `ForwardConnector` target naming no known action is
+/// `rule-<n>`. A `tenant` field selects the owning tenant (absent
+/// means the default tenant); an unknown tenant is rejected with 400.
+/// A `ForwardConnector` target naming no known action is
 /// rejected (the W3-02 action linkage). Management-plane only; publish
 /// and deliver never touch this map (dispatch reads a snapshot).
 pub async fn create_rule(
@@ -180,6 +220,12 @@ pub async fn create_rule(
         return ApiError::BadRequest("missing required field: sql".to_string()).into_response();
     };
     let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    // Tenant scope first: an unknown tenant fails with 400 before
+    // any other store check, and stores nothing.
+    let tenant = match resolve_rule_tenant(&state, obj) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
     let raw_actions: Vec<serde_json::Value> = match obj.get("actions") {
         None => Vec::new(),
         Some(value) => match value.as_array() {
@@ -289,14 +335,23 @@ pub async fn create_rule(
     }
 
     let rule = match explicit_id {
-        Some(id) => {
-            state
-                .engine
-                .create_rule_with_id(id, name, topic_filter, Some(sql), enable, actions)
-        }
-        None => state
-            .engine
-            .create_rule(name, topic_filter, Some(sql), enable, actions),
+        Some(id) => state.engine.create_rule_with_id_in_tenant(
+            id,
+            tenant,
+            name,
+            topic_filter,
+            Some(sql),
+            enable,
+            actions,
+        ),
+        None => state.engine.create_rule_in_tenant(
+            tenant,
+            name,
+            topic_filter,
+            Some(sql),
+            enable,
+            actions,
+        ),
     };
 
     match rule {
@@ -316,7 +371,7 @@ pub async fn create_rule(
 /// `GET /api/v5/rules/:id`: read one rule (C06-21).
 ///
 /// A known id returns the full documented rule fields (`id`, `name`,
-/// `sql`, `from`, `enable`, `actions`) from live engine state; an unknown
+/// `tenant`, `sql`, `from`, `enable`, `actions`) from live engine state; an unknown
 /// id returns 404 with the documented error code, not an empty body. The
 /// pair is not paged; unknown query parameters are ignored (the ignored
 /// query sink below). Management-plane only: one short read lock cloning
@@ -342,6 +397,9 @@ pub async fn get_rule(
 
 /// `PUT /api/v5/rules/:id`: validated full replace of one rule (C06-22).
 ///
+/// A `tenant` field moves the rule to that tenant. Absent keeps the
+/// stored tenant. An unknown tenant fails with 400 and keeps the old
+/// rule.
 /// The body gets the same compilation as create: it must be a JSON object
 /// carrying the full rule (`sql` required, `actions` as string ids or
 /// `{id,name}` objects validated against the W3-02 action directory,
@@ -436,7 +494,8 @@ pub async fn update_rule(
     let has_full_keys = obj.contains_key("sql")
         || obj.contains_key("from")
         || obj.contains_key("actions")
-        || obj.contains_key("name");
+        || obj.contains_key("name")
+        || obj.contains_key("tenant");
     if !has_full_keys {
         // Legacy enable-only shape (pre-W3-14): apply only the flag.
         if let Some(enable) = obj.get("enable").and_then(|v| v.as_bool()) {
@@ -554,10 +613,42 @@ pub async fn update_rule(
                 .into_response();
             }
         }
-        match state
-            .engine
-            .replace_rule(&id, name, topic_filter, Some(sql), enable, actions)
-        {
+        // Tenant scope: a body tenant moves the rule. Absent keeps
+        // the stored tenant. A present but non-string tenant fails
+        // with 400. An unknown tenant fails with 400 and keeps the
+        // old rule.
+        let tenant = match obj.get("tenant") {
+            None => existing.tenant.clone(),
+            Some(value) => {
+                let Some(raw) = value.as_str() else {
+                    return ApiError::BadRequest("field `tenant` must be a string".to_string())
+                        .into_response();
+                };
+                let tenant = broker_config::canonical_rule_tenant(raw);
+                if !broker_config::is_valid_rule_tenant(&tenant) {
+                    return ApiError::BadRequest(format!(
+                        "tenant {tenant:?} is not valid (field `tenant`)"
+                    ))
+                    .into_response();
+                }
+                if !state.namespaces.contains(&tenant) {
+                    return ApiError::BadRequest(format!(
+                        "unknown tenant {tenant:?} (field `tenant`)"
+                    ))
+                    .into_response();
+                }
+                tenant
+            }
+        };
+        match state.engine.replace_rule_in_tenant(
+            &id,
+            tenant,
+            name,
+            topic_filter,
+            Some(sql),
+            enable,
+            actions,
+        ) {
             Ok(Some(r)) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
             Ok(None) => (
                 StatusCode::NOT_FOUND,

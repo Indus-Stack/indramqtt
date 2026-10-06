@@ -1253,25 +1253,35 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
+        self.publish_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            topic,
+            payload,
+            qos,
+            retain,
+        )
+        .await
+    }
+    /// Fan out one derived message inside one tenant. The match and
+    /// the session reads use that tenant only, so output never
+    /// leaves it.
+    async fn publish_in_tenant(
+        &self,
+        tenant: &str,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), broker_rules::RuleEngineError> {
         let qos_raw = u8::from(qos);
         let topic_str = topic.as_str();
         let mut frames = Vec::new();
         let mut offline_failed = false;
-        // Tenant scope (MT-02, MT-03): rule republishes fan out in the
-        // default tenant only (fail closed, single-tenant behaviour
-        // unchanged); the tenant attribution for derived messages is open
-        // until the rule engine dispatches per tenant.
-        let (matched, _tenant_skipped) = self.router.matches_in_tenant_counted(
-            &topic,
-            None,
-            broker_session::tenant::DEFAULT_TENANT_ID,
-        );
+        let (matched, _tenant_skipped) =
+            self.router.matches_in_tenant_counted(&topic, None, tenant);
         for sub in matched {
             let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
-            match self.sessions.get_in_tenant(
-                broker_session::tenant::DEFAULT_TENANT_ID,
-                sub.client_id.as_ref(),
-            ) {
+            match self.sessions.get_in_tenant(tenant, sub.client_id.as_ref()) {
                 Some(session) => {
                     let connected = *session.connected.read();
                     let live = *session.conn_id.read();
@@ -1423,11 +1433,13 @@ async fn handle_mgmt_retained(
     retain: bool,
     payload: &Bytes,
 ) {
-    // TODO(parity): management publishes carry no client tenant yet, so the
-    // mirror stores in the default tenant only (fail closed: never another
-    // tenant's; single-tenant behaviour unchanged). The open question is the
-    // tenant attribution for management publishes once authenticated callers
-    // carry a tenant.
+    // Management publishes carry no client tenant, so the mirror
+    // stores in the default tenant only (fail closed: never another
+    // tenant's; single-tenant behaviour unchanged).
+    // TODO(parity): which tenant owns a management publish once
+    // authenticated callers carry one? The rulebook does not decide;
+    // the current choice keeps the default tenant until the checker
+    // pins it.
     handle_mgmt_retained_in_tenant(
         state,
         topic,

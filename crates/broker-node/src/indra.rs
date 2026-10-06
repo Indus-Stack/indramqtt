@@ -292,6 +292,8 @@ enum ClientsCommand {
 }
 
 /// Rule governance: every verb maps 1:1 onto `/api/v1/rules`.
+/// `--tenant` selects the owning tenant; without it the command
+/// creates in the default tenant, as before.
 #[derive(Subcommand, Debug)]
 enum RulesCommand {
     /// List routing rules.
@@ -330,6 +332,9 @@ enum RulesCommand {
         /// Append a republish action as TOPIC:QOS (repeatable).
         #[arg(long)]
         republish: Vec<String>,
+        /// Tenant scope (absent means the default tenant).
+        #[arg(long)]
+        tenant: Option<String>,
     },
     /// Delete one rule. Destructive: requires `--yes` or an interactive
     /// confirm.
@@ -1300,6 +1305,7 @@ async fn cmd_rules_create(
     log: bool,
     forwards: &[String],
     republishes: &[String],
+    tenant: Option<&str>,
 ) -> Result<String, CtlError> {
     if name.trim().is_empty() {
         return Err(CtlError::validation("rule name must not be empty"));
@@ -1344,6 +1350,7 @@ async fn cmd_rules_create(
         "sql_query": sql,
         "enabled": !disable,
         "actions": actions,
+        "tenant": tenant.unwrap_or(""),
     });
     let (_, response) =
         request(ctl, key, reqwest::Method::POST, "/api/v1/rules", Some(body)).await?;
@@ -2226,6 +2233,7 @@ async fn run_ctl(ctl: &CtlArgs) -> Result<String, CtlError> {
                 log,
                 forward,
                 republish,
+                tenant,
             } => {
                 cmd_rules_create(
                     ctl,
@@ -2238,6 +2246,7 @@ async fn run_ctl(ctl: &CtlArgs) -> Result<String, CtlError> {
                     *log,
                     forward,
                     republish,
+                    tenant.as_deref(),
                 )
                 .await
             }
@@ -3169,6 +3178,7 @@ mod tests {
                     log: false,
                     forward: Vec::new(),
                     republish: Vec::new(),
+                    tenant: None,
                 },
             },
         ))
@@ -3235,6 +3245,7 @@ mod tests {
                     log: true,
                     forward: Vec::new(),
                     republish: vec!["gov/out:1".to_string()],
+                    tenant: None,
                 },
             },
         ))
@@ -4646,6 +4657,7 @@ mod tests {
                     log: false,
                     forward: Vec::new(),
                     republish: Vec::new(),
+                    tenant: None,
                 },
             },
         ))

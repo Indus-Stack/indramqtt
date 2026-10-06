@@ -657,6 +657,120 @@ else
     pass "the deleted tenant stays out of indra ctl tenants list"
 fi
 
+# --- 8. A rule of one tenant fires only for that tenant ---
+# Two tenants come from the API. One rule of the first tenant
+# republishes. A random value the broker cannot know is published in
+# each tenant. The republished message arrives in the first tenant
+# only. A publish in the second tenant fires no rule.
+RULE_NS_A="t-rule-a"
+RULE_NS_B="t-rule-b"
+RULE_USER_A="rule-a"
+RULE_USER_B="rule-b"
+RULE_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+RULE_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+RULE_IN="smoke/rule/in"
+RULE_OUT="smoke/rule/out"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$RULE_NS_A" "$RULE_USER_A" "$RULE_PASS_A" "$RULE_NS_B" "$RULE_USER_B" "$RULE_PASS_B" "$RULE_IN" "$RULE_OUT" <<'PY'
+import json, sys, urllib.request
+api, key, ns_a, user_a, pass_a, ns_b, user_b, pass_b, rule_in, rule_out = sys.argv[1:11]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, res.read().decode()
+    except urllib.request.HTTPError as err:
+        return err.code, err.read().decode()
+for ns, user, password in ((ns_a, user_a, pass_a), (ns_b, user_b, pass_b)):
+    status, _ = call("POST", f"/api/v5/mt/ns/{ns}", {})
+    assert status in (204, 409), f"create managed namespace {ns}: {status}"
+    status, _ = call("POST", f"/api/v1/auth/users?tenant={ns}",
+                     {"username": user, "password": password})
+    assert status in (201, 409), f"create tenant user {user}: {status}"
+    for action in ("publish", "subscribe"):
+        status, _ = call("POST", f"/api/v1/auth/acls?tenant={ns}",
+                         {"client_pattern": "*", "action": action,
+                          "topic_pattern": "smoke/rule/#", "allow": True})
+        assert status == 201, f"create tenant {action} rule: {status}"
+status, text = call("POST", "/api/v1/rules",
+                    {"name": "smoke-tenant-rule", "topic_filter": rule_in,
+                     "tenant": ns_a,
+                     "actions": [{"type": "republish", "topic": rule_out, "qos": 0}]})
+assert status == 201, f"create tenant rule: {status} {text}"
+assert json.loads(text)["tenant"] == ns_a, f"rule keeps its tenant: {text}"
+print("tenant rule is stored through the API")
+PY
+check "a rule of the first tenant with a republish action is stored through the API" $?
+
+python3 - "$MQTT_PORT" "$RULE_USER_A" "$RULE_PASS_A" "$RULE_USER_B" "$RULE_PASS_B" "$RULE_IN" "$RULE_OUT" <<'PY'
+import os, socket, struct, sys
+mqtt_port, username_a, password_a, username_b, password_b, rule_in, rule_out = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode(), sys.argv[7].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            import time
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+secret_a = os.urandom(8).hex().encode()
+secret_b = os.urandom(8).hex().encode()
+sub_a, ok_a = connect(b"rule-a-sub", username_a, password_a)
+sub_b, ok_b = connect(b"rule-b-sub", username_b, password_b)
+ready = ok_a and ok_b
+if ok_a:
+    sub_a.sendall(packet(0x82, b"\x00\x01" + field(rule_out) + b"\x00"))
+    ready = ready and sub_a.recv(5)[:1] == b"\x90"
+if ok_b:
+    sub_b.sendall(packet(0x82, b"\x00\x01" + field(rule_out) + b"\x00"))
+    ready = ready and sub_b.recv(5)[:1] == b"\x90"
+pub_a, pub_a_ok = connect(b"rule-a-pub", username_a, password_a)
+pub_b, pub_b_ok = connect(b"rule-b-pub", username_b, password_b)
+ready = ready and pub_a_ok and pub_b_ok
+if ready:
+    pub_a.sendall(packet(0x30, field(rule_in) + secret_a))
+    report("the rule output arrives in the tenant of the rule",
+           receive(sub_a, 5).endswith(secret_a))
+    report("the rule output does not leak to the other tenant",
+           secret_a not in receive(sub_b, 2))
+    pub_b.sendall(packet(0x30, field(rule_in) + secret_b))
+    report("a publish in the tenant without the rule fires no output there",
+           secret_b not in receive(sub_b, 2))
+    report("a publish in the tenant without the rule sends nothing to the rule tenant",
+           secret_b not in receive(sub_a, 2))
+else:
+    report("the rule output arrives in the tenant of the rule", False)
+    report("the rule output does not leak to the other tenant", False)
+    report("a publish in the tenant without the rule fires no output there", False)
+    report("a publish in the tenant without the rule sends nothing to the rule tenant", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"
     exit 0

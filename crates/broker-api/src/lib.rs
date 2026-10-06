@@ -893,6 +893,8 @@ async fn get_dashboard_version() -> Response {
 }
 
 /// Creation payload: identifiers are assigned server-side (`rule-<n>`).
+/// `tenant` selects the owning tenant; absent or blank selects the
+/// default tenant, so calls without it behave as before.
 #[derive(Debug, Deserialize)]
 struct CreateRuleRequest {
     name: String,
@@ -903,6 +905,8 @@ struct CreateRuleRequest {
     enabled: bool,
     #[serde(default)]
     actions: Vec<ActionDto>,
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -977,6 +981,16 @@ async fn create_rule(
     if req.name.trim().is_empty() {
         return bad_request("rule name must not be empty");
     }
+    // Tenant scope: absent or blank rides as the default tenant.
+    // A malformed id fails with 400. An unknown tenant (no managed
+    // namespace) fails with 400 and stores nothing.
+    let tenant = broker_config::canonical_rule_tenant(req.tenant.as_deref().unwrap_or(""));
+    if !broker_config::is_valid_rule_tenant(&tenant) {
+        return bad_request(format!("tenant {tenant:?} is not valid (field `tenant`)"));
+    }
+    if !state.namespaces.contains(&tenant) {
+        return bad_request(format!("unknown tenant {tenant:?} (field `tenant`)"));
+    }
     let topic_filter = match TopicFilter::new(req.topic_filter) {
         Ok(filter) => filter,
         Err(e) => return bad_request(format!("invalid topic_filter: {e}")),
@@ -1005,17 +1019,20 @@ async fn create_rule(
         }
     }
 
-    let rule: Rule =
-        match state
-            .engine
-            .create_rule(req.name, topic_filter, req.sql_query, req.enabled, actions)
-        {
-            Ok(rule) => rule,
-            // A persist failure is a 500 (the in-memory rule stays but the
-            // disk save failed); validation failures stay 400.
-            Err(error @ RuleEngineError::Persist(_)) => return rule_persist_error(error),
-            Err(e) => return bad_request(format!("invalid sql_query: {e}")),
-        };
+    let rule: Rule = match state.engine.create_rule_in_tenant(
+        tenant,
+        req.name,
+        topic_filter,
+        req.sql_query,
+        req.enabled,
+        actions,
+    ) {
+        Ok(rule) => rule,
+        // A persist failure is a 500 (the in-memory rule stays but the
+        // disk save failed); validation failures stay 400.
+        Err(error @ RuleEngineError::Persist(_)) => return rule_persist_error(error),
+        Err(e) => return bad_request(format!("invalid sql_query: {e}")),
+    };
     (StatusCode::CREATED, Json(rule)).into_response()
 }
 
@@ -3141,6 +3158,264 @@ mod tests {
             .delete_auth(&format!("/api/v1/rules/{id}"), &token)
             .await;
         assert_eq!(status, 404);
+    }
+
+    /// Record the tenant of each rule output through the broker sink.
+    struct TenantProbe {
+        recorded: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl broker_rules::BrokerSink for TenantProbe {
+        async fn publish(
+            &self,
+            topic: Topic,
+            _payload: bytes::Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> Result<(), broker_rules::RuleEngineError> {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push(("default".to_string(), topic.as_str().to_string()));
+            Ok(())
+        }
+
+        async fn publish_in_tenant(
+            &self,
+            tenant: &str,
+            topic: Topic,
+            _payload: bytes::Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> Result<(), broker_rules::RuleEngineError> {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push((tenant.to_string(), topic.as_str().to_string()));
+            Ok(())
+        }
+    }
+
+    /// Unknown rule tenants fail closed through the v1 API: an unknown
+    /// tenant and a malformed tenant both answer 400 and store nothing.
+    #[tokio::test]
+    async fn test_rules_tenant_unknown_rejected_through_api() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for tenant in ["tm04-ghost", "bad\u{7}tenant"] {
+            let (status, body) = server
+                .post_auth(
+                    "/api/v1/rules",
+                    json!({
+                        "name": "tm04-bad",
+                        "topic_filter": "tm04/#",
+                        "tenant": tenant,
+                        "actions": []
+                    }),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "tenant {tenant:?} must fail");
+            assert!(
+                body["error"].as_str().unwrap().contains("tenant"),
+                "error names the field: {body}"
+            );
+        }
+        let (status, body) = server.get_auth("/api/v1/rules", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]), "nothing stored");
+        assert!(state.engine.list_rules().is_empty());
+    }
+
+    /// One rule of tenant A is created through the v1 API. It reads
+    /// back with its tenant. It fires only for a publish of tenant A
+    /// through the broker dispatch. Its output carries tenant A only.
+    #[tokio::test]
+    async fn test_rules_tenant_round_trip_through_api_and_broker() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Two tenants through the production namespace entry.
+        for ns in ["tm04-a", "tm04-b"] {
+            let (status, _) = server
+                .post_auth(&format!("/api/v5/mt/ns/{ns}"), json!({}), &token)
+                .await;
+            assert_eq!(status, 204, "namespace {ns} creates");
+        }
+        // Random value the broker cannot know.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|span| span.as_nanos())
+            .unwrap_or(0);
+        let secret = format!("tm04-secret-{nanos}");
+        // Create the rule of tenant A with a republish action.
+        let (status, created) = server
+            .post_auth(
+                "/api/v1/rules",
+                json!({
+                    "name": "tm04-a-rule",
+                    "topic_filter": "tm04/in",
+                    "tenant": "tm04-a",
+                    "actions": [{"type": "republish", "topic": "tm04/out", "qos": 0}]
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule creates: {created}");
+        assert_eq!(created["tenant"], json!("tm04-a"));
+        let id = created["id"]
+            .as_str()
+            .expect("created rule has id")
+            .to_string();
+        // The read shows the same tenant.
+        let (status, fetched) = server
+            .get_auth(&format!("/api/v1/rules/{id}"), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["tenant"], json!("tm04-a"));
+        // No tenant in the body means the default tenant, as before.
+        let (status, created) = server
+            .post_auth(
+                "/api/v1/rules",
+                json!({
+                    "name": "tm04-plain",
+                    "topic_filter": "tm04/in",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["tenant"], json!("default"));
+        // Through the broker: a publish of A fires only the A rule,
+        // and the output carries tenant A. A publish of B fires
+        // nothing: no rule of B matches.
+        let probe = Arc::new(TenantProbe {
+            recorded: std::sync::Mutex::new(Vec::new()),
+        });
+        let probe_obj: Arc<dyn broker_rules::BrokerSink> = probe.clone();
+        let topic = Topic::new("tm04/in").expect("topic parses");
+        let payload = bytes::Bytes::from(secret.clone());
+        let fired = state
+            .engine
+            .dispatch_ingress_in_tenant("tm04-a", &topic, &payload, QoS::AtMostOnce, &probe_obj)
+            .await;
+        assert_eq!(fired, 1, "only the A rule fires for an A publish");
+        let fired = state
+            .engine
+            .dispatch_ingress_in_tenant("tm04-b", &topic, &payload, QoS::AtMostOnce, &probe_obj)
+            .await;
+        assert_eq!(fired, 0, "no rule fires for a B publish");
+        let recorded = probe.recorded.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one output, from the A publish");
+        assert_eq!(recorded[0], ("tm04-a".to_string(), "tm04/out".to_string()));
+        // Cleanup through the API.
+        for rule_id in [id, created["id"].as_str().unwrap().to_string()] {
+            let (status, _) = server
+                .delete_auth(&format!("/api/v1/rules/{rule_id}"), &token)
+                .await;
+            assert_eq!(status, 204);
+        }
+    }
+
+    /// The v5 rule API carries the tenant: create validates it, the
+    /// read shows it, update moves it, and dispatch honours it.
+    #[tokio::test]
+    async fn test_v5_rules_tenant_create_update_dispatch_through_api() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for ns in ["tm04-v5a", "tm04-v5b"] {
+            let (status, _) = server
+                .post_auth(&format!("/api/v5/mt/ns/{ns}"), json!({}), &token)
+                .await;
+            assert_eq!(status, 204, "namespace {ns} creates");
+        }
+        // Unknown tenant fails with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "tm04-v5-bad",
+                    "sql": "SELECT * FROM \"tm04v5/in\"",
+                    "tenant": "tm04-ghost",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Create in the first tenant.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "tm04-v5-rule",
+                    "sql": "SELECT * FROM \"tm04v5/in\"",
+                    "tenant": "tm04-v5a",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule creates: {created}");
+        assert_eq!(created["tenant"], json!("tm04-v5a"));
+        let id = created["id"]
+            .as_str()
+            .expect("created rule has id")
+            .to_string();
+        // Update moves the rule to the second tenant.
+        let (status, updated) = server
+            .put_auth(
+                &format!("/api/v5/rules/{id}"),
+                json!({
+                    "name": "tm04-v5-rule",
+                    "sql": "SELECT * FROM \"tm04v5/in\"",
+                    "tenant": "tm04-v5b",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "update moves tenant: {updated}");
+        assert_eq!(updated["tenant"], json!("tm04-v5b"));
+        // Update to an unknown tenant fails and keeps the old rule.
+        let (status, body) = server
+            .put_auth(
+                &format!("/api/v5/rules/{id}"),
+                json!({
+                    "name": "tm04-v5-rule",
+                    "sql": "SELECT * FROM \"tm04v5/in\"",
+                    "tenant": "tm04-ghost",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, fetched) = server
+            .get_auth(&format!("/api/v5/rules/{id}"), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["tenant"], json!("tm04-v5b"));
+        // Dispatch honours the moved tenant.
+        let probe = Arc::new(TenantProbe {
+            recorded: std::sync::Mutex::new(Vec::new()),
+        });
+        let probe_obj: Arc<dyn broker_rules::BrokerSink> = probe.clone();
+        let topic = Topic::new("tm04v5/in").expect("topic parses");
+        let payload = bytes::Bytes::from_static(br#"{"temp": 21}"#);
+        let fired = state
+            .engine
+            .dispatch_ingress_in_tenant("tm04-v5a", &topic, &payload, QoS::AtMostOnce, &probe_obj)
+            .await;
+        assert_eq!(fired, 0, "the moved rule no longer fires in A");
+        let fired = state
+            .engine
+            .dispatch_ingress_in_tenant("tm04-v5b", &topic, &payload, QoS::AtMostOnce, &probe_obj)
+            .await;
+        assert_eq!(fired, 1, "the moved rule fires in B");
     }
 
     #[tokio::test]

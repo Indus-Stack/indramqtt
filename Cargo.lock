@@ -1524,6 +1524,8 @@ dependencies = [
  "broker-connectors-enterprise",
  "broker-observability",
  "broker-protocol",
+ "broker-router",
+ "broker-session",
  "bytes",
  "chrono",
  "flate2",

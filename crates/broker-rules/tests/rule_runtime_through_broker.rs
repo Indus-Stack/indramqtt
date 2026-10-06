@@ -20,10 +20,12 @@
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic, TopicFilter};
+use broker_router::{Router, Subscription};
 use broker_rules::{
     runtime as rule_runtime, BackpressurePolicy, BrokerSink, RuleAction, RuleEngine,
     RuleEngineError,
 };
+use broker_session::SessionManager;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -249,6 +251,7 @@ async fn runtime_bus_batch_admission_through_broker() {
     .iter()
     .map(|payload| {
         rule_runtime::ingress_to_stream_record(
+            "default",
             &Topic::new("sensors/kitchen").expect("ingress topic parses"),
             &Bytes::copy_from_slice(payload),
             QoS::AtMostOnce,
@@ -281,4 +284,269 @@ fn runtime_bounds_table_pinned() {
         65_536,
         "feed depth alias must match the task feed bound"
     );
+}
+
+/// Sink for the broker path. It fans out each rule output through
+/// the router to live sessions of the same tenant. It records each
+/// delivery as `(tenant, client, topic)`.
+struct BrokerPathSink {
+    router: Arc<Router>,
+    sessions: Arc<SessionManager>,
+    delivered: StdMutex<Vec<(String, String, String)>>,
+}
+
+impl BrokerPathSink {
+    fn with_parts(router: Arc<Router>, sessions: Arc<SessionManager>) -> Self {
+        Self {
+            router,
+            sessions,
+            delivered: StdMutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl BrokerSink for BrokerPathSink {
+    async fn publish(
+        &self,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), RuleEngineError> {
+        self.publish_in_tenant("default", topic, payload, qos, retain)
+            .await
+    }
+
+    async fn publish_in_tenant(
+        &self,
+        tenant: &str,
+        topic: Topic,
+        _payload: Bytes,
+        _qos: QoS,
+        _retain: bool,
+    ) -> Result<(), RuleEngineError> {
+        let (matched, _) = self.router.matches_in_tenant_counted(&topic, None, tenant);
+        for sub in matched.iter() {
+            let session = self.sessions.get_in_tenant(tenant, sub.client_id.as_ref());
+            if let Some(session) = session {
+                let connected = *session.connected.read();
+                let live = *session.conn_id.read();
+                if connected && live == Some(sub.conn_id) {
+                    self.delivered.lock().unwrap().push((
+                        tenant.to_string(),
+                        sub.client_id.to_string(),
+                        topic.as_str().to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Connect one real client. It creates the session record and pins
+/// the edge connection, like the kernel bind hook does.
+fn connect_client(sessions: &SessionManager, tenant: &str, client_id: &str, conn_id: u64) {
+    let (session, _) = sessions.get_or_create_in_tenant(tenant, client_id, true);
+    sessions.bind_session(&session, conn_id);
+    *session.keepalive_secs.write() = 60;
+    assert!(*session.connected.read());
+}
+
+/// Subscribe one real client. It records the grant on the router
+/// and on the session, like the kernel subscribe path does.
+fn subscribe_client(
+    router: &Router,
+    sessions: &SessionManager,
+    tenant: &str,
+    client_id: &str,
+    conn_id: u64,
+    filter: &str,
+) {
+    router.subscribe(
+        &TopicFilter::new(filter).expect("filter parses"),
+        Subscription::new_in_tenant(client_id, conn_id, QoS::AtMostOnce, tenant),
+    );
+    sessions.add_subscription_in_tenant(
+        tenant,
+        client_id,
+        TopicFilter::new(filter).expect("filter parses"),
+        QoS::AtMostOnce,
+    );
+}
+
+/// Make one republish action to a concrete topic.
+fn republish_to(out: &str) -> Vec<RuleAction> {
+    vec![RuleAction::Republish {
+        topic: Topic::new(out).expect("out topic parses"),
+        qos: QoS::AtMostOnce,
+    }]
+}
+
+/// Make one random value. The broker cannot know it in advance.
+fn random_secret(tag: &str) -> Bytes {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|span| span.as_nanos())
+        .unwrap_or(0);
+    Bytes::from(format!("tm04-{tag}-{nanos}"))
+}
+
+/// Rule of tenant A fires for a publish of tenant A only.
+/// It delivers to the subscriber of tenant A only.
+#[tokio::test]
+async fn tm04_rule_in_tenant_a_fires_only_for_a_through_broker_path() {
+    let router = Arc::new(Router::new());
+    let sessions = Arc::new(SessionManager::new());
+    connect_client(&sessions, "tm04-a", "tm04-a-sub", 4101);
+    connect_client(&sessions, "tm04-b", "tm04-b-sub", 4102);
+    subscribe_client(&router, &sessions, "tm04-a", "tm04-a-sub", 4101, "tm04/out");
+    subscribe_client(&router, &sessions, "tm04-b", "tm04-b-sub", 4102, "tm04/out");
+    let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+    engine
+        .create_rule_in_tenant(
+            "tm04-a".to_string(),
+            "tm04-a-rule".to_string(),
+            TopicFilter::new("tm04/in").expect("filter parses"),
+            None,
+            true,
+            republish_to("tm04/out"),
+        )
+        .expect("rule creates");
+    let sink = Arc::new(BrokerPathSink::with_parts(router, sessions));
+    let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+    let topic = Topic::new("tm04/in").expect("topic parses");
+    // Publish of tenant A fires once and delivers to A only.
+    let fired = engine
+        .dispatch_ingress_in_tenant(
+            "tm04-a",
+            &topic,
+            &random_secret("a"),
+            QoS::AtMostOnce,
+            &sink_obj,
+        )
+        .await;
+    assert_eq!(fired, 1);
+    // Publish of tenant B fires nothing and delivers nothing.
+    let fired = engine
+        .dispatch_ingress_in_tenant(
+            "tm04-b",
+            &topic,
+            &random_secret("b"),
+            QoS::AtMostOnce,
+            &sink_obj,
+        )
+        .await;
+    assert_eq!(fired, 0);
+    let rows = sink.delivered.lock().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "tm04-a");
+    assert_eq!(rows[0].1, "tm04-a-sub");
+    assert_eq!(rows[0].2, "tm04/out");
+}
+
+/// Rule output of tenant A reaches a subscriber of tenant A.
+/// It never reaches a subscriber of tenant B.
+#[tokio::test]
+async fn tm04_rule_output_stays_in_own_tenant_through_broker_path() {
+    let router = Arc::new(Router::new());
+    let sessions = Arc::new(SessionManager::new());
+    connect_client(&sessions, "tm04-a", "tm04-a-sub", 4201);
+    connect_client(&sessions, "tm04-b", "tm04-b-sub", 4202);
+    subscribe_client(
+        &router,
+        &sessions,
+        "tm04-a",
+        "tm04-a-sub",
+        4201,
+        "tm04/shared",
+    );
+    subscribe_client(
+        &router,
+        &sessions,
+        "tm04-b",
+        "tm04-b-sub",
+        4202,
+        "tm04/shared",
+    );
+    let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+    for (tenant, name) in [("tm04-a", "rule-a"), ("tm04-b", "rule-b")] {
+        engine
+            .create_rule_in_tenant(
+                tenant.to_string(),
+                name.to_string(),
+                TopicFilter::new("tm04/in").expect("filter parses"),
+                None,
+                true,
+                republish_to("tm04/shared"),
+            )
+            .expect("rule creates");
+    }
+    let sink = Arc::new(BrokerPathSink::with_parts(router, sessions));
+    let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+    let topic = Topic::new("tm04/in").expect("topic parses");
+    let fired = engine
+        .dispatch_ingress_in_tenant(
+            "tm04-a",
+            &topic,
+            &random_secret("a"),
+            QoS::AtMostOnce,
+            &sink_obj,
+        )
+        .await;
+    assert_eq!(fired, 1);
+    let rows = sink.delivered.lock().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "tm04-a");
+    assert_eq!(rows[0].1, "tm04-a-sub");
+}
+
+/// Rule from before tenancy serves the default tenant.
+/// It fires for default ingress and never for other tenants.
+#[tokio::test]
+async fn tm04_legacy_rule_serves_default_tenant_through_broker_path() {
+    let router = Arc::new(Router::new());
+    let sessions = Arc::new(SessionManager::new());
+    connect_client(&sessions, "default", "tm04-legacy-sub", 4301);
+    subscribe_client(
+        &router,
+        &sessions,
+        "default",
+        "tm04-legacy-sub",
+        4301,
+        "tm04/legacy-out",
+    );
+    let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+    let rule = engine
+        .create_rule(
+            "legacy".to_string(),
+            TopicFilter::new("tm04/legacy-in").expect("filter parses"),
+            None,
+            true,
+            republish_to("tm04/legacy-out"),
+        )
+        .expect("rule creates");
+    assert_eq!(rule.tenant, "default");
+    let sink = Arc::new(BrokerPathSink::with_parts(router, sessions));
+    let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+    let topic = Topic::new("tm04/legacy-in").expect("topic parses");
+    let fired = engine
+        .dispatch_ingress(&topic, &random_secret("d"), QoS::AtMostOnce, &sink_obj)
+        .await;
+    assert_eq!(fired, 1);
+    let fired = engine
+        .dispatch_ingress_in_tenant(
+            "tm04-a",
+            &topic,
+            &random_secret("a"),
+            QoS::AtMostOnce,
+            &sink_obj,
+        )
+        .await;
+    assert_eq!(fired, 0);
+    let rows = sink.delivered.lock().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "default");
+    assert_eq!(rows[0].1, "tm04-legacy-sub");
 }

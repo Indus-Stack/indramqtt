@@ -679,6 +679,34 @@ fn default_rule_enabled() -> bool {
     true
 }
 
+/// Serde default for a missing rule tenant: historical entries predate
+/// tenancy and ran in the default tenant.
+fn default_rule_tenant() -> String {
+    "default".to_string()
+}
+
+/// Longest accepted rule tenant id (128 chars). Reason: mirrors the
+/// session tenant bound, so the id joins routing keys with bounded
+/// key memory.
+pub const MAX_RULE_TENANT_LEN: usize = 128;
+
+/// True when a rule tenant id may own a rule: non-empty, at most
+/// 128 chars, no control chars. Empty fails here; callers map empty
+/// to the default tenant before this check.
+pub fn is_valid_rule_tenant(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_RULE_TENANT_LEN && !id.chars().any(|c| c.is_control())
+}
+
+/// Map an absent or blank rule tenant to the default tenant.
+pub fn canonical_rule_tenant(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Upper bound for stored routing rules. Creates past this size are
 /// rejected instead of growing the map without limit. Reason: the list
 /// handler clones the whole snapshot once per request, so the catalogue
@@ -703,6 +731,10 @@ pub struct RuleEntry {
     /// Rule name; free-form (pre-persistence files load as empty).
     #[serde(default)]
     pub name: String,
+    /// Tenant that owns the rule. Empty loads as the default tenant so
+    /// files written before tenancy keep their behaviour.
+    #[serde(default = "default_rule_tenant")]
+    pub tenant: String,
     /// MQTT topic filter; must be non-empty.
     pub topic_filter: String,
     /// Optional streaming-SQL program (`None` = match without SQL).
@@ -747,6 +779,12 @@ impl RulesConf {
                 return Err(ConfigError::Invalid(format!(
                     "rules.rules[{index}].id {:?} is too long (field `id`)",
                     rule.id
+                )));
+            }
+            if !is_valid_rule_tenant(&rule.tenant) {
+                return Err(ConfigError::Invalid(format!(
+                    "rules.rules[{index}].tenant {:?} is not valid (field `tenant`)",
+                    rule.tenant
                 )));
             }
             if rule.topic_filter.trim().is_empty() {
@@ -3573,6 +3611,7 @@ mod tests {
                 rules: vec![RuleEntry {
                     id: "rule-1".to_string(),
                     name: "rule-1".to_string(),
+                    tenant: "default".to_string(),
                     topic_filter: "sensors/#".to_string(),
                     sql_query: Some("SELECT * FROM 'sensors/#'".to_string()),
                     enabled: true,
@@ -3702,6 +3741,7 @@ mod tests {
         let rule = RuleEntry {
             id: "rule-1".to_string(),
             name: "rule-1".to_string(),
+            tenant: "default".to_string(),
             topic_filter: "a/#".to_string(),
             sql_query: Some("SELECT * FROM 'a/#'".to_string()),
             enabled: true,
@@ -4048,6 +4088,7 @@ mod tests {
             rules: vec![RuleEntry {
                 id: "rule-1".to_string(),
                 name: "rule-1".to_string(),
+                tenant: "default".to_string(),
                 topic_filter: "sensors/#".to_string(),
                 sql_query: Some("SELECT * FROM 'sensors/#'".to_string()),
                 enabled: true,
@@ -4099,6 +4140,7 @@ mod tests {
             rules: vec![RuleEntry {
                 id: String::new(),
                 name: String::new(),
+                tenant: "default".to_string(),
                 topic_filter: "a/#".to_string(),
                 sql_query: Some("SELECT 1".to_string()),
                 enabled: true,

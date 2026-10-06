@@ -1054,6 +1054,7 @@ mod tests {
         broker_config::RuleEntry {
             id: id.to_string(),
             name: id.to_string(),
+            tenant: "default".to_string(),
             topic_filter: filter.to_string(),
             sql_query: None,
             enabled: true,
@@ -1211,6 +1212,7 @@ mod tests {
         snapshot.rules.rules.push(broker_config::RuleEntry {
             id: "dangling".to_string(),
             name: "dangling".to_string(),
+            tenant: "default".to_string(),
             topic_filter: "a/#".to_string(),
             sql_query: None,
             enabled: true,

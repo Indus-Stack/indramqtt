@@ -38,6 +38,8 @@ lz4_flex = "0.14"
 
 [dev-dependencies]
 broker-connectors-enterprise = { workspace = true }
+broker-router = { workspace = true }
+broker-session = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }

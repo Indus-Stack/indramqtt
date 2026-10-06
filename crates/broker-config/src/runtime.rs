@@ -739,6 +739,7 @@ mod tests {
                 rules: vec![crate::RuleEntry {
                     id: "r1".to_string(),
                     name: "r1".to_string(),
+                    tenant: "default".to_string(),
                     topic_filter: "a/#".to_string(),
                     sql_query: None,
                     enabled: true,

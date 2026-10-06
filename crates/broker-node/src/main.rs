@@ -4234,11 +4234,25 @@ impl BrokerSink for InMemoryBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
-        // TODO(parity): rule republished output carries no tenant yet, so
-        // it fans out in the default tenant only (fail closed: no
-        // cross-tenant leak, single-tenant behaviour unchanged). The open
-        // question is the tenant attribution for derived messages once
-        // the rule engine dispatches per tenant.
+        self.publish_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            topic,
+            payload,
+            qos,
+            retain,
+        )
+        .await
+    }
+    /// Fan out one derived message inside one tenant. The match reads
+    /// only that tenant, so output never leaves it.
+    async fn publish_in_tenant(
+        &self,
+        tenant: &str,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), broker_rules::RuleEngineError> {
         let deliveries = build_downlink_frames(
             &self.router,
             &self.sessions,
@@ -4247,7 +4261,7 @@ impl BrokerSink for InMemoryBrokerSink {
             qos,
             retain,
             &payload,
-            broker_session::tenant::DEFAULT_TENANT_ID,
+            tenant,
         );
         // Only frames that reached a live mailbox count as
         // forwarded/sent/delivered. Drops are already counted inside
@@ -6638,19 +6652,14 @@ async fn ingress_pipeline_with_publisher_and_props(
     // Republished output re-enters through the sink only, so rules can
     // never recurse through their own output.
     //
-    // The rules and the CoAP observers do not contain a tenant. A rule
-    // publishes its output in the default tenant. An observer reads the
-    // default tenant. Thus they get only the messages of the default
-    // tenant. A message of a different tenant does not go to them. An
-    // installation with the default tenant only operates as before.
-    let default_tenant = is_default_tenant(publisher_tenant);
-    if default_tenant {
-        let rules_fired = shared
-            .engine
-            .dispatch_ingress(topic, payload, qos, &shared.sink)
-            .await;
-        shared.metrics.inc_rules_executed_by(rules_fired as u64);
-    }
+    // Each rule serves one tenant. Only rules of the publisher tenant
+    // run. Each output fans out in the same tenant. A default-only
+    // setup runs as before.
+    let rules_fired = shared
+        .engine
+        .dispatch_ingress_in_tenant(publisher_tenant, topic, payload, qos, &shared.sink)
+        .await;
+    shared.metrics.inc_rules_executed_by(rules_fired as u64);
 
     // Topic index (W1-15): remember the concrete publish topic so the
     // management list/detail reads observe edge publishes as well as
@@ -6687,7 +6696,9 @@ async fn ingress_pipeline_with_publisher_and_props(
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
     // returns after a length check, no spawn, no socket work.
-    if default_tenant {
+    // Observers read the default tenant only. A message of another
+    // tenant never reaches them (fail closed, TM-05 owns gateways).
+    if is_default_tenant(publisher_tenant) {
         maybe_notify_coap_observers(shared, topic.as_str(), payload);
     }
     deliveries
@@ -18465,6 +18476,187 @@ mod tests {
         let ack = ack.expect("QoS 1 publisher gets its ack");
         assert_eq!(ack.metadata[2], 0x87, "B's publish is refused");
         assert!(deliveries.is_empty(), "B's publish delivers nothing");
+    }
+
+    #[tokio::test]
+    async fn tm04_rule_in_tenant_fires_only_for_own_tenant_through_broker() {
+        // TM-04 through the real broker path (bind, subscribe,
+        // publish, rule dispatch, sink — never store-only). Two
+        // tenants share the username `sam` with separate passwords.
+        // One rule of tenant A republishes. A publish with a random
+        // value in A fires the rule and the output carries tenant A
+        // to the subscriber set of A only. A publish in B fires
+        // nothing and outputs nothing.
+        use broker_session::tenant::TenantRule;
+        let mut shared = test_shared();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${clientid}")])
+            .expect("tenant rules store");
+        for (tenant, password) in [
+            ("t-tm04-a", b"pw-for-a".as_slice()),
+            ("t-tm04-b", b"pw-for-b".as_slice()),
+        ] {
+            shared
+                .auth
+                .add_user_in_tenant(tenant, "sam", password)
+                .expect("tenant user stores");
+            for action in [
+                broker_auth::AclAction::Publish,
+                broker_auth::AclAction::Subscribe,
+            ] {
+                shared
+                    .auth
+                    .add_rule_in_tenant(
+                        tenant,
+                        broker_auth::AclRule::new("*", action, "tm04/#", true),
+                    )
+                    .expect("tenant rule stores");
+            }
+        }
+        for (conn, client, pw) in [
+            (401u64, "tm04-a", b"pw-for-a".as_slice()),
+            (402u64, "tm04-b", b"pw-for-b".as_slice()),
+        ] {
+            let meta = encode_bind_meta_creds(client, true, 60, "sam", pw);
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0, "{client} connects with its own password");
+        }
+        // One rule of tenant A: match `tm04/in`, republish `tm04/out`.
+        let rule = shared
+            .engine
+            .create_rule_in_tenant(
+                "t-tm04-a".to_string(),
+                "tm04-a-rule".to_string(),
+                broker_protocol::TopicFilter::new("tm04/in").expect("filter parses"),
+                None,
+                true,
+                vec![broker_rules::RuleAction::Republish {
+                    topic: broker_protocol::Topic::new("tm04/out").expect("topic parses"),
+                    qos: broker_protocol::QoS::AtMostOnce,
+                }],
+            )
+            .expect("rule creates");
+        assert_eq!(rule.tenant, "t-tm04-a");
+        // Both tenants subscribe to the output topic. Both grants land.
+        for (conn, client) in [(401u64, "tm04-a"), (402u64, "tm04-b")] {
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("tm04/out", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            let reply = reply.expect("subscribe replies");
+            assert_eq!(reply.metadata[2], 0, "{client} subscribe is granted");
+        }
+        // Tee probe: record the output tenant, then run the real
+        // fan-out unchanged.
+        #[derive(Default)]
+        struct TeeSink {
+            inner: std::sync::Mutex<Option<std::sync::Arc<dyn BrokerSink>>>,
+            recorded: std::sync::Mutex<Vec<(String, String, bytes::Bytes)>>,
+        }
+        #[async_trait::async_trait]
+        impl BrokerSink for TeeSink {
+            async fn publish(
+                &self,
+                topic: Topic,
+                payload: Bytes,
+                qos: QoS,
+                retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                self.recorded.lock().unwrap().push((
+                    "default".to_string(),
+                    topic.as_str().to_string(),
+                    payload.clone(),
+                ));
+                let inner = self.inner.lock().unwrap().clone();
+                if let Some(inner) = inner {
+                    inner.publish(topic, payload, qos, retain).await?;
+                }
+                Ok(())
+            }
+            async fn publish_in_tenant(
+                &self,
+                tenant: &str,
+                topic: Topic,
+                payload: Bytes,
+                qos: QoS,
+                retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                self.recorded.lock().unwrap().push((
+                    tenant.to_string(),
+                    topic.as_str().to_string(),
+                    payload.clone(),
+                ));
+                let inner = self.inner.lock().unwrap().clone();
+                if let Some(inner) = inner {
+                    inner
+                        .publish_in_tenant(tenant, topic, payload, qos, retain)
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+        let tee = std::sync::Arc::new(TeeSink::default());
+        *tee.inner.lock().unwrap() = Some(shared.sink.clone());
+        let tee_obj: std::sync::Arc<dyn BrokerSink> = tee.clone();
+        shared.sink = tee_obj;
+        // Random values the broker cannot know.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|span| span.as_nanos())
+            .unwrap_or(0);
+        let secret_a = format!("tm04-secret-a-{nanos}");
+        let secret_b = format!("tm04-secret-b-{nanos}");
+        // Publish in A: the rule fires once.
+        let (meta, payload) = encode_publish_meta("tm04/in", 0, 0, false, secret_a.as_bytes());
+        let (_, deliveries) = apply_publish(&publish_frame(401, 2, meta, payload), &shared).await;
+        assert!(deliveries.is_empty(), "no direct subscriber on tm04/in");
+        let recorded = tee.recorded.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one rule output for the A publish");
+        assert_eq!(recorded[0].0, "t-tm04-a", "output stays in tenant A");
+        assert_eq!(recorded[0].1, "tm04/out");
+        assert_eq!(recorded[0].2, bytes::Bytes::from(secret_a.clone()));
+        // The output tenant holds only the A subscriber.
+        let out_topic = broker_protocol::Topic::new("tm04/out").expect("topic parses");
+        let (matched_a, _) = shared
+            .router
+            .matches_in_tenant_counted(&out_topic, None, "t-tm04-a");
+        assert!(matched_a.iter().any(|s| s.client_id.as_ref() == "tm04-a"));
+        assert!(!matched_a.iter().any(|s| s.client_id.as_ref() == "tm04-b"));
+        let (matched_b, _) = shared
+            .router
+            .matches_in_tenant_counted(&out_topic, None, "t-tm04-b");
+        assert!(matched_b.iter().any(|s| s.client_id.as_ref() == "tm04-b"));
+        assert!(!matched_b.iter().any(|s| s.client_id.as_ref() == "tm04-a"));
+        // Publish in B: no rule of B exists, so nothing outputs.
+        let (meta, payload) = encode_publish_meta("tm04/in", 0, 0, false, secret_b.as_bytes());
+        let (_, deliveries) = apply_publish(&publish_frame(402, 3, meta, payload), &shared).await;
+        assert!(deliveries.is_empty(), "no direct subscriber on tm04/in");
+        assert_eq!(
+            tee.recorded.lock().unwrap().len(),
+            1,
+            "the B publish outputs nothing"
+        );
+        // Counters show one match and one pass, both from A.
+        let stored = shared.engine.get_rule(&rule.id).expect("rule stays");
+        assert_eq!(
+            stored
+                .matched_cnt
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stored.passed_cnt.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]

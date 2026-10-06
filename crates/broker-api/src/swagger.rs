@@ -326,6 +326,7 @@ pub fn openapi_spec_json() -> &'static str {
                     "properties": {
                       "id": { "type": "string", "example": "rule-1" },
                       "name": { "type": "string", "example": "high-temp-alert" },
+                      "tenant": { "type": "string", "example": "default" },
                       "topic_filter": { "type": "string", "example": "sensors/+" },
                       "sql_query": { "type": "string", "example": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 40.0" },
                       "enabled": { "type": "boolean", "example": true }
@@ -350,6 +351,7 @@ pub fn openapi_spec_json() -> &'static str {
                 "required": ["name", "topic_filter"],
                 "properties": {
                   "name": { "type": "string", "example": "high-temp-alert" },
+                  "tenant": { "type": "string", "example": "default" },
                   "topic_filter": { "type": "string", "example": "sensors/+" },
                   "sql_query": { "type": "string", "example": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 40.0" },
                   "enabled": { "type": "boolean", "default": true }
