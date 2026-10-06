@@ -884,6 +884,9 @@ fn describe_action(action: &serde_json::Value) -> String {
 }
 
 async fn cmd_status(ctl: &CtlArgs, key: &SecretString) -> Result<String, CtlError> {
+    // `GET /status` is public health. Verify the key first.
+    // `GET /nodes` needs authentication. A wrong key fails here.
+    request(ctl, key, reqwest::Method::GET, "/api/v5/nodes", None).await?;
     let (_, body) = request(
         ctl,
         key,

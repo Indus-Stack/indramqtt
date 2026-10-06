@@ -697,14 +697,14 @@ pub fn access_for_path(path: &str) -> PathAccess {
     match group.as_str() {
         "status" | "error_codes" => PathAccess::Anonymous,
         "current_user" | "features" => PathAccess::AnyKey,
-        "clients" | "clients_v2" | "subscriptions" | "topics" | "sessions_count" | "banned" => {
-            PathAccess::Scope("connections")
-        }
+        "clients" | "clients_v2" | "subscriptions" | "topics" | "sessions_count" | "banned"
+        | "queues" | "queue" | "streams" | "stream" => PathAccess::Scope("connections"),
         "publish" => PathAccess::Scope("publish"),
         "rules"
         | "rule_engine"
         | "rule_events"
         | "rule_test"
+        | "ai"
         | "actions"
         | "actions_probe"
         | "actions_summary"
@@ -721,8 +721,8 @@ pub fn access_for_path(path: &str) -> PathAccess {
         "authentication" | "authorization" => PathAccess::Scope("access_control"),
         "gateways" => PathAccess::Scope("gateways"),
         "metrics" | "monitor" | "monitor_current" | "stats" | "alarms" | "trace" | "tracing"
-        | "slow_subscriptions" => PathAccess::Scope("monitoring"),
-        "nodes" => PathAccess::Scope("cluster_operations"),
+        | "slow_subscriptions" | "telemetry" => PathAccess::Scope("monitoring"),
+        "nodes" | "load_rebalance" | "node_eviction" => PathAccess::Scope("cluster_operations"),
         "listeners" | "mqtt" | "data" => PathAccess::Scope("system"),
         "audit" => PathAccess::Scope("audit"),
         "license" => PathAccess::Scope("license"),

@@ -192,3 +192,17 @@ is not changed.
   `/schemas/actions`, strips the label keys and reads paths inside the
   object. The broker returns the schema object, so the checker reports a
   type error for this row.
+- `GET /queues`, response 200. The specification declares a bare array,
+  but its own example shows one object with `data` and `meta`. The
+  management console reads one object with `data` and `meta`:
+  `getMessageQueues` in the API module of the console returns
+  `ListDataWithCursor<MessageQueue>`, and the queue page reads
+  `res?.data`. The broker returns one object with `data` and the standard
+  page `meta`, so the checker reports a type error for this row.
+- `GET /streams`, response 200. The specification declares a bare array,
+  but its own example shows one object with `data` and `meta`. The
+  management console reads one object with `data` and `meta`:
+  `getMessageStreamList` in the API module of the console returns
+  `ListDataWithCursor<MessageStreamItem>`, and the stream page reads
+  `res?.data`. The broker returns one object with `data` and the standard
+  page `meta`, so the checker reports a type error for this row.

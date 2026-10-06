@@ -2979,6 +2979,103 @@ mod tests {
         assert_eq!(text, "OK");
     }
 
+    /// Empty states of the console pages (AP-01): the reads answer the
+    /// documented shape with an empty or disabled state, and the writes
+    /// refuse with 400 `BAD_REQUEST`. Nothing is stored.
+    #[tokio::test]
+    async fn test_console_empty_states_are_honest() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // AI lists read empty; the Flow Designer loads both together.
+        let (status, body) = server.get_auth("/api/v5/ai/providers", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"items": []}));
+        let (status, body) = server
+            .get_auth("/api/v5/ai/completion_profiles", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"items": []}));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/ai/providers",
+                json!({"name": "x", "type": "openai", "api_key": "k"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/ai/providers/no-such-provider", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Queue and stream configs read disabled; lists read empty.
+        let (status, body) = server.get_auth("/api/v5/queues/config", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server.get_auth("/api/v5/streams/config", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        let (status, body) = server.get_auth("/api/v5/queues", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        let (status, body) = server.get_auth("/api/v5/streams", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        let (status, body) = server
+            .put_auth("/api/v5/queues/config", json!({"enable": true}), &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .post_auth("/api/v5/queues", json!({"name": "q1"}), &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Telemetry reads disabled; data misses while disabled.
+        let (status, body) = server.get_auth("/api/v5/telemetry/status", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"enable": false}));
+        let (status, body) = server.get_auth("/api/v5/telemetry/data", &token).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Rebalance and eviction read idle; writes refuse.
+        let (status, body) = server
+            .get_auth("/api/v5/load_rebalance/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"status": "disabled"}));
+        let (status, body) = server
+            .get_auth("/api/v5/load_rebalance/global_status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rebalances"], json!([]));
+        let (status, body) = server
+            .get("/api/v5/load_rebalance/availability_check")
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({}));
+        let (status, body) = server
+            .get_auth("/api/v5/node_eviction/status", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"status": "disabled"}));
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/load_rebalance/no-such-node/start",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+    }
+
     #[tokio::test]
     async fn test_rules_crud_lifecycle() {
         let (server, _state) = TestServer::start().await;
@@ -15613,7 +15710,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         for path in [
             "/api/v5/mqtt/retained",
             "/api/v5/mqtt/delayed/messages",
-            "/api/v5/ai/providers",
             "/api/v5/configs/a2a_registry",
             "/api/v5/indra/extra_features",
         ] {
@@ -15631,7 +15727,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     async fn removed_system_fake_routes_return_404() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in ["/api/v5/configs", "/api/v5/telemetry/status"] {
+        for path in ["/api/v5/configs"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }

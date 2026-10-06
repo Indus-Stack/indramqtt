@@ -20,6 +20,7 @@ pub mod backup;
 pub mod banned;
 pub mod clients;
 pub mod data;
+pub mod empty_states;
 pub mod error_codes;
 pub mod features;
 pub mod gateways;
@@ -61,6 +62,14 @@ pub fn public_router() -> Router<ApiState> {
         // documents. One relaxed atomic load per request; publish and
         // deliver never touch it.
         .route("/status", get(status::get_status))
+        // Load rebalance availability check (AP-01): ready while the node
+        // evacuates nothing. Public by definition: the reference API
+        // requires no credentials here. Management-plane only; publish
+        // and deliver never touch it.
+        .route(
+            "/load_rebalance/availability_check",
+            get(empty_states::get_rebalance_availability),
+        )
         // Single-sign-on backend login (W2-33, C05-12): pre-auth by
         // definition (the dashboard login page calls it before anyone
         // holds a token). Management-plane only; publish and deliver
@@ -871,5 +880,98 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/schema_registry/:name",
             delete(schema_registry::delete_schema_registry),
+        )
+        // Honest empty states for functions the broker does not have
+        // (AP-01): AI providers and completion profiles, message queues,
+        // message streams, telemetry, load rebalance and node eviction.
+        // Reads answer the documented shape with an empty or disabled
+        // state. Writes answer 400 `BAD_REQUEST`. Nothing is stored.
+        // Management-plane only; publish and deliver never touch it.
+        .route(
+            "/ai/providers",
+            get(empty_states::list_ai_providers).post(empty_states::create_ai_provider),
+        )
+        .route(
+            "/ai/providers/:name",
+            get(empty_states::get_ai_provider)
+                .put(empty_states::update_ai_provider)
+                .delete(empty_states::delete_ai_provider),
+        )
+        .route(
+            "/ai/providers/:name/models",
+            get(empty_states::list_ai_provider_models),
+        )
+        .route("/ai/models", post(empty_states::list_ai_models))
+        .route(
+            "/ai/completion_profiles",
+            get(empty_states::list_ai_completion_profiles)
+                .post(empty_states::create_ai_completion_profile),
+        )
+        .route(
+            "/ai/completion_profiles/:name",
+            get(empty_states::get_ai_completion_profile)
+                .put(empty_states::update_ai_completion_profile)
+                .delete(empty_states::delete_ai_completion_profile),
+        )
+        .route(
+            "/queues",
+            get(empty_states::list_queues).post(empty_states::create_queue),
+        )
+        .route(
+            "/queues/config",
+            get(empty_states::get_queue_config).put(empty_states::put_queue_config),
+        )
+        .route(
+            "/queue/:name",
+            get(empty_states::get_queue)
+                .put(empty_states::update_queue)
+                .delete(empty_states::delete_queue),
+        )
+        .route(
+            "/streams",
+            get(empty_states::list_streams).post(empty_states::create_stream),
+        )
+        .route(
+            "/streams/config",
+            get(empty_states::get_stream_config).put(empty_states::put_stream_config),
+        )
+        .route(
+            "/stream/:name",
+            get(empty_states::get_stream)
+                .put(empty_states::update_stream)
+                .delete(empty_states::delete_stream),
+        )
+        .route(
+            "/telemetry/status",
+            get(empty_states::get_telemetry_status).put(empty_states::put_telemetry_status),
+        )
+        .route("/telemetry/data", get(empty_states::get_telemetry_data))
+        .route(
+            "/load_rebalance/status",
+            get(empty_states::get_rebalance_status),
+        )
+        .route(
+            "/load_rebalance/global_status",
+            get(empty_states::get_rebalance_global_status),
+        )
+        .route(
+            "/load_rebalance/:node/start",
+            post(empty_states::start_rebalance),
+        )
+        .route(
+            "/load_rebalance/:node/stop",
+            post(empty_states::stop_rebalance),
+        )
+        .route(
+            "/load_rebalance/:node/evacuation/start",
+            post(empty_states::start_evacuation),
+        )
+        .route(
+            "/load_rebalance/:node/evacuation/stop",
+            post(empty_states::stop_evacuation),
+        )
+        .route(
+            "/node_eviction/status",
+            get(empty_states::get_node_eviction_status),
         )
 }
