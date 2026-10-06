@@ -9133,6 +9133,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // management reads observe the persisted sources from the first
     // connection. Defaults yield the built-in database source.
     shared.authz_sources.seed_from_registry(&shared.config);
+    // Link the shared registry into the shared rule table (AP-06):
+    // publish/subscribe verdicts attribute to the built-in counters and
+    // honour the stored enable flag and order. One `Arc` clone.
+    shared
+        .auth
+        .set_authz_sources(Arc::clone(&shared.authz_sources));
     // Management API keys (W2-25): seed the shared directory in place
     // (the same instance `serve_api` shares with `ApiState`), so
     // management reads observe the persisted keys from the first

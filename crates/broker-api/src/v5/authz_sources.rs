@@ -1,8 +1,8 @@
 //! Authorization source registry for the v5 management API.
 //!
-//! Covers `GET /authorization/sources` (ordered page), `POST
+//! Covers `GET /authorization/sources` (ordered collection), `POST
 //! /authorization/sources` (register one source), `GET
-//! /authorization/sources/:type` (one source's config and health),
+//! /authorization/sources/:type` (one source's config and counters),
 //! `PUT /authorization/sources/:type` (replace one source) and `POST
 //! /authorization/sources/:type/metrics/reset` (zero one source's
 //! counters), plus `DELETE
@@ -11,10 +11,12 @@
 //! plus the live built-in rule table (`MemoryAuth` in
 //! `crates/broker-auth/src/lib.rs`, consulted by the publish event in
 //! `crates/broker-node/src/main.rs` and the console path in
-//! `crates/broker-api/src/ws.rs`). Single-node, management-plane only:
-//! handlers clone at most the capped list once per request under a short
-//! lock; the CONNECT path keeps its own short locks and publish/deliver
-//! never touch this registry.
+//! `crates/broker-api/src/ws.rs`). Single-node: handlers clone at most
+//! the capped list once per request under a short lock; the publish and
+//! subscribe consults load the lock-free order snapshot for the stored
+//! enable flag and order plus the built-in rule table, and attribute
+//! each verdict to the built-in counters; publish/deliver never take
+//! this registry's write lock.
 //!
 //! Only the built-in database source executes; every other source type's
 //! config is stored and reported, never claimed as live (per-type query
@@ -28,11 +30,12 @@
 //! bounded; 8 covers the documented backend families with headroom while
 //! keeping per-request clones cheap). Default registry: only the
 //! built-in database source.
-// TODO(parity): which per-source fields plus list envelope does the spec
-// require (bare list versus data/meta, status/health fields)? The
-// rulebook does not decide the exact shape; the current choice reuses the
-// shared pagination extractor (data plus meta) and reports type/enable
-// only, omitting status fields the broker cannot supply.
+//!
+//! Shape note: the reference specification types each source as a variant
+//! (one schema per backend). Each row reports the stored keys (`type`,
+//! `enable`) plus the stored backend fields at the top level. The
+//! management console reads the same flat fields. A stored `config`
+//! object also renders under `config` for older readers.
 // TODO(parity): does a successful clear report an empty 204 or a 200
 // success envelope, and does creating with an unknown `type` fail with
 // 404 or 400? The rulebook does not decide the exact shapes; the current
@@ -49,42 +52,41 @@ use axum::{
 use bytes::Bytes;
 
 use crate::errors::ApiError;
-use crate::pagination::{meta_page, paginate, PageParams};
+use crate::pagination::PageParams;
 use crate::ApiState;
 use broker_auth::{AuthzSourceEntry, SourceInsertError, SourceUpdateError};
 
-/// Render one stored source. Only stored fields are reported: `type`
-/// plus `enable`, with the backend `config` object when one is stored.
-/// Health/status fields the broker does not measure are omitted, never
-/// invented; non-built-in sources are stored configuration, never
-/// claimed as live.
+/// Render one stored source. Report the stored keys (`type`, `enable`).
+/// Copy each stored backend field to the top level. Keep the stored
+/// object under `config` for older readers. Omit health fields the
+/// broker does not measure.
 fn render_entry(entry: &AuthzSourceEntry) -> serde_json::Value {
     let mut value = serde_json::json!({
         "type": entry.source_type,
         "enable": entry.enable,
     });
-    if !entry.config.is_null() {
-        value["config"] = entry.config.clone();
+    if let Some(fields) = entry.config.as_object() {
+        for (key, field) in fields {
+            if value.get(key).is_none() {
+                value[key] = field.clone();
+            }
+        }
+        if !entry.config.is_null() {
+            value["config"] = entry.config.clone();
+        }
     }
     value
 }
 
-/// `GET /authorization/sources`: ordered page (`data` plus `meta`). An
-/// empty registry reads as an empty page, never an error. Malformed
-/// `page`/`limit` fall back to defaults via [`PageParams`].
+/// `GET /authorization/sources`: ordered collection under `sources`.
+/// An empty registry reads as an empty collection, never an error.
+/// The reference specification documents `{"sources": [...]}`; the
+/// broker answers exactly that shape in stored order.
 pub async fn list_authz_sources(State(state): State<ApiState>, params: PageParams) -> Response {
+    let _ = params;
     let all = state.authz_sources.list();
-    let total = all.len();
-    let page_items = paginate(&all, params.page, params.limit);
-    let data: Vec<serde_json::Value> = page_items.iter().map(render_entry).collect();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": data,
-            "meta": meta_page(params.page, params.limit, total),
-        })),
-    )
-        .into_response()
+    let data: Vec<serde_json::Value> = all.iter().map(render_entry).collect();
+    (StatusCode::OK, Json(serde_json::json!({ "sources": data }))).into_response()
 }
 
 /// Why a create body was refused.
@@ -484,11 +486,13 @@ pub async fn clear_catch_all_rules(State(state): State<ApiState>) -> Response {
 /// type, or a list omitting a stored type applies nothing and fails with
 /// `BAD_REQUEST` in the documented `{code, message}` shape. On success
 /// returns 204 with no body. The order persists across a restart through
-/// the config registry.
-/// Management-plane only: one short registry write lock per request
-/// (plus the registry save lock on persist); the publish and subscribe
-/// authorization consults read the built-in rule table, never this
-/// registry, and publish/deliver never touch this handler's lock.
+/// the config registry and the publish/subscribe consults honour it from
+/// the next verdict (stored-only sources are skipped in stored order;
+/// a disabled or removed built-in source denies fail closed).
+/// Management-plane only for the write: one short registry write lock
+/// per request (plus the registry save lock on persist); the publish
+/// and subscribe consults load the lock-free order snapshot and never
+/// take this handler's lock.
 // TODO(parity): is the documented order body a bare array of
 // `{"type": ...}` objects (as implemented here, mirroring the sibling
 // authenticator order), an array of bare type strings, or an object
@@ -570,11 +574,12 @@ fn parse_order_request(value: &serde_json::Value) -> Result<Vec<String>, String>
 /// message}` shape and apply nothing. Deleting the last remaining
 /// source is refused with `BAD_REQUEST` instead of leaving
 /// authorization open. On success returns 204 with no body. The removal
-/// persists across a restart through the config registry.
-/// Management-plane only: one short registry write lock per request
-/// (plus the registry save lock on persist); the publish and subscribe
-/// authorization consults read the built-in rule table, never this
-/// registry, and publish/deliver never touch this handler's lock.
+/// persists across a restart through the config registry and the
+/// publish/subscribe consults honour it from the next verdict.
+/// Management-plane only for the write: one short registry write lock
+/// per request (plus the registry save lock on persist); the publish
+/// and subscribe consults load the lock-free order snapshot and never
+/// take this handler's lock.
 // TODO(parity): is "last" the last entry of any kind, or the last
 // enabled entry / last live backend? The rulebook does not decide the
 // exact refusal set; the current choice refuses deleting the sole
@@ -602,63 +607,48 @@ pub async fn delete_authz_source(
     }
 }
 
-/// Honest single-node liveness for one source entry.
-///
-/// An enabled built-in entry executes locally, so it reads as
-/// connected. Anything else (disabled, or a stored-only backend that
-/// never executes) reads as disconnected: no live backend serves it. No
-/// outbound connection is opened to decide this.
-fn live_status(entry: &AuthzSourceEntry) -> &'static str {
-    if entry.enable && entry.source_type == "built_in_database" {
-        "connected"
-    } else {
-        "disconnected"
-    }
-}
-
-/// Render one stored source with its live health and counters. Only
-/// stored fields are reported (`type` plus `enable`, with the backend
-/// `config` object when one is stored) plus the live `status` and the
-/// counter-only `metrics` (`allow`/`deny`/`total`, memory-only, zeroed
-/// on restart): health the broker does not measure (rates, resource
-/// fields) is omitted, never invented; non-built-in sources are stored
-/// configuration, never claimed as live.
-// TODO(parity): which per-source detail fields plus rate/status shapes
-// does the spec require? The rulebook does not decide the exact shape;
-// the current choice reports the honest live subset the broker can
-// supply (type/enable/config plus connected/disconnected status and
-// counter-only metrics) and omits rate and resource fields the broker
-// does not track rather than standing a constant in for a measurement.
+/// Render one stored source with its live counters. Report the stored
+/// keys (`type`, `enable`) plus the stored backend fields at the top
+/// level and the counter-only `metrics` (`allow`/`deny`/`total`,
+/// memory-only, zeroed on restart). Keep the stored object under
+/// `config` for older readers. Health the broker does not measure
+/// (`status`, rates) is omitted, never invented.
 fn render_detail(
     entry: &AuthzSourceEntry,
     counters: broker_auth::AuthzSourceCounterSnapshot,
 ) -> serde_json::Value {
-    let status = live_status(entry);
     let mut value = serde_json::json!({
         "type": entry.source_type,
         "enable": entry.enable,
-        "status": status,
         "metrics": {
             "allow": counters.allow,
             "deny": counters.deny,
             "total": counters.total,
         },
     });
-    if !entry.config.is_null() {
-        value["config"] = entry.config.clone();
+    if let Some(fields) = entry.config.as_object() {
+        for (key, field) in fields {
+            if value.get(key).is_none() {
+                value[key] = field.clone();
+            }
+        }
+        if !entry.config.is_null() {
+            value["config"] = entry.config.clone();
+        }
     }
     value
 }
 
 /// `GET /authorization/sources/{type}`: read one source's config and
-/// health by type.
+/// counters by type.
 ///
 /// Returns 200 with the stored `type`/`enable` (plus the backend
-/// `config` object when one is stored), the live `status` and the live
-/// counter-only `metrics`. Unknown types fail with `NOT_FOUND` in the
-/// documented `{code, message}` shape. Management-plane read only: one
-/// short registry read plus lock-free atomic loads; publish and deliver
-/// never touch this store.
+/// `config` object when one is stored) and the live counter-only
+/// `metrics`. Health the broker does not measure is omitted, never
+/// invented. Unknown types fail with `NOT_FOUND` in the documented
+/// `{code, message}` shape. Management-plane read only: one short
+/// registry read plus lock-free atomic loads; publish and deliver never
+/// take this store's write lock.
 pub async fn get_authz_source(
     State(state): State<ApiState>,
     Path(source_type): Path<String>,
@@ -689,11 +679,12 @@ pub async fn get_authz_source(
 /// the fields to change still replaces after full validation. On
 /// success returns 204 with no body, as the reference API documents.
 /// The write persists across a restart through the config registry
-/// (counters do not: they restart at zero).
-/// Management-plane only: one short write lock per request (plus the
-/// registry save lock on persist); the publish and subscribe
-/// authorization consults read the built-in rule table, never this
-/// registry, and publish/deliver never touch this handler's lock.
+/// (counters do not: they restart at zero) and the publish/subscribe
+/// consults honour it from the next verdict.
+/// Management-plane only for the write: one short write lock per
+/// request (plus the registry save lock on persist); the publish and
+/// subscribe consults load the lock-free order snapshot and never take
+/// this handler's lock.
 // TODO(parity): may the update rename the entry (change its `type`) or
 // only replace the config/enable pair in place? The rulebook does not
 // decide the exact PUT field set; the current choice replaces the whole
@@ -809,9 +800,10 @@ fn parse_update_request(
 /// body). Resetting an unknown type fails with `NOT_FOUND` in the
 /// documented `{code, message}` shape, not an empty body. Counters
 /// resume from zero on the next verdict; the reset itself does not
-/// persist beyond the counter values. Management-plane only: one short
-/// registry read plus lock-free atomic stores; increments stay lock-free
-/// atomics and publish and deliver never touch these counters. The
+/// persist beyond the counter values. Management-plane only for the
+/// reset: one short registry read plus lock-free atomic stores;
+/// verdict increments stay lock-free atomics and publish and deliver
+/// never take the registry write lock here. The
 /// counter set is fixed (allow/deny/total per source type, at most the
 /// source cap of records), so a reset never grows anything.
 // TODO(parity): does the spec report success as an empty 204 or as a 200
@@ -842,11 +834,12 @@ pub async fn reset_authz_source_metrics(
 /// and moves nothing. Moving to the entry's current position is a
 /// no-op success. On success returns 204 with no body, as the reference
 /// API documents. The new order persists across a restart through the
-/// config registry.
-/// Management-plane only: one short registry write lock per request
-/// (plus the registry save lock on persist); the publish and subscribe
-/// authorization consults read the built-in rule table, never this
-/// registry, and publish/deliver never touch this handler's lock. A
+/// config registry and the publish/subscribe consults honour it from
+/// the next verdict.
+/// Management-plane only for the write: one short registry write lock
+/// per request (plus the registry save lock on persist); the publish
+/// and subscribe consults load the lock-free order snapshot and never
+/// take this handler's lock. A
 /// move never grows the list: at most the source cap of entries is
 /// reordered, and the counter set stays fixed.
 // TODO(parity): is the documented move body `{"position": ...}` with a
@@ -1032,29 +1025,29 @@ fn resolve_move_target(
     Err("field `position` must be an index or a position keyword".to_string())
 }
 
-/// `GET /authorization/sources/{type}/status`: liveness plus live
-/// counters for one source.
+/// `GET /authorization/sources/{type}/status`: live counters for one
+/// source.
 ///
-/// Returns 200 with the stored `type`/`enable`, the live `status` (and
-/// its single-node `node_status` row), the live counter-only `metrics`
-/// (and its single-node `node_metrics` row) and the empty `node_error`
-/// list. Unknown types fail with `NOT_FOUND` in the documented `{code,
-/// message}` shape. Unknown query keys are ignored: the route is not
-/// paged, so extra keys never become a 400. Status is live and does not
-/// persist (counters are memory-only and restart at zero); no outbound
-/// connection is opened to decide it.
+/// Returns 200 with the stored `type`/`enable`, the live counter-only
+/// `metrics` (and its single-node `node_metrics` row) and the empty
+/// `node_error` list. Health the broker does not measure (`status`,
+/// `node_status`, rates, resource fields) is omitted, never invented:
+/// no backend health probe runs here. Unknown types fail with
+/// `NOT_FOUND` in the documented `{code, message}` shape. Unknown query
+/// keys are ignored: the route is not paged, so extra keys never become
+/// a 400. Status is live and does not persist (counters are memory-only
+/// and restart at zero); no outbound connection is opened to decide it.
 /// Management-plane read only: one short registry read plus lock-free
-/// atomic loads; publish and deliver never touch this store. The
-/// counter set is fixed (allow/deny/total per source type, at most the
-/// source cap of records).
-// TODO(parity): which status fields plus rate/resource shapes does the
-// spec require (rates, resource metrics, exact status vocabulary)? The
-// rulebook does not decide the exact shape; the current choice reports
-// the honest live subset the broker can supply (`type`, `enable`,
-// `status` plus single-node `node_status`, counter-only `metrics` plus
-// single-node `node_metrics`, empty `node_error`) and omits rate and
-// resource fields the broker does not track rather than standing a
-// constant in for a measurement.
+/// atomic loads; publish and deliver never take this store's write
+/// lock. The counter set is fixed (allow/deny/total per source type,
+/// at most the source cap of records).
+// TODO(parity): which further status fields plus rate/resource shapes
+// does the spec require? The rulebook does not decide the exact shape;
+// the current choice reports the honest live subset the broker can
+// supply (counter-only `metrics` plus single-node `node_metrics`,
+// empty `node_error`) and omits rate, resource and status fields the
+// broker does not track rather than standing a constant in for a
+// measurement.
 pub async fn get_authz_source_status(
     State(state): State<ApiState>,
     Path(source_type): Path<String>,
@@ -1072,7 +1065,6 @@ pub async fn get_authz_source_status(
             deny: 0,
             total: 0,
         });
-    let status = live_status(&entry);
     let node = state.node_id.clone();
     let metrics = serde_json::json!({
         "allow": counters.allow,
@@ -1084,8 +1076,6 @@ pub async fn get_authz_source_status(
         Json(serde_json::json!({
             "type": entry.source_type,
             "enable": entry.enable,
-            "status": status,
-            "node_status": [{"node": node, "status": status}],
             "metrics": metrics,
             "node_metrics": [{"node": node, "metrics": metrics}],
             "node_error": [],
@@ -1135,18 +1125,18 @@ mod tests {
         let state = standalone_state();
 
         // Default registry holds only the built-in database source.
+        // The reference specification documents `{"sources": [...]}`.
         let (status, listed, _) =
             parts(list_authz_sources(State(state.clone()), params(1, 100)).await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(listed["data"].as_array().expect("data array").len(), 1);
         assert_eq!(
-            listed["data"][0]["type"],
+            listed["sources"].as_array().expect("sources array").len(),
+            1
+        );
+        assert_eq!(
+            listed["sources"][0]["type"],
             serde_json::json!("built_in_database")
         );
-        assert_eq!(listed["meta"]["page"], serde_json::json!(1));
-        assert_eq!(listed["meta"]["limit"], serde_json::json!(100));
-        assert_eq!(listed["meta"]["count"], serde_json::json!(1));
-        assert_eq!(listed["meta"]["hasnext"], serde_json::json!(false));
 
         // Register one stored-only source; it reads back with its health
         // never claimed: type/enable only, no live status invented.
@@ -1164,21 +1154,13 @@ mod tests {
         let (status, listed, _) =
             parts(list_authz_sources(State(state.clone()), params(1, 100)).await).await;
         assert_eq!(status, StatusCode::OK);
-        let types: Vec<&str> = listed["data"]
+        let types: Vec<&str> = listed["sources"]
             .as_array()
-            .expect("data array")
+            .expect("sources array")
             .iter()
             .map(|row| row["type"].as_str().expect("row has type"))
             .collect();
         assert_eq!(types, vec!["built_in_database", "file"]);
-        assert_eq!(listed["meta"]["count"], serde_json::json!(2));
-
-        // Paging slices after stored order: page 2 with limit 1 holds file.
-        let (status, page2, _) =
-            parts(list_authz_sources(State(state.clone()), params(2, 1)).await).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(page2["data"][0]["type"], serde_json::json!("file"));
-        assert_eq!(page2["meta"]["count"], serde_json::json!(2));
 
         // A duplicate type is rejected, never silently merged.
         let (status, duplicate, _) = parts(
@@ -1227,7 +1209,10 @@ mod tests {
         let (status, listed, _) =
             parts(list_authz_sources(State(state.clone()), params(1, 100)).await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(listed["meta"]["count"], serde_json::json!(2));
+        assert_eq!(
+            listed["sources"].as_array().expect("sources array").len(),
+            2
+        );
 
         // Unknown source types are 404 with the documented shape.
         let (status, unknown, _) = parts(
@@ -1519,9 +1504,9 @@ mod tests {
     async fn list_types(state: &ApiState) -> Vec<String> {
         let (_, listed, _) =
             parts(list_authz_sources(State(state.clone()), params(1, 100)).await).await;
-        listed["data"]
+        listed["sources"]
             .as_array()
-            .expect("data array")
+            .expect("sources array")
             .iter()
             .map(|row| row["type"].as_str().expect("row has type").to_string())
             .collect()
@@ -1533,9 +1518,9 @@ mod tests {
         // missing (bare 404). Register a second source, swap the whole
         // evaluation order and read it back; a bad order naming an
         // unknown type is rejected with the stored order unchanged.
-        // Management-plane only: publish and deliver never touch this
-        // registry (the built-in rule consult stays on the
-        // publish/subscribe path).
+        // The stored order gates the publish/subscribe consult from the
+        // next verdict (a disabled or removed built-in source denies
+        // fail closed).
         let state = standalone_state();
         assert_eq!(
             list_types(&state).await,
@@ -1666,8 +1651,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        // Read hits with the stored config and live health; a
-        // stored-only backend never claims to be live.
+        // Read hits with the stored config and live counters; health
+        // the broker does not measure is omitted, never invented.
         let (status, detail, _) =
             parts(get_authz_source(State(state.clone()), Path("file".to_string())).await).await;
         assert_eq!(status, StatusCode::OK);
@@ -1677,28 +1662,76 @@ mod tests {
             detail["config"]["path"],
             serde_json::json!("/etc/authz/rules.conf")
         );
-        assert_eq!(detail["status"], serde_json::json!("disconnected"));
-        assert!(detail.get("status").is_some(), "health is reported");
+        assert!(detail.get("status").is_none());
+        assert!(detail.get("node_status").is_none());
         assert_eq!(detail["metrics"]["allow"], serde_json::json!(0));
         assert_eq!(detail["metrics"]["deny"], serde_json::json!(0));
         assert_eq!(detail["metrics"]["total"], serde_json::json!(0));
 
-        // The built-in entry executes locally, so it reads as connected.
+        // The built-in entry reports its stored keys with live counters.
         let (status, builtin, _) = parts(
             get_authz_source(State(state.clone()), Path("built_in_database".to_string())).await,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(builtin["status"], serde_json::json!("connected"));
+        assert_eq!(builtin["type"], serde_json::json!("built_in_database"));
+        assert!(builtin.get("status").is_none());
 
         // The stored built-in source is live on the publish path: the
-        // empty table allows.
+        // empty table allows, and the verdict attributes to the
+        // built-in counters (not only to explicit store records).
         let topic = broker_protocol::Topic::new("w223/data").expect("topic parses");
         state
             .auth
             .authorize_publish("any-client", &topic)
             .await
             .expect("empty table allows on the publish path");
+        let broker_counted = state
+            .authz_sources
+            .counter_snapshot("built_in_database")
+            .expect("broker verdict attributes to built-in counters");
+        assert_eq!(broker_counted.allow, 1);
+        assert_eq!(broker_counted.total, 1);
+
+        // The stored order and enable flags gate the publish path: a
+        // disabled built-in source denies fail closed and counts the
+        // denial.
+        state
+            .authz_sources
+            .update(
+                "built_in_database",
+                broker_auth::AuthzSourceEntry {
+                    source_type: "built_in_database".to_string(),
+                    enable: false,
+                    config: serde_json::Value::Null,
+                },
+            )
+            .expect("disable applies");
+        assert!(
+            state
+                .auth
+                .authorize_publish("any-client", &topic)
+                .await
+                .is_err(),
+            "disabled built-in denies on the publish path"
+        );
+        let gated = state
+            .authz_sources
+            .counter_snapshot("built_in_database")
+            .expect("gated denial attributes to built-in counters");
+        assert_eq!(gated.deny, 1);
+        assert_eq!(gated.total, 2);
+        state
+            .authz_sources
+            .update(
+                "built_in_database",
+                broker_auth::AuthzSourceEntry {
+                    source_type: "built_in_database".to_string(),
+                    enable: true,
+                    config: serde_json::Value::Null,
+                },
+            )
+            .expect("re-enable applies");
 
         // Update with a valid config and read back.
         let (status, _, raw) = parts(
@@ -1723,7 +1756,7 @@ mod tests {
             reread["config"]["path"],
             serde_json::json!("/etc/authz/other.conf")
         );
-        assert_eq!(reread["status"], serde_json::json!("disconnected"));
+        assert!(reread.get("status").is_none());
 
         // Move counters then reset and verify zeroed.
         state.authz_sources.record_allow("file");
@@ -2078,18 +2111,14 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(list_types(&state).await[0], "built_in_database");
 
-        // Status carries the documented fields: identity plus liveness,
-        // health rows and counters.
+        // Status carries the documented fields: identity plus live
+        // counters. Health the broker does not measure is omitted.
         let (status, shaped, _) = status_call(&state, "file").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(shaped["type"], serde_json::json!("file"));
         assert_eq!(shaped["enable"], serde_json::json!(true));
-        assert_eq!(shaped["status"], serde_json::json!("disconnected"));
-        assert_eq!(
-            shaped["node_status"][0]["status"],
-            serde_json::json!("disconnected")
-        );
-        assert!(shaped["node_status"][0]["node"].is_string());
+        assert!(shaped.get("status").is_none());
+        assert!(shaped.get("node_status").is_none());
         assert_eq!(shaped["metrics"]["allow"], serde_json::json!(0));
         assert_eq!(shaped["metrics"]["deny"], serde_json::json!(0));
         assert_eq!(shaped["metrics"]["total"], serde_json::json!(0));
@@ -2099,10 +2128,11 @@ mod tests {
         );
         assert_eq!(shaped["node_error"], serde_json::json!([]));
 
-        // The built-in entry executes locally, so it reads as connected.
+        // The built-in entry reports its stored keys with live counters.
         let (status, builtin, _) = status_call(&state, "built_in_database").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(builtin["status"], serde_json::json!("connected"));
+        assert_eq!(builtin["type"], serde_json::json!("built_in_database"));
+        assert!(builtin.get("status").is_none());
 
         // Unknown query keys never become a 400 on the status read.
         let (status, _, _) = parts(
@@ -2121,13 +2151,19 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         // The stored built-in source is live on the publish path: the
-        // empty table allows.
+        // empty table allows, and the verdict attributes to the
+        // built-in counters.
         let topic = broker_protocol::Topic::new("w224/data").expect("topic parses");
         state
             .auth
             .authorize_publish("any-client", &topic)
             .await
             .expect("empty table allows on the publish path");
+        let broker_counted = state
+            .authz_sources
+            .counter_snapshot("built_in_database")
+            .expect("broker verdict attributes to built-in counters");
+        assert_eq!(broker_counted.total, 1);
 
         // Counters move on explicit records and read back on status.
         state.authz_sources.record_allow("file");

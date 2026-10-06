@@ -46,12 +46,9 @@
 // same client, topic and action as ALREADY_EXISTS and answers unknown
 // ids with NOT_FOUND (mirroring the sibling authz 404s) until the
 // checker pins it.
-// TODO(parity): is the per-client detail envelope `{"rules": [...]}`,
-// is a successful replace a 204 like the sibling catch-all replace, and
-// are the per-client and per-user tables separate stores? The rulebook
-// does not decide any of the three; the current choice mirrors the
-// catch-all replace (object body, 204 on success) and shares the one
-// built-in table between both listings until the checker pins it.
+// Shape note: the detail envelope carries the key (`clientid` or
+// `username`) plus `rules`. The replace body carries `rules`, with an
+// optional key that must match the path.
 // TODO(parity): does the documented per-user listing carry the same
 // topic/permission/action triple under a `username` key with the
 // standard data/meta page envelope, and does the per-user add accept a
@@ -285,8 +282,8 @@ fn render_user_rule(rule: &AclRule) -> serde_json::Value {
 /// `GET /authorization/sources/built_in_database/rules/clients/{clientid}`:
 /// read one client's rule set.
 ///
-/// Returns 200 with `{"rules": [...]}` in stored evaluation order; a
-/// client id with no rules fails with `NOT_FOUND` in the documented
+/// Returns 200 with the client key plus `{"rules": [...]}` in stored
+/// evaluation order; a client id with no rules fails with `NOT_FOUND` in
 /// `{code, message}` shape and the catch-all `*` (owned by the
 /// `/rules/all` table) is always a miss here, never a read of another
 /// table. The read persists trivially: it observes the same
@@ -317,7 +314,7 @@ pub async fn get_client_rules(
     let rendered: Vec<serde_json::Value> = rules.iter().map(render_client_rule).collect();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "rules": rendered })),
+        Json(serde_json::json!({ "clientid": clientid, "rules": rendered })),
     )
         .into_response()
 }
@@ -613,7 +610,7 @@ fn parse_user_rule_body(value: &serde_json::Value) -> Result<AclRule, String> {
 /// `GET /authorization/sources/built_in_database/rules/users/{username}`:
 /// read one user's rule set.
 ///
-/// Returns 200 with `{"rules": [...]}` in stored evaluation order; a
+/// Returns 200 with the user key plus `{"rules": [...]}` in stored
 /// username with no rules fails with `NOT_FOUND` in the documented
 /// `{code, message}` shape and the catch-all `*` (owned by the
 /// `/rules/all` table) is always a miss here, never a read of another
@@ -645,7 +642,7 @@ pub async fn get_user_rules(
     let rendered: Vec<serde_json::Value> = rules.iter().map(render_user_rule).collect();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "rules": rendered })),
+        Json(serde_json::json!({ "username": username, "rules": rendered })),
     )
         .into_response()
 }
@@ -1214,6 +1211,7 @@ mod tests {
 
         let (status, detail, _) = get_detail(&state, "w220-a").await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["clientid"], serde_json::json!("w220-a"));
         let rules = detail["rules"].as_array().expect("rules array").clone();
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0]["clientid"], serde_json::json!("w220-a"));
@@ -1463,6 +1461,7 @@ mod tests {
 
         let (status, detail, _) = get_user_detail(&state, "w221-u").await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["username"], serde_json::json!("w221-u"));
         let rules = detail["rules"].as_array().expect("rules array").clone();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["username"], serde_json::json!("w221-u"));

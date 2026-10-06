@@ -517,6 +517,11 @@ impl ApiState {
                 .collect();
             engine.sync_transform_metrics(&names);
         }
+        // Link the shared authorization source registry into the
+        // caller-shared `MemoryAuth` (AP-06): publish/subscribe verdicts
+        // attribute to the built-in counters and honour the stored
+        // enable flag and order without a restart. One `Arc` clone.
+        auth.set_authz_sources(Arc::clone(&authz_sources));
         Self {
             engine,
             sessions,
@@ -612,12 +617,18 @@ impl ApiState {
         let connectors = Arc::new(crate::v5::rules::ConnectorStore::from_registry(
             &config, &engine,
         ));
+        let auth = Arc::new(MemoryAuth::new());
+        let authz_sources = Arc::new(broker_auth::AuthzSourceRegistry::new());
+        // Link the standalone registry into the standalone rule table
+        // (AP-06): handler tests that publish through `MemoryAuth`
+        // attribute to the built-in counters. One `Arc` clone.
+        auth.set_authz_sources(Arc::clone(&authz_sources));
         Self {
             engine,
             sessions: Arc::new(SessionManager::new()),
             router: Arc::new(SubscriptionRouter::new()),
             metrics: Arc::new(Metrics::new()),
-            auth: Arc::new(MemoryAuth::new()),
+            auth,
             conns: Arc::new(ConnTable::default()),
             admin_users: Arc::new(AdminUsers::with_default_admin()),
             tokens: Arc::new(ApiTokens::new()),
@@ -644,7 +655,7 @@ impl ApiState {
             authn_settings,
             authz_node_cache: Arc::new(broker_auth::AuthzNodeCache::new()),
             authz_settings: Arc::new(broker_auth::AuthzSettingsStore::new()),
-            authz_sources: Arc::new(broker_auth::AuthzSourceRegistry::new()),
+            authz_sources,
             api_keys: Arc::new(crate::v5::api_keys::ApiKeyStore::new()),
             audit: Arc::new(crate::v5::audit::AuditLog::new()),
             sso_backends: Arc::new(crate::v5::sso::SsoStore::new()),
@@ -6849,28 +6860,58 @@ mod tests {
             "setup returns the pending secret, got: {provisioning}"
         );
         assert!(provisioning["provisioning_uri"].is_string());
+        let first_secret = provisioning["secret"]
+            .as_str()
+            .expect("setup returns a secret")
+            .to_string();
 
-        // The setup route sees the same enrolment as pending.
-        let (status, info) = server
+        // Setup_info follows the single-sign-on shape. A local body
+        // fails with 400. A full body fails with 401.
+        let (status, err) = server
             .post_auth(
                 "/api/v5/sso/mfa/setup_info",
                 json!({"username": "w244-http"}),
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(info["pending"], json!(true));
-
-        // A second enrol is rejected cleanly.
+        assert_eq!(status, 400);
+        assert_eq!(err["code"], json!("BAD_REQUEST"));
         let (status, err) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup_info",
+                json!({
+                    "backend": "oidc",
+                    "setup_token": "w244-token",
+                    "username": "w244-http",
+                }),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 401);
+        assert_eq!(err["code"], json!("UNAUTHORIZED"));
+
+        // A second enrol resets with a fresh secret.
+        let (status, _) = server
             .post_auth(
                 "/api/v5/users/w244-http/mfa",
                 json!({"mechanism": "totp"}),
                 &admin_token,
             )
             .await;
-        assert_eq!(status, 409);
-        assert_eq!(err["code"], json!("ALREADY_EXISTS"));
+        assert_eq!(status, 204);
+        let (status, second) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "w244-http"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let rotated = second["secret"]
+            .as_str()
+            .expect("reset returns a secret")
+            .to_string();
+        assert_ne!(first_secret, rotated);
 
         // Delete disables; a second delete changes nothing and answers 204.
         let (status, _) = server
@@ -7724,16 +7765,15 @@ mod tests {
         let token = server.login_as_admin().await;
 
         // Default registry: only the built-in database source, empty
-        // collection shape (data plus meta), never an error.
+        // collection shape (sources list), never an error.
         let (status, body) = server
             .get_auth("/api/v5/authorization/sources", &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(
-            body["data"],
+            body["sources"],
             json!([{"type": "built_in_database", "enable": true}])
         );
-        assert_eq!(body["meta"]["count"], json!(1));
 
         // Register one stored-only source; only the built-in executes,
         // the new entry is stored and reported without a live claim.
@@ -7752,14 +7792,14 @@ mod tests {
             .get_auth("/api/v5/authorization/sources", &token)
             .await;
         assert_eq!(status, 200);
-        let types: Vec<_> = body["data"]
+        let types: Vec<_> = body["sources"]
             .as_array()
             .expect("data is a list")
             .iter()
             .map(|row| row["type"].clone())
             .collect();
         assert_eq!(types, vec![json!("built_in_database"), json!("file")]);
-        assert_eq!(body["meta"]["count"], json!(2));
+        assert_eq!(body["sources"].as_array().expect("sources list").len(), 2);
 
         // Re-creating the same type is a clean duplicate rejection, never
         // a silent merge.
@@ -7846,7 +7886,7 @@ mod tests {
             .get_auth("/api/v5/authorization/sources", &token)
             .await;
         assert_eq!(status, 200);
-        let types: Vec<_> = body["data"]
+        let types: Vec<_> = body["sources"]
             .as_array()
             .expect("data is a list")
             .iter()
@@ -7958,7 +7998,7 @@ mod tests {
             .get_auth("/api/v5/authorization/sources", &token)
             .await;
         assert_eq!(status, 200);
-        let types: Vec<_> = body["data"]
+        let types: Vec<_> = body["sources"]
             .as_array()
             .expect("data is a list")
             .iter()
@@ -7979,7 +8019,7 @@ mod tests {
             .get_auth("/api/v5/authorization/sources", &token)
             .await;
         assert_eq!(status, 200);
-        let types: Vec<_> = body["data"]
+        let types: Vec<_> = body["sources"]
             .as_array()
             .expect("data is a list")
             .iter()
@@ -7996,7 +8036,7 @@ mod tests {
             .get_auth("/api/v5/authorization/sources", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["meta"]["count"], json!(1));
+        assert_eq!(body["sources"].as_array().expect("sources list").len(), 1);
         let (status, body) = server
             .delete_auth("/api/v5/authorization/sources/nowhere", &token)
             .await;
@@ -8146,14 +8186,24 @@ mod tests {
         assert_eq!(created["mechanism"], json!("password_based"));
         assert_eq!(created["backend"], json!("built_in_database"));
         assert_eq!(created["enable"], json!(true));
-        // No invented fields: exactly the documented slot fields.
+        // No invented fields: the documented slot fields plus the
+        // documented built-in default.
         let obj = created.as_object().expect("entry is an object");
         for key in obj.keys() {
             assert!(
-                ["id", "mechanism", "backend", "enable", "config"].contains(&key.as_str()),
+                [
+                    "id",
+                    "mechanism",
+                    "backend",
+                    "enable",
+                    "config",
+                    "user_id_type"
+                ]
+                .contains(&key.as_str()),
                 "unexpected field {key} in chain entry"
             );
         }
+        assert_eq!(created["user_id_type"], json!("username"));
 
         // List again: the entry is present in order.
         let (status, body) = server.get_auth("/api/v5/authentication", &token).await;
@@ -8855,14 +8905,20 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body["id"], json!("password_based:built_in_database"));
         assert_eq!(body["enable"], json!(true));
-        assert_eq!(body["status"], json!("connected"));
+        assert!(body.get("status").is_none());
+        assert!(body.get("node_status").is_none());
         assert_eq!(body["metrics"]["success"], json!(0));
         assert_eq!(body["metrics"]["failed"], json!(0));
         assert_eq!(body["metrics"]["total"], json!(0));
         assert!(body["metrics"]["nomatch"].is_number());
-        assert_eq!(body["node_status"][0]["status"], json!("connected"));
+        assert!(body["node_metrics"].is_array());
+        assert!(body["node_resource_metrics"].is_array());
         assert_eq!(
             body["node_metrics"][0]["metrics"]["total"],
+            body["metrics"]["total"]
+        );
+        assert_eq!(
+            body["node_resource_metrics"][0]["metrics"]["matched"],
             body["metrics"]["total"]
         );
         assert_eq!(body["node_error"], json!([]));

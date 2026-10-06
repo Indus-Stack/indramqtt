@@ -8,12 +8,13 @@
 //! live counters), plus the built-in
 //! catch-all clear (`DELETE
 //! /authorization/sources/built_in_database/rules`, which empties the
-//! built-in rule table). Single-node, management-plane only: handlers
-//! clone at most the capped list once per request under a short lock;
-//! the publish and subscribe authorization consults read the built-in
-//! rule table (`MemoryAuth` in `crate::lib`, driven by the publish event
-//! in `crates/broker-node/src/main.rs`), never this registry's write
-//! lock, and publish/deliver never touch this store.
+//! built-in rule table). Single-node: handlers clone at most the capped
+//! list once per request under a short lock; the publish and subscribe
+//! authorization consults (`MemoryAuth` in `crate::lib`, driven by the
+//! publish event in `crates/broker-node/src/main.rs`) read the lock-free
+//! order snapshot for the stored enable flag and order plus the built-in
+//! rule table, and attribute each verdict to the built-in counters;
+//! publish/deliver never take this registry's write lock.
 //!
 //! Store bounds (both stated here and enforced below):
 //! - at most [`broker_config::MAX_AUTHZ_SOURCES`] entries (8: the
@@ -157,12 +158,10 @@ pub enum SourceUpdateError {
 /// itself is only looked up under one short read lock to clone the
 /// `Arc`. Counters are memory-only and restart at zero (configs persist
 /// across a restart through the config registry, counters do not).
-/// Management-plane only: publish and deliver never touch these
-/// counters, and no publish/subscribe consult increments them today.
-// TODO(parity): which counter keys plus which broker event attributes
-// them does the spec require (allow/deny split, per-decision versus
-// per-request)? The rulebook does not decide the exact set; the current
-// choice counts explicit record calls only, until the checker pins it.
+/// The publish and subscribe authorization consults
+/// (`MemoryAuth::authorize_publish` and `authorize_subscribe_in_tenant`
+/// in `crate::lib`) attribute each built-in verdict here; management
+/// reads and resets observe the same records.
 #[derive(Debug, Default)]
 pub struct AuthzSourceCounters {
     allow: AtomicU64,
@@ -642,9 +641,11 @@ impl AuthzSourceRegistry {
 
     /// Record one allow verdict for `type`.
     ///
-    /// Management-plane only: one short read lock to clone the counter
-    /// `Arc` plus two lock-free atomic adds; unknown types apply nothing
-    /// (no accumulation). Publish and deliver never call this.
+    /// One short read lock to clone the counter `Arc` plus two
+    /// lock-free atomic adds; unknown types apply nothing (no
+    /// accumulation). The publish and subscribe authorization consults
+    /// call this for each built-in allow; publish/deliver never take the
+    /// registry write lock here.
     pub fn record_allow(&self, source_type: &str) {
         if let Some(counters) = self.counters.read().get(source_type).cloned() {
             counters.record_allow();
@@ -653,9 +654,10 @@ impl AuthzSourceRegistry {
 
     /// Record one deny verdict for `type`.
     ///
-    /// Management-plane only: same cost and bounds as
-    /// [`AuthzSourceRegistry::record_allow`]. Publish and deliver never
-    /// call this.
+    /// Same cost and bounds as [`AuthzSourceRegistry::record_allow`].
+    /// The publish and subscribe authorization consults call this for
+    /// each built-in deny; publish/deliver never take the registry
+    /// write lock here.
     pub fn record_deny(&self, source_type: &str) {
         if let Some(counters) = self.counters.read().get(source_type).cloned() {
             counters.record_deny();

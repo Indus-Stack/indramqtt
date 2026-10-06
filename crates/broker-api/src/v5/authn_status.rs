@@ -14,23 +14,15 @@
 //! (counters are memory-only and restart at zero). Unknown ids fail with
 //! `NOT_FOUND` in the documented `{code, message}` shape. Backend health
 //! is stored state only: no new outbound connections are opened here.
-// TODO(parity): which status fields plus rate/resource shapes does the
-// spec require (rates, resource metrics, exact status vocabulary)? The
-// rulebook does not decide the exact shape; the current choice reports
-// the honest live subset the broker can supply (`id`, `enable`,
-// `status` plus single-node `node_status`, counter-only `metrics` plus
-// single-node `node_metrics`, empty `node_error`) and omits rate and
-// resource fields the broker does not track rather than standing a
-// constant in for a measurement.
-// TODO(parity): what is the exact per-backend status vocabulary and the
-// exact CONNECT-to-counter attribution (success/failed/nomatch split,
-// which entry moves on bypasses or a chain with no live backend)? The
-// rulebook does not decide the mapping; the current choice reports
-// `connected` for an enabled built-in entry and `disconnected`
-// otherwise, counts local verdicts as success/failed on the first
-// enabled built-in entry and bypass verdicts as nomatch, and counts a
-// no-live-backend refusal as failed on the first entry, until the
-// checker pins it.
+//!
+//! Shape note: each `node_*` field is an array with one object per node
+//! (today one node). The management console reads the same arrays. Rate
+//! fields are absent: the broker tracks counters only, never rates.
+//! Health fields the broker does not measure are absent as well: no
+//! `status` or `node_status` is reported because the broker performs no
+//! backend health probe (an enabled built-in entry executes locally, a
+//! stored-only backend never executes, and neither state is a measured
+//! connection).
 
 use axum::{
     extract::{Path, Query, State},
@@ -42,17 +34,20 @@ use axum::{
 use crate::errors::ApiError;
 use crate::ApiState;
 
-/// `GET /authentication/{id}/status`: liveness plus live counters for one
+/// `GET /authentication/{id}/status`: live counters for one
 /// authenticator.
 ///
-/// Returns 200 with the stored `id`/`enable`, the live `status` (and its
-/// single-node `node_status` row), the live counter-only `metrics` (and
-/// its single-node `node_metrics` row) and the empty `node_error` list.
-/// Unknown ids fail with `NOT_FOUND` in the documented `{code, message}`
-/// shape. Unknown query keys are ignored: the route is not paged, so
-/// extra keys never become a 400. Management-plane read only: one short
-/// chain lock plus lock-free atomic loads; publish and deliver never
-/// touch this store.
+/// Returns 200 with the stored `id`/`enable`, the live counter-only
+/// `metrics` (and its single-node `node_metrics` row), the live
+/// counter-only `resource_metrics` (and its single-node
+/// `node_resource_metrics` row) and the empty `node_error` list.
+/// Health fields the broker does not measure (`status`,
+/// `node_status`, rates) are omitted, never invented: no backend
+/// health probe runs here. Unknown ids fail with `NOT_FOUND` in
+/// the documented `{code, message}` shape. Unknown query keys are
+/// ignored: the route is not paged, so extra keys never become a 400.
+/// Management-plane read only: one short chain lock plus lock-free atomic
+/// loads; publish and deliver never touch this store.
 pub async fn get_authn_status(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -72,7 +67,6 @@ pub async fn get_authn_status(
                 nomatch: 0,
                 total: 0,
             });
-    let status = live_status(&entry);
     let node = state.node_id.clone();
     let metrics = serde_json::json!({
         "total": counters.total,
@@ -80,15 +74,20 @@ pub async fn get_authn_status(
         "failed": counters.failed,
         "nomatch": counters.nomatch,
     });
+    let resource_metrics = serde_json::json!({
+        "matched": counters.total,
+        "success": counters.success,
+        "failed": counters.failed,
+    });
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "id": entry.id,
             "enable": entry.enable,
-            "status": status,
-            "node_status": [{"node": node, "status": status}],
             "metrics": metrics,
             "node_metrics": [{"node": node, "metrics": metrics}],
+            "resource_metrics": resource_metrics,
+            "node_resource_metrics": [{"node": node, "metrics": resource_metrics}],
             "node_error": [],
         })),
     )
@@ -119,20 +118,6 @@ pub async fn reset_authn_metrics(
         return ApiError::NotFound(format!("authenticator {id:?} not found")).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
-}
-
-/// Honest single-node liveness for one chain entry.
-///
-/// An enabled built-in entry executes locally, so it reads as connected.
-/// Anything else (disabled, or a stored-only backend that never executes)
-/// reads as disconnected: no live backend serves it. No outbound
-/// connection is opened to decide this.
-fn live_status(entry: &broker_auth::AuthnEntry) -> &'static str {
-    if entry.enable && entry.backend == "built_in_database" {
-        "connected"
-    } else {
-        "disconnected"
-    }
 }
 
 #[cfg(test)]
@@ -267,7 +252,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["id"], serde_json::json!(stored.id));
         assert_eq!(body["enable"], serde_json::json!(true));
-        assert_eq!(body["status"], serde_json::json!("connected"));
+        // Health the broker does not measure is omitted, never invented.
+        assert!(body.get("status").is_none());
+        assert!(body.get("node_status").is_none());
         assert_eq!(body["metrics"]["success"], serde_json::json!(2));
         assert_eq!(body["metrics"]["failed"], serde_json::json!(1));
         assert_eq!(body["metrics"]["total"], serde_json::json!(3));
@@ -276,12 +263,19 @@ mod tests {
             body["node_metrics"][0]["metrics"]["total"],
             body["metrics"]["total"]
         );
-        assert_eq!(
-            body["node_status"][0]["status"],
-            serde_json::json!("connected")
-        );
         assert_eq!(body["node_error"], serde_json::json!([]));
-        // A disabled entry reads as disconnected with its own counters.
+        // Each remaining `node_*` field is an array with one row per node.
+        assert!(body["node_metrics"].is_array());
+        assert!(body["node_resource_metrics"].is_array());
+        assert_eq!(
+            body["node_resource_metrics"][0]["metrics"]["matched"],
+            body["metrics"]["total"]
+        );
+        assert_eq!(
+            body["resource_metrics"]["success"],
+            body["metrics"]["success"]
+        );
+        // A disabled entry keeps its own counters with no invented status.
         state
             .authn_chain
             .update(
@@ -305,7 +299,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], serde_json::json!("disconnected"));
+        assert_eq!(body["enable"], serde_json::json!(false));
+        assert!(body.get("status").is_none());
+        assert!(body.get("node_status").is_none());
         assert_eq!(body["metrics"]["total"], serde_json::json!(3));
     }
 }

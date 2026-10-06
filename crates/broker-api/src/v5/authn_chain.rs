@@ -16,11 +16,13 @@
 //!
 //! Only the built-in database executes; every other backend's config is
 //! stored and reported, never claimed as live.
-// TODO(parity): which per-entry fields plus list envelope does the spec
-// require (status fields)? The list is a bare array, as the reference API
-// and the management console expect. The rows report
-// id/mechanism/backend/enable only, omitting status fields the broker
-// cannot supply.
+//!
+//! Shape note: the reference specification types each authenticator as a
+//! variant (one schema per mechanism and backend). The row reports the
+//! stored keys (`id`, `mechanism`, `backend`, `enable`) plus the stored
+//! backend fields at the top level. The management console reads the same
+//! flat fields. A stored `config` object also renders under `config` for
+//! older readers.
 
 use axum::{
     extract::State,
@@ -317,6 +319,11 @@ fn parse_order_request(value: &serde_json::Value) -> Result<Vec<String>, String>
     Ok(ids)
 }
 
+/// Render one stored entry as a typed variant row.
+/// Report the stored keys. Copy each stored backend field to the top
+/// level. Keep the stored object under `config` for older readers.
+/// Add the documented `user_id_type` default (`username`) for the
+/// built-in database when the stored entry lacks it.
 fn render_entry(entry: &AuthnEntry) -> serde_json::Value {
     let mut value = serde_json::json!({
         "id": entry.id,
@@ -324,8 +331,21 @@ fn render_entry(entry: &AuthnEntry) -> serde_json::Value {
         "backend": entry.backend,
         "enable": entry.enable,
     });
-    if !entry.config.is_null() {
-        value["config"] = entry.config.clone();
+    if let Some(fields) = entry.config.as_object() {
+        for (key, field) in fields {
+            if value.get(key).is_none() {
+                value[key] = field.clone();
+            }
+        }
+        if !entry.config.is_null() {
+            value["config"] = entry.config.clone();
+        }
+    }
+    if entry.mechanism == "password_based"
+        && entry.backend == "built_in_database"
+        && value.get("user_id_type").is_none()
+    {
+        value["user_id_type"] = serde_json::json!("username");
     }
     value
 }
@@ -528,4 +548,120 @@ fn parse_update_request(
         enable,
         config,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use broker_rules::{BackpressurePolicy, RuleEngine};
+
+    fn standalone_state() -> ApiState {
+        ApiState::standalone(std::sync::Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )))
+    }
+
+    fn entry(id: &str, mechanism: &str, backend: &str) -> AuthnEntry {
+        AuthnEntry {
+            id: id.to_string(),
+            mechanism: mechanism.to_string(),
+            backend: backend.to_string(),
+            enable: true,
+            config: serde_json::Value::Null,
+        }
+    }
+
+    async fn parts(response: Response) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let raw = bytes.to_vec();
+        let json: serde_json::Value = if raw.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&raw).expect("test body is JSON")
+        };
+        (status, json, raw)
+    }
+
+    #[tokio::test]
+    async fn detail_renders_flat_variant_fields() {
+        // The detail row carries the backend fields at the top level.
+        // Before: only `id`/`mechanism`/`backend`/`enable` plus nested
+        // `config`, so no documented variant schema matched.
+        let state = standalone_state();
+        state
+            .authn_chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("insert applies");
+        let (status, body, _) = parts(
+            get_authn_entry(
+                State(state),
+                axum::extract::Path("password_based:built_in_database".to_string()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mechanism"], serde_json::json!("password_based"));
+        assert_eq!(body["backend"], serde_json::json!("built_in_database"));
+        assert_eq!(body["user_id_type"], serde_json::json!("username"));
+    }
+
+    #[tokio::test]
+    async fn order_accepts_the_documented_body() {
+        // The documented body is an array of `{"id": ...}` objects.
+        // Before: the route answered 400 for this body.
+        let state = standalone_state();
+        state
+            .authn_chain
+            .insert(entry(
+                "password_based:built_in_database",
+                "password_based",
+                "built_in_database",
+            ))
+            .expect("insert applies");
+        state
+            .authn_chain
+            .insert(entry("password_based:mysql", "password_based", "mysql"))
+            .expect("insert applies");
+        let body = Bytes::from_static(
+            br#"[{"id": "password_based:mysql"}, {"id": "password_based:built_in_database"}]"#,
+        );
+        let (status, _, raw) = parts(replace_authn_order(State(state.clone()), body).await).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(raw.is_empty(), "order answers 204 with no body");
+        let ids: Vec<String> = state
+            .authn_chain
+            .list()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string()
+            ]
+        );
+
+        // An unknown id fails closed and changes nothing.
+        let body = Bytes::from_static(br#"[{"id": "password_based:nowhere"}]"#);
+        let (status, err, _) = parts(replace_authn_order(State(state.clone()), body).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        let ids: Vec<String> = state
+            .authn_chain
+            .list()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+    }
 }

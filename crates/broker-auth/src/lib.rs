@@ -265,6 +265,21 @@ pub struct MemoryAuth {
     /// [`PasswordHashPolicy`]). Replaced atomically; reads take a short
     /// read lock on the management plane only, never on delivery.
     policy: RwLock<PasswordHashPolicy>,
+    /// Ordered authorization source registry driving the stored
+    /// evaluation order and the live allow/deny counters
+    /// (`AuthzSourceRegistry` in `crate::authz_sources`, shared with the
+    /// management API). `None` in unit tests and standalone state, which
+    /// stay memory-only with today's open behaviour. `Some` on the kernel
+    /// and the management plane after boot links the same instance the
+    /// API serves, so publish/subscribe verdicts attribute to the
+    /// built-in source and honour its stored enable flag and order.
+    /// Bound: at most [`broker_config::MAX_AUTHZ_SOURCES`] counter
+    /// records (8: one per source type, each exactly three atomics, no
+    /// list or history ever accumulates); linking is one `Arc` clone at
+    /// boot, verdicts take one short read lock to clone the counter
+    /// `Arc` plus lock-free atomic adds, and order consults load one
+    /// lock-free snapshot of at most the capped entries.
+    authz_sources: RwLock<Option<Arc<AuthzSourceRegistry>>>,
     /// Bounds concurrent expensive verifications (bcrypt/PBKDF2/Argon2).
     /// `Arc` so the async verifier can hold an owned permit across the
     /// blocking task without borrowing `self`.
@@ -300,6 +315,7 @@ impl Default for MemoryAuth {
             registry: RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
             policy: RwLock::new(PasswordHashPolicy::default()),
+            authz_sources: RwLock::new(None),
             verify_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
             migrate_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MIGRATIONS)),
         }
@@ -658,6 +674,43 @@ impl MemoryAuth {
     /// Current hashing policy.
     pub fn policy(&self) -> PasswordHashPolicy {
         *self.policy.read()
+    }
+
+    /// Link the shared authorization source registry serving the
+    /// management API. Boot and management plane only: one `Arc` clone.
+    /// After linking, every publish/subscribe verdict attributes to the
+    /// built-in source counters and honours its stored enable flag and
+    /// order. Unlinked state keeps today's behaviour (open when empty).
+    pub fn set_authz_sources(&self, registry: Arc<AuthzSourceRegistry>) {
+        *self.authz_sources.write() = Some(registry);
+    }
+
+    /// True when the built-in database source may execute: unlinked
+    /// state keeps today's behaviour (true), linked state follows the
+    /// stored registry order and enable flags via
+    /// [`AuthzSourceRegistry::built_in_available`]. One lock-free
+    /// snapshot load of at most [`broker_config::MAX_AUTHZ_SOURCES`]
+    /// entries; stored-only sources never execute and are skipped in
+    /// stored order, so the check consults both order and enable.
+    fn built_in_live(&self) -> bool {
+        self.authz_sources
+            .read()
+            .as_ref()
+            .is_none_or(|registry| registry.built_in_available())
+    }
+
+    /// Attribute one built-in verdict to the shared registry counters.
+    /// Unlinked state applies nothing. One short read lock to clone the
+    /// counter `Arc` plus lock-free atomic adds; unknown types apply
+    /// nothing and never accumulate.
+    fn record_authz_verdict(&self, allowed: bool) {
+        if let Some(registry) = self.authz_sources.read().clone() {
+            if allowed {
+                registry.record_allow("built_in_database");
+            } else {
+                registry.record_deny("built_in_database");
+            }
+        }
     }
 
     fn digest(password: &[u8]) -> [u8; 32] {
@@ -2339,14 +2392,26 @@ async fn migrate_legacy_hash_gated_in_tenant(
 #[async_trait]
 impl Authorizer for MemoryAuth {
     async fn authorize_publish(&self, client_id: &str, topic: &Topic) -> Result<()> {
+        // Stored order and enable flags gate the built-in table: a
+        // disabled or removed built-in source denies fail closed and
+        // counts the denial on the shared registry. Otherwise the
+        // verdict attributes to the built-in counters.
+        if !self.built_in_live() {
+            self.record_authz_verdict(false);
+            return Err(AuthError::PublishDenied(format!(
+                "{client_id} cannot publish"
+            )));
+        }
         // Default-tenant shim through the shared first-match-wins helper
         // so single-tenant installs behave exactly as before (same
         // open-when-empty, same deny-if-unmatched).
         if self.check(client_id, AclAction::Publish, |rule| {
             rule.topic_matches(topic)
         }) {
+            self.record_authz_verdict(true);
             Ok(())
         } else {
+            self.record_authz_verdict(false);
             Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )))
@@ -2354,12 +2419,21 @@ impl Authorizer for MemoryAuth {
     }
 
     async fn authorize_subscribe(&self, client_id: &str, filter: &TopicFilter) -> Result<()> {
+        // Same stored order and enable gate as publish (see above).
+        if !self.built_in_live() {
+            self.record_authz_verdict(false);
+            return Err(AuthError::SubscribeDenied(format!(
+                "{client_id} cannot subscribe"
+            )));
+        }
         // Same default-tenant shim as publish (see above).
         if self.check(client_id, AclAction::Subscribe, |rule| {
             rule.filter_covered(filter)
         }) {
+            self.record_authz_verdict(true);
             Ok(())
         } else {
+            self.record_authz_verdict(false);
             Err(AuthError::SubscribeDenied(format!(
                 "{client_id} cannot subscribe"
             )))
@@ -2383,6 +2457,16 @@ impl MemoryAuth {
         let topic = topic.clone();
         if !is_default_tenant(key) && !is_valid_tenant_id(key) {
             self.deny_closed_tenant(key, client_id, "invalid tenant id at authorize_publish");
+            self.record_authz_verdict(false);
+            return Err(AuthError::PublishDenied(format!(
+                "{client_id} cannot publish"
+            )));
+        }
+        // Stored order and enable gate first: a disabled or removed
+        // built-in source denies fail closed in every tenant and counts
+        // the denial on the shared registry.
+        if !self.built_in_live() {
+            self.record_authz_verdict(false);
             return Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )));
@@ -2403,6 +2487,7 @@ impl MemoryAuth {
             (allowed, closed)
         };
         if allowed {
+            self.record_authz_verdict(true);
             Ok(())
         } else {
             // Count only genuinely closed tenants (unknown or a
@@ -2412,6 +2497,7 @@ impl MemoryAuth {
             if closed {
                 self.deny_closed_tenant(key, client_id, "closed tenant at authorize_publish");
             }
+            self.record_authz_verdict(false);
             Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )))
@@ -2430,6 +2516,14 @@ impl MemoryAuth {
         let filter = filter.clone();
         if !is_default_tenant(key) && !is_valid_tenant_id(key) {
             self.deny_closed_tenant(key, client_id, "invalid tenant id at authorize_subscribe");
+            self.record_authz_verdict(false);
+            return Err(AuthError::SubscribeDenied(format!(
+                "{client_id} cannot subscribe"
+            )));
+        }
+        // Same stored order and enable gate as the publish path.
+        if !self.built_in_live() {
+            self.record_authz_verdict(false);
             return Err(AuthError::SubscribeDenied(format!(
                 "{client_id} cannot subscribe"
             )));
@@ -2448,11 +2542,13 @@ impl MemoryAuth {
             (allowed, closed)
         };
         if allowed {
+            self.record_authz_verdict(true);
             Ok(())
         } else {
             if closed {
                 self.deny_closed_tenant(key, client_id, "closed tenant at authorize_subscribe");
             }
+            self.record_authz_verdict(false);
             Err(AuthError::SubscribeDenied(format!(
                 "{client_id} cannot subscribe"
             )))

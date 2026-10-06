@@ -33,22 +33,16 @@
 //!   of rendered JSON, so one record cannot balloon memory;
 //! - the default store is empty; an empty set lists as an empty
 //!   collection, never an error.
-// TODO(parity): which per-backend fields does the documented shape
-// require beyond backend/enable (display name, URLs, client ids, ...)?
-// The rulebook does not decide the exact shape and the broker tracks only
-// the registry slot (backend key, enable flag, opaque config), so the
-// current choice renders backend/enable plus `config` when one is stored
-// and omits fields the broker cannot supply (never a constant standing
-// in for a measurement) until the checker pins them.
-// TODO(parity): is the documented list a bare array or an envelope, and
-// what are the exact per-backend field names (`backend` versus `name`
-// versus `id`)? The rulebook does not decide the exact shape; the current
-// choice answers a bare JSON array of backend rows (the route is not
-// paged) until the checker pins it.
-// TODO(parity): which backend names does the spec document (oidc, saml,
-// oauth, ...)? The rulebook does not decide the exact vocabulary; the
-// current choice stores any non-empty slash-free name within the length
-// cap, without claiming any backend executes, until the checker pins it.
+// Shape note: the reference specification types each backend as a
+// variant (one schema each for `saml`, `oidc` and `ldap`). Each row
+// reports the stored keys (`backend`, `enable`) plus the stored backend
+// fields at the top level. The management console sends and reads the
+// same flat fields. A stored `config` object also renders under `config`
+// for older readers.
+// Open question: the specification addresses only `ldap`, `oidc` and
+// `saml` names. The store keeps any slash-free name.
+// TODO(parity): which backend names does the specification allow beyond
+// the three typed variants?
 
 use axum::{
     extract::{Path, Query, State},
@@ -174,11 +168,12 @@ fn redact_secrets(value: &serde_json::Value) -> serde_json::Value {
 impl SsoBackend {
     /// API row: the stored slot with secrets redacted. `config` renders
     /// only when one is stored; backends without stored config omit it
-    /// rather than inventing an empty object. Secret fields inside the
-    /// config render as [`REDACTED_SECRET`], never the stored value: the
-    /// stored secret stays sealed in the registry file and out of logs
-    /// and responses, while non-secret fields (issuer, URLs) render
-    /// verbatim so operators can still inspect them.
+    /// rather than inventing an empty object. Each stored backend field
+    /// also renders at the top level, so the row matches the documented
+    /// variant shape. Secret fields render as [`REDACTED_SECRET`], never
+    /// the stored value: the stored secret stays sealed in the registry
+    /// file and out of logs and responses, while non-secret fields
+    /// (issuer, URLs) render verbatim so operators can still inspect them.
     // TODO(parity): which config fields does the documented shape redact
     // (marker string versus omission, exact secret field list)? The
     // rulebook does not decide the redaction shape; the current choice
@@ -189,8 +184,17 @@ impl SsoBackend {
             "backend": self.backend,
             "enable": self.enable,
         });
-        if !self.config.is_null() {
-            value["config"] = redact_secrets(&self.config);
+        if self.config.is_null() {
+            return value;
+        }
+        let redacted = redact_secrets(&self.config);
+        value["config"] = redacted.clone();
+        if let Some(fields) = redacted.as_object() {
+            for (key, field) in fields {
+                if value.get(key).is_none() {
+                    value[key] = field.clone();
+                }
+            }
         }
         value
     }
@@ -684,19 +688,17 @@ fn validate_detail_name(backend: &str) -> Result<(), String> {
 
 /// Build the record one `PUT /sso/{backend}` write stores. The body must
 /// be a JSON object carrying `enable` (boolean, defaults to `true` when
-/// omitted or null, the historical behaviour for slots that predate the
-/// flag) and `config` (object, JSON-text string, or null/missing for an
-/// empty slot); a `backend` field, when present as a non-empty string,
-/// must name the path backend. Unknown fields are ignored, consistently
-/// with the sibling create paths' extra-fields-ignored rule. Every field
-/// is checked before the record is built, so a bad body applies nothing.
+/// omitted or null) and the backend fields. Backend fields ride either
+/// as a nested `config` object (or JSON-text string) or as flat top-level
+/// fields besides `backend`/`enable`/`config`; both forms store the same
+/// object and read back flat at the top level. A `backend` field, when
+/// present as a non-empty string, must name the path backend. Every
+/// field is checked before the record is built, so a bad body applies
+/// nothing.
 // TODO(parity): which fields does the documented write accept beyond
-// enable/config (display name, URLs, client ids, ...)? The rulebook does
-// not decide the exact shape and the broker tracks only the registry slot
-// (backend key, enable flag, opaque config), so the current choice stores
-// the opaque config verbatim and omits fields the broker cannot supply
-// (never a constant standing in for a measurement) until the checker
-// pins them.
+// the variant fields? The rulebook does not decide the exact shape; the
+// current choice stores every extra top-level field verbatim as backend
+// config until the checker pins the set.
 // TODO(parity): does the documented write reject a `backend` body field
 // that differs from the path, or ignore it? The rulebook does not decide
 // the mismatch policy; the current choice rejects it as the conservative
@@ -721,17 +723,26 @@ fn parse_detail_body(path_backend: &str, value: &serde_json::Value) -> Result<Ss
         Some(serde_json::Value::Bool(flag)) => *flag,
         Some(_) => return Err("field `enable` must be a boolean".to_string()),
     };
-    let config = match object.get("config") {
-        None | Some(serde_json::Value::Null) => serde_json::Value::Null,
-        Some(serde_json::Value::Object(_)) => {
-            object.get("config").expect("config is an object").clone()
-        }
-        Some(serde_json::Value::String(text)) if text.trim().is_empty() => serde_json::Value::Null,
+    let mut fields = match object.get("config") {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(map)) => map.clone(),
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => serde_json::Map::new(),
         Some(serde_json::Value::String(text)) => match serde_json::from_str(text) {
-            Ok(parsed) => parsed,
+            Ok(serde_json::Value::Object(map)) => map,
+            Ok(_) => return Err("field `config` must be an object".to_string()),
             Err(_) => return Err("field `config` is not valid JSON".to_string()),
         },
         Some(_) => return Err("field `config` must be an object".to_string()),
+    };
+    for (key, field) in object {
+        if !matches!(key.as_str(), "backend" | "enable" | "config") && !fields.contains_key(key) {
+            fields.insert(key.clone(), field.clone());
+        }
+    }
+    let config = if fields.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(fields)
     };
     Ok(SsoBackend {
         backend: path_backend.to_string(),
@@ -3867,11 +3878,54 @@ mod sso_token_exchange_tests {
     }
 
     #[test]
-    fn exchange_bounds_are_finite_and_reasoned() {
-        const { assert!(MAX_PENDING_SSO_LOGINS > 0) };
+    fn detail_bounds_are_finite_and_reasoned() {
+        const { assert!(MAX_SSO_BACKENDS > 0) };
         const { assert!(MAX_SSO_GRANT_LEN > 0) };
         const { assert!(broker_config::MAX_SSO_BACKEND_NAME_LEN > 0) };
         assert!(!PENDING_SSO_LOGIN_TTL.is_zero());
+    }
+
+    #[tokio::test]
+    async fn put_then_get_round_trip_serves_flat_variant_fields() {
+        // A flat variant write reads back flat. Before: the write
+        // dropped unknown fields, so the row matched no documented
+        // variant schema.
+        use broker_rules::{BackpressurePolicy, RuleEngine};
+        let state = ApiState::standalone(Arc::new(RuleEngine::new(
+            16,
+            BackpressurePolicy::DropOldest,
+        )));
+        let write = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "backend": "ldap",
+                "enable": true,
+                "server": "127.0.0.1:389",
+                "base_dn": "dc=example,dc=com",
+                "username": "cn=reader",
+            }))
+            .expect("test body serialises"),
+        );
+        let response = put_sso_backend(State(state.clone()), Path("ldap".to_string()), write).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let stored: serde_json::Value = serde_json::from_slice(&bytes).expect("test body is JSON");
+        assert_eq!(stored["backend"], serde_json::json!("ldap"));
+        assert_eq!(stored["server"], serde_json::json!("127.0.0.1:389"));
+
+        let response = get_sso_backend(State(state.clone()), Path("ldap".to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("test body is small and readable");
+        let read: serde_json::Value = serde_json::from_slice(&bytes).expect("test body is JSON");
+        assert_eq!(read, stored);
+
+        // An unknown backend misses with the documented shape.
+        let response =
+            get_sso_backend(State(state.clone()), Path("w239-missing".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
 
@@ -4131,6 +4185,48 @@ mod sso_detail_tests {
                 "bad body must be rejected: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn flat_variant_fields_store_and_render_at_top_level() {
+        // The console sends variant fields flat. Before: unknown fields
+        // never reached the store, so the detail row matched no
+        // documented variant schema.
+        let record = parse_detail_body(
+            "ldap",
+            &serde_json::json!({
+                "backend": "ldap",
+                "enable": true,
+                "server": "127.0.0.1:389",
+                "base_dn": "dc=example,dc=com",
+                "username": "cn=reader",
+            }),
+        )
+        .expect("flat variant body parses");
+        assert_eq!(record.backend, "ldap");
+        assert!(record.enable);
+        assert_eq!(record.config["server"], serde_json::json!("127.0.0.1:389"));
+        let row = record.to_json();
+        assert_eq!(row["backend"], serde_json::json!("ldap"));
+        assert_eq!(row["server"], serde_json::json!("127.0.0.1:389"));
+        assert_eq!(row["base_dn"], serde_json::json!("dc=example,dc=com"));
+        assert_eq!(row["username"], serde_json::json!("cn=reader"));
+
+        // Flat fields merge into an explicit `config` object.
+        let record = parse_detail_body(
+            "oidc",
+            &serde_json::json!({
+                "backend": "oidc",
+                "config": {"issuer": "https://idp.example.invalid"},
+                "clientid": "w239-client",
+            }),
+        )
+        .expect("mixed body parses");
+        assert_eq!(
+            record.config["issuer"],
+            serde_json::json!("https://idp.example.invalid")
+        );
+        assert_eq!(record.config["clientid"], serde_json::json!("w239-client"));
     }
 
     #[test]

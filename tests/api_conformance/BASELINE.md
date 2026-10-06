@@ -206,3 +206,26 @@ is not changed.
   `ListDataWithCursor<MessageStreamItem>`, and the stream page reads
   `res?.data`. The broker returns one object with `data` and the standard
   page `meta`, so the checker reports a type error for this row.
+- `GET /authentication/{id}/status`, response 200. The specification schema
+  types `node_error`, `node_metrics`, `node_resource_metrics` and
+  `node_status` as single objects. The specification example answers one
+  array per field with one object per node, and the management console
+  reads arrays (`node_status: Array<{node, status}>`,
+  `node_metrics: Array<...>`). The broker returns one row per node in each
+  array, so the checker reports a type error for this row.
+- `POST /sso/mfa/setup_info`, response 401. The specification documents
+  401 `UNAUTHORIZED` for an invalid or expired token. The management console
+  sends `backend`, `setup_token` and `username` and reads `secret` plus
+  `mechanism` (`postSSOmfaSetupInfo`). Single sign-on is unstable, so no
+  setup token verifies and the broker answers the documented 401. A body
+  without the three fields answers 400.
+- `GET /authorization/sources`, response 200. The specification declares
+  one object with `sources`. The broker returns one object with `sources`
+  in stored order.
+- `GET /authentication/{id}/status`, `GET /authorization/sources/{type}/status`
+  and `GET /authorization/sources/{type}`, response 200. The broker omits
+  `status` and `node_status` plus rate and resource fields it does not
+  measure. Counters are live: each publish and subscribe verdict on the
+  built-in table attributes to the built-in allow and deny counters, and a
+  disabled or removed built-in source denies fail closed. The stored
+  evaluation order gates the next verdict.

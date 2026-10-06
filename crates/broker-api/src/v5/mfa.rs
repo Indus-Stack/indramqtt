@@ -24,27 +24,23 @@
 //! Secrets are stored reversibly (verification must recompute codes),
 //! never logged, and only returned once by the setup route.
 //!
+//! Shape note: `setup_info` follows the documented single-sign-on shape
+//! (`backend`, `setup_token`, `username`) and fails closed with 401 while
+//! single sign-on is unstable. `setup` and `verify` keep the local shape
+//! (`username`, plus `code` for verify): local enrolment has no
+//! single-sign-on token. `POST /users/{username}/mfa` sets up or resets,
+//! so it always stores a fresh secret.
+//!
 //! Management-plane only: short user-map and attempt-map locks per call;
 //! publish and deliver never touch either map, add no locks and allocate
 //! nothing on the message path.
-// TODO(parity): what are the documented request/response field names and
-// shapes for these three routes (secret versus provisioning fields,
-// envelope versus bare object, code field name)? The rulebook does not
-// decide the exact shapes; the current choice takes `{username}` for
-// setup and setup_info and `{username, code}` for verify, and answers
-// `{username, secret, provisioning_uri}`, `{username, enabled, pending}`
-// and `{username, enabled}` respectively, until the checker pins them.
 // TODO(parity): which error codes does the documented shape assign to
-// bad codes, replays, missing enrolments and duplicate setups? The
-// rulebook does not decide the exact code names; the current choice keeps
-// `BAD_REQUEST` (400) for bad/replayed/missing-enrolment codes,
-// `ALREADY_EXISTS` (409) for setup while enabled, `NOT_FOUND` (404) for
-// unknown users and `TOO_MANY_REQUESTS` (429) for the cool-down, all in
-// the documented `{code, message}` shape, until the checker pins them.
-// TODO(parity): is an already-enabled user re-enrolled by setup (secret
-// rotation) or rejected? The rulebook does not decide the rotation
-// policy; the current choice rejects with `ALREADY_EXISTS` fail-closed
-// (never silently replaces a live second factor) until the checker pins it.
+// bad codes, replays and missing enrolments? The rulebook does not
+// decide the exact code names; the current choice keeps `BAD_REQUEST`
+// (400) for bad/replayed/missing-enrolment codes, `ALREADY_EXISTS` (409)
+// for setup while enabled, `NOT_FOUND` (404) for unknown users and
+// `TOO_MANY_REQUESTS` (429) for the cool-down, all in the documented
+// `{code, message}` shape, until the checker pins them.
 
 use axum::{
     extract::{Path, State},
@@ -224,13 +220,17 @@ pub async fn setup(State(state): State<ApiState>, body: Bytes) -> Response {
         .into_response()
 }
 
-/// `POST /sso/mfa/setup_info`: report one user's MFA enrolment state.
+/// `POST /sso/mfa/setup_info`: report TOTP setup data for one
+/// single-sign-on user.
 ///
-/// The body must be a JSON object with a non-empty string `username`.
-/// Unknown users fail with 404. Answers `{username, enabled, pending}`
-/// where `pending` means a secret is stored but no code has verified yet.
-/// Secrets never render here. The route is not paged.
-pub async fn setup_info(State(state): State<ApiState>, body: Bytes) -> Response {
+/// The body must carry non-empty `backend`, `setup_token` and `username`
+/// strings, as the reference specification documents. Anything else
+/// fails with 400. A well-formed call fails closed with 401
+/// `UNAUTHORIZED`: single sign-on is unstable, so no setup token verifies
+/// and no secret is issued here. Local enrolment state stays on the setup
+/// route and on `GET /users`. The route is not paged. Secrets are never
+/// logged.
+pub async fn setup_info(State(_state): State<ApiState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
@@ -238,22 +238,29 @@ pub async fn setup_info(State(state): State<ApiState>, body: Bytes) -> Response 
                 .into_response();
         }
     };
-    let username = match parse_username(&value) {
-        Ok(username) => username,
-        Err(message) => return ApiError::BadRequest(message).into_response(),
-    };
-    let Some(status) = state.admin_users.mfa_status(&username) else {
-        return ApiError::NotFound(format!("user {username:?} not found")).into_response();
-    };
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "username": username,
-            "enabled": status.enabled,
-            "pending": status.pending,
-        })),
-    )
+    if let Err(message) = parse_sso_token_body(&value, "setup_token") {
+        return ApiError::BadRequest(message).into_response();
+    }
+    ApiError::Unauthorized("single sign-on is not available in this release".to_string())
         .into_response()
+}
+
+/// Check a single-sign-on token body: a JSON object with non-empty
+/// `backend`, `username` and one non-empty token field.
+fn parse_sso_token_body(value: &serde_json::Value, token_field: &str) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "mfa body must be a JSON object".to_string())?;
+    for field in ["backend", "username", token_field] {
+        let text = object
+            .get(field)
+            .and_then(|name| name.as_str())
+            .ok_or_else(|| format!("field `{field}` is required"))?;
+        if text.trim().is_empty() {
+            return Err(format!("field `{field}` must not be empty"));
+        }
+    }
+    Ok(())
 }
 
 /// `POST /sso/mfa/verify`: confirm a one-time code and enable MFA.
@@ -316,29 +323,16 @@ pub async fn verify(State(state): State<ApiState>, body: Bytes) -> Response {
 /// JSON object with an optional string `mechanism` field; any other
 /// mechanism fails with 400 fail-closed, since non-TOTP factors are out
 /// of scope and must never enrol silently. A malformed body fails with
-/// 400 and enrols nothing. Unknown users fail with 404; a user with any
-/// existing enrolment (pending or enabled) fails with 409
-/// `ALREADY_EXISTS` and changes nothing, so enrolment never grows past
-/// the single secret slot. On success answers 204 with no body, as the
-/// reference API documents. The user stays pending until a code verifies
-/// on the verification route. The user reads the secret and the
-/// provisioning URI from `POST /sso/mfa/setup`, which returns the same
-/// pending secret.
+/// 400 and enrols nothing. Unknown users fail with 404. The call sets up
+/// or resets: it always stores a fresh secret as pending (enabled stays
+/// false until a code verifies), even for a user with an existing
+/// enrolment. On success answers 204 with no body, as the reference API
+/// documents. The user reads the secret from `POST /sso/mfa/setup`,
+/// which returns the same pending secret.
 /// The route is not paged. Secrets are never logged.
 /// Management-plane only: one short user-map write lock per call (plus
 /// the registry save lock on persist); publish and deliver never touch
 /// the user map or the attempt counters.
-// TODO(parity): what are the documented request/response field names and
-// shapes for this route (mechanism body, secret versus provisioning
-// fields, 200 versus an empty success)? The rulebook does not decide the
-// exact shapes; the current choice accepts an empty or
-// `{mechanism: "totp"}` body and answers the same provisioning fields
-// as the setup route until the checker pins them.
-// TODO(parity): is a duplicate enrolment rejected with `ALREADY_EXISTS`
-// (409 here) or `BAD_REQUEST` (400)? The rulebook does not decide the
-// exact duplicate code; the current choice keeps `ALREADY_EXISTS`
-// (409, distinct from validation failures, shared with the setup route's
-// enabled-duplicate) until the checker pins it.
 // TODO(parity): may an administrator enrol their own account through
 // this route, or must self-service stay on the current-user MFA route?
 // The rulebook does not decide the self-target policy; the current
@@ -356,9 +350,6 @@ pub async fn enrol(
         Ok(_) => {}
         Err(AdminUserError::NotFound) => {
             return ApiError::UserNotFound(format!("user {username:?} not found")).into_response();
-        }
-        Err(AdminUserError::AlreadyExists) => {
-            return already_exists(format!("user {username:?} already has MFA enrolled"));
         }
         Err(error @ AdminUserError::Persist(_)) => return internal_error(error.to_string()),
         Err(error) => return ApiError::BadRequest(error.to_string()).into_response(),
@@ -476,10 +467,9 @@ mod mfa_handler_tests {
     }
 
     #[tokio::test]
-    async fn setup_then_info_then_verify_round_trip_with_replay_rejected() {
-        // W2-34 failing test: setup starts enrolment, setup_info reports
-        // pending, a valid code enables, and the same code replayed is
-        // rejected. Before: all three routes answered 404.
+    async fn setup_then_verify_round_trip_with_replay_rejected() {
+        // Setup starts enrolment, a valid code enables, and the same code
+        // replayed is rejected. Before: all three routes answered 404.
         let state = standalone_state();
         create_user(&state, "w234-alice");
 
@@ -508,22 +498,13 @@ mod mfa_handler_tests {
             "setup body carries no password"
         );
 
-        // Setup_info reports pending (secret stored, not yet enabled).
-        let (status, info, _) = parts(
-            setup_info(
-                State(state.clone()),
-                body(serde_json::json!({"username": "w234-alice"})),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(info["enabled"], serde_json::json!(false));
-        assert_eq!(info["pending"], serde_json::json!(true));
-        assert!(
-            info.get("secret").is_none(),
-            "setup_info never renders the secret"
-        );
+        // The store reports pending (secret stored, not yet enabled).
+        let status = state
+            .admin_users
+            .mfa_status("w234-alice")
+            .expect("enrolment is stored");
+        assert!(!status.enabled);
+        assert!(status.pending);
 
         // A valid code enables.
         let code = current_code(&state, "w234-alice");
@@ -538,18 +519,13 @@ mod mfa_handler_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(verified["enabled"], serde_json::json!(true));
 
-        // Setup_info now reports enabled.
-        let (status, info, _) = parts(
-            setup_info(
-                State(state.clone()),
-                body(serde_json::json!({"username": "w234-alice"})),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(info["enabled"], serde_json::json!(true));
-        assert_eq!(info["pending"], serde_json::json!(false));
+        // The store now reports enabled.
+        let status = state
+            .admin_users
+            .mfa_status("w234-alice")
+            .expect("enrolment is stored");
+        assert!(status.enabled);
+        assert!(!status.pending);
 
         // Replaying the same code is rejected (single-use window).
         let (status, replayed, _) = parts(
@@ -607,16 +583,11 @@ mod mfa_handler_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
-        let (status, info, _) = parts(
-            setup_info(
-                State(state.clone()),
-                body(serde_json::json!({"username": "w234-bob"})),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(info["enabled"], serde_json::json!(false));
+        let status = state
+            .admin_users
+            .mfa_status("w234-bob")
+            .expect("enrolment is stored");
+        assert!(!status.enabled);
 
         // Malformed codes fail closed without enabling.
         for bad in ["", "12345", "1234567", "abcdef", "not-a-code"] {
@@ -632,20 +603,10 @@ mod mfa_handler_tests {
             assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
         }
 
-        // Unknown users are 404 with the documented shape on all routes.
+        // Unknown users are 404 with the documented shape on setup and
+        // verify.
         let (status, err, _) = parts(
             setup(
-                State(state.clone()),
-                body(serde_json::json!({"username": "w234-ghost"})),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
-        assert_eq!(err.as_object().expect("error is an object").len(), 2);
-        let (status, err, _) = parts(
-            setup_info(
                 State(state.clone()),
                 body(serde_json::json!({"username": "w234-ghost"})),
             )
@@ -667,6 +628,20 @@ mod mfa_handler_tests {
         assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
         assert_eq!(err.as_object().expect("error is an object").len(), 2);
 
+        // Setup_info follows the single-sign-on shape: a local-only body
+        // is malformed, never a user lookup.
+        let (status, err, _) = parts(
+            setup_info(
+                State(state.clone()),
+                body(serde_json::json!({"username": "w234-ghost"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+
         // Malformed bodies are 400 and change nothing.
         let (status, err, _) =
             parts(setup(State(state.clone()), Bytes::from_static(b"not json")).await).await;
@@ -676,6 +651,56 @@ mod mfa_handler_tests {
             parts(setup(State(state.clone()), body(serde_json::json!({}))).await).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn setup_info_answers_the_documented_sso_shape() {
+        // The request carries `backend`, `setup_token` and `username`.
+        // Before: the route read a local `{username}` body.
+        let state = standalone_state();
+        create_user(&state, "w240-sso");
+
+        // Malformed bodies fail with 400 and issue nothing.
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"username": "w240-sso"}),
+            serde_json::json!({"backend": "oidc", "username": "w240-sso"}),
+            serde_json::json!({"backend": "", "setup_token": "w240-t", "username": "w240-sso"}),
+            serde_json::json!({"backend": "oidc", "setup_token": "", "username": "w240-sso"}),
+            serde_json::json!({"backend": "oidc", "setup_token": "w240-t", "username": ""}),
+        ] {
+            let (status, err, _) =
+                parts(setup_info(State(state.clone()), body(bad.clone())).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body {bad}");
+            assert_eq!(err["code"], serde_json::json!("BAD_REQUEST"));
+            assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        }
+        let (status, _, _) =
+            parts(setup_info(State(state.clone()), Bytes::from_static(b"not json")).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A well-formed call fails closed with the documented 401: no
+        // setup token verifies while single sign-on is unstable.
+        let (status, err, raw) = parts(
+            setup_info(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "backend": "oidc",
+                    "setup_token": "w240-token",
+                    "username": "w240-sso",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err["code"], serde_json::json!("UNAUTHORIZED"));
+        assert!(err["message"].is_string());
+        assert_eq!(err.as_object().expect("error is an object").len(), 2);
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("w240-token"),
+            "denial carries no token"
+        );
     }
 
     #[tokio::test]
@@ -833,10 +858,10 @@ mod mfa_handler_tests {
     }
 
     #[tokio::test]
-    async fn admin_mfa_enrol_then_disable_round_trip_with_duplicate_rejected() {
-        // W2-44 failing test: enrol returns the provisioning fields, a
-        // second enrol is rejected as a duplicate, delete disables, and a
-        // second delete is a miss. Before: both routes answered 404.
+    async fn admin_mfa_enrol_then_disable_round_trip_with_reset() {
+        // Enrol answers 204 with no body. A second enrol resets: it
+        // answers 204 and stores a fresh secret. Delete disables, and a
+        // second delete is a miss. Before: the second enrol answered 409.
         let state = standalone_state();
         create_user(&state, "w244-alice");
 
@@ -877,24 +902,19 @@ mod mfa_handler_tests {
         assert!(provisioning["provisioning_uri"].is_string());
 
         // The shared admin-user state reports the enrolment as pending.
-        let (status, info, _) = parts(
-            setup_info(
-                State(state.clone()),
-                body(serde_json::json!({"username": "w244-alice"})),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(info["pending"], serde_json::json!(true));
+        let status = state
+            .admin_users
+            .mfa_status("w244-alice")
+            .expect("enrolment is stored");
+        assert!(!status.enabled);
+        assert!(status.pending);
 
-        // Re-enrolling (pending or enabled) is rejected cleanly and keeps
-        // the stored secret.
+        // Re-enrolling resets with a fresh secret.
         let before = state
             .admin_users
             .mfa_secret_for_test("w244-alice")
             .expect("enrolment stores a secret");
-        let (status, err, _) = parts(
+        let (status, reset, raw) = parts(
             enrol(
                 State(state.clone()),
                 Path("w244-alice".to_string()),
@@ -903,16 +923,19 @@ mod mfa_handler_tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(err["code"], serde_json::json!("ALREADY_EXISTS"));
-        assert_eq!(err.as_object().expect("error is an object").len(), 2);
-        assert_eq!(
-            state
-                .admin_users
-                .mfa_secret_for_test("w244-alice")
-                .expect("secret survives a duplicate"),
-            before
-        );
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(reset.is_null() && raw.is_empty(), "reset has no body");
+        let after = state
+            .admin_users
+            .mfa_secret_for_test("w244-alice")
+            .expect("reset stores a secret");
+        assert_ne!(before, after, "reset stores a fresh secret");
+        let status = state
+            .admin_users
+            .mfa_status("w244-alice")
+            .expect("enrolment is stored");
+        assert!(!status.enabled);
+        assert!(status.pending);
 
         // Delete disables and reports success with no body.
         let (status, gone, raw) =
@@ -1003,7 +1026,8 @@ mod mfa_handler_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
-        // An enabled user re-enrolling is rejected the same clean way.
+        // An enabled user re-enrolling resets to pending with a fresh
+        // secret.
         let secret = state
             .admin_users
             .mfa_secret_for_test("w244-bob")
@@ -1014,7 +1038,7 @@ mod mfa_handler_tests {
             .admin_users
             .mfa_verify("w244-bob", &code, now)
             .expect("verify enables");
-        let (status, err, _) = parts(
+        let (status, reset, _) = parts(
             enrol(
                 State(state.clone()),
                 Path("w244-bob".to_string()),
@@ -1023,25 +1047,26 @@ mod mfa_handler_tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(err["code"], serde_json::json!("ALREADY_EXISTS"));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(reset.is_null(), "reset has no body");
+        let status = state
+            .admin_users
+            .mfa_status("w244-bob")
+            .expect("enrolment is stored");
+        assert!(!status.enabled);
+        assert!(status.pending);
 
         // Disabling an enabled user clears the enrolment; the state reads
         // as neither pending nor enabled afterwards.
         let (status, _, _) =
             parts(disable(State(state.clone()), Path("w244-bob".to_string())).await).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, info, _) = parts(
-            setup_info(
-                State(state.clone()),
-                body(serde_json::json!({"username": "w244-bob"})),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(info["enabled"], serde_json::json!(false));
-        assert_eq!(info["pending"], serde_json::json!(false));
+        let status = state
+            .admin_users
+            .mfa_status("w244-bob")
+            .expect("user survives the disable");
+        assert!(!status.enabled);
+        assert!(!status.pending);
     }
 
     #[tokio::test]
@@ -1071,11 +1096,10 @@ mod mfa_handler_tests {
         let secret = durable
             .mfa_admin_enrol("w244-kept")
             .expect("enrol persists");
-        assert_eq!(
-            durable.mfa_admin_enrol("w244-kept"),
-            Err(crate::admin_users::AdminUserError::AlreadyExists),
-            "duplicate enrol is rejected without growing state"
-        );
+        let reset = durable
+            .mfa_admin_enrol("w244-kept")
+            .expect("re-enrol resets with a fresh secret");
+        assert_ne!(secret, reset, "reset stores a fresh secret");
         drop(durable);
         let reloaded = std::sync::Arc::new(
             broker_config::ConfigRegistry::load(&dir).expect("registry reloads after a restart"),
