@@ -884,6 +884,10 @@ fn describe_action(action: &serde_json::Value) -> String {
 }
 
 async fn cmd_status(ctl: &CtlArgs, key: &SecretString) -> Result<String, CtlError> {
+    // The status document is public for load balancers.
+    // Verify the key on a protected route first.
+    // Reject a wrong key before reading the status.
+    request(ctl, key, reqwest::Method::GET, "/api/v5/nodes", None).await?;
     let (_, body) = request(
         ctl,
         key,

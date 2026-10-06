@@ -1080,36 +1080,82 @@ struct QuotasDto {
     max_publish_burst: Option<u32>,
 }
 
+/// Optional tenant scope for the v1 user and ACL routes (TM-01):
+/// `?tenant=<id>` selects one tenant table. Absent or empty selects the
+/// default tenant, so calls without the parameter behave exactly as
+/// before. Each write validates the tenant id before it applies: a bad
+/// id fails with 400 naming the field and leaves state unchanged.
+#[derive(Debug, Deserialize, Default)]
+struct TenantScope {
+    #[serde(default)]
+    tenant: Option<String>,
+}
+
+/// Resolve the tenant scope to its store key: empty rides as the default
+/// tenant; other ids must pass the credential-store tenant rule.
+fn resolve_tenant_scope(query: &TenantScope) -> Result<String, Box<Response>> {
+    let raw = query.tenant.as_deref().unwrap_or("");
+    if raw.is_empty() {
+        return Ok(broker_auth::DEFAULT_TENANT_ID.to_string());
+    }
+    if !broker_auth::is_valid_tenant_id(raw) {
+        return Err(Box::new(bad_request(format!(
+            "tenant {raw:?} is not a valid tenant id (field `tenant`)"
+        ))));
+    }
+    Ok(raw.to_string())
+}
+
 /// Users with their quota bounds (passwords are write-only, never listed).
-async fn list_users(State(state): State<ApiState>) -> Json<Vec<serde_json::Value>> {
+/// `?tenant=<id>` lists one tenant; absent lists the default tenant.
+async fn list_users(
+    State(state): State<ApiState>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
+) -> Response {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
     Json(
         state
             .auth
-            .usernames()
+            .usernames_in_tenant(&tenant)
             .iter()
             .map(|username| {
                 serde_json::json!({
                     "username": username,
-                    "quotas": state.auth.get_quotas(username),
+                    "quotas": state.auth.get_quotas_in_tenant(&tenant, username),
                 })
             })
-            .collect(),
+            .collect::<Vec<_>>(),
     )
+    .into_response()
 }
 
+/// Create one user credential (password is write-only).
+/// `?tenant=<id>` stores in one tenant; absent stores in the default
+/// tenant. The same username in two tenants is two independent
+/// identities. The write persists through the registry, so it survives a
+/// restart and a reload and ships in the export and the backup.
 async fn create_user(
     State(state): State<ApiState>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
     Json(req): Json<CreateUserRequest>,
 ) -> Response {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
     if req.username.trim().is_empty() {
         return bad_request("username must not be empty");
     }
     if req.password.is_empty() {
         return bad_request("password must not be empty");
     }
-    if let Err(error) = state
-        .auth
-        .add_user(req.username.clone(), req.password.as_bytes())
+    if let Err(error) =
+        state
+            .auth
+            .add_user_in_tenant(&tenant, req.username.clone(), req.password.as_bytes())
     {
         return persist_error(error);
     }
@@ -1120,13 +1166,16 @@ async fn create_user(
     }) {
         // The user was just created, so this always finds it; a persist
         // failure is still surfaced instead of silently dropped.
-        if let Err(error) = state.auth.set_quotas(&req.username, quotas) {
+        if let Err(error) = state
+            .auth
+            .set_quotas_in_tenant(&tenant, &req.username, quotas)
+        {
             return persist_error(error);
         }
     }
     // Quotas always render as an object (all-null when unset) so GET
     // and POST share one shape.
-    let stored = state.auth.get_quotas(&req.username);
+    let stored = state.auth.get_quotas_in_tenant(&tenant, &req.username);
     (
         StatusCode::CREATED,
         Json(serde_json::json!({ "username": req.username, "quotas": stored })),
@@ -1144,11 +1193,31 @@ struct CreateAclRequest {
 }
 
 /// Ordered ACL snapshot (first match wins on evaluation).
-async fn list_acls(State(state): State<ApiState>) -> Json<Vec<AclRule>> {
-    Json(state.auth.acl_rules())
+/// `?tenant=<id>` reads one tenant; absent reads the default tenant.
+async fn list_acls(
+    State(state): State<ApiState>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
+) -> Response {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    Json(state.auth.acl_rules_in_tenant(&tenant)).into_response()
 }
 
-async fn create_acl(State(state): State<ApiState>, Json(req): Json<CreateAclRequest>) -> Response {
+/// Append one ordered ACL entry (first match wins within the tenant).
+/// `?tenant=<id>` writes one tenant; absent writes the default tenant.
+/// The write persists through the registry, so it survives a restart
+/// and a reload and ships in the export and the backup.
+async fn create_acl(
+    State(state): State<ApiState>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
+    Json(req): Json<CreateAclRequest>,
+) -> Response {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
     if req.client_pattern.trim().is_empty() {
         return bad_request("client_pattern must not be empty");
     }
@@ -1159,12 +1228,15 @@ async fn create_acl(State(state): State<ApiState>, Json(req): Json<CreateAclRequ
     if TopicFilter::new(req.topic_pattern.clone()).is_err() {
         return bad_request("topic_pattern must be a valid MQTT filter");
     }
-    if let Err(error) = state.auth.add_rule(AclRule::new(
-        req.client_pattern.clone(),
-        action,
-        req.topic_pattern.clone(),
-        req.allow,
-    )) {
+    if let Err(error) = state.auth.add_rule_in_tenant(
+        &tenant,
+        AclRule::new(
+            req.client_pattern.clone(),
+            action,
+            req.topic_pattern.clone(),
+            req.allow,
+        ),
+    ) {
         return persist_error(error);
     }
     (
@@ -1178,22 +1250,36 @@ async fn create_acl(State(state): State<ApiState>, Json(req): Json<CreateAclRequ
         .into_response()
 }
 
+/// Delete one user. `?tenant=<id>` deletes in one tenant; absent deletes
+/// in the default tenant.
 async fn delete_user(
     State(state): State<ApiState>,
     axum::extract::Path(username): axum::extract::Path<String>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
 ) -> Response {
-    match state.auth.remove_user(&username) {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    match state.auth.remove_user_in_tenant(&tenant, &username) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => persist_error(error),
     }
 }
 
+/// Delete one ACL entry by index within its tenant list.
+/// `?tenant=<id>` deletes in one tenant; absent deletes in the default.
 async fn delete_acl(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
 ) -> Response {
-    match state.auth.remove_rule(id) {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    match state.auth.remove_rule_in_tenant(&tenant, id) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => persist_error(error),
@@ -4787,6 +4873,220 @@ mod tests {
             assert!(!text.contains("password_hash"));
             assert!(!text.contains("Sup3r-secret-pw!"));
         }
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TM-01: two tenants share one username with different passwords.
+    /// Real API calls create the users and rules per tenant; the CONNECT
+    /// and publish checks run through the broker auth store; a reload
+    /// keeps both tenants; a restart on the same data dir keeps both;
+    /// the export file carries both tenants without secrets.
+    #[tokio::test]
+    async fn tm01_two_tenants_persist_across_reload_restart_and_export() {
+        let dir = unique_data_dir("tm01-storage");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        state
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        let token = server.login_as_admin().await;
+        // Same username, different passwords, disjoint rules per tenant.
+        for (tenant, password, topic) in [
+            ("tenant-a", "pw-for-a-7x", "t/a/#"),
+            ("tenant-b", "pw-for-b-9q", "t/b/#"),
+        ] {
+            let (status, _) = server
+                .post_auth(
+                    &format!("/api/v1/auth/users?tenant={tenant}"),
+                    json!({"username": "sam", "password": password}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201, "user creates in {tenant}");
+            for action in ["publish", "subscribe"] {
+                let (status, _) = server
+                    .post_auth(
+                        &format!("/api/v1/auth/acls?tenant={tenant}"),
+                        json!({
+                            "client_pattern": "*",
+                            "action": action,
+                            "topic_pattern": topic,
+                            "allow": true,
+                        }),
+                        &token,
+                    )
+                    .await;
+                assert_eq!(status, 201, "{action} rule creates in {tenant}");
+            }
+        }
+        // Default tenant rows work through the same routes with no change.
+        let (status, _) = server
+            .post_auth(
+                "/api/v1/auth/users",
+                json!({"username": "base", "password": "base-pw-3z"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v1/auth/acls",
+                json!({
+                    "client_pattern": "base",
+                    "action": "all",
+                    "topic_pattern": "t/#",
+                    "allow": true,
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // A bad tenant id fails with 400 and applies nothing.
+        let long = "t".repeat(129);
+        let (status, _) = server
+            .get_auth(&format!("/api/v1/auth/users?tenant={long}"), &token)
+            .await;
+        assert_eq!(status, 400);
+        // Broker-path checks: the same calls the kernel makes per CONNECT
+        // and per message. Each password works only in its own tenant.
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a-7x"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-b-9q"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-b-9q"))
+            .await
+            .is_err());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-a-7x"))
+            .await
+            .is_err());
+        // A publish allowed in A is refused in B and vice versa.
+        let topic_a = Topic::new("t/a/1").expect("topic");
+        let topic_b = Topic::new("t/b/1").expect("topic");
+        assert!(state
+            .auth
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic_a)
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authorize_publish_in_tenant("tenant-b", "sam", &topic_a)
+            .await
+            .is_err());
+        assert!(state
+            .auth
+            .authorize_publish_in_tenant("tenant-b", "sam", &topic_b)
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic_b)
+            .await
+            .is_err());
+        // Delivery isolation: one subscription per tenant on the same
+        // filter; a publish in A matches only the subscriber in A.
+        let filter = TopicFilter::new("t/#").expect("filter");
+        state.router.subscribe(
+            &filter,
+            broker_router::Subscription::new_in_tenant("sub-a", 7101, QoS::AtMostOnce, "tenant-a"),
+        );
+        state.router.subscribe(
+            &filter,
+            broker_router::Subscription::new_in_tenant("sub-b", 7102, QoS::AtMostOnce, "tenant-b"),
+        );
+        let (matched_a, _) = state
+            .router
+            .matches_in_tenant_counted(&topic_a, None, "tenant-a");
+        assert!(matched_a.iter().any(|s| s.client_id.as_ref() == "sub-a"));
+        assert!(!matched_a.iter().any(|s| s.client_id.as_ref() == "sub-b"));
+        let (matched_b, _) = state
+            .router
+            .matches_in_tenant_counted(&topic_b, None, "tenant-b");
+        assert!(matched_b.iter().any(|s| s.client_id.as_ref() == "sub-b"));
+        assert!(!matched_b.iter().any(|s| s.client_id.as_ref() == "sub-a"));
+        // Reload keeps both tenants.
+        let candidate = registry.snapshot().as_ref().clone();
+        let (status, body) = server
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": candidate, "actor": "tm01", "summary": "keep both tenants"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "reload keeps both tenants: {body}");
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a-7x"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-b-9q"))
+            .await
+            .is_ok());
+        // The state file carries both tenants; plaintext never persists.
+        let text = std::fs::read_to_string(dir.join("state.toml")).expect("state file written");
+        assert!(text.contains("tenant-a") && text.contains("tenant-b"));
+        assert!(!text.contains("pw-for-a-7x") && !text.contains("pw-for-b-9q"));
+        // The export file carries both tenants without secrets.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/export",
+                json!({"root_keys": ["mqtt_users"], "table_sets": ["builtin_authn", "builtin_authz"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let filename = body["filename"].as_str().expect("export names its file");
+        let parts = read_backup_file(&dir.join("backup").join(filename));
+        let snap = parts
+            .iter()
+            .find(|(name, _)| name.ends_with("/snapshot/mqtt_users.json"))
+            .expect("mqtt_users root ships");
+        assert!(snap.1.contains("tenant-a") && snap.1.contains("tenant-b"));
+        let authn = parts
+            .iter()
+            .find(|(name, _)| name.ends_with("/tables/builtin_authn.json"))
+            .expect("authn table ships");
+        assert!(authn.1.contains("tenant-a") && authn.1.contains("tenant-b"));
+        for (_, text) in &parts {
+            assert!(!text.contains("password_hash"));
+            assert!(!text.contains("pw-for-a-7x"));
+            assert!(!text.contains("pw-for-b-9q"));
+        }
+        // Restart on the same data dir keeps both tenants.
+        drop(server);
+        drop(state);
+        drop(registry);
+        let registry =
+            Arc::new(ConfigRegistry::load(&dir).expect("registry reloads after a restart"));
+        let (server, state) = TestServer::start_with_registry(registry).await;
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a-7x"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-b-9q"))
+            .await
+            .is_ok());
+        use broker_auth::Authenticator as _;
+        assert!(state
+            .auth
+            .authenticate("device-1", Some("base"), Some(b"base-pw-3z"))
+            .await
+            .is_ok());
         drop(server);
         std::fs::remove_dir_all(&dir).ok();
     }

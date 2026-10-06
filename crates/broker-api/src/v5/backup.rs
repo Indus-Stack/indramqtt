@@ -514,7 +514,95 @@ fn merge_mqtt_users(value: &Value, previous: &MqttUsersConf) -> Result<MqttUsers
         })?;
         acls.push(entry);
     }
-    let conf = MqttUsersConf { users, acls };
+    // Per-tenant tables (TM-01): each entry carries `tenant`, `users`
+    // and `acls`. A missing `tenants` key reads as empty (pre-change
+    // files hold only the default tenant). The file is authoritative for
+    // membership in each table; live fills each password hash in its own
+    // table. Unknown names are refused per table: no password can be
+    // invented for them.
+    let mut tenants = Vec::new();
+    if let Some(tables_value) = value.get("tenants") {
+        let tables = tables_value.as_array().ok_or_else(|| {
+            ApiError::BadRequest("mqtt_users part `tenants` is not a list".to_string())
+        })?;
+        for (table_index, item) in tables.iter().enumerate() {
+            let tenant = item.get("tenant").and_then(Value::as_str).ok_or_else(|| {
+                ApiError::BadRequest(format!("mqtt_users.tenants[{table_index}] misses `tenant`"))
+            })?;
+            if !broker_config::is_valid_mqtt_tenant_id(tenant) || tenant == "default" {
+                return Err(ApiError::ValidationFailed(format!(
+                    "mqtt_users.tenants[{table_index}].tenant {tenant:?} is not a valid tenant id (field `tenant`)"
+                )));
+            }
+            if tenants
+                .iter()
+                .any(|table: &broker_config::TenantMqttConf| table.tenant == tenant)
+            {
+                return Err(ApiError::ValidationFailed(format!(
+                    "mqtt_users.tenants[{table_index}].tenant {tenant:?} is duplicated (field `tenant`)"
+                )));
+            }
+            let live_table = previous.tenants.iter().find(|table| table.tenant == tenant);
+            let users_value = item.get("users").and_then(Value::as_array).ok_or_else(|| {
+                ApiError::BadRequest(format!("mqtt_users.tenants[{table_index}] misses `users`"))
+            })?;
+            let mut table_users = Vec::with_capacity(users_value.len());
+            for (index, user_item) in users_value.iter().enumerate() {
+                let row: FileMqttUser =
+                    serde_json::from_value(user_item.clone()).map_err(|error| {
+                        ApiError::BadRequest(format!(
+                            "mqtt_users.tenants[{table_index}].users[{index}] is not a user: {error}"
+                        ))
+                    })?;
+                if row.username.trim().is_empty() {
+                    return Err(ApiError::ValidationFailed(format!(
+                        "mqtt_users.tenants[{table_index}].users[{index}].username must not be empty (field `username`)"
+                    )));
+                }
+                let live = live_table.and_then(|table| {
+                    table
+                        .users
+                        .iter()
+                        .find(|entry| entry.username == row.username)
+                });
+                let Some(live) = live else {
+                    return Err(ApiError::ValidationFailed(format!(
+                        "mqtt_users.tenants[{table_index}].users[{index}] {:?} is unknown: the backup carries no password for it",
+                        row.username
+                    )));
+                };
+                table_users.push(broker_config::MqttUser {
+                    username: row.username,
+                    password_hash: live.password_hash.clone(),
+                    max_connections: row.max_connections,
+                    max_publish_rate: row.max_publish_rate,
+                    max_publish_burst: row.max_publish_burst,
+                });
+            }
+            let acls_value = item.get("acls").and_then(Value::as_array).ok_or_else(|| {
+                ApiError::BadRequest(format!("mqtt_users.tenants[{table_index}] misses `acls`"))
+            })?;
+            let mut table_acls = Vec::with_capacity(acls_value.len());
+            for (index, acl_item) in acls_value.iter().enumerate() {
+                let entry: AclConf = serde_json::from_value(acl_item.clone()).map_err(|error| {
+                    ApiError::BadRequest(format!(
+                        "mqtt_users.tenants[{table_index}].acls[{index}] is not an ACL: {error}"
+                    ))
+                })?;
+                table_acls.push(entry);
+            }
+            tenants.push(broker_config::TenantMqttConf {
+                tenant: tenant.to_string(),
+                users: table_users,
+                acls: table_acls,
+            });
+        }
+    }
+    let conf = MqttUsersConf {
+        users,
+        acls,
+        tenants,
+    };
     check_part("mqtt_users", &conf)?;
     Ok(conf)
 }

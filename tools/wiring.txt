@@ -23,6 +23,7 @@ wired  audit
 wired  sso_backends
 wired  hwm_history
 wired  license_setting
+wired  license
 wired  sources
 wired  actions
 wired  transformations

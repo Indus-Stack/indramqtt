@@ -1133,6 +1133,133 @@ mod tests {
         (tx, rx, bound)
     }
 
+    /// Binds one client with credentials through the production frame
+    /// handler. Gives back whether the kernel accepted the bind plus the
+    /// CONNACK bytes, so tests observe refusals as well as accepts.
+    async fn bind_client_with_password(
+        shared: &Shared,
+        conn_id: u64,
+        client_id: &str,
+        username: &str,
+        password: &[u8],
+    ) -> (bool, Vec<u8>) {
+        let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+        let waker = Arc::new(tokio::sync::Notify::new());
+        let sink = NativeSink::new();
+        let mut bound = Vec::new();
+        let request = bind_request(
+            wire::Connect {
+                level: 4,
+                clean_start: true,
+                keepalive: 60,
+                client_id: client_id.to_string(),
+                will: None,
+                username: Some(username.to_string()),
+                password: Some(password.to_vec()),
+                properties: None,
+            },
+            "127.0.0.1",
+        );
+        let frame = BrokerFrame::new(
+            OpCode::BindConnection,
+            conn_id,
+            1,
+            Bytes::new(),
+            Bytes::new(),
+        )
+        .expect("frame");
+        handle_inbound_frame_with(
+            frame,
+            shared,
+            &tx,
+            &sink,
+            &mut bound,
+            &waker,
+            Some(&request),
+        )
+        .await
+        .expect("bind is handled");
+        let accepted = sink.accepted.load(Ordering::Relaxed);
+        (accepted, sink.take())
+    }
+
+    /// TM-01: two tenants hold the same username with different
+    /// passwords. Each CONNECT authenticates only in its own tenant,
+    /// through the production bind handler (not the store alone). The
+    /// tenant rule keys on the client id, so the same username in two
+    /// connections lands in two tenants.
+    #[tokio::test]
+    async fn tm01_connect_authenticates_same_username_in_two_tenants() {
+        let shared = Shared::new();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .tenant_registry
+            .replace(vec![broker_session::tenant::TenantRule::new(
+                "",
+                "tenant",
+                "t-${client_id}",
+            )])
+            .expect("tenant rule installs");
+        shared
+            .auth
+            .add_user_in_tenant("t-c-a", "sam", b"pw-for-a")
+            .expect("first tenant user stores");
+        shared
+            .auth
+            .add_user_in_tenant("t-c-b", "sam", b"pw-for-b")
+            .expect("second tenant user stores");
+        // Each password opens only its own tenant.
+        let (accepted, connack) = bind_client_with_password(
+            &shared,
+            NATIVE_CONN_ID_BASE + 910_001,
+            "c-a",
+            "sam",
+            b"pw-for-a",
+        )
+        .await;
+        assert!(accepted, "own password binds");
+        assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+        let (accepted, connack) = bind_client_with_password(
+            &shared,
+            NATIVE_CONN_ID_BASE + 910_002,
+            "c-b",
+            "sam",
+            b"pw-for-b",
+        )
+        .await;
+        assert!(accepted, "own password binds");
+        assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+        // Each password refuses in the other tenant.
+        let (accepted, connack) = bind_client_with_password(
+            &shared,
+            NATIVE_CONN_ID_BASE + 910_003,
+            "c-a",
+            "sam",
+            b"pw-for-b",
+        )
+        .await;
+        assert!(!accepted, "other tenant password refuses");
+        assert!(
+            connack.len() == 4 && connack[3] != 0,
+            "refusal carries a CONNACK code, got: {connack:?}"
+        );
+        let (accepted, connack) = bind_client_with_password(
+            &shared,
+            NATIVE_CONN_ID_BASE + 910_004,
+            "c-b",
+            "sam",
+            b"pw-for-a",
+        )
+        .await;
+        assert!(!accepted, "other tenant password refuses");
+        assert!(
+            connack.len() == 4 && connack[3] != 0,
+            "refusal carries a CONNACK code, got: {connack:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_panic_in_one_connection_releases_only_that_connection() {
         let shared = Shared::new();

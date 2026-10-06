@@ -155,6 +155,18 @@ fn redacted_root(name: &str, snapshot: &FullSnapshot) -> Value {
                 "max_publish_burst": user.max_publish_burst,
             })).collect::<Vec<_>>(),
             "acls": snapshot.mqtt_users.acls,
+            // Every tenant ships (TM-01): usernames and quotas carry no
+            // secrets, so the redacted export keeps them all.
+            "tenants": snapshot.mqtt_users.tenants.iter().map(|table| json!({
+                "tenant": table.tenant,
+                "users": table.users.iter().map(|user| json!({
+                    "username": user.username,
+                    "max_connections": user.max_connections,
+                    "max_publish_rate": user.max_publish_rate,
+                    "max_publish_burst": user.max_publish_burst,
+                })).collect::<Vec<_>>(),
+                "acls": table.acls,
+            })).collect::<Vec<_>>(),
         }),
         "rules" => json!(snapshot.rules),
         "connectors" => json!({
@@ -252,11 +264,22 @@ fn live_table(name: &str, state: &ApiState) -> Value {
             .collect::<Vec<_>>()),
         "builtin_authn" => json!(state
             .auth
-            .usernames()
+            .all_users_with_tenants()
             .iter()
-            .map(|username| json!({ "username": username }))
+            .map(|(tenant, username)| json!({ "tenant": tenant, "username": username }))
             .collect::<Vec<_>>()),
-        "builtin_authz" => json!(state.auth.acl_rules()),
+        "builtin_authz" => json!(state
+            .auth
+            .all_rules_with_tenants()
+            .iter()
+            .map(|(tenant, rule)| {
+                let mut value = serde_json::to_value(rule).unwrap_or(serde_json::json!({}));
+                if let Some(map) = value.as_object_mut() {
+                    map.insert("tenant".to_string(), serde_json::json!(tenant));
+                }
+                value
+            })
+            .collect::<Vec<_>>()),
         _ => Value::Null,
     }
 }

@@ -349,6 +349,113 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 5. Users and ACLs of each tenant stay after a restart ---
+# The tenant rule maps each username to its own tenant. The password is
+# random, thus the broker cannot know it. The broker restarts on the
+# same data directory. The same password must still open access, and a
+# wrong password must still fail. A publish must still reach the
+# subscriber in the same tenant, which proves the ACLs stayed too.
+KEEP_USER="smoke-keep"
+KEEP_TENANT="t-smoke-keep"
+KEEP_PASS=$(python3 -c 'import os; print(os.urandom(12).hex())')
+KEEP_TOPIC="smoke/keep/check"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$KEEP_TENANT" "$KEEP_USER" "$KEEP_PASS" <<'PY'
+import json, sys, urllib.request
+api, key, tenant, user, password = sys.argv[1:6]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(req) as res:
+        return res.status, res.read().decode()
+status, _ = call("POST", f"/api/v1/auth/users?tenant={tenant}",
+                 {"username": user, "password": password})
+assert status == 201, f"create per-tenant user: {status}"
+for action in ("publish", "subscribe"):
+    status, _ = call("POST", f"/api/v1/auth/acls?tenant={tenant}",
+                     {"client_pattern": "*", "action": action,
+                      "topic_pattern": "smoke/keep/#", "allow": True})
+    assert status == 201, f"create per-tenant {action} rule: {status}"
+print("per-tenant user and ACLs are stored")
+PY
+check "a per-tenant user with a random password is stored through the API" $?
+
+# Restart the kernel and the edge on the same data directory.
+kill "$KERNEL_PID" "$EDGE_PID" 2>/dev/null
+wait 2>/dev/null
+sleep 0.5
+INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
+    "$KERNEL" --config-dir "$ROOT/cfg" > "$ROOT/kernel2.log" 2>&1 &
+KERNEL_PID=$!
+healthz=
+for _ in $(seq 1 50); do
+    healthz=$(python3 - "$API_PORT" <<'PY' 2>/dev/null
+import sys, urllib.request
+print(urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/healthz", timeout=1).read().decode())
+PY
+)
+    [ "$healthz" = OK ] && break
+    kill -0 "$KERNEL_PID" 2>/dev/null || break
+    sleep 0.2
+done
+[ "$healthz" = OK ]
+check "the kernel restarts on the same data directory" $?
+(cd "$ROOT" && exec erl -noshell -noinput -pa "$EBIN" "${EDGE_ARGS[@]}" \
+    -eval '{ok, _} = application:ensure_all_started(indra_edge), timer:sleep(infinity).' \
+    > "$ROOT/edge2.log" 2>&1) &
+EDGE_PID=$!
+
+python3 - "$MQTT_PORT" "$KEEP_USER" "$KEEP_PASS" "$KEEP_TOPIC" <<'PY'
+import socket, struct, sys, time
+mqtt_port, username, password, topic = sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(), sys.argv[4].encode()
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the edge does not listen on port {port} after the restart")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+sub, ok = connect(b"keep-sub", username, password)
+report("the kept password still opens access after the restart", ok)
+wrong, wrong_ok = connect(b"keep-wrong", username, b"wrong-password")
+report("a wrong password still fails after the restart", not wrong_ok)
+ready = ok
+if ok:
+    sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = sub.recv(5)[:1] == b"\x90"
+    pub, pub_ok = connect(b"keep-pub", username, password)
+    ready = ready and pub_ok
+    if ready:
+        pub.sendall(packet(0x30, field(topic) + b"keep-ok"))
+        report("a publish still reaches the subscriber in the same tenant after the restart",
+               receive(sub, 5).endswith(b"keep-ok"))
+    else:
+        report("a publish still reaches the subscriber in the same tenant after the restart", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"
     exit 0
