@@ -229,3 +229,15 @@ is not changed.
   built-in table attributes to the built-in allow and deny counters, and a
   disabled or removed built-in source denies fail closed. The stored
   evaluation order gates the next verdict.
+- `POST /trace`, `PUT /trace/{name}/stop` and `GET /trace`, response 200,
+  field `log_size`. The specification declares an array of objects. The
+  management console reads an object keyed by node name. Its trace type
+  declares `log_size` as a map from node name to byte count. Its trace
+  table sums the values of that object. The broker returns one object
+  keyed by node name, so the checker reports a type error for these rows.
+- `GET /data/files/{filename}`, response 200. The specification declares
+  a JSON string with the single value `binary`. The management console
+  reads a file body. Its backup download call requests the path with a
+  blob response type. The broker serves the raw file bytes as
+  `application/octet-stream`, so the checker reports a type error for
+  this row.

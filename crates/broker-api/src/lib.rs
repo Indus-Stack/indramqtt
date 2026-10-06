@@ -4955,6 +4955,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_export_answers_documented_fields() {
+        // The export answers the documented file fields through the API.
+        // Before: only `filename`. Now: `created_at`, `filename`,
+        // `node` and the true file `size`.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/export",
+                json!({"root_keys": ["rules"], "table_sets": ["banned"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let filename = body["filename"].as_str().expect("export names its file");
+        assert!(filename.ends_with(".tar.gz"));
+        assert!(body["created_at"].is_string(), "export stamps its time");
+        assert!(body["node"].is_string(), "export names its node");
+        assert!(
+            body["size"].as_u64().is_some_and(|size| size > 0),
+            "export reports its true size"
+        );
+    }
+
+    #[tokio::test]
     async fn data_export_files_survive_restart() {
         // Export files persist across a restart: export, restart on the
         // same data dir, and the file is still there.
@@ -12499,6 +12524,54 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             status, 200,
             "kept route PUT /api/v5/slow_subscriptions/settings must be 200"
         );
+    }
+
+    #[tokio::test]
+    async fn trace_stop_and_log_detail_round_trip_through_api() {
+        // Stop and detail read go through the HTTP router. Create one
+        // session, read its file facts, stop it, and read the facts
+        // again. A missing session reads as 404 on both routes.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server.delete_auth("/api/v5/trace", &token).await;
+        assert_eq!(status, 204);
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/trace",
+                json!({"name": "http-trace-1", "type": "topic", "topic": "http/trace/#"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert!(created["log_size"].is_object());
+        let (status, detail) = server
+            .get_auth("/api/v5/trace/http-trace-1/log_detail", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert!(detail.as_array().is_some_and(|rows| rows.len() == 1));
+        assert!(detail[0]["node"].is_string());
+        assert!(detail[0]["size"].as_u64().is_some());
+        assert!(detail[0]["mtime"].as_u64().is_some());
+        let (status, stopped) = server
+            .put_auth("/api/v5/trace/http-trace-1/stop", json!(null), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(stopped["status"], json!("stopped"));
+        assert!(stopped["log_size"].is_object());
+        let (status, _) = server
+            .get_auth("/api/v5/trace/http-trace-1/log_detail", &token)
+            .await;
+        assert_eq!(status, 200);
+        let (status, _) = server
+            .get_auth("/api/v5/trace/no-such-trace/log_detail", &token)
+            .await;
+        assert_eq!(status, 404);
+        let (status, _) = server
+            .put_auth("/api/v5/trace/no-such-trace/stop", json!(null), &token)
+            .await;
+        assert_eq!(status, 404);
+        let (status, _) = server.delete_auth("/api/v5/trace", &token).await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]

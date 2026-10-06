@@ -8,7 +8,7 @@
 //! `GET /trace/{name}/download` (serve one session's captured log as a
 //! file download), `GET /trace/{name}/log` (paged inline read over the
 //! same bounded capture buffer) and `GET /trace/{name}/log_detail`
-//! (single-entry detail read over the same buffer by `position`).
+//! (file facts: one row per node with node, size and time).
 //! Single-node, management-plane only for reads and writes:
 //! nothing here runs on the per-message path, so reads, creates, clears,
 //! single deletes, stops, downloads, log reads and detail reads never take a
@@ -42,8 +42,8 @@
 //!   and render only the requested W0 page (`page`/`limit` plus
 //!   `meta { page, limit, count, hasnext }`), so one read cannot grow
 //!   without bound.
-//! - detail reads return the single entry at the same zero-based `position`
-//!   the log list reports, so one line is rendered per request and the
+//! - detail reads return one row per node. The row carries the true
+//!   node name, the true byte count and the last write time. The
 //!   response stays small.
 
 use axum::{
@@ -175,6 +175,9 @@ impl TraceSession {
 struct TraceData {
     sessions: HashMap<String, TraceSession>,
     logs: HashMap<String, Vec<u8>>,
+    // Last write time per session, epoch seconds. Set at insert,
+    // refreshed on each append. Serves the `mtime` of `log_detail`.
+    mtimes: HashMap<String, u64>,
 }
 
 /// Bounded in-memory trace registry keyed by session `name`.
@@ -192,6 +195,7 @@ impl TraceStore {
             inner: RwLock::new(TraceData {
                 sessions: HashMap::new(),
                 logs: HashMap::new(),
+                mtimes: HashMap::new(),
             }),
         }
     }
@@ -218,6 +222,20 @@ impl TraceStore {
             .logs
             .get(name)
             .map_or(0, Vec::len)
+    }
+
+    /// File facts for `name`: node, size and last write time. Returns
+    /// `None` when the session is unknown. The node is this process,
+    /// the size is the true buffer length, the time is the last append
+    /// (or insert when nothing was captured yet). No field is a stand-in.
+    pub fn log_detail(&self, name: &str) -> Option<(String, usize, u64)> {
+        let data = self.inner.read().expect("trace store lock");
+        if !data.sessions.contains_key(name) {
+            return None;
+        }
+        let size = data.logs.get(name).map_or(0, Vec::len);
+        let mtime = data.mtimes.get(name).copied().unwrap_or(0);
+        Some((local_node_name().to_string(), size, mtime))
     }
 
     /// Clone the captured bytes for `name`. Returns `None` when the
@@ -259,6 +277,7 @@ impl TraceStore {
             };
             *entry = tail;
         }
+        data.mtimes.insert(name.to_string(), now_epoch_secs());
         true
     }
 
@@ -362,6 +381,7 @@ impl TraceStore {
             return Err(TraceInsertError::Full);
         }
         data.logs.insert(session.name.clone(), Vec::new());
+        data.mtimes.insert(session.name.clone(), now_epoch_secs());
         data.sessions.insert(session.name.clone(), session.clone());
         Ok(session)
     }
@@ -371,6 +391,7 @@ impl TraceStore {
         let mut data = self.inner.write().expect("trace store lock");
         data.sessions.clear();
         data.logs.clear();
+        data.mtimes.clear();
     }
 
     /// Fetch one session by name (used by follow-up single-session tasks).
@@ -388,6 +409,7 @@ impl TraceStore {
     pub fn remove(&self, name: &str) -> bool {
         let mut data = self.inner.write().expect("trace store lock");
         data.logs.remove(name);
+        data.mtimes.remove(name);
         data.sessions.remove(name).is_some()
     }
 
@@ -727,49 +749,29 @@ pub async fn get_trace_log(
         .into_response()
 }
 
-/// `GET /trace/{name}/log_detail`: single-entry detail read over one
-/// session's captured log.
+/// `GET /trace/{name}/log_detail`: file facts for one session.
 ///
-/// Reads the same bounded per-session buffer the download and the paged
-/// log read serve, splits it into newline-delimited entries exactly like
-/// `get_trace_log`, and returns the one entry at the requested zero-based
-/// `position` as `{ position, content }`. `position` arrives as the
-/// `position` query parameter and must parse as a non-negative integer.
-/// Unknown sessions and out-of-range positions fail with `NOT_FOUND`;
-/// a missing or malformed `position` fails with `INVALID_PARAMS`.
-/// Management-plane only: one capped clone per request (at most
-/// [`MAX_TRACE_LOG_BYTES`] bytes, split into lines); delivery never waits
-/// on it and no new buffering is added to fan-out or fan-in.
+/// Answers the documented array with one row per node. This broker is
+/// single-node, so the array holds one row. The row carries the true
+/// node name, the true byte count and the last write time. Unknown
+/// sessions fail with `NOT_FOUND`. Unknown query keys are ignored.
+/// Management-plane only: one short read lock per request; delivery
+/// never waits on it and no new buffering is added to fan-out or fan-in.
 pub async fn get_trace_log_detail(
     State(state): State<ApiState>,
     Path(name): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(_ignored): Query<HashMap<String, String>>,
 ) -> Response {
-    let raw = match params.get("position") {
-        Some(value) => value.clone(),
-        None => return invalid_params("field `position` is required".to_string()),
-    };
-    let position: usize = match raw.trim().parse() {
-        Ok(value) => value,
-        Err(_) => {
-            return invalid_params("field `position` must be a non-negative integer".to_string());
-        }
-    };
-    let Some(session) = state.traces.get(&name) else {
+    let Some((node, size, mtime)) = state.traces.log_detail(&name) else {
         return ApiError::NotFound("trace not found".to_string()).into_response();
-    };
-    let bytes = state.traces.read_log(&session.name).unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let Some(content) = lines.get(position).cloned() else {
-        return ApiError::NotFound("trace log position not found".to_string()).into_response();
     };
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "position": position,
-            "content": content,
-        })),
+        Json(serde_json::json!([{
+            "node": node,
+            "size": size,
+            "mtime": mtime,
+        }])),
     )
         .into_response()
 }
@@ -1741,134 +1743,100 @@ mod tests {
         assert_eq!(err["code"], serde_json::json!("NOT_FOUND"));
     }
 
-    fn log_detail_query(position: &str) -> Query<HashMap<String, String>> {
-        let mut map = HashMap::new();
-        map.insert("position".to_string(), position.to_string());
-        Query(map)
-    }
-
     fn empty_detail_query() -> Query<HashMap<String, String>> {
         Query(HashMap::new())
     }
 
     #[tokio::test]
-    async fn trace_log_detail_returns_entry_and_misses_unknown() {
+    async fn trace_log_detail_returns_file_facts_and_misses_unknown() {
         let state = standalone_state();
         let (status, _) =
             response_parts(create_trace(State(state.clone()), valid_body("trace-detail")).await)
                 .await;
         assert_eq!(status, StatusCode::OK);
 
-        // Simulated captured traffic lands in the same bounded buffer the
-        // detail read serves.
+        // Simulated captured traffic grows the same buffer the
+        // detail read measures.
         assert!(state
             .traces
             .append_log("trace-detail", b"publish sensors/temp {\"t\": 21}\n"));
-        assert!(state
-            .traces
-            .append_log("trace-detail", b"publish sensors/hum {\"h\": 55}\n"));
 
-        let (status, first) = response_parts(
+        let (status, detail) = response_parts(
             get_trace_log_detail(
                 State(state.clone()),
                 Path("trace-detail".to_string()),
-                log_detail_query("0"),
+                empty_detail_query(),
             )
             .await,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(first["position"], serde_json::json!(0));
-        assert!(
-            first["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("publish sensors/temp"),
-            "detail at 0 must carry appended traffic, got {first:?}"
-        );
-
-        let (status, second) = response_parts(
-            get_trace_log_detail(
-                State(state.clone()),
-                Path("trace-detail".to_string()),
-                log_detail_query("1"),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(second["position"], serde_json::json!(1));
-        assert!(
-            second["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("publish sensors/hum"),
-            "detail at 1 must carry appended traffic, got {second:?}"
-        );
+        let rows = detail.as_array().expect("detail is an array");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]["node"].is_string());
+        assert!(rows[0]["size"].as_u64().is_some_and(|size| size > 0));
+        assert!(rows[0]["mtime"].as_u64().is_some());
 
         let (status, missing_session) = response_parts(
             get_trace_log_detail(
                 State(state.clone()),
                 Path("never-stored".to_string()),
-                log_detail_query("0"),
+                empty_detail_query(),
             )
             .await,
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(missing_session["code"], serde_json::json!("NOT_FOUND"));
-
-        let (status, missing_position) = response_parts(
-            get_trace_log_detail(
-                State(state.clone()),
-                Path("trace-detail".to_string()),
-                log_detail_query("999999"),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(missing_position["code"], serde_json::json!("NOT_FOUND"));
     }
 
     #[tokio::test]
-    async fn trace_log_detail_rejects_missing_or_malformed_position() {
+    async fn trace_log_detail_grows_with_capture_through_broker_event() {
+        // The detail read goes through the broker capture path: a
+        // published message lands in the buffer, and the size grows.
+        // `valid_body` filters `sensors/#`, so `sensors/temp` matches.
         let state = standalone_state();
         let (status, _) = response_parts(
-            create_trace(State(state.clone()), valid_body("trace-detail-bad")).await,
+            create_trace(State(state.clone()), valid_body("trace-detail-live")).await,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        let (status, err) = response_parts(
+        let (status, before) = response_parts(
             get_trace_log_detail(
                 State(state.clone()),
-                Path("trace-detail-bad".to_string()),
+                Path("trace-detail-live".to_string()),
                 empty_detail_query(),
             )
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(err["code"], serde_json::json!("INVALID_PARAMS"));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            before[0]["size"],
+            serde_json::json!(0),
+            "empty session has no bytes"
+        );
 
-        for bad in ["abc", "-1", "1.5", ""] {
-            let (status, err) = response_parts(
-                get_trace_log_detail(
-                    State(state.clone()),
-                    Path("trace-detail-bad".to_string()),
-                    log_detail_query(bad),
-                )
-                .await,
+        // The kernel publish event drives the capture.
+        state
+            .traces
+            .capture_publish("trace-client", Some("127.0.0.1"), "sensors/temp", b"hello");
+
+        let (status, after) = response_parts(
+            get_trace_log_detail(
+                State(state.clone()),
+                Path("trace-detail-live".to_string()),
+                empty_detail_query(),
             )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::BAD_REQUEST,
-                "position {bad} must be rejected"
-            );
-            assert_eq!(err["code"], serde_json::json!("INVALID_PARAMS"));
-        }
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            after[0]["size"].as_u64().is_some_and(|size| size > 0),
+            "captured publish must grow the size, got {after:?}"
+        );
     }
 
     #[tokio::test]
@@ -1880,21 +1848,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        // Capture one line first: an uncaptured session has no position 0.
-        assert!(state
-            .traces
-            .append_log("trace-detail-gone", b"publish sensors/temp x\n"));
         let (status, detail) = response_parts(
             get_trace_log_detail(
                 State(state.clone()),
                 Path("trace-detail-gone".to_string()),
-                log_detail_query("0"),
+                empty_detail_query(),
             )
             .await,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(detail["position"], serde_json::json!(0));
+        assert!(detail.as_array().is_some_and(|rows| rows.len() == 1));
 
         let response =
             delete_trace(State(state.clone()), Path("trace-detail-gone".to_string())).await;
@@ -1904,7 +1868,7 @@ mod tests {
             get_trace_log_detail(
                 State(state.clone()),
                 Path("trace-detail-gone".to_string()),
-                log_detail_query("0"),
+                empty_detail_query(),
             )
             .await,
         )

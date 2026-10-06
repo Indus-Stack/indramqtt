@@ -119,7 +119,7 @@
   {
     "operation": "GET /trace/{name}/log_detail",
     "path_params": {"name": "conf-trace-detail"},
-    "query": {"position": 0},
+    "query": {},
     "body": null,
     "expect_status": 200,
     "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-detail", "type": "topic", "topic": "conf/detail/#"}}}],
@@ -128,20 +128,11 @@
   {
     "operation": "GET /trace/{name}/log_detail",
     "path_params": {"name": "conf-trace-detail-missing"},
-    "query": {"position": 0},
+    "query": {},
     "body": null,
     "expect_status": 404,
     "setup": [],
     "cleanup": []
-  },
-  {
-    "operation": "GET /trace/{name}/log_detail",
-    "path_params": {"name": "conf-trace-detail"},
-    "query": {"position": 999999},
-    "body": null,
-    "expect_status": 404,
-    "setup": [{"api": {"method": "POST", "path": "/trace", "body": {"name": "conf-trace-detail", "type": "topic", "topic": "conf/detail/#"}}}],
-    "cleanup": [{"api": {"method": "DELETE", "path": "/trace"}}]
   },
   {
     "operation": "PUT /trace/{name}/stop",

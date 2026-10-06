@@ -367,12 +367,19 @@ pub(crate) fn backup_dir(state: &ApiState) -> PathBuf {
     state.config.dir().join("backup")
 }
 
-// `POST /api/v5/data/export`: write one backup file and report its name.
+// `POST /api/v5/data/export`: write one backup file and report its fields.
+// Answers the documented file fields: `created_at`, `filename`, `node`
+// plus the true file `size`. An empty body selects every root and table.
 pub async fn export_data(State(state): State<ApiState>, body: Bytes) -> Response {
-    let value: Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(_) => {
-            return ApiError::BadRequest("request body must be JSON".to_string()).into_response()
+    let value: Value = if body.is_empty() {
+        Value::Object(Default::default())
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(_) => {
+                return ApiError::BadRequest("request body must be JSON".to_string())
+                    .into_response()
+            }
         }
     };
     let req: ExportRequest = match serde_json::from_value(value) {
@@ -466,7 +473,21 @@ pub async fn export_data(State(state): State<ApiState>, body: Bytes) -> Response
     }
     enforce_bounds(&dir).await;
 
-    (StatusCode::OK, Json(json!({ "filename": filename }))).into_response()
+    // True file facts. The time is now, the size is the written bytes,
+    // the node is this process. No field is a stand-in.
+    let size = bytes.len() as u64;
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let node = local_node_name().to_string();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "created_at": created_at,
+            "filename": filename,
+            "node": node,
+            "size": size,
+        })),
+    )
+        .into_response()
 }
 
 // Accept one uploaded file name. Reject path parts and bad suffix.
