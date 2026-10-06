@@ -71,6 +71,15 @@ default_max_publish_rate = 50000
 # Token bucket burst multiplier (allows burst up to burst * rate)
 burst_multiplier = 2.0
 
+# Default max live connections per tenant (0 = unlimited)
+max_connections_per_tenant = 10000
+
+# Default max sessions per tenant (0 = unlimited)
+max_sessions_per_tenant = 10000
+
+# Default max retained topics per tenant (0 = unlimited)
+max_retained_per_tenant = 10000
+
 # =============================================================================
 # Session & Protocol Invariants
 # =============================================================================

@@ -771,6 +771,101 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 9. A full tenant keeps service for other tenants ---
+# Two tenants come from the API. The first tenant sets a low
+# connection limit. The limit fills with real clients. A client in
+# the second tenant still connects and publishes a random value.
+LIM_NS_A="t-lim-a"
+LIM_NS_B="t-lim-b"
+LIM_USER_A="lim-a"
+LIM_USER_B="lim-b"
+LIM_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+LIM_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+LIM_TOPIC="smoke/lim/check"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$LIM_NS_A" "$LIM_USER_A" "$LIM_PASS_A" "$LIM_NS_B" "$LIM_USER_B" "$LIM_PASS_B" <<'PY'
+import json, sys, urllib.request
+api, key, ns_a, user_a, pass_a, ns_b, user_b, pass_b = sys.argv[1:9]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, res.read().decode()
+    except urllib.request.HTTPError as err:
+        return err.code, err.read().decode()
+for ns, user, password in ((ns_a, user_a, pass_a), (ns_b, user_b, pass_b)):
+    status, _ = call("POST", f"/api/v5/mt/ns/{ns}", {})
+    assert status in (204, 409), f"create managed namespace {ns}: {status}"
+    status, _ = call("POST", f"/api/v1/auth/users?tenant={ns}",
+                     {"username": user, "password": password})
+    assert status in (201, 409), f"create tenant user {user}: {status}"
+    for action in ("publish", "subscribe"):
+        status, _ = call("POST", f"/api/v1/auth/acls?tenant={ns}",
+                         {"client_pattern": "*", "action": action,
+                          "topic_pattern": "smoke/lim/#", "allow": True})
+        assert status == 201, f"create tenant {action} rule: {status}"
+status, _ = call("PUT", f"/api/v5/mt/ns/{ns_a}/config",
+                 {"limits": {"max_connections": 1}})
+assert status == 200, f"set per-tenant connection limit: {status}"
+print("per-tenant connection limit is stored through the API")
+PY
+check "a low connection limit for one tenant is stored through the API" $?
+
+python3 - "$MQTT_PORT" "$LIM_USER_A" "$LIM_PASS_A" "$LIM_USER_B" "$LIM_PASS_B" "$LIM_TOPIC" <<'PY'
+import os, socket, struct, sys
+mqtt_port, username_a, password_a, username_b, password_b, topic = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            import time
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+secret = os.urandom(8).hex().encode()
+first, first_ok = connect(b"lim-a-first", username_a, password_a)
+second, second_ok = connect(b"lim-a-second", username_a, password_a)
+report("a tenant at its connection limit refuses a new connection", first_ok and not second_ok)
+sub, sub_ok = connect(b"lim-b-sub", username_b, password_b)
+ready = sub_ok
+if sub_ok:
+    sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and sub.recv(5)[:1] == b"\x90"
+pub, pub_ok = connect(b"lim-b-pub", username_b, password_b)
+ready = ready and pub_ok
+if ready:
+    pub.sendall(packet(0x30, field(topic) + secret))
+    report("the other tenant still publishes a random value", receive(sub, 5).endswith(secret))
+else:
+    report("the other tenant still publishes a random value", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"
     exit 0

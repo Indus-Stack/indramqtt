@@ -1464,10 +1464,10 @@ async fn handle_mgmt_retained_in_tenant(
     }
     // Per-tenant accounting: the global `backend.max_retained_messages` cap
     // (and the hard `broker_storage::MAX_RETAINED_MESSAGES` cap inside the
-    // store) counts `(tenant, topic)` pairs across all tenants, so every
-    // tenant's retained usage counts toward the same finite bound with no
-    // second unlimited default. Consults state the store already holds with
-    // one short-lock lookup, never a scan, so the per-lookup cost stays flat.
+    // store) counts `(tenant, topic)` pairs across all tenants. The
+    // per-tenant bound drops the new topic in its own tenant only, while
+    // delivery keeps working. One short-lock lookup per check, never a
+    // scan. Management-plane only; the deliver path takes no lock here.
     if payload.is_empty() {
         if state
             .retained
@@ -1496,6 +1496,32 @@ async fn handle_mgmt_retained_in_tenant(
             .is_some();
         if !already && state.stats.retained() >= cap {
             return;
+        }
+    }
+    let tenant_cap = state.retained.retained_cap_for_tenant(tenant);
+    if tenant_cap > 0 {
+        let already = state
+            .retained
+            .get_retained_in_tenant(topic, tenant)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !already {
+            let used = state
+                .retained
+                .count_retained_in_tenant(tenant)
+                .await
+                .unwrap_or(usize::MAX);
+            if used >= tenant_cap {
+                state.metrics.inc_tenant_retained_dropped();
+                tracing::warn!(
+                    tenant = %tenant,
+                    topic = %topic.as_str(),
+                    "tenant retained limit reached: dropping new retained topic"
+                );
+                return;
+            }
         }
     }
     if state

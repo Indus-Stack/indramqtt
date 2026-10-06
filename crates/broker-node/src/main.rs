@@ -1681,6 +1681,55 @@ async fn apply_bind_request(
                     };
                     return Some(refusal_for_req(frame, &req, rc, alias_max));
                 }
+                // TM-06: per-tenant connection bound. Counts live
+                // sessions in the bind's own tenant only, so one full
+                // tenant never gates another. A takeover of the same
+                // client id still succeeds. Refuses with the documented
+                // quota code, counted and logged.
+                let is_takeover = shared
+                    .sessions
+                    .get_in_tenant(&tenant_for_quota, &req.client_id)
+                    .map(|session| *session.connected.read())
+                    .unwrap_or(false);
+                if !is_takeover && !tenant_connection_fits(shared, &tenant_for_quota) {
+                    shared
+                        .sessions
+                        .release_connection_slot_in_tenant(&tenant_for_quota, username);
+                    shared.metrics.inc_tenant_conn_refused();
+                    shared.tenant_limits.count_conn_refused();
+                    tracing::warn!(
+                        tenant = %tenant_for_quota,
+                        client_id = %req.client_id,
+                        "tenant connection limit reached: refusing CONNECT"
+                    );
+                    let rc = if req.protocol_version == 5 {
+                        V5_RC_CONNECT_QUOTA
+                    } else {
+                        0x8B
+                    };
+                    return Some(refusal_for_req(frame, &req, rc, alias_max));
+                }
+            } else {
+                // TM-06: anonymous binds carry no username slot, but the
+                // per-tenant connection bound still applies. A full
+                // tenant refuses with the documented quota code.
+                let tenant_for_anon =
+                    bind_tenant_for_req(shared, &req, kerberos_principal.as_deref());
+                if !tenant_connection_fits(shared, &tenant_for_anon) {
+                    shared.metrics.inc_tenant_conn_refused();
+                    shared.tenant_limits.count_conn_refused();
+                    tracing::warn!(
+                        tenant = %tenant_for_anon,
+                        client_id = %req.client_id,
+                        "tenant connection limit reached: refusing anonymous CONNECT"
+                    );
+                    let rc = if req.protocol_version == 5 {
+                        V5_RC_CONNECT_QUOTA
+                    } else {
+                        0x8B
+                    };
+                    return Some(refusal_for_req(frame, &req, rc, alias_max));
+                }
             }
             // W2-03: record the successful credentialed CONNECT in the
             // node auth cache (one short lock, CONNECT-only; publish and
@@ -1756,6 +1805,30 @@ async fn apply_bind_request(
     // supervision lives on the edge. Malformed binds answer return code
     // 2 exactly like the synchronous reply path (0x82 with a reason
     // string when the peer negotiated version 5).
+    // TM-06: per-tenant session bound. A full tenant refuses with
+    // the documented quota code, counted and logged. Another tenant
+    // still creates sessions. Connect path only.
+    if let Ok(req) = parsed.clone() {
+        let is_new_session = shared
+            .sessions
+            .get_in_tenant(&tenant_for_bind, &req.client_id)
+            .is_none();
+        if is_new_session && !tenant_session_fits(shared, &tenant_for_bind) {
+            shared.metrics.inc_tenant_sess_refused();
+            shared.tenant_limits.count_sess_refused();
+            tracing::warn!(
+                tenant = %tenant_for_bind,
+                client_id = %req.client_id,
+                "tenant session limit reached: refusing CONNECT"
+            );
+            let rc = if req.protocol_version == 5 {
+                V5_RC_CONNECT_QUOTA
+            } else {
+                0x8B
+            };
+            return Some(refusal_for_req(frame, &req, rc, alias_max));
+        }
+    }
     let reply = match parsed.clone() {
         Ok(req) => {
             // F1-01: validate the CONNECT last will before touching
@@ -3405,6 +3478,12 @@ struct Shared {
     /// per setting. `serve_api` shares it into `ApiState` so explain
     /// reports the file, variable or flag that set each value.
     api_startup_config: Arc<std::sync::RwLock<Option<Arc<LayeredConfig>>>>,
+    /// Per-tenant limit defaults and overrides (TM-06). Defaults come
+    /// from the file configuration. Overrides come from the namespace
+    /// config. The connect path reads the effective triple. The publish
+    /// path never touches this store directly; retained caps live in
+    /// the retained store under its own lock.
+    tenant_limits: Arc<broker_session::tenant_limits::TenantLimitStore>,
 }
 
 impl Shared {
@@ -3568,6 +3647,7 @@ impl Shared {
             slow_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             api_listeners: Arc::new(std::sync::RwLock::new(None)),
             api_startup_config: Arc::new(std::sync::RwLock::new(None)),
+            tenant_limits: Arc::new(broker_session::tenant_limits::TenantLimitStore::default()),
         }
     }
 
@@ -4214,6 +4294,24 @@ fn install_tenant_rules(
         .replace(rules)
         .map_err(|e| format!("invalid tenants.rules: {e}"))?;
     Ok(())
+}
+
+/// Apply the file defaults for per-tenant limits (TM-06).
+///
+/// Copies the three quota bounds into the limit store and the
+/// retained store before any edge binds. The file and the
+/// environment already resolved into `cfg`, so both entries apply
+/// here. Management overrides apply later per namespace.
+fn apply_tenant_limit_defaults(shared: &Shared, cfg: &broker_config::schema::BrokerConfig) {
+    let defaults = broker_session::tenant_limits::TenantLimits {
+        max_connections: cfg.quotas.max_connections_per_tenant,
+        max_sessions: cfg.quotas.max_sessions_per_tenant,
+        max_retained: cfg.quotas.max_retained_per_tenant,
+    };
+    shared.tenant_limits.set_defaults(defaults);
+    shared
+        .retained
+        .set_default_retained_per_tenant_cap(defaults.max_retained as usize);
 }
 
 /// [`BrokerSink`] that forwards rule output directly to local router
@@ -6617,6 +6715,7 @@ async fn ingress_pipeline_with_publisher_and_props(
                 broker_api::v5::retainer::parse_bytesize_to_bytes(&cfg.max_payload_size)
                     .unwrap_or(1_048_576);
             let mut drop_new = false;
+            let mut tenant_limited = false;
             if (payload.len() as u64) > max_bytes {
                 drop_new = true;
             } else {
@@ -6633,17 +6732,59 @@ async fn ingress_pipeline_with_publisher_and_props(
                         drop_new = true;
                     }
                 }
+                // TM-06: per-tenant retained bound lives in the store.
+                // The store checks the cap inside its write lock.
+                // Caps sync off path at boot and on API writes.
+                // This path takes no new lock. It reads one atomic
+                // for the unreachable flag. It counts and logs each
+                // refusal.
+                if !drop_new && shared.tenant_limits.is_unreachable() {
+                    drop_new = true;
+                    tenant_limited = true;
+                    shared.tenant_limits.count_store_denied();
+                }
+            }
+            if tenant_limited {
+                shared.metrics.inc_tenant_retained_dropped();
+                shared.tenant_limits.count_retained_dropped();
+                tracing::warn!(
+                    tenant = %publisher_tenant,
+                    topic = %topic.as_str(),
+                    "tenant retained limit reached: dropping new retained topic"
+                );
             }
             if drop_new {
                 // Delivered but not stored, matching the management path.
-            } else if let Err(e) = shared
-                .retained
-                .set_retained_in_tenant(topic.clone(), qos, payload.clone(), publisher_tenant)
-                .await
-            {
-                warn!("Retained store failed for {}: {}", topic.as_str(), e);
             } else {
-                sync_retained_stat(shared).await;
+                match shared
+                    .retained
+                    .set_retained_in_tenant_checked(
+                        topic.clone(),
+                        qos,
+                        payload.clone(),
+                        publisher_tenant,
+                    )
+                    .await
+                {
+                    Ok(broker_storage::RetainedWriteOutcome::Stored) => {
+                        sync_retained_stat(shared).await;
+                    }
+                    Ok(broker_storage::RetainedWriteOutcome::DroppedPerTenantLimit) => {
+                        shared.metrics.inc_tenant_retained_dropped();
+                        shared.tenant_limits.count_retained_dropped();
+                        tracing::warn!(
+                            tenant = %publisher_tenant,
+                            topic = %topic.as_str(),
+                            "tenant retained limit reached: dropping new retained topic"
+                        );
+                    }
+                    Ok(broker_storage::RetainedWriteOutcome::DroppedGlobalLimit) => {
+                        // Delivered but not stored at the global cap.
+                    }
+                    Err(e) => {
+                        warn!("Retained store failed for {}: {}", topic.as_str(), e);
+                    }
+                }
             }
         }
     }
@@ -7023,6 +7164,75 @@ fn bind_tenant_for_req(
         user_properties: req.user_properties.clone(),
     };
     shared.tenant_registry.assign(&ctx)
+}
+
+/// Effective per-tenant bounds for one tenant (TM-06).
+///
+/// Defaults come from the limit store. A namespace config override
+/// wins when present. An invalid override or an unreachable store
+/// denies new use (fail closed) and logs the event. Reads take short
+/// locks on the connect path only; the deliver path never calls this.
+/// TODO(parity): the exact wire shape of limit fields stays open;
+/// the current JSON shape applies until the checker pins it.
+fn effective_tenant_limits(
+    shared: &Shared,
+    tenant: &str,
+) -> Result<broker_session::tenant_limits::TenantLimits, &'static str> {
+    if shared.tenant_limits.is_unreachable() {
+        shared.tenant_limits.count_store_denied();
+        tracing::warn!(tenant = %tenant, "tenant limit store is unreachable: denying new use");
+        return Err("limit store is unreachable");
+    }
+    let mut effective = shared.tenant_limits.effective(tenant);
+    let Some(entry) = shared.namespaces.get(tenant) else {
+        return Ok(effective);
+    };
+    let parsed = broker_api::v5::mt::ns_limit_override(&entry.config)
+        .map_err(|_| "namespace limit config is not valid")?;
+    if let Some(value) = parsed.max_connections {
+        effective.max_connections = value;
+    }
+    if let Some(value) = parsed.max_sessions {
+        effective.max_sessions = value;
+    }
+    if let Some(value) = parsed.max_retained {
+        effective.max_retained = value;
+    }
+    Ok(effective)
+}
+
+/// True when one more live connection fits in `tenant`.
+///
+/// Counts live sessions in the owning tenant only. A full tenant
+/// refuses with the documented quota code, counted and logged.
+/// Connect path only; the publish and deliver paths never call this.
+fn tenant_connection_fits(shared: &Shared, tenant: &str) -> bool {
+    let limits = match effective_tenant_limits(shared, tenant) {
+        Ok(limits) => limits,
+        Err(_) => return false,
+    };
+    if limits.max_connections == 0 {
+        return true;
+    }
+    let live = shared.sessions.live_connection_count_in_tenant(tenant);
+    (live as u64) < u64::from(limits.max_connections)
+}
+
+/// True when one more session fits in `tenant`.
+///
+/// Counts sessions in the owning tenant only. A full tenant refuses
+/// with the documented quota code, counted and logged. Connect path
+/// only; the publish and deliver paths never call this.
+fn tenant_session_fits(shared: &Shared, tenant: &str) -> bool {
+    let limits = match effective_tenant_limits(shared, tenant) {
+        Ok(limits) => limits,
+        Err(_) => return false,
+    };
+    if limits.max_sessions == 0 {
+        return true;
+    }
+    let total = shared.sessions.session_count_in_tenant(tenant);
+    (total as u64) < u64::from(limits.max_sessions)
 }
 
 /// Tenant id recorded on one session, or the default tenant when the
@@ -9027,6 +9237,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Tenants (MT-01): install the configured assignment rules before
     // any edge binds. Validated whole; a bad row fails boot loudly.
     install_tenant_rules(&shared, &cfg)?;
+    // Tenant limits (TM-06): apply the file defaults before any edge
+    // binds. One store write at boot; the connect path reads the
+    // effective triple and the retained store holds the same default.
+    apply_tenant_limit_defaults(&shared, &cfg);
     // Config registry: create the data dir when missing, then load
     // `state.toml` (missing file yields validated defaults). A corrupt
     // file is a fatal boot error naming the file and the field, never a
@@ -18945,6 +19159,215 @@ mod tests {
         }
         assert_eq!(session_a.offline_len(), 0);
         assert_eq!(session_b.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tm06_tenant_at_connection_limit_refuses_new_connection() {
+        // Bind through the kernel. Tenant A allows one live connection.
+        // The second CONNECT in A fails with the documented code.
+        // Tenant B still connects. The refusal is counted and logged.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${username}")])
+            .expect("tenant rules store");
+        shared.namespaces.create("t-alpha").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "t-alpha",
+                serde_json::json!({"limits": {"max_connections": 1}}),
+            )
+            .expect("limit stores");
+        for (conn, client) in [(501u64, "tm06-a1")] {
+            let meta = encode_bind_meta_creds(client, true, 60, "alpha", b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        let meta = encode_bind_meta_creds("tm06-a2", true, 60, "alpha", b"pw");
+        let reply = apply_bind(&bind_frame(502, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8B, "full tenant refuses with quota code");
+        assert_eq!(shared.metrics.tenant_conn_refused(), 1);
+        assert_eq!(shared.tenant_limits.conn_refused(), 1);
+        let meta = encode_bind_meta_creds("tm06-b1", true, 60, "beta", b"pw");
+        let reply = apply_bind(&bind_frame(503, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "other tenant still connects");
+    }
+
+    #[tokio::test]
+    async fn tm06_tenant_at_session_limit_refuses_new_session() {
+        // Bind through the kernel. Tenant A allows one session.
+        // A second client id in A fails with the documented code.
+        // Tenant B still creates sessions.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${username}")])
+            .expect("tenant rules store");
+        shared.namespaces.create("t-alpha").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "t-alpha",
+                serde_json::json!({"limits": {"max_sessions": 1}}),
+            )
+            .expect("limit stores");
+        let meta = encode_bind_meta_creds("tm06-s1", true, 60, "alpha", b"pw");
+        let reply = apply_bind(&bind_frame(511, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let meta = encode_bind_meta_creds("tm06-s2", true, 60, "alpha", b"pw");
+        let reply = apply_bind(&bind_frame(512, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8B, "full tenant refuses with quota code");
+        assert_eq!(shared.metrics.tenant_sess_refused(), 1);
+        let meta = encode_bind_meta_creds("tm06-sb1", true, 60, "beta", b"pw");
+        let reply = apply_bind(&bind_frame(513, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "other tenant still creates sessions");
+    }
+
+    #[tokio::test]
+    async fn tm06_tenant_at_retained_limit_drops_new_topic() {
+        // Publish through the kernel. Tenant A allows one retained topic.
+        // A second retained topic drops but delivery still works.
+        // Tenant B still stores retained messages.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${username}")])
+            .expect("tenant rules store");
+        shared.namespaces.create("t-alpha").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "t-alpha",
+                serde_json::json!({"limits": {"max_retained": 1}}),
+            )
+            .expect("limit stores");
+        shared.retained.set_retained_per_tenant_cap("t-alpha", 1);
+        for (conn, client, user) in [(521u64, "tm06-ra", "alpha"), (522u64, "tm06-rb", "beta")] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        let (meta, payload) = encode_publish_meta("tm06/r1", 0, 0, true, b"keep-a");
+        let _ = apply_publish(&publish_frame(521, 2, meta, payload), &shared).await;
+        let sub = subscribe_frame(
+            521,
+            1,
+            encode_subscribe_meta(1, "tm06-ra", &[("tm06/r2", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (meta, payload) = encode_publish_meta("tm06/r2", 0, 0, true, b"drop-a");
+        let (_, deliveries) = apply_publish(&publish_frame(521, 3, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "delivery still works at the limit");
+        let stored = shared
+            .retained
+            .get_retained_in_tenant(&broker_protocol::Topic::new("tm06/r2").unwrap(), "t-alpha")
+            .await
+            .expect("retained reads");
+        assert!(stored.is_none(), "new topic drops at the limit");
+        assert_eq!(shared.metrics.tenant_retained_dropped(), 1);
+        let (meta, payload) = encode_publish_meta("tm06/r2", 0, 0, true, b"keep-b");
+        let _ = apply_publish(&publish_frame(522, 2, meta, payload), &shared).await;
+        let stored = shared
+            .retained
+            .get_retained_in_tenant(&broker_protocol::Topic::new("tm06/r2").unwrap(), "t-beta")
+            .await
+            .expect("retained reads");
+        assert!(stored.is_some(), "other tenant still stores");
+    }
+
+    #[tokio::test]
+    async fn tm06_limits_apply_from_file_and_env_and_api() {
+        // File and env entries drive the defaults. The API entry
+        // drives the per-tenant override. Sockets observe the result.
+        let dir = std::env::temp_dir().join(format!(
+            "tm06-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            dir.join("indra.toml"),
+            "[quotas]\nmax_connections_per_tenant = 7\nmax_sessions_per_tenant = 8\nmax_retained_per_tenant = 9\n",
+        )
+        .expect("write indra.toml");
+        let env = vec![(
+            "INDRA_QUOTAS__MAX_SESSIONS_PER_TENANT".to_string(),
+            "8".to_string(),
+        )];
+        let layered = broker_config::layers::load_layered_with_env(
+            &dir,
+            &env,
+            &broker_config::layers::CliOverrides::default(),
+        )
+        .expect("layers load");
+        assert_eq!(layered.config().quotas.max_connections_per_tenant, 7);
+        assert_eq!(layered.config().quotas.max_sessions_per_tenant, 8);
+        assert_eq!(layered.config().quotas.max_retained_per_tenant, 9);
+        let shared = test_shared();
+        apply_tenant_limit_defaults(&shared, layered.config());
+        assert_eq!(shared.tenant_limits.defaults().max_connections, 7);
+        assert_eq!(shared.tenant_limits.defaults().max_sessions, 8);
+        assert_eq!(shared.tenant_limits.defaults().max_retained, 9);
+        shared.namespaces.create("t-api").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "t-api",
+                serde_json::json!({"limits": {"max_connections": 2}}),
+            )
+            .expect("limit stores");
+        let effective = effective_tenant_limits(&shared, "t-api").expect("limits resolve");
+        assert_eq!(effective.max_connections, 2);
+        assert_eq!(effective.max_sessions, 8);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tm06_unreachable_limit_store_denies_new_use() {
+        // Fail closed: an unreachable store denies new connections.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${username}")])
+            .expect("tenant rules store");
+        shared.tenant_limits.set_unreachable(true);
+        let meta = encode_bind_meta_creds("tm06-u1", true, 60, "alpha", b"pw");
+        let reply = apply_bind(&bind_frame(531, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8B, "unreachable store denies");
+        shared.tenant_limits.set_unreachable(false);
     }
 
     #[tokio::test]

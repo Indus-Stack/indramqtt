@@ -216,6 +216,27 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "Default max connections per authenticated username (0 = unlimited).",
             },
             FieldDoc {
+                path: "quotas.max_connections_per_tenant",
+                setting_type: "u32",
+                default: "10000",
+                range: "0..=1000000 (0 = unlimited opt-in)",
+                doc: "Default max live connections per tenant (0 = unlimited).",
+            },
+            FieldDoc {
+                path: "quotas.max_sessions_per_tenant",
+                setting_type: "u32",
+                default: "10000",
+                range: "0..=100000 (0 = unlimited opt-in)",
+                doc: "Default max sessions per tenant (0 = unlimited).",
+            },
+            FieldDoc {
+                path: "quotas.max_retained_per_tenant",
+                setting_type: "u32",
+                default: "10000",
+                range: "0..=100000 (0 = unlimited opt-in)",
+                doc: "Default max retained topics per tenant (0 = unlimited).",
+            },
+            FieldDoc {
                 path: "quotas.default_max_publish_rate",
                 setting_type: "u32",
                 default: "50000",
@@ -1103,6 +1124,15 @@ pub struct QuotasConf {
     /// Token bucket burst multiplier (allows bursts up to burst times rate).
     #[serde(default = "default_burst_multiplier")]
     pub burst_multiplier: f64,
+    /// Default max live connections per tenant (0 = unlimited).
+    #[serde(default = "default_quota_max_connections_per_tenant")]
+    pub max_connections_per_tenant: u32,
+    /// Default max sessions per tenant (0 = unlimited).
+    #[serde(default = "default_quota_max_sessions_per_tenant")]
+    pub max_sessions_per_tenant: u32,
+    /// Default max retained topics per tenant (0 = unlimited).
+    #[serde(default = "default_quota_max_retained_per_tenant")]
+    pub max_retained_per_tenant: u32,
 }
 
 // Reason: 10k connections per user fits a large tenant without letting one
@@ -1120,6 +1150,21 @@ fn default_quota_max_publish_rate() -> u32 {
 fn default_burst_multiplier() -> f64 {
     2.0
 }
+// Reason: 10k live connections per tenant share the 1M listener bound
+// across many tenants without letting one tenant take it all.
+fn default_quota_max_connections_per_tenant() -> u32 {
+    10_000
+}
+// Reason: 10k sessions per tenant keep per-tenant session memory near
+// tens of MB while covering fleets far past real installs.
+fn default_quota_max_sessions_per_tenant() -> u32 {
+    10_000
+}
+// Reason: 10k retained topics per tenant keep per-tenant retained memory
+// bounded while covering fleet state far past real installs.
+fn default_quota_max_retained_per_tenant() -> u32 {
+    10_000
+}
 
 impl Default for QuotasConf {
     fn default() -> Self {
@@ -1127,6 +1172,9 @@ impl Default for QuotasConf {
             default_max_connections: default_quota_max_connections(),
             default_max_publish_rate: default_quota_max_publish_rate(),
             burst_multiplier: default_burst_multiplier(),
+            max_connections_per_tenant: default_quota_max_connections_per_tenant(),
+            max_sessions_per_tenant: default_quota_max_sessions_per_tenant(),
+            max_retained_per_tenant: default_quota_max_retained_per_tenant(),
         }
     }
 }
@@ -1145,6 +1193,24 @@ impl QuotasConf {
             u64::from(self.default_max_publish_rate),
             0,
             10_000_000,
+        )?;
+        check_range_u64(
+            "quotas.max_connections_per_tenant",
+            u64::from(self.max_connections_per_tenant),
+            0,
+            1_000_000,
+        )?;
+        check_range_u64(
+            "quotas.max_sessions_per_tenant",
+            u64::from(self.max_sessions_per_tenant),
+            0,
+            100_000,
+        )?;
+        check_range_u64(
+            "quotas.max_retained_per_tenant",
+            u64::from(self.max_retained_per_tenant),
+            0,
+            100_000,
         )?;
         if !(1.0..=10.0).contains(&self.burst_multiplier) {
             return Err(invalid(
@@ -2684,6 +2750,27 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     1.0,
                     10.0,
                     "Token bucket burst multiplier (allows bursts up to burst times rate).",
+                ),
+                int_field(
+                    "max_connections_per_tenant",
+                    10_000,
+                    0,
+                    1_000_000,
+                    "Default max live connections per tenant (0 = unlimited).",
+                ),
+                int_field(
+                    "max_sessions_per_tenant",
+                    10_000,
+                    0,
+                    100_000,
+                    "Default max sessions per tenant (0 = unlimited).",
+                ),
+                int_field(
+                    "max_retained_per_tenant",
+                    10_000,
+                    0,
+                    100_000,
+                    "Default max retained topics per tenant (0 = unlimited).",
                 ),
             ],
         ),

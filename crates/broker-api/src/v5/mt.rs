@@ -303,11 +303,64 @@ fn validate_ns_id(name: &str) -> Result<(), String> {
 }
 
 /// Check one stored namespace config before it applies.
+///
+/// Accepts any JSON object. When it carries `limits`, that block must
+/// hold integer bounds within the documented ranges. Enforcement of
+/// those bounds lives in the kernel (TM-06); this route stores only.
 fn validate_ns_config(config: &serde_json::Value) -> Result<(), String> {
-    if !config.is_object() {
+    let Some(map) = config.as_object() else {
         return Err("field `config` must be a JSON object".to_string());
+    };
+    if let Some(limits) = map.get("limits") {
+        parse_ns_limits(limits)?;
     }
     Ok(())
+}
+
+/// One per-tenant limit override from a namespace config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NsLimitOverride {
+    /// Max live connections (None = use the default).
+    pub max_connections: Option<u32>,
+    /// Max sessions (None = use the default).
+    pub max_sessions: Option<u32>,
+    /// Max retained topics (None = use the default).
+    pub max_retained: Option<u32>,
+}
+
+/// Read the `limits` block of one namespace config.
+///
+/// Missing block means no override. Present fields must be integers
+/// in range; 0 opts into unlimited for that bound.
+pub fn parse_ns_limits(limits: &serde_json::Value) -> Result<NsLimitOverride, String> {
+    let Some(map) = limits.as_object() else {
+        return Err("field `limits` must be a JSON object".to_string());
+    };
+    let get = |name: &str, max: u32| -> Result<Option<u32>, String> {
+        let Some(raw) = map.get(name) else {
+            return Ok(None);
+        };
+        let Some(num) = raw.as_u64() else {
+            return Err(format!("field `limits.{name}` must be an integer"));
+        };
+        if num > u64::from(max) {
+            return Err(format!("field `limits.{name}` holds {num}, at most {max}"));
+        }
+        Ok(Some(num as u32))
+    };
+    Ok(NsLimitOverride {
+        max_connections: get("max_connections", 1_000_000)?,
+        max_sessions: get("max_sessions", 100_000)?,
+        max_retained: get("max_retained", 100_000)?,
+    })
+}
+
+/// Override carried by one namespace config, if any.
+pub fn ns_limit_override(config: &serde_json::Value) -> Result<NsLimitOverride, String> {
+    match config.get("limits") {
+        None => Ok(NsLimitOverride::default()),
+        Some(limits) => parse_ns_limits(limits),
+    }
 }
 
 /// 404 shape for an unknown namespace.
@@ -742,9 +795,9 @@ pub async fn ns_client_list(
 /// `GET /mt/ns/{ns}/config`: read one namespace config (TM-02).
 ///
 /// Answers the exact stored object (`{}` when never set). Unknown
-/// namespaces answer 404 with code `NOT_FOUND`. Per-tenant limits are
-/// stored here but not enforced yet (TM-06 owns enforcement); the read
-/// reports what the operator stored, never an applied claim.
+/// namespaces answer 404 with code `NOT_FOUND`. A `limits` block sets
+/// the per-tenant bounds the kernel enforces on the next CONNECT and
+/// the next retained write. The read reports what the operator stored.
 /// Management-plane only.
 pub async fn get_ns_config(State(state): State<ApiState>, Path(ns): Path<String>) -> Response {
     if !state.namespaces.contains(&ns) {
@@ -760,9 +813,10 @@ pub async fn get_ns_config(State(state): State<ApiState>, Path(ns): Path<String>
 ///
 /// The body must be a JSON object; anything else answers 400 with code
 /// `BAD_REQUEST` and applies nothing. Unknown namespaces answer 404
-/// and create nothing. The write stores the object and answers it back;
-/// enforcement arrives with TM-06, so the route claims storage only.
-/// Management-plane only.
+/// and create nothing. The write stores the object and answers it back.
+/// A `limits` block also sets the retained cap for that tenant, so the
+/// next retained write enforces it. Connect and session bounds apply
+/// on the next CONNECT through the kernel. Management-plane only.
 pub async fn put_ns_config(
     State(state): State<ApiState>,
     Path(ns): Path<String>,
@@ -786,6 +840,13 @@ pub async fn put_ns_config(
             return ns_not_found(&ns);
         }
         return ApiError::BadRequest(message).into_response();
+    }
+    if let Ok(override_) = ns_limit_override(&config) {
+        if let Some(cap) = override_.max_retained {
+            state
+                .retained
+                .set_retained_per_tenant_cap(&ns, cap as usize);
+        }
     }
     (StatusCode::OK, Json(config)).into_response()
 }
