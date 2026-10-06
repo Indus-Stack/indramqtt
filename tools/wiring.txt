@@ -26,5 +26,6 @@ wired  hwm_history
 wired  license_setting
 wired  sources
 wired  actions
+wired  connectors
 wired  transformations
 wired  schema_registry

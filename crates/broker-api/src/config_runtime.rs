@@ -231,11 +231,10 @@ async fn apply_candidate(
             // Keep the observable v5 connector list in step with the
             // committed snapshot (reference form, redacted at read time);
             // removals drop, additions/updates upsert.
-            super::v5::rules::reconcile_connectors_store(
-                &previous.connectors,
-                &candidate.connectors,
-            )
-            .await;
+            state
+                .connectors
+                .reconcile(&previous.connectors, &candidate.connectors)
+                .await;
             Ok(ReloadResult {
                 version,
                 diff,
@@ -303,11 +302,10 @@ async fn apply_restore(
         apply_connectors_live(&state.engine, &previous, &candidate).await;
     match state.config.history_restore(id, actor) {
         Ok(version) => {
-            super::v5::rules::reconcile_connectors_store(
-                &previous.connectors,
-                &candidate.connectors,
-            )
-            .await;
+            state
+                .connectors
+                .reconcile(&previous.connectors, &candidate.connectors)
+                .await;
             Ok(ReloadResult {
                 version,
                 diff,

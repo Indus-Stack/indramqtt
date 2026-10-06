@@ -7,7 +7,7 @@ use axum::{
     Json,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::errors::ApiError;
 use crate::node_scope::resolve_node;
@@ -716,14 +716,406 @@ pub async fn reset_rule_metrics(
 // Data Connectors
 // ---------------------------------------------------------------------------
 
-static CONNECTORS: LazyLock<RwLock<Vec<serde_json::Value>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
+/// Insert refusal: duplicate id or a full store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectorInsertError {
+    Duplicate,
+    Full,
+}
 
-/// Serialises export-commit-save for connector mutations so concurrent
-/// creates, updates and deletes cannot interleave into a lost update on
-/// disk (mirrors the `save_lock` in `broker-auth` and `broker-rules`).
-static CONNECTORS_SAVE_LOCK: LazyLock<std::sync::Mutex<()>> =
-    LazyLock::new(|| std::sync::Mutex::new(()));
+/// Bounded in-memory connector directory, one per `ApiState`.
+///
+/// Each state holds its own list, so two servers in one process never
+/// share connectors. Every mutation persists through the bound registry.
+/// Management writes take the write lock plus the save lock on persist;
+/// reads take one short lock and clone at most [`MAX_CONNECTORS`] small
+/// entries. Publish and deliver never touch this store: dispatch reads
+/// the connector manager directly.
+pub struct ConnectorStore {
+    inner: RwLock<Vec<serde_json::Value>>,
+    /// Kernel config registry receiving every mutation (`None` in unit
+    /// tests and standalone state, which stay memory-only).
+    registry: RwLock<Option<Arc<broker_config::ConfigRegistry>>>,
+    /// Serialises export-commit-save so concurrent mutations cannot
+    /// interleave into a lost update on disk.
+    save_lock: Mutex<()>,
+}
+
+impl ConnectorStore {
+    /// Empty directory (today's empty behaviour: no connectors).
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(Vec::new()),
+            registry: RwLock::new(None),
+            save_lock: Mutex::new(()),
+        }
+    }
+
+    /// Seed from the registry snapshot and replay every live sink through
+    /// the same path `create_connector` uses. Kernel boot path; an empty
+    /// snapshot yields today's empty behaviour.
+    pub fn from_registry(
+        registry: &Arc<broker_config::ConfigRegistry>,
+        engine: &broker_rules::RuleEngine,
+    ) -> Self {
+        let store = Self::new();
+        store.seed_from_registry(registry, engine);
+        store
+    }
+
+    /// Attach the registry and replace the contents with its snapshot, in
+    /// place on the same instance. Kernel boot path: the shared instance
+    /// `serve_api` hands to `ApiState` must observe the persisted
+    /// connectors from the first connection. An empty snapshot keeps
+    /// today's empty behaviour.
+    pub fn seed_from_registry(
+        &self,
+        registry: &Arc<broker_config::ConfigRegistry>,
+        engine: &broker_rules::RuleEngine,
+    ) {
+        let snapshot = registry.snapshot();
+        self.inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+        if snapshot.connectors.connectors.is_empty() {
+            *self
+                .registry
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(registry));
+            return;
+        }
+        if let Err(error) = snapshot.connectors.validate() {
+            panic!("invalid stored connectors snapshot: {error}");
+        }
+        let mut restored = Vec::with_capacity(snapshot.connectors.connectors.len());
+        for entry in &snapshot.connectors.connectors {
+            // Bare `file:`/`env:` references are valid stored configs:
+            // keep the reference form instead of panicking on non-JSON.
+            let params = connector_store_doc(entry);
+            restored.push((entry.id.clone(), entry.connector_type.clone(), params));
+        }
+        // `register_live_sink` is async (the `disk_log` arm opens its
+        // directory) while boot callers are sync (`ApiState::new`), so the
+        // replay runs on a dedicated thread with its own current-thread
+        // runtime. The thread is joined: boot never completes with sinks
+        // half restored.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("connector boot runtime");
+                    runtime.block_on(async {
+                        for (id, conn_type, mut params) in restored {
+                            let reachable = probe_connector_reachable(&params).await;
+                            let status = connector_status(reachable);
+                            if let Some(obj) = params.as_object_mut() {
+                                obj.insert(
+                                    "status".to_string(),
+                                    serde_json::Value::String(status.to_string()),
+                                );
+                                obj.insert(
+                                    "node_status".to_string(),
+                                    connector_node_status(status),
+                                );
+                            }
+                            let live_name = params
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&id)
+                                .to_string();
+                            self.upsert(params.clone());
+                            if reachable {
+                                // A disabled Cargo feature fails closed here:
+                                // the entry stays persist-only and the missing
+                                // feature is logged naming it.
+                                if let Err(feature_error) =
+                                    try_register_live_sink(engine, &conn_type, &live_name, &params)
+                                        .await
+                                {
+                                    tracing::warn!(
+                                        connector = %live_name,
+                                        kind = %conn_type,
+                                        "{feature_error}"
+                                    );
+                                }
+                            }
+                        }
+                    });
+                })
+                .join()
+                .expect("connector boot thread");
+        });
+        *self
+            .registry
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(registry));
+    }
+
+    /// Clone of every stored document, unsorted. Callers sort for reads.
+    pub fn snapshot(&self) -> Vec<serde_json::Value> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Clone of one stored document. Matches `id` or `name` exactly.
+    /// Returns `None` when the id is unknown (caller maps to `NOT_FOUND`).
+    pub fn get(&self, id: &str) -> Option<serde_json::Value> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .find(|c| {
+                c.get("id").and_then(|v| v.as_str()) == Some(id)
+                    || c.get("name").and_then(|v| v.as_str()) == Some(id)
+            })
+            .cloned()
+    }
+
+    /// True when the id already lives in the store. Matches `id` or
+    /// `name` exactly, like the read and update paths.
+    pub fn contains(&self, id: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .any(|c| {
+                c.get("id").and_then(|v| v.as_str()) == Some(id)
+                    || c.get("name").and_then(|v| v.as_str()) == Some(id)
+            })
+    }
+
+    /// Count of stored documents, under one short read lock.
+    pub fn len(&self) -> usize {
+        self.inner
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+
+    /// True when the store holds no document.
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_empty()
+    }
+
+    /// Insert one document. Fails cleanly when the id already exists
+    /// (caller maps to `ALREADY_EXISTS`) or the store is at
+    /// [`MAX_CONNECTORS`] (caller maps to `BAD_REQUEST`). Both checks run
+    /// under the write lock, so concurrent creates cannot push duplicates.
+    pub(crate) fn try_insert(
+        &self,
+        id: &str,
+        doc: serde_json::Value,
+    ) -> Result<(), ConnectorInsertError> {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if inner.iter().any(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(id)
+                || c.get("name").and_then(|v| v.as_str()) == Some(id)
+        }) {
+            return Err(ConnectorInsertError::Duplicate);
+        }
+        if inner.len() >= MAX_CONNECTORS {
+            return Err(ConnectorInsertError::Full);
+        }
+        inner.push(doc);
+        Ok(())
+    }
+
+    /// Replace the document stored under `id`. Returns false when the id
+    /// is unknown (caller maps to `NOT_FOUND` and creates nothing). The
+    /// replace swaps one entry in place and never grows the store toward
+    /// [`MAX_CONNECTORS`].
+    pub(crate) fn replace(&self, id: &str, doc: serde_json::Value) -> bool {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(pos) = inner.iter().position(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(id)
+                || c.get("name").and_then(|v| v.as_str()) == Some(id)
+        }) else {
+            return false;
+        };
+        inner[pos] = doc;
+        true
+    }
+
+    /// Remove one document by id. Returns false when the id is unknown
+    /// (caller maps to `NOT_FOUND`).
+    pub(crate) fn remove(&self, id: &str) -> bool {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let before = inner.len();
+        inner.retain(|c| {
+            c.get("id").and_then(|v| v.as_str()) != Some(id)
+                && c.get("name").and_then(|v| v.as_str()) != Some(id)
+        });
+        inner.len() != before
+    }
+
+    /// Flip the enable flag of one document in place. Returns false when
+    /// the id is unknown (caller maps to `NOT_FOUND` and persists
+    /// nothing). Touches only the single boolean.
+    pub(crate) fn set_enabled(&self, id: &str, enable: bool) -> bool {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(pos) = inner.iter().position(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(id)
+                || c.get("name").and_then(|v| v.as_str()) == Some(id)
+        }) else {
+            return false;
+        };
+        if let Some(obj) = inner[pos].as_object_mut() {
+            obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
+        }
+        true
+    }
+
+    /// Insert or replace one document by `id`-or-`name` match. Boot and
+    /// reload replay only; request paths use the checked writes above.
+    fn upsert(&self, doc: serde_json::Value) {
+        let id = doc
+            .get("id")
+            .and_then(|v| v.as_str())
+            .or_else(|| doc.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(pos) = inner.iter().position(|c| {
+            c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
+        }) {
+            inner[pos] = doc;
+        } else {
+            inner.push(doc);
+        }
+    }
+
+    /// Export the store as a validated config root: entries sorted by id
+    /// so the persisted file is deterministic. Only inputs persist: the
+    /// derived `status`/`node_status` display values are stripped and
+    /// recomputed at read time.
+    fn export_conf(&self) -> broker_config::ConnectorsConf {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut entries: Vec<broker_config::ConnectorEntry> = inner
+            .iter()
+            .map(|body| {
+                let id = body
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| body.get("name").and_then(|v| v.as_str()))
+                    .unwrap_or_default()
+                    .to_string();
+                let connector_type = body
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("http")
+                    .to_string();
+                let enable = body.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+                let mut params = body.clone();
+                if let Some(obj) = params.as_object_mut() {
+                    obj.remove("status");
+                    obj.remove("node_status");
+                }
+                broker_config::ConnectorEntry {
+                    id,
+                    connector_type,
+                    enable,
+                    config: serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()),
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        broker_config::ConnectorsConf {
+            connectors: entries,
+        }
+    }
+
+    /// Commit the exported root and atomically save it. A no-op without
+    /// a registry; any commit or save failure surfaces so callers answer
+    /// 500 and the loss is never silent.
+    pub(crate) fn persist(&self) -> Result<(), broker_config::ConfigError> {
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let Some(registry) = registry else {
+            return Ok(());
+        };
+        let _guard = self
+            .save_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let conf = self.export_conf();
+        registry.commit_connectors(conf)?;
+        registry.save()?;
+        Ok(())
+    }
+
+    /// Reconcile this store with a freshly committed snapshot
+    /// (reload/restore path): upsert every candidate entry (reference
+    /// form, status recomputed with the same probe create uses) and drop
+    /// ids the candidate removed. Runs on the store of the serving state,
+    /// never on a process static.
+    pub(crate) async fn reconcile(
+        &self,
+        previous: &broker_config::ConnectorsConf,
+        candidate: &broker_config::ConnectorsConf,
+    ) {
+        use std::collections::HashSet;
+        let candidate_ids: HashSet<&str> = candidate
+            .connectors
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        for entry in &previous.connectors {
+            if candidate_ids.contains(entry.id.as_str()) {
+                continue;
+            }
+            self.remove(entry.id.as_str());
+        }
+        for entry in &candidate.connectors {
+            let mut doc = connector_store_doc(entry);
+            let reachable = probe_connector_reachable(&doc).await;
+            let status = connector_status(reachable);
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(status.to_string()),
+                );
+                obj.insert("node_status".to_string(), connector_node_status(status));
+            }
+            self.upsert(doc);
+        }
+    }
+}
+
+impl Default for ConnectorStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Map a connector registry failure onto a 500: the in-memory mutation
 /// applied but the commit or atomic save failed, so the loss must never
@@ -737,62 +1129,6 @@ fn connector_persist_error(error: broker_config::ConfigError) -> Response {
         })),
     )
         .into_response()
-}
-
-/// Export the connector store as a validated config root: entries sorted
-/// by id so the persisted file is deterministic. Each entry carries the
-/// id, type, enable flag and the full connector params as a JSON
-/// document (everything `create_connector` accepts, lossless). The
-/// derived `status`/`node_status` display values are stripped: only
-/// inputs are stored, display values are recomputed at read time.
-fn export_connectors_conf() -> broker_config::ConnectorsConf {
-    let store = CONNECTORS.read().unwrap();
-    let mut entries: Vec<broker_config::ConnectorEntry> = store
-        .iter()
-        .map(|body| {
-            let id = body
-                .get("id")
-                .and_then(|v| v.as_str())
-                .or_else(|| body.get("name").and_then(|v| v.as_str()))
-                .unwrap_or_default()
-                .to_string();
-            let connector_type = body
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("http")
-                .to_string();
-            let enable = body.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
-            let mut params = body.clone();
-            if let Some(obj) = params.as_object_mut() {
-                obj.remove("status");
-                obj.remove("node_status");
-            }
-            broker_config::ConnectorEntry {
-                id,
-                connector_type,
-                enable,
-                config: serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()),
-            }
-        })
-        .collect();
-    entries.sort_by(|a, b| a.id.cmp(&b.id));
-    broker_config::ConnectorsConf {
-        connectors: entries,
-    }
-}
-
-/// Commit the exported connectors root and atomically save it. Any
-/// commit or save failure surfaces as [`broker_config::ConfigError`] so
-/// callers answer 500 and the loss is never silent (the in-memory
-/// mutation stays: commit precedes the atomic save).
-fn persist_connectors(
-    config: &Arc<broker_config::ConfigRegistry>,
-) -> Result<(), broker_config::ConfigError> {
-    let _guard = CONNECTORS_SAVE_LOCK.lock().unwrap();
-    let conf = export_connectors_conf();
-    config.commit_connectors(conf)?;
-    config.save()?;
-    Ok(())
 }
 
 /// Probe the connector target the way boot replay does: entries
@@ -997,21 +1333,6 @@ fn missing_connector_field(conn_type: &str, body: &serde_json::Value) -> Option<
     }
 }
 
-/// Boot replay for the connector store: merge the persisted snapshot
-/// into the process-global store and re-register every live sink through
-/// [`register_live_sink`], the same path `create_connector` uses, so a
-/// restored connector actually connects instead of merely being listed.
-///
-/// Entries merge by id without clearing: on a fresh boot the store is
-/// empty and the merge is a full load; on an in-process rebuild (tests)
-/// entries created after the snapshot was taken are kept, which keeps
-/// parallel test servers sharing the process-global store deterministic.
-/// Stored `status`/`node_status` display values are recomputed with the
-/// same probe `create_connector` runs; only the persisted inputs
-/// round-trip.
-///
-/// An invalid snapshot or an unparsable stored params document fails boot
-/// loudly instead of being skipped silently.
 /// Build the observable connector document for one registry entry,
 /// preserving secret references (never resolving values into the store).
 ///
@@ -1070,135 +1391,6 @@ fn connector_store_doc(entry: &broker_config::ConnectorEntry) -> serde_json::Val
     serde_json::Value::Object(map)
 }
 
-/// Reconcile the process-global connector list with a freshly committed
-/// snapshot (reload/restore path): upsert every candidate entry (reference
-/// form, status recomputed with the same probe create uses) and drop ids
-/// the candidate removed. Entries never in `previous` are left alone, so
-/// parallel test servers sharing the global store stay deterministic.
-pub(crate) async fn reconcile_connectors_store(
-    previous: &broker_config::ConnectorsConf,
-    candidate: &broker_config::ConnectorsConf,
-) {
-    use std::collections::HashSet;
-    let candidate_ids: HashSet<&str> = candidate
-        .connectors
-        .iter()
-        .map(|entry| entry.id.as_str())
-        .collect();
-    for entry in &previous.connectors {
-        if candidate_ids.contains(entry.id.as_str()) {
-            continue;
-        }
-        let mut store = CONNECTORS.write().unwrap();
-        store.retain(|doc| {
-            doc.get("id").and_then(|v| v.as_str()) != Some(entry.id.as_str())
-                && doc.get("name").and_then(|v| v.as_str()) != Some(entry.id.as_str())
-        });
-    }
-    for entry in &candidate.connectors {
-        let mut doc = connector_store_doc(entry);
-        let reachable = probe_connector_reachable(&doc).await;
-        let status = connector_status(reachable);
-        if let Some(obj) = doc.as_object_mut() {
-            obj.insert(
-                "status".to_string(),
-                serde_json::Value::String(status.to_string()),
-            );
-            obj.insert("node_status".to_string(), connector_node_status(status));
-        }
-        let mut store = CONNECTORS.write().unwrap();
-        if let Some(pos) = store.iter().position(|c| {
-            c.get("id").and_then(|v| v.as_str()) == Some(entry.id.as_str())
-                || c.get("name").and_then(|v| v.as_str()) == Some(entry.id.as_str())
-        }) {
-            store[pos] = doc;
-        } else {
-            store.push(doc);
-        }
-    }
-}
-
-pub fn seed_connectors_from_registry(
-    config: &Arc<broker_config::ConfigRegistry>,
-    engine: &broker_rules::RuleEngine,
-) {
-    let snapshot = config.snapshot();
-    if snapshot.connectors.connectors.is_empty() {
-        return;
-    }
-    if let Err(error) = snapshot.connectors.validate() {
-        panic!("invalid stored connectors snapshot: {error}");
-    }
-    let mut restored = Vec::with_capacity(snapshot.connectors.connectors.len());
-    for entry in &snapshot.connectors.connectors {
-        // Bare `file:`/`env:` references are valid stored configs (M1-05):
-        // keep the reference form instead of panicking on non-JSON.
-        let params = connector_store_doc(entry);
-        restored.push((entry.id.clone(), entry.connector_type.clone(), params));
-    }
-    // `register_live_sink` is async (the `disk_log` arm opens its
-    // directory) while boot callers are sync (`ApiState::new`), so the
-    // replay runs on a dedicated thread with its own current-thread
-    // runtime. The thread is joined: boot never completes with sinks
-    // half restored.
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("connector boot runtime");
-                runtime.block_on(async {
-                    for (id, conn_type, mut params) in restored {
-                        let reachable = probe_connector_reachable(&params).await;
-                        let status = connector_status(reachable);
-                        if let Some(obj) = params.as_object_mut() {
-                            obj.insert(
-                                "status".to_string(),
-                                serde_json::Value::String(status.to_string()),
-                            );
-                            obj.insert("node_status".to_string(), connector_node_status(status));
-                        }
-                        let live_name = params
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&id)
-                            .to_string();
-                        {
-                            let mut store = CONNECTORS.write().unwrap();
-                            if let Some(pos) = store.iter().position(|c| {
-                                c.get("id").and_then(|v| v.as_str()) == Some(live_name.as_str())
-                                    || c.get("name").and_then(|v| v.as_str())
-                                        == Some(live_name.as_str())
-                            }) {
-                                store[pos] = params.clone();
-                            } else {
-                                store.push(params.clone());
-                            }
-                        }
-                        if reachable {
-                            // A disabled Cargo feature fails closed here:
-                            // the entry stays persist-only and the missing
-                            // feature is logged naming it.
-                            if let Err(feature_error) =
-                                try_register_live_sink(engine, &conn_type, &live_name, &params)
-                                    .await
-                            {
-                                tracing::warn!(
-                                    connector = %live_name,
-                                    kind = %conn_type,
-                                    "{feature_error}"
-                                );
-                            }
-                        }
-                    }
-                });
-            })
-            .join()
-            .expect("connector boot thread");
-    });
-}
-
 /// Upper bound for stored connectors. Creates past this size are rejected
 /// with `BAD_REQUEST` instead of growing the map without limit. Reason:
 /// the list handler clones the whole snapshot once per request, so the
@@ -1217,7 +1409,7 @@ const MAX_CONNECTOR_ID_LEN: usize = 256;
 /// snapshot: `status`/`node_status` are recomputed from the live
 /// connector manager (`engine.connectors()`), so a restart or a later
 /// delete is visible on the next read. Only the inputs persist (see
-/// [`export_connectors_conf`]); display values are derived here per
+/// [`ConnectorStore::export_conf`]); display values are derived here per
 /// request. Management-plane only: one short store lock plus lock-free
 /// manager lookups, and publish and deliver never call this.
 fn connector_live_view(
@@ -1286,8 +1478,9 @@ pub async fn list_connectors(
     State(state): State<ApiState>,
     Query(_ignored): Query<HashMap<String, String>>,
 ) -> Response {
-    let store = CONNECTORS.read().unwrap();
-    let mut rows: Vec<serde_json::Value> = store
+    let mut rows: Vec<serde_json::Value> = state
+        .connectors
+        .snapshot()
         .iter()
         .map(|body| redact_connector_doc(&connector_live_view(body, &state.engine)))
         .collect();
@@ -1304,7 +1497,6 @@ pub async fn list_connectors(
             .unwrap_or("");
         a_id.cmp(b_id)
     });
-    drop(store);
     (StatusCode::OK, Json(rows)).into_response()
 }
 
@@ -1343,16 +1535,7 @@ pub async fn get_connector(
 ) -> Response {
     // Exact id matching only: the path id must equal the stored `id` or
     // `name` exactly. No suffix splitting: `a:b` must not read `b`.
-    let stored = {
-        let connectors = CONNECTORS.read().unwrap();
-        connectors
-            .iter()
-            .find(|c| {
-                c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-                    || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
-            })
-            .cloned()
-    };
+    let stored = state.connectors.get(&id);
     match stored {
         Some(body) => {
             let live = redact_connector_doc(&connector_live_view(&body, &state.engine));
@@ -4747,16 +4930,6 @@ pub(crate) async fn register_live_sink(
     }
 }
 
-/// Whether a connector id already lives in the store, matching the
-/// same `id`-or-`name` predicate the read and update paths use. Control
-/// plane only: one linear scan per create, nothing on the message path.
-fn connector_id_exists(name: &str) -> bool {
-    CONNECTORS.read().unwrap().iter().any(|c| {
-        c.get("id").and_then(|v| v.as_str()) == Some(name)
-            || c.get("name").and_then(|v| v.as_str()) == Some(name)
-    })
-}
-
 /// `POST /api/v5/connectors` (C07-02): validate the body against the
 /// named kind (unknown kind or malformed config rejected with the
 /// documented error shape); a duplicate id is rejected cleanly, never
@@ -4833,14 +5006,14 @@ pub async fn create_connector(
     // This early read-check also skips the wasted live-sink
     // registration below; the write-locked re-check before the push
     // closes the check-then-insert race for the in-memory store.
-    if connector_id_exists(&name) {
+    if state.connectors.contains(&name) {
         return ApiError::AlreadyExists(format!("connector {name:?} already exists"))
             .into_response();
     }
     // Store-cap bound (management-plane, fail closed): an obviously full
     // store fails without a needless registration attempt.
     {
-        let live = CONNECTORS.read().unwrap().len();
+        let live = state.connectors.len();
         if live >= MAX_CONNECTORS {
             return ApiError::BadRequest(format!(
                 "connector store holds {live} entries, at most {MAX_CONNECTORS}"
@@ -4911,23 +5084,19 @@ pub async fn create_connector(
 
     // Re-check under the write lock so two concurrent creates for the
     // same id cannot both pass the early check and push a duplicate pair.
-    {
-        let mut store = CONNECTORS.write().unwrap();
-        if store.iter().any(|c| {
-            c.get("id").and_then(|v| v.as_str()) == Some(name.as_str())
-                || c.get("name").and_then(|v| v.as_str()) == Some(name.as_str())
-        }) {
+    match state.connectors.try_insert(&name, body.clone()) {
+        Ok(()) => {}
+        Err(ConnectorInsertError::Duplicate) => {
             return ApiError::AlreadyExists(format!("connector {name:?} already exists"))
                 .into_response();
         }
-        if store.len() >= MAX_CONNECTORS {
+        Err(ConnectorInsertError::Full) => {
             return ApiError::BadRequest(format!(
                 "connector store holds {} entries, at most {MAX_CONNECTORS}",
-                store.len()
+                state.connectors.len()
             ))
             .into_response();
         }
-        store.push(body.clone());
     }
     // W3-19: mirror the flag into the engine's lock-free dispatch
     // snapshot so rule evaluation observes a created-disabled connector
@@ -4938,7 +5107,7 @@ pub async fn create_connector(
 
     // A persist failure is a 500 (the in-memory entry stays but the disk
     // save failed); the loss must never be silent.
-    if let Err(error) = persist_connectors(&state.config) {
+    if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
 
@@ -4997,11 +5166,7 @@ pub async fn update_connector(
     // `name` exactly. No suffix splitting: `a:b` must not update `b`.
     // Existence before validation: an unknown id is 404 and creates
     // nothing, even when the body is also invalid.
-    let exists = CONNECTORS.read().unwrap().iter().any(|c| {
-        c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-            || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
-    });
-    if !exists {
+    if !state.connectors.contains(&id) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     let Some(obj) = body.as_object() else {
@@ -5092,23 +5257,15 @@ pub async fn update_connector(
         );
         obj.insert("node_status".to_string(), connector_node_status(status_str));
     }
-    {
-        let mut connectors = CONNECTORS.write().unwrap();
-        if let Some(pos) = connectors.iter().position(|c| {
-            c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-                || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
-        }) {
-            connectors[pos] = body.clone();
-        } else {
-            return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
-        }
+    if !state.connectors.replace(&id, body.clone()) {
+        return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // W3-19: mirror the flag into the dispatch snapshot (same lock-free
     // path as the enable route below).
     state.engine.set_action_enabled(&id, enable);
     // A persist failure is a 500 (the in-memory replacement stays but the
     // disk save failed); the loss must never be silent.
-    if let Err(error) = persist_connectors(&state.config) {
+    if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
     (StatusCode::OK, Json(body)).into_response()
@@ -5119,11 +5276,7 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
     // `name` exactly. The previous `split(':')` suffix match is gone: it
     // let `a:b` delete `b`, which is never correct for operator-owned ids.
     // Read (C07-04) and replace (C07-05) match exactly the same way.
-    let exists = CONNECTORS.read().unwrap().iter().any(|c| {
-        c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-            || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
-    });
-    if !exists {
+    if !state.connectors.contains(&id) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // Reference guard: a connector still referenced by a rule forward or
@@ -5171,16 +5324,7 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
         }
     }
 
-    let removed = {
-        let mut connectors = CONNECTORS.write().unwrap();
-        let before = connectors.len();
-        connectors.retain(|c| {
-            c.get("id").and_then(|v| v.as_str()) != Some(id.as_str())
-                && c.get("name").and_then(|v| v.as_str()) != Some(id.as_str())
-        });
-        connectors.len() != before
-    };
-    if !removed {
+    if !state.connectors.remove(&id) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // The id no longer names anything: drop it from the dispatch
@@ -5189,7 +5333,7 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
     state.engine.remove_action(&id);
     // Unknown ids persist nothing; a persist failure after a real removal
     // is a 500 (the in-memory removal stays but the disk save failed).
-    if let Err(error) = persist_connectors(&state.config) {
+    if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
     StatusCode::NO_CONTENT.into_response()
@@ -5246,11 +5390,7 @@ pub async fn set_connector_enabled(
     // must equal the stored `id` or `name` exactly. Existence before
     // validation: an unknown id is 404 and persists nothing, even when
     // the flag is also malformed.
-    let exists = CONNECTORS.read().unwrap().iter().any(|c| {
-        c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-            || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
-    });
-    if !exists {
+    if !state.connectors.contains(&id) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     let enable = match enable_raw.trim().to_ascii_lowercase().as_str() {
@@ -5263,27 +5403,17 @@ pub async fn set_connector_enabled(
             .into_response();
         }
     };
-    {
-        let mut connectors = CONNECTORS.write().unwrap();
-        let Some(pos) = connectors.iter().position(|c| {
-            c.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-                || c.get("name").and_then(|v| v.as_str()) == Some(id.as_str())
-        }) else {
-            return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
-        };
-        // Flip only the single boolean; id, kind and params are
-        // untouched, so the update can never trip the store cap or change
-        // validation.
-        if let Some(obj) = connectors[pos].as_object_mut() {
-            obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
-        }
+    // Flip only the single boolean; id, kind and params are untouched, so
+    // the update can never trip the store cap or change validation.
+    if !state.connectors.set_enabled(&id, enable) {
+        return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // Mirror into the dispatch snapshot before persisting: the in-memory
     // flag is already flipped, so evaluation must observe it even if the
     // disk save below fails (the store itself keeps the mutation on a
     // persist failure and answers 500, never silently).
     state.engine.set_action_enabled(&id, enable);
-    if let Err(error) = persist_connectors(&state.config) {
+    if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
     StatusCode::NO_CONTENT.into_response()
@@ -5409,11 +5539,7 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     // path id must equal the stored `id` or `name` exactly. Existence
     // before validation: an unknown id is 404 and persists nothing, even
     // when the operation is also unknown.
-    let exists = CONNECTORS.read().unwrap().iter().any(|c| {
-        c.get("id").and_then(|v| v.as_str()) == Some(id)
-            || c.get("name").and_then(|v| v.as_str()) == Some(id)
-    });
-    if !exists {
+    if !state.connectors.contains(id) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     let enable = match operation {
@@ -5426,20 +5552,10 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
             .into_response();
         }
     };
-    {
-        let mut connectors = CONNECTORS.write().unwrap();
-        let Some(pos) = connectors.iter().position(|c| {
-            c.get("id").and_then(|v| v.as_str()) == Some(id)
-                || c.get("name").and_then(|v| v.as_str()) == Some(id)
-        }) else {
-            return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
-        };
-        // Flip only the single boolean; id, kind and params are
-        // untouched, so the update can never trip the store cap or change
-        // validation.
-        if let Some(obj) = connectors[pos].as_object_mut() {
-            obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
-        }
+    // Flip only the single boolean; id, kind and params are untouched, so
+    // the update can never trip the store cap or change validation.
+    if !state.connectors.set_enabled(id, enable) {
+        return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // Mirror into the dispatch snapshot before persisting: the in-memory
     // flag is already flipped, so evaluation must observe it even if the
@@ -5449,7 +5565,7 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     // so a disabled connector costs the same single lookup and never
     // touches the connector store on the fire path.
     state.engine.set_action_enabled(id, enable);
-    if let Err(error) = persist_connectors(&state.config) {
+    if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
     StatusCode::NO_CONTENT.into_response()

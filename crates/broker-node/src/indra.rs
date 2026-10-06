@@ -2730,7 +2730,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Unique suffix so parallel tests never share a rule, connector or
-    /// user identity (the v5 connector directory is process-global).
+    /// user identity (each live API holds its own connector directory).
     static GOV_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn gov_id(prefix: &str) -> String {

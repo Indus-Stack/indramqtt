@@ -252,6 +252,19 @@ pub struct ApiState {
     /// snapshot, never this store directly, and publish and deliver
     /// never touch it.
     pub actions: Arc<crate::v5::actions::ActionStore>,
+    /// Connector instance directory for `GET /api/v5/connectors`,
+    /// `POST /api/v5/connectors`, `DELETE /api/v5/connectors/{id}`,
+    /// `GET`/`PUT /api/v5/connectors/{id}`, the enable flip and the
+    /// start/stop operations: bounded id-keyed list persisted across a
+    /// restart via the config core, with delete refused while a rule or
+    /// action references the connector. Each state holds its own list, so
+    /// two servers in one process never share connectors. The routes read
+    /// one bounded snapshot per request; the kernel boot path shares the
+    /// same instance (`crates/broker-node/src/main.rs`, `serve_api` share
+    /// below) so management reads observe the kernel's directory.
+    /// Management-plane only; rule evaluation reads the connector manager
+    /// directly, and publish and deliver never touch this store.
+    pub connectors: Arc<crate::v5::rules::ConnectorStore>,
     /// Rule-engine settings for `GET`/`PUT /api/v5/rule_engine` (W3-10,
     /// C06-14/C06-15): one validated struct persisted across a restart via
     /// the config core, with a subscriber callback hot-applying every
@@ -342,12 +355,15 @@ impl ApiState {
         // standalone engines report here; memory-only inputs only ever
         // count refusals.
         engine.set_metrics(&metrics);
-        // Boot replay (W0-23): merge the persisted connectors into the
-        // v5 store and re-register every live sink through the same path
-        // `create_connector` uses. An empty snapshot is a no-op (today's
-        // empty behaviour); an invalid snapshot fails boot loudly
-        // instead of being skipped silently.
-        crate::v5::rules::seed_connectors_from_registry(&config, &engine);
+        // Boot replay (W0-23): route the loaded connectors into a shared
+        // directory so management reads observe the persisted connectors
+        // from the first connection, and re-register every live sink
+        // through the same path `create_connector` uses. An empty snapshot
+        // is a no-op (today's empty behaviour); an invalid snapshot fails
+        // boot loudly instead of being skipped silently.
+        let connectors = Arc::new(crate::v5::rules::ConnectorStore::from_registry(
+            &config, &engine,
+        ));
         // Boot seeding (W2-02): route the loaded authenticator chain into
         // a shared chain instance so management reads and the CONNECT
         // consult observe the same order without a restart. An empty
@@ -539,6 +555,7 @@ impl ApiState {
             sso_backends,
             sources,
             actions,
+            connectors,
             rule_engine_config,
             operator_api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
             license: Arc::new(crate::v5::license::LicenseState::new()),
@@ -588,6 +605,13 @@ impl ApiState {
                 },
             ));
         }
+        // Standalone connector directory shares the standalone registry
+        // so creates persist to history and backup export carries them.
+        // An empty snapshot stays empty.
+        let config = defaults_registry();
+        let connectors = Arc::new(crate::v5::rules::ConnectorStore::from_registry(
+            &config, &engine,
+        ));
         Self {
             engine,
             sessions: Arc::new(SessionManager::new()),
@@ -597,7 +621,7 @@ impl ApiState {
             conns: Arc::new(ConnTable::default()),
             admin_users: Arc::new(AdminUsers::with_default_admin()),
             tokens: Arc::new(ApiTokens::new()),
-            config: defaults_registry(),
+            config,
             node_id: "indra-node-1".to_string(),
             edge_tx,
             bans: Arc::new(crate::v5::banned::BanStore::new()),
@@ -626,6 +650,7 @@ impl ApiState {
             sso_backends: Arc::new(crate::v5::sso::SsoStore::new()),
             sources: Arc::new(crate::v5::sources::SourceStore::new()),
             actions: Arc::new(crate::v5::actions::ActionStore::new()),
+            connectors,
             rule_engine_config,
             operator_api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
             license: Arc::new(crate::v5::license::LicenseState::new()),
@@ -13123,6 +13148,43 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, _) = server
             .delete_auth("/api/v5/connectors/w3-19-conn", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn connector_store_is_per_state_not_process_global() {
+        // AP-10 broker-through test: two servers in one process hold
+        // separate connector lists. A connector made on the first is
+        // absent on the second. Before the move it was present: every
+        // state shared one process static.
+        let (server_a, _) = TestServer::start().await;
+        let (server_b, _) = TestServer::start().await;
+        let token_a = server_a.login_as_admin().await;
+        let token_b = server_b.login_as_admin().await;
+        let (status, _) = server_a
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "ap-10-isolated", "type": "http", "url": "http://127.0.0.1:9"}),
+                &token_a,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server_a
+            .get_auth("/api/v5/connectors/ap-10-isolated", &token_a)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], json!("ap-10-isolated"));
+        let (status, body) = server_b
+            .get_auth("/api/v5/connectors/ap-10-isolated", &token_b)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, body) = server_b.get_auth("/api/v5/connectors", &token_b).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, _) = server_a
+            .delete_auth("/api/v5/connectors/ap-10-isolated", &token_a)
             .await;
         assert_eq!(status, 204);
     }

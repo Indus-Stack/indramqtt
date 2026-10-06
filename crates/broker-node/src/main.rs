@@ -3229,6 +3229,16 @@ struct Shared {
     /// evaluation reads a snapshot, never this store directly, and
     /// publish and deliver never touch it.
     actions: Arc<broker_api::v5::actions::ActionStore>,
+    /// Connector instance directory for `GET/POST /connectors` and the
+    /// per-connector routes: shared with the management API so validated
+    /// creates and deletes are visible to list reads without a restart.
+    /// One `Arc` clone at boot; the kernel boot path seeds it from the
+    /// registry and management reads take one bounded snapshot per
+    /// request. Management-plane only; rule evaluation reads the
+    /// connector manager directly, and publish and deliver never touch it.
+    /// The create, enable and operation events mirror the flag into the
+    /// engine's lock-free dispatch snapshot.
+    connectors: Arc<broker_api::v5::rules::ConnectorStore>,
     /// Rule-engine settings for W3-10 (`GET`/`PUT /rule_engine`): shared
     /// with the management API so validated writes are visible to reads
     /// without a restart and hot-apply to the engine's fire-path snapshot
@@ -3531,6 +3541,7 @@ impl Shared {
             sso_backends: Arc::new(broker_api::v5::sso::SsoStore::new()),
             sources: Arc::new(broker_api::v5::sources::SourceStore::new()),
             actions: Arc::new(broker_api::v5::actions::ActionStore::new()),
+            connectors: Arc::new(broker_api::v5::rules::ConnectorStore::new()),
             rule_engine_config,
             transformations: Arc::new(broker_api::v5::transformations::TransformChainStore::new()),
             schema_registry: Arc::new(broker_api::v5::schema_registry::SchemaRegistryStore::new()),
@@ -8872,6 +8883,14 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // evaluation reads a snapshot and the publish and deliver paths
     // never touch it.
     state.actions = shared.actions.clone();
+    // Share the connector instance directory so validated management
+    // creates/deletes are visible to `GET /connectors` reads without a
+    // restart. One `Arc` clone; management-plane only, rule evaluation
+    // reads the connector manager and the publish and deliver paths never
+    // touch it. Seeding already ran inside `ApiState::new`; sharing
+    // replaces that fresh instance with the kernel's so no second copy
+    // diverges.
+    state.connectors = shared.connectors.clone();
     // Share the rule-engine settings (W3-10) so validated management
     // writes are visible to `GET /rule_engine` reads without a restart
     // and hot-apply to the engine's fire-path snapshot through the
@@ -9160,6 +9179,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a no-op (today's empty behaviour: `GET /actions` reads an empty
     // page).
     shared.actions.seed_from_registry(&shared.config);
+    // Connector directory: seed the shared directory in place (the same
+    // instance `serve_api` shares with `ApiState`), so management reads
+    // observe the persisted connectors from the first connection. An empty
+    // snapshot is a no-op (today's empty behaviour: `GET /connectors`
+    // reads `[]`).
+    shared
+        .connectors
+        .seed_from_registry(&shared.config, &shared.engine);
+    // Connector enable flags: mirror the persisted flags (seeded in place
+    // above) into the engine's lock-free dispatch snapshot so a restart
+    // keeps disabled connectors skipped from the first publish. An empty
+    // store is a no-op (today's empty behaviour: nothing disabled). One
+    // snapshot read at boot; the publish path only loads afterwards.
+    {
+        let enables: Vec<(String, bool)> = shared
+            .connectors
+            .snapshot()
+            .iter()
+            .map(|doc| {
+                let id = doc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| doc.get("name").and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                let enable = doc.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+                (id, enable)
+            })
+            .collect();
+        for (id, enable) in &enables {
+            if !enable {
+                shared.engine.set_action_enabled(id, false);
+            }
+        }
+    }
     // Rule-engine settings (W3-10): seed the shared store in place (the
     // same instance `serve_api` shares with `ApiState`), so management
     // reads observe the persisted knobs from the first connection, then
