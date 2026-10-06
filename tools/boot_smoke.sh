@@ -456,6 +456,106 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 6. A tenant from the management API carries a real client ---
+# The tenant rule maps each username to its own tenant. Each namespace
+# is created through POST /mt/ns/{ns}. Each user is created through the
+# API with a random password the broker cannot know. A publish in one
+# tenant reaches the subscriber in the same tenant only.
+MT_USER_A="mtapi"
+MT_NS_A="t-mtapi"
+MT_USER_B="mtother"
+MT_NS_B="t-mtother"
+MT_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+MT_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+MT_TOPIC="smoke/mt/check"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$MT_NS_A" "$MT_USER_A" "$MT_PASS_A" "$MT_NS_B" "$MT_USER_B" "$MT_PASS_B" <<'PY'
+import json, sys, urllib.request
+api, key, ns_a, user_a, pass_a, ns_b, user_b, pass_b = sys.argv[1:9]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, res.read().decode()
+    except urllib.request.HTTPError as err:
+        return err.code, err.read().decode()
+for ns, user, password in ((ns_a, user_a, pass_a), (ns_b, user_b, pass_b)):
+    status, _ = call("POST", f"/api/v5/mt/ns/{ns}", {})
+    assert status in (204, 409), f"create managed namespace {ns}: {status}"
+    status, _ = call("POST", f"/api/v1/auth/users?tenant={ns}",
+                     {"username": user, "password": password})
+    assert status in (201, 409), f"create tenant user {user}: {status}"
+    for action in ("publish", "subscribe"):
+        status, _ = call("POST", f"/api/v1/auth/acls?tenant={ns}",
+                         {"client_pattern": "*", "action": action,
+                          "topic_pattern": "smoke/mt/#", "allow": True})
+        assert status == 201, f"create tenant {action} rule: {status}"
+    status, text = call("GET", f"/api/v5/mt/ns/{ns}/config")
+    assert status == 200, f"show managed namespace {ns}: {status} {text}"
+print("managed namespaces and tenant users are stored through the API")
+PY
+check "two tenants and two users with random passwords are stored through the API" $?
+
+python3 - "$MQTT_PORT" "$MT_USER_A" "$MT_PASS_A" "$MT_USER_B" "$MT_PASS_B" "$MT_TOPIC" <<'PY'
+import socket, struct, sys, time
+mqtt_port, username_a, password_a, username_b, password_b, topic = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+def connect(client_id, username, password):
+    sock = wait_port(mqtt_port)
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+import os
+secret = os.urandom(8).hex().encode()
+sub, ok = connect(b"mtapi-sub", username_a, password_a)
+other, other_ok = connect(b"mtapi-other", username_b, password_b)
+ready = ok and other_ok
+if ok:
+    sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and sub.recv(5)[:1] == b"\x90"
+if other_ok:
+    other.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and other.recv(5)[:1] == b"\x90"
+pub, pub_ok = connect(b"mtapi-pub", username_a, password_a)
+ready = ready and pub_ok
+if ready:
+    pub.sendall(packet(0x30, field(topic) + secret))
+    report("a publish in the API tenant reaches its own subscriber",
+           receive(sub, 5).endswith(secret))
+    report("a publish in the API tenant does not leak to another tenant",
+           secret not in receive(other, 2))
+else:
+    report("a publish in the API tenant reaches its own subscriber", False)
+    report("a publish in the API tenant does not leak to another tenant", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"
     exit 0

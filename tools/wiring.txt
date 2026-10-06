@@ -28,3 +28,4 @@ wired  sources
 wired  actions
 wired  transformations
 wired  schema_registry
+wired  namespaces

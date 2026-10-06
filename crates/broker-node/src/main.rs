@@ -3250,6 +3250,12 @@ struct Shared {
     /// at boot. Reads take one short lock per request. No publish path
     /// reads this store. Publish and deliver take no lock here.
     schema_registry: Arc<broker_api::v5::schema_registry::SchemaRegistryStore>,
+    /// Managed tenant namespaces for TM-02 (`GET/POST/PUT/DELETE
+    /// /api/v5/mt/...`): shared with the management API so validated
+    /// creates and deletes are visible to reads without a restart. One
+    /// `Arc` clone at boot. Management-plane only; publish and deliver
+    /// never touch it.
+    namespaces: Arc<broker_api::v5::mt::NamespaceStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -3534,6 +3540,7 @@ impl Shared {
             rule_engine_config,
             transformations: Arc::new(broker_api::v5::transformations::TransformChainStore::new()),
             schema_registry: Arc::new(broker_api::v5::schema_registry::SchemaRegistryStore::new()),
+            namespaces: Arc::new(broker_api::v5::mt::NamespaceStore::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -8892,6 +8899,10 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Reads take one short lock per request. No publish path reads this
     // store. Publish and deliver take no lock here.
     state.schema_registry = shared.schema_registry.clone();
+    // Share the managed namespaces (TM-02) so validated creates and
+    // deletes are visible to reads without a restart. One `Arc` clone.
+    // Management-plane only; publish and deliver never touch it.
+    state.namespaces = shared.namespaces.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.

@@ -298,6 +298,15 @@ pub struct ApiState {
     /// request. No publish path reads this store. Publish and deliver take
     /// no lock here.
     pub schema_registry: Arc<crate::v5::schema_registry::SchemaRegistryStore>,
+    /// Managed tenant namespaces for the 16 `GET/POST/PUT/DELETE
+    /// /api/v5/mt/...` operations (TM-02): bounded name-keyed map with
+    /// creation times plus stored configs. Reads join live broker state
+    /// (sessions per tenant, credential tables per tenant); writes touch
+    /// only this registry plus the tenant rows. The instance is created
+    /// once in `ApiState::new`, so the served API and the kernel observe
+    /// one registry with no second copy. Management-plane only; publish
+    /// and deliver never touch this store.
+    pub namespaces: Arc<crate::v5::mt::NamespaceStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -548,6 +557,7 @@ impl ApiState {
             schema_registry: Arc::new(
                 crate::v5::schema_registry::SchemaRegistryStore::from_registry(&config),
             ),
+            namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -633,6 +643,7 @@ impl ApiState {
             startup_config: Arc::new(std::sync::RwLock::new(None)),
             transformations: Arc::new(crate::v5::transformations::TransformChainStore::new()),
             schema_registry: Arc::new(crate::v5::schema_registry::SchemaRegistryStore::new()),
+            namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
