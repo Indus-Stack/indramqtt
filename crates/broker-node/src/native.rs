@@ -587,6 +587,14 @@ fn encode_frame(frame: &BrokerFrame, level: u8, out: &mut Vec<u8>) -> FrameEffec
             wire::encode_suback(packet_id, &meta[2..], level, out);
             FrameEffect::None
         }
+        OpCode::UnsubAckOut => {
+            if meta.len() < 2 {
+                return FrameEffect::Close;
+            }
+            let packet_id = u16::from_be_bytes([meta[0], meta[1]]);
+            wire::encode_unsuback(packet_id, &meta[2..], level, out);
+            FrameEffect::None
+        }
         OpCode::PubAckOut | OpCode::PubRecOut | OpCode::PubRelOut | OpCode::PubCompOut => {
             if meta.len() < 2 {
                 return FrameEffect::Close;
@@ -720,6 +728,21 @@ fn publish_in_meta(publish: &wire::Publish<'_>, level: u8) -> Vec<u8> {
         // The alias section alone. An alias of 0 stays in the frame,
         // thus the kernel refuses it with reason code 0x94.
         meta.extend_from_slice(&alias.to_be_bytes());
+    }
+    meta
+}
+
+/// The metadata of an `UnsubscribeIn` frame.
+fn unsubscribe_in_meta(client_id: &str, unsubscribe: &wire::Unsubscribe<'_>) -> Vec<u8> {
+    let id = client_id.as_bytes();
+    let mut meta = Vec::with_capacity(6 + id.len() + unsubscribe.filters.len() * 16);
+    meta.extend_from_slice(&unsubscribe.packet_id.to_be_bytes());
+    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    meta.extend_from_slice(id);
+    meta.extend_from_slice(&(unsubscribe.filters.len() as u16).to_be_bytes());
+    for filter in &unsubscribe.filters {
+        meta.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+        meta.extend_from_slice(filter.as_bytes());
     }
     meta
 }
@@ -1087,6 +1110,11 @@ async fn drain_inbound(
                 let meta = subscribe_in_meta(&conn.client_id, &subscribe, conn.level);
                 conn.frame(OpCode::SubscribeIn, meta, Bytes::new())
             }
+            kind::UNSUBSCRIBE => {
+                let unsubscribe = wire::decode_unsubscribe(&body, conn.level)?;
+                let meta = unsubscribe_in_meta(&conn.client_id, &unsubscribe);
+                conn.frame(OpCode::UnsubscribeIn, meta, Bytes::new())
+            }
             kind::PUBACK | kind::PUBREC | kind::PUBREL | kind::PUBCOMP => {
                 let (packet_id, reason) = wire::decode_ack(&body, conn.level)?;
                 let mut meta = packet_id.to_be_bytes().to_vec();
@@ -1122,8 +1150,6 @@ async fn drain_inbound(
                 conn.connected = false;
                 return Ok(Some(Stop::Clean));
             }
-            // UNSUBSCRIBE is not available in the kernel yet. The edge
-            // closes the connection for it also.
             _ => return Err(WireError::Unsupported("packet type")),
         };
         let Some(frame) = frame else {
@@ -1190,6 +1216,7 @@ mod tests {
             OpCode::PublishOut,
             OpCode::SessionBinding,
             OpCode::SubAckOut,
+            OpCode::UnsubAckOut,
             OpCode::PubAckOut,
             OpCode::PubRecOut,
             OpCode::PubRelOut,
@@ -1517,6 +1544,69 @@ mod tests {
         assert!(!certs.is_empty());
         let fields = peer_cert_fields(Some(&certs));
         assert_eq!(fields.cn.as_deref(), Some("test-device"));
+    }
+
+    /// Unsubscribe on the native path stops delivery and keeps the
+    /// socket. The wire bytes decode, the shared broker handler
+    /// removes the router copy, and the reply encodes as UNSUBACK.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn native_unsubscribe_stops_delivery_with_unsuback() {
+        let shared = Shared::new();
+        let conn_id = NATIVE_CONN_ID_BASE + 920_001;
+        let (tx, mut rx, mut bound) = bind_client(&shared, conn_id, "native-unsub").await;
+        let waker = Arc::new(tokio::sync::Notify::new());
+        let sink = NativeSink::new();
+        // Subscribe through the production frame handler.
+        let sub = wire::Subscribe {
+            packet_id: 1,
+            subscription_id: 0,
+            filters: vec![("nsub/data", 0)],
+        };
+        let meta = subscribe_in_meta("native-unsub", &sub, 4);
+        let frame = BrokerFrame::new(
+            OpCode::SubscribeIn,
+            conn_id,
+            2,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .expect("frame");
+        handle_inbound_frame_with(frame, &shared, &tx, &sink, &mut bound, &waker, None)
+            .await
+            .expect("subscribe is handled");
+        let suback = sink.take();
+        assert_eq!(&suback[0..2], &[0x90, 0x03], "SUBACK for the client");
+        // Unsubscribe through the wire decode and the shared handler.
+        // Body: packet id 2 plus one filter.
+        let mut body = vec![0x00, 0x02];
+        body.extend_from_slice(&[0x00, 0x09]);
+        body.extend_from_slice(b"nsub/data");
+        let unsub = wire::decode_unsubscribe(&body, 4).expect("wire decodes");
+        assert_eq!(unsub.packet_id, 2);
+        let meta = unsubscribe_in_meta("native-unsub", &unsub);
+        let frame = BrokerFrame::new(
+            OpCode::UnsubscribeIn,
+            conn_id,
+            3,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .expect("frame");
+        handle_inbound_frame_with(frame, &shared, &tx, &sink, &mut bound, &waker, None)
+            .await
+            .expect("unsubscribe is handled");
+        let unsuback = sink.take();
+        assert_eq!(
+            unsuback,
+            vec![0xB0, 0x02, 0x00, 0x02],
+            "UNSUBACK for the client"
+        );
+        // No routed delivery remains for the filter.
+        let _ = rx.try_recv();
+        let topic = broker_protocol::Topic::new("nsub/data".to_string()).expect("topic");
+        let matched = shared.router.matches(&topic);
+        assert!(matched.is_empty(), "router drops the filter");
     }
 
     /// Server config loads with and without client verification.

@@ -5291,6 +5291,17 @@ where
                 );
             }
         },
+        OpCode::UnsubscribeIn => match apply_unsubscribe(&frame, shared).await {
+            Some(reply) => {
+                transport.send(reply).await?;
+            }
+            None => {
+                warn!(
+                    "Dropping malformed UnsubscribeIn from conn {}",
+                    frame.header.conn_id
+                );
+            }
+        },
         OpCode::PublishIn => {
             let (ack, deliveries) = apply_publish(&frame, shared).await;
             if let Some(ack) = ack {
@@ -5832,6 +5843,75 @@ async fn apply_subscribe(
     }
 
     (reply, retained)
+}
+
+/// Remove the subscriptions of one `UnsubscribeIn` frame and build its
+/// `UnsubAckOut` reply. Both transports share this function: the edge
+/// path and the kernel listener path build the same frame.
+/// Malformed framing yields `None` (the caller drops the frame).
+///
+/// Meta layout: `PacketId:16be | IdLen:16be | ClientId | N:16be |
+/// (FilterLen:16be | Filter) * N`. Each reply code covers one filter:
+/// `0x00` success, `0x11` no subscription existed, `0x8F` topic filter
+/// invalid. Version-4 peers observe the packet identifier only; the
+/// wider set rides the same bytes for version-5 peers.
+/// A `$share/<group>/` prefix removes the inner filter, like subscribe.
+/// A rewrite rule applies before removal, like subscribe.
+async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
+    let (packet_id, client_id, filters) = decode_unsubscribe_meta(&frame.metadata)?;
+    // Tenant scope: resolve once from the owning connection, like subscribe.
+    // Two tenants with one client id unsubscribe independently.
+    let tenant = session_tenant_for_conn(shared, frame.header.conn_id, &client_id);
+    let owner = shared.sessions.get_in_tenant(&tenant, &client_id);
+    let mut codes = Vec::with_capacity(filters.len());
+    let mut removed_any = false;
+    for raw in &filters {
+        // Subscribe rewrites before it stores. Unsubscribe rewrites
+        // before it removes, so it removes the stored form.
+        let filter_str = match shared.router.rewrite_subscribe(raw) {
+            Some(rewritten) => rewritten,
+            None => raw.clone(),
+        };
+        let parsed = TopicFilter::new(filter_str)
+            .ok()
+            .and_then(|filter| split_shared_filter(&filter).map(|(_, inner)| inner));
+        let Some(inner) = parsed else {
+            codes.push(V5_UNSUBACK_FILTER_INVALID);
+            continue;
+        };
+        let existed = owner
+            .as_ref()
+            .is_some_and(|session| session.subscriptions.read().contains_key(&inner));
+        shared
+            .router
+            .unsubscribe_in_tenant(&inner, &client_id, &tenant);
+        shared
+            .sessions
+            .remove_subscription_in_tenant(&tenant, &client_id, &inner);
+        if existed {
+            removed_any = true;
+            codes.push(V5_UNSUBACK_SUCCESS);
+        } else {
+            // TODO(parity): the reference answer for an unknown filter
+            // is open (success vs no-subscription-existed). Current
+            // choice answers 0x11 when the session holds no such filter.
+            codes.push(V5_UNSUBACK_NO_SUBSCRIPTION);
+        }
+    }
+    if removed_any {
+        refresh_subscription_stats(shared);
+    }
+    let mut meta = Vec::with_capacity(2 + codes.len());
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    meta.extend_from_slice(&codes);
+    BrokerFrame::new(
+        OpCode::UnsubAckOut,
+        frame.header.conn_id,
+        frame.header.sequence_no,
+        Bytes::from(meta),
+        Bytes::new(),
+    )
+    .ok()
 }
 
 /// Replay a resumed durable session's backlog onto its new connection:
@@ -8682,6 +8762,14 @@ const V5_SUBACK_NOT_AUTHORIZED: u8 = 0x87;
 const V5_SUBACK_FILTER_INVALID: u8 = 0x8F;
 const V5_SUBACK_QUOTA_EXCEEDED: u8 = 0x97;
 
+/// v5 UNSUBACK reason codes carried per filter: success, no
+/// subscription existed and topic filter invalid. Version-4 peers
+/// observe the packet identifier only. A malformed filter answers
+/// 0x8F, failing only the affected filter.
+const V5_UNSUBACK_SUCCESS: u8 = 0x00;
+const V5_UNSUBACK_NO_SUBSCRIPTION: u8 = 0x11;
+const V5_UNSUBACK_FILTER_INVALID: u8 = 0x8F;
+
 /// Decode `SubscribeMeta` into `(packet_id, client_id, [entries])`.
 /// Accepts the legacy form (`FilterLen | Filter | QoS`) and the X1-03
 /// extended form (`FilterLen | Filter | Opts | SubId:32be`) per filter.
@@ -8773,6 +8861,50 @@ fn decode_subscribe_entries_v5(
         return None;
     }
     Some(subs)
+}
+
+/// Decode `UnsubscribeMeta` into `(packet_id, client_id, [filters])`.
+/// Layout: `PacketId:16be | IdLen:16be | ClientId | N:16be |
+/// (FilterLen:16be | Filter) * N`. Structural truncation, bad UTF-8,
+/// an empty filter or an empty list fails the frame (`None`).
+fn decode_unsubscribe_meta(meta: &[u8]) -> Option<(u16, String, Vec<String>)> {
+    if meta.len() < 6 {
+        return None;
+    }
+    let packet_id = u16::from_be_bytes([meta[0], meta[1]]);
+    if packet_id == 0 {
+        return None;
+    }
+    let id_len = u16::from_be_bytes([meta[2], meta[3]]) as usize;
+    if meta.len() < 4 + id_len + 2 {
+        return None;
+    }
+    let client_id = std::str::from_utf8(&meta[4..4 + id_len]).ok()?.to_string();
+    let mut cursor = 4 + id_len;
+    let count = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
+    cursor += 2;
+    if count == 0 {
+        return None;
+    }
+    let mut filters = Vec::with_capacity(count);
+    for _ in 0..count {
+        if meta.len() < cursor + 2 {
+            return None;
+        }
+        let filter_len = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
+        if filter_len == 0 || meta.len() < cursor + 2 + filter_len {
+            return None;
+        }
+        let filter = std::str::from_utf8(&meta[cursor + 2..cursor + 2 + filter_len])
+            .ok()?
+            .to_string();
+        filters.push(filter);
+        cursor += 2 + filter_len;
+    }
+    if cursor != meta.len() {
+        return None;
+    }
+    Some((packet_id, client_id, filters))
 }
 
 /// Encode one extended subscription entry for tests (mirror of the edge
@@ -10703,6 +10835,26 @@ mod tests {
             .expect("valid subscribe frame")
     }
 
+    /// Encode `UnsubscribeMeta` for tests. Mirrors the native path layout.
+    fn encode_unsubscribe_meta(packet_id: u16, client_id: &str, filters: &[&str]) -> Bytes {
+        let id = client_id.as_bytes();
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&packet_id.to_be_bytes());
+        meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+        meta.extend_from_slice(id);
+        meta.extend_from_slice(&(filters.len() as u16).to_be_bytes());
+        for filter in filters {
+            meta.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+            meta.extend_from_slice(filter.as_bytes());
+        }
+        Bytes::from(meta)
+    }
+
+    fn unsubscribe_frame(conn_id: u64, seq: u64, meta: Bytes) -> BrokerFrame {
+        BrokerFrame::new(OpCode::UnsubscribeIn, conn_id, seq, meta, Bytes::new())
+            .expect("valid unsubscribe frame")
+    }
+
     fn publish_frame(conn_id: u64, seq: u64, meta: Bytes, payload: Bytes) -> BrokerFrame {
         BrokerFrame::new(OpCode::PublishIn, conn_id, seq, meta, payload)
             .expect("valid publish frame")
@@ -11543,6 +11695,176 @@ mod tests {
         let (reply, retained) = apply_subscribe(&frame, &shared).await;
         assert!(reply.is_none());
         assert!(retained.is_empty());
+    }
+
+    /// Unsubscribe removes the router copy and the session mirror
+    /// through the broker. A publish after it delivers nothing.
+    /// Goes through `apply_subscribe` and `apply_unsubscribe`, not
+    /// the store alone.
+    #[tokio::test]
+    async fn unsubscribe_removes_subscription_and_stops_delivery() {
+        let shared = test_shared();
+        let bind_meta = encode_bind_meta("unsub-1", true, 60);
+        let bind_reply = apply_bind(&bind_frame(21, 1, bind_meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, bind_rc) = decode_session_binding_meta(&bind_reply.metadata);
+        assert_eq!(bind_rc, 0);
+        let sub_frame = subscribe_frame(
+            21,
+            2,
+            encode_subscribe_meta(1, "unsub-1", &[("k1/data", 0)]),
+        );
+        apply_subscribe(&sub_frame, &shared)
+            .await
+            .0
+            .expect("subscribe");
+        let (meta, payload) = encode_publish_meta("k1/data", 0, 0, false, b"first");
+        let (_, before) = apply_publish(&publish_frame(40, 1, meta, payload), &shared).await;
+        assert!(!before.is_empty(), "delivery before unsubscribe");
+        let unsub = unsubscribe_frame(21, 3, encode_unsubscribe_meta(2, "unsub-1", &["k1/data"]));
+        let reply = apply_unsubscribe(&unsub, &shared)
+            .await
+            .expect("unsuback replies");
+        assert_eq!(reply.header.opcode, OpCode::UnsubAckOut);
+        assert_eq!(&reply.metadata[0..2], &2u16.to_be_bytes());
+        assert_eq!(&reply.metadata[2..], &[0x00u8]);
+        assert!(
+            shared
+                .sessions
+                .get("unsub-1")
+                .expect("session exists")
+                .subscriptions
+                .read()
+                .is_empty(),
+            "session mirror drops the filter"
+        );
+        let (meta, payload) = encode_publish_meta("k1/data", 0, 0, false, b"second");
+        let (_, after) = apply_publish(&publish_frame(40, 2, meta, payload), &shared).await;
+        assert!(after.is_empty(), "no delivery after unsubscribe");
+    }
+
+    /// An unknown filter answers 0x11 and an invalid filter answers
+    /// 0x8F, each failing only its filter. Goes through the broker.
+    #[tokio::test]
+    async fn unsubscribe_unknown_and_invalid_filters_get_their_codes() {
+        let shared = test_shared();
+        let bind_meta = encode_bind_meta("unsub-2", true, 60);
+        apply_bind(&bind_frame(22, 1, bind_meta), &shared)
+            .await
+            .expect("bind");
+        let sub_frame = subscribe_frame(
+            22,
+            2,
+            encode_subscribe_meta(1, "unsub-2", &[("k2/kept", 0)]),
+        );
+        apply_subscribe(&sub_frame, &shared)
+            .await
+            .0
+            .expect("subscribe");
+        let unsub = unsubscribe_frame(
+            22,
+            3,
+            encode_unsubscribe_meta(5, "unsub-2", &["k2/missing", "sport/#/bogus", "k2/kept"]),
+        );
+        let reply = apply_unsubscribe(&unsub, &shared)
+            .await
+            .expect("unsuback replies");
+        assert_eq!(&reply.metadata[0..2], &5u16.to_be_bytes());
+        assert_eq!(&reply.metadata[2..], &[0x11u8, 0x8Fu8, 0x00u8]);
+        let (meta, payload) = encode_publish_meta("k2/kept", 0, 0, false, b"x");
+        let (_, deliveries) = apply_publish(&publish_frame(40, 1, meta, payload), &shared).await;
+        assert!(
+            deliveries.is_empty(),
+            "kept filter is gone, missing never existed"
+        );
+    }
+
+    /// A shared subscription leaves through its `$share` form. Goes
+    /// through the broker subscribe and unsubscribe events.
+    #[tokio::test]
+    async fn unsubscribe_shared_group_form_removes_the_member() {
+        let shared = test_shared();
+        let bind_meta = encode_bind_meta("unsub-share", true, 60);
+        apply_bind(&bind_frame(23, 1, bind_meta), &shared)
+            .await
+            .expect("bind");
+        let sub_frame = subscribe_frame(
+            23,
+            2,
+            encode_subscribe_meta(1, "unsub-share", &[("$share/pool/k3/tasks", 0)]),
+        );
+        apply_subscribe(&sub_frame, &shared)
+            .await
+            .0
+            .expect("subscribe");
+        let (meta, payload) = encode_publish_meta("k3/tasks", 0, 0, false, b"job");
+        let (_, before) = apply_publish(&publish_frame(40, 1, meta, payload), &shared).await;
+        assert_eq!(before.len(), 1, "shared member delivers before unsubscribe");
+        let unsub = unsubscribe_frame(
+            23,
+            3,
+            encode_unsubscribe_meta(2, "unsub-share", &["$share/pool/k3/tasks"]),
+        );
+        let reply = apply_unsubscribe(&unsub, &shared)
+            .await
+            .expect("unsuback replies");
+        assert_eq!(&reply.metadata[2..], &[0x00u8]);
+        let (meta, payload) = encode_publish_meta("k3/tasks", 0, 0, false, b"job2");
+        let (_, after) = apply_publish(&publish_frame(40, 2, meta, payload), &shared).await;
+        assert!(
+            after.is_empty(),
+            "shared member is silent after unsubscribe"
+        );
+    }
+
+    /// Malformed unsubscribe metadata yields no reply and changes
+    /// nothing. Goes through the broker.
+    #[tokio::test]
+    async fn unsubscribe_malformed_meta_yields_no_reply() {
+        let shared = test_shared();
+        let frame = unsubscribe_frame(21, 4, Bytes::from(vec![0x00, 0x07, 0xAA]));
+        assert!(apply_unsubscribe(&frame, &shared).await.is_none());
+    }
+
+    /// One client id in two tenants unsubscribes independently. A
+    /// removal in one tenant keeps the other tenant delivery.
+    /// Goes through the broker bind, subscribe, unsubscribe and
+    /// publish events.
+    #[tokio::test]
+    async fn unsubscribe_keeps_the_other_tenant_subscription() {
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "u-${username}")])
+            .expect("tenant rules store");
+        for (conn, client, user) in [(211u64, "dup-unsub", "alice"), (212u64, "dup-unsub", "bob")] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        for (conn, client) in [(211u64, "dup-unsub"), (212u64, "dup-unsub")] {
+            let frame =
+                subscribe_frame(conn, 2, encode_subscribe_meta(1, client, &[("k4/data", 0)]));
+            apply_subscribe(&frame, &shared).await.0.expect("subscribe");
+        }
+        let unsub = unsubscribe_frame(
+            211,
+            3,
+            encode_unsubscribe_meta(2, "dup-unsub", &["k4/data"]),
+        );
+        let reply = apply_unsubscribe(&unsub, &shared)
+            .await
+            .expect("unsuback replies");
+        assert_eq!(&reply.metadata[2..], &[0x00u8]);
+        let (meta, payload) = encode_publish_meta("k4/data", 0, 0, false, b"from-b");
+        let (_, deliveries) = apply_publish(&publish_frame(212, 4, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "other tenant still delivers");
+        assert_eq!(deliveries[0].0, 212);
     }
 
     /// X1-03: each subscription option round-trips through the extended

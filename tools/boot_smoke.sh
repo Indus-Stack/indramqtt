@@ -360,6 +360,83 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 4a. Unsubscribe on the kernel listener keeps the connection ---
+# Run this check only when the kernel owns the MQTT listener.
+# A client subscribes, gets a message, unsubscribes, gets UNSUBACK,
+# and gets no more messages. Covers MQTT 3.1.1 and MQTT 5.
+if [ "${SMOKE_NATIVE:-0}" = 1 ]; then
+python3 - "$MQTT_PORT" <<'PY'
+import socket, struct, sys, time
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def mqtt_connect(sock, client_id):
+    body = b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)
+    sock.sendall(packet(0x10, body))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+sub = wait_port(mqtt_port)
+sub_ok = mqtt_connect(sub, b"smoke-unsub-sub")
+topic = b"smoke/unsub/check"
+sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+suback_ok = sub.recv(5)[:1] == b"\x90"
+pub = wait_port(mqtt_port)
+pub_ok = mqtt_connect(pub, b"smoke-unsub-pub")
+pub.sendall(packet(0x30, field(topic) + b"first"))
+first_ok = receive(sub, 5).endswith(b"first")
+sub.sendall(packet(0xA2, b"\x00\x02" + field(topic)))
+unsuback = receive(sub, 5)
+unsuback_ok = unsuback[:1] == b"\xB0" and unsuback[2:4] == b"\x00\x02"
+pub.sendall(packet(0x30, field(topic) + b"second"))
+second_got = receive(sub, 1)
+report("an unsubscribe stops delivery and keeps the connection",
+       sub_ok and suback_ok and pub_ok and first_ok and unsuback_ok and second_got == b"")
+def mqtt5_connect(sock, client_id):
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x05\x02\x00\x3c\x00" + field(client_id)))
+    ack = receive(sock, 5)
+    return len(ack) >= 4 and ack[0] == 0x20 and ack[3] == 0
+v5_sub = wait_port(mqtt_port)
+v5_ok = mqtt5_connect(v5_sub, b"smoke-unsub-v5")
+v5_topic = b"smoke/unsub/v5"
+v5_sub.sendall(packet(0x82, b"\x00\x03\x00" + field(v5_topic) + b"\x00"))
+v5_suback = receive(v5_sub, 5)
+v5_ready = v5_ok and len(v5_suback) >= 6 and v5_suback[0] == 0x90
+v5_pub = wait_port(mqtt_port)
+v5_pub_ok = mqtt5_connect(v5_pub, b"smoke-unsub-v5-pub")
+v5_pub.sendall(packet(0x30, field(v5_topic) + b"\x00" + b"v5-first"))
+v5_first_ok = b"v5-first" in receive(v5_sub, 5)
+v5_sub.sendall(packet(0xA2, b"\x00\x04\x00" + field(v5_topic)))
+v5_unsuback = receive(v5_sub, 5)
+v5_unsuback_ok = (len(v5_unsuback) >= 6 and v5_unsuback[0] == 0xB0
+                  and v5_unsuback[2:4] == b"\x00\x04" and v5_unsuback[5] == 0)
+v5_pub.sendall(packet(0x30, field(v5_topic) + b"\x00" + b"v5-second"))
+report("an MQTT 5 unsubscribe stops delivery and answers success",
+       v5_ready and v5_pub_ok and v5_first_ok and v5_unsuback_ok
+       and receive(v5_sub, 1) == b"")
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+fi
+
 # --- 4b. Tenant filters on the client list keep tenants apart ---
 # Run this check before the first user exists. The broker stays open.
 # The tenant rule maps each username to its own tenant. The same
