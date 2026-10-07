@@ -19,6 +19,7 @@ use broker_protocol::wire::{self, kind, ConnackProperties, PublishOut, WireError
 use broker_session::SessionKey;
 use brokerlink::{BrokerFrame, BrokerLinkError, BrokerLinkTransport, OpCode};
 use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,40 +54,56 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// connection keeps only this much. The buffer grows for a larger packet.
 const READ_BUFFER_BYTES: usize = 256;
 
-/// Number of connections that the kernel listeners hold at this time.
-static ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
-
-/// One accepted connection in [`ACTIVE_CONNECTIONS`]. The drop takes it
+/// One accepted connection in a per-listener count. The drop takes it
 /// out again, also when the task ends on a panic.
-struct ConnectionSlot;
+struct PerListenerSlot {
+    count: Arc<AtomicU64>,
+}
 
-impl ConnectionSlot {
-    /// Takes a slot if the number of connections is below `limit`.
-    fn take(limit: u32) -> Option<Self> {
+impl PerListenerSlot {
+    /// Takes one slot of `count` below `limit`. `None` sets no limit:
+    /// per-connection memory stays bounded by the read buffer and the
+    /// egress backlog, so no counter bounds the listener.
+    fn take(count: &Arc<AtomicU64>, limit: Option<u32>) -> Option<Self> {
+        let Some(limit) = limit else {
+            count.fetch_add(1, Ordering::Relaxed);
+            return Some(Self {
+                count: count.clone(),
+            });
+        };
         let limit = u64::from(limit);
-        let mut current = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
+        let mut current = count.load(Ordering::Relaxed);
         loop {
             if current >= limit {
                 return None;
             }
-            match ACTIVE_CONNECTIONS.compare_exchange_weak(
+            match count.compare_exchange_weak(
                 current,
                 current + 1,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(Self),
+                Ok(_) => {
+                    return Some(Self {
+                        count: count.clone(),
+                    });
+                }
                 Err(actual) => current = actual,
             }
         }
     }
 }
 
-impl Drop for ConnectionSlot {
+impl Drop for PerListenerSlot {
     fn drop(&mut self) {
-        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+        self.count.fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+// Reason: the reference API documents 1024 as the default accept
+// backlog, and `listeners.tcp.backlog` defaults to the same value.
+// Rows without a backlog (edge rows, API creates) bind with it.
+const DEFAULT_BIND_BACKLOG: u32 = 1024;
 
 /// Binds a listener socket with the accept backlog of the configuration.
 pub(super) fn bind_listener(bind: &str, backlog: u32) -> std::io::Result<TcpListener> {
@@ -103,9 +120,112 @@ pub(super) fn bind_listener(bind: &str, backlog: u32) -> std::io::Result<TcpList
     socket.listen(backlog)
 }
 
+/// Socket control of the kernel-owned listeners (AP-02).
+///
+/// The API listener store calls this control when an operator starts,
+/// stops or restarts a kernel row. One accept task per open listener;
+/// stopping aborts the task and drops the socket. Management-plane
+/// only; publish and deliver never touch these handles.
+pub(super) struct NativeListenerController {
+    shared: Shared,
+    /// Accept tasks by `{type}:{name}` id.
+    handles: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Live connection counts by `{type}:{name}` id.
+    counts: std::sync::Mutex<HashMap<String, Arc<AtomicU64>>>,
+}
+
+impl NativeListenerController {
+    /// Control that serves new sockets with a clone of `shared`.
+    pub(super) fn new(shared: Shared) -> Self {
+        Self {
+            shared,
+            handles: std::sync::Mutex::new(HashMap::new()),
+            counts: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl broker_api::v5::listeners::ListenerController for NativeListenerController {
+    fn start_listener(
+        &self,
+        record: &broker_api::v5::listeners::ListenerRecord,
+    ) -> Result<(), String> {
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if handles.contains_key(&record.id) {
+            return Ok(());
+        }
+        let backlog = if record.backlog == 0 {
+            DEFAULT_BIND_BACKLOG
+        } else {
+            record.backlog
+        };
+        let max = match record.max_connections {
+            Some(broker_api::v5::listeners::ListenerMaxConnections::Finite(count)) => Some(count),
+            Some(broker_api::v5::listeners::ListenerMaxConnections::Infinite) | None => None,
+        };
+        let count = Arc::new(AtomicU64::new(0));
+        self.counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(record.id.clone(), count.clone());
+        if record.kind == "ssl" {
+            let tls =
+                load_tls_config(&record.cert_file, &record.key_file).map_err(|e| e.to_string())?;
+            let listener = bind_listener(&record.bind, backlog)
+                .map_err(|e| format!("{}: {e}", record.bind))?;
+            let shared = self.shared.clone();
+            handles.insert(
+                record.id.clone(),
+                tokio::spawn(serve_native_mqtts(listener, tls, max, count, shared)),
+            );
+            return Ok(());
+        }
+        let listener =
+            bind_listener(&record.bind, backlog).map_err(|e| format!("{}: {e}", record.bind))?;
+        let shared = self.shared.clone();
+        handles.insert(
+            record.id.clone(),
+            tokio::spawn(serve_native_mqtt(listener, max, count, shared)),
+        );
+        Ok(())
+    }
+
+    fn stop_listener(&self, id: &str) {
+        if let Some(handle) = self
+            .handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id)
+        {
+            handle.abort();
+        }
+        self.counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
+    }
+
+    fn connection_count(&self, id: &str) -> u64 {
+        self.counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+}
+
 /// Accepts MQTT clients and runs one task for each of them. A client
 /// above `max_connections` is closed at once.
-pub(super) async fn serve_native_mqtt(listener: TcpListener, max_connections: u32, shared: Shared) {
+pub(super) async fn serve_native_mqtt(
+    listener: TcpListener,
+    max_connections: Option<u32>,
+    count: Arc<AtomicU64>,
+    shared: Shared,
+) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -115,7 +235,7 @@ pub(super) async fn serve_native_mqtt(listener: TcpListener, max_connections: u3
                 continue;
             }
         };
-        let Some(slot) = ConnectionSlot::take(max_connections) else {
+        let Some(slot) = PerListenerSlot::take(&count, max_connections) else {
             debug!("Kernel MQTT listener is at its connection limit");
             continue;
         };
@@ -181,7 +301,8 @@ pub(super) fn load_tls_config(
 pub(super) async fn serve_native_mqtts(
     listener: TcpListener,
     config: Arc<rustls::ServerConfig>,
-    max_connections: u32,
+    max_connections: Option<u32>,
+    count: Arc<AtomicU64>,
     shared: Shared,
 ) {
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
@@ -194,7 +315,7 @@ pub(super) async fn serve_native_mqtts(
                 continue;
             }
         };
-        let Some(slot) = ConnectionSlot::take(max_connections) else {
+        let Some(slot) = PerListenerSlot::take(&count, max_connections) else {
             debug!("Kernel MQTT TLS listener is at its connection limit");
             continue;
         };

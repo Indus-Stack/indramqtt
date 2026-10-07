@@ -723,7 +723,7 @@ pub fn access_for_path(path: &str) -> PathAccess {
         "metrics" | "monitor" | "monitor_current" | "stats" | "alarms" | "trace" | "tracing"
         | "slow_subscriptions" | "telemetry" => PathAccess::Scope("monitoring"),
         "nodes" | "load_rebalance" | "node_eviction" => PathAccess::Scope("cluster_operations"),
-        "listeners" | "mqtt" | "data" => PathAccess::Scope("system"),
+        "listeners" | "listeners_status" | "mqtt" | "data" => PathAccess::Scope("system"),
         "audit" => PathAccess::Scope("audit"),
         "license" => PathAccess::Scope("license"),
         _ => PathAccess::Closed,

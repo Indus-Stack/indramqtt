@@ -2134,6 +2134,10 @@ mod tests {
                 });
             if let Some(listeners) = listeners {
                 state.listeners = Arc::new(listeners);
+                // Mirror the custom bind in the live store.
+                state
+                    .listener_store
+                    .reset_from_config(state.listeners.as_ref());
             }
             state
                 .operator_api_keys

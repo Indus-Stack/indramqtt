@@ -241,3 +241,19 @@ is not changed.
   blob response type. The broker serves the raw file bytes as
   `application/octet-stream`, so the checker reports a type error for
   this row.
+- `POST /listeners/{id}`, response 200. The specification has no such
+  operation (creates go to `POST /listeners`). The management console
+  sends creates there: `addListener` in the API module of the console
+  posts the full listener form to `/listeners/{id}`. The broker treats
+  it as a create with the path id, so the checker has no row for it.
+- `GET /listeners`, response 200. The specification declares no
+  top-level `current_connections` on list rows. The management console
+  reads it first: its listener table uses
+  `row.current_connections ?? row.status?.current_connections ?? 0`.
+  The broker returns the live count in both places, so the checker sees
+  one extra field and the table shows the count.
+- `POST /listeners` and `PUT /listeners/{id}`, request `bind`. The
+  specification types `bind` as a string with the numeric default
+  `1883`. The management console sends a bare port as a number. The
+  broker accepts a string or a number and stores the string form, so the
+  checker sees no error and the console create succeeds.

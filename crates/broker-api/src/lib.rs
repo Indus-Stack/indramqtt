@@ -283,7 +283,17 @@ pub struct ApiState {
     /// so `GET /api/v5/listeners` reports the running configuration.
     /// One `Arc` clone at boot; handlers clone at most five small rows per
     /// request. Management-plane only, never on the delivery path.
+    /// Superseded by [`listener_store`](Self::listener_store) for the v5
+    /// handlers, which need live running state; kept as the boot snapshot.
     pub listeners: Arc<broker_config::schema::ListenersConf>,
+    /// Live listener directory for the v5 listener routes (AP-02):
+    /// stored configuration plus the running flag and the socket
+    /// control the kernel installs at boot. The kernel shares its
+    /// instance (`crates/broker-node/src/main.rs`, boot plus the
+    /// `serve_api` share) so management writes reach the bound sockets
+    /// without a restart. One short lock per request; publish and
+    /// deliver never touch this store.
+    pub listener_store: Arc<crate::v5::listeners::ListenerStore>,
     /// Startup layer provenance for M1-05 `explain` (defaults, `indra.toml`,
     /// `conf.d` fragment, environment variable, flag). Set by the kernel
     /// boot path from the resolved [`broker_config::layers::LayeredConfig`];
@@ -565,6 +575,9 @@ impl ApiState {
             operator_api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
             license: Arc::new(crate::v5::license::LicenseState::new()),
             listeners: Arc::new(broker_config::schema::ListenersConf::default()),
+            listener_store: Arc::new(crate::v5::listeners::ListenerStore::from_config(
+                &broker_config::schema::ListenersConf::default(),
+            )),
             startup_config: Arc::new(std::sync::RwLock::new(None)),
             transformations,
             schema_registry: Arc::new(
@@ -666,6 +679,9 @@ impl ApiState {
             operator_api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
             license: Arc::new(crate::v5::license::LicenseState::new()),
             listeners: Arc::new(broker_config::schema::ListenersConf::default()),
+            listener_store: Arc::new(crate::v5::listeners::ListenerStore::from_config(
+                &broker_config::schema::ListenersConf::default(),
+            )),
             startup_config: Arc::new(std::sync::RwLock::new(None)),
             transformations: Arc::new(crate::v5::transformations::TransformChainStore::new()),
             schema_registry: Arc::new(crate::v5::schema_registry::SchemaRegistryStore::new()),
@@ -12455,24 +12471,37 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
-    async fn removed_listeners_routes_return_404() {
-        // M1-06 restores `GET /api/v5/listeners` on the real boot-captured
-        // listener configuration, so only the per-listener detail and
-        // stop routes stay removed here; list coverage lives with the
-        // listeners store tests.
+    async fn listeners_routes_answer_documented_shapes() {
+        // AP-02 restores the per-listener detail and lifecycle routes on
+        // the live listener store; list coverage lives with the store
+        // tests in `v5::listeners`.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let (status, body) = server.get_auth("/api/v5/listeners", &token).await;
         assert_eq!(status, 200, "kept route GET /api/v5/listeners must be 200");
         assert!(body.is_array(), "listeners list is an array: {body}");
-        for raw in [
-            "GET /api/v5/listeners/tcp:default HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nConnection: close\r\n\r\n",
-            "POST /api/v5/listeners/x/stop HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer TOKEN\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-        ] {
-            let raw = raw.replace("TOKEN", &token);
-            let (status, _) = server.request_raw(&raw).await;
-            assert_eq!(status, 404, "removed route must be 404: {raw}");
-        }
+        let (status, body) = server
+            .get_auth("/api/v5/listeners/tcp:default", &token)
+            .await;
+        assert_eq!(status, 200, "GET /api/v5/listeners/tcp:default must be 200");
+        assert_eq!(body["id"], serde_json::json!("tcp:default"));
+        let (status, body) = server.get_auth("/api/v5/listeners_status", &token).await;
+        assert_eq!(status, 200, "GET /api/v5/listeners_status must be 200");
+        assert!(body.is_array(), "listeners status is an array: {body}");
+        let (status, body) = server
+            .get_auth("/api/v5/listeners/tcp:missing", &token)
+            .await;
+        assert_eq!(status, 404, "unknown listener must be 404");
+        assert_eq!(body["code"], serde_json::json!("BAD_LISTENER_ID"));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/listeners/tcp:missing/stop",
+                serde_json::json!({}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "stop of unknown listener must be 400");
+        assert_eq!(body["code"], serde_json::json!("BAD_LISTENER_ID"));
     }
 
     #[tokio::test]

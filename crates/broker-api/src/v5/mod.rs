@@ -502,8 +502,26 @@ pub fn protected_router() -> Router<ApiState> {
         .route("/nodes/:node/metrics", get(monitoring::get_metrics_node))
         .route("/nodes/:node/stats", get(monitoring::get_stats_node))
         .route("/nodes/:node/clients/:clientid", get(clients::get_client))
-        // Listeners (M1-06): configured listener list on real boot state.
-        .route("/listeners", get(listeners::list_listeners))
+        // Listeners (AP-02): live listener inventory on the kernel
+        // listener store seeded from the boot configuration. Reads
+        // report stored configuration plus the running flag the kernel
+        // controls; lifecycle calls open and close kernel sockets.
+        // Management-plane only; publish and deliver never touch it.
+        .route(
+            "/listeners",
+            get(listeners::list_listeners).post(listeners::create_listener),
+        )
+        .route(
+            "/listeners/:id",
+            get(listeners::get_listener)
+                .put(listeners::update_listener)
+                .post(listeners::create_listener_with_id)
+                .delete(listeners::delete_listener),
+        )
+        .route("/listeners/:id/start", post(listeners::start_listener))
+        .route("/listeners/:id/stop", post(listeners::stop_listener))
+        .route("/listeners/:id/restart", post(listeners::restart_listener))
+        .route("/listeners_status", get(listeners::listeners_status))
         // Clients & Subscriptions
         .route("/clients", get(clients::list_clients))
         .route("/clients_v2", get(clients::list_clients))
