@@ -613,6 +613,22 @@ pub const MAX_OFFLINE_QUEUE: usize = 1024;
 /// unbounded memory-backed queue.
 pub const DEFAULT_MAX_OFFLINE_QUEUE: usize = 10_000;
 
+/// Encode an offline cap for the atomic store: 0 = unbounded, else the
+/// floored cap. Keeps the manager `Sync` without a lock on the queue
+/// path.
+fn encode_offline_cap(limit: Option<usize>) -> usize {
+    limit.map(|value| value.max(1)).unwrap_or(0)
+}
+
+/// Decode the atomic store back to a cap: 0 = unbounded.
+fn decode_offline_cap(raw: usize) -> Option<usize> {
+    if raw == 0 {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
 /// Maximum rows snapshotted by one global subscription listing (W1-14).
 /// The read clones at most this many `(client, filter)` rows under short
 /// session locks, sorted for a deterministic order, then the W0 paging
@@ -1814,8 +1830,10 @@ pub struct SessionManager {
     /// fan-in.
     connected_count: AtomicU64,
     /// Offline queue cap applied by [`SessionManager::queue_offline`];
-    /// `None` queues without bound.
-    max_offline_queue: Option<usize>,
+    /// 0 = unbounded (`None`), else the per-session cap. One relaxed
+    /// atomic load per detached-session queue op; the connected deliver
+    /// path never reads it.
+    max_offline_queue: AtomicUsize,
     /// Default QoS 1 window bound applied to sessions created after the
     /// last set (B4-01). One relaxed atomic load per new session; never
     /// touched on the publish fast path.
@@ -1902,7 +1920,7 @@ impl SessionManager {
             conn_counts: RwLock::new(HashMap::new()),
             buckets: RwLock::new(HashMap::new()),
             connected_count: AtomicU64::new(0),
-            max_offline_queue: max_offline_queue.map(|limit| limit.max(1)),
+            max_offline_queue: AtomicUsize::new(encode_offline_cap(max_offline_queue)),
             max_qos1_inflight: AtomicUsize::new(max_qos1_inflight.max(1)),
             max_qos1_spill: AtomicUsize::new(max_qos1_spill.max(1)),
             max_topic_alias: AtomicU16::new(DEFAULT_TOPIC_ALIAS_MAXIMUM),
@@ -1998,7 +2016,7 @@ impl SessionManager {
             self.apply_topic_alias_limits(&session);
             session.set_offline_store(Some(store.clone()));
             *session.connected.write() = false;
-            let dropped = session.push_restored_with_limit(messages, self.max_offline_queue);
+            let dropped = session.push_restored_with_limit(messages, self.max_offline_queue());
             stats.capped_dropped += dropped;
             if dropped > 0 {
                 let snapshot: Vec<OfflineRecord> = session
@@ -2036,7 +2054,15 @@ impl SessionManager {
 
     /// Configured offline queue cap (`None` = unbounded).
     pub fn max_offline_queue(&self) -> Option<usize> {
+        decode_offline_cap(self.max_offline_queue.load(Ordering::Relaxed))
+    }
+
+    /// Override the offline queue cap for sessions buffering afterwards
+    /// (floored at 1; `None` = unbounded). One relaxed atomic store;
+    /// sessions created afterwards queue under the new cap.
+    pub fn set_max_offline_queue(&self, limit: Option<usize>) {
         self.max_offline_queue
+            .store(encode_offline_cap(limit), Ordering::Relaxed);
     }
 
     /// Default QoS 1 window bound for sessions created after the last
@@ -2115,7 +2141,7 @@ impl SessionManager {
         message: QueuedMessage,
     ) -> bool {
         match self.get_in_tenant(tenant, client_id) {
-            Some(session) => session.push_offline_with_limit(message, self.max_offline_queue),
+            Some(session) => session.push_offline_with_limit(message, self.max_offline_queue()),
             None => false,
         }
     }

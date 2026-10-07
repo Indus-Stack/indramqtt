@@ -223,6 +223,10 @@ async fn apply_candidate(
     }
     let (connector_undo, pending_live) =
         apply_connectors_live(&state.engine, &previous, candidate).await;
+    // Default-zone knobs (AP-03): apply to the live session manager so a
+    // reload carrying kept knobs keeps bounding new sessions. The setters
+    // never fail; a later commit failure rolls them back below.
+    apply_zone_live(&state.sessions, &candidate.global_zone);
 
     // 3. Single whole commit: validate again, swap, version, persist.
     // A failure rolls every live owner back to the previous snapshot.
@@ -246,6 +250,7 @@ async fn apply_candidate(
             let _ = state.engine.apply_snapshot_conf(&previous.rules);
             let _ = state.admin_users.apply_snapshot_conf(&previous.admin_users);
             undo_connectors_live(&state.engine, &connector_undo);
+            apply_zone_live(&state.sessions, &previous.global_zone);
             let _ = ensure_history_truncated(&state.config, history_len_before);
             Err(Box::new(apply_failed(format!(
                 "config commit failed: {err}"
@@ -300,6 +305,9 @@ async fn apply_restore(
     }
     let (connector_undo, pending_live) =
         apply_connectors_live(&state.engine, &previous, &candidate).await;
+    // Default-zone knobs (AP-03): same live apply as a reload, with the
+    // same rollback when the restore fails to commit.
+    apply_zone_live(&state.sessions, &candidate.global_zone);
     match state.config.history_restore(id, actor) {
         Ok(version) => {
             state
@@ -317,6 +325,7 @@ async fn apply_restore(
             let _ = state.engine.apply_snapshot_conf(&previous.rules);
             let _ = state.admin_users.apply_snapshot_conf(&previous.admin_users);
             undo_connectors_live(&state.engine, &connector_undo);
+            apply_zone_live(&state.sessions, &previous.global_zone);
             Err(Box::new(apply_failed(format!(
                 "config commit failed: {err}"
             ))))
@@ -563,6 +572,18 @@ fn undo_connectors_live(engine: &broker_rules::RuleEngine, undo: &ConnectorLiveU
     for (id, sink) in &undo.removed {
         engine.connectors().register(id.clone(), Arc::clone(sink));
     }
+}
+
+/// Apply one snapshot's default-zone knobs to the live session manager
+/// (AP-03). New sessions inherit them. Infallible by construction: the
+/// setters floor and store only.
+fn apply_zone_live(
+    sessions: &Arc<broker_session::SessionManager>,
+    zone: &broker_config::GlobalZoneConf,
+) {
+    sessions.set_max_qos1_inflight(zone.max_inflight as usize);
+    sessions.set_max_offline_queue(zone.max_mqueue_len.map(|len| len as usize));
+    sessions.set_max_topic_alias(zone.max_topic_alias);
 }
 
 /// Reload the broker from a candidate snapshot: validate whole, show the

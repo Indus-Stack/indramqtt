@@ -2826,6 +2826,164 @@ impl RuleEngineConf {
     }
 }
 
+/// Longest stored cluster description (1024 chars). Reason: the console
+/// renders it in the cluster page header, and handlers clone it once per
+/// request; 1024 chars cover operator notes with headroom while keeping
+/// each read cheap.
+pub const MAX_CLUSTER_DESCRIPTION_LEN: usize = 1024;
+
+/// Cluster display root: operator text for the cluster page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ClusterMetaConf {
+    /// Free-form cluster description shown by `GET /cluster`.
+    #[serde(default)]
+    pub description: String,
+}
+
+impl ClusterMetaConf {
+    /// Validates the description length.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.description.len() > MAX_CLUSTER_DESCRIPTION_LEN {
+            return Err(ConfigError::Invalid(format!(
+                "cluster_meta.description holds {} bytes, at most {} (field `description`)",
+                self.description.len(),
+                MAX_CLUSTER_DESCRIPTION_LEN
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Default QoS 1 window applied to new sessions (100 unacked downlinks).
+/// Reason: matches the session default, so a fresh registry reads the
+/// same value the broker enforces.
+fn default_global_zone_max_inflight() -> u32 {
+    100
+}
+
+/// Default offline queue cap applied to new sessions (10 000 messages).
+/// Reason: matches the session default, so a fresh registry reads the
+/// same value the broker enforces.
+fn default_global_zone_max_mqueue_len() -> Option<u32> {
+    Some(10_000)
+}
+
+/// Default inbound topic-alias maximum (10 aliases). Reason: matches the
+/// session default, so a fresh registry reads the same value the broker
+/// advertises in CONNACK.
+fn default_global_zone_max_topic_alias() -> u16 {
+    10
+}
+
+/// Upper bound for the offline queue cap (10 000 000 messages). Reason:
+/// one detached session past this holds gigabytes of small frames, so
+/// larger values are rejected instead of growing without limit. Explicit
+/// `None` (infinity) stays an operator opt-in.
+pub const MAX_GLOBAL_ZONE_MQUEUE_LEN: u32 = 10_000_000;
+
+/// Write one offline cap. `None` writes as `infinity`.
+fn serialize_mqueue_len<S>(value: &Option<u32>, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(limit) => ser.serialize_u32(*limit),
+        None => ser.serialize_str("infinity"),
+    }
+}
+
+/// Read one offline cap. Accepts an integer or `infinity`.
+fn deserialize_mqueue_len<'de, D>(de: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, Unexpected, Visitor};
+    struct Cap;
+    impl<'de> Visitor<'de> for Cap {
+        type Value = Option<u32>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an integer or `infinity`")
+        }
+        fn visit_none<E: Error>(self) -> Result<Option<u32>, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: Error>(self) -> Result<Option<u32>, E> {
+            Ok(None)
+        }
+        fn visit_u64<E: Error>(self, value: u64) -> Result<Option<u32>, E> {
+            u32::try_from(value)
+                .map(Some)
+                .map_err(|_| Error::invalid_value(Unexpected::Unsigned(value), &self))
+        }
+        fn visit_i64<E: Error>(self, value: i64) -> Result<Option<u32>, E> {
+            u32::try_from(value)
+                .map(Some)
+                .map_err(|_| Error::invalid_value(Unexpected::Signed(value), &self))
+        }
+        fn visit_str<E: Error>(self, value: &str) -> Result<Option<u32>, E> {
+            if value == "infinity" {
+                return Ok(None);
+            }
+            Err(Error::invalid_value(Unexpected::Str(value), &self))
+        }
+        fn visit_string<E: Error>(self, value: String) -> Result<Option<u32>, E> {
+            self.visit_str(&value)
+        }
+    }
+    de.deserialize_any(Cap)
+}
+
+/// Default-zone MQTT knobs the broker enforces. Each field maps to a
+/// session limit applied at session creation; every other documented
+/// `global_zone` field has no broker setting and is omitted by the API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalZoneConf {
+    /// QoS 1 window for new sessions (1..=65535).
+    #[serde(default = "default_global_zone_max_inflight")]
+    pub max_inflight: u32,
+    /// Offline queue cap for new sessions (`None` = infinity).
+    #[serde(
+        default = "default_global_zone_max_mqueue_len",
+        serialize_with = "serialize_mqueue_len",
+        deserialize_with = "deserialize_mqueue_len"
+    )]
+    pub max_mqueue_len: Option<u32>,
+    /// Inbound topic-alias maximum for new sessions (0..=65535).
+    #[serde(default = "default_global_zone_max_topic_alias")]
+    pub max_topic_alias: u16,
+}
+
+impl Default for GlobalZoneConf {
+    fn default() -> Self {
+        Self {
+            max_inflight: default_global_zone_max_inflight(),
+            max_mqueue_len: default_global_zone_max_mqueue_len(),
+            max_topic_alias: default_global_zone_max_topic_alias(),
+        }
+    }
+}
+
+impl GlobalZoneConf {
+    /// Validates every bound; the first bad field names itself.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_inflight < 1 || self.max_inflight > 65_535 {
+            return Err(ConfigError::Invalid(format!(
+                "global_zone.max_inflight holds {}, must be 1..=65535 (field `max_inflight`)",
+                self.max_inflight
+            )));
+        }
+        if let Some(len) = self.max_mqueue_len {
+            if !(1..=MAX_GLOBAL_ZONE_MQUEUE_LEN).contains(&len) {
+                return Err(ConfigError::Invalid(format!(
+                    "global_zone.max_mqueue_len holds {len}, must be 1..={} or infinity (field `max_mqueue_len`)",
+                    MAX_GLOBAL_ZONE_MQUEUE_LEN
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The full validated configuration: all roots in one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FullSnapshot {
@@ -2863,6 +3021,12 @@ pub struct FullSnapshot {
     pub transformations: TransformationsConf,
     #[serde(default)]
     pub schemas: SchemasConf,
+    /// Cluster display text (AP-03).
+    #[serde(default)]
+    pub cluster_meta: ClusterMetaConf,
+    /// Default-zone MQTT knobs (AP-03).
+    #[serde(default)]
+    pub global_zone: GlobalZoneConf,
 }
 
 impl FullSnapshot {
@@ -2885,6 +3049,8 @@ impl FullSnapshot {
         self.rule_engine.validate()?;
         self.transformations.validate()?;
         self.schemas.validate()?;
+        self.cluster_meta.validate()?;
+        self.global_zone.validate()?;
         Ok(())
     }
 
@@ -2932,6 +3098,10 @@ pub enum ConfigRoot {
     Transformations(TransformationsConf),
     /// Validated schema registry root.
     Schemas(SchemasConf),
+    /// Validated cluster display root.
+    ClusterMeta(ClusterMetaConf),
+    /// Validated default-zone MQTT root.
+    GlobalZone(GlobalZoneConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3039,6 +3209,8 @@ impl ConfigRegistry {
             ConfigRoot::RuleEngine(conf) => self.commit_rule_engine(conf),
             ConfigRoot::Transformations(conf) => self.commit_transformations(conf),
             ConfigRoot::Schemas(conf) => self.commit_schemas(conf),
+            ConfigRoot::ClusterMeta(conf) => self.commit_cluster_meta(conf),
+            ConfigRoot::GlobalZone(conf) => self.commit_global_zone(conf),
         }
     }
 
@@ -3420,6 +3592,28 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits validated cluster display text.
+    pub fn commit_cluster_meta(&self, conf: ClusterMetaConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.cluster_meta = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Commits validated default-zone MQTT knobs.
+    pub fn commit_global_zone(&self, conf: GlobalZoneConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.global_zone = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Serialises the current snapshot to TOML and writes it atomically.
     ///
     /// The snapshot is written to a unique temp file in the same
@@ -3541,6 +3735,8 @@ mod tests {
             rule_engine: RuleEngineConf::default(),
             transformations: TransformationsConf::default(),
             schemas: SchemasConf::default(),
+            cluster_meta: ClusterMetaConf::default(),
+            global_zone: GlobalZoneConf::default(),
         }
     }
 
@@ -4058,5 +4254,49 @@ mod tests {
         let dir = unique_dir("defaults");
         let registry = ConfigRegistry::load(&dir).expect("missing file loads defaults");
         assert_eq!(*registry.snapshot(), FullSnapshot::default());
+    }
+
+    #[test]
+    fn cluster_and_zone_roots_validate_and_reject_bad_values() {
+        let dir = unique_dir("cluster-zone");
+        let registry = ConfigRegistry::load(&dir).expect("defaults load");
+        registry
+            .commit(ConfigRoot::ClusterMeta(ClusterMetaConf {
+                description: "one node".to_string(),
+            }))
+            .expect("short description commits");
+        assert_eq!(registry.snapshot().cluster_meta.description, "one node");
+        let long = "x".repeat(MAX_CLUSTER_DESCRIPTION_LEN + 1);
+        registry
+            .commit(ConfigRoot::ClusterMeta(ClusterMetaConf {
+                description: long,
+            }))
+            .expect_err("long description must fail");
+        registry
+            .commit(ConfigRoot::GlobalZone(GlobalZoneConf {
+                max_inflight: 64,
+                max_mqueue_len: None,
+                max_topic_alias: 5,
+            }))
+            .expect("valid zone commits");
+        let zone = registry.snapshot().global_zone.clone();
+        assert_eq!(zone.max_inflight, 64);
+        assert_eq!(zone.max_mqueue_len, None);
+        registry
+            .commit(ConfigRoot::GlobalZone(GlobalZoneConf {
+                max_inflight: 0,
+                max_mqueue_len: Some(10),
+                max_topic_alias: 5,
+            }))
+            .expect_err("zero inflight must fail");
+        registry
+            .commit(ConfigRoot::GlobalZone(GlobalZoneConf {
+                max_inflight: 64,
+                max_mqueue_len: Some(0),
+                max_topic_alias: 5,
+            }))
+            .expect_err("zero queue cap must fail");
+        // A refused commit leaves the kept knobs untouched.
+        assert_eq!(registry.snapshot().global_zone.max_inflight, 64);
     }
 }

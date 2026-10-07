@@ -283,3 +283,9 @@ is not changed.
   editing. The broker accepts `source` or `schema` on write and
   returns both (`source` as text, `schema` parsed), so the checker
   validates the documented field and historic bodies keep working.
+- `PUT /configs`, request body. The specification declares `text/plain`
+  (a configuration text). The management console sends JSON:
+  `putConfigs` in the API module of the console puts the object with
+  `Content-Type: application/json`. The broker accepts a JSON object
+  keyed by root, so the checker sends JSON and the console write
+  succeeds.

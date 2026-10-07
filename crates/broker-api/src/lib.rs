@@ -15945,11 +15945,22 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn removed_system_fake_routes_return_404() {
+        // AP-03 restores `GET /api/v5/configs` on the real registry.
+        // It answers 200 with each routed root. Management-plane only.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in ["/api/v5/configs"] {
-            let (status, _) = server.get_auth(path, &token).await;
-            assert_eq!(status, 404, "removed route {path} must be 404");
+        let (status, body) = server.get_auth("/api/v5/configs", &token).await;
+        assert_eq!(status, 200, "restored route /api/v5/configs must be 200");
+        for root in [
+            "broker",
+            "log",
+            "sysmon",
+            "sys_topics",
+            "alarm",
+            "dashboard",
+            "global_zone",
+        ] {
+            assert!(body.get(root).is_some(), "root {root} is present");
         }
     }
 
@@ -16861,9 +16872,20 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn removed_cluster_inflight_routes_return_404() {
+        // AP-03 restores `GET /api/v5/cluster` on the real registry.
+        // It answers 200 with the local view. Management-plane only.
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in ["/api/v5/cluster", "/api/v5/clients/any/inflight_messages"] {
+        let (status, body) = server.get_auth("/api/v5/cluster", &token).await;
+        assert_eq!(
+            status, 200,
+            "restored route GET /api/v5/cluster must be 200"
+        );
+        assert!(body["name"].is_string(), "cluster view carries a name");
+        assert!(body["nodes"].is_array(), "cluster view carries nodes");
+        assert!(body["self"].is_string(), "cluster view carries self");
+        assert!(body["description"].is_string(), "cluster view carries text");
+        for path in ["/api/v5/clients/any/inflight_messages"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route GET {path} must be 404");
         }

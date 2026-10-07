@@ -9269,6 +9269,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // kept schemas from the first connection. An empty snapshot is a
     // no-op (empty reads as an empty page).
     shared.schema_registry.seed_from_registry(&shared.config);
+    // Default-zone MQTT knobs (AP-03): apply the kept snapshot to
+    // the live session manager, so kept values bound new sessions from
+    // the first connection. A fresh registry holds defaults, so skip it
+    // and keep the layered session config (file and `INDRA_` vars).
+    {
+        let zone = shared.config.snapshot().global_zone.clone();
+        if zone != broker_config::GlobalZoneConf::default() {
+            shared
+                .sessions
+                .set_max_qos1_inflight(zone.max_inflight as usize);
+            shared
+                .sessions
+                .set_max_offline_queue(zone.max_mqueue_len.map(|len| len as usize));
+            shared.sessions.set_max_topic_alias(zone.max_topic_alias);
+        }
+    }
     // Rule spill buffer (B4-07): opt-in via `rules_engine.spill_dir`, before
     // the rules seed so the restored rules land in the engine that will
     // serve them. Empty keeps today's memory-only `DropOldest` input.
@@ -9700,6 +9716,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.api_bind.is_empty() {
         let listener = tokio::net::TcpListener::bind(&args.api_bind).await?;
         info!("Management API listening on {}", args.api_bind);
+        // Cluster text (AP-03): name the kept description once at boot,
+        // so operators confirm the cluster identity in the log.
+        let kept = shared.config.snapshot().cluster_meta.description.clone();
+        if !kept.is_empty() {
+            info!("Cluster description: {}", kept);
+        }
         // SY-02: assign the resolved listeners and startup provenance so
         // `GET /listeners` and `explain` report the running configuration
         // instead of defaults. The api row reports the bound address: the

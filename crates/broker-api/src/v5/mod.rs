@@ -19,6 +19,8 @@ pub mod auto_subscribe;
 pub mod backup;
 pub mod banned;
 pub mod clients;
+pub mod cluster;
+pub mod configs;
 pub mod data;
 pub mod empty_states;
 pub mod error_codes;
@@ -498,6 +500,49 @@ pub fn protected_router() -> Router<ApiState> {
         .route("/trace/:name/log", get(trace::get_trace_log))
         .route("/trace/:name/log_detail", get(trace::get_trace_log_detail))
         // Cluster & Nodes
+        // Cluster view (AP-03): single-node name, nodes and self plus
+        // the stored operator description, with a validated description
+        // replace and a core-only topology. Management-plane only;
+        // publish and deliver never touch this root.
+        .route(
+            "/cluster",
+            get(cluster::get_cluster).put(cluster::put_cluster),
+        )
+        .route("/cluster/topology", get(cluster::get_topology))
+        // Configuration groups (AP-03): generic key read plus merge or
+        // replace, the live default-zone knobs, one honest read per
+        // remaining documented root, and a reset to defaults.
+        // Management-plane only; publish and deliver never touch it.
+        .route(
+            "/configs",
+            get(configs::get_configs).put(configs::put_configs),
+        )
+        .route(
+            "/configs/global_zone",
+            get(configs::get_global_zone).put(configs::put_global_zone),
+        )
+        .route(
+            "/configs/broker",
+            get(configs::get_broker).put(configs::put_broker),
+        )
+        .route("/configs/log", get(configs::get_log).put(configs::put_log))
+        .route(
+            "/configs/sysmon",
+            get(configs::get_sysmon).put(configs::put_sysmon),
+        )
+        .route(
+            "/configs/sys_topics",
+            get(configs::get_sys_topics).put(configs::put_sys_topics),
+        )
+        .route(
+            "/configs/alarm",
+            get(configs::get_alarm).put(configs::put_alarm),
+        )
+        .route(
+            "/configs/dashboard",
+            get(configs::get_dashboard).put(configs::put_dashboard),
+        )
+        .route("/configs_reset/:rootname", post(configs::post_reset))
         .route("/nodes", get(nodes::list_nodes))
         .route("/nodes/:node", get(nodes::get_node))
         .route("/nodes/:node/metrics", get(monitoring::get_metrics_node))
