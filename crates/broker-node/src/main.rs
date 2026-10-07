@@ -9,6 +9,7 @@ use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
 };
 use broker_config::{CliOverrides, ConfigError, ConfigRegistry, LayeredConfig};
+use broker_delayed::{DelayedEntry, DelayedScheduler, DEFAULT_MAX_DELAYED_SECS, DELAYED_TICK_MS};
 use broker_gateway::coap::{CoapCode, CoapGatewayHandler, CoapMessage};
 use broker_observability::{Metrics, NodeReadiness, StatsStore};
 use broker_protocol::{v5 as protocol_v5, QoS, Topic, TopicFilter};
@@ -26,11 +27,9 @@ use broker_storage::{MemoryStore, RetainedStore};
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
 use clap::Parser;
-use delayed::{DelayedEntry, DelayedScheduler, DEFAULT_MAX_DELAYED_SECS, DELAYED_TICK_MS};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-mod delayed;
 /// Shared JWKS fixtures (B5-02): single-sourced in
 /// `crates/broker-auth/src/jwks_test_support.rs` (test-only in both crates),
 /// included here with `#[path]` so there is one copy of the
@@ -3334,7 +3333,7 @@ struct Shared {
     /// driver task. Measured before/after rates print in
     /// `delayed_delivery_workload_timings`. Bounded by the pending cap
     /// and the per-message
-    /// payload cap documented in `delayed.rs`.
+    /// payload cap documented in `broker-delayed`.
     delayed: Arc<DelayedScheduler>,
     /// Slow-subscription recorder for F1-03 (T-73): bounded ranked table
     /// shared with the management API so the egress hook and `GET/DELETE
@@ -5972,12 +5971,16 @@ async fn apply_publish(
     }
 
     // Delayed delivery: ack now (the publisher must not stall), defer
-    // everything else past the timer.
-    if let Some((delay_secs, inner)) = strip_delayed_prefix(&topic_str) {
-        return apply_delayed_publish(
-            frame, shared, delay_secs, inner, qos, retain, packet_id, tenant,
-        )
-        .await;
+    // everything else past the timer. Gated on the runtime switch: one
+    // relaxed load; while off the marker routes as a normal topic and
+    // nothing new is queued.
+    if shared.delayed.is_enabled() {
+        if let Some((delay_secs, inner)) = strip_delayed_prefix(&topic_str) {
+            return apply_delayed_publish(
+                frame, shared, delay_secs, inner, qos, retain, packet_id, tenant,
+            )
+            .await;
+        }
     }
 
     // B4-06 fail-closed: snapshot the durable offline persist-failure
@@ -6044,7 +6047,7 @@ async fn apply_publish(
 /// an over-limit delay, an oversized payload or a full backlog drops the
 /// message with a warning and a counter (it could never be delivered
 /// correctly). The entry is recorded in the wheel and in
-/// `<data-dir>/delayed.jsonl` (see `delayed.rs`) before the ack is
+/// `<data-dir>/delayed.jsonl` (see `broker-delayed`) before the ack is
 /// returned, so the publisher is never stalled past the timer and a
 /// restart keeps the entry on schedule.
 #[allow(clippy::too_many_arguments)]
@@ -6128,11 +6131,26 @@ async fn apply_delayed_publish(
     let entry = DelayedEntry {
         id: shared.delayed.next_id(),
         deliver_at_ms: now_ms.saturating_add(delay_secs.saturating_mul(1_000)),
+        publish_at_ms: now_ms,
         topic: inner.to_string(),
         qos: qos as u8,
         retain,
         payload: frame.payload.to_vec(),
         publisher: shared.sessions.client_id_for_conn(frame.header.conn_id),
+        // The list shows the name the session carried at schedule
+        // time; anonymous sessions read as unknown, never as another
+        // user. One short lock, delayed path only.
+        username: shared
+            .sessions
+            .session_for_conn(frame.header.conn_id)
+            .or_else(|| {
+                shared
+                    .sessions
+                    .client_id_for_conn(frame.header.conn_id)
+                    .as_deref()
+                    .and_then(|id| shared.sessions.get(id))
+            })
+            .and_then(|session| session.username.read().clone()),
         // The publisher's tenant rides into the deferred pipeline (MT-02):
         // fan-out after the timer stays inside the same tenant.
         publisher_tenant: publisher_tenant.to_string(),
@@ -6257,90 +6275,97 @@ async fn apply_qos2_pubrel(
     // must not stall past the timer. The entry is recorded on the shared
     // wheel and in `<data-dir>/delayed.jsonl` before the PUBCOMP is
     // returned; the driver delivers it through the normal pipeline.
-    if let Some((delay_secs, inner)) = strip_delayed_prefix(stored.topic.as_str()) {
-        let comp = qos2_reply(OpCode::PubCompOut, frame, packet_id);
-        let Ok(inner_topic) = Topic::new(inner.to_string()) else {
-            shared.delayed.note_malformed();
-            warn!("Dropping delayed QoS 2 publish with bad inner topic");
-            return (comp, Vec::new());
-        };
-        if delay_secs == 0 {
-            // B4-02: the QoS 2 publisher id is the PUBREL sender, so the
-            // deferred fan-out hashes the same key as immediate delivery.
-            let deliveries = ingress_pipeline_with_publisher(
-                shared,
-                &inner_topic,
-                QoS::ExactlyOnce,
-                stored.retain,
-                &stored.payload,
-                Some(client_id.as_str()),
-                &publisher_tenant,
-            )
-            .await;
-            forward_cluster(
-                shared,
-                &inner_topic,
-                QoS::ExactlyOnce,
-                &stored.payload,
-                &publisher_tenant,
-            )
-            .await;
-            let persist_failed = offline_persist_failed_before.is_some_and(|before| {
-                shared
-                    .sessions
-                    .offline_store()
-                    .map(|s| s.persist_failed() > before)
-                    .unwrap_or(false)
-            });
-            if persist_failed {
+    // Gated on the runtime switch like the QoS 0/1 branch above.
+    if shared.delayed.is_enabled() {
+        if let Some((delay_secs, inner)) = strip_delayed_prefix(stored.topic.as_str()) {
+            let comp = qos2_reply(OpCode::PubCompOut, frame, packet_id);
+            let Ok(inner_topic) = Topic::new(inner.to_string()) else {
+                shared.delayed.note_malformed();
+                warn!("Dropping delayed QoS 2 publish with bad inner topic");
+                return (comp, Vec::new());
+            };
+            if delay_secs == 0 {
+                // B4-02: the QoS 2 publisher id is the PUBREL sender, so the
+                // deferred fan-out hashes the same key as immediate delivery.
+                let deliveries = ingress_pipeline_with_publisher(
+                    shared,
+                    &inner_topic,
+                    QoS::ExactlyOnce,
+                    stored.retain,
+                    &stored.payload,
+                    Some(client_id.as_str()),
+                    &publisher_tenant,
+                )
+                .await;
+                forward_cluster(
+                    shared,
+                    &inner_topic,
+                    QoS::ExactlyOnce,
+                    &stored.payload,
+                    &publisher_tenant,
+                )
+                .await;
+                let persist_failed = offline_persist_failed_before.is_some_and(|before| {
+                    shared
+                        .sessions
+                        .offline_store()
+                        .map(|s| s.persist_failed() > before)
+                        .unwrap_or(false)
+                });
+                if persist_failed {
+                    warn!(
+                        "Offline queue persist failed: withholding QoS 2 PUBCOMP so the publisher retries"
+                    );
+                    // Restore the taken entry so the retried PUBREL re-routes
+                    // instead of hitting the unknown-id fast path. The
+                    // original delayed topic is kept so the retry defers again.
+                    // Cloned (failure path only): avoids moving `stored` while
+                    // the delayed prefix borrow is live.
+                    let _ = session.store_qos2_inbound(
+                        packet_id,
+                        Qos2InboundEntry {
+                            topic: stored.topic.clone(),
+                            retain: stored.retain,
+                            payload: stored.payload.clone(),
+                        },
+                    );
+                    return (None, deliveries);
+                }
+                return (comp, deliveries);
+            }
+            let max_secs = shared.delayed.max_secs();
+            if delay_secs > max_secs {
                 warn!(
-                    "Offline queue persist failed: withholding QoS 2 PUBCOMP so the publisher retries"
+                    "Dropping delayed QoS 2 publish: {}s exceeds the {}s cap",
+                    delay_secs, max_secs
                 );
-                // Restore the taken entry so the retried PUBREL re-routes
-                // instead of hitting the unknown-id fast path. The
-                // original delayed topic is kept so the retry defers again.
-                // Cloned (failure path only): avoids moving `stored` while
-                // the delayed prefix borrow is live.
-                let _ = session.store_qos2_inbound(
-                    packet_id,
-                    Qos2InboundEntry {
-                        topic: stored.topic.clone(),
-                        retain: stored.retain,
-                        payload: stored.payload.clone(),
-                    },
-                );
-                return (None, deliveries);
             }
-            return (comp, deliveries);
-        }
-        let max_secs = shared.delayed.max_secs();
-        if delay_secs > max_secs {
-            warn!(
-                "Dropping delayed QoS 2 publish: {}s exceeds the {}s cap",
-                delay_secs, max_secs
-            );
-        }
-        let entry = DelayedEntry {
-            id: shared.delayed.next_id(),
-            deliver_at_ms: broker_storage::now_ms()
-                .saturating_add(delay_secs.saturating_mul(1_000)),
-            topic: inner.to_string(),
-            qos: QoS::ExactlyOnce as u8,
-            retain: stored.retain,
-            payload: stored.payload.to_vec(),
-            publisher: Some(client_id.clone()),
-            // The publisher's tenant rides into the deferred pipeline:
-            // fan-out after the timer stays inside the same tenant.
-            publisher_tenant: publisher_tenant.clone(),
-        };
-        if let Err(e) = shared.delayed.persist_and_schedule(entry, delay_secs) {
-            // The scheduler already bumped the matching drop counter;
-            // warn here so the drop is visible in the log like before.
-            if delay_secs <= max_secs {
-                warn!("Dropping delayed QoS 2 publish: {:?}", e);
+            let now_ms = broker_storage::now_ms();
+            let entry = DelayedEntry {
+                id: shared.delayed.next_id(),
+                deliver_at_ms: now_ms.saturating_add(delay_secs.saturating_mul(1_000)),
+                publish_at_ms: now_ms,
+                topic: inner.to_string(),
+                qos: QoS::ExactlyOnce as u8,
+                retain: stored.retain,
+                payload: stored.payload.to_vec(),
+                publisher: Some(client_id.clone()),
+                // The list shows the name the owning session carried; the
+                // QoS 2 phase already holds the session, so no new lookup.
+                username: session.username.read().clone(),
+                // The publisher's tenant rides into the deferred pipeline:
+                // fan-out after the timer stays inside the same tenant.
+                publisher_tenant: publisher_tenant.clone(),
+            };
+            if let Err(e) = shared.delayed.persist_and_schedule(entry, delay_secs) {
+                // The scheduler already bumped the matching drop counter;
+                // warn here so the drop is visible in the log like before.
+                if delay_secs <= max_secs {
+                    warn!("Dropping delayed QoS 2 publish: {:?}", e);
+                }
             }
+            return (comp, Vec::new());
         }
-        return (comp, Vec::new());
     }
     // B4-02: QoS 2 second phase hashes the original publisher id.
     let deliveries = ingress_pipeline_with_publisher(
@@ -8817,6 +8842,12 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // writes are visible to the connect hook without a restart.
     // One Arc clone; reads take a short lock and clone at most 20 rows.
     state.auto_subscribe = shared.auto_subscribe.clone();
+    // Share the delayed scheduler (AP-04) so the list, detail and
+    // removal routes observe the same wheel the publish path schedules
+    // on and the driver fires from. One `Arc` clone; management reads
+    // take one short wheel lock per request and the publish path pays
+    // one atomic load for the switch.
+    state.delayed = shared.delayed.clone();
     // Share the ban directory (B1-03) so validated management writes
     // are enforced by the connect and publish checks without a restart.
     // One Arc clone; checks take a short read lock, never a write.
@@ -19835,10 +19866,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_message_lists_and_removal_stops_delivery() {
+        // AP-04: a client-published delayed message waits on the shared
+        // scheduler (the management list reads it there), and removing
+        // it stops the delivery while other entries still fire.
+        let shared = test_shared();
+        let (session, _) = shared.sessions.get_or_create("ap04-pub", true);
+        *session.conn_id.write() = Some(941);
+        *session.username.write() = Some("ap04-user".to_string());
+
+        let (meta, payload) = encode_publish_meta("$delayed/600/ap04/one", 0, 0, false, b"one");
+        let (ack, deliveries) = apply_publish(&publish_frame(941, 1, meta, payload), &shared).await;
+        assert!(ack.is_none());
+        assert!(deliveries.is_empty());
+        let (meta, payload) = encode_publish_meta("$delayed/600/ap04/two", 0, 0, false, b"two");
+        let (_, deliveries) = apply_publish(&publish_frame(941, 2, meta, payload), &shared).await;
+        assert!(deliveries.is_empty());
+
+        // Both publishes wait on the scheduler with client and user names.
+        let waiting = shared.delayed.snapshot();
+        assert_eq!(waiting.len(), 2);
+        for entry in &waiting {
+            assert!(entry.topic.starts_with("ap04/"));
+            assert_eq!(entry.publisher.as_deref(), Some("ap04-pub"));
+            assert_eq!(entry.username.as_deref(), Some("ap04-user"));
+        }
+
+        // A due entry that is removed never fires; a kept one does.
+        let now = broker_storage::now_ms();
+        let gone = DelayedEntry {
+            id: shared.delayed.next_id(),
+            deliver_at_ms: now.saturating_sub(1_000),
+            publish_at_ms: now.saturating_sub(61_000),
+            topic: "ap04/gone".to_string(),
+            qos: 0,
+            retain: false,
+            payload: b"x".to_vec(),
+            publisher: None,
+            username: None,
+            publisher_tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
+        };
+        let gone_id = gone.id;
+        shared
+            .delayed
+            .persist_and_schedule(gone, 60)
+            .expect("due entry queues");
+        let kept = DelayedEntry {
+            id: shared.delayed.next_id(),
+            deliver_at_ms: now.saturating_sub(1_000),
+            publish_at_ms: now.saturating_sub(61_000),
+            topic: "ap04/kept".to_string(),
+            qos: 0,
+            retain: false,
+            payload: b"x".to_vec(),
+            publisher: None,
+            username: None,
+            publisher_tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
+        };
+        let kept_id = kept.id;
+        shared
+            .delayed
+            .persist_and_schedule(kept, 60)
+            .expect("due entry queues");
+        assert!(shared.delayed.remove_one(gone_id));
+        assert!(!shared.delayed.remove_one(gone_id));
+        let due = shared.delayed.tick_due();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, kept_id);
+        // The two published entries still wait with 600 s deadlines.
+        assert_eq!(shared.delayed.snapshot().len(), 2);
+    }
+
+    #[tokio::test]
     async fn delayed_publish_survives_restart_from_same_dir() {
         // Persistence lives behind the wheel in `<data-dir>/delayed.jsonl`
         // (written by `DelayedScheduler::persist_and_schedule` in
-        // `delayed.rs`, consulted by `DelayedScheduler::load`): the
+        // `broker-delayed`, consulted by `DelayedScheduler::load`): the
         // publish event drives the write, the boot path drives the
         // reload, and the driver delivers on schedule afterwards.
         let dir = unique_data_dir();
@@ -19971,7 +20074,7 @@ mod tests {
         // assert; counts are CI sample sizes, not SLOs. On-time behaviour
         // (requested vs actual delay) and pending memory (wheel depth,
         // persisted file bytes) print alongside. Publish-path cost prose
-        // lives in `delayed.rs`; this test is the measured numbers behind
+        // lives in `broker-delayed`; this test is the measured numbers behind
         // it.
         let shared = test_shared();
         let (tx_base, _rx_base) = tokio::sync::mpsc::unbounded_channel();

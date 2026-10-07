@@ -1,0 +1,27 @@
+[
+  {
+    "operation": "GET /mqtt/topic_rewrite",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /mqtt/topic_rewrite",
+    "path_params": {},
+    "query": {},
+    "body": [
+      {
+        "action": "publish",
+        "source_topic": "conf/rw/#",
+        "dest_topic": "rewritten/$1",
+        "re": "^conf/rw/(.*)$"
+      }
+    ],
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  }
+]

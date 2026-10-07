@@ -12,6 +12,7 @@ members = [
     "crates/broker-connectors-enterprise",
     "crates/broker-cluster",
     "crates/broker-api",
+    "crates/broker-delayed",
     "crates/broker-observability",
     "crates/broker-node",
     "crates/broker-gateway",
@@ -78,6 +79,7 @@ broker-connectors = { path = "crates/broker-connectors" }
 broker-connectors-enterprise = { path = "crates/broker-connectors-enterprise" }
 broker-cluster = { path = "crates/broker-cluster" }
 broker-api = { path = "crates/broker-api" }
+broker-delayed = { path = "crates/broker-delayed" }
 broker-observability = { path = "crates/broker-observability" }
 broker-gateway = { path = "crates/broker-gateway" }
 broker-config = { path = "crates/broker-config" }

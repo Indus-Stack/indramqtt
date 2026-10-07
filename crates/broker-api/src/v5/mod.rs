@@ -22,6 +22,7 @@ pub mod clients;
 pub mod cluster;
 pub mod configs;
 pub mod data;
+pub mod delayed;
 pub mod empty_states;
 pub mod error_codes;
 pub mod features;
@@ -33,6 +34,7 @@ pub mod monitor;
 pub mod monitoring;
 pub mod nodes;
 pub mod retainer;
+pub mod rewrite;
 pub mod rule_engine;
 pub mod rule_events;
 pub mod rule_test;
@@ -43,6 +45,7 @@ pub mod slow_subscriptions;
 pub mod sources;
 pub mod sso;
 pub mod status;
+pub mod topic_metrics;
 pub mod trace;
 pub mod tracing;
 pub mod transformations;
@@ -473,6 +476,53 @@ pub fn protected_router() -> Router<ApiState> {
         .route(
             "/mqtt/retainer/messages",
             get(retainer::list_retainer_messages).delete(retainer::clear_retainer_messages),
+        )
+        // Delayed messages (AP-04): switch plus pending cap, paged
+        // list, single detail read and two removals, all on the shared
+        // scheduler the kernel fires from. Management-plane only; the
+        // publish path pays one atomic load for the switch.
+        .route(
+            "/mqtt/delayed",
+            get(delayed::get_delayed_config).put(delayed::put_delayed_config),
+        )
+        .route(
+            "/mqtt/delayed/messages",
+            get(delayed::list_delayed_messages),
+        )
+        .route(
+            "/mqtt/delayed/messages/:node/:msgid",
+            get(delayed::get_delayed_message).delete(delayed::delete_delayed_message),
+        )
+        .route(
+            "/mqtt/delayed/messages/:topic",
+            delete(delayed::delete_delayed_by_topic),
+        )
+        // Topic rewrite (AP-04): ordered list plus validated full
+        // replacement on the shared router the kernel rewrites with.
+        // Management-plane only; the publish path takes the same short
+        // rule lock it already took.
+        .route(
+            "/mqtt/topic_rewrite",
+            get(rewrite::list_rewrites).put(rewrite::put_rewrites),
+        )
+        // Topic-metric collections (AP-04): honest empty states. The
+        // broker keeps no per-filter counters: the list reads empty,
+        // single reads miss, creates and resets fail, and the bulk
+        // delete reports success. Management-plane only; nothing runs
+        // on the publish path.
+        .route(
+            "/mqtt/topic_metrics2",
+            get(topic_metrics::list_collections)
+                .post(topic_metrics::create_collection)
+                .delete(topic_metrics::delete_all_collections),
+        )
+        .route(
+            "/mqtt/topic_metrics2/:name",
+            get(topic_metrics::get_collection).delete(topic_metrics::delete_collection),
+        )
+        .route(
+            "/mqtt/topic_metrics2/:name/reset",
+            put(topic_metrics::reset_collection),
         )
         .route(
             "/slow_subscriptions",

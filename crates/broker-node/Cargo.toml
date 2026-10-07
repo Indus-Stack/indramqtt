@@ -38,6 +38,7 @@ broker-rules-enterprise = { workspace = true }
 broker-connectors = { workspace = true }
 broker-cluster = { workspace = true }
 broker-api = { workspace = true }
+broker-delayed = { workspace = true }
 broker-observability = { workspace = true }
 broker-gateway = { workspace = true }
 bytes = { workspace = true }

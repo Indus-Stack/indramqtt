@@ -1,0 +1,13 @@
+[package]
+name = "broker-delayed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+broker-session = { workspace = true }
+parking_lot = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+tracing = { workspace = true }

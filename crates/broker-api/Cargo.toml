@@ -15,6 +15,7 @@ broker-router = { workspace = true }
 broker-observability = { workspace = true }
 broker-auth = { workspace = true }
 broker-config = { workspace = true }
+broker-delayed = { workspace = true }
 brokerlink = { workspace = true }
 broker-connectors = { workspace = true }
 broker-connectors-enterprise = { workspace = true }

@@ -1191,6 +1191,7 @@ dependencies = [
  "broker-config",
  "broker-connectors",
  "broker-connectors-enterprise",
+ "broker-delayed",
  "broker-gateway",
  "broker-observability",
  "broker-protocol",
@@ -1416,6 +1417,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "broker-delayed"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "broker-session",
+ "parking_lot",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "broker-gateway"
 version = "0.1.0"
 dependencies = [
@@ -1445,6 +1457,7 @@ dependencies = [
  "broker-cluster",
  "broker-config",
  "broker-connectors",
+ "broker-delayed",
  "broker-gateway",
  "broker-observability",
  "broker-protocol",

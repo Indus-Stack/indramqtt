@@ -125,6 +125,13 @@ pub struct ApiState {
     /// routes read one bounded snapshot per request; the kernel hook
     /// clones the same capped list once per bind, never per message.
     pub auto_subscribe: Arc<crate::v5::auto_subscribe::AutoSubscribeStore>,
+    /// Delayed-publish scheduler for the `/api/v5/mqtt/delayed` routes
+    /// (AP-04): the same wheel the kernel schedules `$delayed/`
+    /// publishes on and fires from. Management reads snapshot the wheel
+    /// under one short lock; removals drop the wheel row and the file
+    /// row together so a removed entry never fires. Management-plane
+    /// only; the publish path pays one atomic load for the switch.
+    pub delayed: Arc<broker_delayed::DelayedScheduler>,
     /// Licence request/install/status store for B2-04: cluster identity,
     /// stored token and trusted signing set. Management-plane only; never
     /// touched on the per-message path.
@@ -558,6 +565,7 @@ impl ApiState {
             tracing: Arc::new(crate::v5::tracing::TracingFlagStore::new()),
             traces: Arc::new(crate::v5::trace::TraceStore::new()),
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
+            delayed: Arc::new(broker_delayed::DelayedScheduler::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
             authn_chain,
             authn_node_cache,
@@ -662,6 +670,7 @@ impl ApiState {
             tracing: Arc::new(crate::v5::tracing::TracingFlagStore::new()),
             traces: Arc::new(crate::v5::trace::TraceStore::new()),
             auto_subscribe: Arc::new(crate::v5::auto_subscribe::AutoSubscribeStore::new()),
+            delayed: Arc::new(broker_delayed::DelayedScheduler::new()),
             licence: Arc::new(crate::licence::LicenceStore::new()),
             authn_chain: Arc::new(broker_auth::AuthnChain::new()),
             authn_node_cache,
@@ -15925,17 +15934,25 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn removed_unsupported_retained_routes_return_404() {
+        // AP-04 restores `GET /api/v5/mqtt/delayed/messages` on the real
+        // scheduler, so it leaves the removed list here: it answers 200
+        // with the documented page. The remaining paths stay removed.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         for path in [
             "/api/v5/mqtt/retained",
-            "/api/v5/mqtt/delayed/messages",
             "/api/v5/configs/a2a_registry",
             "/api/v5/indra/extra_features",
         ] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }
+        let (status, body) = server
+            .get_auth("/api/v5/mqtt/delayed/messages", &token)
+            .await;
+        assert_eq!(status, 200, "restored delayed list must be 200");
+        assert!(body.get("data").and_then(|v| v.as_array()).is_some());
+        assert_eq!(body["meta"]["count"], serde_json::json!(0));
         let (status, _) = server.delete_auth("/api/v5/mqtt/retained", &token).await;
         assert_eq!(
             status, 404,
@@ -15962,6 +15979,161 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         ] {
             assert!(body.get(root).is_some(), "root {root} is present");
         }
+    }
+
+    #[tokio::test]
+    async fn mqtt_group_delayed_rewrite_topicmetrics_over_http() {
+        // AP-04 failing test: the `/mqtt` group answers the documented
+        // shapes through the served management API. Before: delayed
+        // routes 404, rewrite routes 404, topic-metrics v2 routes 404.
+        // Broker-through: delayed reads run on the shared scheduler,
+        // rewrite reads and writes run on the shared router, and the
+        // honest-empty collection routes store nothing.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Delayed switch plus cap: read defaults, write, read back.
+        let (status, before) = server.get_auth("/api/v5/mqtt/delayed", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(before["enable"], json!(true));
+        assert!(before["max_delayed_messages"].as_u64().is_some());
+        let (status, after) = server
+            .put_auth(
+                "/api/v5/mqtt/delayed",
+                json!({"enable": false, "max_delayed_messages": 7}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "delayed update: {after}");
+        assert_eq!(after["enable"], json!(false));
+        assert_eq!(after["max_delayed_messages"], json!(7));
+        let (status, reread) = server.get_auth("/api/v5/mqtt/delayed", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(reread, after);
+        // Bad switch and cap values fail without applying.
+        for bad in [
+            json!({"enable": "yes"}),
+            json!({"max_delayed_messages": -1}),
+            json!({"max_delayed_messages": 1_000_001}),
+            json!("enable"),
+        ] {
+            let (status, err) = server.put_auth("/api/v5/mqtt/delayed", bad, &token).await;
+            assert_eq!(status, 400, "bad delayed write must fail: {err}");
+            assert_eq!(err["code"], json!("BAD_REQUEST"));
+        }
+        let (status, kept) = server.get_auth("/api/v5/mqtt/delayed", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(kept, after, "failed writes must not apply");
+
+        // Empty delayed list reads as an empty page with the meta.
+        let (status, empty) = server
+            .get_auth("/api/v5/mqtt/delayed/messages", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(empty["data"], json!([]));
+        assert_eq!(empty["meta"]["count"], json!(0));
+        assert!(empty["meta"]["page"].as_u64().is_some());
+        assert!(empty["meta"]["limit"].as_u64().is_some());
+
+        // Detail and removal misses carry the documented codes.
+        let (status, err) = server
+            .get_auth("/api/v5/mqtt/delayed/messages/no-such-node/1", &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(err["code"], json!("INVALID_NODE"));
+        let (status, err) = server
+            .delete_auth("/api/v5/mqtt/delayed/messages/no-such-node/1", &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(err["code"], json!("INVALID_NODE"));
+
+        // Rewrite list starts empty, replaces, and rejects bad rules.
+        let (status, before) = server.get_auth("/api/v5/mqtt/topic_rewrite", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(before, json!([]));
+        let (status, after) = server
+            .put_auth(
+                "/api/v5/mqtt/topic_rewrite",
+                json!([{
+                    "action": "publish",
+                    "source_topic": "conf/http-rw/#",
+                    "dest_topic": "rewritten/$1",
+                    "re": "^conf/http-rw/(.*)$",
+                }]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "rewrite update: {after}");
+        assert_eq!(after[0]["action"], json!("publish"));
+        assert_eq!(after[0]["source_topic"], json!("conf/http-rw/#"));
+        let (status, err) = server
+            .put_auth(
+                "/api/v5/mqtt/topic_rewrite",
+                json!([{"action": "bogus"}]),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(err["code"], json!("BAD_REQUEST"));
+        let many: Vec<Value> = (0..65)
+            .map(|i| {
+                json!({
+                    "action": "publish",
+                    "source_topic": format!("conf/http-rw/{i}/#"),
+                    "dest_topic": "rewritten/$1",
+                    "re": format!("^conf/http-rw/{i}/(.*)$"),
+                })
+            })
+            .collect();
+        let (status, err) = server
+            .put_auth("/api/v5/mqtt/topic_rewrite", json!(many), &token)
+            .await;
+        assert_eq!(status, 413);
+        assert_eq!(err["code"], json!("EXCEED_LIMIT"));
+
+        // Topic-metric collections stay honestly empty: the list reads
+        // empty, single reads miss, creates and resets fail, and the
+        // bulk delete reports success.
+        let (status, body) = server.get_auth("/api/v5/mqtt/topic_metrics2", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, err) = server
+            .post_auth(
+                "/api/v5/mqtt/topic_metrics2",
+                json!({"name": "alpha", "topic_filter": "alpha/#"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(err["code"], json!("BAD_REQUEST"));
+        let (status, err) = server
+            .get_auth("/api/v5/mqtt/topic_metrics2/alpha", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(err["code"], json!("NAME_NOT_FOUND"));
+        let (status, err) = server
+            .delete_auth("/api/v5/mqtt/topic_metrics2/alpha", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(err["code"], json!("NAME_NOT_FOUND"));
+        let (status, err) = server
+            .put_auth(
+                "/api/v5/mqtt/topic_metrics2/alpha/reset",
+                json!(null),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(err["code"], json!("NAME_NOT_FOUND"));
+        let (status, _) = server
+            .delete_auth("/api/v5/mqtt/topic_metrics2", &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // The legacy v1 paths carry no operation in the specification,
+        // so they keep no route and answer 404.
+        let (status, _) = server.get_auth("/api/v5/mqtt/topic_metrics", &token).await;
+        assert_eq!(status, 404, "legacy v1 topic_metrics must stay 404");
     }
 
     #[tokio::test]

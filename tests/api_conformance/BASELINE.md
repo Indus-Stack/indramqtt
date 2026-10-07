@@ -289,3 +289,40 @@ is not changed.
   `Content-Type: application/json`. The broker accepts a JSON object
   keyed by root, so the checker sends JSON and the console write
   succeeds.
+- `GET /mqtt/delayed/messages`, response 200, field `meta`. The
+  specification declares `count`, `limit` and `page`. The management
+  console reads `data` and `meta.count` for the delayed table. The
+  broker returns the shared page `meta` with one extra field
+  (`hasnext`), as the retained list does, and clamps `limit` to
+  `1..=1000` while the specification allows `10000`, so the checker
+  sees the extra field and large limits page earlier.
+- `GET /mqtt/delayed/messages/{node}/{msgid}`, response 200. The
+  specification declares the shape without `payload`. The management
+  console reads `detail?.payload` for the payload dialog and shows a
+  placeholder when it is missing. The broker follows the specification
+  and omits `payload`, so the checker validates the row and the dialog
+  shows the placeholder.
+- `GET /mqtt/delayed/messages`, field `msgid`. The specification types
+  it as an integer. The management console types it as a string but
+  passes it through to the path unchanged. The broker returns an
+  integer, so the checker validates the row and the console read works.
+- `PUT /mqtt/delayed`, request body. The specification marks no field
+  required. The management console always sends `enable` and
+  `max_delayed_messages` together. The broker keeps the current value
+  of a missing field, so the checker sends full bodies and partial
+  writes never clear a setting.
+- `POST /mqtt/topic_metrics2`, response 400, field `code`. The
+  specification lists `BAD_NAME` and `BAD_TOPIC_FILTER`. The broker
+  keeps no per-filter counters, so each create fails with `BAD_REQUEST`
+  and a message that the function is not available. The checker flags
+  the code while the status stays documented.
+- `/mqtt/topic_metrics` and `/mqtt/topic_metrics/{topic}`. The
+  specification carries no operation on these paths. The management
+  console still ships helpers for them, but the topic-metrics view
+  calls only the `topic_metrics2` operations. The broker keeps no
+  route there and answers 404.
+- `PUT /mqtt/topic_rewrite`, field `dest_topic`. The specification
+  fills `${clientid}` and `${username}` per client. The router has no
+  client context on the match path yet, so the broker stores the
+  template and renders `$1` captures only, leaving those placeholders
+  literal. Plain capture templates rewrite exactly.
