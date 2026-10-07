@@ -1439,6 +1439,24 @@ check "explain shows listeners.tls.verify_client_cert stays off by default" $?
 "$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
     config explain --key listeners.wss.verify_client_cert 2>/dev/null | grep -q 'false'
 check "explain shows listeners.wss.verify_client_cert stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.tls.verify 2>/dev/null | grep -q 'verify_none'
+check "explain shows listeners.tls.verify stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.wss.verify 2>/dev/null | grep -q 'verify_none'
+check "explain shows listeners.wss.verify stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.tls.fail_if_no_peer_cert 2>/dev/null | grep -q 'false'
+check "explain shows listeners.tls.fail_if_no_peer_cert stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.wss.fail_if_no_peer_cert 2>/dev/null | grep -q 'false'
+check "explain shows listeners.wss.fail_if_no_peer_cert stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.tls.peer_cert_as_username 2>/dev/null | grep -q 'disabled'
+check "explain shows listeners.tls.peer_cert_as_username stays disabled by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.wss.peer_cert_as_username 2>/dev/null | grep -q 'disabled'
+check "explain shows listeners.wss.peer_cert_as_username stays disabled by default" $?
 LIS_NS_A="t-lis-a"
 LIS_NS_B="t-lis-b"
 LIS_USER_A="lis-a"

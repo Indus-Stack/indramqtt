@@ -3740,6 +3740,35 @@ struct Shared {
     /// Whether the secure WebSocket listener verifies a client
     /// certificate (TM-08). Mirrors the TLS listener. Off by default.
     wss_verify_client_cert: bool,
+    /// True when `listeners.tls.verify` is `verify_peer` (K1-05).
+    /// Set once at boot from the resolved config. Read on connect only.
+    tls_verify_peer: bool,
+    /// True when the TLS listener refuses a handshake without a
+    /// certificate (K1-05). Set once at boot. Read on connect only.
+    tls_fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate
+    /// on the TLS listener (K1-05). Set once at boot.
+    /// Read on connect only.
+    tls_peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client
+    /// certificate on the TLS listener (K1-05). Set once at boot.
+    /// Read on connect only.
+    tls_peer_cert_as_clientid: String,
+    /// True when `listeners.wss.verify` is `verify_peer` (K1-05).
+    /// Set once at boot from the resolved config. Read on connect only.
+    wss_verify_peer: bool,
+    /// True when the secure WebSocket listener refuses a handshake
+    /// without a certificate (K1-05). Set once at boot.
+    /// Read on connect only.
+    wss_fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate
+    /// on the secure WebSocket listener (K1-05). Set once at boot.
+    /// Read on connect only.
+    wss_peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client
+    /// certificate on the secure WebSocket listener (K1-05).
+    /// Set once at boot. Read on connect only.
+    wss_peer_cert_as_clientid: String,
 }
 
 impl Shared {
@@ -3906,6 +3935,14 @@ impl Shared {
             tenant_limits: Arc::new(broker_session::tenant_limits::TenantLimitStore::default()),
             tls_verify_client_cert: false,
             wss_verify_client_cert: false,
+            tls_verify_peer: false,
+            tls_fail_if_no_peer_cert: false,
+            tls_peer_cert_as_username: "disabled".to_string(),
+            tls_peer_cert_as_clientid: "disabled".to_string(),
+            wss_verify_peer: false,
+            wss_fail_if_no_peer_cert: false,
+            wss_peer_cert_as_username: "disabled".to_string(),
+            wss_peer_cert_as_clientid: "disabled".to_string(),
         }
     }
 
@@ -7523,12 +7560,22 @@ fn bind_tenant_for_req(
 }
 
 /// True when the listener of this bind must carry a client certificate.
-/// The TLS and secure WebSocket listeners each have one switch.
-/// Off by default keeps handshakes unchanged. Connect only.
+/// The legacy switches deny at the bind for compatibility.
+/// The new settings deny at the bind when `fail_if_no_peer_cert` is set
+/// with verification on. The handshake already refuses a missing
+/// certificate in that mode. Optional verification never denies
+/// a missing certificate here. Off by default keeps handshakes unchanged.
+/// Connect only.
 fn client_cert_required(shared: &Shared, listener: &str) -> bool {
     match listener {
-        "tls" => shared.tls_verify_client_cert,
-        "wss" => shared.wss_verify_client_cert,
+        "tls" => {
+            shared.tls_verify_client_cert
+                || (shared.tls_verify_peer && shared.tls_fail_if_no_peer_cert)
+        }
+        "wss" => {
+            shared.wss_verify_client_cert
+                || (shared.wss_verify_peer && shared.wss_fail_if_no_peer_cert)
+        }
         _ => false,
     }
 }
@@ -9669,6 +9716,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // without a certificate on that listener. Connect only.
     shared.tls_verify_client_cert = cfg.listeners.tls.verify_client_cert;
     shared.wss_verify_client_cert = cfg.listeners.wss.verify_client_cert;
+    // K1-05: apply the client-certificate policy before any bind.
+    // The verifier and the bind read these. Connect only.
+    shared.tls_verify_peer = cfg.listeners.tls.verify == "verify_peer";
+    shared.tls_fail_if_no_peer_cert = cfg.listeners.tls.fail_if_no_peer_cert;
+    shared
+        .tls_peer_cert_as_username
+        .clone_from(&cfg.listeners.tls.peer_cert_as_username);
+    shared
+        .tls_peer_cert_as_clientid
+        .clone_from(&cfg.listeners.tls.peer_cert_as_clientid);
+    shared.wss_verify_peer = cfg.listeners.wss.verify == "verify_peer";
+    shared.wss_fail_if_no_peer_cert = cfg.listeners.wss.fail_if_no_peer_cert;
+    shared
+        .wss_peer_cert_as_username
+        .clone_from(&cfg.listeners.wss.peer_cert_as_username);
+    shared
+        .wss_peer_cert_as_clientid
+        .clone_from(&cfg.listeners.wss.peer_cert_as_clientid);
     // Tenants (MT-01): install the configured assignment rules before
     // any edge binds. Validated whole; a bad row fails boot loudly.
     install_tenant_rules(&shared, &cfg)?;
@@ -10353,7 +10418,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tls_config = native::load_tls_config(
             &cfg.listeners.tls.cert_file,
             &cfg.listeners.tls.key_file,
-            cfg.listeners.tls.verify_client_cert,
+            &native::TlsClientAuth {
+                verify_peer: cfg.listeners.tls.verify == "verify_peer",
+                legacy_verify: cfg.listeners.tls.verify_client_cert,
+                cacertfile: cfg.listeners.tls.cacertfile.clone(),
+                fail_if_no_peer_cert: cfg.listeners.tls.fail_if_no_peer_cert,
+            },
         )
         .map_err(|e| format!("listeners.tls: {e}"))?;
         // The TLS listener has no connection limit of its own in the
@@ -10389,7 +10459,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tls_config = native::load_tls_config(
             &cfg.listeners.wss.cert_file,
             &cfg.listeners.wss.key_file,
-            cfg.listeners.wss.verify_client_cert,
+            &native::TlsClientAuth {
+                verify_peer: cfg.listeners.wss.verify == "verify_peer",
+                legacy_verify: cfg.listeners.wss.verify_client_cert,
+                cacertfile: cfg.listeners.wss.cacertfile.clone(),
+                fail_if_no_peer_cert: cfg.listeners.wss.fail_if_no_peer_cert,
+            },
         )
         .map_err(|e| format!("listeners.wss: {e}"))?;
         // The secure WebSocket listener has no connection limit of its

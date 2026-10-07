@@ -428,6 +428,11 @@
               "description": "Bind address for the secure TLS MQTT listener.",
               "type": "string"
             },
+            "cacertfile": {
+              "default": "",
+              "description": "CA file for client certificate checks of the TLS listener.",
+              "type": "string"
+            },
             "cert_file": {
               "default": "",
               "description": "Path to the PEM server certificate for the TLS listener.",
@@ -436,6 +441,11 @@
             "enabled": {
               "default": false,
               "description": "Whether the secure TLS MQTT listener accepts connections.",
+              "type": "boolean"
+            },
+            "fail_if_no_peer_cert": {
+              "default": false,
+              "description": "Whether the TLS listener refuses a handshake without a certificate.",
               "type": "boolean"
             },
             "key_file": {
@@ -447,6 +457,35 @@
               "default": false,
               "description": "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
               "type": "boolean"
+            },
+            "peer_cert_as_clientid": {
+              "default": "disabled",
+              "description": "Source for the bind client identifier from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "peer_cert_as_username": {
+              "default": "disabled",
+              "description": "Source for the bind username from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "verify": {
+              "default": "verify_none",
+              "description": "Client certificate chain check mode of the TLS listener.",
+              "enum": [
+                "verify_none",
+                "verify_peer"
+              ],
+              "type": "string"
             },
             "verify_client_cert": {
               "default": false,

@@ -146,6 +146,41 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "Whether the TLS listener requests and verifies a client certificate.",
             },
             FieldDoc {
+                path: "listeners.tls.verify",
+                setting_type: "string",
+                default: "\"verify_none\"",
+                range: "verify_none | verify_peer",
+                doc: "Client certificate chain check mode of the TLS listener.",
+            },
+            FieldDoc {
+                path: "listeners.tls.cacertfile",
+                setting_type: "path string",
+                default: "\"\"",
+                range: "PEM file path; empty uses system roots",
+                doc: "CA file for client certificate checks of the TLS listener.",
+            },
+            FieldDoc {
+                path: "listeners.tls.fail_if_no_peer_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the TLS listener refuses a handshake without a certificate.",
+            },
+            FieldDoc {
+                path: "listeners.tls.peer_cert_as_username",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind username from the client certificate.",
+            },
+            FieldDoc {
+                path: "listeners.tls.peer_cert_as_clientid",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind client identifier from the client certificate.",
+            },
+            FieldDoc {
                 path: "listeners.ws.enabled",
                 setting_type: "bool",
                 default: "true",
@@ -214,6 +249,41 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the secure WebSocket listener requests and verifies a client certificate.",
+            },
+            FieldDoc {
+                path: "listeners.wss.verify",
+                setting_type: "string",
+                default: "\"verify_none\"",
+                range: "verify_none | verify_peer",
+                doc: "Client certificate chain check mode of the secure WebSocket listener.",
+            },
+            FieldDoc {
+                path: "listeners.wss.cacertfile",
+                setting_type: "path string",
+                default: "\"\"",
+                range: "PEM file path; empty uses system roots",
+                doc: "CA file for client certificate checks of the secure WebSocket listener.",
+            },
+            FieldDoc {
+                path: "listeners.wss.fail_if_no_peer_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the secure WebSocket listener refuses a handshake without a certificate.",
+            },
+            FieldDoc {
+                path: "listeners.wss.peer_cert_as_username",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind username from the client certificate.",
+            },
+            FieldDoc {
+                path: "listeners.wss.peer_cert_as_clientid",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind client identifier from the client certificate.",
             },
             FieldDoc {
                 path: "listeners.wss.native",
@@ -915,11 +985,36 @@ pub struct TlsListenerConf {
     /// Whether the TLS listener requests and verifies a client certificate.
     #[serde(default = "default_false")]
     pub verify_client_cert: bool,
+    /// Client certificate chain check mode.
+    #[serde(default = "default_tls_verify")]
+    pub verify: String,
+    /// Path to the PEM CA file for client certificate checks.
+    #[serde(default)]
+    pub cacertfile: String,
+    /// Whether the TLS listener refuses a handshake without a certificate.
+    #[serde(default = "default_false")]
+    pub fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_clientid: String,
 }
 
 // Reason: off by default keeps current handshakes unchanged; the operator opts into client certificates.
 fn default_verify_client_cert() -> bool {
     false
+}
+
+// Reason: no check by default keeps current handshakes unchanged.
+fn default_tls_verify() -> String {
+    "verify_none".to_string()
+}
+
+// Reason: no mapping by default keeps CONNECT credentials unchanged.
+fn default_cert_as() -> String {
+    "disabled".to_string()
 }
 
 // Reason: the standard secure MQTT port.
@@ -936,6 +1031,11 @@ impl Default for TlsListenerConf {
             key_file: String::new(),
             native: false,
             verify_client_cert: default_verify_client_cert(),
+            verify: default_tls_verify(),
+            cacertfile: String::new(),
+            fail_if_no_peer_cert: false,
+            peer_cert_as_username: default_cert_as(),
+            peer_cert_as_clientid: default_cert_as(),
         }
     }
 }
@@ -960,8 +1060,75 @@ impl TlsListenerConf {
                 ));
             }
         }
+        validate_client_cert_opts(
+            "listeners.tls",
+            &self.verify,
+            &self.peer_cert_as_username,
+            &self.peer_cert_as_clientid,
+            self.fail_if_no_peer_cert,
+            self.verify_client_cert,
+        )?;
         Ok(())
     }
+}
+
+/// Validates client certificate options shared by TLS and secure WebSocket.
+/// Rejects unknown modes. Refuses `fail_if_no_peer_cert` without
+/// verification. Refuses identity mapping without verification.
+/// TODO(parity): which of `crt`, `pem`, `md5` sources does the broker
+/// support for `peer_cert_as_username` and `peer_cert_as_clientid`?
+/// The rulebook does not decide the set. Only `disabled`, `cn` and
+/// `dn` apply today. Other values fail closed at boot.
+fn validate_client_cert_opts(
+    prefix: &str,
+    verify: &str,
+    as_username: &str,
+    as_clientid: &str,
+    fail_if_no_peer_cert: bool,
+    legacy_verify: bool,
+) -> Result<(), ConfigError> {
+    if verify != "verify_none" && verify != "verify_peer" {
+        return Err(invalid(
+            &format!("{prefix}.verify"),
+            verify,
+            "must be verify_none or verify_peer",
+        ));
+    }
+    for (name, value) in [
+        ("peer_cert_as_username", as_username),
+        ("peer_cert_as_clientid", as_clientid),
+    ] {
+        if value != "disabled" && value != "cn" && value != "dn" {
+            if ["crt", "pem", "md5"].contains(&value) {
+                return Err(invalid(
+                    &format!("{prefix}.{name}"),
+                    value,
+                    "is not supported yet: use disabled, cn or dn",
+                ));
+            }
+            return Err(invalid(
+                &format!("{prefix}.{name}"),
+                value,
+                "must be disabled, cn or dn",
+            ));
+        }
+    }
+    let verify_on = verify == "verify_peer" || legacy_verify;
+    if fail_if_no_peer_cert && !verify_on {
+        return Err(invalid(
+            &format!("{prefix}.fail_if_no_peer_cert"),
+            "true",
+            "needs verify set to verify_peer",
+        ));
+    }
+    if (as_username != "disabled" || as_clientid != "disabled") && !verify_on {
+        return Err(invalid(
+            &format!("{prefix}.peer_cert_as_username"),
+            as_username,
+            "needs verify set to verify_peer",
+        ));
+    }
+    Ok(())
 }
 
 /// MQTT-over-WebSocket listener.
@@ -1040,6 +1207,21 @@ pub struct WssListenerConf {
     /// Whether the secure WebSocket listener requests and verifies a client certificate.
     #[serde(default = "default_false")]
     pub verify_client_cert: bool,
+    /// Client certificate chain check mode.
+    #[serde(default = "default_tls_verify")]
+    pub verify: String,
+    /// Path to the PEM CA file for client certificate checks.
+    #[serde(default)]
+    pub cacertfile: String,
+    /// Whether the secure WebSocket listener refuses a handshake without a certificate.
+    #[serde(default = "default_false")]
+    pub fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_clientid: String,
 }
 
 // Reason: TODO(parity): no canonical secure-WebSocket port is decided yet;
@@ -1058,6 +1240,11 @@ impl Default for WssListenerConf {
             key_file: String::new(),
             native: false,
             verify_client_cert: false,
+            verify: default_tls_verify(),
+            cacertfile: String::new(),
+            fail_if_no_peer_cert: false,
+            peer_cert_as_username: default_cert_as(),
+            peer_cert_as_clientid: default_cert_as(),
         }
     }
 }
@@ -1089,6 +1276,14 @@ impl WssListenerConf {
                 ));
             }
         }
+        validate_client_cert_opts(
+            "listeners.wss",
+            &self.verify,
+            &self.peer_cert_as_username,
+            &self.peer_cert_as_clientid,
+            self.fail_if_no_peer_cert,
+            self.verify_client_cert,
+        )?;
         Ok(())
     }
 }
@@ -2729,6 +2924,34 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     false,
                     "Whether the TLS listener requests and verifies a client certificate.",
                 ),
+                enum_field(
+                    "tls.verify",
+                    "verify_none",
+                    &["verify_none", "verify_peer"],
+                    "Client certificate chain check mode of the TLS listener.",
+                ),
+                str_field(
+                    "tls.cacertfile",
+                    "",
+                    "CA file for client certificate checks of the TLS listener.",
+                ),
+                bool_field(
+                    "tls.fail_if_no_peer_cert",
+                    false,
+                    "Whether the TLS listener refuses a handshake without a certificate.",
+                ),
+                enum_field(
+                    "tls.peer_cert_as_username",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind username from the client certificate.",
+                ),
+                enum_field(
+                    "tls.peer_cert_as_clientid",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind client identifier from the client certificate.",
+                ),
                 bool_field(
                     "ws.enabled",
                     true,
@@ -2775,6 +2998,34 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "wss.verify_client_cert",
                     false,
                     "Whether the secure WebSocket listener requests and verifies a client certificate.",
+                ),
+                enum_field(
+                    "wss.verify",
+                    "verify_none",
+                    &["verify_none", "verify_peer"],
+                    "Client certificate chain check mode of the secure WebSocket listener.",
+                ),
+                str_field(
+                    "wss.cacertfile",
+                    "",
+                    "CA file for client certificate checks of the secure WebSocket listener.",
+                ),
+                bool_field(
+                    "wss.fail_if_no_peer_cert",
+                    false,
+                    "Whether the secure WebSocket listener refuses a handshake without a certificate.",
+                ),
+                enum_field(
+                    "wss.peer_cert_as_username",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind username from the client certificate.",
+                ),
+                enum_field(
+                    "wss.peer_cert_as_clientid",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind client identifier from the client certificate.",
                 ),
                 bool_field(
                     "api.enabled",

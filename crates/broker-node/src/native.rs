@@ -152,18 +152,77 @@ pub(super) async fn serve_native_mqtt(listener: TcpListener, max_connections: u3
 /// and sends nothing does not keep a task for a longer time.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Client certificate policy of one secure listener.
+/// The fields mirror the listener settings with the same names.
+/// `verify_peer` mirrors `verify = "verify_peer"`.
+/// `legacy_verify` mirrors `verify_client_cert`.
+/// `cacertfile` mirrors `cacertfile`.
+/// `fail_if_no_peer_cert` mirrors `fail_if_no_peer_cert`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct TlsClientAuth {
+    /// True when the mode setting requests a chain check.
+    pub verify_peer: bool,
+    /// True when the legacy switch requests a chain check.
+    pub legacy_verify: bool,
+    /// CA file for the chain check. Empty selects the system roots.
+    pub cacertfile: String,
+    /// True when a missing certificate fails the handshake.
+    pub fail_if_no_peer_cert: bool,
+}
+
+impl TlsClientAuth {
+    /// True when the listener checks any client certificate chain.
+    fn verify_on(&self) -> bool {
+        self.verify_peer || self.legacy_verify
+    }
+
+    /// True when a missing certificate fails the handshake.
+    /// The bind check repeats the refusal for defense in depth.
+    fn require_cert(&self) -> bool {
+        self.fail_if_no_peer_cert && self.verify_on()
+    }
+}
+
+/// Loads the trust roots for client certificate checks.
+/// An empty path selects the bundled system roots.
+/// A set path must name a PEM file with at least one certificate.
+/// A missing file, an unreadable file and an empty file return an
+/// error. The caller fails the listener start on an error.
+fn load_client_roots(
+    cacertfile: &str,
+) -> Result<rustls::RootCertStore, Box<dyn std::error::Error + Send + Sync>> {
+    if cacertfile.trim().is_empty() {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        return Ok(roots);
+    }
+    let file = std::fs::File::open(cacertfile)?;
+    let mut reader = std::io::BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)?;
+    if certs.is_empty() {
+        return Err(format!("no CA certificate in {cacertfile}").into());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for der in certs {
+        roots.add(rustls::pki_types::CertificateDer::from(der))?;
+    }
+    Ok(roots)
+}
+
 /// Reads the certificate chain and the private key of the TLS listener
 /// and makes the server configuration. The protocol versions are TLS 1.2
 /// and TLS 1.3 with the default cipher suites of the library.
-/// When `verify` is false the server requests no client certificate.
-/// When `verify` is true the server requests a client certificate and
-/// checks its chain against Mozilla roots. A missing certificate passes
-/// the handshake and fails at the bind with a counted denial. A bad
-/// chain fails the handshake. Off by default keeps handshakes unchanged.
+/// Without verification the server requests no client certificate.
+/// With optional verification the server requests a client certificate
+/// and checks a sent chain against the CA file. A missing certificate
+/// passes the handshake and fails at the bind when required there.
+/// With required verification a missing certificate fails the handshake.
+/// A bad chain (wrong CA, expired, not yet valid) fails the handshake.
+/// Off by default keeps handshakes unchanged.
 pub(super) fn load_tls_config(
     cert_file: &str,
     key_file: &str,
-    verify: bool,
+    client_auth: &TlsClientAuth,
 ) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error + Send + Sync>> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -190,20 +249,21 @@ pub(super) fn load_tls_config(
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?;
-    if verify {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let verifier = rustls::server::WebPkiClientVerifier::builder(roots.into())
-            .allow_unauthenticated()
-            .build()?;
-        let config = builder
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)?;
-        Ok(Arc::new(config))
-    } else {
+    if !client_auth.verify_on() {
         let config = builder.with_no_client_auth().with_single_cert(certs, key)?;
-        Ok(Arc::new(config))
+        return Ok(Arc::new(config));
     }
+    let roots = load_client_roots(&client_auth.cacertfile)?;
+    let verifier_builder = rustls::server::WebPkiClientVerifier::builder(roots.into());
+    let verifier = if client_auth.require_cert() {
+        verifier_builder.build()?
+    } else {
+        verifier_builder.allow_unauthenticated().build()?
+    };
+    let config = builder
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)?;
+    Ok(Arc::new(config))
 }
 
 /// Largest certificate field kept for tenant rules.
@@ -1133,18 +1193,49 @@ impl Conn {
     }
 }
 
+/// Takes one `peer_cert_as_*` mode and returns the certificate value.
+/// `cn` selects the common name. `dn` selects the subject name.
+/// `disabled` and unknown modes return `None`.
+/// An absent or empty source returns `None`.
+/// TODO(parity): the rulebook does not decide whether a bind with
+/// mapping on but no certificate keeps the CONNECT values (current)
+/// or fails. The current choice keeps accepted behavior unchanged.
+fn cert_identity_value(mode: &str, peer_cert: &PeerCert) -> Option<String> {
+    let value = match mode {
+        "cn" => peer_cert.cn.clone(),
+        "dn" => peer_cert.subject.clone(),
+        _ => None,
+    }?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Makes the bind request of one CONNECT on a kernel-owned connection.
+/// The verified certificate fills the same bind fields the edge sends:
+/// common name, subject and SANs. The listener policy takes the bind
+/// username and client identifier from the certificate when set.
+/// Connections the edge holds keep their CONNECT values: the edge
+/// has no such setting.
+/// TODO(parity): the rulebook does not decide whether edge-held binds
+/// honor `peer_cert_as_*`. The current code maps only kernel-held
+/// connections and keeps edge behavior unchanged.
 fn bind_request(
     connect: wire::Connect,
     peer: &str,
     listener: &str,
     peer_cert: &PeerCert,
+    peer_as_username: &str,
+    peer_as_clientid: &str,
 ) -> BindRequest {
     let props = connect.properties;
     BindRequest {
-        client_id: connect.client_id,
+        client_id: cert_identity_value(peer_as_clientid, peer_cert).unwrap_or(connect.client_id),
         clean_start: connect.clean_start,
         keepalive_secs: connect.keepalive,
-        username: connect.username,
+        username: cert_identity_value(peer_as_username, peer_cert).or(connect.username),
         password: connect.password,
         peerhost: Some(peer.to_string()),
         client_alias_max: props
@@ -1545,7 +1636,28 @@ async fn drain_inbound(
                 sink.level.store(conn.level, Ordering::Relaxed);
                 conn.keepalive = (connect.keepalive > 0)
                     .then(|| Duration::from_millis(u64::from(connect.keepalive) * 1500));
-                let request = bind_request(connect, &conn.peer, listener, peer_cert);
+                // The listener policy selects the certificate identity
+                // for kernel-owned connections. Other listeners keep
+                // the CONNECT values.
+                let (peer_as_username, peer_as_clientid) = match listener {
+                    "tls" => (
+                        shared.tls_peer_cert_as_username.as_str(),
+                        shared.tls_peer_cert_as_clientid.as_str(),
+                    ),
+                    "wss" => (
+                        shared.wss_peer_cert_as_username.as_str(),
+                        shared.wss_peer_cert_as_clientid.as_str(),
+                    ),
+                    _ => ("disabled", "disabled"),
+                };
+                let request = bind_request(
+                    connect,
+                    &conn.peer,
+                    listener,
+                    peer_cert,
+                    peer_as_username,
+                    peer_as_clientid,
+                );
                 conn.client_id = request.client_id.clone();
                 let Some(frame) = conn.frame(OpCode::BindConnection, Vec::new(), Bytes::new())
                 else {
@@ -1741,6 +1853,8 @@ mod tests {
             "127.0.0.1",
             "tcp",
             &PeerCert::default(),
+            "disabled",
+            "disabled",
         );
         let frame = BrokerFrame::new(
             OpCode::BindConnection,
@@ -1801,6 +1915,8 @@ mod tests {
             "127.0.0.1",
             "tcp",
             &PeerCert::default(),
+            "disabled",
+            "disabled",
         );
         let frame = BrokerFrame::new(
             OpCode::BindConnection,
@@ -2085,6 +2201,8 @@ mod tests {
     /// Server config loads with and without client verification.
     /// The fixture is the test server certificate and key.
     /// Verification on requests a client certificate.
+    /// An empty CA path selects the bundled system roots.
+    /// A missing CA file returns an error.
     #[test]
     fn tls_config_loads_with_and_without_verify() {
         let base = concat!(
@@ -2093,8 +2211,19 @@ mod tests {
         );
         let cert = format!("{base}/server-cert.pem");
         let key = format!("{base}/server-key.pem");
-        assert!(super::load_tls_config(&cert, &key, false).is_ok());
-        assert!(super::load_tls_config(&cert, &key, true).is_ok());
+        let off = TlsClientAuth::default();
+        assert!(super::load_tls_config(&cert, &key, &off).is_ok());
+        let on = TlsClientAuth {
+            verify_peer: true,
+            ..TlsClientAuth::default()
+        };
+        assert!(super::load_tls_config(&cert, &key, &on).is_ok());
+        let missing_ca = TlsClientAuth {
+            verify_peer: true,
+            cacertfile: "/nonexistent-ca.pem".to_string(),
+            ..TlsClientAuth::default()
+        };
+        assert!(super::load_tls_config(&cert, &key, &missing_ca).is_err());
     }
 
     /// Builds a small MQTT 3.1.1 CONNECT packet.
@@ -2675,7 +2804,8 @@ mod tests {
         );
         let cert = format!("{base}/server-cert.pem");
         let key = format!("{base}/server-key.pem");
-        let tls = super::load_tls_config(&cert, &key, false).expect("test TLS loads");
+        let tls = super::load_tls_config(&cert, &key, &super::TlsClientAuth::default())
+            .expect("test TLS loads");
         let tcp = Listener::bind("127.0.0.1:0").await.expect("tcp binds");
         let wss = Listener::bind("127.0.0.1:0").await.expect("wss binds");
         let tcp_port = tcp.local_addr().expect("tcp addr").port();
@@ -3062,5 +3192,522 @@ mod tests {
         assert!(other_b.is_err(), "other tenant gets nothing");
         let _ = client_a.close(None).await;
         let _ = client_b.close(None).await;
+    }
+
+    /// Path of one K1-05 test PKI file.
+    /// The files live under `crates/broker-node/tests/k1_05`.
+    /// OpenSSL commands generate them: one CA, one server certificate
+    /// for 127.0.0.1, two client certificates, one other CA with its
+    /// own client certificate, one expired client certificate.
+    /// Each client certificate is version 3 with clientAuth use.
+    /// The sign step uses an extension file with clientAuth use.
+    /// No new crate was added for them: `rcgen` is not in the lock file.
+    fn k1_05_file(name: &str) -> String {
+        format!("{}/tests/k1_05/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Trust roots of the K1-05 test CA.
+    fn k1_05_roots() -> rustls::RootCertStore {
+        let pem = std::fs::read(k1_05_file("ca-cert.pem")).expect("test CA reads");
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        let certs = rustls_pemfile::certs(&mut reader).expect("test CA parses");
+        let mut roots = rustls::RootCertStore::empty();
+        for der in certs {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(der))
+                .expect("test CA trusts");
+        }
+        roots
+    }
+
+    /// Private key in a PEM file. Accepts PKCS#8, RSA and SEC1 forms.
+    fn k1_05_key(path: &str) -> rustls::pki_types::PrivateKeyDer<'static> {
+        use rustls::pki_types::PrivateKeyDer;
+        let bytes = std::fs::read(path).expect("test key reads");
+        for item in rustls_pemfile::read_all(&mut bytes.as_slice()).expect("test key parses") {
+            match item {
+                rustls_pemfile::Item::PKCS8Key(der) => return PrivateKeyDer::Pkcs8(der.into()),
+                rustls_pemfile::Item::RSAKey(der) => return PrivateKeyDer::Pkcs1(der.into()),
+                rustls_pemfile::Item::ECKey(der) => return PrivateKeyDer::Sec1(der.into()),
+                _ => continue,
+            }
+        }
+        panic!("no private key in test file");
+    }
+
+    /// Certificate chain in a PEM file.
+    fn k1_05_chain(path: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+        let pem = std::fs::read(path).expect("test chain reads");
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        rustls_pemfile::certs(&mut reader)
+            .expect("test chain parses")
+            .into_iter()
+            .map(rustls::pki_types::CertificateDer::from)
+            .collect()
+    }
+
+    /// TLS client config for the K1-05 tests. Trusts the test CA only.
+    /// `client` selects the client certificate, if any.
+    fn k1_05_client_config(client: Option<&str>) -> std::sync::Arc<rustls::ClientConfig> {
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let base = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions hold")
+            .with_root_certificates(k1_05_roots());
+        let config = match client {
+            Some(name) => base
+                .with_client_auth_cert(
+                    k1_05_chain(&k1_05_file(&format!("{name}-cert.pem"))),
+                    k1_05_key(&k1_05_file(&format!("{name}-key.pem"))),
+                )
+                .expect("client identity loads"),
+            None => base.with_no_client_auth(),
+        };
+        std::sync::Arc::new(config)
+    }
+
+    /// Opens a TLS session to the test port. `client` selects the
+    /// client certificate, if any. Returns the handshake result.
+    async fn k1_05_dial(
+        port: u16,
+        client: Option<&str>,
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, std::io::Error> {
+        let connector = tokio_rustls::TlsConnector::from(k1_05_client_config(client));
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("name holds");
+        tokio::time::timeout(Duration::from_secs(10), connector.connect(name, tcp))
+            .await
+            .expect("handshake ends in time")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e))
+    }
+
+    /// Starts one kernel TLS listener with the K1-05 test server
+    /// certificate and the given client policy. Returns the port.
+    /// The task runs until the test aborts it.
+    /// The listener copies the policy into the shared bind flags.
+    /// The bind then refuses a missing certificate when required.
+    async fn k1_05_listener(mut shared: Shared, policy: super::TlsClientAuth) -> u16 {
+        shared.tls_verify_peer = policy.verify_peer;
+        shared.tls_verify_client_cert = policy.legacy_verify;
+        shared.tls_fail_if_no_peer_cert = policy.fail_if_no_peer_cert;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("tls binds");
+        let port = listener.local_addr().expect("tls addr").port();
+        let config = super::load_tls_config(
+            &k1_05_file("server-cert.pem"),
+            &k1_05_file("server-key.pem"),
+            &policy,
+        )
+        .expect("test TLS loads");
+        tokio::spawn(async move {
+            serve_native_mqtts(listener, config, 1000, shared).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// Server policy for the K1-05 tests. Trusts the test CA file.
+    /// `require` selects the require mode.
+    fn k1_05_policy(require: bool) -> super::TlsClientAuth {
+        super::TlsClientAuth {
+            verify_peer: true,
+            legacy_verify: false,
+            cacertfile: k1_05_file("ca-cert.pem"),
+            fail_if_no_peer_cert: require,
+        }
+    }
+
+    /// Reads one MQTT packet from a TLS client.
+    async fn k1_05_recv<S>(stream: &mut S) -> Vec<u8>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt as _;
+        let mut head = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+            .await
+            .expect("a header in time")
+            .expect("the socket stays open");
+        let length = head[1] as usize;
+        let mut packet = head.to_vec();
+        if length > 0 {
+            let mut body = vec![0u8; length];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut body))
+                .await
+                .expect("a body in time")
+                .expect("the socket stays open");
+            packet.extend_from_slice(&body);
+        }
+        packet
+    }
+
+    /// In require mode a client without a certificate fails the
+    /// handshake. Before the change it connected. Goes through
+    /// the broker. The broker stays up after the failed handshake.
+    /// TLS 1.3 reports the refusal after the client flight.
+    /// The test accepts a dial error or a refused CONNECT.
+    #[tokio::test]
+    async fn k1_05_require_mode_refuses_client_without_certificate() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let port = k1_05_listener(shared, k1_05_policy(true)).await;
+
+        // No certificate: the handshake fails or the bind refuses.
+        match k1_05_dial(port, None).await {
+            Err(_) => {}
+            Ok(mut stream) => {
+                let _ = stream.write_all(&ws_test_connect("k1-05-no-cert")).await;
+                use tokio::io::AsyncReadExt as _;
+                let mut head = [0u8; 4];
+                let denied =
+                    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+                        .await;
+                match denied {
+                    Err(_) => {}
+                    Ok(Err(_)) => {}
+                    Ok(Ok(_)) => {
+                        assert_ne!(
+                            head,
+                            [0x20, 0x02, 0x00, 0x00],
+                            "no certificate must not connect"
+                        );
+                    }
+                }
+            }
+        }
+
+        // A valid certificate still connects. The broker stays up.
+        let mut valid = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        valid
+            .write_all(&ws_test_connect("k1-05-valid"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut valid).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "valid certificate connects"
+        );
+    }
+
+    /// A client with a valid certificate connects. With the common
+    /// name as username the session username is the common name.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn k1_05_valid_certificate_maps_common_name_to_username() {
+        use tokio::io::AsyncWriteExt as _;
+        let mut shared = Shared::new();
+        shared.tls_peer_cert_as_username = "cn".to_string();
+        let port = k1_05_listener(shared.clone(), k1_05_policy(false)).await;
+
+        let mut client = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        client
+            .write_all(&ws_test_connect("k1-05-cn-user"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut client).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "valid certificate connects"
+        );
+        let session = shared
+            .sessions
+            .get("k1-05-cn-user")
+            .expect("session exists");
+        assert_eq!(
+            session.username.read().as_deref(),
+            Some("k1-05-a"),
+            "session username is the common name"
+        );
+    }
+
+    /// With the common name as client identifier the session uses
+    /// the common name. A publish through the broker still delivers.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn k1_05_certificate_client_id_carries_publish() {
+        use tokio::io::AsyncWriteExt as _;
+        let mut shared = Shared::new();
+        shared.tls_peer_cert_as_clientid = "cn".to_string();
+        let port = k1_05_listener(shared.clone(), k1_05_policy(false)).await;
+
+        let mut client = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        client
+            .write_all(&ws_test_connect("k1-05-ignored-id"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut client).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "mapped identifier connects"
+        );
+        assert!(
+            shared.sessions.get("k1-05-a").is_some(),
+            "session uses the common name"
+        );
+        client
+            .write_all(&ws_test_subscribe(1, "k1-05/cert/#"))
+            .await
+            .expect("SUBSCRIBE sends");
+        assert_eq!(k1_05_recv(&mut client).await[0], 0x90, "SUBACK answers");
+        client
+            .write_all(&ws_test_publish("k1-05/cert/x", b"secret"))
+            .await
+            .expect("PUBLISH sends");
+        let delivered = k1_05_recv(&mut client).await;
+        assert!(delivered.ends_with(b"secret"), "own publish delivers");
+    }
+
+    /// A certificate from a different CA fails the handshake.
+    /// An expired certificate fails the handshake. Goes through
+    /// the broker. The broker stays up after each failed handshake.
+    /// TLS 1.3 reports the refusal after the client flight.
+    /// The test accepts a dial error or a refused CONNECT.
+    #[tokio::test]
+    async fn k1_05_wrong_ca_and_expired_certificates_fail() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let port = k1_05_listener(shared, k1_05_policy(true)).await;
+
+        for client in ["wrong-client", "expired-client"] {
+            match k1_05_dial(port, Some(client)).await {
+                Err(_) => {}
+                Ok(mut stream) => {
+                    let _ = stream.write_all(&ws_test_connect("k1-05-bad-cert")).await;
+                    use tokio::io::AsyncReadExt as _;
+                    let mut head = [0u8; 4];
+                    let denied =
+                        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+                            .await;
+                    match denied {
+                        Err(_) => {}
+                        Ok(Err(_)) => {}
+                        Ok(Ok(_)) => {
+                            assert_ne!(
+                                head,
+                                [0x20, 0x02, 0x00, 0x00],
+                                "a bad certificate must not connect"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut valid = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        valid
+            .write_all(&ws_test_connect("k1-05-after-denials"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut valid).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "the broker stays up"
+        );
+    }
+
+    /// Without verification the behavior of today does not change.
+    /// A client without a certificate connects. Goes through the broker.
+    #[tokio::test]
+    async fn k1_05_no_verification_keeps_today_behavior() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let port = k1_05_listener(shared, super::TlsClientAuth::default()).await;
+
+        let mut plain = k1_05_dial(port, None).await.expect("plain TLS dials");
+        plain
+            .write_all(&ws_test_connect("k1-05-plain"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut plain).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "no verification connects"
+        );
+    }
+
+    /// Two tenants stay apart on the certificate path. Each client
+    /// carries its own certificate. A publish reaches its own tenant
+    /// only. Goes through the broker.
+    #[tokio::test]
+    async fn k1_05_two_tenants_stay_apart_on_certificate_path() {
+        use tokio::io::AsyncWriteExt as _;
+        let mut shared = Shared::new();
+        shared.tls_peer_cert_as_username = "cn".to_string();
+        shared
+            .tenant_registry
+            .replace(vec![broker_session::tenant::TenantRule::new(
+                "",
+                "tenant",
+                "t-${username}",
+            )])
+            .expect("tenant rule installs");
+        let port = k1_05_listener(shared.clone(), k1_05_policy(false)).await;
+
+        // Each tenant connects with its own certificate.
+        let mut client_a = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("first dials");
+        client_a
+            .write_all(&ws_test_connect("k1-05-tenant-a"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut client_a).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "first tenant connects"
+        );
+        client_a
+            .write_all(&ws_test_subscribe(1, "k1-05/tenant/x"))
+            .await
+            .expect("SUBSCRIBE sends");
+        assert_eq!(k1_05_recv(&mut client_a).await[0], 0x90);
+
+        let mut client_b = k1_05_dial(port, Some("client-b"))
+            .await
+            .expect("second dials");
+        client_b
+            .write_all(&ws_test_connect("k1-05-tenant-b"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut client_b).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "second tenant connects"
+        );
+        client_b
+            .write_all(&ws_test_subscribe(1, "k1-05/tenant/x"))
+            .await
+            .expect("SUBSCRIBE sends");
+        assert_eq!(k1_05_recv(&mut client_b).await[0], 0x90);
+
+        // A publish in the first tenant reaches its own subscriber only.
+        client_a
+            .write_all(&ws_test_publish("k1-05/tenant/x", b"secret-a"))
+            .await
+            .expect("PUBLISH sends");
+        let got_a = k1_05_recv(&mut client_a).await;
+        assert!(got_a.ends_with(b"secret-a"), "own tenant delivers");
+        let other_a =
+            tokio::time::timeout(Duration::from_millis(300), k1_05_recv(&mut client_b)).await;
+        assert!(other_a.is_err(), "other tenant gets nothing");
+
+        // A publish in the second tenant reaches its own subscriber only.
+        client_b
+            .write_all(&ws_test_publish("k1-05/tenant/x", b"secret-b"))
+            .await
+            .expect("PUBLISH sends");
+        let got_b = k1_05_recv(&mut client_b).await;
+        assert!(got_b.ends_with(b"secret-b"), "own tenant delivers");
+        let other_b =
+            tokio::time::timeout(Duration::from_millis(300), k1_05_recv(&mut client_a)).await;
+        assert!(other_b.is_err(), "other tenant gets nothing");
+    }
+
+    /// Starts one kernel secure WebSocket listener with the K1-05
+    /// test server certificate and the given client policy.
+    /// Returns the port. The task runs until the test aborts it.
+    /// The listener copies the policy into the shared bind flags.
+    /// The bind then refuses a missing certificate when required.
+    async fn k1_05_wss_listener(mut shared: Shared, policy: super::TlsClientAuth) -> u16 {
+        shared.wss_verify_peer = policy.verify_peer;
+        shared.wss_verify_client_cert = policy.legacy_verify;
+        shared.wss_fail_if_no_peer_cert = policy.fail_if_no_peer_cert;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("wss binds");
+        let port = listener.local_addr().expect("wss addr").port();
+        let config = super::load_tls_config(
+            &k1_05_file("server-cert.pem"),
+            &k1_05_file("server-key.pem"),
+            &policy,
+        )
+        .expect("test TLS loads");
+        tokio::spawn(async move {
+            serve_native_wss(listener, config, "/mqtt".to_string(), 1000, shared).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// Opens a secure WebSocket session to the test port.
+    /// `client` selects the client certificate, if any.
+    /// Returns the handshake result. The server selects `mqtt`.
+    // The result error type is large. The signature is fixed.
+    #[allow(clippy::result_large_err)]
+    async fn k1_05_wss_dial(
+        port: u16,
+        client: Option<&str>,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
+        let connector = tokio_rustls::TlsConnector::from(k1_05_client_config(client));
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("name holds");
+        let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, tcp))
+            .await
+            .expect("handshake ends in time")?;
+        let uri: http::Uri = format!("wss://127.0.0.1:{port}/mqtt")
+            .parse()
+            .expect("uri parses");
+        let builder = ClientRequestBuilder::new(uri).with_sub_protocol("mqtt");
+        let (stream, response) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::client_async_with_config(builder, tls, None),
+        )
+        .await
+        .expect("upgrade ends in time")?;
+        let selected = response
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(selected, "mqtt", "server selects mqtt");
+        Ok(stream)
+    }
+
+    /// In require mode a secure WebSocket client without a certificate
+    /// fails. A valid certificate connects. Goes through the broker.
+    /// The broker stays up after the failed handshake.
+    #[tokio::test]
+    async fn k1_05_wss_require_mode_checks_client_certificate() {
+        use futures::SinkExt as _;
+        let shared = Shared::new();
+        let port = k1_05_wss_listener(shared, k1_05_policy(true)).await;
+
+        let denied = k1_05_wss_dial(port, None).await;
+        assert!(denied.is_err(), "no certificate fails");
+
+        let mut valid = k1_05_wss_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        valid
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("k1-05-wss-valid"),
+            ))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut valid).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "valid certificate connects"
+        );
+        let _ = valid.close(None).await;
     }
 }
