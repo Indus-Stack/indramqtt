@@ -216,6 +216,13 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "Whether the secure WebSocket listener requests and verifies a client certificate.",
             },
             FieldDoc {
+                path: "listeners.wss.native",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them.",
+            },
+            FieldDoc {
                 path: "listeners.api.enabled",
                 setting_type: "bool",
                 default: "true",
@@ -1027,6 +1034,9 @@ pub struct WssListenerConf {
     /// Path to the PEM private key for the secure WebSocket listener.
     #[serde(default)]
     pub key_file: String,
+    /// Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them.
+    #[serde(default = "default_false")]
+    pub native: bool,
     /// Whether the secure WebSocket listener requests and verifies a client certificate.
     #[serde(default = "default_false")]
     pub verify_client_cert: bool,
@@ -1046,6 +1056,7 @@ impl Default for WssListenerConf {
             path: default_ws_path(),
             cert_file: String::new(),
             key_file: String::new(),
+            native: false,
             verify_client_cert: false,
         }
     }
@@ -2759,6 +2770,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "",
                     "Path to the PEM private key for the secure WebSocket listener.",
                 ),
+                bool_field("wss.native", false, "Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them."),
                 bool_field(
                     "wss.verify_client_cert",
                     false,

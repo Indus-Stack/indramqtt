@@ -36,6 +36,7 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `listeners.wss.path` | string | `/mqtt` | string | HTTP path serving secure WebSocket traffic. |
 | `listeners.wss.cert_file` | string | `` | string | Path to the PEM server certificate for the secure WebSocket listener. |
 | `listeners.wss.key_file` | string | `` | string | Path to the PEM private key for the secure WebSocket listener. |
+| `listeners.wss.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them. |
 | `listeners.wss.verify_client_cert` | boolean | `false` | boolean | Whether the secure WebSocket listener requests and verifies a client certificate. |
 | `listeners.api.enabled` | boolean | `true` | boolean | Whether the management REST API and dashboard serve requests. |
 | `listeners.api.bind` | string | `0.0.0.0:18083` | string | Bind address for the management REST API. Empty disables the API. |

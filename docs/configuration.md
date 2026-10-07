@@ -123,13 +123,18 @@ key_file = "/etc/indramqtt/server.key"
 
 [listeners.ws]
 native = true
+
+[listeners.wss]
+enabled = true
+native = true
+cert_file = "/etc/indramqtt/server.pem"
+key_file = "/etc/indramqtt/server.key"
 ```
 
 The edge does not open a listener that has `native = true`. The
-secure WebSocket listener always belongs to the edge. The kernel
-listener does not support UNSUBSCRIBE, PSK and client certificates
+kernel listener does not support PSK and client certificates
 yet. If a kernel listener cannot start, the kernel stops with an
-error. The kernel WebSocket listener uses the limit of the plaintext
+error. Each kernel WebSocket listener uses the limit of the plaintext
 listener.
 
 ## Flags: one more layer, then the schema

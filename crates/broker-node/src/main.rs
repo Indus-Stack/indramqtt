@@ -4251,7 +4251,7 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
     listener(
         "wss",
         "listeners.wss.bind",
-        listeners.wss.enabled,
+        listeners.wss.enabled && !listeners.wss.native,
         &listeners.wss.bind,
     )?;
     put("ws_path", quoted(&listeners.ws.path));
@@ -10385,6 +10385,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shared.clone(),
         ));
     }
+    if cfg.listeners.wss.enabled && cfg.listeners.wss.native {
+        let tls_config = native::load_tls_config(
+            &cfg.listeners.wss.cert_file,
+            &cfg.listeners.wss.key_file,
+            cfg.listeners.wss.verify_client_cert,
+        )
+        .map_err(|e| format!("listeners.wss: {e}"))?;
+        // The secure WebSocket listener has no connection limit of its
+        // own in the configuration. It uses the limit of the plaintext
+        // listener, as the TLS and WebSocket listeners do.
+        let listener = native::bind_listener(&cfg.listeners.wss.bind, cfg.listeners.tcp.backlog)
+            .map_err(|e| format!("listeners.wss.bind {}: {e}", cfg.listeners.wss.bind))?;
+        info!(
+            "Kernel MQTT secure WebSocket listener on {}",
+            cfg.listeners.wss.bind
+        );
+        tokio::spawn(native::serve_native_wss(
+            listener,
+            tls_config,
+            cfg.listeners.wss.path.clone(),
+            cfg.listeners.tcp.max_connections,
+            shared.clone(),
+        ));
+    }
     serve_brokerlink(&args.brokerlink_bind, shared).await
 }
 
@@ -10538,6 +10562,12 @@ mod tests {
             triple(&changed, "wss_certfile").as_deref(),
             Some("\"/etc/indramqtt/tls/cert.pem\"")
         );
+        // A native secure WebSocket listener belongs to the kernel.
+        // The edge stands down, so the two never bind one port.
+        cfg.listeners.wss.native = true;
+        let native = edge_args(&cfg).expect("native config resolves");
+        assert_eq!(triple(&native, "wss_enabled").as_deref(), Some("false"));
+        cfg.listeners.wss.native = false;
         // The edge gets the verify switches from the resolved config.
         cfg.listeners.tls.verify_client_cert = true;
         cfg.listeners.wss.verify_client_cert = true;

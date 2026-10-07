@@ -52,10 +52,10 @@ check() { if [ "$2" = 0 ]; then pass "$1"; else fail "$1"; fi; }
 
 # Get free ports. The checks use these ports and not the defaults. Thus
 # a check is satisfactory only if the broker reads the port from the file.
-read -r API_PORT LINK_PORT MQTT_PORT WS_PORT <<EOF
+read -r API_PORT LINK_PORT MQTT_PORT WS_PORT WSS_PORT <<EOF
 $(python3 - <<'PY'
 import socket
-socks = [socket.socket() for _ in range(4)]
+socks = [socket.socket() for _ in range(5)]
 for s in socks:
     s.bind(("127.0.0.1", 0))
 print(" ".join(str(s.getsockname()[1]) for s in socks))
@@ -64,6 +64,14 @@ for s in socks:
 PY
 )
 EOF
+
+# Test certificates for the secure WebSocket check. The same files
+# serve the TLS listener tests of the kernel.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+TREE_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+WSS_CERT="$TREE_DIR/crates/broker-connectors-enterprise/testdata/server-cert.pem"
+WSS_KEY="$TREE_DIR/crates/broker-connectors-enterprise/testdata/server-key.pem"
+WSS_CA="$TREE_DIR/crates/broker-connectors-enterprise/testdata/ca-cert.pem"
 
 API_KEY_GOOD=boot-smoke-key-0001
 # With SMOKE_NATIVE=1 the kernel owns the plaintext MQTT listener
@@ -110,7 +118,28 @@ expression = "t-tcp-\${username}"
 [[tenants.rules]]
 listener = "ws"
 expression = "t-ws-\${username}"
+
+[[tenants.rules]]
+listener = "wss"
+expression = "t-ws-\${username}"
 EOF
+
+# With SMOKE_NATIVE=1 the kernel also owns the secure WebSocket
+# listener. The test certificate is the one of the kernel TLS tests.
+if [ "$NATIVE" = true ]; then
+for cert in "$WSS_CERT" "$WSS_KEY" "$WSS_CA"; do
+    [ -f "$cert" ] || { echo "FAIL: test certificate $cert is missing"; exit 2; }
+done
+cat >> "$ROOT/cfg/indra.toml" <<EOF
+[listeners.wss]
+bind = "127.0.0.1:$WSS_PORT"
+path = "/smoke"
+cert_file = "$WSS_CERT"
+key_file = "$WSS_KEY"
+enabled = true
+native = true
+EOF
+fi
 
 # --- 1. The kernel starts from the file and the credential variables ---
 INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
@@ -562,6 +591,149 @@ if ready:
 else:
     report("a TCP publish reaches a WebSocket subscriber through the kernel", False)
     report("a WebSocket publish reaches a TCP subscriber through the kernel", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+fi
+
+# --- 4a3. Secure WebSocket on the kernel listener carries MQTT ---
+# Run this check only when the kernel owns the listeners. A TLS
+# client makes the WebSocket upgrade with the mqtt subprotocol and
+# exchanges a publish with a TCP client in both directions. A client
+# without TLS gets no upgrade. A wrong path fails.
+if [ "${SMOKE_NATIVE:-0}" = 1 ]; then
+python3 - "$MQTT_PORT" "$WSS_PORT" "$WSS_CA" <<'PY'
+import base64, os, socket, ssl, struct, sys, time
+mqtt_port, wss_port, ca = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def tls_dial(port):
+    raw = wait_port(port)
+    ctx = ssl.create_default_context(cafile=ca)
+    ctx.check_hostname = False
+    return ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+def wss_upgrade(port, path, protocol=True):
+    tls = tls_dial(port)
+    key = base64.b64encode(os.urandom(16)).decode()
+    headers = (f"GET {path} HTTP/1.1\r\nHost: smoke\r\nUpgrade: websocket\r\n"
+               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+               "Sec-WebSocket-Version: 13\r\n")
+    if protocol:
+        headers += "Sec-WebSocket-Protocol: mqtt\r\n"
+    headers += "\r\n"
+    tls.sendall(headers.encode())
+    head = b""
+    tls.settimeout(5)
+    try:
+        while b"\r\n\r\n" not in head:
+            chunk = tls.recv(512)
+            if not chunk:
+                break
+            head += chunk
+    except OSError:
+        pass
+    return tls, head.split(b"\r\n")[0] if head else b""
+def ws_send(sock, payload):
+    mask = os.urandom(4)
+    length = len(payload)
+    if length < 126:
+        sock.sendall(bytes([0x82, 0x80 | length]) + mask
+                     + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+    elif length < 65536:
+        sock.sendall(struct.pack(">BBH", 0x82, 0x80 | 126, length) + mask
+                     + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+    else:
+        sock.sendall(struct.pack(">BBQ", 0x82, 0x80 | 127, length) + mask
+                     + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+def ws_recv(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        head = sock.recv(2)
+    except OSError:
+        return b""
+    if len(head) < 2:
+        return b""
+    length = head[1] & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", sock.recv(2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", sock.recv(8))[0]
+    data = b""
+    while len(data) < length:
+        try:
+            chunk = sock.recv(length - len(data))
+        except OSError:
+            break
+        if not chunk:
+            break
+        data += chunk
+    return data
+def mqtt_connect_ws(sock, client_id):
+    sock.settimeout(5)
+    ws_send(sock, packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return ws_recv(sock, 5) == b"\x20\x02\x00\x00"
+def mqtt_connect_tcp(sock, client_id):
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+good, head = wss_upgrade(wss_port, "/smoke")
+report("the kernel secure WebSocket listener answers the upgrade on its path",
+       b"101" in head)
+bad, bad_head = wss_upgrade(wss_port, "/mqtt")
+report("the kernel secure WebSocket listener refuses a wrong path",
+       b"404" in bad_head)
+bad.close()
+plain = wait_port(wss_port)
+plain.sendall((f"GET /smoke HTTP/1.1\r\nHost: smoke\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+               "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n").encode())
+plain.settimeout(5)
+try:
+    plain_head = plain.recv(12)
+except OSError:
+    plain_head = b""
+report("a client without TLS gets no upgrade on the secure port",
+       b"101" not in plain_head)
+plain.close()
+topic = b"smoke/wss/check"
+secret_tcp = os.urandom(6).hex().encode()
+secret_wss = os.urandom(6).hex().encode()
+wss = good
+wss_ok = mqtt_connect_ws(wss, b"smoke-wss-sub") if b"101" in head else False
+tcp = wait_port(mqtt_port)
+tcp_ok = mqtt_connect_tcp(tcp, b"smoke-wss-tcp")
+ready = wss_ok and tcp_ok
+if ready:
+    ws_send(wss, packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ws_recv(wss, 5)[:1] == b"\x90"
+if ready:
+    tcp.sendall(packet(0x30, field(topic) + secret_tcp))
+    report("a TCP publish reaches a secure WebSocket subscriber through the kernel",
+           ws_recv(wss, 5).endswith(secret_tcp))
+    ws_send(wss, packet(0x30, field(topic) + secret_wss))
+    tcp.settimeout(5)
+    try:
+        got = tcp.recv(100)
+    except OSError:
+        got = b""
+    report("a secure WebSocket publish reaches a TCP subscriber through the kernel",
+           got.endswith(secret_wss))
+else:
+    report("a TCP publish reaches a secure WebSocket subscriber through the kernel", False)
+    report("a secure WebSocket publish reaches a TCP subscriber through the kernel", False)
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))

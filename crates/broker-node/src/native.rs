@@ -364,6 +364,72 @@ const MAX_WS_FRAME_BYTES: usize = MAX_PACKET_BYTES;
 /// Reason: keeps the tungstenite WebSocketConfig default of 128 KiB, so small frames share one write.
 const WS_WRITE_BUFFER_BYTES: usize = 128 * 1024;
 
+/// Builds the WebSocket bound config.
+/// The frame bound matches the MQTT packet bound.
+fn ws_bound_config() -> WebSocketConfig {
+    WebSocketConfig {
+        write_buffer_size: WS_WRITE_BUFFER_BYTES,
+        max_write_buffer_size: MAX_WS_FRAME_BYTES,
+        max_message_size: Some(MAX_WS_FRAME_BYTES),
+        max_frame_size: Some(MAX_WS_FRAME_BYTES),
+        accept_unmasked_frames: false,
+        ..WebSocketConfig::default()
+    }
+}
+
+/// Checks the WebSocket upgrade request.
+/// The path must match. The client must offer the `mqtt` subprotocol.
+/// The answer selects `mqtt`. A wrong path gets 404.
+/// A missing subprotocol gets 400.
+// The callback returns the HTTP response type of the library.
+// That type exceeds the lint limit. The signature is fixed.
+#[allow(clippy::result_large_err)]
+fn ws_upgrade_answer(
+    req: &Request,
+    path: &str,
+    mut resp: Response,
+) -> Result<Response, http::Response<Option<String>>> {
+    if req.uri().path() != path {
+        let denied = http::Response::builder()
+            .status(404)
+            .body(Some("Unknown WS path".to_string()))
+            .unwrap_or_else(|_| {
+                http::Response::builder()
+                    .status(404)
+                    .body(None)
+                    .expect("empty 404 builds")
+            });
+        return Err(denied);
+    }
+    let wants_mqtt = req
+        .headers()
+        .get("Sec-WebSocket-Protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("mqtt"))
+        })
+        .unwrap_or(false);
+    if !wants_mqtt {
+        let denied = http::Response::builder()
+            .status(400)
+            .body(Some("mqtt subprotocol required".to_string()))
+            .unwrap_or_else(|_| {
+                http::Response::builder()
+                    .status(400)
+                    .body(None)
+                    .expect("empty 400 builds")
+            });
+        return Err(denied);
+    }
+    resp.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        "mqtt".parse().expect("static header parses"),
+    );
+    Ok(resp)
+}
+
 /// Accepts MQTT clients over WebSocket and runs one task for each.
 /// The HTTP upgrade requires the configured path and the `mqtt`
 /// subprotocol. A wrong path gets 404. A missing subprotocol gets
@@ -400,60 +466,12 @@ pub(super) async fn serve_native_ws(
         let accepted_at = Instant::now();
         tokio::spawn(async move {
             let _slot = slot;
-            let config = WebSocketConfig {
-                write_buffer_size: WS_WRITE_BUFFER_BYTES,
-                max_write_buffer_size: MAX_WS_FRAME_BYTES,
-                max_message_size: Some(MAX_WS_FRAME_BYTES),
-                max_frame_size: Some(MAX_WS_FRAME_BYTES),
-                accept_unmasked_frames: false,
-                ..WebSocketConfig::default()
-            };
             let ws = match tokio::time::timeout(
                 CONNECT_TIMEOUT,
                 tokio_tungstenite::accept_hdr_async_with_config(
                     stream,
-                    |req: &Request, mut resp: Response| {
-                        if req.uri().path() != path.as_str() {
-                            let denied = http::Response::builder()
-                                .status(404)
-                                .body(Some("Unknown WS path".to_string()))
-                                .unwrap_or_else(|_| {
-                                    http::Response::builder()
-                                        .status(404)
-                                        .body(None)
-                                        .expect("empty 404 builds")
-                                });
-                            return Err(denied);
-                        }
-                        let wants_mqtt = req
-                            .headers()
-                            .get("Sec-WebSocket-Protocol")
-                            .and_then(|value| value.to_str().ok())
-                            .map(|value| {
-                                value
-                                    .split(',')
-                                    .any(|token| token.trim().eq_ignore_ascii_case("mqtt"))
-                            })
-                            .unwrap_or(false);
-                        if !wants_mqtt {
-                            let denied = http::Response::builder()
-                                .status(400)
-                                .body(Some("mqtt subprotocol required".to_string()))
-                                .unwrap_or_else(|_| {
-                                    http::Response::builder()
-                                        .status(400)
-                                        .body(None)
-                                        .expect("empty 400 builds")
-                                });
-                            return Err(denied);
-                        }
-                        resp.headers_mut().insert(
-                            "Sec-WebSocket-Protocol",
-                            "mqtt".parse().expect("static header parses"),
-                        );
-                        Ok(resp)
-                    },
-                    Some(config),
+                    |req: &Request, resp: Response| ws_upgrade_answer(req, &path, resp),
+                    Some(ws_bound_config()),
                 ),
             )
             .await
@@ -484,6 +502,113 @@ pub(super) async fn serve_native_ws(
             .await
             {
                 debug!("Kernel MQTT WebSocket connection {} ended: {}", conn_id, e);
+            }
+        });
+    }
+}
+
+/// Accepts MQTT clients over secure WebSocket and runs one task for each.
+/// TLS wraps the socket first. The upgrade then runs on the TLS stream
+/// with the same path and subprotocol checks as the plain WebSocket
+/// listener. The handshake uses the same certificate settings as the
+/// TLS listener with TLS 1.2 and 1.3. A client without TLS fails the
+/// TLS handshake and the task ends. The TLS handshake has the TLS time
+/// limit. The upgrade has the connect time limit. The listener name is
+/// `wss` for tenant rules. The same packet limits, the connect timeout
+/// from accept, and `max_connections` apply as on TCP.
+// The handshake callback returns the HTTP response type of the library.
+// That type exceeds the lint limit. The signature is fixed.
+#[allow(clippy::result_large_err)]
+pub(super) async fn serve_native_wss(
+    listener: TcpListener,
+    config: Arc<rustls::ServerConfig>,
+    path: String,
+    max_connections: u32,
+    shared: Shared,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                warn!("Kernel MQTT secure WebSocket accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Some(slot) = ConnectionSlot::take(max_connections) else {
+            debug!("Kernel MQTT secure WebSocket listener is at its connection limit");
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let shared = shared.clone();
+        let acceptor = acceptor.clone();
+        let path = path.clone();
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let accepted_at = Instant::now();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let tls =
+                match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(tls)) => tls,
+                    Ok(Err(e)) => {
+                        debug!(
+                            "Kernel MQTT secure WebSocket TLS handshake with {} failed: {}",
+                            peer, e
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        debug!(
+                            "Kernel MQTT secure WebSocket TLS handshake with {} timed out",
+                            peer
+                        );
+                        return;
+                    }
+                };
+            let peer_cert = peer_cert_fields(tls.get_ref().1.peer_certificates());
+            let ws = match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                tokio_tungstenite::accept_hdr_async_with_config(
+                    tls,
+                    |req: &Request, resp: Response| ws_upgrade_answer(req, &path, resp),
+                    Some(ws_bound_config()),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(ws)) => ws,
+                Ok(Err(e)) => {
+                    debug!(
+                        "Kernel MQTT secure WebSocket handshake with {} failed: {}",
+                        peer, e
+                    );
+                    return;
+                }
+                Err(_) => {
+                    debug!(
+                        "Kernel MQTT secure WebSocket handshake with {} timed out",
+                        peer
+                    );
+                    return;
+                }
+            };
+            let io = WsIo::new(ws);
+            if let Err(e) = run_connection(
+                io,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "wss",
+                peer_cert,
+                accepted_at,
+            )
+            .await
+            {
+                debug!(
+                    "Kernel MQTT secure WebSocket connection {} ended: {}",
+                    conn_id, e
+                );
             }
         });
     }
@@ -2501,6 +2626,439 @@ mod tests {
         assert!(got_b.ends_with(b"secret-b"), "own tenant delivers");
         let other_b =
             tokio::time::timeout(Duration::from_millis(300), ws_test_recv(&mut client_a)).await;
+        assert!(other_b.is_err(), "other tenant gets nothing");
+        let _ = client_a.close(None).await;
+        let _ = client_b.close(None).await;
+    }
+
+    /// Opens a TLS session to the secure WebSocket port.
+    /// Trusts the test CA only. Sends no HTTP yet.
+    async fn wss_test_tls(port: u16) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let base = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../broker-connectors-enterprise/testdata"
+        );
+        let ca_pem = std::fs::read(format!("{base}/ca-cert.pem")).expect("test CA reads");
+        let mut reader = std::io::BufReader::new(ca_pem.as_slice());
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut reader)
+                .expect("test CA parses")
+                .into_iter()
+                .map(rustls::pki_types::CertificateDer::from)
+                .collect();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert).expect("test CA trusts");
+        }
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions hold")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client));
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("name holds");
+        connector.connect(name, tcp).await.expect("TLS opens")
+    }
+
+    /// Starts one TCP and one secure WebSocket kernel listener.
+    /// Returns the two ports. The tasks run until the test aborts them.
+    async fn wss_test_listeners(shared: Shared) -> (u16, u16) {
+        use tokio::net::TcpListener as Listener;
+        let base = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../broker-connectors-enterprise/testdata"
+        );
+        let cert = format!("{base}/server-cert.pem");
+        let key = format!("{base}/server-key.pem");
+        let tls = super::load_tls_config(&cert, &key, false).expect("test TLS loads");
+        let tcp = Listener::bind("127.0.0.1:0").await.expect("tcp binds");
+        let wss = Listener::bind("127.0.0.1:0").await.expect("wss binds");
+        let tcp_port = tcp.local_addr().expect("tcp addr").port();
+        let wss_port = wss.local_addr().expect("wss addr").port();
+        let tcp_shared = shared.clone();
+        tokio::spawn(async move {
+            serve_native_mqtt(tcp, 1000, tcp_shared).await;
+        });
+        let wss_shared = shared;
+        tokio::spawn(async move {
+            serve_native_wss(wss, tls, "/mqtt".to_string(), 1000, wss_shared).await;
+        });
+        // The accept loops need a moment to start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (tcp_port, wss_port)
+    }
+
+    /// Connects a secure WebSocket client with the `mqtt` subprotocol.
+    /// Returns the stream. The server must select `mqtt`.
+    async fn wss_test_dial(
+        wss_port: u16,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>
+    {
+        use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
+        let tls = wss_test_tls(wss_port).await;
+        let uri: http::Uri = format!("wss://127.0.0.1:{wss_port}/mqtt")
+            .parse()
+            .expect("uri parses");
+        let builder = ClientRequestBuilder::new(uri).with_sub_protocol("mqtt");
+        let (stream, response) = tokio_tungstenite::client_async_with_config(builder, tls, None)
+            .await
+            .expect("websocket dials");
+        let selected = response
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(selected, "mqtt", "server selects mqtt");
+        stream
+    }
+
+    /// Reads one binary MQTT packet from a secure WebSocket client.
+    async fn wss_test_recv(
+        stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Vec<u8> {
+        use futures::StreamExt as _;
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a message in time")
+            .expect("the stream stays open")
+            .expect("a correct frame");
+        match message {
+            tokio_tungstenite::tungstenite::protocol::Message::Binary(data) => data,
+            other => panic!("binary expected, got: {other:?}"),
+        }
+    }
+
+    /// Reads the status line of a raw HTTPS upgrade answer.
+    async fn wss_test_raw_status(port: u16, path: &str, subprotocol: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut tls = wss_test_tls(port).await;
+        let mut request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        );
+        if let Some(protocol) = subprotocol {
+            request.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
+        }
+        request.push_str("\r\n");
+        tls.write_all(request.as_bytes())
+            .await
+            .expect("request sends");
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut byte = [0u8; 1];
+                tls.read_exact(&mut byte).await.expect("a byte");
+                answer.extend_from_slice(&byte);
+                if answer.ends_with(b"\r\n\r\n") || answer.len() > 512 {
+                    break;
+                }
+                if answer.ends_with(b"\n") && answer.len() > 12 {
+                    break;
+                }
+            }
+        })
+        .await;
+        String::from_utf8_lossy(&answer)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// A secure WebSocket client and a TCP client exchange publishes.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn wss_and_tcp_clients_exchange_publishes_both_ways() {
+        use futures::SinkExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let (tcp_port, wss_port) = wss_test_listeners(shared).await;
+
+        // A TCP subscriber waits on the topic.
+        let mut tcp_sub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_sub
+            .write_all(&ws_test_connect("wss-tcp-sub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_sub
+            .write_all(&ws_test_subscribe(1, "wss/share"))
+            .await
+            .expect("tcp SUBSCRIBE sends");
+        let suback = tcp_test_recv(&mut tcp_sub).await;
+        assert_eq!(suback[0], 0x90, "TCP SUBACK answers");
+
+        // A secure WebSocket client publishes. TCP gets it.
+        let mut wss_pub = wss_test_dial(wss_port).await;
+        wss_pub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("wss-pub"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut wss_pub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WSS CONNACK accepts"
+        );
+        wss_pub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("wss/share", b"from-wss"),
+            ))
+            .await
+            .expect("wss PUBLISH sends");
+        let delivered = tcp_test_recv(&mut tcp_sub).await;
+        assert!(delivered.ends_with(b"from-wss"), "TCP gets the WSS publish");
+
+        // The reverse: WSS subscribes, TCP publishes, WSS gets it.
+        let mut wss_sub = wss_test_dial(wss_port).await;
+        wss_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("wss-sub"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut wss_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WSS CONNACK accepts"
+        );
+        wss_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "wss/back"),
+            ))
+            .await
+            .expect("wss SUBSCRIBE sends");
+        let wss_suback = wss_test_recv(&mut wss_sub).await;
+        assert_eq!(wss_suback[0], 0x90, "WSS SUBACK answers");
+        let mut tcp_pub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_pub
+            .write_all(&ws_test_connect("wss-tcp-pub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_pub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_pub
+            .write_all(&ws_test_publish("wss/back", b"from-tcp"))
+            .await
+            .expect("tcp PUBLISH sends");
+        let back = wss_test_recv(&mut wss_sub).await;
+        assert!(back.ends_with(b"from-tcp"), "WSS gets the TCP publish");
+        let _ = wss_pub.close(None).await;
+        let _ = wss_sub.close(None).await;
+    }
+
+    /// Bad upgrades and plain clients are refused on the secure port.
+    /// Goes through the broker. The broker stays up after each close.
+    #[tokio::test]
+    async fn wss_refusals_close_only_that_connection() {
+        use futures::SinkExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        let (_tcp_port, wss_port) = wss_test_listeners(shared).await;
+
+        let no_protocol = wss_test_raw_status(wss_port, "/mqtt", None).await;
+        assert!(
+            no_protocol.contains("400"),
+            "no subprotocol gets 400: {no_protocol}"
+        );
+        let wrong_path = wss_test_raw_status(wss_port, "/wrong", Some("mqtt")).await;
+        assert!(
+            wrong_path.contains("404"),
+            "wrong path gets 404: {wrong_path}"
+        );
+
+        // A client without TLS gets no upgrade answer.
+        let mut plain = tokio::net::TcpStream::connect(("127.0.0.1", wss_port))
+            .await
+            .expect("tcp dials");
+        plain
+            .write_all(
+                b"GET /mqtt HTTP/1.1\r\nHost: smoke\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n",
+            )
+            .await
+            .expect("request sends");
+        let mut head = [0u8; 12];
+        let answer =
+            tokio::time::timeout(Duration::from_secs(5), plain.read_exact(&mut head)).await;
+        if let Ok(Ok(_)) = answer {
+            assert!(
+                !head.starts_with(b"HTTP/1.1 101"),
+                "plain client gets no upgrade"
+            );
+        }
+
+        // The broker still serves a secure client after each refusal.
+        let mut fresh = wss_test_dial(wss_port).await;
+        fresh
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("wss-fresh"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut fresh).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "the broker stays up"
+        );
+        let _ = fresh.close(None).await;
+    }
+
+    /// A TLS handshake that sends nothing ends in the time limit.
+    /// Goes through the broker. The broker stays up after the close.
+    #[tokio::test]
+    async fn wss_idle_tls_handshake_times_out() {
+        use futures::SinkExt as _;
+        use tokio::io::AsyncReadExt as _;
+        let shared = Shared::new();
+        let (_tcp_port, wss_port) = wss_test_listeners(shared).await;
+
+        // A client opens the socket and sends nothing.
+        let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", wss_port))
+            .await
+            .expect("tcp dials");
+        let mut byte = [0u8; 1];
+        let end = tokio::time::timeout(Duration::from_secs(15), idle.read_exact(&mut byte)).await;
+        assert!(end.is_ok(), "an idle handshake ends in the limit");
+
+        // The broker still serves a secure client after the close.
+        let mut fresh = wss_test_dial(wss_port).await;
+        fresh
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("wss-after-idle"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut fresh).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "the broker stays up"
+        );
+        let _ = fresh.close(None).await;
+    }
+
+    /// Two tenants stay apart on the secure WebSocket path.
+    /// Goes through the broker. Each publish reaches its own tenant only.
+    #[tokio::test]
+    async fn wss_two_tenants_stay_apart() {
+        use futures::SinkExt as _;
+        let shared = Shared::new();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .tenant_registry
+            .replace(vec![broker_session::tenant::TenantRule::new(
+                "",
+                "tenant",
+                "t-${client_id}",
+            )])
+            .expect("tenant rule installs");
+        for (tenant, user, password) in [
+            ("t-wss-a", "alice", b"pw-a".as_slice()),
+            ("t-wss-b", "bob", b"pw-b".as_slice()),
+        ] {
+            shared
+                .auth
+                .add_user_in_tenant(tenant, user, password)
+                .expect("tenant user stores");
+            for action in [
+                broker_auth::AclAction::Publish,
+                broker_auth::AclAction::Subscribe,
+            ] {
+                shared
+                    .auth
+                    .add_rule_in_tenant(
+                        tenant,
+                        broker_auth::AclRule::new("*", action, "wss/tenant/#", true),
+                    )
+                    .expect("tenant rule stores");
+            }
+        }
+        let (_tcp_port, wss_port) = wss_test_listeners(shared).await;
+
+        // Each tenant connects with its own client id and credentials.
+        let mut client_a = wss_test_dial(wss_port).await;
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect_with_auth("wss-a", "alice", b"pw-a"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut client_a).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "first tenant CONNECT accepts"
+        );
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "wss/tenant/x"),
+            ))
+            .await
+            .expect("wss SUBSCRIBE sends");
+        assert_eq!(wss_test_recv(&mut client_a).await[0], 0x90);
+
+        let mut client_b = wss_test_dial(wss_port).await;
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect_with_auth("wss-b", "bob", b"pw-b"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut client_b).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "second tenant CONNECT accepts"
+        );
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "wss/tenant/x"),
+            ))
+            .await
+            .expect("wss SUBSCRIBE sends");
+        assert_eq!(wss_test_recv(&mut client_b).await[0], 0x90);
+
+        // A publish in the first tenant reaches its own subscriber only.
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("wss/tenant/x", b"secret-a"),
+            ))
+            .await
+            .expect("wss PUBLISH sends");
+        let got_a = wss_test_recv(&mut client_a).await;
+        assert!(got_a.ends_with(b"secret-a"), "own tenant delivers");
+        let other_a =
+            tokio::time::timeout(Duration::from_millis(300), wss_test_recv(&mut client_b)).await;
+        assert!(other_a.is_err(), "other tenant gets nothing");
+
+        // A publish in the second tenant reaches its own subscriber only.
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("wss/tenant/x", b"secret-b"),
+            ))
+            .await
+            .expect("wss PUBLISH sends");
+        let got_b = wss_test_recv(&mut client_b).await;
+        assert!(got_b.ends_with(b"secret-b"), "own tenant delivers");
+        let other_b =
+            tokio::time::timeout(Duration::from_millis(300), wss_test_recv(&mut client_a)).await;
         assert!(other_b.is_err(), "other tenant gets nothing");
         let _ = client_a.close(None).await;
         let _ = client_b.close(None).await;

@@ -503,6 +503,11 @@
               "description": "Path to the PEM private key for the secure WebSocket listener.",
               "type": "string"
             },
+            "native": {
+              "default": false,
+              "description": "Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them.",
+              "type": "boolean"
+            },
             "path": {
               "default": "/mqtt",
               "description": "HTTP path serving secure WebSocket traffic.",
