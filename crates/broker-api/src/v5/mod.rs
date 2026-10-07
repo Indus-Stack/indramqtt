@@ -58,10 +58,6 @@ pub fn public_router() -> Router<ApiState> {
         .route("/login/challenge", post(auth::scram_challenge))
         .route("/login/verify", post(auth::scram_verify))
         .route("/login", post(auth::direct_login))
-        // Health check. It needs no authentication, as the reference API
-        // documents. One relaxed atomic load per request; publish and
-        // deliver never touch it.
-        .route("/status", get(status::get_status))
         // Single-sign-on backend login (W2-33, C05-12): pre-auth by
         // definition (the dashboard login page calls it before anyone
         // holds a token). Management-plane only; publish and deliver
@@ -447,6 +443,10 @@ pub fn protected_router() -> Router<ApiState> {
             get(monitoring::monitor_current_node),
         )
         .route("/stats", get(monitoring::get_stats))
+        // Node status (W1-27): authenticated read of liveness.
+        // It requires a bearer token like all protected routes.
+        // The public alias `GET /status` serves load balancers.
+        .route("/status", get(status::get_status))
         .route(
             "/mqtt/auto_subscribe",
             get(auto_subscribe::get_auto_subscribe).put(auto_subscribe::put_auto_subscribe),

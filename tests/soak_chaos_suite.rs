@@ -11,9 +11,12 @@
 
 #![allow(clippy::manual_is_multiple_of)]
 
+use broker_auth::{Authenticator, MemoryAuth};
+// Kafka legs use these types (X1-10). Gate them with the tests.
+#[cfg(feature = "kafka")]
 use broker_auth::{
-    AclAction, AclRule, AuthError, Authenticator, Authorizer, KerberosAuthenticator,
-    KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth, UserQuotas,
+    AclAction, AclRule, AuthError, KerberosAuthenticator, KerberosConfig, LdapAuthenticator,
+    LdapConfig, UserQuotas,
 };
 use broker_cluster::{
     ChannelSwimNetwork, ClusterRouteTable, NodeId, NodeStatus, SwimConfig, SwimMembership,
@@ -22,16 +25,26 @@ use broker_connectors::disk_log::{
     DiskLogCompression, DiskLogFormat, DiskLogSink, DiskLogSinkConfig, DiskSyncMode,
     FileDiskLogWriter,
 };
+// Kafka legs use these sinks (X1-10). Gate them with the tests.
+#[cfg(feature = "kafka")]
 use broker_connectors::{
-    KafkaSink, KafkaSinkConfig, MemoryKafkaTransport, MemoryMySqlTransport, MemoryPgTransport,
-    MemoryRedisTransport, MySqlSink, MySqlSinkConfig, PostgreSqlSink, PostgreSqlSinkConfig,
-    RedisCommandKind, RedisSink, RedisSinkConfig,
+    MemoryMySqlTransport, MemoryPgTransport, MemoryRedisTransport, MySqlSink, MySqlSinkConfig,
+    PostgreSqlSink, PostgreSqlSinkConfig, RedisCommandKind, RedisSink, RedisSinkConfig,
 };
+// Kafka legs of the soak suite (X1-10): the `kafka` vendor SDK is off in
+// the default build, so the three tests that fan out through it run only
+// on feature builds.
+#[cfg(feature = "kafka")]
+use broker_connectors::{KafkaSink, KafkaSinkConfig, MemoryKafkaTransport};
+// Kafka legs use the gateways (X1-10). Gate them with the tests.
+#[cfg(feature = "kafka")]
 use broker_gateway::{coap, lwm2m, ocpp, GatewayManager, GatewayProtocol};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleAction, RuleEngine};
 use broker_session::{QueuedMessage, SessionManager, TokenBucket};
+// Kafka legs use the stream store (X1-10). Gate it with the tests.
+#[cfg(feature = "kafka")]
 use broker_storage::DurableStreamStore;
 use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
 use bytes::Bytes;
@@ -728,6 +741,8 @@ async fn test_soak_sensor_ingest_sql_transform_to_disk_and_storage() {
 // 8. End-to-End Multi-Target Sequential Test (Postgres, Redis, Kafka, MySQL, DiskLog)
 // ============================================================================
 
+// Kafka legs use these helpers (X1-10). Gate them with the tests.
+#[cfg(feature = "kafka")]
 #[derive(Debug, Clone)]
 struct RawSensorPacket {
     device: String,
@@ -737,6 +752,8 @@ struct RawSensorPacket {
     secret_token: String, // Confidential field that MUST be stripped by SQL projection
 }
 
+// Kafka legs use this helper (X1-10). Gate it with the tests.
+#[cfg(feature = "kafka")]
 fn build_verification_dataset(count: usize) -> (Vec<RawSensorPacket>, Vec<serde_json::Value>) {
     let mut sent = Vec::with_capacity(count);
     let mut expected = Vec::new();
@@ -775,6 +792,8 @@ fn build_verification_dataset(count: usize) -> (Vec<RawSensorPacket>, Vec<serde_
     (sent, expected)
 }
 
+// Kafka legs use this helper (X1-10). Gate it with the tests.
+#[cfg(feature = "kafka")]
 fn verify_database_records(
     target_name: &str,
     actual: &[serde_json::Value],
@@ -824,6 +843,8 @@ fn verify_database_records(
     }
 }
 
+// Kafka legs need the `kafka` feature (X1-10); skipped otherwise.
+#[cfg(feature = "kafka")]
 #[tokio::test]
 async fn test_e2e_sequential_all_free_targets_with_rule_engine_and_zero_disk_residue() {
     let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::Block));
@@ -1272,6 +1293,8 @@ async fn test_e2e_sequential_all_free_targets_with_rule_engine_and_zero_disk_res
 // 9. End-to-End User Creation, Authorisation, ACL Rules & Tenant Isolation
 // ============================================================================
 
+// Kafka legs need the `kafka` feature (X1-10); skipped otherwise.
+#[cfg(feature = "kafka")]
 #[tokio::test]
 async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
     // ------------------------------------------------------------------------
@@ -1827,6 +1850,8 @@ async fn test_e2e_user_creation_authorisation_acl_rules_and_tenant_isolation() {
 // 10. Multi-Protocol Gateways, Enterprise Auth & Durable Stream Replay
 // ============================================================================
 
+// Kafka legs need the `kafka` feature (X1-10); skipped otherwise.
+#[cfg(feature = "kafka")]
 #[tokio::test]
 async fn test_e2e_gateways_enterprise_auth_and_durable_stream_replay() {
     // ------------------------------------------------------------------------

@@ -6731,6 +6731,8 @@ mod tests {
         }
     }
 
+    // Needs the `kafka` heavy SDK (X1-10); runs on feature builds.
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn test_into_connector_desugars_to_forward_action() {
         use broker_connectors::{KafkaSink, KafkaSinkConfig, MemoryKafkaTransport};
@@ -6834,6 +6836,8 @@ mod tests {
     /// (Kafka, Redis, MySQL, ClickHouse, InfluxDB) via distinct
     /// connectors. TCP sinks use in-memory transports, HTTP sinks use
     /// in-process axum fakes: no broker anywhere in the loop.
+    // Needs the `kafka` + `clickhouse` heavy SDKs (X1-10).
+    #[cfg(all(feature = "kafka", feature = "clickhouse"))]
     #[tokio::test]
     async fn test_rule_fans_out_to_five_analytical_sinks() {
         use axum::{extract::State, routing::post, Router};
@@ -7291,8 +7295,13 @@ mod tests {
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the Kinesis, GCP Pub/Sub, Azure Event Hubs
     /// and Pulsar mocks. All transports are in-memory.
-    /// X1-09: needs the `azure_eventhubs` feature (absent by default).
-    #[cfg(feature = "azure_eventhubs")]
+    // Needs the `azure_eventhubs`, `gcp_pubsub` and `kinesis` heavy
+    // SDKs; runs on feature builds.
+    #[cfg(all(
+        feature = "azure_eventhubs",
+        feature = "gcp_pubsub",
+        feature = "kinesis"
+    ))]
     #[tokio::test]
     async fn test_into_fans_out_to_cloud_sinks() {
         use broker_connectors_enterprise::{
@@ -7861,6 +7870,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the MongoDB, MSSQL, Cassandra and Couchbase
     /// mocks with zero drops. All transports are in-memory.
+    // Needs the `mongodb` + `cassandra` + `couchbase` heavy SDKs (X1-10).
+    #[cfg(all(feature = "mongodb", feature = "cassandra", feature = "couchbase"))]
     #[tokio::test]
     async fn test_into_fans_out_to_database_sinks() {
         use broker_connectors_enterprise::{
@@ -8353,8 +8364,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the Snowflake, Databricks, Doris, BigQuery
     /// and Redshift mocks with zero drops. All transports in-memory.
-    /// X1-09: needs the `bigquery` feature (absent by default).
-    #[cfg(feature = "bigquery")]
+    // Needs the `bigquery` heavy SDK (with its `gcp_pubsub` auth stack);
+    // runs on feature builds.
+    #[cfg(all(feature = "bigquery", feature = "gcp_pubsub"))]
     #[tokio::test]
     async fn test_into_fans_out_to_lakehouse_sinks() {
         use broker_connectors_enterprise::{
@@ -8637,8 +8649,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// `SdkBigQueryTransport` to a loopback `insertAll` fake. Row count is
     /// asserted on the fake (not just the sink counters), plus selective
     /// requeue of only failed rows through the same rule path.
-    /// X1-09: needs the `bigquery` feature (absent by default).
-    #[cfg(feature = "bigquery")]
+    // Needs the `bigquery` heavy SDK (with its `gcp_pubsub` auth stack);
+    // runs on feature builds.
+    #[cfg(all(feature = "bigquery", feature = "gcp_pubsub"))]
     #[tokio::test]
     async fn test_bigquery_sdk_sink_via_rule_against_fake() {
         use axum::{extract::State, http::StatusCode, routing::post, Router};
@@ -8973,8 +8986,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// through five streaming SQL `INTO connector(...)` rules and lands
     /// simultaneously in the Azure Blob, Tablestore, S3 Tables,
     /// Confluent and RocketMQ mocks. All transports are in-memory.
-    /// X1-09: needs the `azure_blob` feature (absent by default).
-    #[cfg(feature = "azure_blob")]
+    // Needs the `azure_blob` and `confluent` heavy SDKs; runs on feature
+    // builds.
+    #[cfg(all(feature = "azure_blob", feature = "confluent"))]
     #[tokio::test]
     async fn test_into_fans_out_to_storage_messaging_sinks() {
         use broker_connectors_enterprise::{

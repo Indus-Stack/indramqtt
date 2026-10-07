@@ -4,13 +4,18 @@
 //! Community connectors: light sinks with no vendor SDK.
 //!
 //! Default build (no features): `postgres`, `mysql`, `redis`,
-//! `mqtt_bridge`, `http`, `disk_log`, `clickhouse`, `kafka`,
-//! `rabbitmq`, `elasticsearch`, `influxdb`, `greptimedb`, `opentsdb`,
-//! `timescaledb`, `cloud_tls` and the `webhook`/`console`/`test` shims.
-//! The `s3` sink is in the build only with the Cargo feature `s3`.
-//! With the feature off, the registration of that kind fails with an
-//! error that names the feature. Release builds use the `full` feature
-//! of `broker-node`, which adds all gated kinds.
+//! `mqtt_bridge`, `http`, `disk_log`, `influxdb`, `greptimedb`,
+//! `opentsdb`, `timescaledb`, `kinesis`, `mssql`, `redshift`,
+//! `sparkplug_b`, `tdengine`, `cloud_tls` and the
+//! `webhook`/`console`/`test` shims. Each heavy vendor SDK stays
+//! off unless its Cargo feature is on: `s3`, `clickhouse`,
+//! `kafka`, `elasticsearch` and `rabbitmq`. Wide-column and
+//! streaming sinks live in the enterprise crate. Each has its
+//! own feature there. A feature build (or `--all-features`)
+//! restores the full set. An unresolvable kind fails closed
+//! with an error naming the missing feature. Release builds use
+//! the `full` feature of `broker-node`, which adds all gated
+//! kinds. New B3 sinks land behind features from the start.
 //!
 //! The modules `kinesis`, `mssql`, `redshift`, `sparkplug_b` and
 //! `tdengine` in this crate contain tests only. Those sinks are in
@@ -27,13 +32,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+#[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 pub mod cloud_tls;
 pub mod disk_log;
+#[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
 pub mod greptimedb;
 pub mod http;
 pub mod influxdb;
+#[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod kinesis;
 pub mod mqtt_bridge;
@@ -41,6 +49,7 @@ pub mod mssql;
 pub mod mysql;
 pub mod opentsdb;
 pub mod postgres;
+#[cfg(feature = "rabbitmq")]
 pub mod rabbitmq;
 pub mod redis;
 pub mod redshift;
@@ -50,6 +59,7 @@ pub mod sparkplug_b;
 pub mod tdengine;
 pub mod timescaledb;
 
+#[cfg(feature = "clickhouse")]
 pub use clickhouse::{
     CapturedClickHouseBatch, ClickHouseConnector, ClickHouseRow, ClickHouseSink,
     ClickHouseSinkConfig, ClickHouseTransport, DriverClickHouseTransport, HttpClickHouseTransport,
@@ -59,6 +69,7 @@ pub use disk_log::{
     BackupInfo, DiskLogCompression, DiskLogConnector, DiskLogFormat, DiskLogSink,
     DiskLogSinkConfig, DiskLogWriter, DiskSyncMode, FileDiskLogWriter, MemoryDiskLogWriter,
 };
+#[cfg(feature = "elasticsearch")]
 pub use elasticsearch::{
     BulkOutcome, CapturedBulk, DriverElasticsearchTransport, ElasticsearchAuth,
     ElasticsearchConnector, ElasticsearchSink, ElasticsearchSinkConfig, ElasticsearchTransport,
@@ -76,10 +87,13 @@ pub use http::{
     HttpTransport, MockHttpOutcome, MockHttpTransport, ReqwestHttpTransport,
 };
 pub use influxdb::{InfluxDbConnector, InfluxDbSink, InfluxDbSinkConfig};
+#[cfg(feature = "kafka")]
 pub use kafka::{
-    classify_driver_error as classify_kafka_driver_error,
-    is_terminal_driver_message as is_kafka_terminal_driver_message,
-    rdkafka_client_config as rdkafka_kafka_client_config, KafkaRecord, KafkaSink, KafkaSinkConfig,
+    classify_driver_error as classify_kafka_driver_error, decode_api_versions_response,
+    encode_api_versions_request, encode_produce_request, encode_record_batch_v2,
+    encode_request_header, is_terminal_driver_message as is_kafka_terminal_driver_message, murmur2,
+    parse_acks, partition_for_key, rdkafka_client_config as rdkafka_kafka_client_config,
+    read_response, render_topic_template, send_frame, KafkaRecord, KafkaSink, KafkaSinkConfig,
     KafkaTransport, MemoryKafkaTransport, RdkafkaKafkaTransport, TcpKafkaTransport,
 };
 pub use mqtt_bridge::{
@@ -102,6 +116,7 @@ pub use postgres::{
     DriverPgTransport, MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink,
     PostgreSqlSinkConfig, TcpPgTransport,
 };
+#[cfg(feature = "rabbitmq")]
 pub use rabbitmq::{
     AmqpFrame, LapinRabbitTransport, MemoryAmqpTransport, RabbitMqSink, RabbitMqSinkConfig,
     RabbitMqTransport, TcpRabbitTransport,
@@ -171,6 +186,49 @@ pub fn connector_tier(kind: &str) -> &'static str {
         | "alloydb" | "datalayers" => "enterprise",
         _ => "community",
     }
+}
+
+/// Connector kinds compiled into this feature build (X1-10 feature
+/// matrix): every light sink is always present; each heavy SDK kind is
+/// present only when its Cargo feature is enabled. A kind absent here is
+/// unresolvable in this build: registration fails closed with an error
+/// naming the missing feature.
+pub fn compiled_kinds() -> Vec<&'static str> {
+    // `mut` is needed only when a heavy feature is enabled; the allow
+    // keeps the default (light-only) build warning-free.
+    #[allow(unused_mut)]
+    let mut kinds = vec![
+        "postgres",
+        "mysql",
+        "redis",
+        "mqtt_bridge",
+        "http",
+        "disk_log",
+        "influxdb",
+        "greptimedb",
+        "opentsdb",
+        "timescaledb",
+        "kinesis",
+        "mssql",
+        "redshift",
+        "sparkplug_b",
+        "tdengine",
+        "cloud_tls",
+        "webhook",
+        "console",
+        "test",
+    ];
+    #[cfg(feature = "s3")]
+    kinds.push("s3");
+    #[cfg(feature = "clickhouse")]
+    kinds.push("clickhouse");
+    #[cfg(feature = "kafka")]
+    kinds.push("kafka");
+    #[cfg(feature = "elasticsearch")]
+    kinds.push("elasticsearch");
+    #[cfg(feature = "rabbitmq")]
+    kinds.push("rabbitmq");
+    kinds
 }
 
 /// Manager-side handle pairing an id with its sink.
@@ -748,6 +806,31 @@ mod tests {
         }
     }
 
+    /// Probe broker entry for the matrix test. The rule engine needs a
+    /// live `BrokerSink` to publish through. It records what the broker
+    /// delivers.
+    #[derive(Debug, Default)]
+    struct RuleProbeSink {
+        published: StdMutex<Vec<(Topic, Bytes, QoS, bool)>>,
+    }
+
+    #[async_trait]
+    impl broker_rules::BrokerSink for RuleProbeSink {
+        async fn publish(
+            &self,
+            topic: Topic,
+            payload: Bytes,
+            qos: QoS,
+            retain: bool,
+        ) -> std::result::Result<(), broker_rules::RuleEngineError> {
+            self.published
+                .lock()
+                .unwrap()
+                .push((topic, payload, qos, retain));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn test_connector_manager_registry() {
         let manager = ConnectorManager::new();
@@ -824,6 +907,167 @@ mod tests {
                 connector_tier(kind),
                 "community",
                 "{kind} must be community"
+            );
+        }
+    }
+
+    /// X1-10 feature matrix: the default build holds exactly the stated
+    /// light set. The test proves the set through the broker. It
+    /// registers one sink per compiled kind with the rule engine. It
+    /// adds one rule per kind and publishes through the rule engine.
+    /// It asserts exact delivery into every sink. Each heavy kind tracks
+    /// its Cargo feature exactly, so per-feature builds carry their sink
+    /// alone and the full-feature build carries all of them.
+    /// Matrix sink for the feature test. It implements the rule
+    /// engine sink trait. It counts each delivery.
+    struct MatrixSink {
+        logged: AtomicU64,
+    }
+
+    impl MatrixSink {
+        fn new() -> Self {
+            Self {
+                logged: AtomicU64::new(0),
+            }
+        }
+
+        fn logged_count(&self) -> u64 {
+            self.logged.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl broker_connectors_enterprise::Sink for MatrixSink {
+        async fn send(
+            &self,
+            _topic: &Topic,
+            _payload: &Bytes,
+            _qos: QoS,
+        ) -> broker_connectors_enterprise::Result<()> {
+            self.logged.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn kind(&self) -> &'static str {
+            "console"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_feature_matrix_compiled_kinds() {
+        let engine =
+            broker_rules::RuleEngine::new(65_536, broker_rules::BackpressurePolicy::DropOldest);
+        let kinds = compiled_kinds();
+        let mut sinks: Vec<Arc<MatrixSink>> = Vec::with_capacity(kinds.len());
+        for kind in &kinds {
+            let sink = Arc::new(MatrixSink::new());
+            engine.connectors().register(*kind, sink.clone());
+            sinks.push(sink);
+        }
+        // The list comes from the running registry.
+        let ids = engine.connectors().ids();
+        assert_eq!(
+            ids.len(),
+            kinds.len(),
+            "registry lists each compiled kind once"
+        );
+        for kind in &kinds {
+            assert!(
+                ids.contains(&kind.to_string()),
+                "registry lists compiled kind `{kind}`"
+            );
+        }
+        // Light sinks are always compiled in.
+        for light in [
+            "postgres",
+            "mysql",
+            "redis",
+            "mqtt_bridge",
+            "http",
+            "disk_log",
+            "influxdb",
+            "greptimedb",
+            "opentsdb",
+            "timescaledb",
+            "kinesis",
+            "mssql",
+            "redshift",
+            "sparkplug_b",
+            "tdengine",
+            "cloud_tls",
+            "webhook",
+            "console",
+            "test",
+        ] {
+            assert!(
+                ids.contains(&light.to_string()),
+                "light sink `{light}` must be compiled in"
+            );
+        }
+        // Each heavy kind is present exactly when its feature is enabled.
+        assert_eq!(
+            ids.contains(&"s3".to_string()),
+            cfg!(feature = "s3"),
+            "s3 tracks its feature"
+        );
+        assert_eq!(
+            ids.contains(&"clickhouse".to_string()),
+            cfg!(feature = "clickhouse"),
+            "clickhouse tracks its feature"
+        );
+        assert_eq!(
+            ids.contains(&"kafka".to_string()),
+            cfg!(feature = "kafka"),
+            "kafka tracks its feature"
+        );
+        assert_eq!(
+            ids.contains(&"elasticsearch".to_string()),
+            cfg!(feature = "elasticsearch"),
+            "elasticsearch tracks its feature"
+        );
+        assert_eq!(
+            ids.contains(&"rabbitmq".to_string()),
+            cfg!(feature = "rabbitmq"),
+            "rabbitmq tracks its feature"
+        );
+        // Default build holds exactly the stated light set, nothing more.
+        #[cfg(not(any(
+            feature = "s3",
+            feature = "clickhouse",
+            feature = "kafka",
+            feature = "elasticsearch",
+            feature = "rabbitmq"
+        )))]
+        assert_eq!(ids.len(), 19, "default build holds exactly the light set");
+        // Through the broker: one rule per compiled kind, then one
+        // publish per kind through the rule engine. Each publish
+        // reaches exactly its own sink once.
+        for kind in &kinds {
+            engine
+                .create_rule(
+                    format!("matrix-{kind}"),
+                    broker_protocol::TopicFilter::new(format!("matrix/{kind}")).unwrap(),
+                    Some(format!(
+                        r#"SELECT client_id, temp FROM "matrix/{kind}" WHERE temp > 20.0 INTO connector("{kind}")"#
+                    )),
+                    true,
+                    vec![],
+                )
+                .expect("matrix rule creates");
+        }
+        let probe: Arc<dyn broker_rules::BrokerSink> = Arc::new(RuleProbeSink::default());
+        let payload = Bytes::from_static(br#"{ "client_id": "device-42", "temp": 22.5 }"#);
+        for kind in &kinds {
+            let topic = Topic::new(format!("matrix/{kind}")).unwrap();
+            engine
+                .dispatch_ingress(&topic, &payload, QoS::AtMostOnce, &probe)
+                .await;
+        }
+        for (kind, sink) in kinds.iter().zip(sinks.iter()) {
+            assert_eq!(
+                sink.logged_count(),
+                1,
+                "kind `{kind}` delivers its publish through the rule path"
             );
         }
     }
