@@ -472,6 +472,11 @@
               "default": "/mqtt",
               "description": "HTTP path serving MQTT-over-WebSocket traffic.",
               "type": "string"
+            },
+            "native": {
+              "default": false,
+              "description": "Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them.",
+              "type": "boolean"
             }
           },
           "type": "object"

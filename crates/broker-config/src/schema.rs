@@ -167,6 +167,13 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "HTTP path serving MQTT-over-WebSocket traffic.",
             },
             FieldDoc {
+                path: "listeners.ws.native",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them.",
+            },
+            FieldDoc {
                 path: "listeners.wss.enabled",
                 setting_type: "bool",
                 default: "false",
@@ -962,6 +969,9 @@ pub struct WsListenerConf {
     /// HTTP path serving MQTT-over-WebSocket traffic.
     #[serde(default = "default_ws_path")]
     pub path: String,
+    /// Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them.
+    #[serde(default = "default_false")]
+    pub native: bool,
 }
 
 // Reason: keeps the dashboard test console reachable without extra setup.
@@ -979,6 +989,7 @@ impl Default for WsListenerConf {
             enabled: true,
             bind: default_ws_bind(),
             path: default_ws_path(),
+            native: false,
         }
     }
 }
@@ -2722,6 +2733,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "/mqtt",
                     "HTTP path serving MQTT-over-WebSocket traffic.",
                 ),
+                bool_field("ws.native", false, "Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them."),
                 bool_field(
                     "wss.enabled",
                     false,

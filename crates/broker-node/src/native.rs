@@ -19,12 +19,17 @@ use broker_protocol::wire::{self, kind, ConnackProperties, PublishOut, WireError
 use broker_session::SessionKey;
 use brokerlink::{BrokerFrame, BrokerLinkError, BrokerLinkTransport, OpCode};
 use bytes::{Bytes, BytesMut};
+use futures::{Sink, Stream};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tracing::{debug, error, warn};
 
 /// Connection identifiers of kernel-owned connections start here. The
@@ -123,17 +128,17 @@ pub(super) async fn serve_native_mqtt(listener: TcpListener, max_connections: u3
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-        let (reader, writer) = stream.into_split();
+        let accepted_at = Instant::now();
         tokio::spawn(async move {
             let _slot = slot;
             if let Err(e) = run_connection(
-                reader,
-                writer,
+                stream,
                 peer.ip().to_string(),
                 conn_id,
                 shared,
                 "tcp",
                 PeerCert::default(),
+                accepted_at,
             )
             .await
             {
@@ -319,6 +324,7 @@ pub(super) async fn serve_native_mqtts(
         let shared = shared.clone();
         let acceptor = acceptor.clone();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let accepted_at = Instant::now();
         tokio::spawn(async move {
             let _slot = slot;
             let tls =
@@ -334,21 +340,365 @@ pub(super) async fn serve_native_mqtts(
                     }
                 };
             let peer_cert = peer_cert_fields(tls.get_ref().1.peer_certificates());
-            let (reader, writer) = tokio::io::split(tls);
             if let Err(e) = run_connection(
-                reader,
-                writer,
+                tls,
                 peer.ip().to_string(),
                 conn_id,
                 shared,
                 "tls",
                 peer_cert,
+                accepted_at,
             )
             .await
             {
                 debug!("Kernel MQTT TLS connection {} ended: {}", conn_id, e);
             }
         });
+    }
+}
+
+/// WebSocket frame and message bound in bytes.
+/// Reason: matches the MQTT packet bound, so one peer cannot grow memory.
+const MAX_WS_FRAME_BYTES: usize = MAX_PACKET_BYTES;
+/// Target size of the WebSocket write buffer in bytes.
+/// Reason: keeps the tungstenite WebSocketConfig default of 128 KiB, so small frames share one write.
+const WS_WRITE_BUFFER_BYTES: usize = 128 * 1024;
+
+/// Accepts MQTT clients over WebSocket and runs one task for each.
+/// The HTTP upgrade requires the configured path and the `mqtt`
+/// subprotocol. A wrong path gets 404. A missing subprotocol gets
+/// 400. MQTT travels in binary frames. A text frame is a protocol
+/// error and closes the connection. Ping gets pong. The listener
+/// name is `ws` for tenant rules. The same packet limits, the
+/// connect timeout from accept, and `max_connections` apply as on TCP.
+// The handshake callback returns the HTTP response type of the library.
+// That type exceeds the lint limit. The signature is fixed.
+#[allow(clippy::result_large_err)]
+pub(super) async fn serve_native_ws(
+    listener: TcpListener,
+    path: String,
+    max_connections: u32,
+    shared: Shared,
+) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                warn!("Kernel MQTT WebSocket accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Some(slot) = ConnectionSlot::take(max_connections) else {
+            debug!("Kernel MQTT WebSocket listener is at its connection limit");
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let shared = shared.clone();
+        let path = path.clone();
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let accepted_at = Instant::now();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let config = WebSocketConfig {
+                write_buffer_size: WS_WRITE_BUFFER_BYTES,
+                max_write_buffer_size: MAX_WS_FRAME_BYTES,
+                max_message_size: Some(MAX_WS_FRAME_BYTES),
+                max_frame_size: Some(MAX_WS_FRAME_BYTES),
+                accept_unmasked_frames: false,
+                ..WebSocketConfig::default()
+            };
+            let ws = match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                tokio_tungstenite::accept_hdr_async_with_config(
+                    stream,
+                    |req: &Request, mut resp: Response| {
+                        if req.uri().path() != path.as_str() {
+                            let denied = http::Response::builder()
+                                .status(404)
+                                .body(Some("Unknown WS path".to_string()))
+                                .unwrap_or_else(|_| {
+                                    http::Response::builder()
+                                        .status(404)
+                                        .body(None)
+                                        .expect("empty 404 builds")
+                                });
+                            return Err(denied);
+                        }
+                        let wants_mqtt = req
+                            .headers()
+                            .get("Sec-WebSocket-Protocol")
+                            .and_then(|value| value.to_str().ok())
+                            .map(|value| {
+                                value
+                                    .split(',')
+                                    .any(|token| token.trim().eq_ignore_ascii_case("mqtt"))
+                            })
+                            .unwrap_or(false);
+                        if !wants_mqtt {
+                            let denied = http::Response::builder()
+                                .status(400)
+                                .body(Some("mqtt subprotocol required".to_string()))
+                                .unwrap_or_else(|_| {
+                                    http::Response::builder()
+                                        .status(400)
+                                        .body(None)
+                                        .expect("empty 400 builds")
+                                });
+                            return Err(denied);
+                        }
+                        resp.headers_mut().insert(
+                            "Sec-WebSocket-Protocol",
+                            "mqtt".parse().expect("static header parses"),
+                        );
+                        Ok(resp)
+                    },
+                    Some(config),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(ws)) => ws,
+                Ok(Err(e)) => {
+                    debug!(
+                        "Kernel MQTT WebSocket handshake with {} failed: {}",
+                        peer, e
+                    );
+                    return;
+                }
+                Err(_) => {
+                    debug!("Kernel MQTT WebSocket handshake with {} timed out", peer);
+                    return;
+                }
+            };
+            let io = WsIo::new(ws);
+            if let Err(e) = run_connection(
+                io,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "ws",
+                PeerCert::default(),
+                accepted_at,
+            )
+            .await
+            {
+                debug!("Kernel MQTT WebSocket connection {} ended: {}", conn_id, e);
+            }
+        });
+    }
+}
+
+/// One WebSocket connection as a byte transport.
+/// Binary payloads are MQTT bytes. Ping gets pong. Text is an error.
+struct WsIo<S> {
+    /// The WebSocket stream. It yields messages and takes replies.
+    inner: S,
+    /// Binary bytes not yet read by the MQTT layer.
+    pending_in: BytesMut,
+    /// MQTT bytes not yet sent as a binary frame.
+    pending_out: Vec<u8>,
+    /// Pong payloads that wait for the next flush.
+    pending_pong: Vec<Vec<u8>>,
+}
+
+impl<S> WsIo<S> {
+    /// Wraps a WebSocket stream as a byte transport.
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            pending_in: BytesMut::new(),
+            pending_out: Vec::new(),
+            pending_pong: Vec::new(),
+        }
+    }
+}
+
+/// Starts one send when the sink is ready. Queues nothing.
+fn ws_poll_send<S>(
+    inner: Pin<&mut S>,
+    cx: &mut Context<'_>,
+    message: Message,
+) -> Poll<std::io::Result<()>>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let mut inner = inner;
+    match inner.as_mut().poll_ready(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(())) => match inner.as_mut().start_send(message) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("websocket send failed: {e}"),
+            ))),
+        },
+        Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!("websocket send failed: {e}"),
+        ))),
+    }
+}
+
+impl<S> AsyncRead for WsIo<S>
+where
+    S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if !this.pending_in.is_empty() {
+            let take = this.pending_in.len().min(buf.remaining());
+            buf.put_slice(&this.pending_in[..take]);
+            let _ = this.pending_in.split_to(take);
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            let next = Pin::new(&mut this.inner).poll_next(cx);
+            match next {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("websocket read failed: {e}"),
+                    )));
+                }
+                Poll::Ready(Some(Ok(message))) => match message {
+                    Message::Binary(data) => {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if data.len() > MAX_WS_FRAME_BYTES {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionAborted,
+                                "websocket frame is too large",
+                            )));
+                        }
+                        let take = data.len().min(buf.remaining());
+                        buf.put_slice(&data[..take]);
+                        if take < data.len() {
+                            this.pending_in.extend_from_slice(&data[take..]);
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                    Message::Ping(payload) => {
+                        match ws_poll_send(
+                            Pin::new(&mut this.inner),
+                            cx,
+                            Message::Pong(payload.clone()),
+                        ) {
+                            Poll::Ready(Ok(())) => {}
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => this.pending_pong.push(payload),
+                        }
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Text(_) => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "text frame on an MQTT transport",
+                        )));
+                    }
+                    Message::Close(_) => return Poll::Ready(Ok(())),
+                    _ => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "unsupported websocket frame",
+                        )));
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl<S> AsyncWrite for WsIo<S>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        // One flush sends the batch as one binary frame. The batch
+        // holds at most EGRESS_BATCH_BYTES, far below the frame bound.
+        self.pending_out.extend_from_slice(data);
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        // Readiness runs before any take, so no bytes are lost.
+        while !this.pending_pong.is_empty() {
+            match Pin::new(&mut this.inner).poll_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("websocket send failed: {e}"),
+                    )));
+                }
+                Poll::Ready(Ok(())) => {}
+            }
+            let Some(payload) = this.pending_pong.pop() else {
+                break;
+            };
+            if let Err(e) = Pin::new(&mut this.inner).start_send(Message::Pong(payload)) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("websocket send failed: {e}"),
+                )));
+            }
+        }
+        if !this.pending_out.is_empty() {
+            match Pin::new(&mut this.inner).poll_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("websocket send failed: {e}"),
+                    )));
+                }
+                Poll::Ready(Ok(())) => {}
+            }
+            let data = std::mem::take(&mut this.pending_out);
+            if let Err(e) = Pin::new(&mut this.inner).start_send(Message::Binary(data)) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("websocket send failed: {e}"),
+                )));
+            }
+        }
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("websocket flush failed: {e}"),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_close(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("websocket close failed: {e}"),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -838,18 +1188,17 @@ impl Drop for ConnGuard {
     }
 }
 
-async fn run_connection<R, W>(
-    mut reader: R,
-    mut writer: W,
+async fn run_connection<S>(
+    mut io: S,
     peer: String,
     conn_id: u64,
     shared: Shared,
     listener: &str,
     peer_cert: PeerCert,
+    accepted_at: Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
     let waker = Arc::new(tokio::sync::Notify::new());
@@ -873,7 +1222,6 @@ where
         keepalive: None,
         peer,
     };
-    let started = Instant::now();
     let mut last_packet = Instant::now();
 
     let stop = loop {
@@ -881,7 +1229,7 @@ where
         let deadline = if conn.connected {
             conn.keepalive.map(|keepalive| last_packet + keepalive)
         } else {
-            Some(started + CONNECT_TIMEOUT)
+            Some(accepted_at + CONNECT_TIMEOUT)
         };
         let timer = async {
             match deadline {
@@ -890,7 +1238,7 @@ where
             }
         };
         tokio::select! {
-            read = reader.read_buf(&mut inbuf) => {
+            read = io.read_buf(&mut inbuf) => {
                 match read {
                     Ok(0) | Err(_) => break Stop::Abnormal,
                     Ok(_) => {}
@@ -916,7 +1264,7 @@ where
                 match drained {
                     Ok(None) => {}
                     Ok(Some(stop)) => {
-                        let _ = flush(&sink, &mut writer).await;
+                        let _ = flush(&sink, &mut io).await;
                         break stop;
                     }
                     Err(reason) => {
@@ -939,7 +1287,7 @@ where
             }
             () = timer => break Stop::Abnormal,
         }
-        if flush(&sink, &mut writer).await.is_err() {
+        if flush(&sink, &mut io).await.is_err() {
             break Stop::Abnormal;
         }
         if sink.close.load(Ordering::Relaxed) {
@@ -960,7 +1308,7 @@ where
         fire_will,
     )
     .await;
-    let _ = writer.shutdown().await;
+    let _ = io.shutdown().await;
     Ok(())
 }
 
@@ -1622,5 +1970,539 @@ mod tests {
         let key = format!("{base}/server-key.pem");
         assert!(super::load_tls_config(&cert, &key, false).is_ok());
         assert!(super::load_tls_config(&cert, &key, true).is_ok());
+    }
+
+    /// Builds a small MQTT 3.1.1 CONNECT packet.
+    fn ws_test_connect(client_id: &str) -> Vec<u8> {
+        let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id.as_bytes());
+        let mut packet = vec![0x10, body.len() as u8];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Builds a CONNECT packet with username and password.
+    fn ws_test_connect_with_auth(client_id: &str, username: &str, password: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0xC2, 0x00, 0x3C];
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id.as_bytes());
+        body.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        body.extend_from_slice(username.as_bytes());
+        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        body.extend_from_slice(password);
+        let mut packet = vec![0x10, body.len() as u8];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Builds a small SUBSCRIBE packet for one filter.
+    fn ws_test_subscribe(packet_id: u16, filter: &str) -> Vec<u8> {
+        let mut body = packet_id.to_be_bytes().to_vec();
+        body.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+        body.extend_from_slice(filter.as_bytes());
+        body.push(0x00);
+        let mut packet = vec![0x82, body.len() as u8];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Builds a small QoS 0 PUBLISH packet.
+    fn ws_test_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(topic.as_bytes());
+        body.extend_from_slice(payload);
+        let mut packet = vec![0x30, body.len() as u8];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Starts one TCP and one WebSocket kernel listener on one [`Shared`].
+    /// Returns the two ports. The tasks run until the test aborts them.
+    async fn ws_test_listeners(shared: Shared) -> (u16, u16) {
+        use tokio::net::TcpListener as Listener;
+        let tcp = Listener::bind("127.0.0.1:0").await.expect("tcp binds");
+        let ws = Listener::bind("127.0.0.1:0").await.expect("ws binds");
+        let tcp_port = tcp.local_addr().expect("tcp addr").port();
+        let ws_port = ws.local_addr().expect("ws addr").port();
+        let tcp_shared = shared.clone();
+        tokio::spawn(async move {
+            serve_native_mqtt(tcp, 1000, tcp_shared).await;
+        });
+        let ws_shared = shared;
+        tokio::spawn(async move {
+            serve_native_ws(ws, "/mqtt".to_string(), 1000, ws_shared).await;
+        });
+        // The accept loops need a moment to start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (tcp_port, ws_port)
+    }
+
+    /// Connects a WebSocket client with the `mqtt` subprotocol.
+    /// Returns the stream. The server must select `mqtt`.
+    async fn ws_test_dial(
+        ws_port: u16,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
+        let uri: http::Uri = format!("ws://127.0.0.1:{ws_port}/mqtt")
+            .parse()
+            .expect("uri parses");
+        let builder = ClientRequestBuilder::new(uri).with_sub_protocol("mqtt");
+        let (stream, response) = tokio_tungstenite::connect_async(builder)
+            .await
+            .expect("websocket dials");
+        let selected = response
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(selected, "mqtt", "server selects mqtt");
+        stream
+    }
+
+    /// Reads one binary MQTT packet from a WebSocket client.
+    async fn ws_test_recv(
+        stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Vec<u8> {
+        use futures::StreamExt as _;
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a message in time")
+            .expect("the stream stays open")
+            .expect("a correct frame");
+        match message {
+            tokio_tungstenite::tungstenite::protocol::Message::Binary(data) => data,
+            other => panic!("binary expected, got: {other:?}"),
+        }
+    }
+
+    /// Reads one MQTT packet from a plaintext TCP client.
+    async fn tcp_test_recv(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let mut head = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+            .await
+            .expect("a header in time")
+            .expect("the socket stays open");
+        let length = head[1] as usize;
+        let mut packet = head.to_vec();
+        if length > 0 {
+            let mut body = vec![0u8; length];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut body))
+                .await
+                .expect("a body in time")
+                .expect("the socket stays open");
+            packet.extend_from_slice(&body);
+        }
+        packet
+    }
+
+    /// A WebSocket client and a TCP client exchange publishes both ways.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn ws_and_tcp_clients_exchange_publishes_both_ways() {
+        use futures::SinkExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let (tcp_port, ws_port) = ws_test_listeners(shared).await;
+
+        // A TCP subscriber waits on the topic.
+        let mut tcp_sub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_sub
+            .write_all(&ws_test_connect("ws-tcp-sub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_sub
+            .write_all(&ws_test_subscribe(1, "ws/share"))
+            .await
+            .expect("tcp SUBSCRIBE sends");
+        let suback = tcp_test_recv(&mut tcp_sub).await;
+        assert_eq!(suback[0], 0x90, "TCP SUBACK answers");
+
+        // A WebSocket client publishes. TCP gets it.
+        let mut ws_pub = ws_test_dial(ws_port).await;
+        ws_pub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-pub"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut ws_pub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        ws_pub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("ws/share", b"from-ws"),
+            ))
+            .await
+            .expect("ws PUBLISH sends");
+        let delivered = tcp_test_recv(&mut tcp_sub).await;
+        assert!(delivered.ends_with(b"from-ws"), "TCP gets the WS publish");
+
+        // The reverse: WS subscribes, TCP publishes, WS gets it.
+        let mut ws_sub = ws_test_dial(ws_port).await;
+        ws_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-sub"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut ws_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        ws_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "ws/back"),
+            ))
+            .await
+            .expect("ws SUBSCRIBE sends");
+        let ws_suback = ws_test_recv(&mut ws_sub).await;
+        assert_eq!(ws_suback[0], 0x90, "WS SUBACK answers");
+        let mut tcp_pub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_pub
+            .write_all(&ws_test_connect("ws-tcp-pub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_pub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_pub
+            .write_all(&ws_test_publish("ws/back", b"from-tcp"))
+            .await
+            .expect("tcp PUBLISH sends");
+        let back = ws_test_recv(&mut ws_sub).await;
+        assert!(back.ends_with(b"from-tcp"), "WS gets the TCP publish");
+        let _ = ws_pub.close(None).await;
+        let _ = ws_sub.close(None).await;
+    }
+
+    /// One packet split over three frames and two packets in one frame
+    /// decode. Goes through the broker.
+    #[tokio::test]
+    async fn ws_split_and_batched_packets_decode() {
+        use futures::SinkExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let (tcp_port, ws_port) = ws_test_listeners(shared).await;
+
+        // A TCP subscriber waits on two topics.
+        let mut tcp_sub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_sub
+            .write_all(&ws_test_connect("ws-split-tcp"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_sub
+            .write_all(&ws_test_subscribe(1, "ws/split/#"))
+            .await
+            .expect("tcp SUBSCRIBE sends");
+        assert_eq!(tcp_test_recv(&mut tcp_sub).await[0], 0x90);
+
+        // A WebSocket client connects, then sends SUBSCRIBE in 3 parts.
+        let mut ws = ws_test_dial(ws_port).await;
+        ws.send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+            ws_test_connect("ws-split"),
+        ))
+        .await
+        .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut ws).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        let subscribe = ws_test_subscribe(7, "ws/split/a");
+        let first = subscribe.len() / 3;
+        let second = 2 * subscribe.len() / 3;
+        for part in [
+            &subscribe[..first],
+            &subscribe[first..second],
+            &subscribe[second..],
+        ] {
+            ws.send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                part.to_vec(),
+            ))
+            .await
+            .expect("ws part sends");
+        }
+        let suback = ws_test_recv(&mut ws).await;
+        assert_eq!(suback[0], 0x90, "split SUBSCRIBE gets SUBACK");
+
+        // Two PUBLISH packets in one binary frame both deliver.
+        let mut batched = ws_test_publish("ws/split/a", b"one");
+        batched.extend_from_slice(&ws_test_publish("ws/split/a", b"two"));
+        ws.send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+            batched,
+        ))
+        .await
+        .expect("ws batch sends");
+        let first_got = tcp_test_recv(&mut tcp_sub).await;
+        assert!(first_got.ends_with(b"one"), "first publish delivers");
+        let second_got = tcp_test_recv(&mut tcp_sub).await;
+        assert!(second_got.ends_with(b"two"), "second publish delivers");
+        let _ = ws.close(None).await;
+    }
+
+    /// Reads the status line of a raw HTTP upgrade answer.
+    async fn ws_test_raw_status(port: u16, path: &str, subprotocol: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let mut request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        );
+        if let Some(protocol) = subprotocol {
+            request.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("request sends");
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.expect("a byte");
+                answer.extend_from_slice(&byte);
+                if answer.ends_with(b"\r\n\r\n") || answer.len() > 512 {
+                    break;
+                }
+                if answer.ends_with(b"\n") && answer.len() > 12 {
+                    break;
+                }
+            }
+        })
+        .await;
+        String::from_utf8_lossy(&answer)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Bad upgrades are refused. Bad frames close only that connection.
+    /// Goes through the broker. The broker stays up after each close.
+    #[tokio::test]
+    async fn ws_refusals_and_frame_errors_close_only_that_connection() {
+        use futures::{SinkExt as _, StreamExt as _};
+        let shared = Shared::new();
+        let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
+
+        let no_protocol = ws_test_raw_status(ws_port, "/mqtt", None).await;
+        assert!(
+            no_protocol.contains("400"),
+            "no subprotocol gets 400: {no_protocol}"
+        );
+        let wrong_path = ws_test_raw_status(ws_port, "/wrong", Some("mqtt")).await;
+        assert!(
+            wrong_path.contains("404"),
+            "wrong path gets 404: {wrong_path}"
+        );
+
+        // A text frame closes the connection.
+        let mut text_client = ws_test_dial(ws_port).await;
+        text_client
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-text"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut text_client).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        text_client
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Text(
+                "hello".into(),
+            ))
+            .await
+            .expect("text sends");
+        let text_end = tokio::time::timeout(Duration::from_secs(5), text_client.next()).await;
+        let text_closed = match text_end {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Close(_)))) => true,
+            Ok(Some(Err(_))) => true,
+            Ok(None) => true,
+            other => panic!("text closes the connection, got: {other:?}"),
+        };
+        assert!(text_closed, "a text frame closes the connection");
+
+        // A frame over the limit closes the connection.
+        let mut big_client = ws_test_dial(ws_port).await;
+        big_client
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-big"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut big_client).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        big_client
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                vec![0u8; MAX_PACKET_BYTES + 1],
+            ))
+            .await
+            .expect("big frame sends");
+        let big_end = tokio::time::timeout(Duration::from_secs(5), big_client.next()).await;
+        let big_closed = match big_end {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Close(_)))) => true,
+            Ok(Some(Err(_))) => true,
+            Ok(None) => true,
+            other => panic!("an oversize frame closes the connection, got: {other:?}"),
+        };
+        assert!(big_closed, "an oversize frame closes the connection");
+
+        // The broker still serves a new client after each close.
+        let mut fresh = ws_test_dial(ws_port).await;
+        fresh
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-fresh"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut fresh).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "the broker stays up"
+        );
+        let _ = fresh.close(None).await;
+    }
+
+    /// Two tenants stay apart on the WebSocket path. Goes through the
+    /// broker. Each publish reaches its own tenant only.
+    #[tokio::test]
+    async fn ws_two_tenants_stay_apart() {
+        use futures::SinkExt as _;
+        let shared = Shared::new();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .tenant_registry
+            .replace(vec![broker_session::tenant::TenantRule::new(
+                "",
+                "tenant",
+                "t-${client_id}",
+            )])
+            .expect("tenant rule installs");
+        for (tenant, user, password) in [
+            ("t-ws-a", "alice", b"pw-a".as_slice()),
+            ("t-ws-b", "bob", b"pw-b".as_slice()),
+        ] {
+            shared
+                .auth
+                .add_user_in_tenant(tenant, user, password)
+                .expect("tenant user stores");
+            for action in [
+                broker_auth::AclAction::Publish,
+                broker_auth::AclAction::Subscribe,
+            ] {
+                shared
+                    .auth
+                    .add_rule_in_tenant(
+                        tenant,
+                        broker_auth::AclRule::new("*", action, "ws/tenant/#", true),
+                    )
+                    .expect("tenant rule stores");
+            }
+        }
+        let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
+
+        // Each tenant connects with its own client id and credentials.
+        let mut client_a = ws_test_dial(ws_port).await;
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect_with_auth("ws-a", "alice", b"pw-a"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut client_a).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "first tenant CONNECT accepts"
+        );
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "ws/tenant/x"),
+            ))
+            .await
+            .expect("ws SUBSCRIBE sends");
+        assert_eq!(ws_test_recv(&mut client_a).await[0], 0x90);
+
+        let mut client_b = ws_test_dial(ws_port).await;
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect_with_auth("ws-b", "bob", b"pw-b"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut client_b).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "second tenant CONNECT accepts"
+        );
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "ws/tenant/x"),
+            ))
+            .await
+            .expect("ws SUBSCRIBE sends");
+        assert_eq!(ws_test_recv(&mut client_b).await[0], 0x90);
+
+        // A publish in the first tenant reaches its own subscriber only.
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("ws/tenant/x", b"secret-a"),
+            ))
+            .await
+            .expect("ws PUBLISH sends");
+        let got_a = ws_test_recv(&mut client_a).await;
+        assert!(got_a.ends_with(b"secret-a"), "own tenant delivers");
+        let other_a =
+            tokio::time::timeout(Duration::from_millis(300), ws_test_recv(&mut client_b)).await;
+        assert!(other_a.is_err(), "other tenant gets nothing");
+
+        // A publish in the second tenant reaches its own subscriber only.
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("ws/tenant/x", b"secret-b"),
+            ))
+            .await
+            .expect("ws PUBLISH sends");
+        let got_b = ws_test_recv(&mut client_b).await;
+        assert!(got_b.ends_with(b"secret-b"), "own tenant delivers");
+        let other_b =
+            tokio::time::timeout(Duration::from_millis(300), ws_test_recv(&mut client_a)).await;
+        assert!(other_b.is_err(), "other tenant gets nothing");
+        let _ = client_a.close(None).await;
+        let _ = client_b.close(None).await;
     }
 }

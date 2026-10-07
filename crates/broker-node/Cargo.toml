@@ -62,6 +62,15 @@ webpki-roots = { version = "1" }
 # Client certificate field pull (CN, subject, SANs) for tenant rules.
 # Licence: MIT OR Apache-2.0.
 x509-parser = { version = "0.16" }
+# MQTT over WebSocket on the kernel listener. Version 0.24 is already
+# in the workspace lock file (via axum). Licence: MIT OR Apache-2.0.
+tokio-tungstenite = { version = "0.24" }
+# HTTP types for the WebSocket upgrade check. Version 1 is already in
+# the workspace lock file (via axum). Licence: MIT OR Apache-2.0.
+http = { version = "1" }
+# Stream and sink traits for the WebSocket transport.
+# Licence: MIT OR Apache-2.0.
+futures = { workspace = true }
 
 [features]
 # Each feature adds one connector kind to the build. With a feature off,

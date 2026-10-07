@@ -4245,7 +4245,7 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
     listener(
         "ws",
         "listeners.ws.bind",
-        listeners.ws.enabled,
+        listeners.ws.enabled && !listeners.ws.native,
         &listeners.ws.bind,
     )?;
     listener(
@@ -10364,6 +10364,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(native::serve_native_mqtts(
             listener,
             tls_config,
+            cfg.listeners.tcp.max_connections,
+            shared.clone(),
+        ));
+    }
+    if cfg.listeners.ws.enabled && cfg.listeners.ws.native {
+        // The WebSocket listener has no connection limit of its own in
+        // the configuration. It uses the limit of the plaintext
+        // listener, as the TLS listener does.
+        let listener = native::bind_listener(&cfg.listeners.ws.bind, cfg.listeners.tcp.backlog)
+            .map_err(|e| format!("listeners.ws.bind {}: {e}", cfg.listeners.ws.bind))?;
+        info!(
+            "Kernel MQTT WebSocket listener on {}",
+            cfg.listeners.ws.bind
+        );
+        tokio::spawn(native::serve_native_ws(
+            listener,
+            cfg.listeners.ws.path.clone(),
             cfg.listeners.tcp.max_connections,
             shared.clone(),
         ));
