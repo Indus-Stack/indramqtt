@@ -88,6 +88,22 @@ pub const KNOWN_CONNECTOR_TYPES: &[&str] = &[
     "timescaledb",
     "timestream",
     "webhook",
+    // Documented names for the same backends. The console sends these.
+    // Each alias maps to the runtime of its base kind.
+    "azure_blob_storage",
+    "azure_event_hub_producer",
+    "aws_timestream",
+    "confluent_producer",
+    "gcp_pubsub_consumer",
+    "gcp_pubsub_producer",
+    "kafka_consumer",
+    "kafka_producer",
+    "opents",
+    "pgsql",
+    "s3tables",
+    "sqlserver",
+    "dynamo",
+    "timescale",
 ];
 
 /// Returns true for a connector type the kernel can instantiate.
@@ -154,6 +170,25 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "timescaledb",
     "timestream",
     "webhook",
+    // Documented names for the same backends. The console sends these.
+    // Each alias maps to the runtime of its base kind.
+    "http",
+    "mqtt",
+    "kafka_producer",
+    "kafka_consumer",
+    "confluent_producer",
+    "pgsql",
+    "timescale",
+    "opents",
+    "sqlserver",
+    "dynamo",
+    "s3tables",
+    "gcp_pubsub_producer",
+    "azure_event_hub_producer",
+    "azure_blob_storage",
+    "azure_event_grid",
+    "aws_timestream",
+    "snowflake_streaming",
 ];
 
 /// Returns true for an action kind the kernel can execute.
@@ -220,6 +255,14 @@ pub const KNOWN_SOURCE_TYPES: &[&str] = &[
     "timescaledb",
     "timestream",
     "webhook",
+    // Documented names for the same backends. The console sends these.
+    // Each alias maps to the runtime of its base kind.
+    "kafka_consumer",
+    "kafka_producer",
+    "gcp_pubsub_consumer",
+    "gcp_pubsub_producer",
+    "azure_event_hub_producer",
+    "azure_event_grid",
 ];
 
 /// Returns true for a source kind the kernel can instantiate.
@@ -2272,11 +2315,7 @@ pub const MAX_SCHEMA_BYTES: usize = 1_048_576;
 pub const MAX_SCHEMA_DESC_LEN: usize = 1024;
 
 /// Schema kinds the registry stores.
-pub const KNOWN_SCHEMA_TYPES: &[&str] = &["json", "avro"];
-
-// TODO(parity): which schema kinds does the spec list beyond json and avro
-// (protobuf, ...)? The rulebook does not decide the set; the current choice
-// stores json and avro only until the checker pins it.
+pub const KNOWN_SCHEMA_TYPES: &[&str] = &["json", "avro", "protobuf", "external_http"];
 
 /// True for a schema kind the registry stores.
 #[must_use]
@@ -2390,6 +2429,19 @@ pub fn validate_schema_document(kind: &str, value: &serde_json::Value) -> Result
     match kind {
         "avro" => validate_avro_document(value),
         "json" => validate_json_schema_document(value),
+        // No compiler for this kind runs in the broker. The check keeps
+        // only the non-empty rule. The broker stores the text.
+        // TODO(parity): which shape checks does protobuf need here?
+        "protobuf" => match value.as_str() {
+            Some(text) if !text.trim().is_empty() => Ok(()),
+            _ => Err("protobuf `source` must be non-empty text".to_string()),
+        },
+        // The broker stores the parameters. It never calls the server.
+        // TODO(parity): which shape checks does external_http need here?
+        "external_http" => match value.as_object() {
+            Some(obj) if !obj.is_empty() => Ok(()),
+            _ => Err("external_http `parameters` must be a non-empty object".to_string()),
+        },
         _ => Err(format!("unknown schema type: {kind}")),
     }
 }
@@ -2471,16 +2523,29 @@ impl SchemasConf {
                     MAX_SCHEMA_BYTES
                 )));
             }
-            let parsed: serde_json::Value = serde_json::from_str(&entry.schema).map_err(|err| {
-                ConfigError::Invalid(format!(
-                    "schemas.schemas[{index}].schema is not valid JSON: {err} (field `schema`)"
-                ))
-            })?;
-            validate_schema_document(entry.schema_type.trim(), &parsed).map_err(|reason| {
-                ConfigError::Invalid(format!(
-                    "schemas.schemas[{index}].schema is invalid: {reason} (field `schema`)"
-                ))
-            })?;
+            // Protobuf stores raw text. It is not JSON. The check runs
+            // on the text itself.
+            let kind = entry.schema_type.trim();
+            if kind == "protobuf" {
+                validate_schema_document(kind, &serde_json::Value::String(entry.schema.clone()))
+                    .map_err(|reason| {
+                        ConfigError::Invalid(format!(
+                            "schemas.schemas[{index}].schema is invalid: {reason} (field `schema`)"
+                        ))
+                    })?;
+            } else {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&entry.schema).map_err(|err| {
+                        ConfigError::Invalid(format!(
+                            "schemas.schemas[{index}].schema is not valid JSON: {err} (field `schema`)"
+                        ))
+                    })?;
+                validate_schema_document(kind, &parsed).map_err(|reason| {
+                    ConfigError::Invalid(format!(
+                        "schemas.schemas[{index}].schema is invalid: {reason} (field `schema`)"
+                    ))
+                })?;
+            }
             if !seen.insert(entry.name.clone()) {
                 return Err(ConfigError::Invalid(format!(
                     "schemas.schemas[{index}].name {:?} is duplicated (field `name`)",

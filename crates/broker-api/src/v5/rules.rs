@@ -224,14 +224,14 @@ pub async fn create_rule(
             // Rule-to-action linkage (W3-02): a forward target naming no
             // known action is rejected instead of going live and failing
             // at fire time.
-            if state.actions.get(id_str).is_none() {
+            let Some(found) = state.actions.get_any(id_str) else {
                 return ApiError::BadRequest(format!(
                     "unknown action {id_str:?} (field `actions`)"
                 ))
                 .into_response();
-            }
+            };
             actions.push(broker_rules::RuleAction::ForwardConnector {
-                connector_id: id_str.to_string(),
+                connector_id: found.id.clone(),
             });
         } else if let Some(obj) = a.as_object() {
             let Some(conn_id) = obj
@@ -250,14 +250,14 @@ pub async fn create_rule(
                 )
                 .into_response();
             };
-            if state.actions.get(conn_id).is_none() {
+            let Some(found) = state.actions.get_any(conn_id) else {
                 return ApiError::BadRequest(format!(
                     "unknown action {conn_id:?} (field `actions`)"
                 ))
                 .into_response();
-            }
+            };
             actions.push(broker_rules::RuleAction::ForwardConnector {
-                connector_id: conn_id.to_string(),
+                connector_id: found.id.clone(),
             });
         } else {
             return ApiError::BadRequest(
@@ -514,14 +514,14 @@ pub async fn update_rule(
         let mut actions = Vec::new();
         for a in &raw_actions {
             if let Some(id_str) = a.as_str() {
-                if state.actions.get(id_str).is_none() {
+                let Some(found) = state.actions.get_any(id_str) else {
                     return ApiError::BadRequest(format!(
                         "unknown action {id_str:?} (field `actions`)"
                     ))
                     .into_response();
-                }
+                };
                 actions.push(broker_rules::RuleAction::ForwardConnector {
-                    connector_id: id_str.to_string(),
+                    connector_id: found.id.clone(),
                 });
             } else if let Some(action_obj) = a.as_object() {
                 let Some(conn_id) = action_obj
@@ -537,14 +537,14 @@ pub async fn update_rule(
                     )
                     .into_response();
                 };
-                if state.actions.get(conn_id).is_none() {
+                let Some(found) = state.actions.get_any(conn_id) else {
                     return ApiError::BadRequest(format!(
                         "unknown action {conn_id:?} (field `actions`)"
                     ))
                     .into_response();
-                }
+                };
                 actions.push(broker_rules::RuleAction::ForwardConnector {
-                    connector_id: conn_id.to_string(),
+                    connector_id: found.id.clone(),
                 });
             } else {
                 return ApiError::BadRequest(
@@ -862,31 +862,27 @@ impl ConnectorStore {
             .clone()
     }
 
-    /// Clone of one stored document. Matches `id` or `name` exactly.
-    /// Returns `None` when the id is unknown (caller maps to `NOT_FOUND`).
+    /// Clone of one stored document. Matches the bare `id`, the bare
+    /// `name` or the `{type}:{name}` key exactly. Returns `None` when
+    /// the id is unknown (caller maps to `NOT_FOUND`).
     pub fn get(&self, id: &str) -> Option<serde_json::Value> {
         self.inner
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .iter()
-            .find(|c| {
-                c.get("id").and_then(|v| v.as_str()) == Some(id)
-                    || c.get("name").and_then(|v| v.as_str()) == Some(id)
-            })
+            .find(|c| connector_doc_matches(c, id))
             .cloned()
     }
 
-    /// True when the id already lives in the store. Matches `id` or
-    /// `name` exactly, like the read and update paths.
+    /// True when the id already lives in the store. Matches the bare
+    /// `id`, the bare `name` or the `{type}:{name}` key exactly, like
+    /// the read and update paths.
     pub fn contains(&self, id: &str) -> bool {
         self.inner
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .iter()
-            .any(|c| {
-                c.get("id").and_then(|v| v.as_str()) == Some(id)
-                    || c.get("name").and_then(|v| v.as_str()) == Some(id)
-            })
+            .any(|c| connector_doc_matches(c, id))
     }
 
     /// Count of stored documents, under one short read lock.
@@ -934,16 +930,14 @@ impl ConnectorStore {
     /// Replace the document stored under `id`. Returns false when the id
     /// is unknown (caller maps to `NOT_FOUND` and creates nothing). The
     /// replace swaps one entry in place and never grows the store toward
-    /// [`MAX_CONNECTORS`].
+    /// [`MAX_CONNECTORS`]. Matches the bare id, the bare name or the
+    /// `{type}:{name}` key.
     pub(crate) fn replace(&self, id: &str, doc: serde_json::Value) -> bool {
         let mut inner = self
             .inner
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        let Some(pos) = inner.iter().position(|c| {
-            c.get("id").and_then(|v| v.as_str()) == Some(id)
-                || c.get("name").and_then(|v| v.as_str()) == Some(id)
-        }) else {
+        let Some(pos) = inner.iter().position(|c| connector_doc_matches(c, id)) else {
             return false;
         };
         inner[pos] = doc;
@@ -951,32 +945,28 @@ impl ConnectorStore {
     }
 
     /// Remove one document by id. Returns false when the id is unknown
-    /// (caller maps to `NOT_FOUND`).
+    /// (caller maps to `NOT_FOUND`). Matches the bare id, the bare name
+    /// or the `{type}:{name}` key.
     pub(crate) fn remove(&self, id: &str) -> bool {
         let mut inner = self
             .inner
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
         let before = inner.len();
-        inner.retain(|c| {
-            c.get("id").and_then(|v| v.as_str()) != Some(id)
-                && c.get("name").and_then(|v| v.as_str()) != Some(id)
-        });
+        inner.retain(|c| !connector_doc_matches(c, id));
         inner.len() != before
     }
 
     /// Flip the enable flag of one document in place. Returns false when
     /// the id is unknown (caller maps to `NOT_FOUND` and persists
-    /// nothing). Touches only the single boolean.
+    /// nothing). Touches only the single boolean. Matches the bare id,
+    /// the bare name or the `{type}:{name}` key.
     pub(crate) fn set_enabled(&self, id: &str, enable: bool) -> bool {
         let mut inner = self
             .inner
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        let Some(pos) = inner.iter().position(|c| {
-            c.get("id").and_then(|v| v.as_str()) == Some(id)
-                || c.get("name").and_then(|v| v.as_str()) == Some(id)
-        }) else {
+        let Some(pos) = inner.iter().position(|c| connector_doc_matches(c, id)) else {
             return false;
         };
         if let Some(obj) = inner[pos].as_object_mut() {
@@ -1405,6 +1395,33 @@ pub const MAX_CONNECTORS: usize = 512;
 /// entry so one create cannot balloon the store.
 const MAX_CONNECTOR_ID_LEN: usize = 256;
 
+/// Bare name of a stored connector document. The console sends the
+/// `{type}:{name}` key in `id`. The store keys rows by the bare name.
+fn connector_bare_name(doc: &serde_json::Value) -> String {
+    let kind = doc.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let raw = doc
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| doc.get("name").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    super::typed::bare_name(raw, kind)
+}
+
+/// True when `requested` names the stored document: the bare id, the
+/// bare name or the `{type}:{name}` key. No fuzzy matching: any other
+/// form is unknown.
+fn connector_doc_matches(doc: &serde_json::Value, requested: &str) -> bool {
+    if doc.get("id").and_then(|v| v.as_str()) == Some(requested) {
+        return true;
+    }
+    if doc.get("name").and_then(|v| v.as_str()) == Some(requested) {
+        return true;
+    }
+    let kind = doc.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let bare = connector_bare_name(doc);
+    requested == bare || requested == super::typed::bridge_key(kind, &bare)
+}
+
 /// Render one stored connector with live health, never the write-time
 /// snapshot: `status`/`node_status` are recomputed from the live
 /// connector manager (`engine.connectors()`), so a restart or a later
@@ -1502,18 +1519,18 @@ pub async fn list_connectors(
 
 /// `GET /api/v5/connectors/:id`: read one connector (C07-04).
 ///
-/// A known id returns the documented fields (`id`, `name`, `type`,
-/// `enable` plus the stored kind-specific config) with live health
+/// A known id returns the documented fields (`name`, `type`, `enable`
+/// plus the stored kind-specific config) with live health
 /// (`status`/`node_status` recomputed from the connector manager, never
 /// the write-time snapshot); an unknown id returns 404 with the
-/// documented `{code, message}` shape, not an empty body. Matching is
-/// exact only: the path id must equal the stored `id` or `name`
-/// exactly, so a near-miss such as `x:<id>` is a 404. The pair is not
-/// paged; unknown query parameters are ignored (the ignored query sink
-/// below). Management-plane only: one short store lock cloning at most
-/// one small entry per request plus lock-free manager lookups, and
-/// publish and deliver never touch this store (dispatch reads the
-/// manager directly, never this map).
+/// documented `{code, message}` shape, not an empty body. Matching
+/// accepts the bare id, the bare name and the documented
+/// `{type}:{name}` key; any other form is a 404. The pair is not paged;
+/// unknown query parameters are ignored (the ignored query sink below).
+/// Management-plane only: one short store lock cloning at most one
+/// small entry per request plus lock-free manager lookups, and publish
+/// and deliver never touch this store (dispatch reads the manager
+/// directly, never this map).
 ///
 /// Bound (stated here and enforced by construction): a read never grows
 /// the map, so the [`MAX_CONNECTORS`] cap from W3-17 applies unchanged
@@ -1636,6 +1653,29 @@ pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str
     }
 }
 
+/// Map a documented type name to the runtime kind that executes it.
+/// The console sends documented names (`mqtt`, `kafka_producer`,
+/// ...). Each maps to the runtime of its base kind, so a documented
+/// create dials the same target as the historic alias. Unknown names
+/// pass through unchanged (the caller rejects them before this runs).
+fn live_sink_kind(conn_type: &str) -> &str {
+    match conn_type {
+        "mqtt" => "mqtt_bridge",
+        "kafka_producer" | "kafka_consumer" => "kafka",
+        "confluent_producer" => "confluent",
+        "gcp_pubsub_producer" | "gcp_pubsub_consumer" => "gcp_pubsub",
+        "azure_event_hub_producer" => "azure_eventhubs",
+        "aws_timestream" => "timestream",
+        "opents" => "opentsdb",
+        "snowflake_streaming" => "snowflake",
+        "postgres" => "pgsql",
+        "sqlserver" => "mssql",
+        "dynamo" => "dynamodb",
+        "s3tables" => "s3_tables",
+        _ => conn_type,
+    }
+}
+
 /// Checked registration: a kind whose Cargo feature is disabled fails
 /// closed with an error naming the missing feature — never a silent
 /// skip, never a fallback identity. Enabled kinds go through
@@ -1646,12 +1686,14 @@ pub(crate) async fn try_register_live_sink(
     name: &str,
     body: &serde_json::Value,
 ) -> Result<(), String> {
-    if let Some(feature) = disabled_connector_feature(conn_type) {
+    // Documented names run on the runtime of their base kind.
+    let runtime = live_sink_kind(conn_type);
+    if let Some(feature) = disabled_connector_feature(runtime) {
         return Err(format!(
             "connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)"
         ));
     }
-    register_live_sink(engine, conn_type, name, body).await;
+    register_live_sink(engine, runtime, name, body).await;
     Ok(())
 }
 
@@ -4965,15 +5007,24 @@ pub async fn create_connector(
             .into_response();
     };
     // The connector id is `name`, with `id` accepted as an alias: stored
-    // entries carry both keys with the same value, and reads match either
-    // exactly (no fuzzy matching).
-    let name = obj_check
+    // entries carry both keys with the same bare value, and reads match
+    // the bare value or the `{type}:{name}` key exactly (no fuzzy
+    // matching). A console body carries the key in `id`; it strips to
+    // the bare name here.
+    let conn_type_early = obj_check
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let raw_name = obj_check
         .get("id")
         .or_else(|| obj_check.get("name"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
+    let name = super::typed::bare_name(&raw_name, &conn_type_early);
     if name.is_empty() {
         return ApiError::BadRequest("connector id or name is required".to_string())
             .into_response();
@@ -5162,13 +5213,14 @@ pub async fn update_connector(
     Query(_ignored): Query<HashMap<String, String>>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
-    // Exact id matching only: the path id must equal the stored `id` or
-    // `name` exactly. No suffix splitting: `a:b` must not update `b`.
+    // The path id is authoritative and accepts the bare id or the
+    // `{type}:{name}` key. No fuzzy matching: any other form is 404.
     // Existence before validation: an unknown id is 404 and creates
     // nothing, even when the body is also invalid.
-    if !state.connectors.contains(&id) {
+    let Some(stored) = state.connectors.get(&id) else {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
-    }
+    };
+    let bare = connector_bare_name(&stored);
     let Some(obj) = body.as_object() else {
         return ApiError::BadRequest("request body must be a JSON object".to_string())
             .into_response();
@@ -5179,17 +5231,23 @@ pub async fn update_connector(
         .and_then(|v| v.as_str())
     {
         let trimmed = body_id.trim();
-        if !trimmed.is_empty() && trimmed != id {
-            return ApiError::BadRequest(format!(
-                "body id {trimmed:?} does not match path id {id:?} (field `id`)"
-            ))
-            .into_response();
+        if !trimmed.is_empty() {
+            let body_bare = super::typed::bare_name(
+                trimmed,
+                obj.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+            );
+            if body_bare != bare && trimmed != id {
+                return ApiError::BadRequest(format!(
+                    "body id {trimmed:?} does not match path id {id:?} (field `id`)"
+                ))
+                .into_response();
+            }
         }
     }
-    if id.len() > MAX_CONNECTOR_ID_LEN {
+    if bare.len() > MAX_CONNECTOR_ID_LEN {
         return ApiError::BadRequest(format!(
             "connector id holds {} chars, at most {MAX_CONNECTOR_ID_LEN} (field `id`)",
-            id.len()
+            bare.len()
         ))
         .into_response();
     }
@@ -5223,11 +5281,12 @@ pub async fn update_connector(
     // with no execution path registers nothing and honestly reads back
     // `disconnected`.
     for registered in state.engine.connectors().ids() {
-        if registered == id || registered.ends_with(&format!(":{id}")) {
+        if registered == bare || registered.ends_with(&format!(":{bare}")) {
             state.engine.connectors().unregister(&registered);
         }
     }
-    if let Err(feature_error) = try_register_live_sink(&state.engine, &conn_type, &id, &body).await
+    if let Err(feature_error) =
+        try_register_live_sink(&state.engine, &conn_type, &bare, &body).await
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -5241,11 +5300,11 @@ pub async fn update_connector(
     // Live health, never a write-time snapshot: a kind with no
     // execution path registers nothing, so it honestly reads back
     // `disconnected` (stored config first, no claimed execution).
-    let live = state.engine.connectors().get(&id).is_some();
+    let live = state.engine.connectors().get(&bare).is_some();
     let status_str = connector_status(live);
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-        obj.insert("name".to_string(), serde_json::Value::String(id.clone()));
+        obj.insert("id".to_string(), serde_json::Value::String(bare.clone()));
+        obj.insert("name".to_string(), serde_json::Value::String(bare.clone()));
         obj.insert(
             "type".to_string(),
             serde_json::Value::String(conn_type.clone()),
@@ -5257,12 +5316,12 @@ pub async fn update_connector(
         );
         obj.insert("node_status".to_string(), connector_node_status(status_str));
     }
-    if !state.connectors.replace(&id, body.clone()) {
+    if !state.connectors.replace(&bare, body.clone()) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // W3-19: mirror the flag into the dispatch snapshot (same lock-free
     // path as the enable route below).
-    state.engine.set_action_enabled(&id, enable);
+    state.engine.set_action_enabled(&bare, enable);
     // A persist failure is a 500 (the in-memory replacement stays but the
     // disk save failed); the loss must never be silent.
     if let Err(error) = state.connectors.persist() {
@@ -5272,17 +5331,18 @@ pub async fn update_connector(
 }
 
 pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    // Exact id matching only: the path id must equal the stored `id` or
-    // `name` exactly. The previous `split(':')` suffix match is gone: it
-    // let `a:b` delete `b`, which is never correct for operator-owned ids.
-    // Read (C07-04) and replace (C07-05) match exactly the same way.
-    if !state.connectors.contains(&id) {
+    // The path id accepts the bare id or the `{type}:{name}` key. No
+    // fuzzy matching: any other form is 404. Read (C07-04) and replace
+    // (C07-05) match exactly the same way.
+    let Some(stored) = state.connectors.get(&id) else {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
-    }
+    };
+    let bare = connector_bare_name(&stored);
     // Reference guard: a connector still referenced by a rule forward or
-    // by an action's stored `connector`/`connector_id` field cannot be
-    // dropped while the reference stands. The first referencing owner is
-    // named in the refusal, mirroring the action delete guard.
+    // by an action's stored `connector` field cannot be dropped while the
+    // reference stands. Both id forms count as a reference. The first
+    // referencing owner is named in the refusal, mirroring the action
+    // delete guard.
     if let Some(rule_id) = state.engine.list_rules().iter().find_map(|rule| {
         rule.actions
             .iter()
@@ -5290,7 +5350,7 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
                 matches!(
                     action,
                     broker_rules::RuleAction::ForwardConnector { connector_id }
-                    if connector_id == &id
+                    if connector_id == &bare || connector_id == &id
                 )
             })
             .then(|| rule.id.clone())
@@ -5301,12 +5361,17 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
         .into_response();
     }
     if let Some(action_id) = state.actions.snapshot().iter().find_map(|record| {
-        let params = &record.params;
-        let target = params
-            .get("connector")
-            .or_else(|| params.get("connector_id"))
-            .and_then(|v| v.as_str());
-        (target == Some(id.as_str())).then(|| record.id.clone())
+        let targets = [
+            record.connector.as_str(),
+            record
+                .params
+                .get("connector")
+                .or_else(|| record.params.get("connector_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        ];
+        (targets.contains(&bare.as_str()) || targets.contains(&id.as_str()))
+            .then(|| record.id.clone())
     }) {
         return ApiError::BadRequest(format!(
             "connector {id:?} is referenced by action {action_id:?}"
@@ -5319,18 +5384,18 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
     // actions (the only stores with a connector reference field today)
     // until the checker pins it.
     for registered in state.engine.connectors().ids() {
-        if registered == id || registered.ends_with(&format!(":{id}")) {
+        if registered == bare || registered.ends_with(&format!(":{bare}")) {
             state.engine.connectors().unregister(&registered);
         }
     }
 
-    if !state.connectors.remove(&id) {
+    if !state.connectors.remove(&bare) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // The id no longer names anything: drop it from the dispatch
     // snapshot so a later re-create with the same id starts enabled
     // (mirrors the W3-04 action delete path; unknown ids are a no-op).
-    state.engine.remove_action(&id);
+    state.engine.remove_action(&bare);
     // Unknown ids persist nothing; a persist failure after a real removal
     // is a 500 (the in-memory removal stays but the disk save failed).
     if let Err(error) = state.connectors.persist() {
@@ -5386,13 +5451,13 @@ pub async fn set_connector_enabled(
     State(state): State<ApiState>,
     Path((id, enable_raw)): Path<(String, String)>,
 ) -> Response {
-    // Exact id matching only, mirroring read/replace/delete: the path id
-    // must equal the stored `id` or `name` exactly. Existence before
-    // validation: an unknown id is 404 and persists nothing, even when
-    // the flag is also malformed.
-    if !state.connectors.contains(&id) {
+    // The path id accepts the bare id or the `{type}:{name}` key.
+    // Existence before validation: an unknown id is 404 and persists
+    // nothing, even when the flag is also malformed.
+    let Some(stored) = state.connectors.get(&id) else {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
-    }
+    };
+    let bare = connector_bare_name(&stored);
     let enable = match enable_raw.trim().to_ascii_lowercase().as_str() {
         "true" => true,
         "false" => false,
@@ -5405,14 +5470,14 @@ pub async fn set_connector_enabled(
     };
     // Flip only the single boolean; id, kind and params are untouched, so
     // the update can never trip the store cap or change validation.
-    if !state.connectors.set_enabled(&id, enable) {
+    if !state.connectors.set_enabled(&bare, enable) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // Mirror into the dispatch snapshot before persisting: the in-memory
     // flag is already flipped, so evaluation must observe it even if the
     // disk save below fails (the store itself keeps the mutation on a
     // persist failure and answers 500, never silently).
-    state.engine.set_action_enabled(&id, enable);
+    state.engine.set_action_enabled(&bare, enable);
     if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
@@ -5535,13 +5600,13 @@ pub async fn run_node_connector_operation(
 /// with no body. Management-plane only; see the caller for the
 /// locking and fire-path notes.
 async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) -> Response {
-    // Exact id matching only, mirroring read/replace/delete/enable: the
-    // path id must equal the stored `id` or `name` exactly. Existence
-    // before validation: an unknown id is 404 and persists nothing, even
-    // when the operation is also unknown.
-    if !state.connectors.contains(id) {
+    // The path id accepts the bare id or the `{type}:{name}` key.
+    // Existence before validation: an unknown id is 404 and persists
+    // nothing, even when the operation is also unknown.
+    let Some(stored) = state.connectors.get(id) else {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
-    }
+    };
+    let bare = connector_bare_name(&stored);
     let enable = match operation {
         "start" => true,
         "stop" => false,
@@ -5554,7 +5619,7 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     };
     // Flip only the single boolean; id, kind and params are untouched, so
     // the update can never trip the store cap or change validation.
-    if !state.connectors.set_enabled(id, enable) {
+    if !state.connectors.set_enabled(&bare, enable) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // Mirror into the dispatch snapshot before persisting: the in-memory
@@ -5564,7 +5629,7 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     // share the W3-04 snapshot with action ids (absent means enabled),
     // so a disabled connector costs the same single lookup and never
     // touches the connector store on the fire path.
-    state.engine.set_action_enabled(id, enable);
+    state.engine.set_action_enabled(&bare, enable);
     if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
@@ -5853,9 +5918,18 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
 // Action Probe (W3-07, C06-11)
 // ---------------------------------------------------------------------------
 
-pub async fn get_action_types() -> Response {
-    let catalogue = broker_connectors::action_types_catalogue();
-    (StatusCode::OK, Json(serde_json::json!(catalogue))).into_response()
+/// `GET /api/v5/action_types`: names of supported action kinds.
+///
+/// Returns the bare list of documented names (not paged). A name is
+/// listed only if its runtime exists in this build. Unknown query
+/// parameters are ignored. Management-plane only; publish and deliver
+/// never touch it.
+pub async fn get_action_types(Query(_ignored): Query<HashMap<String, String>>) -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(super::typed::SPEC_ACTION_TYPES)),
+    )
+        .into_response()
 }
 
 /// Single-request bound for `POST /api/v5/actions_probe`: one TCP dial at
@@ -5868,13 +5942,12 @@ pub async fn get_action_types() -> Response {
 pub const ACTION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Action-kind validation for the probe (the W3-01 kind set): a kind is
-/// listed only if the kernel can execute it, read from the action-types
-/// catalogue rather than a second list that could drift from the runtimes.
-/// This is the same registry `POST /api/v5/actions` validates against.
+/// listed only if the kernel can execute it, read from the shared kind
+/// registry in `broker-config`, which also accepts the documented names
+/// the console sends. This is the same registry `POST /api/v5/actions`
+/// validates against.
 fn is_known_probe_action_type(kind: &str) -> bool {
-    broker_connectors::action_types_catalogue()
-        .iter()
-        .any(|entry| entry.kind == kind)
+    broker_config::is_known_action_type(kind)
 }
 
 /// Stateless action probe: validates the config against the named kind and

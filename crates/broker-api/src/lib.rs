@@ -18249,43 +18249,42 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
-    async fn action_types_catalogue_lists_executable_kinds() {
-        // W3-01 failing test: GET /action_types returns the catalogue of
-        // supported action kinds with per-entry kind plus configuration
-        // shape hints; an unknown query parameter is ignored. Before:
-        // the handler returned a hardcoded array of 8 strings with wrong
-        // names ("pgsql", "http") and no shape hints.
+    async fn action_types_lists_documented_names() {
+        // AP-05: GET /action_types returns the documented names as a
+        // bare string array, limited to the runtimes in this build. The
+        // old shape (objects with kind plus configuration) contradicts
+        // the documented array of strings, so the test changed with the
+        // handler. An unknown query parameter is ignored.
         // Broker-through: the request goes through the served management
         // API on `ApiState` (the same state the kernel shares in
-        // `crates/broker-node/src/main.rs`, `serve_api`); the catalogue
-        // itself is a static snapshot owned by `broker-connectors`
-        // (`action_types_catalogue` in
-        // `crates/broker-connectors/src/lib.rs`), read only on this
-        // management GET and never consulted on publish or deliver.
+        // `crates/broker-node/src/main.rs`, `serve_api`); the list is a
+        // static snapshot read only on this management GET and never
+        // consulted on publish or deliver.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
         let (status, body) = server.get_auth("/api/v5/action_types", &token).await;
         assert_eq!(status, 200);
-        let entries = body.as_array().expect("catalogue is a list");
-        assert!(!entries.is_empty(), "catalogue must not be empty");
-        for entry in entries {
-            assert!(entry["kind"].is_string(), "entry carries kind: {entry:?}");
-            assert!(
-                entry["configuration"].is_object(),
-                "entry carries configuration shape hints: {entry:?}"
-            );
-        }
+        let names = body.as_array().expect("type list is an array");
+        assert!(!names.is_empty(), "type list must not be empty");
         let kinds: std::collections::HashSet<&str> =
-            entries.iter().filter_map(|e| e["kind"].as_str()).collect();
-        assert_eq!(kinds.len(), entries.len(), "kinds must be unique");
-        for expected in ["kafka", "postgres", "mysql", "redis", "webhook", "s3"] {
-            assert!(kinds.contains(expected), "catalogue lists '{expected}'");
+            names.iter().filter_map(|e| e.as_str()).collect();
+        assert_eq!(kinds.len(), names.len(), "names must be unique strings");
+        // The console order starts with http, mqtt and kafka. Every name
+        // stays inside the documented enum.
+        for expected in ["http", "mqtt", "kafka_producer", "redis", "mysql", "pgsql"] {
+            assert!(kinds.contains(expected), "type list holds '{expected}'");
         }
-        for wrong in ["pgsql", "http"] {
+        for missing in [
+            "bigtable",
+            "quasardb",
+            "syskeeper_forwarder",
+            "matrix",
+            "azure_event_grid",
+        ] {
             assert!(
-                !kinds.contains(wrong),
-                "catalogue has no invented '{wrong}'"
+                !kinds.contains(missing),
+                "type list has no '{missing}' without a runtime"
             );
         }
 
@@ -18298,59 +18297,34 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
-    async fn source_types_catalogue_lists_runnable_kinds() {
-        // W3-25 failing test: GET /source_types returns the catalogue of
-        // supported source kinds with per-entry kind plus configuration
-        // shape hints; every listed kind has a runtime behind it and an
-        // unknown query parameter is ignored. Before: route returned 404.
+    async fn source_types_lists_documented_names() {
+        // AP-05: GET /source_types returns the documented names as a
+        // bare string array, limited to the runtimes in this build. The
+        // old shape (objects with kind plus configuration) contradicts
+        // the documented array of strings, so the test changed with the
+        // handler. An unknown query parameter is ignored.
         // Broker-through: the request goes through the served management
         // API on `ApiState` (the same state the kernel shares in
-        // `crates/broker-node/src/main.rs`, `serve_api`); the catalogue
-        // itself is a static snapshot owned by `broker-connectors`
-        // (`source_types_catalogue` in
-        // `crates/broker-connectors/src/lib.rs`), read only on this
-        // management GET and never consulted on publish or deliver.
+        // `crates/broker-node/src/main.rs`, `serve_api`); the list is a
+        // static snapshot read only on this management GET and never
+        // consulted on publish or deliver.
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
         let (status, body) = server.get_auth("/api/v5/source_types", &token).await;
         assert_eq!(status, 200);
-        let entries = body.as_array().expect("catalogue is a list");
-        assert!(!entries.is_empty(), "catalogue must not be empty");
-        assert!(
-            entries.len() <= broker_connectors::MAX_SOURCE_TYPES,
-            "catalogue is bounded"
-        );
-        for entry in entries {
-            assert!(entry["kind"].is_string(), "entry carries kind: {entry:?}");
-            assert!(
-                entry["description"].is_string(),
-                "entry carries description: {entry:?}"
-            );
-            assert!(
-                entry["configuration"].is_object(),
-                "entry carries configuration shape hints: {entry:?}"
-            );
-            assert!(
-                entry.get("tier").is_none(),
-                "tier field must not be in the response: {entry:?}"
-            );
-            let kind = entry["kind"].as_str().expect("kind is a string");
-            assert!(
-                broker_connectors::is_known_source_type(kind),
-                "catalogue lists unrunnable kind '{kind}'"
-            );
-        }
+        let entries = body.as_array().expect("type list is an array");
+        assert!(!entries.is_empty(), "type list must not be empty");
         let kinds: std::collections::HashSet<&str> =
-            entries.iter().filter_map(|e| e["kind"].as_str()).collect();
-        assert_eq!(kinds.len(), entries.len(), "kinds must be unique");
-        for expected in ["mqtt", "http", "kafka", "mqtt_bridge"] {
-            assert!(kinds.contains(expected), "catalogue lists '{expected}'");
+            entries.iter().filter_map(|e| e.as_str()).collect();
+        assert_eq!(kinds.len(), entries.len(), "names must be unique strings");
+        for expected in ["mqtt", "kafka_consumer", "rabbitmq"] {
+            assert!(kinds.contains(expected), "type list holds '{expected}'");
         }
-        for wrong in ["test", "pgsql", "no_such_source_kind_xyz"] {
+        for wrong in ["test", "azure_event_grid", "no_such_source_kind_xyz"] {
             assert!(
                 !kinds.contains(wrong),
-                "catalogue has no unrunnable '{wrong}'"
+                "type list has no unrunnable '{wrong}'"
             );
         }
 
@@ -18410,6 +18384,349 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .dispatch_ingress(&topic, &payload, broker_protocol::QoS::AtMostOnce, &sink)
             .await;
         assert_eq!(matched, 1);
+    }
+
+    #[tokio::test]
+    async fn ap05_http_action_typed_round_trip() {
+        // AP-05: the documented http action body is accepted and reads
+        // back in the same shape. The read works through the bare name
+        // and through the `{type}:{name}` key. A replace keeps the
+        // shape. An unknown type is 400. A duplicate is 400.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let body = json!({
+            "type": "http",
+            "name": "ap05-web",
+            "connector": "http:ap05-up",
+            "enable": true,
+            "parameters": {"method": "post", "path": "/hook"},
+            "resource_opts": {},
+        });
+        let (status, created) = server
+            .post_auth("/api/v5/actions", body.clone(), &token)
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["type"], json!("http"));
+        assert_eq!(created["name"], json!("ap05-web"));
+        assert_eq!(created["connector"], json!("http:ap05-up"));
+        assert_eq!(created["parameters"]["path"], json!("/hook"));
+        assert!(created["resource_opts"].is_object());
+        assert_eq!(created["status"], json!("connected"));
+        assert!(created["node_status"].is_array());
+        for path in ["/api/v5/actions/ap05-web", "/api/v5/actions/http:ap05-web"] {
+            let (status, read) = server.get_auth(path, &token).await;
+            assert_eq!(status, 200, "read through {path}");
+            assert_eq!(read, created, "same shape through {path}");
+        }
+        let (status, _) = server.post_auth("/api/v5/actions", body, &token).await;
+        assert_eq!(status, 400);
+        let (status, bad) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "no_such_kind_xyz", "name": "ap05-bad"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(bad["code"], json!("BAD_REQUEST"));
+        let (status, missing) = server
+            .get_auth("/api/v5/actions/http:no-such", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(missing["code"], json!("NOT_FOUND"));
+        let (status, updated) = server
+            .put_auth(
+                "/api/v5/actions/http:ap05-web",
+                json!({
+                    "type": "http",
+                    "name": "ap05-web",
+                    "connector": "http:ap05-up",
+                    "enable": false,
+                    "parameters": {"method": "post", "path": "/hook2"},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(updated["enable"], json!(false));
+        assert_eq!(updated["parameters"]["path"], json!("/hook2"));
+        assert_eq!(updated["status"], json!("disconnected"));
+        let (status, _) = server.delete_auth("/api/v5/actions/ap05-web", &token).await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn ap05_mqtt_kafka_actions_typed_round_trip() {
+        // AP-05: the console shapes for mqtt and kafka actions are
+        // accepted and read back unchanged. Old flat bodies still pass.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let mqtt = json!({
+            "type": "mqtt",
+            "name": "ap05-mqtt",
+            "connector": "mqtt:ap05-up",
+            "parameters": {"topic": "out/ap05", "qos": 1, "retain": false},
+        });
+        let (status, created) = server.post_auth("/api/v5/actions", mqtt, &token).await;
+        assert_eq!(status, 201);
+        assert_eq!(created["parameters"]["topic"], json!("out/ap05"));
+        let kafka = json!({
+            "type": "kafka_producer",
+            "name": "ap05-kafka",
+            "connector": "kafka_producer:ap05-up",
+            "parameters": {"topic": "events", "message": {"key": "${.clientid}", "value": "${.}"}},
+        });
+        let (status, created) = server.post_auth("/api/v5/actions", kafka, &token).await;
+        assert_eq!(status, 201);
+        assert_eq!(created["type"], json!("kafka_producer"));
+        // The historic alias still passes and reads back as sent.
+        let (status, legacy) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "ap05-legacy", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(legacy["type"], json!("mqtt_bridge"));
+        assert_eq!(legacy["server"], json!("127.0.0.1:1883"));
+        for id in ["ap05-mqtt", "ap05-kafka", "ap05-legacy"] {
+            let (status, _) = server
+                .delete_auth(&format!("/api/v5/actions/{id}"), &token)
+                .await;
+            assert_eq!(status, 204);
+        }
+    }
+
+    #[tokio::test]
+    async fn ap05_connectors_typed_round_trip() {
+        // AP-05: connector creates for http, mqtt and kafka use the
+        // documented fields and read back through both id forms. The
+        // documented names run on the runtime of their base kind.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let cases = [
+            (
+                "ap05-conn-http",
+                json!({"type": "http", "name": "ap05-conn-http", "url": "http://127.0.0.1:9"}),
+                "http:ap05-conn-http",
+            ),
+            (
+                "ap05-conn-mqtt",
+                json!({"type": "mqtt", "name": "ap05-conn-mqtt", "server": "127.0.0.1:1883"}),
+                "mqtt:ap05-conn-mqtt",
+            ),
+            (
+                "ap05-conn-kafka",
+                json!({"type": "kafka_producer", "name": "ap05-conn-kafka", "bootstrap_hosts": "127.0.0.1:9092"}),
+                "kafka_producer:ap05-conn-kafka",
+            ),
+        ];
+        for (bare, body, key) in cases {
+            let (status, created) = server.post_auth("/api/v5/connectors", body, &token).await;
+            assert_eq!(status, 201, "create for {bare}");
+            assert_eq!(created["name"], json!(bare));
+            assert!(created["status"].is_string());
+            assert!(created["node_status"].is_array());
+            for path in [
+                format!("/api/v5/connectors/{bare}"),
+                format!("/api/v5/connectors/{key}"),
+            ] {
+                let (status, read) = server.get_auth(&path, &token).await;
+                assert_eq!(status, 200, "read through {path}");
+                assert_eq!(read["name"], json!(bare));
+            }
+            let (status, _) = server
+                .put_auth(
+                    &format!("/api/v5/connectors/{key}"),
+                    json!({"type": created["type"].clone(), "name": bare, "description": "ap05"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 200, "replace through {key}");
+            let (status, _) = server
+                .delete_auth(&format!("/api/v5/connectors/{bare}"), &token)
+                .await;
+            assert_eq!(status, 204);
+        }
+        let (status, bad) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "no_such_kind_xyz", "name": "ap05-bad"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(bad["code"], json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn ap05_sources_typed_round_trip() {
+        // AP-05: source creates for mqtt and kafka_consumer use the
+        // documented envelope and read back through both id forms.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let cases = [
+            (
+                "ap05-src-mqtt",
+                json!({
+                    "type": "mqtt",
+                    "name": "ap05-src-mqtt",
+                    "connector": "mqtt:ap05-up",
+                    "parameters": {"topic": "in/ap05"},
+                }),
+            ),
+            (
+                "ap05-src-kafka",
+                json!({
+                    "type": "kafka_consumer",
+                    "name": "ap05-src-kafka",
+                    "connector": "kafka_consumer:ap05-up",
+                    "parameters": {"topic": "events"},
+                }),
+            ),
+        ];
+        for (bare, body) in cases {
+            let (status, created) = server.post_auth("/api/v5/sources", body, &token).await;
+            assert_eq!(status, 201, "create for {bare}");
+            assert_eq!(created["name"], json!(bare));
+            assert!(created["parameters"].is_object());
+            assert_eq!(created["status"], json!("connected"));
+            let (status, _) = server
+                .get_auth(&format!("/api/v5/sources/{bare}"), &token)
+                .await;
+            assert_eq!(status, 200);
+            let (status, _) = server
+                .delete_auth(&format!("/api/v5/sources/{bare}"), &token)
+                .await;
+            assert_eq!(status, 204);
+        }
+    }
+
+    #[tokio::test]
+    async fn ap05_schema_registry_source_field_and_single_read() {
+        // AP-05: the registry accepts the documented `source` text and
+        // serves the single read. Old `schema` bodies still pass.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/schema_registry",
+                json!({
+                    "name": "ap05-schema",
+                    "type": "json",
+                    "source": "{\"type\": \"object\"}",
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["source"], json!("{\"type\":\"object\"}"));
+        let (status, read) = server
+            .get_auth("/api/v5/schema_registry/ap05-schema", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(read, created);
+        let (status, missing) = server
+            .get_auth("/api/v5/schema_registry/no-such", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(missing["code"], json!("NOT_FOUND"));
+        let (status, _) = server
+            .delete_auth("/api/v5/schema_registry/ap05-schema", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn ap05_typed_action_fires_through_the_rule_path() {
+        // AP-05 integration: a typed http action created through the
+        // management API fires through the broker rule path. A rule
+        // forwards to the action id. A publish through
+        // `dispatch_ingress` reaches the sink once. Every step uses the
+        // production entries: the HTTP router and the engine ingress.
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "ap05-counter"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({
+                    "type": "http",
+                    "name": "ap05-fire",
+                    "connector": "http:ap05-up",
+                    "parameters": {"method": "post", "path": "/hook"},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state
+            .engine
+            .connectors()
+            .register("ap05-fire", counter.clone());
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "ap05-rule",
+                    "name": "ap05-rule",
+                    "sql": "SELECT * FROM \"ap05/fire\"",
+                    "actions": ["ap05-fire"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let broker: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("ap05/fire").expect("topic");
+        let payload = bytes::Bytes::from_static(br#"{"temp": 21.5}"#);
+        state
+            .engine
+            .dispatch_ingress(&topic, &payload, broker_protocol::QoS::AtMostOnce, &broker)
+            .await;
+        assert_eq!(counter.hits.load(AtomicOrdering::Relaxed), 1);
+        let (status, _) = server.delete_auth("/api/v5/rules/ap05-rule", &token).await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/ap05-fire", &token)
+            .await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]

@@ -1554,17 +1554,17 @@ pub fn action_types_catalogue() -> Vec<ActionTypeInfo> {
 ///
 /// Reason: the list handler clones the whole snapshot once per request,
 /// so the catalogue must stay small and bounded; 64 covers the built-in
-/// ingress set (the executable sink set plus the `http`/`mqtt` ingress
-/// aliases) with headroom while keeping per-request clones cheap. The
-/// default is finite (exactly [`SOURCE_TYPE_COUNT`]); the operator never
-/// opts into unlimited because writes are out of scope (read-only route).
+/// ingress set (the executable sink set plus the four ingress aliases)
+/// with headroom while keeping per-request clones cheap. The default is
+/// finite (exactly [`SOURCE_TYPE_COUNT`]); the operator never opts into
+/// unlimited because writes are out of scope (read-only route).
 pub const MAX_SOURCE_TYPES: usize = 64;
 
 /// Stated count of the built-in source set served today. Reason: one entry
 /// per source kind the kernel can instantiate (the executable sink set
-/// plus the `http`/`mqtt` ingress aliases, minus the `test` helper which
-/// has no runtime); the count documents the bound the handler enforces.
-pub const SOURCE_TYPE_COUNT: usize = ACTION_TYPES_CATALOGUE.len() + 2;
+/// plus the ingress aliases, minus the `test` helper which has no
+/// runtime); the count documents the bound the handler enforces.
+pub const SOURCE_TYPE_COUNT: usize = ACTION_TYPES_CATALOGUE.len() + 4;
 
 /// Catalogue entry for one source type (ingress kind) with configuration
 /// shape hints. This is a static snapshot of what the kernel can
@@ -1583,9 +1583,9 @@ pub struct SourceTypeInfo {
 }
 
 // Compile-time guard that the bound covers the served registry: the
-// action set plus the two ingress aliases must fit in the cap.
+// action set plus the four ingress aliases must fit in the cap.
 const _: () = assert!(
-    ACTION_TYPES_CATALOGUE.len() + 2 <= MAX_SOURCE_TYPES,
+    ACTION_TYPES_CATALOGUE.len() + 4 <= MAX_SOURCE_TYPES,
     "source types catalogue exceeds its bound"
 );
 
@@ -1608,6 +1608,28 @@ const SOURCE_TYPE_ALIASES: &[SourceTypeInfo] = &[
         configuration: &[
             ("server", "Source broker address"),
             ("topic", "Topic filter to subscribe"),
+        ],
+    },
+    // Documented names for the same backends. The console sends these.
+    // Each alias shares the enable-flag runtime and the probe dial hook
+    // of its base kind.
+    SourceTypeInfo {
+        kind: "kafka_consumer",
+        description: "Kafka ingress source",
+        configuration: &[
+            (
+                "bootstrap_hosts",
+                "Kafka broker list, comma-separated host:port",
+            ),
+            ("topic", "Kafka topic to consume from"),
+        ],
+    },
+    SourceTypeInfo {
+        kind: "gcp_pubsub_consumer",
+        description: "Google Cloud Pub/Sub ingress source",
+        configuration: &[
+            ("project_id", "GCP project ID"),
+            ("topic", "Subscription or topic name"),
         ],
     },
 ];

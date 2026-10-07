@@ -25,15 +25,6 @@
 //! a commit or save failure answers 500 so the loss is never silent.
 //! In-flight execution counters do not persist (per-action metrics land
 //! with their own task and stay memory-only).
-// TODO(parity): which per-action fields does the spec document beyond
-// id/type/enable (connector reference, failure handling, ...)? The
-// rulebook does not decide the exact shape; fields the broker cannot
-// supply are omitted rather than invented, and kind-specific body
-// fields round-trip opaquely.
-// TODO(parity): what per-kind config validation does create require
-// beyond the kind being known? The rulebook does not decide the exact
-// per-kind schemas; the current choice validates the kind against the
-// W3-01 kind registry and stores the remaining fields opaquely.
 // TODO(parity): what is the exact delete-referenced status and code
 // (400 versus 409, and which code name)? The rulebook does not decide
 // the exact shape; the current choice refuses with `BAD_REQUEST` (a
@@ -69,27 +60,52 @@ pub const MAX_ACTIONS: usize = broker_config::MAX_ACTIONS;
 /// entry so one create cannot balloon the store.
 const MAX_ACTION_ID_LEN: usize = broker_config::MAX_ACTION_ID_LEN;
 
-/// One stored action: operator-chosen id, the action kind it was
-/// validated against, whether it participates, and the kind-specific
-/// fields stored opaquely (everything the create call accepts except
-/// `id`/`name`/`type`/`enable`).
+/// One stored action: operator-chosen bare id, the action kind it was
+/// validated against, whether it participates, the documented
+/// `connector` reference, the documented `parameters` and
+/// `resource_opts` objects, and all remaining fields stored opaquely
+/// (legacy flat fields plus `description`, `tags` and
+/// `fallback_actions`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActionRecord {
     pub id: String,
+    pub name: String,
     pub action_type: String,
     pub enable: bool,
+    pub connector: String,
+    pub parameters: serde_json::Value,
+    pub resource_opts: serde_json::Value,
     pub params: serde_json::Value,
 }
 
 impl ActionRecord {
     fn to_json(&self) -> serde_json::Value {
+        let status = super::typed::typed_status(self.enable);
         let mut obj = serde_json::Map::new();
         obj.insert("id".to_string(), serde_json::Value::String(self.id.clone()));
+        obj.insert(
+            "name".to_string(),
+            serde_json::Value::String(self.name.clone()),
+        );
         obj.insert(
             "type".to_string(),
             serde_json::Value::String(self.action_type.clone()),
         );
         obj.insert("enable".to_string(), serde_json::Value::Bool(self.enable));
+        obj.insert(
+            "connector".to_string(),
+            serde_json::Value::String(self.connector.clone()),
+        );
+        obj.insert("parameters".to_string(), self.parameters.clone());
+        obj.insert("resource_opts".to_string(), self.resource_opts.clone());
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.to_string()),
+        );
+        obj.insert(
+            "node_status".to_string(),
+            super::typed::typed_node_status(status),
+        );
         if let Some(extra) = self.params.as_object() {
             for (key, value) in extra {
                 if !obj.contains_key(key) {
@@ -99,6 +115,110 @@ impl ActionRecord {
         }
         serde_json::Value::Object(obj)
     }
+}
+
+/// Envelope keys live in first-class fields. All other keys stay in
+/// `params` and read back unchanged.
+const ACTION_ENVELOPE_KEYS: &[&str] = &[
+    "id",
+    "name",
+    "type",
+    "enable",
+    "connector",
+    "parameters",
+    "resource_opts",
+    "status",
+    "node_status",
+    "status_reason",
+];
+
+/// Split a create or replace body into envelope fields plus extras.
+/// Returns the error text for a 400 answer.
+fn split_action_body(
+    body: &serde_json::Value,
+    path_id: Option<&str>,
+) -> Result<ActionRecord, String> {
+    let Some(obj) = body.as_object() else {
+        return Err("request body must be a JSON object".to_string());
+    };
+    let raw_id = obj
+        .get("id")
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // A console body carries the `{type}:{name}` key in `id`. The
+    // store keys rows by the bare name. Reads accept both forms.
+    let kind = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return Err("missing required field: type".to_string());
+    }
+    if !is_known_action_type(&kind) {
+        return Err(format!("unknown action type: {kind}"));
+    }
+    // The path id is authoritative. The caller resolves it to the
+    // stored bare id first. A body id that names another action is
+    // rejected. A type change through replace stays allowed.
+    let mut id = if raw_id.is_empty() {
+        String::new()
+    } else {
+        super::typed::bare_name(&raw_id, &kind)
+    };
+    if let Some(expected) = path_id {
+        if !id.is_empty() && id != expected {
+            return Err(format!(
+                "body id {raw_id:?} does not match path id {expected:?} (field `id`)"
+            ));
+        }
+        id = expected.to_string();
+    }
+    if id.is_empty() {
+        return Err("action id or name is required".to_string());
+    }
+    if id.len() > MAX_ACTION_ID_LEN {
+        return Err(format!(
+            "action id holds {} chars, at most {MAX_ACTION_ID_LEN} (field `id`)",
+            id.len()
+        ));
+    }
+    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    let connector = obj
+        .get("connector")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let parameters = match obj.get("parameters") {
+        None => serde_json::json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => return Err("field `parameters` must be an object".to_string()),
+    };
+    let resource_opts = match obj.get("resource_opts") {
+        None => serde_json::json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => return Err("field `resource_opts` must be an object".to_string()),
+    };
+    let mut extras = serde_json::Map::new();
+    for (key, value) in obj {
+        if !ACTION_ENVELOPE_KEYS.contains(&key.as_str()) {
+            extras.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(ActionRecord {
+        id: id.clone(),
+        name: id,
+        action_type: kind,
+        enable,
+        connector,
+        parameters,
+        resource_opts,
+        params: serde_json::Value::Object(extras),
+    })
 }
 
 /// Insert failure: duplicate id or a full store.
@@ -161,11 +281,14 @@ impl ActionStore {
         let mut map = self.inner.write().expect("action store lock");
         map.clear();
         for entry in &conf.actions {
-            let params = if entry.config.trim().is_empty() {
+            // Old files store flat fields only. New files store the
+            // envelope (`connector`, `parameters`, `resource_opts`)
+            // plus flat extras. Missing envelope keys read as empty.
+            let doc = if entry.config.trim().is_empty() {
                 serde_json::json!({})
             } else {
                 match serde_json::from_str(&entry.config) {
-                    Ok(params) => params,
+                    Ok(doc) => doc,
                     Err(_) => {
                         // Fail closed: an undecodable config can never
                         // drive an action, so the entry keeps its key
@@ -178,13 +301,40 @@ impl ActionStore {
                     }
                 }
             };
+            let doc_obj = doc.as_object().cloned().unwrap_or_default();
+            let connector = doc_obj
+                .get("connector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let parameters = match doc_obj.get("parameters") {
+                Some(value) if value.is_object() => value.clone(),
+                _ => serde_json::json!({}),
+            };
+            let resource_opts = match doc_obj.get("resource_opts") {
+                Some(value) if value.is_object() => value.clone(),
+                _ => serde_json::json!({}),
+            };
+            let mut extras = serde_json::Map::new();
+            for (key, value) in &doc_obj {
+                if !ACTION_ENVELOPE_KEYS.contains(&key.as_str()) {
+                    extras.insert(key.clone(), value.clone());
+                }
+            }
+            // Old rows keyed the map by `{type}:{name}` stay readable:
+            // the key form resolves to the bare name here.
+            let bare = super::typed::bare_name(&entry.id, &entry.action_type);
             map.insert(
-                entry.id.clone(),
+                bare.clone(),
                 ActionRecord {
-                    id: entry.id.clone(),
+                    id: bare.clone(),
+                    name: bare,
                     action_type: entry.action_type.clone(),
                     enable: entry.enable,
-                    params,
+                    connector,
+                    parameters,
+                    resource_opts,
+                    params: serde_json::Value::Object(extras),
                 },
             );
         }
@@ -248,6 +398,46 @@ impl ActionStore {
             .cloned()
     }
 
+    /// Resolve a path id to the stored bare id. Accepts the bare name
+    /// and the `{type}:{name}` key. Returns `None` for unknown ids.
+    pub fn resolve_id(&self, requested: &str) -> Option<String> {
+        let map = self.inner.read().expect("action store lock");
+        if map.contains_key(requested) {
+            return Some(requested.to_string());
+        }
+        map.values()
+            .find(|record| super::typed::id_matches(&record.id, &record.action_type, requested))
+            .map(|record| record.id.clone())
+    }
+
+    /// Read one entry by bare name or key. Returns `None` when unknown.
+    pub fn get_any(&self, requested: &str) -> Option<ActionRecord> {
+        let bare = self.resolve_id(requested)?;
+        self.get(&bare)
+    }
+
+    /// True when the bare name or key names a stored entry.
+    pub fn contains_any(&self, requested: &str) -> bool {
+        self.resolve_id(requested).is_some()
+    }
+
+    /// Remove one entry by bare name or key. Returns false when unknown.
+    pub fn remove_any(&self, requested: &str) -> bool {
+        let Some(bare) = self.resolve_id(requested) else {
+            return false;
+        };
+        self.remove(&bare)
+    }
+
+    /// Replace the entry stored under the resolved bare id. Returns
+    /// false when unknown. Never grows the map.
+    pub fn replace_any(&self, requested: &str, entry: ActionRecord) -> bool {
+        let Some(bare) = self.resolve_id(requested) else {
+            return false;
+        };
+        self.replace(&bare, entry)
+    }
+
     /// Replace the entry stored under `id` with a validated snapshot.
     /// Returns false when the id is unknown (caller maps to `NOT_FOUND`
     /// and creates nothing). The replace swaps one validated entry in
@@ -279,17 +469,35 @@ impl ActionStore {
 
     /// Export the store as a validated config root: entries sorted by
     /// id so the persisted file is deterministic. Each entry carries
-    /// the id, kind, enable flag and the opaque kind-specific fields as
-    /// a JSON document. Nothing derived is stored: only inputs persist.
+    /// the id, kind, enable flag and the envelope (`connector`,
+    /// `parameters`, `resource_opts`) plus the opaque extras as a JSON
+    /// document. Nothing derived is stored: only inputs persist.
     fn export_conf(&self) -> broker_config::ActionsConf {
         let map = self.inner.read().expect("action store lock");
         let mut entries: Vec<broker_config::ActionEntry> = map
             .values()
-            .map(|record| broker_config::ActionEntry {
-                id: record.id.clone(),
-                action_type: record.action_type.clone(),
-                enable: record.enable,
-                config: serde_json::to_string(&record.params).unwrap_or_else(|_| "{}".to_string()),
+            .map(|record| {
+                let mut doc = serde_json::Map::new();
+                doc.insert(
+                    "connector".to_string(),
+                    serde_json::Value::String(record.connector.clone()),
+                );
+                doc.insert("parameters".to_string(), record.parameters.clone());
+                doc.insert("resource_opts".to_string(), record.resource_opts.clone());
+                if let Some(extra) = record.params.as_object() {
+                    for (key, value) in extra {
+                        if !doc.contains_key(key) {
+                            doc.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                broker_config::ActionEntry {
+                    id: record.id.clone(),
+                    action_type: record.action_type.clone(),
+                    enable: record.enable,
+                    config: serde_json::to_string(&serde_json::Value::Object(doc))
+                        .unwrap_or_else(|_| "{}".to_string()),
+                }
             })
             .collect();
         entries.sort_by(|a, b| a.id.cmp(&b.id));
@@ -334,13 +542,13 @@ fn action_persist_error(error: broker_config::ConfigError) -> Response {
         .into_response()
 }
 
-/// An action kind is listed only if the kernel can execute it: the kind
-/// registry from the action-types catalogue (W3-01), not a second list
-/// that could drift from the runtimes.
+/// An action kind is listed only if the kernel can execute it: the
+/// shared kind registry in `broker-config`, which also accepts the
+/// documented names the console sends (`http`, `mqtt`,
+/// `kafka_producer`, ...). Historic aliases (`mqtt_bridge`, `kafka`,
+/// ...) stay accepted so old files keep loading.
 fn is_known_action_type(kind: &str) -> bool {
-    broker_connectors::action_types_catalogue()
-        .iter()
-        .any(|entry| entry.kind == kind)
+    broker_config::is_known_action_type(kind)
 }
 
 /// `GET /api/v5/actions`: every action as a bare JSON array, as the
@@ -356,58 +564,23 @@ pub async fn list_actions(State(state): State<ApiState>) -> Response {
 
 /// `POST /api/v5/actions`: validate the body against the named action
 /// kind (unknown kind rejected with the documented error shape); a
-/// duplicate id is rejected cleanly, never overwritten. Management-plane
-/// only; publish and deliver never touch this store.
+/// duplicate id is rejected cleanly, never overwritten. The body
+/// carries the documented envelope (`type`, `name`, `connector`,
+/// `enable`, `parameters`, `resource_opts`); `parameters` and
+/// `resource_opts` default to `{}` and the rest reads back opaquely.
+/// Answers 201 with the stored shape. Management-plane only; publish
+/// and deliver never touch this store.
 pub async fn create_action(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let Some(obj) = body.as_object() else {
-        return ApiError::BadRequest("request body must be a JSON object".to_string())
-            .into_response();
+    let entry = match split_action_body(&body, None) {
+        Ok(entry) => entry,
+        Err(reason) => return ApiError::BadRequest(reason).into_response(),
     };
-    let id = obj
-        .get("id")
-        .or_else(|| obj.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if id.is_empty() {
-        return ApiError::BadRequest("action id or name is required".to_string()).into_response();
-    }
-    if id.len() > MAX_ACTION_ID_LEN {
-        return ApiError::BadRequest(format!(
-            "action id holds {} chars, at most {MAX_ACTION_ID_LEN} (field `id`)",
-            id.len()
-        ))
-        .into_response();
-    }
-    let kind = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if kind.is_empty() {
-        return ApiError::BadRequest("missing required field: type".to_string()).into_response();
-    }
-    if !is_known_action_type(&kind) {
-        return ApiError::BadRequest(format!("unknown action type: {kind}")).into_response();
-    }
-    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
-    let mut params = serde_json::Map::new();
-    for (key, value) in obj {
-        if key != "id" && key != "name" && key != "type" && key != "enable" {
-            params.insert(key.clone(), value.clone());
-        }
-    }
-    match state.actions.insert(ActionRecord {
-        id: id.clone(),
-        action_type: kind,
-        enable,
-        params: serde_json::Value::Object(params),
-    }) {
+    let id = entry.id.clone();
+    let enable = entry.enable;
+    match state.actions.insert(entry.clone()) {
         Ok(entry) => {
             // W3-04: mirror the flag into the engine's lock-free dispatch
             // snapshot so rule evaluation observes the create without
@@ -437,14 +610,15 @@ pub async fn create_action(
 /// still referenced by a rule is rejected with a client-error status.
 /// Management-plane only; publish and deliver never touch this store.
 pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let records = state.actions.snapshot();
-    if !records.iter().any(|record| record.id == id) {
+    let Some(stored) = state.actions.get_any(&id) else {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
-    }
+    };
+    let bare = stored.id.clone();
     // Rule linkage: an action still referenced by a rule cannot be
     // dropped while the reference stands. Rules name their forward
     // target by connector id, so a rule forwarding to this id holds the
-    // reference; the first such rule is named in the refusal.
+    // reference; the first such rule is named in the refusal. Both id
+    // forms count as a reference.
     if let Some(rule_id) = state.engine.list_rules().iter().find_map(|rule| {
         rule.actions
             .iter()
@@ -452,7 +626,7 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
                 matches!(
                     action,
                     broker_rules::RuleAction::ForwardConnector { connector_id }
-                    if connector_id == &id
+                    if connector_id == &bare || connector_id == &id
                 )
             })
             .then(|| rule.id.clone())
@@ -460,15 +634,15 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
         return ApiError::BadRequest(format!("action {id:?} is referenced by rule {rule_id:?}"))
             .into_response();
     }
-    if !state.actions.remove(&id) {
+    if !state.actions.remove(&bare) {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
     // W3-04: drop the id from the dispatch snapshot so a later re-create
     // with the same id starts enabled.
-    state.engine.remove_action(&id);
+    state.engine.remove_action(&bare);
     // W3-05: drop the per-action metric record so the id reads as unknown
     // (404) until re-created, which starts again at zero.
-    state.engine.remove_action_metrics(&id);
+    state.engine.remove_action_metrics(&bare);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -485,7 +659,7 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
 /// read lock cloning at most one small record per request, and publish
 /// and deliver never touch this store.
 pub async fn get_action(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    match state.actions.get(&id) {
+    match state.actions.get_any(&id) {
         Some(entry) => (StatusCode::OK, Json(entry.to_json())).into_response(),
         None => ApiError::NotFound(format!("action {id:?} not found")).into_response(),
     }
@@ -525,67 +699,23 @@ pub async fn update_action(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if state.actions.get(&id).is_none() {
+    let Some(stored) = state.actions.get_any(&id) else {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
-    }
-    let Some(obj) = body.as_object() else {
-        return ApiError::BadRequest("request body must be a JSON object".to_string())
-            .into_response();
     };
-    if let Some(body_id) = obj
-        .get("id")
-        .or_else(|| obj.get("name"))
-        .and_then(|v| v.as_str())
-    {
-        let trimmed = body_id.trim();
-        if !trimmed.is_empty() && trimmed != id {
-            return ApiError::BadRequest(format!(
-                "body id {trimmed:?} does not match path id {id:?} (field `id`)"
-            ))
-            .into_response();
-        }
-    }
-    if id.len() > MAX_ACTION_ID_LEN {
-        return ApiError::BadRequest(format!(
-            "action id holds {} chars, at most {MAX_ACTION_ID_LEN} (field `id`)",
-            id.len()
-        ))
-        .into_response();
-    }
-    let kind = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if kind.is_empty() {
-        return ApiError::BadRequest("missing required field: type".to_string()).into_response();
-    }
-    if !is_known_action_type(&kind) {
-        return ApiError::BadRequest(format!("unknown action type: {kind}")).into_response();
-    }
-    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
-    let mut params = serde_json::Map::new();
-    for (key, value) in obj {
-        if key != "id" && key != "name" && key != "type" && key != "enable" {
-            params.insert(key.clone(), value.clone());
-        }
-    }
-    let entry = ActionRecord {
-        id: id.clone(),
-        action_type: kind,
-        enable,
-        params: serde_json::Value::Object(params),
+    let bare = stored.id.clone();
+    let entry = match split_action_body(&body, Some(&bare)) {
+        Ok(entry) => entry,
+        Err(reason) => return ApiError::BadRequest(reason).into_response(),
     };
-    if !state.actions.replace(&id, entry.clone()) {
+    if !state.actions.replace(&bare, entry.clone()) {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
     // W3-04: mirror the flag into the dispatch snapshot (same lock-free
-    // path as the enable route below).
-    state.engine.set_action_enabled(&id, entry.enable);
+    // path as the enable route below). The engine keys by bare id.
+    state.engine.set_action_enabled(&bare, entry.enable);
     // W3-05: keep the metric record registered across replaces (counters
     // survive a config replace; only delete or reset zeroes them).
-    state.engine.ensure_action_metrics(&id);
+    state.engine.ensure_action_metrics(&bare);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -622,9 +752,10 @@ pub async fn set_action_enabled(
     State(state): State<ApiState>,
     Path((id, enable_raw)): Path<(String, String)>,
 ) -> Response {
-    if state.actions.get(&id).is_none() {
+    let Some(stored) = state.actions.get_any(&id) else {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
-    }
+    };
+    let bare = stored.id.clone();
     let enable = match enable_raw.trim().to_ascii_lowercase().as_str() {
         "true" => true,
         "false" => false,
@@ -635,14 +766,14 @@ pub async fn set_action_enabled(
             .into_response();
         }
     };
-    if state.actions.set_enabled(&id, enable).is_none() {
+    if state.actions.set_enabled(&bare, enable).is_none() {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
     // Mirror into the dispatch snapshot before persisting: the in-memory
     // flag is already flipped, so evaluation must observe it even if the
     // disk save below fails (the store itself keeps the mutation on a
     // persist failure and answers 500, never silently).
-    state.engine.set_action_enabled(&id, enable);
+    state.engine.set_action_enabled(&bare, enable);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -682,14 +813,15 @@ pub async fn get_action_metrics(
     Path(id): Path<String>,
     Query(_ignored): Query<HashMap<String, String>>,
 ) -> Response {
-    if state.actions.get(&id).is_none() {
+    let Some(stored) = state.actions.get_any(&id) else {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
-    }
+    };
+    let bare = stored.id.clone();
     // The record is registered on create/boot, but a standalone engine or
     // a race keeps this fail-closed at zero rather than 500.
     let (total, success, failed) = state
         .engine
-        .action_metrics_snapshot_for(&id)
+        .action_metrics_snapshot_for(&bare)
         .unwrap_or((0, 0, 0));
     (
         StatusCode::OK,
@@ -725,15 +857,16 @@ pub async fn reset_action_metrics(
     Path(id): Path<String>,
     Query(_ignored): Query<HashMap<String, String>>,
 ) -> Response {
-    if state.actions.get(&id).is_none() {
+    let Some(stored) = state.actions.get_any(&id) else {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
-    }
-    if !state.engine.reset_action_metrics(&id) {
+    };
+    let bare = stored.id.clone();
+    if !state.engine.reset_action_metrics(&bare) {
         // The action exists but its record is missing (standalone engine
         // or a boot race): register a zeroed record and report success so
         // the reset is still observable as zeroes on the next read.
-        state.engine.ensure_action_metrics(&id);
-        state.engine.reset_action_metrics(&id);
+        state.engine.ensure_action_metrics(&bare);
+        state.engine.reset_action_metrics(&bare);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -851,9 +984,10 @@ pub async fn run_node_action_operation(
 /// 204 answer with no body. Management-plane only; see the callers for the
 /// locking and fire-path notes.
 async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> Response {
-    if state.actions.get(id).is_none() {
+    let Some(stored) = state.actions.get_any(id) else {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
-    }
+    };
+    let bare = stored.id.clone();
     let enable = match operation {
         "start" => true,
         "stop" => false,
@@ -864,7 +998,7 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
             .into_response();
         }
     };
-    if state.actions.set_enabled(id, enable).is_none() {
+    if state.actions.set_enabled(&bare, enable).is_none() {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
     // Wire into the connector lifecycle underneath: the engine's
@@ -873,7 +1007,7 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
     // `crates/broker-rules/src/lib.rs`), so flipping the flag here
     // starts/stops delivery through the connector without touching the
     // publish path itself.
-    state.engine.set_action_enabled(id, enable);
+    state.engine.set_action_enabled(&bare, enable);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -913,8 +1047,12 @@ mod tests {
     fn record(id: &str) -> ActionRecord {
         ActionRecord {
             id: id.to_string(),
+            name: id.to_string(),
             action_type: "mqtt_bridge".to_string(),
             enable: true,
+            connector: String::new(),
+            parameters: serde_json::json!({}),
+            resource_opts: serde_json::json!({}),
             params: serde_json::json!({}),
         }
     }
@@ -942,16 +1080,74 @@ mod tests {
         let store = ActionStore::new();
         let entry = ActionRecord {
             id: "act-1".to_string(),
-            action_type: "mqtt_bridge".to_string(),
+            name: "act-1".to_string(),
+            action_type: "mqtt".to_string(),
             enable: false,
+            connector: "mqtt:up".to_string(),
+            parameters: serde_json::json!({"topic": "out/1"}),
+            resource_opts: serde_json::json!({}),
             params: serde_json::json!({"server": "127.0.0.1:1883"}),
         };
         assert!(store.insert(entry).is_ok());
         let rendered = store.snapshot()[0].to_json();
         assert_eq!(rendered["id"], serde_json::json!("act-1"));
-        assert_eq!(rendered["type"], serde_json::json!("mqtt_bridge"));
+        assert_eq!(rendered["name"], serde_json::json!("act-1"));
+        assert_eq!(rendered["type"], serde_json::json!("mqtt"));
         assert_eq!(rendered["enable"], serde_json::json!(false));
+        assert_eq!(rendered["connector"], serde_json::json!("mqtt:up"));
+        assert_eq!(
+            rendered["parameters"],
+            serde_json::json!({"topic": "out/1"})
+        );
+        assert!(rendered["resource_opts"].is_object());
+        assert_eq!(rendered["status"], serde_json::json!("disconnected"));
+        assert!(rendered["node_status"].is_array());
         assert_eq!(rendered["server"], serde_json::json!("127.0.0.1:1883"));
+    }
+
+    #[test]
+    fn key_form_resolves_to_the_bare_row() {
+        let store = ActionStore::new();
+        assert!(store.insert(record("a")).is_ok());
+        let found = store.get_any("mqtt_bridge:a").expect("key form reads back");
+        assert_eq!(found.id, "a");
+        assert!(store.contains_any("mqtt_bridge:a"));
+        assert!(store.get_any("other:a").is_none());
+        assert!(store.get_any("missing").is_none());
+    }
+
+    #[test]
+    fn split_body_accepts_the_documented_envelope() {
+        let entry = split_action_body(
+            &serde_json::json!({
+                "type": "http",
+                "name": "web",
+                "connector": "http:up",
+                "enable": true,
+                "parameters": {"method": "post", "path": "/hook"},
+                "resource_opts": {},
+            }),
+            None,
+        )
+        .expect("documented body parses");
+        assert_eq!(entry.id, "web");
+        assert_eq!(entry.connector, "http:up");
+        assert_eq!(entry.parameters["path"], serde_json::json!("/hook"));
+        // The console key form in `id` strips to the bare name.
+        let keyed = split_action_body(&serde_json::json!({"id": "http:web", "type": "http"}), None)
+            .expect("key form parses");
+        assert_eq!(keyed.id, "web");
+        // A missing type and an unknown type both fail.
+        assert!(split_action_body(&serde_json::json!({"name": "x"}), None).is_err());
+        assert!(
+            split_action_body(&serde_json::json!({"name": "x", "type": "nope"}), None).is_err()
+        );
+        // A non-object `parameters` fails.
+        assert!(split_action_body(
+            &serde_json::json!({"name": "x", "type": "http", "parameters": []}),
+            None
+        )
+        .is_err());
     }
 
     #[test]
@@ -982,6 +1178,9 @@ mod tests {
     fn known_action_type_follows_the_w3_01_catalogue() {
         assert!(is_known_action_type("mqtt_bridge"));
         assert!(is_known_action_type("kafka"));
+        assert!(is_known_action_type("http"));
+        assert!(is_known_action_type("mqtt"));
+        assert!(is_known_action_type("kafka_producer"));
         assert!(!is_known_action_type("no_such_kind_xyz"));
         assert!(!is_known_action_type(""));
     }
@@ -1016,14 +1215,19 @@ mod tests {
         assert!(store.insert(record("a")).is_ok());
         let updated = ActionRecord {
             id: "a".to_string(),
+            name: "a".to_string(),
             action_type: "kafka".to_string(),
             enable: false,
-            params: serde_json::json!({"topic": "events"}),
+            connector: String::new(),
+            parameters: serde_json::json!({"topic": "events"}),
+            resource_opts: serde_json::json!({}),
+            params: serde_json::json!({}),
         };
         assert!(store.replace("a", updated.clone()));
         let found = store.get("a").expect("replaced action reads back");
         assert_eq!(found, updated);
         assert_eq!(store.snapshot().len(), 1);
         assert!(!store.replace("missing", record("missing")));
+        assert!(store.replace_any("kafka:a", record("a")));
     }
 }

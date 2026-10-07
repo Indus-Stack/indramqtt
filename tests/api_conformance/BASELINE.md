@@ -257,3 +257,29 @@ is not changed.
   `1883`. The management console sends a bare port as a number. The
   broker accepts a string or a number and stores the string form, so the
   checker sees no error and the console create succeeds.
+- `GET /action_types` and `GET /source_types`, response 200. The
+  specification declares the full name enum. The management console
+  reads a bare string array (`getActionTypes`) and offers creation
+  forms only for installed types. The broker returns the documented
+  names limited to the runtimes in this build, so the checker sees a
+  shorter array and each listed name still validates against the enum.
+- `GET /actions/{id}`, `GET /sources/{id}` and `GET /connectors/{id}`,
+  path `id`. The specification shows the `{type}:{name}` key. The
+  management console builds that key client side (`getBridgeKey`) and
+  sends it encoded in the path. The broker accepts the key and the
+  bare name, stores the bare name, and returns the bare `id` with the
+  bare `name`, so the checker validates the key-form read and the
+  console derives the same key back.
+- `GET /actions/{id}` and `GET /sources/{id}`, response 200, fields
+  `status` and `node_status`. The specification declares health rows
+  per node. The management console renders those rows in the detail
+  pages. The broker runs no health probe for actions or sources, so it
+  derives the rows from the stored enable flag (`connected` while
+  enabled, `disconnected` while stopped) on the local node, instead of
+  a constant or a missing field.
+- `POST /schema_registry` and `GET /schema_registry/{name}`, fields
+  `source` and `schema`. The specification declares `source` text. The
+  management console form posts the document and reads it back for
+  editing. The broker accepts `source` or `schema` on write and
+  returns both (`source` as text, `schema` parsed), so the checker
+  validates the documented field and historic bodies keep working.

@@ -18,8 +18,6 @@
 //!
 //! Persistence: each write exports the checked store to the config core
 //! (`SchemasConf`) and saves it. A save failure answers 500. Nothing stays silent.
-// TODO(parity): which schema kinds does the spec list beyond json and avro?
-// TODO(parity): which fields does each schema row carry beyond name and type?
 // TODO(parity): which status and code does delete of a used schema return?
 
 use axum::{
@@ -57,12 +55,32 @@ pub struct SchemaRecord {
 
 impl SchemaRecord {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "name": self.name,
-            "type": self.schema_type,
-            "description": self.description,
-            "schema": self.schema,
-        })
+        // The console reads `source` (text). Old bodies read `schema`
+        // (parsed). Both stay present. `parameters` stays for the
+        // external server kind.
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "name".to_string(),
+            serde_json::Value::String(self.name.clone()),
+        );
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String(self.schema_type.clone()),
+        );
+        obj.insert(
+            "description".to_string(),
+            serde_json::Value::String(self.description.clone()),
+        );
+        obj.insert("schema".to_string(), self.schema.clone());
+        let source = match &self.schema {
+            serde_json::Value::String(text) => text.clone(),
+            other => serde_json::to_string(other).unwrap_or_default(),
+        };
+        obj.insert("source".to_string(), serde_json::Value::String(source));
+        if self.schema_type == "external_http" && self.schema.is_object() {
+            obj.insert("parameters".to_string(), self.schema.clone());
+        }
+        serde_json::Value::Object(obj)
     }
 }
 
@@ -112,18 +130,25 @@ impl SchemaRegistryStore {
         let mut map = self.inner.write().expect("schema store lock");
         map.clear();
         for entry in &conf.schemas {
-            let parsed = match serde_json::from_str(&entry.schema) {
-                Ok(value) => value,
-                Err(_) => {
-                    // Fail closed: skip bad rows at boot.
-                    tracing::warn!(
-                        schema = entry.name.as_str(),
-                        "schema snapshot entry is not valid JSON; skipped"
-                    );
-                    continue;
+            // Protobuf stores raw text. It is not JSON. The other
+            // kinds store parsed JSON.
+            let kind = entry.schema_type.trim();
+            let parsed = if kind == "protobuf" {
+                serde_json::Value::String(entry.schema.clone())
+            } else {
+                match serde_json::from_str(&entry.schema) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        // Fail closed: skip bad rows at boot.
+                        tracing::warn!(
+                            schema = entry.name.as_str(),
+                            "schema snapshot entry is not valid JSON; skipped"
+                        );
+                        continue;
+                    }
                 }
             };
-            if broker_config::validate_schema_document(entry.schema_type.trim(), &parsed).is_err() {
+            if broker_config::validate_schema_document(kind, &parsed).is_err() {
                 tracing::warn!(
                     schema = entry.name.as_str(),
                     "schema snapshot entry fails shape checks; skipped"
@@ -182,16 +207,26 @@ impl SchemaRegistryStore {
     }
 
     /// Export the store as a checked config root. Entries sort by name
-    /// so the saved file stays stable. Only inputs persist.
+    /// so the saved file stays stable. Only inputs persist. Protobuf
+    /// stores raw text, so it persists verbatim and survives a restart
+    /// without added quoting.
     fn export_conf(&self) -> broker_config::SchemasConf {
         let map = self.inner.read().expect("schema store lock");
         let mut entries: Vec<broker_config::SchemaEntry> = map
             .values()
-            .map(|record| broker_config::SchemaEntry {
-                name: record.name.clone(),
-                schema_type: record.schema_type.clone(),
-                description: record.description.clone(),
-                schema: serde_json::to_string(&record.schema).unwrap_or_else(|_| "{}".to_string()),
+            .map(|record| {
+                let schema = match &record.schema {
+                    serde_json::Value::String(text) if record.schema_type.trim() == "protobuf" => {
+                        text.clone()
+                    }
+                    other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+                };
+                broker_config::SchemaEntry {
+                    name: record.name.clone(),
+                    schema_type: record.schema_type.clone(),
+                    description: record.description.clone(),
+                    schema,
+                }
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -233,9 +268,11 @@ fn schema_persist_error(error: broker_config::ConfigError) -> Response {
 }
 
 /// Check one create body and build the record.
-/// The body must be an object with `name`, `type` and `schema`.
-/// `schema` accepts an object or a JSON string. The parser parses it
-/// and checks its shape per kind. All limits apply here.
+/// The body must be an object with `name` and `type`. The document
+/// arrives in `source` (documented text) or `schema` (historic: object
+/// or JSON string). `parameters` carries the external server config.
+/// The parser parses the document and checks its shape per kind. All
+/// limits apply here.
 fn parse_schema_request(value: &serde_json::Value) -> Result<SchemaRecord, String> {
     let obj = value
         .as_object()
@@ -279,35 +316,87 @@ fn parse_schema_request(value: &serde_json::Value) -> Result<SchemaRecord, Strin
             description.len()
         ));
     }
+    // The external server kind stores its `parameters` object. It never
+    // calls the server.
+    if kind == "external_http" {
+        let params = obj
+            .get("parameters")
+            .ok_or_else(|| "field `parameters` is required".to_string())?;
+        if !params.is_object() {
+            return Err("field `parameters` must be an object".to_string());
+        }
+        let text = serde_json::to_string(params).unwrap_or_default();
+        if text.len() > MAX_SCHEMA_BYTES {
+            return Err(format!(
+                "field `parameters` holds {} bytes, at most {MAX_SCHEMA_BYTES}",
+                text.len()
+            ));
+        }
+        broker_config::validate_schema_document(&kind, params)
+            .map_err(|reason| format!("field `parameters` is invalid: {reason}"))?;
+        return Ok(SchemaRecord {
+            name,
+            schema_type: kind,
+            description,
+            schema: params.clone(),
+        });
+    }
     let raw = obj
-        .get("schema")
-        .ok_or_else(|| "field `schema` is required".to_string())?;
-    let parsed: serde_json::Value = if let Some(text) = raw.as_str() {
+        .get("source")
+        .or_else(|| obj.get("schema"))
+        .ok_or_else(|| "field `source` is required".to_string())?;
+    // Protobuf stores raw text. It is not JSON. The other kinds store
+    // parsed JSON.
+    if kind == "protobuf" {
+        let text = if let Some(text) = raw.as_str() {
+            text.to_string()
+        } else {
+            serde_json::to_string(raw).unwrap_or_default()
+        };
         if text.trim().is_empty() {
-            return Err("field `schema` must not be empty".to_string());
+            return Err("field `source` must not be empty".to_string());
         }
         if text.len() > MAX_SCHEMA_BYTES {
             return Err(format!(
-                "field `schema` holds {} bytes, at most {MAX_SCHEMA_BYTES}",
+                "field `source` holds {} bytes, at most {MAX_SCHEMA_BYTES}",
+                text.len()
+            ));
+        }
+        broker_config::validate_schema_document(&kind, &serde_json::Value::String(text.clone()))
+            .map_err(|reason| format!("field `source` is invalid: {reason}"))?;
+        return Ok(SchemaRecord {
+            name,
+            schema_type: kind,
+            description,
+            schema: serde_json::Value::String(text),
+        });
+    }
+    let parsed: serde_json::Value = if let Some(text) = raw.as_str() {
+        if text.trim().is_empty() {
+            return Err("field `source` must not be empty".to_string());
+        }
+        if text.len() > MAX_SCHEMA_BYTES {
+            return Err(format!(
+                "field `source` holds {} bytes, at most {MAX_SCHEMA_BYTES}",
                 text.len()
             ));
         }
         serde_json::from_str(text)
-            .map_err(|err| format!("field `schema` is not valid JSON: {err}"))?
+            .map_err(|err| format!("field `source` is not valid JSON: {err}"))?
     } else if raw.is_object() {
         let text = serde_json::to_string(raw).unwrap_or_default();
         if text.len() > MAX_SCHEMA_BYTES {
             return Err(format!(
-                "field `schema` holds {} bytes, at most {MAX_SCHEMA_BYTES}",
+                "field `source` holds {} bytes, at most {MAX_SCHEMA_BYTES}",
                 text.len()
             ));
         }
         raw.clone()
     } else {
-        return Err("field `schema` must be an object".to_string());
+        return Err("field `source` must be an object".to_string());
     };
     broker_config::validate_schema_document(&kind, &parsed)
-        .map_err(|reason| format!("field `schema` is invalid: {reason}"))?;
+        .map_err(|reason| format!("field `source` is invalid: {reason}"))?;
     Ok(SchemaRecord {
         name,
         schema_type: kind,
@@ -367,14 +456,34 @@ pub async fn create_schema_registry(State(state): State<ApiState>, body: Bytes) 
     }
 }
 
+/// `GET /api/v5/schema_registry/:name`: read one schema.
+/// A known name returns the stored row (`name`, `type`,
+/// `description`, `source` text plus the historic `schema` value).
+/// An unknown name returns 404 with the documented shape.
+/// Management plane only. Publish and deliver never touch this store.
+///
+/// Store wiring: same store as list and create, shared with the kernel.
+/// Declared `wired` in `tools/wiring.txt`.
+///
+/// Fire path cost: none. This route takes one short read lock.
+/// Publish and deliver take no lock here.
+pub async fn get_schema_registry(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Response {
+    match state.schema_registry.get(&name) {
+        Some(record) => (StatusCode::OK, Json(record.to_json())).into_response(),
+        None => ApiError::NotFound(format!("schema {name:?} not found")).into_response(),
+    }
+}
+
 /// `DELETE /api/v5/schema_registry/:name`: drop one schema.
 /// Unknown names return 404 with the documented shape.
 /// Delete removes the entry without a use check. Answers 204 on success.
 /// Management plane only. Publish and deliver never touch this store.
 ///
 /// Store wiring: same store as list and create, shared with the kernel.
-/// The boot path seeds it. Only list, create and delete use it.
-/// Declared `wired` in `tools/wiring.txt`.
+/// The boot path seeds it. Declared `wired` in `tools/wiring.txt`.
 ///
 /// Fire path cost: none. This route takes one short write lock.
 /// Publish and deliver take no lock here.
@@ -488,6 +597,54 @@ mod tests {
         }))
         .expect("string schema parses");
         assert_eq!(from_text.schema, avro_schema());
+    }
+
+    #[test]
+    fn parse_accepts_documented_source_field() {
+        let record = parse_schema_request(&serde_json::json!({
+            "name": "s1",
+            "type": "json",
+            "source": "{\"type\": \"object\"}",
+        }))
+        .expect("documented source parses");
+        assert_eq!(record.schema, serde_json::json!({"type": "object"}));
+        let rendered = record.to_json();
+        assert_eq!(rendered["name"], serde_json::json!("s1"));
+        assert_eq!(rendered["type"], serde_json::json!("json"));
+        assert_eq!(rendered["schema"], serde_json::json!({"type": "object"}));
+        assert_eq!(
+            rendered["source"],
+            serde_json::json!("{\"type\":\"object\"}")
+        );
+    }
+
+    #[test]
+    fn parse_accepts_protobuf_text_and_external_http() {
+        let proto = parse_schema_request(&serde_json::json!({
+            "name": "p1",
+            "type": "protobuf",
+            "source": "message Reading { string id = 1; }",
+        }))
+        .expect("protobuf text parses");
+        assert_eq!(
+            proto.to_json()["source"],
+            serde_json::json!("message Reading { string id = 1; }")
+        );
+        let external = parse_schema_request(&serde_json::json!({
+            "name": "e1",
+            "type": "external_http",
+            "parameters": {"url": "http://127.0.0.1:9/schema"},
+        }))
+        .expect("external parameters parse");
+        assert_eq!(
+            external.to_json()["parameters"],
+            serde_json::json!({"url": "http://127.0.0.1:9/schema"})
+        );
+        assert!(parse_schema_request(&serde_json::json!({
+            "name": "e2",
+            "type": "external_http",
+        }))
+        .is_err());
     }
 
     #[test]

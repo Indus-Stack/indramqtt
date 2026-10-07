@@ -80,24 +80,162 @@ pub const MAX_SOURCES: usize = broker_config::MAX_SOURCES;
 /// entry so one create cannot balloon the store.
 const MAX_SOURCE_ID_LEN: usize = broker_config::MAX_SOURCE_ID_LEN;
 
-/// One stored source: operator-chosen id, the ingress kind it was
-/// validated against, and whether it is enabled (disabled sources stop
-/// ingress; the flag is visible on the next summary read).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One stored source: operator-chosen bare id, the ingress kind it was
+/// validated against, whether it is enabled (disabled sources stop
+/// ingress; the flag is visible on the next summary read), the
+/// documented `connector` reference, the documented `parameters` and
+/// `resource_opts` objects, and all remaining fields stored opaquely.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceEntry {
     pub id: String,
+    pub name: String,
     pub source_type: String,
     pub enable: bool,
+    pub connector: String,
+    pub parameters: serde_json::Value,
+    pub resource_opts: serde_json::Value,
+    pub params: serde_json::Value,
 }
 
 impl SourceEntry {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "id": self.id,
-            "type": self.source_type,
-            "enable": self.enable,
-        })
+        let status = super::typed::typed_status(self.enable);
+        let mut obj = serde_json::Map::new();
+        obj.insert("id".to_string(), serde_json::Value::String(self.id.clone()));
+        obj.insert(
+            "name".to_string(),
+            serde_json::Value::String(self.name.clone()),
+        );
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String(self.source_type.clone()),
+        );
+        obj.insert("enable".to_string(), serde_json::Value::Bool(self.enable));
+        obj.insert(
+            "connector".to_string(),
+            serde_json::Value::String(self.connector.clone()),
+        );
+        obj.insert("parameters".to_string(), self.parameters.clone());
+        obj.insert("resource_opts".to_string(), self.resource_opts.clone());
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.to_string()),
+        );
+        obj.insert(
+            "node_status".to_string(),
+            super::typed::typed_node_status(status),
+        );
+        if let Some(extra) = self.params.as_object() {
+            for (key, value) in extra {
+                if !obj.contains_key(key) {
+                    obj.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        serde_json::Value::Object(obj)
     }
+}
+
+/// Envelope keys live in first-class fields. All other keys stay in
+/// `params` and read back unchanged.
+const SOURCE_ENVELOPE_KEYS: &[&str] = &[
+    "id",
+    "name",
+    "type",
+    "enable",
+    "connector",
+    "parameters",
+    "resource_opts",
+    "status",
+    "node_status",
+    "status_reason",
+];
+
+/// Split a create or replace body into envelope fields plus extras.
+/// Returns the error text for a 400 answer.
+fn split_source_body(
+    body: &serde_json::Value,
+    path_bare: Option<&str>,
+) -> Result<SourceEntry, String> {
+    let Some(obj) = body.as_object() else {
+        return Err("request body must be a JSON object".to_string());
+    };
+    let raw_id = obj
+        .get("id")
+        .or_else(|| obj.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let kind = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return Err("missing required field: type".to_string());
+    }
+    if !is_known_source_type(&kind) {
+        return Err(format!("unknown source type: {kind}"));
+    }
+    // The path id is authoritative. The caller resolves it to the
+    // stored bare id first. A body id that names another source is
+    // rejected. A type change through replace stays allowed.
+    let mut id = if raw_id.is_empty() {
+        String::new()
+    } else {
+        super::typed::bare_name(&raw_id, &kind)
+    };
+    if let Some(expected) = path_bare {
+        if !id.is_empty() && id != expected {
+            return Err(format!(
+                "body id {raw_id:?} does not match path id {expected:?} (field `id`)"
+            ));
+        }
+        id = expected.to_string();
+    }
+    if id.is_empty() {
+        return Err("source id or name is required".to_string());
+    }
+    if id.len() > MAX_SOURCE_ID_LEN {
+        return Err(format!(
+            "source id holds {} chars, at most {MAX_SOURCE_ID_LEN} (field `id`)",
+            id.len()
+        ));
+    }
+    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    let connector = obj
+        .get("connector")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let parameters = match obj.get("parameters") {
+        None => serde_json::json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => return Err("field `parameters` must be an object".to_string()),
+    };
+    let resource_opts = match obj.get("resource_opts") {
+        None => serde_json::json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(_) => return Err("field `resource_opts` must be an object".to_string()),
+    };
+    let mut extras = serde_json::Map::new();
+    for (key, value) in obj {
+        if !SOURCE_ENVELOPE_KEYS.contains(&key.as_str()) {
+            extras.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(SourceEntry {
+        id: id.clone(),
+        name: id,
+        source_type: kind,
+        enable,
+        connector,
+        parameters,
+        resource_opts,
+        params: serde_json::Value::Object(extras),
+    })
 }
 
 /// Insert failure: duplicate id or a full store.
@@ -160,12 +298,55 @@ impl SourceStore {
         let mut map = self.inner.write().expect("source store lock");
         map.clear();
         for entry in &conf.sources {
+            // Old files store an empty document. New files store the
+            // envelope (`connector`, `parameters`, `resource_opts`)
+            // plus flat extras. Missing envelope keys read as empty.
+            let doc = if entry.config.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str(&entry.config) {
+                    Ok(doc) => doc,
+                    Err(_) => {
+                        tracing::warn!(
+                            source = entry.id.as_str(),
+                            "source snapshot entry has an undecodable config; stored without params"
+                        );
+                        serde_json::json!({})
+                    }
+                }
+            };
+            let doc_obj = doc.as_object().cloned().unwrap_or_default();
+            let connector = doc_obj
+                .get("connector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let parameters = match doc_obj.get("parameters") {
+                Some(value) if value.is_object() => value.clone(),
+                _ => serde_json::json!({}),
+            };
+            let resource_opts = match doc_obj.get("resource_opts") {
+                Some(value) if value.is_object() => value.clone(),
+                _ => serde_json::json!({}),
+            };
+            let mut extras = serde_json::Map::new();
+            for (key, value) in &doc_obj {
+                if !SOURCE_ENVELOPE_KEYS.contains(&key.as_str()) {
+                    extras.insert(key.clone(), value.clone());
+                }
+            }
+            let bare = super::typed::bare_name(&entry.id, &entry.source_type);
             map.insert(
-                entry.id.clone(),
+                bare.clone(),
                 SourceEntry {
-                    id: entry.id.clone(),
+                    id: bare.clone(),
+                    name: bare,
                     source_type: entry.source_type.clone(),
                     enable: entry.enable,
+                    connector,
+                    parameters,
+                    resource_opts,
+                    params: serde_json::Value::Object(extras),
                 },
             );
         }
@@ -226,6 +407,46 @@ impl SourceStore {
             .cloned()
     }
 
+    /// Resolve a path id to the stored bare id. Accepts the bare name
+    /// and the `{type}:{name}` key. Returns `None` for unknown ids.
+    pub fn resolve_id(&self, requested: &str) -> Option<String> {
+        let map = self.inner.read().expect("source store lock");
+        if map.contains_key(requested) {
+            return Some(requested.to_string());
+        }
+        map.values()
+            .find(|entry| super::typed::id_matches(&entry.id, &entry.source_type, requested))
+            .map(|entry| entry.id.clone())
+    }
+
+    /// Read one entry by bare name or key. Returns `None` when unknown.
+    pub fn get_any(&self, requested: &str) -> Option<SourceEntry> {
+        let bare = self.resolve_id(requested)?;
+        self.get(&bare)
+    }
+
+    /// True when the bare name or key names a stored entry.
+    pub fn contains_any(&self, requested: &str) -> bool {
+        self.resolve_id(requested).is_some()
+    }
+
+    /// Remove one entry by bare name or key. Returns false when unknown.
+    pub fn remove_any(&self, requested: &str) -> bool {
+        let Some(bare) = self.resolve_id(requested) else {
+            return false;
+        };
+        self.remove(&bare)
+    }
+
+    /// Replace the entry stored under the resolved bare id. Returns
+    /// false when unknown. Never grows the map.
+    pub fn replace_any(&self, requested: &str, entry: SourceEntry) -> bool {
+        let Some(bare) = self.resolve_id(requested) else {
+            return false;
+        };
+        self.replace(&bare, entry)
+    }
+
     /// Flip the enable flag of one entry in place (W3-23, C07-20
     /// runtime core). Returns the updated record, or `None` when the id
     /// is unknown (caller maps to `NOT_FOUND` and changes nothing).
@@ -258,18 +479,35 @@ impl SourceStore {
 
     /// Export the store as a validated config root: entries sorted by
     /// id so the persisted file is deterministic. Each entry carries
-    /// the id, kind and enable flag; kind-specific body fields are not
-    /// stored (the create call keeps only the shared `id`/`type`/`enable`
-    /// envelope, and nothing derived is persisted).
+    /// the id, kind, enable flag and the envelope (`connector`,
+    /// `parameters`, `resource_opts`) plus the opaque extras as a JSON
+    /// document. Nothing derived is stored: only inputs persist.
     fn export_conf(&self) -> broker_config::SourcesConf {
         let map = self.inner.read().expect("source store lock");
         let mut entries: Vec<broker_config::SourceEntry> = map
             .values()
-            .map(|entry| broker_config::SourceEntry {
-                id: entry.id.clone(),
-                source_type: entry.source_type.clone(),
-                enable: entry.enable,
-                config: "{}".to_string(),
+            .map(|entry| {
+                let mut doc = serde_json::Map::new();
+                doc.insert(
+                    "connector".to_string(),
+                    serde_json::Value::String(entry.connector.clone()),
+                );
+                doc.insert("parameters".to_string(), entry.parameters.clone());
+                doc.insert("resource_opts".to_string(), entry.resource_opts.clone());
+                if let Some(extra) = entry.params.as_object() {
+                    for (key, value) in extra {
+                        if !doc.contains_key(key) {
+                            doc.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                broker_config::SourceEntry {
+                    id: entry.id.clone(),
+                    source_type: entry.source_type.clone(),
+                    enable: entry.enable,
+                    config: serde_json::to_string(&serde_json::Value::Object(doc))
+                        .unwrap_or_else(|_| "{}".to_string()),
+                }
             })
             .collect();
         entries.sort_by(|a, b| a.id.cmp(&b.id));
@@ -310,54 +548,37 @@ fn is_known_source_type(kind: &str) -> bool {
     broker_connectors::is_known_source_type(kind)
 }
 
-/// `GET /api/v5/source_types` (C07-11): catalogue of supported source
-/// kinds with the documented per-entry fields.
+/// `GET /api/v5/source_types` (C07-11): names of supported source kinds.
 ///
-/// Returns the bare list (not paged): an empty registry reads as `[]`,
-/// never an error. Unknown query parameters are ignored (only the ignore
-/// sink is extracted). A kind is listed only if its runtime exists (the
-/// shared W3-25 registry in `broker-connectors`: every executable sink
-/// kind plus the `http`/`mqtt` ingress aliases, never the `test`
-/// helper), so adding a runtime elsewhere automatically extends the
-/// served list. Management-plane only: reads a static registry, takes no
-/// lock, and publish/deliver never touch it.
+/// Returns the bare list of documented names (not paged): an empty
+/// build reads as `[]`, never an error. Unknown query parameters are
+/// ignored (only the ignore sink is extracted). A name is listed only
+/// if its runtime exists in this build (`azure_event_grid` has none
+/// and stays out). Management-plane only: reads a static list, takes
+/// no lock, and publish/deliver never touch it.
 ///
-/// Store wiring (rulebook section 2): no store. The catalogue is the
-/// source-type registry itself, shared with the [`is_known_source_type`]
-/// predicate above (and the source store validation plus the stateless
-/// probe) so the served list and the checks cannot drift. There is no
-/// broker event driving it beyond serving the management read, and
-/// nothing outside `crates/broker-api` writes or consults it, so
+/// Store wiring (rulebook section 2): no store. The list is the
+/// documented enum filtered to the runtimes, shared with the
+/// [`is_known_source_type`] predicate above (and the source store
+/// validation plus the stateless probe) so the served list and the
+/// checks cannot drift. There is no broker event driving it beyond
+/// serving the management read, and nothing outside
+/// `crates/broker-api` writes or consults it, so
 /// `tools/wiring_check.sh` needs no new entry (it only tracks
 /// `Arc<crate::v5::...>` store fields on `ApiState`, of which this task
 /// adds none).
 ///
-/// Store bounds (stated here and enforced by construction):
-/// - at most [`broker_connectors::MAX_SOURCE_TYPES`] entries (64: caps
-///   management-plane memory; the built-in set is exactly
-///   [`broker_connectors::SOURCE_TYPE_COUNT`]);
-/// - an empty catalogue reads as an empty list (`[]`), never an error;
-/// - reads clone at most one small document per kind (three short
-///   strings) with no lock held.
+/// Store bounds (stated here and enforced by construction): at most
+/// four short strings; the list never grows at runtime.
 ///
-/// Fire-path cost: none. The catalogue is never consulted per message;
-/// the publish path keeps paying what message ingress already pays (the
+/// Fire-path cost: none. The list is never consulted per message; the
+/// publish path keeps paying what message ingress already pays (the
 /// rule match in `dispatch_ingress`) with no new lock, allocation or
 /// queue from this route.
-// TODO(parity): which per-entry fields does the documented catalogue shape
-// require beyond `kind`/`description`/`configuration` (columns, schema,
-// ...)? The rulebook does not decide the exact shape; fields the broker
-// cannot supply are omitted rather than invented, until the checker pins
-// it.
-// TODO(parity): which kinds have dedicated ingress readers versus the
-// generic enable-flag runtime? The rulebook does not decide the exact
-// ingress split; the current choice lists every backend family the kernel
-// can instantiate minus the `test` helper, until the checker pins it.
 pub async fn list_source_types(Query(_ignored): Query<HashMap<String, String>>) -> Response {
-    let catalogue = broker_connectors::source_types_catalogue();
     (
         StatusCode::OK,
-        Json(serde_json::to_value(catalogue).unwrap_or_default()),
+        Json(serde_json::json!(super::typed::SPEC_SOURCE_TYPES)),
     )
         .into_response()
 }
@@ -396,10 +617,6 @@ fn source_persist_error(error: broker_config::ConfigError) -> Response {
 /// Fire-path cost: none. The list is never consulted per message; the
 /// publish path keeps paying nothing for sources (no consult, no lock,
 /// no allocation on either path).
-// TODO(parity): which per-entry fields does the documented list shape
-// require beyond `id`/`type`/`enable` (status, node rows, ...)? The
-// rulebook does not decide the exact shape; fields the broker cannot
-// supply are omitted rather than invented, until the checker pins it.
 pub async fn list_sources(State(state): State<ApiState>) -> Response {
     let entries = state.sources.snapshot();
     let rows: Vec<serde_json::Value> = entries.iter().map(SourceEntry::to_json).collect();
@@ -419,45 +636,13 @@ pub async fn create_source(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let Some(obj) = body.as_object() else {
-        return ApiError::BadRequest("request body must be a JSON object".to_string())
-            .into_response();
+    let entry = match split_source_body(&body, None) {
+        Ok(entry) => entry,
+        Err(reason) => return ApiError::BadRequest(reason).into_response(),
     };
-    let id = obj
-        .get("id")
-        .or_else(|| obj.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if id.is_empty() {
-        return ApiError::BadRequest("source id or name is required".to_string()).into_response();
-    }
-    if id.len() > MAX_SOURCE_ID_LEN {
-        return ApiError::BadRequest(format!(
-            "source id holds {} chars, at most {MAX_SOURCE_ID_LEN} (field `id`)",
-            id.len()
-        ))
-        .into_response();
-    }
-    let kind = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if kind.is_empty() {
-        return ApiError::BadRequest("missing required field: type".to_string()).into_response();
-    }
-    if !is_known_source_type(&kind) {
-        return ApiError::BadRequest(format!("unknown source type: {kind}")).into_response();
-    }
-    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
-    match state.sources.insert(SourceEntry {
-        id: id.clone(),
-        source_type: kind,
-        enable,
-    }) {
+    let id = entry.id.clone();
+    let enable = entry.enable;
+    match state.sources.insert(entry.clone()) {
         Ok(entry) => {
             // W3-29: register a zeroed per-source metric record and mirror
             // the flag into the engine's lock-free ingress snapshot so the
@@ -484,13 +669,17 @@ pub async fn create_source(
 /// returns 404 with the documented error code, not an empty body.
 /// Management-plane only; publish and deliver never touch this store.
 pub async fn delete_source(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    if state.sources.remove(&id) {
+    let Some(stored) = state.sources.get_any(&id) else {
+        return ApiError::NotFound(format!("source {id:?} not found")).into_response();
+    };
+    let bare = stored.id.clone();
+    if state.sources.remove(&bare) {
         // W3-29: drop the per-source metric record so the id reads as
         // unknown (404) until re-created, which starts again at zero; drop
         // the id from the ingress snapshot so a later re-create with the
         // same id starts enabled.
-        state.engine.remove_source_metrics(&id);
-        state.engine.remove_source(&id);
+        state.engine.remove_source_metrics(&bare);
+        state.engine.remove_source(&bare);
         if let Err(error) = state.sources.persist() {
             return source_persist_error(error);
         }
@@ -525,16 +714,12 @@ pub async fn delete_source(State(state): State<ApiState>, Path(id): Path<String>
 /// Fire-path cost: none. The read is never consulted per message; the
 /// publish path keeps paying nothing for sources (no consult, no lock,
 /// no allocation on either path).
-// TODO(parity): which per-entry fields does the documented single-read
-// shape require beyond `id`/`type`/`enable` (status, node rows, ...)? The
-// rulebook does not decide the exact shape; fields the broker cannot
-// supply are omitted rather than invented, until the checker pins it.
 pub async fn get_source(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Query(_ignored): Query<HashMap<String, String>>,
 ) -> Response {
-    match state.sources.get(&id) {
+    match state.sources.get_any(&id) {
         Some(entry) => (StatusCode::OK, Json(entry.to_json())).into_response(),
         None => ApiError::NotFound(format!("source {id:?} not found")).into_response(),
     }
@@ -585,60 +770,23 @@ pub async fn update_source(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if state.sources.get(&id).is_none() {
+    let Some(stored) = state.sources.get_any(&id) else {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
-    }
-    let Some(obj) = body.as_object() else {
-        return ApiError::BadRequest("request body must be a JSON object".to_string())
-            .into_response();
     };
-    if let Some(body_id) = obj
-        .get("id")
-        .or_else(|| obj.get("name"))
-        .and_then(|v| v.as_str())
-    {
-        let trimmed = body_id.trim();
-        if !trimmed.is_empty() && trimmed != id {
-            return ApiError::BadRequest(format!(
-                "body id {trimmed:?} does not match path id {id:?} (field `id`)"
-            ))
-            .into_response();
-        }
-    }
-    if id.len() > MAX_SOURCE_ID_LEN {
-        return ApiError::BadRequest(format!(
-            "source id holds {} chars, at most {MAX_SOURCE_ID_LEN} (field `id`)",
-            id.len()
-        ))
-        .into_response();
-    }
-    let kind = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if kind.is_empty() {
-        return ApiError::BadRequest("missing required field: type".to_string()).into_response();
-    }
-    if !is_known_source_type(&kind) {
-        return ApiError::BadRequest(format!("unknown source type: {kind}")).into_response();
-    }
-    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
-    let entry = SourceEntry {
-        id: id.clone(),
-        source_type: kind,
-        enable,
+    let bare = stored.id.clone();
+    let entry = match split_source_body(&body, Some(&bare)) {
+        Ok(entry) => entry,
+        Err(reason) => return ApiError::BadRequest(reason).into_response(),
     };
-    if !state.sources.replace(&id, entry.clone()) {
+    if !state.sources.replace(&bare, entry.clone()) {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
     }
     // W3-29: keep the metric record registered across replaces (counters
     // survive a config replace; only delete or reset zeroes them) and
     // mirror the flag into the ingress snapshot (same lock-free path as
     // the enable route below).
-    state.engine.ensure_source_metrics(&id);
-    state.engine.set_source_enabled(&id, entry.enable);
+    state.engine.ensure_source_metrics(&bare);
+    state.engine.set_source_enabled(&bare, entry.enable);
     if let Err(error) = state.sources.persist() {
         return source_persist_error(error);
     }
@@ -686,9 +834,10 @@ pub async fn run_source_operation(
 /// flip and the 204 answer with no body. Management-plane only; see
 /// the caller for the locking and fire-path notes.
 fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Response {
-    if state.sources.get(id).is_none() {
+    let Some(stored) = state.sources.get_any(id) else {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
-    }
+    };
+    let bare = stored.id.clone();
     let enable = match operation {
         "start" => true,
         "stop" => false,
@@ -699,14 +848,14 @@ fn apply_source_operation(state: &ApiState, id: &str, operation: &str) -> Respon
             .into_response();
         }
     };
-    if state.sources.set_enabled(id, enable).is_none() {
+    if state.sources.set_enabled(&bare, enable).is_none() {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
     }
     // Mirror into the ingress snapshot before persisting: the in-memory
     // flag is already flipped, so the next ingress must observe it even if
     // the disk save below fails (the store itself keeps the mutation on a
     // persist failure and answers 500, never silently).
-    state.engine.set_source_enabled(id, enable);
+    state.engine.set_source_enabled(&bare, enable);
     if let Err(error) = state.sources.persist() {
         return source_persist_error(error);
     }
@@ -809,9 +958,10 @@ pub async fn set_source_enabled(
     State(state): State<ApiState>,
     Path((id, enable_raw)): Path<(String, String)>,
 ) -> Response {
-    if state.sources.get(&id).is_none() {
+    let Some(stored) = state.sources.get_any(&id) else {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
-    }
+    };
+    let bare = stored.id.clone();
     let enable = match enable_raw.trim().to_ascii_lowercase().as_str() {
         "true" => true,
         "false" => false,
@@ -822,14 +972,14 @@ pub async fn set_source_enabled(
             .into_response();
         }
     };
-    if state.sources.set_enabled(&id, enable).is_none() {
+    if state.sources.set_enabled(&bare, enable).is_none() {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
     }
     // Mirror into the ingress snapshot before persisting: the in-memory
     // flag is already flipped, so the next ingress must observe it even if
     // the disk save below fails (the store itself keeps the mutation on a
     // persist failure and answers 500, never silently).
-    state.engine.set_source_enabled(&id, enable);
+    state.engine.set_source_enabled(&bare, enable);
     if let Err(error) = state.sources.persist() {
         return source_persist_error(error);
     }
@@ -871,14 +1021,15 @@ pub async fn get_source_metrics(
     Path(id): Path<String>,
     Query(_ignored): Query<HashMap<String, String>>,
 ) -> Response {
-    if state.sources.get(&id).is_none() {
+    let Some(stored) = state.sources.get_any(&id) else {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
-    }
+    };
+    let bare = stored.id.clone();
     // The record is registered on create/boot, but a standalone engine or
     // a race keeps this fail-closed at zero rather than 500.
     let (received, dropped) = state
         .engine
-        .source_metrics_snapshot_for(&id)
+        .source_metrics_snapshot_for(&bare)
         .unwrap_or((0, 0));
     (
         StatusCode::OK,
@@ -913,15 +1064,16 @@ pub async fn reset_source_metrics(
     Path(id): Path<String>,
     Query(_ignored): Query<HashMap<String, String>>,
 ) -> Response {
-    if state.sources.get(&id).is_none() {
+    let Some(stored) = state.sources.get_any(&id) else {
         return ApiError::NotFound(format!("source {id:?} not found")).into_response();
-    }
-    if !state.engine.reset_source_metrics(&id) {
+    };
+    let bare = stored.id.clone();
+    if !state.engine.reset_source_metrics(&bare) {
         // The source exists but its record is missing (standalone engine
         // or a boot race): register a zeroed record and report success so
         // the reset is still observable as zeroes on the next read.
-        state.engine.ensure_source_metrics(&id);
-        state.engine.reset_source_metrics(&id);
+        state.engine.ensure_source_metrics(&bare);
+        state.engine.reset_source_metrics(&bare);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -959,8 +1111,13 @@ mod tests {
     fn entry(id: &str, enable: bool) -> SourceEntry {
         SourceEntry {
             id: id.to_string(),
+            name: id.to_string(),
             source_type: "mqtt".to_string(),
             enable,
+            connector: String::new(),
+            parameters: serde_json::json!({}),
+            resource_opts: serde_json::json!({}),
+            params: serde_json::json!({}),
         }
     }
 
@@ -994,27 +1151,51 @@ mod tests {
     #[test]
     fn replace_swaps_in_place_and_misses_unknown() {
         let store = SourceStore::new();
-        assert!(!store.replace(
-            "missing",
-            SourceEntry {
-                id: "missing".to_string(),
-                source_type: "mqtt".to_string(),
-                enable: true,
-            }
-        ));
+        assert!(!store.replace("missing", entry("missing", true)));
         assert!(store.insert(entry("a", true)).is_ok());
-        assert!(store.replace(
-            "a",
-            SourceEntry {
-                id: "a".to_string(),
-                source_type: "http".to_string(),
-                enable: false,
-            }
-        ));
+        let mut updated = entry("a", false);
+        updated.source_type = "http".to_string();
+        assert!(store.replace("a", updated));
         let found = store.get("a").expect("replaced source reads back");
         assert_eq!(found.source_type, "http");
         assert!(!found.enable);
         assert_eq!(store.snapshot().len(), 1);
+        assert!(store.replace_any("http:a", entry("a", true)));
+    }
+
+    #[test]
+    fn key_form_resolves_to_the_bare_row() {
+        let store = SourceStore::new();
+        assert!(store.insert(entry("a", true)).is_ok());
+        let found = store.get_any("mqtt:a").expect("key form reads back");
+        assert_eq!(found.id, "a");
+        assert!(store.contains_any("mqtt:a"));
+        assert!(store.get_any("other:a").is_none());
+        let rendered = found.to_json();
+        assert_eq!(rendered["type"], serde_json::json!("mqtt"));
+        assert_eq!(rendered["connector"], serde_json::json!(""));
+        assert!(rendered["parameters"].is_object());
+        assert_eq!(rendered["status"], serde_json::json!("connected"));
+    }
+
+    #[test]
+    fn split_body_accepts_the_documented_envelope() {
+        let entry = split_source_body(
+            &serde_json::json!({
+                "type": "kafka_consumer",
+                "name": "in",
+                "connector": "kafka_consumer:up",
+                "parameters": {"topic": "events"},
+            }),
+            None,
+        )
+        .expect("documented body parses");
+        assert_eq!(entry.id, "in");
+        assert_eq!(entry.parameters["topic"], serde_json::json!("events"));
+        assert!(split_source_body(&serde_json::json!({"name": "x"}), None).is_err());
+        assert!(
+            split_source_body(&serde_json::json!({"name": "x", "type": "nope"}), None).is_err()
+        );
     }
 
     #[test]

@@ -44,6 +44,7 @@ pub mod status;
 pub mod trace;
 pub mod tracing;
 pub mod transformations;
+pub mod typed;
 
 use crate::ApiState;
 use axum::{
@@ -897,7 +898,8 @@ pub fn protected_router() -> Router<ApiState> {
         )
         .route(
             "/schema_registry/:name",
-            delete(schema_registry::delete_schema_registry),
+            get(schema_registry::get_schema_registry)
+                .delete(schema_registry::delete_schema_registry),
         )
         // Honest empty states for functions the broker does not have
         // (AP-01): AI providers and completion profiles, message queues,
