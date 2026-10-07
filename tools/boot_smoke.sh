@@ -360,6 +360,91 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 4b. Tenant filters on the client list keep tenants apart ---
+# Run this check before the first user exists. The broker stays open.
+# The tenant rule maps each username to its own tenant. The same
+# client id connects in both tenants. A publish uses a random value the
+# broker cannot know. Each tenant filter of the client list shows its
+# own client only. The unfiltered list shows both namesakes with two
+# tenant ids.
+python3 - "$MQTT_PORT" "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, os, socket, struct, sys, urllib.request
+mqtt_port, api_port, api_key = sys.argv[1], sys.argv[2], sys.argv[3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    import time
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the edge does not listen")
+def mqtt_connect(sock, client_id, username):
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(b"pw")
+    sock.sendall(packet(0x10, body))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def subscribe(sock, topic):
+    sock.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    return sock.recv(5)[:1] == b"\x90"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+def api_get(path):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}{path}",
+        headers={"Authorization": f"Bearer {api_key}"})
+    with urllib.request.urlopen(req) as res:
+        return res.status, json.loads(res.read().decode())
+def rows_of(tenant):
+    status, body = api_get(f"/api/v5/clients?tenant={tenant}")
+    assert status == 200, f"client list of {tenant}: {status}"
+    return body["data"]
+topic = b"smoke/filter/check"
+secret = os.urandom(8).hex().encode()
+a_sock = wait_port(mqtt_port)
+a_ok = mqtt_connect(a_sock, b"smoke-filter-dup", b"alpha")
+b_sock = wait_port(mqtt_port)
+b_ok = mqtt_connect(b_sock, b"smoke-filter-dup", b"beta")
+a_pub = wait_port(mqtt_port)
+a_pub_ok = mqtt_connect(a_pub, b"smoke-filter-pub", b"alpha")
+ready = a_ok and b_ok and a_pub_ok and subscribe(a_sock, topic) and subscribe(b_sock, topic)
+if ready:
+    a_pub.sendall(packet(0x30, field(topic) + secret))
+    report("a subscriber gets the publish of its own tenant before the read check",
+           receive(a_sock, 5).endswith(secret))
+    report("a subscriber does not get the publish of another tenant before the read check",
+           secret not in receive(b_sock, 2))
+else:
+    report("a subscriber gets the publish of its own tenant before the read check", False)
+    report("a subscriber does not get the publish of another tenant before the read check", False)
+rows_a = rows_of("t-alpha")
+rows_b = rows_of("t-beta")
+report("the tenant filter of the first tenant shows its client only",
+       all(row.get("mountpoint") == "t-alpha" for row in rows_a)
+       and any(row.get("clientid") == "smoke-filter-dup" for row in rows_a))
+report("the tenant filter of the second tenant shows its client only",
+       all(row.get("mountpoint") == "t-beta" for row in rows_b)
+       and any(row.get("clientid") == "smoke-filter-dup" for row in rows_b))
+status, body = api_get("/api/v5/clients")
+mounts = sorted(row.get("mountpoint") for row in body["data"]
+                if row.get("clientid") == "smoke-filter-dup")
+report("the unfiltered list shows the same client id with two tenant ids",
+       status == 200 and mounts == ["t-alpha", "t-beta"])
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 # --- 10. Explicit bind sections keep tenants apart ---
 # Run this check before the first user exists. The broker stays open.
 # Unknown users connect. The check proves isolation on the new path.
