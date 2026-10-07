@@ -53,11 +53,25 @@
                        | {transport, tcp | ssl}
                        | {certfile, file:filename()}
                        | {keyfile, file:filename()}
+                       | {verify_client_cert, boolean()}
                        | {path, string() | binary()}
                        | {handshake_timeout_ms, pos_integer()}
                        | {max_frame_bytes, pos_integer()}
                        | {max_connections, pos_integer()}
                        | {conn, [tuple()]}.
+
+%% @private SSL verify options for client certificates (TM-08).
+%% Off requests no certificate. On requests one and checks its chain
+%% against system roots. Missing passes the handshake and fails at the
+%% bind. A bad chain fails the handshake.
+wss_verify_opts(true) ->
+    Cacerts = case catch public_key:cacerts_get() of
+        Certs when is_list(Certs) -> [{cacerts, Certs}];
+        _ -> []
+    end,
+    [{verify, verify_peer}, {fail_if_no_peer_cert, false} | Cacerts];
+wss_verify_opts(_) ->
+    [].
 
 %%====================================================================
 %% API
@@ -139,10 +153,12 @@ init(Opts) ->
                 {_, undefined} -> {error, {missing_option, keyfile}};
                 {Cert, Key} ->
                     %% Same posture as the TCP/TLS listener: OTP `ssl'
-                    %% defaults (TLS 1.2 + 1.3, default ciphers), no
-                    %% client-certificate verification. Material is read
-                    %% once here; rotation needs a restart.
-                    ssl:listen(Port, [{certfile, Cert}, {keyfile, Key} | SockOpts])
+                    %% defaults (TLS 1.2 + 1.3, default ciphers). Client
+                    %% verification follows the verify flag. Material is
+                    %% read once here; rotation needs a restart.
+                    Verify = proplists:get_value(verify_client_cert, Opts, false),
+                    ssl:listen(Port, [{certfile, Cert}, {keyfile, Key} |
+                                      wss_verify_opts(Verify)] ++ SockOpts)
             end;
         _ ->
             gen_tcp:listen(Port, SockOpts)

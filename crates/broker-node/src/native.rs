@@ -104,7 +104,8 @@ pub(super) fn bind_listener(bind: &str, backlog: u32) -> std::io::Result<TcpList
 }
 
 /// Accepts MQTT clients and runs one task for each of them. A client
-/// above `max_connections` is closed at once.
+/// above `max_connections` is closed at once. The listener name is
+/// `tcp` for tenant rules and certificate checks.
 pub(super) async fn serve_native_mqtt(listener: TcpListener, max_connections: u32, shared: Shared) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -125,8 +126,16 @@ pub(super) async fn serve_native_mqtt(listener: TcpListener, max_connections: u3
         let (reader, writer) = stream.into_split();
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) =
-                run_connection(reader, writer, peer.ip().to_string(), conn_id, shared).await
+            if let Err(e) = run_connection(
+                reader,
+                writer,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "tcp",
+                PeerCert::default(),
+            )
+            .await
             {
                 debug!("Kernel MQTT connection {} ended: {}", conn_id, e);
             }
@@ -141,9 +150,15 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reads the certificate chain and the private key of the TLS listener
 /// and makes the server configuration. The protocol versions are TLS 1.2
 /// and TLS 1.3 with the default cipher suites of the library.
+/// When `verify` is false the server requests no client certificate.
+/// When `verify` is true the server requests a client certificate and
+/// checks its chain against Mozilla roots. A missing certificate passes
+/// the handshake and fails at the bind with a counted denial. A bad
+/// chain fails the handshake. Off by default keeps handshakes unchanged.
 pub(super) fn load_tls_config(
     cert_file: &str,
     key_file: &str,
+    verify: bool,
 ) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error + Send + Sync>> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -168,16 +183,118 @@ pub(super) fn load_tls_config(
     }
     let key = key.ok_or_else(|| format!("no private key in {key_file}"))?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    Ok(Arc::new(config))
+    let builder = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?;
+    if verify {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let verifier = rustls::server::WebPkiClientVerifier::builder(roots.into())
+            .allow_unauthenticated()
+            .build()?;
+        let config = builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)?;
+        Ok(Arc::new(config))
+    } else {
+        let config = builder.with_no_client_auth().with_single_cert(certs, key)?;
+        Ok(Arc::new(config))
+    }
+}
+
+/// Largest certificate field kept for tenant rules.
+/// Reason: matches the bind section bound, so one peer cannot grow memory.
+const MAX_NATIVE_CERT_FIELD_LEN: usize = 1024;
+/// Most SANs kept for tenant rules.
+/// Reason: matches the bind section bound.
+const MAX_NATIVE_CERT_SANS: usize = 16;
+
+/// Client certificate fields pulled from the TLS handshake.
+/// The kernel native path fills them. Plain TCP keeps them empty.
+#[derive(Clone, Debug, Default)]
+pub(super) struct PeerCert {
+    /// Common name of the leaf, if present.
+    pub cn: Option<String>,
+    /// Subject name of the leaf, if present.
+    pub subject: Option<String>,
+    /// DNS and IP subject-alt names of the leaf.
+    pub sans: Vec<String>,
+}
+
+/// Pulls CN, subject and SANs from the leaf peer certificate.
+/// Runs once at handshake, never on publish or deliver.
+/// A missing or bad certificate yields empty fields.
+/// The bind check then denies when verification is on.
+fn peer_cert_fields(certs: Option<&[rustls::pki_types::CertificateDer<'_>]>) -> PeerCert {
+    use x509_parser::prelude::*;
+    let Some(certs) = certs else {
+        return PeerCert::default();
+    };
+    let Some(leaf) = certs.first() else {
+        return PeerCert::default();
+    };
+    let Ok((_, cert)) = parse_x509_certificate(leaf.as_ref()) else {
+        return PeerCert::default();
+    };
+    let cn = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.attr_value().as_str().ok().map(str::to_string))
+        .filter(|text| !text.is_empty())
+        .map(|mut text| {
+            text.truncate(MAX_NATIVE_CERT_FIELD_LEN);
+            text
+        });
+    let mut subject = cert.subject().to_string();
+    if subject.is_empty() {
+        return PeerCert {
+            cn,
+            subject: None,
+            sans: Vec::new(),
+        };
+    }
+    subject.truncate(MAX_NATIVE_CERT_FIELD_LEN);
+    let mut sans: Vec<String> = Vec::new();
+    for ext in cert.extensions().iter() {
+        if let ParsedExtension::SubjectAlternativeName(names) = ext.parsed_extension() {
+            for name in &names.general_names {
+                let text = match name {
+                    GeneralName::DNSName(value) => Some(value.to_string()),
+                    GeneralName::IPAddress(bytes) => {
+                        if bytes.len() == 4 {
+                            Some(format!(
+                                "{}.{}.{}.{}",
+                                bytes[0], bytes[1], bytes[2], bytes[3]
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(mut text) = text {
+                    if !text.is_empty() && sans.len() < MAX_NATIVE_CERT_SANS {
+                        text.truncate(MAX_NATIVE_CERT_FIELD_LEN);
+                        sans.push(text);
+                    }
+                }
+            }
+        }
+    }
+    PeerCert {
+        cn,
+        subject: Some(subject),
+        sans,
+    }
 }
 
 /// Accepts MQTT clients over TLS. The handshake runs in the task of the
 /// connection, thus a slow handshake does not delay the accept of other
-/// clients. A client above `max_connections` is closed at once.
+/// clients. A client above `max_connections` is closed at once. The
+/// listener name is `tls` for tenant rules and certificate checks.
+/// The handshake pulls the peer certificate fields for the bind.
+/// A bad chain fails the handshake. A missing certificate reaches
+/// the bind check, which denies it only when verification is on.
 pub(super) async fn serve_native_mqtts(
     listener: TcpListener,
     config: Arc<rustls::ServerConfig>,
@@ -216,9 +333,18 @@ pub(super) async fn serve_native_mqtts(
                         return;
                     }
                 };
+            let peer_cert = peer_cert_fields(tls.get_ref().1.peer_certificates());
             let (reader, writer) = tokio::io::split(tls);
-            if let Err(e) =
-                run_connection(reader, writer, peer.ip().to_string(), conn_id, shared).await
+            if let Err(e) = run_connection(
+                reader,
+                writer,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "tls",
+                peer_cert,
+            )
+            .await
             {
                 debug!("Kernel MQTT TLS connection {} ended: {}", conn_id, e);
             }
@@ -524,7 +650,12 @@ impl Conn {
     }
 }
 
-fn bind_request(connect: wire::Connect, peer: &str) -> BindRequest {
+fn bind_request(
+    connect: wire::Connect,
+    peer: &str,
+    listener: &str,
+    peer_cert: &PeerCert,
+) -> BindRequest {
     let props = connect.properties;
     BindRequest {
         client_id: connect.client_id,
@@ -543,9 +674,9 @@ fn bind_request(connect: wire::Connect, peer: &str) -> BindRequest {
             qos: will.qos,
             retain: will.retain,
         }),
-        cert_cn: None,
-        cert_subject: None,
-        cert_sans: Vec::new(),
+        cert_cn: peer_cert.cn.clone(),
+        cert_subject: peer_cert.subject.clone(),
+        cert_sans: peer_cert.sans.clone(),
         protocol_version: if connect.level == 5 { 5 } else { 4 },
         session_expiry: props.as_ref().and_then(|p| p.session_expiry).unwrap_or(0),
         receive_maximum: props
@@ -557,6 +688,7 @@ fn bind_request(connect: wire::Connect, peer: &str) -> BindRequest {
             .and_then(|p| p.maximum_packet_size)
             .unwrap_or(0),
         user_properties: props.map(|p| p.user_properties.into_iter().collect()),
+        listener: listener.to_string(),
     }
 }
 
@@ -689,6 +821,8 @@ async fn run_connection<R, W>(
     peer: String,
     conn_id: u64,
     shared: Shared,
+    listener: &str,
+    peer_cert: PeerCert,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     R: AsyncRead + Unpin + Send,
@@ -747,6 +881,8 @@ where
                     &sink,
                     &mut guard.bound,
                     &waker,
+                    listener,
+                    &peer_cert,
                 )
                 .await;
                 // The guard must know the state for a release after a panic.
@@ -879,6 +1015,8 @@ async fn drain_inbound(
     sink: &NativeSink,
     bound: &mut Vec<(SessionKey, u64)>,
     waker: &Arc<tokio::sync::Notify>,
+    listener: &str,
+    peer_cert: &PeerCert,
 ) -> Result<Option<Stop>, WireError> {
     loop {
         let Some(header) = wire::fixed_header(inbuf)? else {
@@ -911,7 +1049,7 @@ async fn drain_inbound(
                 sink.level.store(conn.level, Ordering::Relaxed);
                 conn.keepalive = (connect.keepalive > 0)
                     .then(|| Duration::from_millis(u64::from(connect.keepalive) * 1500));
-                let request = bind_request(connect, &conn.peer);
+                let request = bind_request(connect, &conn.peer, listener, peer_cert);
                 conn.client_id = request.client_id.clone();
                 let Some(frame) = conn.frame(OpCode::BindConnection, Vec::new(), Bytes::new())
                 else {
@@ -1101,6 +1239,8 @@ mod tests {
                 properties: None,
             },
             "127.0.0.1",
+            "tcp",
+            &PeerCert::default(),
         );
         let frame = BrokerFrame::new(
             OpCode::BindConnection,
@@ -1159,6 +1299,8 @@ mod tests {
                 properties: None,
             },
             "127.0.0.1",
+            "tcp",
+            &PeerCert::default(),
         );
         let frame = BrokerFrame::new(
             OpCode::BindConnection,
@@ -1344,5 +1486,51 @@ mod tests {
         assert_eq!(connack_return_code(0x87), 5);
         assert_eq!(connack_return_code(0x8A), 5);
         assert_eq!(connack_return_code(0x97), 3);
+    }
+
+    /// No peer certificate yields empty fields.
+    /// The bind check then denies only when verification is on.
+    #[test]
+    fn peer_cert_fields_empty_when_no_cert() {
+        let fields = peer_cert_fields(None);
+        assert!(fields.cn.is_none());
+        assert!(fields.subject.is_none());
+        assert!(fields.sans.is_empty());
+        let bad: Vec<rustls::pki_types::CertificateDer<'static>> = Vec::new();
+        let fields = peer_cert_fields(Some(&bad));
+        assert!(fields.cn.is_none());
+    }
+
+    /// Real leaf certificate yields its common name.
+    /// The fixture is the test client certificate.
+    /// The bind check uses this name for tenant rules.
+    #[test]
+    fn peer_cert_fields_pull_cn_from_real_cert() {
+        let cert_pem = include_str!("../../broker-connectors-enterprise/testdata/client-cert.pem");
+        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut reader)
+                .expect("fixture reads")
+                .into_iter()
+                .map(rustls::pki_types::CertificateDer::from)
+                .collect();
+        assert!(!certs.is_empty());
+        let fields = peer_cert_fields(Some(&certs));
+        assert_eq!(fields.cn.as_deref(), Some("test-device"));
+    }
+
+    /// Server config loads with and without client verification.
+    /// The fixture is the test server certificate and key.
+    /// Verification on requests a client certificate.
+    #[test]
+    fn tls_config_loads_with_and_without_verify() {
+        let base = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../broker-connectors-enterprise/testdata"
+        );
+        let cert = format!("{base}/server-cert.pem");
+        let key = format!("{base}/server-key.pem");
+        assert!(super::load_tls_config(&cert, &key, false).is_ok());
+        assert!(super::load_tls_config(&cert, &key, true).is_ok());
     }
 }

@@ -94,6 +94,17 @@ level = "warn"
 # A client with a username goes into the tenant of that username.
 [[tenants.rules]]
 expression = "t-\${username}"
+
+# Listener-scoped rules. The default rule is first, so edge
+# clients keep the default scope. Scoped rules stay to prove
+# scoping at connect does not break delivery.
+[[tenants.rules]]
+listener = "tls"
+expression = "t-tls-\${username}"
+
+[[tenants.rules]]
+listener = "tcp"
+expression = "t-tcp-\${username}"
 EOF
 
 # --- 1. The kernel starts from the file and the credential variables ---
@@ -946,6 +957,110 @@ if ready:
     report("the other tenant still publishes a random value", receive(sub, 5).endswith(secret))
 else:
     report("the other tenant still publishes a random value", False)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 11. Listener scope and client certificate defaults through the socket ---
+# The broker starts from indra.toml with listener-scoped tenant rules.
+# The default rule is first, so edge clients use the per-username
+# rule. Each tenant gets one user with a random password the broker
+# cannot know, plus publish and subscribe rules. Real clients connect
+# in each tenant. A publish in one tenant reaches its own subscriber
+# only. The check also proves the verify switches stay off by default,
+# so the broker requests no client certificate.
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.tls.verify_client_cert 2>/dev/null | grep -q 'false'
+check "explain shows listeners.tls.verify_client_cert stays off by default" $?
+"$CTL" ctl --endpoint "$CTL_API" --api-key "$API_KEY_GOOD" --json \
+    config explain --key listeners.wss.verify_client_cert 2>/dev/null | grep -q 'false'
+check "explain shows listeners.wss.verify_client_cert stays off by default" $?
+LIS_NS_A="t-lis-a"
+LIS_NS_B="t-lis-b"
+LIS_USER_A="lis-a"
+LIS_USER_B="lis-b"
+LIS_PASS_A=$(python3 -c 'import os; print(os.urandom(12).hex())')
+LIS_PASS_B=$(python3 -c 'import os; print(os.urandom(12).hex())')
+LIS_TOPIC="smoke/listener/check"
+python3 - "$API_PORT" "$API_KEY_GOOD" "$LIS_NS_A" "$LIS_USER_A" "$LIS_PASS_A" "$LIS_NS_B" "$LIS_USER_B" "$LIS_PASS_B" <<'PY'
+import json, sys, urllib.request
+api, key, ns_a, user_a, pass_a, ns_b, user_b, pass_b = sys.argv[1:9]
+def call(method, path, body=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}{path}", method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, res.read().decode()
+    except urllib.request.HTTPError as err:
+        return err.code, err.read().decode()
+for ns, user, password in ((ns_a, user_a, pass_a), (ns_b, user_b, pass_b)):
+    status, _ = call("POST", f"/api/v5/mt/ns/{ns}", {})
+    assert status in (204, 409), f"create managed namespace {ns}: {status}"
+    status, _ = call("POST", f"/api/v1/auth/users?tenant={ns}",
+                     {"username": user, "password": password})
+    assert status in (201, 409), f"create tenant user {user}: {status}"
+    for action in ("publish", "subscribe"):
+        status, _ = call("POST", f"/api/v1/auth/acls?tenant={ns}",
+                         {"client_pattern": "*", "action": action,
+                          "topic_pattern": "smoke/listener/#", "allow": True})
+        assert status == 201, f"create tenant {action} rule: {status}"
+print("listener tenants and users are stored through the API")
+PY
+check "two listener tenants and users with random passwords are stored through the API" $?
+python3 - "$MQTT_PORT" "$LIS_USER_A" "$LIS_PASS_A" "$LIS_USER_B" "$LIS_PASS_B" "$LIS_TOPIC" <<'PY'
+import os, socket, struct, sys
+mqtt_port, username_a, password_a, username_b, password_b, topic = (
+    sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode(),
+    sys.argv[4].encode(), sys.argv[5].encode(), sys.argv[6].encode())
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    import time
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the edge does not listen")
+def mqtt_connect(sock, client_id, username, password):
+    body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
+    sock.sendall(packet(0x10, body))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+def subscribe(sock, topic):
+    sock.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    return sock.recv(5)[:1] == b"\x90"
+secret = os.urandom(8).hex().encode()
+a_sub = wait_port(mqtt_port)
+a_ok = mqtt_connect(a_sub, b"lis-a-sub", username_a, password_a)
+b_sub = wait_port(mqtt_port)
+b_ok = mqtt_connect(b_sub, b"lis-b-sub", username_b, password_b)
+a_pub = wait_port(mqtt_port)
+a_pub_ok = mqtt_connect(a_pub, b"lis-a-pub", username_a, password_a)
+ready = a_ok and b_ok and a_pub_ok and subscribe(a_sub, topic) and subscribe(b_sub, topic)
+if ready:
+    a_pub.sendall(packet(0x30, field(topic) + secret))
+    report("a subscriber gets the publish of its own tenant with listener rules present",
+           receive(a_sub, 5).endswith(secret))
+    report("a subscriber does not get the publish of another tenant with listener rules present",
+           secret not in receive(b_sub, 2))
+else:
+    report("a subscriber gets the publish of its own tenant with listener rules present", False)
+    report("a subscriber does not get the publish of another tenant with listener rules present", False)
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))

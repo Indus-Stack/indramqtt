@@ -56,6 +56,12 @@ toml = { workspace = true }
 rustls = { version = "0.23.45" }
 tokio-rustls = { version = "0.26" }
 rustls-pemfile = { version = "1" }
+# Client certificate request and chain check use Mozilla roots.
+# Licence: ISC (roots data under CDLA-Permissive-2.0, CTO exception DEV-013).
+webpki-roots = { version = "1" }
+# Client certificate field pull (CN, subject, SANs) for tenant rules.
+# Licence: MIT OR Apache-2.0.
+x509-parser = { version = "0.16" }
 
 [features]
 # Each feature adds one connector kind to the build. With a feature off,

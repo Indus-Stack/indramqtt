@@ -36,6 +36,8 @@ enabled = false
 bind = "0.0.0.0:8883"
 cert_file = "/etc/indramqtt/certs/server.crt"
 key_file = "/etc/indramqtt/certs/server.key"
+# Request and verify a client certificate. Off by default.
+verify_client_cert = false
 
 [listeners.ws]
 # Binary MQTT-over-WebSocket listener (older files may use
@@ -51,6 +53,8 @@ bind = "0.0.0.0:8084"
 path = "/mqtt"
 cert_file = ""
 key_file = ""
+# Request and verify a client certificate. Off by default.
+verify_client_cert = false
 
 [listeners.api]
 # Axum REST Management API & Embedded Web Dashboard SPA

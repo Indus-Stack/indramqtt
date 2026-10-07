@@ -483,6 +483,20 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_MONITOR_SAMPLE_SECS)]
     monitor_sample_secs: u64,
 
+    /// Require a client certificate on the TLS listener (TM-08). Off by
+    /// default keeps current handshakes unchanged. On requests a client
+    /// certificate and refuses the connect when none is present.
+    /// Schema home: `listeners.tls.verify_client_cert`.
+    #[arg(long)]
+    tls_verify_client_cert: Option<bool>,
+
+    /// Require a client certificate on the secure WebSocket listener
+    /// (TM-08). Off by default mirrors the TLS listener. On requests a
+    /// client certificate and refuses the connect when none is present.
+    /// Schema home: `listeners.wss.verify_client_cert`.
+    #[arg(long)]
+    wss_verify_client_cert: Option<bool>,
+
     /// Print the `erl` arguments of the edge and exit. The output has
     /// one argument on each line. The arguments contain the resolved
     /// listener settings. The edge holds the MQTT, TLS and WebSocket
@@ -1201,6 +1215,20 @@ async fn apply_bind_request(
             shared.metrics.inc_auth_failures();
             return Some(refusal_for_req(frame, &req, 0x8A, alias_max));
         }
+        // TM-08: client-certificate check. Runs on connect only, never
+        // on publish or deliver. No lock, no queue, no per-client store.
+        // The accept loop bounds the rate (50 ms backoff plus the
+        // connection limit). When the listener verifies, the bind must
+        // carry a certificate field. Else deny, count and log.
+        if client_cert_required(shared, &req.listener) && !has_client_cert(&req) {
+            shared.metrics.inc_auth_failures();
+            tracing::warn!(
+                client_id = %req.client_id,
+                listener = %req.listener,
+                "client certificate is missing or not valid: refusing CONNECT"
+            );
+            return Some(refusal_for_req(frame, &req, 0x87, alias_max));
+        }
         // W2-02: authenticator-chain consult. Loads one lock-free
         // snapshot per connect and never takes the chain write lock;
         // publish and deliver never touch this store. An empty chain
@@ -1759,10 +1787,9 @@ async fn apply_bind_request(
     // Kerberos principal, else the MQTT username): never from stored
     // state of another tenant's namesake session, so a client can never
     // be placed into a tenant it did not authenticate for (fail closed).
-    // TODO(parity): the bind carries no listener name or MQTT 5
-    // user-property map yet (the edge terminates CONNECT as 3.1.1 only),
-    // so both ride as absent: the default listener scope and no user
-    // properties. Absent means the default tenant, never another
+    // The bind carries the listener name on flagged binds and the
+    // kernel native path. Edge binds without the flag still carry the
+    // default scope. Absent means the default tenant, never another
     // tenant's (fail closed).
     // TODO(parity): an anonymous reconnect carries no username, so it
     // renders the default tenant even when a previous credentialed bind
@@ -2230,7 +2257,18 @@ struct BindRequest {
     /// omit them. No session, routing, auth or tenant logic reads
     /// them beyond the echo.
     user_properties: Option<std::collections::HashMap<String, String>>,
+    /// Listener name the connection arrived on (`""` means default).
+    /// The edge reports it. The kernel native path sets it.
+    listener: String,
 }
+
+/// Longest accepted listener name in a bind.
+/// Reason: listener names are short labels, so 64 chars bound bind memory.
+const MAX_BIND_LISTENER_LEN: usize = 64;
+
+/// Bind flag for a listener-name section in the bind tail.
+/// Reason: the bit tells the listener section from other bytes.
+const BIND_FLAG_LISTENER: u8 = 0x40;
 
 /// Largest v5 bind section in bytes (see [`BindRequest`]).
 const MAX_V5_SECTION_LEN: usize = 4096;
@@ -2276,7 +2314,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     // present. A clear flag means it is absent. Flagged binds parse
     // by flags, so peer bytes never become a username. Binds without
     // the flags keep the old position parse below.
-    if flags & (BIND_FLAG_CREDS | BIND_FLAG_PEER | BIND_FLAG_CERT) != 0 {
+    if flags & (BIND_FLAG_CREDS | BIND_FLAG_PEER | BIND_FLAG_CERT | BIND_FLAG_LISTENER) != 0 {
         return decode_flagged_bind(client_id, flags, keepalive_secs, will, rest);
     }
     // X1-01: Flags bit 2 marks a trailing v5 section
@@ -2306,6 +2344,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             receive_maximum: v5.receive_maximum,
             max_packet_size: v5.max_packet_size,
             user_properties: Some(v5.user_properties),
+            listener: identity.listener,
         });
     }
     // Preferred: exact legacy parse (no alias section).
@@ -2327,6 +2366,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             receive_maximum: u16::MAX,
             max_packet_size: 0,
             user_properties: None,
+            listener: identity.listener,
         });
     }
     // Otherwise the last two bytes may be the alias section: the prefix
@@ -2354,6 +2394,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
                 receive_maximum: u16::MAX,
                 max_packet_size: 0,
                 user_properties: None,
+                listener: identity.listener,
             });
         }
     }
@@ -2425,6 +2466,7 @@ fn decode_flagged_bind(
         receive_maximum,
         max_packet_size,
         user_properties,
+        listener: identity.listener,
     })
 }
 
@@ -2446,7 +2488,7 @@ fn decode_flagged_tail(rest: &[u8], flags: u8) -> Result<(BindIdentity, u16), &'
     Err("bind meta length mismatch")
 }
 
-/// Decode flagged credentials, peer and certificate sections.
+/// Decode flagged credentials, peer, certificate and listener sections.
 /// A set flag needs its section. A clear flag needs no bytes.
 /// A short section fails with a truncation error.
 fn decode_flagged_identity(rest: &[u8], flags: u8) -> Result<BindIdentity, &'static str> {
@@ -2472,6 +2514,13 @@ fn decode_flagged_identity(rest: &[u8], flags: u8) -> Result<BindIdentity, &'sta
     } else {
         (None, None, Vec::new())
     };
+    let listener = if flags & BIND_FLAG_LISTENER != 0 {
+        let (name, tail) = take_flagged_listener(cursor)?;
+        cursor = tail;
+        name
+    } else {
+        String::new()
+    };
     if !cursor.is_empty() {
         return Err("bind meta length mismatch");
     }
@@ -2482,7 +2531,22 @@ fn decode_flagged_identity(rest: &[u8], flags: u8) -> Result<BindIdentity, &'sta
         cert_cn,
         cert_subject,
         cert_sans,
+        listener,
     })
+}
+
+/// Take one flagged listener section off the front.
+/// The name is UTF-8 and at most 64 chars. Short input fails.
+fn take_flagged_listener(cursor: &[u8]) -> Result<(String, &[u8]), &'static str> {
+    if cursor.len() < 2 {
+        return Err("bind listener truncated");
+    }
+    let len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if len > MAX_BIND_LISTENER_LEN || cursor.len() < 2 + len {
+        return Err("bind listener truncated");
+    }
+    let name = std::str::from_utf8(&cursor[2..2 + len]).map_err(|_| "listener not UTF-8")?;
+    Ok((name.to_string(), &cursor[2 + len..]))
 }
 
 /// Take one flagged credentials section off the front.
@@ -2693,7 +2757,7 @@ fn observe_bind_v5(req: &BindRequest) {
 }
 
 /// Credentials plus peer address plus certificate fields decoded from
-/// the bind tail.
+/// the bind tail. The listener name rides only in flagged binds.
 struct BindIdentity {
     username: Option<String>,
     password: Option<Vec<u8>>,
@@ -2701,6 +2765,7 @@ struct BindIdentity {
     cert_cn: Option<String>,
     cert_subject: Option<String>,
     cert_sans: Vec<String>,
+    listener: String,
 }
 
 /// Decode the optional trailing credentials, peer-address and
@@ -2724,6 +2789,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
             cert_cn: None,
             cert_subject: None,
             cert_sans: Vec::new(),
+            listener: String::new(),
         });
     }
     if rest.len() < 2 {
@@ -2744,6 +2810,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
                     cert_cn,
                     cert_subject,
                     cert_sans,
+                    listener: String::new(),
                 })
             }
             None => match decode_cert_tail(rest) {
@@ -2754,6 +2821,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
                     cert_cn,
                     cert_subject,
                     cert_sans,
+                    listener: String::new(),
                 }),
                 None => Err("bind credentials truncated"),
             },
@@ -2795,6 +2863,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
             cert_cn: None,
             cert_subject: None,
             cert_sans: Vec::new(),
+            listener: String::new(),
         });
     }
     // After credentials: optional peer prefix, then optional certificate
@@ -2809,6 +2878,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
             cert_cn,
             cert_subject,
             cert_sans,
+            listener: String::new(),
         });
     }
     if let Some((cert_cn, cert_subject, cert_sans)) = decode_cert_tail(tail) {
@@ -2822,6 +2892,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
             cert_cn,
             cert_subject,
             cert_sans,
+            listener: String::new(),
         });
     }
     Err("bind meta length mismatch")
@@ -3662,6 +3733,13 @@ struct Shared {
     /// path never touches this store directly; retained caps live in
     /// the retained store under its own lock.
     tenant_limits: Arc<broker_session::tenant_limits::TenantLimitStore>,
+    /// Whether the TLS listener verifies a client certificate (TM-08).
+    /// Set once at boot from the resolved config. Read on connect only.
+    /// Off by default keeps handshakes unchanged.
+    tls_verify_client_cert: bool,
+    /// Whether the secure WebSocket listener verifies a client
+    /// certificate (TM-08). Mirrors the TLS listener. Off by default.
+    wss_verify_client_cert: bool,
 }
 
 impl Shared {
@@ -3826,6 +3904,8 @@ impl Shared {
             api_listeners: Arc::new(std::sync::RwLock::new(None)),
             api_startup_config: Arc::new(std::sync::RwLock::new(None)),
             tenant_limits: Arc::new(broker_session::tenant_limits::TenantLimitStore::default()),
+            tls_verify_client_cert: false,
+            wss_verify_client_cert: false,
         }
     }
 
@@ -4186,6 +4266,16 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
             put(key, quoted(value));
         }
     }
+    // TM-08: the edge needs the verify switches to request client
+    // certificates. Off by default keeps handshakes unchanged.
+    put(
+        "tls_verify_client_cert",
+        listeners.tls.verify_client_cert.to_string(),
+    );
+    put(
+        "wss_verify_client_cert",
+        listeners.wss.verify_client_cert.to_string(),
+    );
     Ok(out)
 }
 
@@ -4275,6 +4365,8 @@ fn cli_overrides(args: &Args, matches: &clap::ArgMatches) -> CliOverrides {
         delayed_max_secs: typed("delayed_max_secs").then_some(args.delayed_max_secs),
         topic_alias_maximum: args.topic_alias_maximum,
         monitor_sample_secs: typed("monitor_sample_secs").then_some(args.monitor_sample_secs),
+        tls_verify_client_cert: args.tls_verify_client_cert,
+        wss_verify_client_cert: args.wss_verify_client_cert,
     }
 }
 
@@ -4443,6 +4535,12 @@ fn apply_resolved_config(args: &mut Args, layered: &LayeredConfig) -> Result<(),
     }
     if let Some(value) = number("observability.monitor_sample_secs")? {
         args.monitor_sample_secs = value;
+    }
+    if set_by_a_layer("listeners.tls.verify_client_cert") {
+        args.tls_verify_client_cert = Some(layered.config().listeners.tls.verify_client_cert);
+    }
+    if set_by_a_layer("listeners.wss.verify_client_cert") {
+        args.wss_verify_client_cert = Some(layered.config().listeners.wss.verify_client_cert);
     }
     Ok(())
 }
@@ -7335,13 +7433,35 @@ fn bind_tenant_for_req(
             .map(str::to_string)
             .or_else(|| req.username.clone()),
         peer_host: req.peerhost.clone(),
-        listener: String::new(),
+        listener: req.listener.clone(),
         cert_cn: req.cert_cn.clone(),
         cert_subject: req.cert_subject.clone(),
         cert_sans: req.cert_sans.clone(),
         user_properties: req.user_properties.clone(),
     };
     shared.tenant_registry.assign(&ctx)
+}
+
+/// True when the listener of this bind must carry a client certificate.
+/// The TLS and secure WebSocket listeners each have one switch.
+/// Off by default keeps handshakes unchanged. Connect only.
+fn client_cert_required(shared: &Shared, listener: &str) -> bool {
+    match listener {
+        "tls" => shared.tls_verify_client_cert,
+        "wss" => shared.wss_verify_client_cert,
+        _ => false,
+    }
+}
+
+/// True when the bind carries a client certificate field.
+/// At least one of common name, subject or SANs is present.
+fn has_client_cert(req: &BindRequest) -> bool {
+    req.cert_cn.as_ref().is_some_and(|value| !value.is_empty())
+        || req
+            .cert_subject
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || !req.cert_sans.is_empty()
 }
 
 /// Effective per-tenant bounds for one tenant (TM-06).
@@ -9412,6 +9532,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .sessions
         .set_max_topic_alias(cfg.session.topic_alias_maximum);
+    // TM-08: apply the client-certificate switches before any bind.
+    // Off by default keeps handshakes unchanged. On denies binds
+    // without a certificate on that listener. Connect only.
+    shared.tls_verify_client_cert = cfg.listeners.tls.verify_client_cert;
+    shared.wss_verify_client_cert = cfg.listeners.wss.verify_client_cert;
     // Tenants (MT-01): install the configured assignment rules before
     // any edge binds. Validated whole; a bad row fails boot loudly.
     install_tenant_rules(&shared, &cfg)?;
@@ -10093,9 +10218,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
     if cfg.listeners.tls.enabled && cfg.listeners.tls.native {
-        let tls_config =
-            native::load_tls_config(&cfg.listeners.tls.cert_file, &cfg.listeners.tls.key_file)
-                .map_err(|e| format!("listeners.tls: {e}"))?;
+        let tls_config = native::load_tls_config(
+            &cfg.listeners.tls.cert_file,
+            &cfg.listeners.tls.key_file,
+            cfg.listeners.tls.verify_client_cert,
+        )
+        .map_err(|e| format!("listeners.tls: {e}"))?;
         // The TLS listener has no connection limit of its own in the
         // configuration. It uses the limit of the plaintext listener.
         let listener = native::bind_listener(&cfg.listeners.tls.bind, cfg.listeners.tcp.backlog)
@@ -10187,6 +10315,35 @@ mod tests {
     }
 
     #[test]
+    fn tm08_verify_flags_apply_from_file_and_layers() {
+        // The production entries are the file and the flag layer.
+        // The broker applies the setting through the resolved config.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            dir.join("indra.toml"),
+            "[listeners.tls]\nverify_client_cert = true\n\
+             [listeners.wss]\nverify_client_cert = true\n",
+        )
+        .expect("write indra.toml");
+        let args = resolve_boot(&dir, &[]);
+        assert_eq!(args.tls_verify_client_cert, Some(true));
+        assert_eq!(args.wss_verify_client_cert, Some(true));
+        let layered = load_startup_config(&args, &{
+            let cmd = <Args as clap::CommandFactory>::command();
+            cmd.get_matches_from(vec!["indramqtt", "--config-dir", dir.to_str().unwrap()])
+        })
+        .expect("config resolves");
+        assert!(layered.config().listeners.tls.verify_client_cert);
+        assert!(layered.config().listeners.wss.verify_client_cert);
+        let _ = std::fs::remove_dir_all(&dir);
+        // Defaults stay off, so current handshakes keep working.
+        let defaults = broker_config::schema::BrokerConfig::default();
+        assert!(!defaults.listeners.tls.verify_client_cert);
+        assert!(!defaults.listeners.wss.verify_client_cert);
+    }
+
+    #[test]
     fn edge_args_carry_the_resolved_listeners() {
         let mut cfg = broker_config::schema::BrokerConfig::default();
         let defaults = edge_args(&cfg).expect("defaults resolve");
@@ -10207,6 +10364,16 @@ mod tests {
         );
         assert_eq!(triple(&defaults, "kernel_port").as_deref(), Some("18883"));
         assert_eq!(triple(&defaults, "tls_certfile"), None);
+        // Verify switches stay off by default, so the edge requests
+        // no client certificate.
+        assert_eq!(
+            triple(&defaults, "tls_verify_client_cert").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            triple(&defaults, "wss_verify_client_cert").as_deref(),
+            Some("false")
+        );
 
         cfg.listeners.tcp.enabled = false;
         cfg.listeners.tcp.bind = "10.0.0.5:11883".to_string();
@@ -10221,6 +10388,18 @@ mod tests {
         assert_eq!(
             triple(&changed, "wss_certfile").as_deref(),
             Some("\"/etc/indramqtt/tls/cert.pem\"")
+        );
+        // The edge gets the verify switches from the resolved config.
+        cfg.listeners.tls.verify_client_cert = true;
+        cfg.listeners.wss.verify_client_cert = true;
+        let verified = edge_args(&cfg).expect("verify flags resolve");
+        assert_eq!(
+            triple(&verified, "tls_verify_client_cert").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            triple(&verified, "wss_verify_client_cert").as_deref(),
+            Some("true")
         );
 
         // The edge binds to an address. The error for a host name gives the setting.
@@ -10363,7 +10542,13 @@ mod tests {
 
     /// Set section flags on an encoded bind (test mirror of the edge
     /// flag patch). Bytes stay the same except the flag bits.
-    fn mark_bind_sections_flagged(mut meta: Vec<u8>, creds: bool, peer: bool, cert: bool) -> Bytes {
+    fn mark_bind_sections_flagged(
+        mut meta: Vec<u8>,
+        creds: bool,
+        peer: bool,
+        cert: bool,
+        listener: bool,
+    ) -> Bytes {
         let id_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
         let flag_pos = 2 + id_len;
         if creds {
@@ -10374,6 +10559,9 @@ mod tests {
         }
         if cert {
             meta[flag_pos] |= super::BIND_FLAG_CERT;
+        }
+        if listener {
+            meta[flag_pos] |= super::BIND_FLAG_LISTENER;
         }
         Bytes::from(meta)
     }
@@ -18325,10 +18513,11 @@ mod tests {
         Bytes::from(meta)
     }
 
-    /// Test mirror of the edge certificate section: append
-    /// `CertLen:16be | CnLen:16be | Cn | SubjectLen:16be | Subject |
-    /// SanCount:16be | (SanLen:16be | San)*` to an encoded bind, ahead of
-    /// any trailing alias section.
+    /// Mirror of the edge certificate section (`encode_cert_payload`):
+    /// append `CertLen:16be | CnLen:16be | Cn | SubjectLen:16be |
+    /// Subject | SanCount:16be | (SanLen:16be | San)*` to an encoded
+    /// bind, ahead of any trailing alias section. Same bytes the edge
+    /// sends, so the test drives the production bind entry.
     fn encode_bind_meta_cert(
         base: Bytes,
         cn: Option<&str>,
@@ -18592,6 +18781,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         );
         assert_eq!(&mirrored[..], creds);
         // A short section fails with the documented error.
@@ -18606,7 +18796,24 @@ mod tests {
     /// Build one flagged bind (test mirror of the edge flag patch).
     /// Sets the section bits on the same bytes the edge sends.
     fn encode_bind_meta_flagged(base: Bytes, creds: bool, peer: bool, cert: bool) -> Bytes {
-        mark_bind_sections_flagged(base.to_vec(), creds, peer, cert)
+        mark_bind_sections_flagged(base.to_vec(), creds, peer, cert, false)
+    }
+
+    /// Mirror of the edge listener section (`encode_listener_bin`):
+    /// append `ListenerLen:16be | Listener` to an encoded bind.
+    /// Same bytes the edge sends, so the test drives the production
+    /// bind entry.
+    fn encode_bind_meta_listener(base: Bytes, listener: &str) -> Bytes {
+        let mut meta = base.to_vec();
+        meta.extend_from_slice(&(listener.len() as u16).to_be_bytes());
+        meta.extend_from_slice(listener.as_bytes());
+        Bytes::from(meta)
+    }
+
+    /// Build one flagged bind with a listener section.
+    fn encode_bind_meta_flagged_listener(base: Bytes, listener: &str) -> Bytes {
+        let with_section = encode_bind_meta_listener(base, listener);
+        mark_bind_sections_flagged(with_section.to_vec(), false, false, false, true)
     }
 
     #[tokio::test]
@@ -18719,6 +18926,155 @@ mod tests {
         let (_, deliveries) = apply_publish(&publish_frame(403, 2, meta, payload), &shared).await;
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].0, 403);
+    }
+
+    #[tokio::test]
+    async fn tm08_listener_name_drives_tenant_through_bind() {
+        // Production entry is bind bytes, as the spec lists. The edge
+        // sends the same bytes with the same flag. A bind with a
+        // listener name lands in the rule for that listener. A bind
+        // without a name keeps the default scope.
+        use broker_session::tenant::{TenantRule, DEFAULT_TENANT_ID};
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![
+                TenantRule::new("tls", "tenant", "t-tls"),
+                TenantRule::new("tcp", "tenant", "t-tcp"),
+            ])
+            .expect("scoped rules store");
+        let tls_meta =
+            encode_bind_meta_flagged_listener(encode_bind_meta("tm08-tls", true, 60), "tls");
+        let reply = apply_bind(&bind_frame(501, 1, tls_meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let tenant = shared
+            .sessions
+            .get_in_tenant("t-tls", "tm08-tls")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, "t-tls");
+        let plain_meta = encode_bind_meta("tm08-plain", true, 60);
+        let reply = apply_bind(&bind_frame(502, 1, plain_meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let tenant = shared
+            .sessions
+            .get("tm08-plain")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, DEFAULT_TENANT_ID);
+    }
+
+    #[tokio::test]
+    async fn tm08_two_listeners_isolated_through_broker() {
+        // Production entry is bind bytes, as the spec lists. Two
+        // listeners hold two tenants apart. Each client uses a random
+        // value the broker cannot know. Delivery stays in-tenant.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![
+                TenantRule::new("tls", "tenant", "t-lis-a"),
+                TenantRule::new("tcp", "tenant", "t-lis-b"),
+            ])
+            .expect("scoped rules store");
+        let meta_a = encode_bind_meta_flagged_listener(encode_bind_meta("tm08-a", true, 60), "tls");
+        let meta_b = encode_bind_meta_flagged_listener(encode_bind_meta("tm08-b", true, 60), "tcp");
+        for (conn, meta) in [(511u64, meta_a), (512u64, meta_b)] {
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        for (conn, client) in [(511u64, "tm08-a"), (512u64, "tm08-b")] {
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("tm08/data", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+        }
+        let secret = format!(
+            "tm08-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            std::process::id()
+        );
+        let (meta, payload) = encode_publish_meta("tm08/data", 0, 0, false, secret.as_bytes());
+        let (_, deliveries) = apply_publish(&publish_frame(511, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "same-tenant delivery works");
+        assert_eq!(deliveries[0].0, 511);
+        let (meta_b, payload_b) = encode_publish_meta("tm08/data", 0, 0, false, secret.as_bytes());
+        let (_, deliveries_b) =
+            apply_publish(&publish_frame(512, 2, meta_b, payload_b), &shared).await;
+        assert_eq!(deliveries_b.len(), 1, "other tenant self-delivers");
+        assert_ne!(
+            deliveries[0].0, deliveries_b[0].0,
+            "no cross-tenant delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn tm08_client_cert_check_through_bind() {
+        // Production entry is bind bytes, as the spec lists. The edge
+        // sends the same bytes. The TLS handshake supplies the fields.
+        // Verification off lets a bind without a certificate through.
+        // Verification on refuses it, counts and logs. A bind with a
+        // certificate passes. All through `apply_bind` with bind bytes.
+        let mut shared = test_shared();
+        let base = encode_bind_meta("tm08-nocert", true, 60);
+        let flagged = mark_bind_sections_flagged(base.to_vec(), false, false, false, false);
+        let reply = apply_bind(&bind_frame(521, 1, flagged), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "no verification means no certificate is fine");
+        shared.tls_verify_client_cert = true;
+        let before = shared.metrics.auth_failures();
+        let base = encode_bind_meta("tm08-deny", true, 60);
+        let with_listener = encode_bind_meta_listener(base, "tls");
+        let flagged = mark_bind_sections_flagged(with_listener.to_vec(), false, false, false, true);
+        let reply = apply_bind(&bind_frame(522, 1, flagged), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x87, "missing certificate is refused");
+        assert_eq!(
+            shared.metrics.auth_failures(),
+            before + 1,
+            "denial is counted"
+        );
+        assert!(
+            shared.sessions.get("tm08-deny").is_none(),
+            "no session is made"
+        );
+        let base = encode_bind_meta_cert(
+            encode_bind_meta("tm08-cert", true, 60),
+            Some("cn-1"),
+            None,
+            &[],
+        );
+        let with_listener = encode_bind_meta_listener(base, "tls");
+        let flagged = mark_bind_sections_flagged(with_listener.to_vec(), false, false, true, true);
+        let reply = apply_bind(&bind_frame(523, 1, flagged), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "a certificate passes verification");
     }
 
     #[tokio::test]

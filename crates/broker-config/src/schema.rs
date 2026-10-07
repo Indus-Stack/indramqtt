@@ -139,6 +139,13 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
             },
             FieldDoc {
+                path: "listeners.tls.verify_client_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the TLS listener requests and verifies a client certificate.",
+            },
+            FieldDoc {
                 path: "listeners.ws.enabled",
                 setting_type: "bool",
                 default: "true",
@@ -193,6 +200,13 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when secure WebSocket is enabled",
                 doc: "Path to the PEM private key for the secure WebSocket listener.",
+            },
+            FieldDoc {
+                path: "listeners.wss.verify_client_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the secure WebSocket listener requests and verifies a client certificate.",
             },
             FieldDoc {
                 path: "listeners.api.enabled",
@@ -884,6 +898,14 @@ pub struct TlsListenerConf {
     /// Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.
     #[serde(default = "default_false")]
     pub native: bool,
+    /// Whether the TLS listener requests and verifies a client certificate.
+    #[serde(default = "default_false")]
+    pub verify_client_cert: bool,
+}
+
+// Reason: off by default keeps current handshakes unchanged; the operator opts into client certificates.
+fn default_verify_client_cert() -> bool {
+    false
 }
 
 // Reason: the standard secure MQTT port.
@@ -899,6 +921,7 @@ impl Default for TlsListenerConf {
             cert_file: String::new(),
             key_file: String::new(),
             native: false,
+            verify_client_cert: default_verify_client_cert(),
         }
     }
 }
@@ -993,6 +1016,9 @@ pub struct WssListenerConf {
     /// Path to the PEM private key for the secure WebSocket listener.
     #[serde(default)]
     pub key_file: String,
+    /// Whether the secure WebSocket listener requests and verifies a client certificate.
+    #[serde(default = "default_false")]
+    pub verify_client_cert: bool,
 }
 
 // Reason: TODO(parity): no canonical secure-WebSocket port is decided yet;
@@ -1009,6 +1035,7 @@ impl Default for WssListenerConf {
             path: default_ws_path(),
             cert_file: String::new(),
             key_file: String::new(),
+            verify_client_cert: false,
         }
     }
 }
@@ -2676,6 +2703,11 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 ),
                 bool_field("tls.native", false, "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them."),
                 bool_field(
+                    "tls.verify_client_cert",
+                    false,
+                    "Whether the TLS listener requests and verifies a client certificate.",
+                ),
+                bool_field(
                     "ws.enabled",
                     true,
                     "Whether the MQTT-over-WebSocket listener accepts connections.",
@@ -2714,6 +2746,11 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "wss.key_file",
                     "",
                     "Path to the PEM private key for the secure WebSocket listener.",
+                ),
+                bool_field(
+                    "wss.verify_client_cert",
+                    false,
+                    "Whether the secure WebSocket listener requests and verifies a client certificate.",
                 ),
                 bool_field(
                     "api.enabled",

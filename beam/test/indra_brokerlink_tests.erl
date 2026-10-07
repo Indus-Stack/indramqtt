@@ -758,6 +758,48 @@ bind_meta_v5_undefined_is_byte_identical_to_v8_test() ->
     ?assertEqual(0, maps:get(max_packet_size, Dec)),
     ?assertEqual([], maps:get(user_properties, Dec)).
 
+bind_meta_listener_roundtrip_test() ->
+    %% The /10 encoding carries the listener name after the
+    %% certificate section. The name decodes back. Empty means
+    %% the default scope and encodes exactly like /9.
+    Base = indra_brokerlink:encode_bind_meta(<<"dev-lis">>, true, 60,
+                                            {<<"alice">>, <<"s3cret">>},
+                                            <<"192.0.2.10">>, 7,
+                                            #{cn => <<"cn1">>, subject => undefined,
+                                              sans => []},
+                                            undefined, undefined),
+    WithTls = indra_brokerlink:encode_bind_meta(<<"dev-lis">>, true, 60,
+                                               {<<"alice">>, <<"s3cret">>},
+                                               <<"192.0.2.10">>, 7,
+                                               #{cn => <<"cn1">>, subject => undefined,
+                                                 sans => []},
+                                               undefined, undefined, <<"tls">>),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(WithTls),
+    ?assertEqual(<<"tls">>, maps:get(listener, Dec)),
+    ?assertEqual(<<"cn1">>, maps:get(cert_cn, Dec)),
+    ?assertEqual(<<"alice">>, maps:get(username, Dec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, Dec)),
+    ?assertEqual(Base, indra_brokerlink:encode_bind_meta(
+                         <<"dev-lis">>, true, 60,
+                         {<<"alice">>, <<"s3cret">>},
+                         <<"192.0.2.10">>, 7,
+                         #{cn => <<"cn1">>, subject => undefined,
+                           sans => []},
+                         undefined, undefined, undefined)),
+    {ok, LDec} = indra_brokerlink:decode_bind_meta(Base),
+    ?assertEqual(<<>>, maps:get(listener, LDec)),
+    %% A truncated listener section fails closed.
+    Short = binary:part(WithTls, 0, byte_size(WithTls) - 1),
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(Short)),
+    %% An overlong name is rejected at encode time.
+    Long = binary:copy(<<"x">>, 65),
+    ?assertError(badarg,
+                 indra_brokerlink:encode_bind_meta(<<"d">>, true, 60,
+                                                  {undefined, undefined},
+                                                  undefined, 0,
+                                                  undefined, undefined, undefined, Long)).
+
 bind_meta_v5_malformed_rejected_test() ->
     %% Truncated v5 section (declared length beyond the bytes present).
     V5 = #{version => 5, session_expiry => 0, receive_max => 10,

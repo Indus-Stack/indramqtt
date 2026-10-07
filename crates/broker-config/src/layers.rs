@@ -317,6 +317,10 @@ pub struct CliOverrides {
     pub delayed_max_secs: Option<u64>,
     pub topic_alias_maximum: Option<u16>,
     pub monitor_sample_secs: Option<u64>,
+    /// `--tls-verify-client-cert` -> `listeners.tls.verify_client_cert`.
+    pub tls_verify_client_cert: Option<bool>,
+    /// `--wss-verify-client-cert` -> `listeners.wss.verify_client_cert`.
+    pub wss_verify_client_cert: Option<bool>,
 }
 
 impl CliOverrides {
@@ -834,6 +838,24 @@ impl CliOverrides {
                 "observability.monitor_sample_secs",
                 toml::Value::Integer(value as i64),
                 "--monitor-sample-secs",
+            );
+        }
+        if let Some(value) = self.tls_verify_client_cert {
+            insert_path(
+                table,
+                provenance,
+                "listeners.tls.verify_client_cert",
+                toml::Value::Boolean(value),
+                "--tls-verify-client-cert",
+            );
+        }
+        if let Some(value) = self.wss_verify_client_cert {
+            insert_path(
+                table,
+                provenance,
+                "listeners.wss.verify_client_cert",
+                toml::Value::Boolean(value),
+                "--wss-verify-client-cert",
             );
         }
     }
@@ -1745,6 +1767,8 @@ mod tests {
             delayed_max_secs: Some(1),
             topic_alias_maximum: Some(1),
             monitor_sample_secs: Some(1),
+            tls_verify_client_cert: Some(true),
+            wss_verify_client_cert: Some(true),
         };
         let mut table = toml::Table::new();
         let mut provenance: HashMap<String, Layer> = HashMap::new();

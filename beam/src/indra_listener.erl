@@ -86,7 +86,21 @@
                     | {keyfile, file:filename()}
                     | {psk_keys, [{binary(), binary()}]}
                     | {psk_hint, binary() | string()}
+                    | {verify_client_cert, boolean()}
                     | {conn, [tuple()]}.
+
+%% @private SSL verify options for client certificates (TM-08).
+%% Off requests no certificate. On requests one and checks its chain
+%% against system roots. Missing passes the handshake and fails at the
+%% bind. A bad chain fails the handshake.
+verify_ssl_opts(true) ->
+    Cacerts = case catch public_key:cacerts_get() of
+        Certs when is_list(Certs) -> [{cacerts, Certs}];
+        _ -> []
+    end,
+    [{verify, verify_peer}, {fail_if_no_peer_cert, false} | Cacerts];
+verify_ssl_opts(_) ->
+    [].
 
 %%====================================================================
 %% API
@@ -258,12 +272,13 @@ build_ssl_opts(Opts, SockOpts) ->
     Cert = proplists:get_value(certfile, Opts, undefined),
     Key = proplists:get_value(keyfile, Opts, undefined),
     PskKeys = proplists:get_value(psk_keys, Opts, undefined),
+    Verify = proplists:get_value(verify_client_cert, Opts, false),
     case PskKeys of
         undefined ->
             case {Cert, Key} of
                 {undefined, _} -> {error, {missing_option, certfile}};
                 {_, undefined} -> {error, {missing_option, keyfile}};
-                {_, _} -> {ok, [{certfile, Cert}, {keyfile, Key} | SockOpts], undefined}
+                {_, _} -> {ok, [{certfile, Cert}, {keyfile, Key} | verify_ssl_opts(Verify)] ++ SockOpts, undefined}
             end;
         _ ->
             case validate_psk_keys(PskKeys) of

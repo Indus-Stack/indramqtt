@@ -229,9 +229,10 @@ type E2eBind = (String, bool, u16, Option<String>, Option<Vec<u8>>);
 
 /// Decode a `BindConnection` metadata body into [`E2eBind`], mirroring
 /// the kernel's `decode_bind_meta` contract (`ClientIdLen:16be |
-/// ClientId | Flags:8 | Keepalive:16be`, plus the optional trailing
-/// `UserLen | Username | PassLen | Password` credentials section and the
-/// optional trailing `PeerLen:16be | PeerIp` peer-address section).
+/// ClientId | Flags:8 | Keepalive:16be`, plus flagged sections).
+/// Flags decide the parse. Bit 0 is clean start. Bit 1 marks a head
+/// will section. Bits 3, 4, 5 and 6 mark credentials, peer, certificate
+/// and listener sections. The tail holds the alias maximum.
 fn decode_e2e_bind(meta: &[u8]) -> Option<E2eBind> {
     if meta.len() < 5 {
         return None;
@@ -243,7 +244,106 @@ fn decode_e2e_bind(meta: &[u8]) -> Option<E2eBind> {
     let client_id = std::str::from_utf8(&meta[2..2 + id_len]).ok()?.to_string();
     let flags = meta[2 + id_len];
     let keepalive = u16::from_be_bytes([meta[3 + id_len], meta[4 + id_len]]);
-    let rest = &meta[5 + id_len..];
+    let mut rest = &meta[5 + id_len..];
+    // Skip the head will section when bit 1 is set.
+    // Layout: QoS:8 | Retain:8 | TopicLen:16be | Topic | PayloadLen:32be | Payload.
+    if flags & 0x02 != 0 {
+        if rest.len() < 8 {
+            return None;
+        }
+        let topic_len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
+        if rest.len() < 4 + topic_len + 4 {
+            return None;
+        }
+        let payload_len = u32::from_be_bytes([
+            rest[4 + topic_len],
+            rest[5 + topic_len],
+            rest[6 + topic_len],
+            rest[7 + topic_len],
+        ]) as usize;
+        if rest.len() < 4 + topic_len + 4 + payload_len {
+            return None;
+        }
+        rest = &rest[4 + topic_len + 4 + payload_len..];
+    }
+    // Flagged parse. The kernel reads credentials, peer, certificate,
+    // then listener. Each set flag needs its section.
+    if flags & (0x08 | 0x10 | 0x20 | 0x40) != 0 {
+        let mut cursor = rest;
+        let (username, password) = if flags & 0x08 != 0 {
+            if cursor.len() < 2 {
+                return None;
+            }
+            let user_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+            if cursor.len() < 2 + user_len + 2 {
+                return None;
+            }
+            let username = std::str::from_utf8(&cursor[2..2 + user_len])
+                .ok()?
+                .to_string();
+            let base = 2 + user_len;
+            let pass_len = u16::from_be_bytes([cursor[base], cursor[base + 1]]) as usize;
+            if cursor.len() < base + 2 + pass_len {
+                return None;
+            }
+            let password = cursor[base + 2..base + 2 + pass_len].to_vec();
+            cursor = &cursor[base + 2 + pass_len..];
+            (Some(username), Some(password))
+        } else {
+            (None, None)
+        };
+        if flags & 0x10 != 0 {
+            if cursor.len() < 2 {
+                return None;
+            }
+            let peer_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+            if cursor.len() < 2 + peer_len {
+                return None;
+            }
+            let literal = std::str::from_utf8(&cursor[2..2 + peer_len]).ok()?;
+            literal.parse::<std::net::IpAddr>().ok()?;
+            cursor = &cursor[2 + peer_len..];
+        }
+        if flags & 0x20 != 0 {
+            if cursor.len() < 2 {
+                return None;
+            }
+            let cert_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+            if cursor.len() < 2 + cert_len {
+                return None;
+            }
+            cursor = &cursor[2 + cert_len..];
+        }
+        if flags & 0x40 != 0 {
+            if cursor.len() < 2 {
+                return None;
+            }
+            let name_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+            if !(1..=64).contains(&name_len) || cursor.len() < 2 + name_len {
+                return None;
+            }
+            std::str::from_utf8(&cursor[2..2 + name_len]).ok()?;
+            cursor = &cursor[2 + name_len..];
+        }
+        // Strip the v5 section when bit 2 is set.
+        // Layout: AliasMax:16be | V5Payload | V5Len:16be.
+        if flags & 0x04 != 0 {
+            if cursor.len() < 4 {
+                return None;
+            }
+            let v5_len =
+                u16::from_be_bytes([cursor[cursor.len() - 2], cursor[cursor.len() - 1]]) as usize;
+            if cursor.len() < 2 + v5_len + 2 {
+                return None;
+            }
+            cursor = &cursor[..2];
+        }
+        // The tail holds nothing or the alias maximum.
+        if !(cursor.is_empty() || cursor.len() == 2) {
+            return None;
+        }
+        return Some((client_id, flags & 0x01 != 0, keepalive, username, password));
+    }
     let (username, password) = if rest.is_empty() {
         (None, None)
     } else {

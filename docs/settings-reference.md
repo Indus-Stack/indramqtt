@@ -26,6 +26,7 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `listeners.tls.cert_file` | string | `` | string | Path to the PEM server certificate for the TLS listener. |
 | `listeners.tls.key_file` | string | `` | string | Path to the PEM private key for the TLS listener. |
 | `listeners.tls.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them. |
+| `listeners.tls.verify_client_cert` | boolean | `false` | boolean | Whether the TLS listener requests and verifies a client certificate. |
 | `listeners.ws.enabled` | boolean | `true` | boolean | Whether the MQTT-over-WebSocket listener accepts connections. |
 | `listeners.ws.bind` | string | `0.0.0.0:8083` | string | Bind address for the MQTT-over-WebSocket listener. |
 | `listeners.ws.path` | string | `/mqtt` | string | HTTP path serving MQTT-over-WebSocket traffic. |
@@ -34,6 +35,7 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `listeners.wss.path` | string | `/mqtt` | string | HTTP path serving secure WebSocket traffic. |
 | `listeners.wss.cert_file` | string | `` | string | Path to the PEM server certificate for the secure WebSocket listener. |
 | `listeners.wss.key_file` | string | `` | string | Path to the PEM private key for the secure WebSocket listener. |
+| `listeners.wss.verify_client_cert` | boolean | `false` | boolean | Whether the secure WebSocket listener requests and verifies a client certificate. |
 | `listeners.api.enabled` | boolean | `true` | boolean | Whether the management REST API and dashboard serve requests. |
 | `listeners.api.bind` | string | `0.0.0.0:18083` | string | Bind address for the management REST API. Empty disables the API. |
 

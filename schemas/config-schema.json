@@ -447,6 +447,11 @@
               "default": false,
               "description": "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
               "type": "boolean"
+            },
+            "verify_client_cert": {
+              "default": false,
+              "description": "Whether the TLS listener requests and verifies a client certificate.",
+              "type": "boolean"
             }
           },
           "type": "object"
@@ -497,6 +502,11 @@
               "default": "/mqtt",
               "description": "HTTP path serving secure WebSocket traffic.",
               "type": "string"
+            },
+            "verify_client_cert": {
+              "default": false,
+              "description": "Whether the secure WebSocket listener requests and verifies a client certificate.",
+              "type": "boolean"
             }
           },
           "type": "object"
