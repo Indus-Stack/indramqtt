@@ -1,0 +1,6 @@
+VERDICT: accept
+FILES READ: /work/team/migration/RULEBOOK.md, /work/team/tickets/AP-13-conformance-cases-b.md, /work/team/parity/REVIEW-BRIEF.md, /work/team/BRIEF.md, /work/team/parity/API-EXACT-MATCH.md, /work/tree/tests/api_conformance/cases/configs.json, /work/state/AP-13.gates.log, /work/tree/crates/broker-api/src/v5/configs.rs, /work/tree/tests/api_conformance/BASELINE.md, /work/tree/tests/api_conformance/__main__.py
+REACHABILITY: none
+PROOF: configs.json:PUT /configs/alarm — test expects 400, production entry is PUT /api/v5/configs/alarm, broker change to fail: implement alarm config and return 200. configs.json:PUT /configs/broker — test expects 400, production entry is PUT /api/v5/configs/broker, broker change to fail: implement broker config and return 200. configs.json:PUT /configs/dashboard — test expects 400, production entry is PUT /api/v5/configs/dashboard, broker change to fail: implement dashboard config and return 200. configs.json:PUT /configs/sys_topics — test expects 400, production entry is PUT /api/v5/configs/sys_topics, broker change to fail: implement sys_topics config and return 200. configs.json:PUT /configs/sysmon — test expects 400, production entry is PUT /api/v5/configs/sysmon, broker change to fail: implement sysmon config and return 200.
+SLOP: none
+CLASSES: none
