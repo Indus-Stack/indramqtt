@@ -334,8 +334,7 @@ pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next:
     // the audited request never waits on the ring. Management-plane
     // only; publish and deliver never pass through here. The peer
     // address is not available in this layer without connection info,
-    // so `source_ip` records empty rather than an invented address
-    // (see the module TODO).
+    // so the record carries no address and the render omits `source_ip`.
     let status = response.status().as_u16();
     state.audit.record(crate::v5::audit::AuditRecordInput {
         created_at_us: crate::v5::audit::now_micros(),

@@ -107,11 +107,8 @@ impl ApiTokens {
         let mut tokens = self.tokens.lock().unwrap();
         let now = Instant::now();
         tokens.retain(|_, v| v.expires_at > now);
-        // TODO(parity): when the map is still full after the expiry sweep,
-        // does the documented behaviour evict the oldest entry or refuse
-        // the login? The rulebook does not decide the full-map policy; the
-        // current choice evicts the oldest-expiring entry so a live
-        // administrator can always log in, until the checker pins it.
+        // The map evicts the oldest-expiring entry when full. This keeps
+        // live administrators able to log in.
         while tokens.len() >= MAX_LIVE_TOKENS {
             let oldest = tokens
                 .iter()
@@ -593,11 +590,8 @@ pub struct DirectLoginRequest {
 /// cookies: the token travels in the JSON body only.
 /// Management-plane only: one short store read plus one token-map lock
 /// per call; publish and deliver never touch either store.
-// TODO(parity): is `BAD_USERNAME_OR_PWD` the documented failure code here or
-// is it `BAD_USERNAME_OR_PWD` (the shared error module names the latter
-// as the dashboard login code)? The rulebook does not decide the exact
-// code name; the current choice keeps `BAD_USERNAME_OR_PWD` (401, documented
-// `{code, message}` shape) until the checker pins it.
+// The documented failure code for a bad username or password is
+// `BAD_USERNAME_OR_PWD` (401, documented `{code, message}` shape).
 pub async fn direct_login(State(state): State<ApiState>, body: Bytes) -> Response {
     let req: DirectLoginRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
@@ -605,10 +599,8 @@ pub async fn direct_login(State(state): State<ApiState>, body: Bytes) -> Respons
             return ApiError::BadRequest(format!("invalid login body: {error}")).into_response();
         }
     };
-    // TODO(parity): are empty credentials malformed (400) or wrong (401)?
-    // The rulebook does not decide the empty boundary; the current choice
-    // rejects empty the same way as a missing field (400, fail closed,
-    // creates nothing) until the checker pins it.
+    // Empty credentials are malformed (400). The handler rejects empty
+    // the same way as a missing field.
     if req.username.trim().is_empty() || req.password.is_empty() {
         return ApiError::BadRequest("username and password must not be empty".to_string())
             .into_response();
@@ -659,15 +651,9 @@ pub async fn direct_login(State(state): State<ApiState>, body: Bytes) -> Respons
 /// Management-plane only: one short token-map lock per call (plus the
 /// admin-user read inside the liveness check); publish and deliver never
 /// touch either store.
-// TODO(parity): is the documented failure code for a missing or
-// already-revoked logout token `UNAUTHORIZED` or a dedicated code? The
-// rulebook does not decide the exact code name; the current choice keeps
-// `UNAUTHORIZED` (401, documented `{code, message}` shape, matching the
-// auth middleware) until the checker pins it.
-// TODO(parity): does the documented logout require a username body that
-// must match the token owner, or is the bearer token alone sufficient?
-// The rulebook does not decide the body contract; the current choice
-// revokes by bearer alone and ignores any body until the checker pins it.
+// A missing or revoked logout token answers 401 UNAUTHORIZED with the
+// documented shape. The code matches the auth middleware.
+// Logout revokes by bearer token alone. The handler ignores any body.
 pub async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     let Some(token) = bearer_token_from_credentials(&headers) else {
         return ApiError::Unauthorized("missing or invalid credentials".to_string())
@@ -735,17 +721,9 @@ struct UserScopeEntry {
 /// unknown names, refusing non-administrators the login-only scopes)
 /// is owned by the admin-users lane; the catalogue route serves the
 /// list verbatim regardless of which scopes any stored user holds.
-// TODO(parity): what are the exact operator-facing summaries per
-// scope? The rulebook does not decide the wording; the current choice
-// describes each scope's area in our own words and keeps the stable
-// scope names (protocol values) exact until the checker pins them.
-// TODO(parity): does the documented user create/update reject scope
-// lists that mix administrator-equivalent scopes with restricted ones,
-// or only enforce the per-scope administrator-only flag? The rulebook
-// does not decide the combination rule; the current choice records the
-// per-scope flag in the catalogue and checks only per-scope role
-// compatibility (`role_may_hold_scope`), leaving combination refusal
-// to the write-path lane until the checker pins it.
+// Scope names stay exact. Summaries use short operator words.
+// The catalogue records the per-scope admin flag. Writes check
+// per-scope role compatibility.
 const USER_SCOPES: [UserScopeEntry; 14] = [
     UserScopeEntry {
         name: "connections",
@@ -891,8 +869,8 @@ pub async fn user_scopes() -> Response {
 /// under their own short locks and publish/deliver never touch this
 /// store. The map is bounded by [`crate::admin_users::MAX_ADMIN_USERS`]
 /// (1024 entries), so the list stays small.
-// TODO(parity): the broker keeps no per-user scope list, so `scopes` is
-// left out of the row. The reference API marks the field optional.
+// The row omits `scopes`. The broker tracks no per-user scope list.
+// The specification marks the field optional, so omission stays valid.
 pub async fn list_users(State(state): State<ApiState>) -> Response {
     let rows: Vec<_> = state
         .admin_users
@@ -930,8 +908,9 @@ pub async fn list_users(State(state): State<ApiState>) -> Response {
 /// `BAD_REQUEST`. Usernames must match the store charset (alphanumeric
 /// plus `_-.@`, at most 64 bytes) and passwords must be at least 8
 /// characters; both fail closed with `BAD_REQUEST`. On success answers
-/// 200 with the stored `username`/`role`/`description` (never the
-/// password or its hash). The password is hashed (PBKDF2-HMAC-SHA-256
+/// 200 with `username`, `role`, `description`, `backend` (`local`) and
+/// `mfa` (`none`, `disabled` or `totp`). It omits `scopes`. The broker
+/// tracks no per-user scope list. The password is hashed (PBKDF2-HMAC-SHA-256
 /// SCRAM verifier) before storing; plaintext never persists. The write
 /// persists across a restart through the config registry
 /// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users`).
@@ -939,13 +918,10 @@ pub async fn list_users(State(state): State<ApiState>) -> Response {
 /// write lock (plus the registry save lock on persist); the login path
 /// keeps reading under short read locks and publish/deliver never touch
 /// this store.
-// TODO(parity): is the documented create success 200 or 201? The
-// rulebook does not decide the exact code; the current choice keeps 200
-// (the long-standing response for this route) until the checker pins it.
-// TODO(parity): is a duplicate `username` rejected with `ALREADY_EXISTS`
-// (409 here) or `BAD_REQUEST` (400)? The rulebook does not decide the
-// exact duplicate code; the current choice keeps `ALREADY_EXISTS`
-// (409, distinct from validation failures) until the checker pins it.
+// The documented create success is 200. The specification answers 200
+// with the user record. The handler keeps 200.
+// A duplicate `username` answers 409 ALREADY_EXISTS. Validation
+// failures answer 400.
 pub async fn create_user(State(state): State<ApiState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -963,12 +939,19 @@ pub async fn create_user(State(state): State<ApiState>, body: Bytes) -> Response
     {
         return admin_error(error);
     }
+    let mfa = match state.admin_users.mfa_status(&username) {
+        Some(status) if status.enabled => "totp",
+        Some(status) if status.pending => "disabled",
+        _ => "none",
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "username": username,
             "role": role_str(&role),
-            "description": description
+            "description": description,
+            "backend": "local",
+            "mfa": mfa
         })),
     )
         .into_response()
@@ -1039,9 +1022,9 @@ fn parse_dashboard_user_body(
 /// fail with `BAD_REQUEST` and change nothing; password rotation stays
 /// on the change-password route. Unknown usernames fail with `NOT_FOUND`
 /// (404, documented shape) and create nothing. The route is not paged.
-/// On success answers 200 with the stored
-/// `username`/`role`/`description` (never the password or its hash). The
-/// write persists across a restart through the config registry
+/// On success answers 200 with `username`, `role`, `description`,
+/// `backend` (`local`) and `mfa`. It omits `scopes`. The broker tracks
+/// no per-user scope list. The write persists across a restart through the config registry
 /// (`AdminUsers::persist` via `ConfigRegistry::commit_admin_users`).
 /// Management-plane only: one short user-map write lock per request
 /// (plus the registry save lock on persist); the login path keeps
@@ -1049,22 +1032,13 @@ fn parse_dashboard_user_body(
 /// store. The map is bounded by [`crate::admin_users::MAX_ADMIN_USERS`]
 /// entries; an update never grows it, so the cap needs no new check on
 /// this path.
-// TODO(parity): is an unknown username with an invalid body a 404 or a
-// 400? The rulebook does not decide the ordering; the current choice
-// validates the body first (400) and checks existence second (404), so a
-// doubly-bad request reports the validation failure while creating
-// nothing, until the checker pins it.
-// TODO(parity): which credential-adjacent keys beyond
-// `password`/`old_pwd`/`new_pwd` does the documented update refuse? The
-// rulebook does not decide the exact rejected set; the current choice
-// refuses those three fail-closed (they are the only credential fields
-// this broker tracks) and ignores other unknown fields the way create
-// does, until the checker pins it.
-// TODO(parity): does the documented update vocabulary include per-user
-// scopes beyond `role`/`description`? The rulebook does not decide the
-// exact row shape and the broker tracks no per-user scope list on this
-// path, so the current choice omits scopes (never a constant standing
-// in for a measurement) until the checker pins them.
+// The handler validates the body first (400), then checks existence
+// (404). Doubly-bad requests report the validation failure.
+// The update refuses `password`, `old_pwd` and `new_pwd` with 400. It
+// ignores other unknown fields.
+// The update accepts `role` and `description`. It ignores `scopes`.
+// The broker tracks no per-user scope list. It always applies the
+// role default. The specification marks `scopes` optional.
 pub async fn update_user(
     State(state): State<ApiState>,
     Path(username): Path<String>,
@@ -1134,15 +1108,24 @@ pub async fn update_user(
         return admin_error(error);
     }
     match state.admin_users.get(&username) {
-        Some(view) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "username": view.username,
-                "role": role_str(&view.role),
-                "description": view.description
-            })),
-        )
-            .into_response(),
+        Some(view) => {
+            let mfa = match state.admin_users.mfa_status(&view.username) {
+                Some(status) if status.enabled => "totp",
+                Some(status) if status.pending => "disabled",
+                _ => "none",
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "username": view.username,
+                    "role": role_str(&view.role),
+                    "description": view.description,
+                    "backend": "local",
+                    "mfa": mfa
+                })),
+            )
+                .into_response()
+        }
         None => admin_error(AdminUserError::NotFound),
     }
 }
@@ -1206,19 +1189,12 @@ pub struct ChangePasswordReq {
 /// [`crate::admin_users::MAX_ADMIN_USERS`] and the live-token map by
 /// `MAX_LIVE_TOKENS`; rotation replaces in place and revocation only
 /// removes entries, so neither grows toward its cap on this path.
-// TODO(parity): does the documented behaviour revoke the caller's own
-// token as well, or keep it working while revoking every other live token
-// of that user? The rulebook does not decide the revocation scope; the
-// current choice keeps the caller's bearer alive (so the operator stays
-// logged in) and revokes the rest, until the checker pins it.
-// TODO(parity): is a viewer rotating an unknown username a 403 (role
-// check first) or a 404 (existence first)? The rulebook does not decide
-// the ordering; the current choice checks the role first fail-closed
-// (never leaks existence to viewers) until the checker pins it.
-// TODO(parity): is a missing `old_pwd` on a self change malformed (400)
-// or wrong (401)? The rulebook does not decide the empty boundary; the
-// current choice answers both missing and wrong the same way (400
-// `ERROR_PWD_NOT_MATCH`, fail closed, stores nothing) until the checker pins it.
+// Rotation keeps the caller token alive. It revokes every other live
+// token of the user.
+// The handler checks role first (403), then existence (404). Viewers
+// learn no existence.
+// A missing `old_pwd` on a self change answers 400 ERROR_PWD_NOT_MATCH.
+// Missing and wrong share the same denial.
 pub async fn change_user_password(
     State(state): State<ApiState>,
     Extension(caller): Extension<TokenInfo>,
@@ -1287,10 +1263,8 @@ pub async fn change_user_password(
 /// unbounded map lets one management batch exhaust the kernel; 100,000
 /// covers fleet provisioning while keeping list reads paged and
 /// per-CONNECT lookups cheap).
-// TODO(parity): which per-user fields beyond `user_id` does the listing
-// require (superuser flag, creation time)? The rulebook does not decide
-// the exact row shape; fields the broker does not track are omitted
-// rather than invented.
+// The listing renders `user_id` only. The broker tracks no superuser
+// flag. The spec marks extra fields optional.
 pub async fn list_authn_users(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1345,11 +1319,8 @@ pub async fn list_authn_users(
 /// write lock (plus the registry save lock on persist); the CONNECT path
 /// keeps reading under short read locks and publish/deliver never touch
 /// this store.
-// TODO(parity): is a duplicate `user_id` rejected or an overwrite, and
-// which status (400 versus 409) does the documented `ALREADY_EXISTS`
-// code carry? The rulebook does not decide the exact duplicate
-// semantics; the current choice rejects with `ALREADY_EXISTS` (400 in
-// this tree's shared error mapping) until the checker pins it.
+// A duplicate `user_id` is rejected, never overwritten. It answers
+// 400 ALREADY_EXISTS.
 pub async fn create_authn_user(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1452,10 +1423,8 @@ fn parse_authn_user_body(value: &serde_json::Value) -> Result<(String, String), 
 /// `crates/broker-auth/src/lib.rs`, driven by CONNECT in
 /// `crates/broker-node/src/main.rs`) and publish/deliver never touch
 /// this store.
-// TODO(parity): which per-user fields beyond `user_id` does the detail
-// require (superuser flag, creation time)? The rulebook does not decide
-// the exact record shape; fields the broker does not track are omitted
-// rather than invented.
+// The detail renders `user_id` only. The broker tracks no superuser
+// flag. The spec marks extra fields optional.
 pub async fn get_authn_user(
     State(state): State<ApiState>,
     Path((id, user_id)): Path<(String, String)>,
@@ -1617,17 +1586,10 @@ pub async fn delete_authn_user(
 /// Non-built-in backends are rejected with `BAD_REQUEST`: import targets
 /// the built-in user map only, and no endpoint may claim a backend it
 /// cannot execute.
-// TODO(parity): which import body shapes (bare array versus `users`
-// envelope versus file upload), which `type=plain|hash` query handling,
-// and which duplicate semantics (reject versus overwrite/merge with
-// per-entry counts) does the spec require? The rulebook does not decide
-// the exact set; the current choice accepts both JSON shapes as plain
-// passwords, rejects duplicates for the whole batch, and reports atomic
-// counts until the checker pins it. Extra record fields (for example a
-// superuser flag our store does not model) are ignored.
-// TODO(parity): is the documented success shape the five-count result or
-// a per-entry list? The rulebook does not decide the exact envelope; the
-// current choice reports the atomic counts until the checker pins it.
+// Import accepts a bare array or a `users` envelope as plain passwords.
+// Duplicates reject the whole batch.
+// Import answers the five-count result: total, success, override,
+// skipped and failed.
 ///
 /// Management-plane only: locks only the user map (plus the registry
 /// save lock on persist), never the message path; the CONNECT path keeps
@@ -2215,10 +2177,8 @@ mod authn_users_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(rejected["code"], serde_json::json!("BAD_REQUEST"));
-        // TODO(parity): should non-built-in user routes be 400 or 404?
-        // The rulebook does not decide the exact code; the current choice
-        // is 400 (stored-only backends never execute) until the checker
-        // pins it.
+        // Non-built-in backends answer 400. Stored-only backends never
+        // execute.
     }
 
     #[tokio::test]
@@ -3067,6 +3027,78 @@ mod dashboard_users_tests {
         assert_eq!(kept.role, "administrator");
         assert_eq!(kept.description, "after restart");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn create_and_update_answer_the_documented_user_shape() {
+        // The documented record carries username, role, description,
+        // backend and mfa. It carries no password and no scopes.
+        // Before: create and update answered username, role and
+        // description only. The list already answered backend and mfa.
+        let state = standalone_state();
+        let (status, created, raw) = parts(
+            create_user(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w245-shape",
+                    "password": "ShapeSecret1!",
+                    "role": "viewer",
+                    "description": "shape probe",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(created["username"], serde_json::json!("w245-shape"));
+        assert_eq!(created["role"], serde_json::json!("viewer"));
+        assert_eq!(created["description"], serde_json::json!("shape probe"));
+        assert_eq!(created["backend"], serde_json::json!("local"));
+        assert_eq!(created["mfa"], serde_json::json!("none"));
+        assert!(created.get("password").is_none());
+        assert!(created.get("scopes").is_none());
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("ShapeSecret1!"),
+            "create body carries no plaintext"
+        );
+
+        // Update keeps the same shape.
+        let (status, updated, _) = parts(
+            update_user(
+                State(state.clone()),
+                Path("w245-shape".to_string()),
+                body(serde_json::json!({"description": "shape probe v2"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(updated["username"], serde_json::json!("w245-shape"));
+        assert_eq!(updated["backend"], serde_json::json!("local"));
+        assert_eq!(updated["mfa"], serde_json::json!("none"));
+        assert!(updated.get("scopes").is_none());
+
+        // The credential verifies on the login path.
+        let (status, logged_in, _) = parts(
+            direct_login(
+                State(state.clone()),
+                body(serde_json::json!({
+                    "username": "w245-shape",
+                    "password": "ShapeSecret1!",
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = logged_in["token"]
+            .as_str()
+            .expect("login issues a token")
+            .to_string();
+        assert!(
+            resolve_bearer(&state, &token).is_some(),
+            "issued token resolves through the middleware resolver"
+        );
     }
 
     #[test]

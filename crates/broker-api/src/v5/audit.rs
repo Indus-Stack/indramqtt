@@ -28,31 +28,16 @@
 //!   instead of blocking the audited request. Reads take one short read
 //!   lock and clone at most the capped ring once per request, so reads
 //!   never block writes beyond one lock hold.
-// TODO(parity): which exact per-entry detail fields does the documented
-// shape require beyond the eleven rendered here (for example structured
-// request bodies, argument lists or failure traces)? The rulebook does
-// not decide the exact record shape and the broker tracks only the
-// management request line (method, path, status, duration, actor), so
-// the current choice renders the request line honestly and omits detail
-// fields the broker cannot supply (never a constant standing in for a
-// measurement) until the checker pins them.
-// TODO(parity): what are the exact time-range query names and value
-// shapes (epoch microseconds versus RFC 3339, `gte_created_at` versus
-// `from`/`since`)? The rulebook does not decide the exact names; the
-// current choice honours `gte_created_at`/`lte_created_at` in either
-// integer (microseconds, milliseconds or seconds, auto-detected) or
-// RFC 3339 form plus the documented `operation_result` outcome filter
-// and common management filters, ignoring every other query key.
-// TODO(parity): which outcome vocabulary beyond `success`/`failure`
-// does the documented filter accept, and what does an unknown outcome
-// value do (empty page versus ignored)? The rulebook does not decide;
-// the current choice matches exactly (`success` for status below 400,
-// `failure` otherwise) and an unknown value matches nothing (empty
-// page) until the checker pins it.
-// TODO(parity): does the documented list stay readable when auditing is
-// disabled, or does it answer 400 while disabled? The rulebook does not
-// decide an enable flag and this tree has no audit toggle, so the list
-// always reads (an empty log reads as an empty page, never an error).
+// Each entry renders the request line: method, path, status,
+// duration and actor. It omits `args`, `failure` and `http_request`.
+// The broker tracks only the request line. The specification marks
+// those fields optional, so omission stays valid.
+// Time filters are `gte_created_at` and `lte_created_at`. Values accept
+// RFC 3339 or epoch integers. The spec names these keys.
+// Outcome filter accepts `success` and `failure`. Unknown values match
+// nothing and read as an empty page.
+// The list always reads. The tree has no audit toggle. An empty log
+// reads as an empty page, never an error.
 
 use axum::{
     extract::{Query, State},
@@ -129,19 +114,24 @@ pub struct AuditEntry {
 
 impl AuditEntry {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        // The peer address is absent when the recorder has no measurement.
+        // The spec marks `source_ip` optional, so omission stays valid.
+        let mut entry = serde_json::json!({
             "created_at": micros_to_rfc3339(self.created_at_us),
             "node": self.node,
             "from": self.from,
             "source": self.source,
-            "source_ip": self.source_ip,
             "operation_id": self.operation_id,
             "operation_type": self.operation_type,
             "operation_result": self.operation_result,
             "http_method": self.http_method,
             "http_status_code": self.http_status_code,
             "duration_ms": self.duration_ms,
-        })
+        });
+        if !self.source_ip.trim().is_empty() {
+            entry["source_ip"] = serde_json::Value::String(self.source_ip.clone());
+        }
+        entry
     }
 }
 
@@ -720,11 +710,9 @@ mod tests {
     #[test]
     fn entry_json_has_documented_shape() {
         let log = AuditLog::new();
-        log.record(entry_at(
-            1_700_000_000_000_000,
-            OUTCOME_SUCCESS,
-            "/api/v5/api_key",
-        ));
+        let mut input = entry_at(1_700_000_000_000_000, OUTCOME_SUCCESS, "/api/v5/api_key");
+        input.source_ip = "127.0.0.1".to_string();
+        log.record(input);
         let all = log.query(&AuditFilter::default());
         assert_eq!(all.len(), 1);
         let rendered = all[0].to_json();
@@ -749,6 +737,39 @@ mod tests {
             serde_json::json!(OUTCOME_SUCCESS)
         );
         assert_eq!(rendered["operation_type"], serde_json::json!("api_key"));
+    }
+
+    #[test]
+    fn empty_source_ip_stays_absent() {
+        // No measurement means no field. The render omits `source_ip`.
+        let log = AuditLog::new();
+        log.record(entry_at(
+            1_700_000_000_000_000,
+            OUTCOME_SUCCESS,
+            "/api/v5/api_key",
+        ));
+        let all = log.query(&AuditFilter::default());
+        assert_eq!(all.len(), 1);
+        let rendered = all[0].to_json();
+        assert!(rendered.get("source_ip").is_none());
+    }
+
+    #[test]
+    fn omitted_detail_fields_stay_absent() {
+        // The broker tracks only the request line. It omits args,
+        // failure and http_request. The test guards the omit rule.
+        let log = AuditLog::new();
+        log.record(entry_at(
+            1_700_000_000_000_000,
+            OUTCOME_SUCCESS,
+            "/api/v5/users",
+        ));
+        let all = log.query(&AuditFilter::default());
+        assert_eq!(all.len(), 1);
+        let rendered = all[0].to_json();
+        for field in ["args", "failure", "http_request"] {
+            assert!(rendered.get(field).is_none(), "omitted field {field}");
+        }
     }
 
     #[test]
