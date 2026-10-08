@@ -326,3 +326,43 @@ is not changed.
   client context on the match path yet, so the broker stores the
   template and renders `$1` captures only, leaving those placeholders
   literal. Plain capture templates rewrite exactly.
+- `GET /clients/{clientid}/authorization/cache`, response 200. The
+  specification declares one object with `access`, `result`, `topic` and
+  `updated_time`. The broker returns a bare list of such objects, one per
+  cached decision. One object cannot hold a cache with many decisions. The
+  management console has no caller for this route, so no console read
+  decides it. The broker keeps the list so no decision is lost, and the
+  checker reports a type error for this row.
+- `GET /clients/{clientid}/authorization/cache`, response 200, field
+  `result`. The specification declares enum `["allow", "denny"]`. The
+  word `denny` is a spelling error. The broker returns `deny` for a
+  denied decision. The checker reports a type error for a denied row.
+- `PUT /clients/{clientid}/keepalive`. The published specification file
+  has no such path. The broker serves it as a hidden route. It takes
+  `{interval: 0..65535}` and answers the full client detail, the same
+  shape as `GET /clients/{clientid}`. An unknown id answers 404
+  `CLIENTID_NOT_FOUND`. The checker exercises this row through
+  `cases/keepalive.json`. A HTTP test in `crates/broker-api` proves it.
+- `GET /clients/{clientid}/inflight_messages`, response 200. The
+  specification lists `from_clientid` and `from_username` on each entry.
+  The broker omits both. The queue tracker keeps no publisher name, so no
+  true value exists. Recording one needs new publish-path allocation, and
+  no bench numbers allow it. The management console reads the list
+  (`loadInflightMsgs` in the API module of the console, the message list
+  dialog) and shows a placeholder for a missing name. The checker reports
+  missing fields for this row.
+- `GET /clients/{clientid}/mqueue_messages`, response 200. The
+  specification lists `from_clientid` and `from_username` on each entry.
+  The broker omits both. The queue keeps no publisher name, so no true
+  value exists. Recording one needs new publish-path allocation, and no
+  bench numbers allow it. The broker omits `mqueue_priority`. The queue
+  keeps no priority, so no true value exists. The
+  management console reads the list (`loadMsgQueue` in the API module of
+  the console, the message list dialog) and shows a placeholder for a
+  missing name. The checker reports missing fields for this row.
+- `GET /clients/{clientid}/mqueue_messages`, response 200, field `msgid`.
+  The specification types it as an optional string. The queue entry holds
+  no message identifier, so the broker omits it. The inflight list keeps
+  the downlink packet id as `msgid`. No identifier was added to the queue:
+  stamping one where the kernel queues the message would add work on the
+  publish path. The checker reports a missing field for this row.

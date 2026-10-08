@@ -435,6 +435,11 @@ pub struct InflightMessage {
     /// no new unbounded state. Reason for `Instant` (monotonic) over
     /// wall-clock: ack latency must not jump on clock adjustments.
     pub enqueued_at: Instant,
+    /// Publish time recorded where the downlink is already being built,
+    /// as millis since the Unix epoch. `None` means the entry predates
+    /// timestamp recording; API reads omit the field rather than
+    /// substituting anything. Stamped on track when absent.
+    pub publish_at_ms: Option<u64>,
 }
 
 /// Maximum unacknowledged QoS 1 downlinks held in the per-session
@@ -967,6 +972,10 @@ impl Session {
     /// Fast path: one atomic load plus one bounded deque push under a
     /// single write lock, no allocation beyond the message itself.
     pub fn track_inflight(&self, message: InflightMessage) -> bool {
+        let mut message = message;
+        if message.publish_at_ms.is_none() {
+            message.publish_at_ms = Some(now_ms());
+        }
         let limit = self.max_inflight();
         let mut inflight = self.inflight.write();
         if inflight.len() >= limit {
@@ -989,6 +998,10 @@ impl Session {
     /// publish-to-delivery pair is printed by
     /// `qos1_inflight_delivery_workload_timings` in broker-node.
     pub fn track_inflight_or_spill(&self, message: InflightMessage) -> InflightTrackOutcome {
+        let mut message = message;
+        if message.publish_at_ms.is_none() {
+            message.publish_at_ms = Some(now_ms());
+        }
         let limit = self.max_inflight();
         {
             let mut inflight = self.inflight.write();
@@ -3613,6 +3626,7 @@ mod tests {
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
                 enqueued_at: Instant::now(),
+                publish_at_ms: None,
             }
         }
 
@@ -3680,6 +3694,7 @@ mod tests {
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
                 enqueued_at: Instant::now(),
+                publish_at_ms: None,
             }
         }
 
@@ -3756,6 +3771,7 @@ mod tests {
                 retain: false,
                 payload: Bytes::from(vec![pid as u8]),
                 enqueued_at: Instant::now(),
+                publish_at_ms: None,
             }
         }
 
@@ -3834,6 +3850,7 @@ mod tests {
             retain: false,
             payload: payload.clone(),
             enqueued_at: Instant::now(),
+            publish_at_ms: None,
         };
 
         // BEFORE baseline (pre-B4-01 window-only entry point): the legacy

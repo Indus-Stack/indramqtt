@@ -7369,6 +7369,7 @@ fn build_downlink_frames_with_publisher_and_props(
                                 // allocation); the entry itself stays
                                 // bounded by the window+spill caps.
                                 enqueued_at: std::time::Instant::now(),
+                                publish_at_ms: None,
                             }) {
                                 InflightTrackOutcome::Tracked => {}
                                 InflightTrackOutcome::Spilled => {

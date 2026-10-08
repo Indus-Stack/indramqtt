@@ -4091,6 +4091,7 @@ mod tests {
             retain: false,
             payload: bytes::Bytes::from_static(b"hello"),
             enqueued_at: std::time::Instant::now(),
+            publish_at_ms: None,
         }));
 
         let (status, body) = server
@@ -4101,9 +4102,10 @@ mod tests {
         let entry = &body["data"][0];
         assert_eq!(entry["topic"], json!("conf/inflight/1"));
         assert_eq!(entry["qos"], json!(1));
-        assert!(
-            entry["packet_id"] == json!(7) || entry["msgid"] == json!("7"),
-            "entry carries the packet identity: {entry}"
+        assert_eq!(
+            entry["msgid"],
+            json!("7"),
+            "inflight entry carries the downlink packet id as msgid: {entry}"
         );
         assert!(entry["payload"].is_string());
 
@@ -4131,6 +4133,7 @@ mod tests {
                 retain: false,
                 payload: bytes::Bytes::from_static(b"x"),
                 enqueued_at: std::time::Instant::now(),
+                publish_at_ms: None,
             }));
         }
 
@@ -4192,8 +4195,8 @@ mod tests {
         assert_eq!(entry["qos"], json!(1));
         assert!(entry["payload"].is_string());
         assert!(
-            entry["msgid"].is_string(),
-            "entry carries the stored-message identity: {entry}"
+            entry.get("msgid").is_none(),
+            "queued entries hold no identifier and omit msgid: {entry}"
         );
 
         // Unknown clients give not-found with the documented shape.
@@ -4246,7 +4249,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_authz_cache_read_clear_round_trip() {
-        let (server, _state) = TestServer::start().await;
+        let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
         // Connect through the broker: the console CONNECT creates the
@@ -4300,7 +4303,7 @@ mod tests {
             .iter()
             .find(|e| e["topic"] == json!("conf/authz/1"))
             .expect("subscribe decision present");
-        assert_eq!(subscribe["access"]["action_type"], json!("subscribe"));
+        assert_eq!(subscribe["access"], json!("subscribe"));
         assert_eq!(subscribe["result"], json!("allow"));
         assert!(subscribe["updated_time"].is_number());
         let (status, body) = server
@@ -4313,9 +4316,46 @@ mod tests {
             .iter()
             .find(|e| e["topic"] == json!("conf/authz/1"))
             .expect("publish decision present");
-        assert_eq!(publish["access"]["action_type"], json!("publish"));
+        assert_eq!(publish["access"], json!("publish"));
         assert_eq!(publish["result"], json!("allow"));
         assert!(publish["updated_time"].is_number());
+
+        // A denial spells `deny`: a denied subscribe through the broker
+        // records the exact value, so a wrong spelling fails this test.
+        state
+            .auth
+            .add_rule(AclRule::new(
+                "w2-01-cache-deny",
+                AclAction::Subscribe,
+                "conf/authz/denied",
+                false,
+            ))
+            .expect("deny rule installs");
+        let mut denied = WsClient::connect(server.port).await;
+        denied
+            .send_bin(&mqtt_connect("w2-01-cache-deny", None, None))
+            .await;
+        let connack = denied.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        denied
+            .send_bin(&mqtt_subscribe(8, &[("conf/authz/denied", 0)]))
+            .await;
+        let suback = denied.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0x87]);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w2-01-cache-deny/authorization/cache",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["access"], json!("subscribe"));
+        assert_eq!(entries[0]["topic"], json!("conf/authz/denied"));
+        assert_eq!(entries[0]["result"], json!("deny"));
 
         // Unknown query keys are ignored, not a 400.
         let (status, body) = server
@@ -17520,12 +17560,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         let results = body.as_array().expect("bulk result is a list");
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 1);
         assert_eq!(results[0]["topic"], json!("w1-08/bulk/good"));
         assert_eq!(results[0]["clientid"], json!("w1-08-b"));
-        assert_eq!(results[1]["topic"], json!("bad/#/topic"));
-        assert_eq!(results[1]["code"], json!("BAD_REQUEST"));
-        assert!(results[1]["message"].is_string());
 
         let (status, body) = server
             .get_auth("/api/v5/clients/w1-08-b/subscriptions", &token)
@@ -17928,7 +17965,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
 
-        let (status, body) = server
+        let (status, _) = server
             .post_auth(
                 "/api/v5/clients/w1-10-b/unsubscribe/bulk",
                 json!([
@@ -17938,19 +17975,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        let results = body.as_array().expect("bulk result is a list");
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0]["topic"], json!("w1-10/bulk/present"));
-        assert!(
-            results[0]["code"].is_null(),
-            "present entry succeeds without code: {results:?}"
-        );
-        assert_eq!(results[1]["topic"], json!("w1-10/bulk/absent"));
-        assert!(
-            results[1]["code"].is_null(),
-            "absent entry still succeeds: {results:?}"
-        );
+        assert_eq!(status, 204);
 
         let (status, body) = server
             .get_auth("/api/v5/clients/w1-10-b/subscriptions", &token)
@@ -18020,7 +18045,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 400);
         assert_eq!(body["code"], json!("BAD_REQUEST"));
 
-        // One bad entry fails per entry while the good one still removes.
+        // One bad entry fails the whole batch with 400.
         let (status, _) = server
             .post_auth(
                 "/api/v5/clients/w1-10-c/subscribe",
@@ -18040,14 +18065,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        let results = body.as_array().expect("bulk result is a list");
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0]["topic"], json!("w1-10/bulk/good"));
-        assert!(results[0]["code"].is_null());
-        assert_eq!(results[1]["topic"], json!("bad/#/topic"));
-        assert_eq!(results[1]["code"], json!("BAD_REQUEST"));
-        assert!(results[1]["message"].is_string());
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"].is_string());
     }
 
     #[tokio::test]
@@ -18126,6 +18146,86 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
         let (status, body) = server
             .get_auth("/api/v5/clients/w1-09-missing/subscriptions", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn client_detail_reads_live_session_and_unknown_is_not_found() {
+        // Detail read through the served handler: known id answers
+        // the detail shape, unknown id answers the documented 404.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("ap07-detail-1", true);
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/ap07-detail-1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], json!("ap07-detail-1"));
+        assert!(body["keepalive"].is_number());
+        assert_eq!(body["proto_name"], json!("MQTT"));
+
+        let (status, body) = server
+            .get_auth("/api/v5/clients/ap07-detail-missing", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn client_keepalive_write_returns_detail_shape() {
+        // Hidden keepalive route: takes `interval`, answers the full
+        // detail shape with the new value applied to live state.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        state.sessions.get_or_create("ap07-ka-1", true);
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/clients/ap07-ka-1/keepalive",
+                json!({"interval": 90}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], json!("ap07-ka-1"));
+        assert_eq!(body["keepalive"], json!(90));
+
+        let (status, body) = server.get_auth("/api/v5/clients/ap07-ka-1", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["keepalive"], json!(90));
+
+        // Missing field is 400.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/clients/ap07-ka-1/keepalive",
+                json!({"keepalive": 90}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Out of range is 400: the wire field holds 0..=65535.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/clients/ap07-ka-1/keepalive",
+                json!({"interval": 70000}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Unknown id is 404 with the documented code.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/clients/ap07-ka-missing/keepalive",
+                json!({"interval": 60}),
+                &token,
+            )
             .await;
         assert_eq!(status, 404);
         assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));

@@ -28,48 +28,99 @@ pub struct ClientFilters {
 }
 
 /// Render one client session in the documented detail shape.
-///
-/// `connected_at` is the instant recorded where the session is already
-/// being written (creation, reconnect, bind), omitted for sessions that
-/// predate timestamp recording rather than substituted.
 fn client_detail_json(
     client_id: &str,
     session: Option<&std::sync::Arc<broker_session::Session>>,
     is_connected: bool,
     keepalive: u16,
 ) -> serde_json::Value {
-    let mut map = serde_json::Map::with_capacity(15);
+    let mut map = serde_json::Map::with_capacity(20);
     map.insert("clientid".to_string(), serde_json::Value::from(client_id));
-    let username = session
-        .and_then(|s| s.username.read().clone())
-        .unwrap_or_else(|| client_id.to_string());
-    map.insert("username".to_string(), serde_json::Value::from(username));
+    match session.and_then(|s| s.username.read().clone()) {
+        Some(name) => {
+            map.insert("username".to_string(), serde_json::Value::from(name));
+        }
+        None => {
+            map.insert("username".to_string(), serde_json::Value::Null);
+        }
+    }
     map.insert(
         "connected".to_string(),
         serde_json::Value::from(is_connected),
     );
-    map.insert(
-        "ip_address".to_string(),
-        serde_json::Value::from("127.0.0.1"),
-    );
-    map.insert("port".to_string(), serde_json::Value::from(54321));
+    if let Some(ip) = session.and_then(|s| s.peerhost.read().clone()) {
+        map.insert("ip_address".to_string(), serde_json::Value::from(ip));
+    }
     map.insert("keepalive".to_string(), serde_json::Value::from(keepalive));
-    map.insert("proto_type".to_string(), serde_json::Value::from("MQTT"));
-    map.insert("proto_ver".to_string(), serde_json::Value::from(5));
-    map.insert("clean_start".to_string(), serde_json::Value::from(true));
-    map.insert("expiry_interval".to_string(), serde_json::Value::from(7200));
+    let proto_ver = session.map(|s| s.protocol_version()).unwrap_or(5);
+    let proto_name = if proto_ver == 3 { "MQIsdp" } else { "MQTT" };
+    map.insert(
+        "proto_name".to_string(),
+        serde_json::Value::from(proto_name),
+    );
+    map.insert("proto_ver".to_string(), serde_json::Value::from(proto_ver));
+    let clean_start = session.map(|s| s.clean_start).unwrap_or(true);
+    map.insert(
+        "clean_start".to_string(),
+        serde_json::Value::from(clean_start),
+    );
+    map.insert("durable".to_string(), serde_json::Value::from(!clean_start));
+    // Reason for the value: the CONNECT expiry the session stored.
+    if let Some(s) = session {
+        map.insert(
+            "expiry_interval".to_string(),
+            serde_json::Value::from(s.session_expiry()),
+        );
+    }
     if let Some(ms) = session.and_then(|s| *s.connected_at_ms.read()) {
         map.insert(
             "connected_at".to_string(),
             serde_json::Value::from(crate::v5::retainer::format_rfc3339_ms(ms)),
         );
     }
-    map.insert("is_bridge".to_string(), serde_json::Value::from(false));
-    map.insert("inflight_cnt".to_string(), serde_json::Value::from(0));
-    map.insert("awaiting_rel_cnt".to_string(), serde_json::Value::from(0));
+    // Reason for the value: the detach instant the session stamped.
+    // It is valid only while disconnected.
+    if !is_connected {
+        if let Some(ms) = session.and_then(|s| *s.ended_at_ms.read()) {
+            map.insert(
+                "disconnected_at".to_string(),
+                serde_json::Value::from(crate::v5::retainer::format_rfc3339_ms(ms)),
+            );
+        }
+    }
+    // Reason for the value: live QoS 1 downlinks the session tracks.
+    if let Some(s) = session {
+        map.insert(
+            "inflight_cnt".to_string(),
+            serde_json::Value::from(s.inflight_total_len() as u64),
+        );
+    }
+    // Reason for the value: live QoS 2 inbound entries the session holds.
+    if let Some(s) = session {
+        map.insert(
+            "awaiting_rel_cnt".to_string(),
+            serde_json::Value::from(s.qos2_inbound_len() as u64),
+        );
+    }
+    // Reason for the value: the per-session QoS 2 inbound bound.
+    map.insert(
+        "awaiting_rel_max".to_string(),
+        serde_json::Value::from(broker_session::MAX_QOS2_INBOUND as u64),
+    );
+    // Reason for the value: the per-session QoS 1 window bound.
+    if let Some(s) = session {
+        map.insert(
+            "inflight_max".to_string(),
+            serde_json::Value::from(s.max_inflight() as u64),
+        );
+    }
     map.insert(
         "mqueue_len".to_string(),
         serde_json::Value::from(session.map(|s| s.offline_len()).unwrap_or(0) as u64),
+    );
+    map.insert(
+        "subscriptions_cnt".to_string(),
+        serde_json::Value::from(session.map(|s| s.subscriptions.read().len()).unwrap_or(0) as u64),
     );
     map.insert(
         "node".to_string(),
@@ -307,7 +358,9 @@ async fn fire_kicked_will(state: &ApiState, will: broker_session::StoredWill) {
 /// clones at most this many rows under a short lock, sorted by topic for
 /// a deterministic order; per-connection state itself stays bounded by
 /// live subscribe/unsubscribe writes. Management-plane only: the
-/// delivery path never takes this lock.
+/// delivery path never takes this lock. Reason for 1000: it covers
+/// the largest console page with headroom, while one read clones at
+/// most 1000 small rows so one request cannot balloon the node.
 const MAX_CLIENT_SUBSCRIPTIONS: usize = 1000;
 
 pub async fn get_client_subscriptions(
@@ -340,6 +393,7 @@ pub async fn get_client_subscriptions(
     if entries.len() > MAX_CLIENT_SUBSCRIPTIONS {
         entries.truncate(MAX_CLIENT_SUBSCRIPTIONS);
     }
+    let durable = !session.clean_start;
     let subs: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(topic, qos, nl, rap, rh)| {
@@ -351,6 +405,7 @@ pub async fn get_client_subscriptions(
                 "rh": rh,
                 "node": crate::node_scope::local_node_name(),
                 "clientid": client_id,
+                "durable": durable,
             })
         })
         .collect();
@@ -359,13 +414,6 @@ pub async fn get_client_subscriptions(
 }
 
 /// One management subscribe against the real router and session index.
-///
-/// Shared by the single and bulk routes; bulk reuses this per entry so
-/// both paths register the same state. It touches the session map and
-/// the router trie and nothing on the message path. Work is bounded by
-/// the request itself: one map insert plus one trie insert per entry,
-/// plus a result list of the same length for bulk. No new buffering is
-/// added to fan-out or fan-in; management-plane only.
 fn apply_single_subscribe(
     state: &ApiState,
     client_id: &str,
@@ -378,10 +426,8 @@ fn apply_single_subscribe(
         }
     };
     let (filter, qos, nl, rap, rh) = parse_subscribe_entry(entry)?;
-    // Live connection owns the router copy; offline subscribes keep a
-    // placeholder until a live re-subscribe replaces it (the trie holds
-    // at most one `conn_id` per `(filter node, client_id)`).
-    let conn_id = (*session.conn_id.read()).unwrap_or(1);
+    // Offline sessions use 0 until a live re-subscribe replaces it.
+    let conn_id = (*session.conn_id.read()).unwrap_or(0);
 
     // B4-08 bound: a new entry past the subscription-table cap is denied
     // fail closed with the documented quota error, registering nothing
@@ -406,6 +452,7 @@ fn apply_single_subscribe(
         "rap": rap,
         "rh": rh,
         "node": crate::node_scope::local_node_name(),
+        "durable": !session.clean_start,
     }))
 }
 
@@ -511,38 +558,16 @@ pub async fn bulk_subscribe(
                 .into_response();
         }
     };
-    // Unknown clients fail the whole batch with not-found; malformed
-    // entries fail per entry while the good ones still land. The result
-    // list is bounded by the request length; no extra buffering.
+    // Unknown clients fail with not-found. Each entry installs one
+    // subscription. Bad entries are skipped. The answer holds only
+    // subscription objects.
     if state.sessions.get(&client_id).is_none() {
         return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
     }
     let mut results = Vec::with_capacity(entries.len());
     for entry in &entries {
-        match apply_single_subscribe(&state, &client_id, entry) {
-            Ok(item) => results.push(item),
-            Err(ApiError::BadRequest(message)) => {
-                let topic = entry
-                    .get("topic")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                results.push(serde_json::json!({
-                    "topic": topic,
-                    "code": "BAD_REQUEST",
-                    "message": message,
-                }));
-            }
-            Err(error) => {
-                let topic = entry
-                    .get("topic")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                results.push(serde_json::json!({
-                    "topic": topic,
-                    "code": error.code(),
-                    "message": error.message(),
-                }));
-            }
+        if let Ok(item) = apply_single_subscribe(&state, &client_id, entry) {
+            results.push(item);
         }
     }
     (StatusCode::OK, Json(results)).into_response()
@@ -624,48 +649,113 @@ pub async fn bulk_unsubscribe(
                 .into_response();
         }
     };
-    // Unknown clients fail the whole batch with not-found; malformed
-    // entries fail per entry while the good ones still remove. Absent
-    // subscriptions succeed per entry. The result list is bounded by the
-    // request length; no extra buffering.
+    // Unknown clients fail with not-found. Each entry removes one
+    // filter. One bad entry fails the batch. Absent filters still succeed.
     if state.sessions.get(&client_id).is_none() {
         return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
     }
-    let mut results = Vec::with_capacity(entries.len());
     for entry in &entries {
-        match apply_single_unsubscribe(&state, &client_id, entry) {
-            Ok(item) => results.push(item),
-            Err(ApiError::BadRequest(message)) => {
-                let topic = entry
-                    .get("topic")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                results.push(serde_json::json!({
-                    "topic": topic,
-                    "code": "BAD_REQUEST",
-                    "message": message,
-                }));
-            }
-            Err(error) => {
-                let topic = entry
-                    .get("topic")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                results.push(serde_json::json!({
-                    "topic": topic,
-                    "code": error.code(),
-                    "message": error.message(),
-                }));
-            }
+        if let Err(error) = apply_single_unsubscribe(&state, &client_id, entry) {
+            return error.into_response();
         }
     }
-    (StatusCode::OK, Json(results)).into_response()
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Query of the per-client message lists.
+///
+/// The console sends `position` plus `limit`. Older callers send
+/// `page` plus `limit`. Both are honoured: an explicit `position`
+/// wins, otherwise the page window applies. `payload` selects the
+/// payload encoding (`plain`, `base64`, `none`). Unknown keys are
+/// ignored so new parameters degrade instead of failing.
+#[derive(Deserialize, Default)]
+pub struct ClientMessagesQuery {
+    #[serde(default)]
+    pub position: Option<String>,
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub payload: Option<String>,
+    #[serde(default)]
+    pub max_payload_bytes: Option<String>,
+}
+
+/// Parse the limit with the shared bound (1..=1000, default 100).
+fn messages_limit(raw: Option<u32>) -> u32 {
+    raw.unwrap_or(crate::pagination::DEFAULT_LIMIT)
+        .clamp(1, crate::pagination::MAX_LIMIT)
+}
+
+/// Parse the start index from `position` (`none`/absent is 0).
+fn messages_start(raw: Option<&str>) -> usize {
+    match raw {
+        None => 0,
+        Some(text) if text == "none" || text.is_empty() => 0,
+        Some(text) => text.parse::<usize>().unwrap_or(0),
+    }
+}
+
+/// Parse a byte size such as `1MB`, `512KB` or plain bytes.
+fn parse_max_payload_bytes(raw: Option<&str>) -> Option<u64> {
+    let text = raw?.trim().to_uppercase().replace(' ', "");
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(num) = text.strip_suffix("MB") {
+        return num.parse::<u64>().ok().map(|v| v * 1024 * 1024);
+    }
+    if let Some(num) = text.strip_suffix("KB") {
+        return num.parse::<u64>().ok().map(|v| v * 1024);
+    }
+    if let Some(num) = text.strip_suffix('B') {
+        return num.parse::<u64>().ok();
+    }
+    text.parse::<u64>().ok()
+}
+
+/// Encode one payload for the message lists.
+fn encode_list_payload(payload: &[u8], mode: &str) -> Option<String> {
+    match mode {
+        "none" => None,
+        "base64" => {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            Some(STANDARD.encode(payload))
+        }
+        _ => Some(String::from_utf8_lossy(payload).into_owned()),
+    }
+}
+
+/// Build the continuation `meta` the console reads, plus the page
+/// fields the shared checker asserts. `start` names the first
+/// returned row, `position` names the next row or `end_of_data`.
+fn messages_meta(
+    page: u32,
+    limit: u32,
+    total: usize,
+    start_token: &str,
+    next_token: &str,
+) -> serde_json::Value {
+    let mut meta = meta_page(page, limit, total);
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("start".to_string(), serde_json::Value::from(start_token));
+        obj.insert("position".to_string(), serde_json::Value::from(next_token));
+    }
+    meta
+}
+
+/// Format one insert instant as nanoseconds since the Unix epoch.
+/// The queue stamps millis; the read scales to nanos for the console.
+fn inserted_at_str(ms: u64) -> String {
+    ((ms as u128) * 1_000_000).to_string()
 }
 
 pub async fn get_client_inflight(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
-    params: PageParams,
+    Query(query): Query<ClientMessagesQuery>,
 ) -> Response {
     // Unknown clients read as not-found with the documented error shape.
     let session = match state.sessions.get(&client_id) {
@@ -674,59 +764,119 @@ pub async fn get_client_inflight(
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
     };
+    if let Some(mode) = query.payload.as_deref() {
+        if mode != "plain" && mode != "base64" && mode != "none" {
+            return ApiError::InvalidParameter(
+                "query parameter `payload` must be one of none, base64, plain".to_string(),
+            )
+            .into_response();
+        }
+    }
     // Bounded per-client view over the real QoS 1 tracker: the window
     // snapshot plus the spill snapshot (oldest-first, window then spill),
-    // clones at most window + spill entries under short read locks, then
-    // paginates with the W0 helper. Management-plane read only;
-    // the delivery hot path never takes a management lock (it takes the
-    // session write lock only to track/ack, never to serve this view).
+    // clones at most window + spill entries under short read locks.
+    // Management-plane read only; the delivery hot path never takes a
+    // management lock (it takes the session write lock only to
+    // track/ack, never to serve this view).
     let mut snapshot = session.inflight_snapshot();
     snapshot.extend(session.inflight_spill_snapshot());
     let total = snapshot.len();
-    let page_items = paginate(&snapshot, params.page, params.limit);
-    let data: Vec<serde_json::Value> = page_items
-        .iter()
-        .map(|m| {
-            serde_json::json!({
-                "topic": m.topic.as_str(),
-                "packet_id": m.packet_id,
-                "msgid": m.packet_id.to_string(),
-                "qos": u8::from(m.qos),
-                "payload": String::from_utf8_lossy(&m.payload),
-            })
-        })
-        .collect();
+    let limit = messages_limit(query.limit);
+    let page = query.page.unwrap_or(1).max(1);
+    let start_index = match query.position.as_deref() {
+        Some(_) => messages_start(query.position.as_deref()),
+        None => {
+            if query.page.is_some() {
+                ((u64::from(page) - 1) * u64::from(limit)).min(total as u64) as usize
+            } else {
+                0
+            }
+        }
+    }
+    .min(total);
+    let mode = query.payload.as_deref().unwrap_or("plain");
+    let budget = parse_max_payload_bytes(query.max_payload_bytes.as_deref());
+    let mut data = Vec::new();
+    let mut used: u64 = 0;
+    let mut end = start_index;
+    for m in snapshot.iter().skip(start_index) {
+        if data.len() as u32 >= limit {
+            break;
+        }
+        if let Some(cap) = budget {
+            let next = used + m.payload.len() as u64;
+            if !data.is_empty() && next > cap {
+                break;
+            }
+            used = next;
+        }
+        let mut entry = serde_json::Map::with_capacity(8);
+        entry.insert(
+            "topic".to_string(),
+            serde_json::Value::from(m.topic.as_str()),
+        );
+        // Reason for the value: the downlink packet id the session tracks.
+        entry.insert(
+            "msgid".to_string(),
+            serde_json::Value::from(m.packet_id.to_string()),
+        );
+        entry.insert("qos".to_string(), serde_json::Value::from(u8::from(m.qos)));
+        if let Some(text) = encode_list_payload(&m.payload, mode) {
+            entry.insert("payload".to_string(), serde_json::Value::from(text));
+        }
+        // Omitted: `from_clientid` and `from_username`.
+        if let Some(ms) = m.publish_at_ms {
+            entry.insert("publish_at".to_string(), serde_json::Value::from(ms));
+            entry.insert(
+                "inserted_at".to_string(),
+                serde_json::Value::from(inserted_at_str(ms)),
+            );
+        }
+        data.push(serde_json::Value::Object(entry));
+        end += 1;
+    }
+    let start_token = if data.is_empty() {
+        "none".to_string()
+    } else {
+        start_index.to_string()
+    };
+    let next_token = if end >= total {
+        "end_of_data".to_string()
+    } else {
+        end.to_string()
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": meta_page(params.page, params.limit, total),
+            "meta": messages_meta(page, limit, total, &start_token, &next_token),
         })),
     )
         .into_response()
 }
 
-/// Render one offline-queue entry in the documented mqueue shape.
-///
-/// `publish_at` is the instant recorded where the message was already
-/// being written (offline queue insert), omitted for entries that predate
-/// timestamp recording rather than substituted.
-fn mqueue_entry_json(qm: &broker_session::QueuedMessage, msgid: String) -> serde_json::Value {
-    let mut map = serde_json::Map::with_capacity(5);
-    map.insert("msgid".to_string(), serde_json::Value::from(msgid));
+/// Render one offline-queue entry in the documented shape. The queue
+/// entry holds no message identifier, so the entry omits `msgid`.
+/// The specification leaves `msgid` optional. A caller that needs the
+/// identifier uses the inflight list. The inflight list carries the
+/// downlink packet id as the true value. The queue keeps no publisher
+/// name, so the entry omits `from_clientid` and `from_username`. The
+/// queue keeps no priority, so the entry omits `mqueue_priority`.
+fn mqueue_entry_json(qm: &broker_session::QueuedMessage, payload_mode: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(8);
     map.insert(
         "topic".to_string(),
         serde_json::Value::from(qm.topic.as_str()),
     );
     map.insert("qos".to_string(), serde_json::Value::from(u8::from(qm.qos)));
-    map.insert(
-        "payload".to_string(),
-        serde_json::Value::from(String::from_utf8_lossy(&qm.payload).into_owned()),
-    );
+    if let Some(text) = encode_list_payload(&qm.payload, payload_mode) {
+        map.insert("payload".to_string(), serde_json::Value::from(text));
+    }
     if let Some(ms) = qm.publish_at_ms {
+        map.insert("publish_at".to_string(), serde_json::Value::from(ms));
         map.insert(
-            "publish_at".to_string(),
-            serde_json::Value::from(crate::v5::retainer::format_rfc3339_ms(ms)),
+            "inserted_at".to_string(),
+            serde_json::Value::from(inserted_at_str(ms)),
         );
     }
     serde_json::Value::Object(map)
@@ -735,7 +885,7 @@ fn mqueue_entry_json(qm: &broker_session::QueuedMessage, msgid: String) -> serde
 pub async fn get_client_mqueue(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
-    params: PageParams,
+    Query(query): Query<ClientMessagesQuery>,
 ) -> Response {
     // Unknown clients read as not-found with the documented error shape.
     let session = match state.sessions.get(&client_id) {
@@ -744,47 +894,74 @@ pub async fn get_client_mqueue(
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
     };
+    if let Some(mode) = query.payload.as_deref() {
+        if mode != "plain" && mode != "base64" && mode != "none" {
+            return ApiError::InvalidParameter(
+                "query parameter `payload` must be one of none, base64, plain".to_string(),
+            )
+            .into_response();
+        }
+    }
     // Bounded per-client view over the real offline queue: the snapshot
     // clones at most `MAX_OFFLINE_QUEUE` (1024) entries under a short read
-    // lock, then paginates with the W0 helper. Management-plane read only;
-    // no new buffering on the delivery path and the delivery hot path
-    // never takes a management lock.
+    // lock. Management-plane read only; no new buffering on the delivery
+    // path and the delivery hot path never takes a management lock.
     let snapshot: Vec<broker_session::QueuedMessage> =
         session.offline_queue.read().iter().cloned().collect();
     let total = snapshot.len();
-    let page_items = paginate(&snapshot, params.page, params.limit);
-    let start =
-        ((u64::from(params.page.max(1)) - 1) * u64::from(params.limit)).min(total as u64) as usize;
-    let data: Vec<serde_json::Value> = page_items
-        .iter()
-        .enumerate()
-        .map(|(i, qm)| mqueue_entry_json(qm, (start + i + 1).to_string()))
-        .collect();
+    let limit = messages_limit(query.limit);
+    let page = query.page.unwrap_or(1).max(1);
+    let start_index = match query.position.as_deref() {
+        Some(_) => messages_start(query.position.as_deref()),
+        None => {
+            if query.page.is_some() {
+                ((u64::from(page) - 1) * u64::from(limit)).min(total as u64) as usize
+            } else {
+                0
+            }
+        }
+    }
+    .min(total);
+    let mode = query.payload.as_deref().unwrap_or("plain");
+    let budget = parse_max_payload_bytes(query.max_payload_bytes.as_deref());
+    let mut data = Vec::new();
+    let mut used: u64 = 0;
+    let mut end = start_index;
+    for qm in snapshot.iter().skip(start_index) {
+        if data.len() as u32 >= limit {
+            break;
+        }
+        if let Some(cap) = budget {
+            let next = used + qm.payload.len() as u64;
+            if !data.is_empty() && next > cap {
+                break;
+            }
+            used = next;
+        }
+        data.push(mqueue_entry_json(qm, mode));
+        end += 1;
+    }
+    let start_token = if data.is_empty() {
+        "none".to_string()
+    } else {
+        start_index.to_string()
+    };
+    let next_token = if end >= total {
+        "end_of_data".to_string()
+    } else {
+        end.to_string()
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": meta_page(params.page, params.limit, total),
+            "meta": messages_meta(page, limit, total, &start_token, &next_token),
         })),
     )
         .into_response()
 }
 
-/// Per-client authorization decision cache read (W2-01, C01-10).
-///
-/// Renders the decisions recorded on the session by the publish and
-/// subscribe authorization events as a bare list (no paging): each entry
-/// carries `access` (`action_type`, `qos`, `retain`), `topic`, `result`
-/// (`allow` or `deny`) and `updated_time` (millis since the Unix epoch).
-/// An empty cache returns `[]`, not an error; unknown client ids return
-/// the documented not-found shape. Unknown query keys are ignored: the
-/// handler takes no paging params so extra keys never become a 400.
-/// Management-plane read only: one short lock on the per-session cache,
-/// which the delivery fan-out path never touches.
-// TODO(parity): is the empty-cache shape a bare list or an envelope, and
-// does a disconnected-but-known session read as empty or as 404? The
-// rulebook does not decide the disconnected policy; current choice follows
-// the neighbouring per-client reads (known session returns, unknown 404).
+/// Per-client authorization decision cache read.
 pub async fn get_client_authz_cache(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
@@ -796,18 +973,13 @@ pub async fn get_client_authz_cache(
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
     };
-    // Bounded snapshot over real state: at most
-    // `MAX_AUTHZ_DECISIONS_PER_CLIENT` (1024) small entries, oldest first.
+    // Snapshot holds at most 1024 entries, oldest first.
     let data: Vec<serde_json::Value> = session
         .authz_cache_snapshot()
         .iter()
         .map(|entry| {
             serde_json::json!({
-                "access": {
-                    "action_type": entry.action,
-                    "qos": entry.qos,
-                    "retain": entry.retain,
-                },
+                "access": entry.action,
                 "topic": entry.topic,
                 "result": if entry.allow { "allow" } else { "deny" },
                 "updated_time": entry.updated_ms,
@@ -817,12 +989,7 @@ pub async fn get_client_authz_cache(
     (StatusCode::OK, Json(data)).into_response()
 }
 
-/// Per-client authorization decision cache clear (W2-01, C01-09).
-///
-/// Evicts every cached decision for the client so a subsequent read shows
-/// empty; clearing an already-empty cache still succeeds (204). Unknown
-/// client ids return the documented not-found shape. A background map
-/// removal only: no work on the publish or deliver path.
+/// Per-client authorization decision cache clear.
 pub async fn clear_client_authz_cache(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
@@ -837,18 +1004,64 @@ pub async fn clear_client_authz_cache(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Global subscription list as a bare array (W1-14).
+/// Update the keepalive of one connected client.
+pub async fn put_client_keepalive(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let session = match state.sessions.get(&client_id) {
+        Some(session) => session,
+        None => {
+            return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::BadRequest(format!("invalid keepalive body: {error}"))
+                .into_response();
+        }
+    };
+    let interval = value.get("interval").cloned();
+    let interval = match interval {
+        Some(serde_json::Value::Number(n)) => match n.as_u64() {
+            Some(v) if v <= u64::from(u16::MAX) => v as u16,
+            _ => {
+                return ApiError::BadRequest(
+                    "field `interval` must be an integer 0..=65535".to_string(),
+                )
+                .into_response();
+            }
+        },
+        _ => {
+            return ApiError::BadRequest("field `interval` is required".to_string())
+                .into_response();
+        }
+    };
+    // Reason for the bound: the wire field is 16 bits, so 0..=65535 is
+    // the full protocol range; 0 disables the timer. One short write
+    // lock on live session state; the per-message path never takes it.
+    *session.keepalive_secs.write() = interval;
+    let is_connected = *session.connected.read();
+    (
+        StatusCode::OK,
+        Json(client_detail_json(
+            &client_id,
+            Some(&session),
+            is_connected,
+            interval,
+        )),
+    )
+        .into_response()
+}
+
+/// Global subscription list as a bare array.
 ///
-/// Reads the session-mirror index via
-/// [`broker_session::SessionManager::global_subscriptions`], not the
-/// router trie, so list reads never block the routing path. The snapshot
-/// is bounded by [`broker_session::MAX_GLOBAL_SUBSCRIPTIONS`] (100_000
-/// rows, sorted by `(client_id, topic)` for a deterministic page order)
-/// and then sliced with the W0 `page`/`limit` helper; unknown query keys
-/// are ignored by the extractor so new parameters degrade to the full
-/// first page instead of a 400. Management-plane only: no new buffering
-/// on fan-out or fan-in. Returns a bare list to match the documented
-/// shape (no `data`/`meta` envelope).
+/// Reads the session mirror, not the router trie.
+/// The snapshot is bounded and sorted.
+/// Unknown query keys are ignored.
+/// Returns a bare list with no envelope.
 pub async fn list_subscriptions(State(state): State<ApiState>, params: PageParams) -> Response {
     let rows = state.sessions.global_subscriptions();
     let page_items = paginate(&rows, params.page, params.limit);
@@ -1048,6 +1261,7 @@ fn build_publish_deliveries_in_tenant(
                                 retain,
                                 payload: payload.clone(),
                                 enqueued_at: std::time::Instant::now(),
+                                publish_at_ms: None,
                             }) {
                                 broker_session::InflightTrackOutcome::Tracked => {}
                                 broker_session::InflightTrackOutcome::Spilled => {
@@ -1294,6 +1508,7 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
                                         retain,
                                         payload: payload.clone(),
                                         enqueued_at: std::time::Instant::now(),
+                                        publish_at_ms: None,
                                     },
                                 ) {
                                     broker_session::InflightTrackOutcome::Tracked => {}
@@ -1639,28 +1854,35 @@ mod tests {
         use broker_protocol::{QoS, Topic};
 
         let state = standalone_state();
+        // Connect a durable session through the broker, then detach it.
+        // The session keeps replayable state for the broker publish below.
         let (session, _) = state.sessions.get_or_create("b110-mqueue", false);
-        *session.connected.write() = false;
-        *session.conn_id.write() = None;
+        state.sessions.bind_session(&session, 9001);
+        let entry = serde_json::json!({"topic": "conf/mqueue/b110", "qos": 1});
+        apply_single_subscribe(&state, "b110-mqueue", &entry).expect("broker subscribe lands");
+        state.sessions.unbind_connection("b110-mqueue", 9001);
 
+        // Publish through the broker fan-out, not the store alone.
         let before = crate::v5::retainer::now_ms();
-        session.push_offline(broker_session::QueuedMessage {
-            topic: Topic::new("conf/mqueue/b110").expect("valid topic"),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            payload: bytes::Bytes::from_static(b"hello-b110"),
-            publish_at_ms: None,
-        });
+        do_mgmt_publish(
+            &state,
+            &Topic::new("conf/mqueue/b110").expect("valid topic"),
+            &bytes::Bytes::from_static(b"hello-b110"),
+            QoS::AtLeastOnce,
+            false,
+        )
+        .await;
         let after = crate::v5::retainer::now_ms();
 
         let (status, body) = response_parts(
             get_client_mqueue(
                 State(state),
                 Path("b110-mqueue".to_string()),
-                PageParams {
-                    page: 1,
-                    limit: 100,
-                },
+                Query(ClientMessagesQuery {
+                    page: Some(1),
+                    limit: Some(100),
+                    ..Default::default()
+                }),
             )
             .await,
         )
@@ -1669,15 +1891,23 @@ mod tests {
         let entry = &body["data"][0];
         let published = entry
             .get("publish_at")
-            .and_then(|v| v.as_str())
+            .and_then(|v| v.as_u64())
             .expect("queued entry carries publish_at");
-        assert_ne!(published, "2026-09-13T21:00:00Z");
-        assert_ne!(published, "2026-09-20T00:00:00Z");
-        let parsed =
-            crate::v5::retainer::parse_rfc3339_ms(published).expect("publish_at is RFC3339");
         assert!(
-            parsed >= before.saturating_sub(1000) && parsed <= after + 1000,
-            "publish_at {published} ({parsed}) must be the queue time [{before}, {after}]"
+            published >= before.saturating_sub(1000) && published <= after + 1000,
+            "publish_at {published} must be the queue time [{before}, {after}]"
+        );
+        assert!(
+            entry.get("inserted_at").and_then(|v| v.as_str()).is_some(),
+            "queued entry carries inserted_at: {entry}"
+        );
+        assert!(
+            entry.get("mqueue_priority").is_none(),
+            "queued entry omits mqueue_priority: the queue keeps no priority: {entry}"
+        );
+        assert!(
+            entry.get("msgid").is_none(),
+            "queued entry omits msgid: the queue keeps no identifier: {entry}"
         );
     }
 
@@ -1692,18 +1922,109 @@ mod tests {
             payload: bytes::Bytes::from_static(b"old"),
             publish_at_ms: None,
         };
-        let rendered = mqueue_entry_json(&qm, "1".to_string());
+        let rendered = mqueue_entry_json(&qm, "plain");
         assert!(
             rendered.get("publish_at").is_none(),
             "entries predating timestamp recording must omit publish_at: {rendered}"
         );
+        assert!(
+            rendered.get("msgid").is_none(),
+            "queued entries hold no identifier and must omit msgid: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_publish_at_is_track_time_not_a_constant() {
+        use broker_protocol::{QoS, Topic};
+
+        let state = standalone_state();
+        // Connect a live session through the broker bind path.
+        let (session, _) = state.sessions.get_or_create("b110-inflight", true);
+        state.sessions.bind_session(&session, 9003);
+        let entry = serde_json::json!({"topic": "conf/inflight/b110", "qos": 1});
+        apply_single_subscribe(&state, "b110-inflight", &entry).expect("broker subscribe lands");
+
+        // Publish QoS 1 through the broker fan-out, not the store alone.
+        let before = crate::v5::retainer::now_ms();
+        do_mgmt_publish(
+            &state,
+            &Topic::new("conf/inflight/b110").expect("valid topic"),
+            &bytes::Bytes::from_static(b"hello-inflight"),
+            QoS::AtLeastOnce,
+            false,
+        )
+        .await;
+        let after = crate::v5::retainer::now_ms();
+
+        let (status, body) = response_parts(
+            get_client_inflight(
+                State(state.clone()),
+                Path("b110-inflight".to_string()),
+                Query(ClientMessagesQuery {
+                    page: Some(1),
+                    limit: Some(100),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let item = &body["data"][0];
+        let published = item
+            .get("publish_at")
+            .and_then(|v| v.as_u64())
+            .expect("inflight entry carries publish_at");
+        assert!(
+            published >= before.saturating_sub(1000) && published <= after + 1000,
+            "publish_at {published} must be the track time [{before}, {after}]"
+        );
+        assert!(
+            item.get("inserted_at").and_then(|v| v.as_str()).is_some(),
+            "inflight entry carries inserted_at: {item}"
+        );
+        assert!(
+            item.get("msgid").and_then(|v| v.as_str()).is_some(),
+            "inflight entry carries the downlink packet id as msgid: {item}"
+        );
+
+        // The detail read reports the live inflight count from the broker.
+        let (status, detail) =
+            response_parts(get_client(State(state), Path("b110-inflight".to_string())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["inflight_cnt"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn keepalive_update_goes_through_the_broker_session() {
+        let state = standalone_state();
+        let (session, _) = state.sessions.get_or_create("b110-keep", true);
+        state.sessions.bind_session(&session, 9004);
+
+        let body = Bytes::from_static(b"{\"interval\": 90}");
+        let (status, rendered) = response_parts(
+            put_client_keepalive(State(state.clone()), Path("b110-keep".to_string()), body).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rendered["keepalive"], serde_json::json!(90));
+        assert_eq!(*session.keepalive_secs.read(), 90);
+
+        let missing = Bytes::from_static(b"{\"interval\": 60}");
+        let (status, _) = response_parts(
+            put_client_keepalive(State(state), Path("b110-missing".to_string()), missing).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn connected_at_is_bind_time_not_a_constant() {
         let state = standalone_state();
         let before = crate::v5::retainer::now_ms();
-        state.sessions.get_or_create("b110-conn", true);
+        // Connect through the broker bind path, not the store alone.
+        let (session, _) = state.sessions.get_or_create("b110-conn", true);
+        state.sessions.bind_session(&session, 9002);
         let after = crate::v5::retainer::now_ms();
 
         let (status, body) =
@@ -1795,6 +2116,27 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(rendered["code"], serde_json::json!("TOO_MANY_REQUESTS"));
+    }
+
+    // Prove the per-client list bound holds through the broker.
+    #[tokio::test]
+    async fn client_subscriptions_truncate_at_bound() {
+        let state = standalone_state();
+        let (session, _) = state.sessions.get_or_create("trunc-client", true);
+        *session.conn_id.write() = Some(4243);
+        for i in 0..(MAX_CLIENT_SUBSCRIPTIONS + 5) {
+            let entry = serde_json::json!({"topic": format!("conf/trunc/{i:05}"), "qos": 0});
+            apply_single_subscribe(&state, "trunc-client", &entry).expect("broker subscribe lands");
+        }
+        let (status, body) = response_parts(
+            get_client_subscriptions(State(state), Path("trunc-client".to_string())).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let subs = body.as_array().expect("subscriptions list");
+        assert_eq!(subs.len(), MAX_CLIENT_SUBSCRIPTIONS);
+        // List stays sorted so the bound keeps the first rows.
+        assert_eq!(subs[0]["topic"], serde_json::json!("conf/trunc/00000"));
     }
     #[tokio::test]
     async fn mgmt_retained_publish_stays_in_default_tenant() {

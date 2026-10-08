@@ -70,7 +70,7 @@ pub struct ErrorCatalogEntry {
 /// construction and management memory cannot grow from this route. The
 /// default is finite (`20`); the operator cannot opt into more because
 /// writes are out of scope (read-only routes).
-const ERROR_CATALOG: [ErrorCatalogEntry; 20] = [
+const ERROR_CATALOG: [ErrorCatalogEntry; 21] = [
     ErrorCatalogEntry {
         code: "NOT_FOUND",
         status: 404,
@@ -171,13 +171,18 @@ const ERROR_CATALOG: [ErrorCatalogEntry; 20] = [
         status: 400,
         desc: "Backup import rejected because a store is not yet initialised",
     },
+    ErrorCatalogEntry {
+        code: "INVALID_PARAMETER",
+        status: 400,
+        desc: "Request query or paging input is malformed",
+    },
 ];
 
 /// Stated count of the fixed bounded set served by these routes. Reason:
 /// one entry per shared error variant above is the whole vocabulary the
 /// management plane can render, so the count documents the bound the
 /// handlers enforce.
-pub const ERROR_CODE_COUNT: usize = 20;
+pub const ERROR_CODE_COUNT: usize = 21;
 
 // Compile-time guard that the bound covers the served catalogue.
 const _: () = assert!(ERROR_CATALOG.len() == ERROR_CODE_COUNT);
@@ -297,6 +302,7 @@ mod tests {
             "USER_NOT_FOUND",
             "ERROR_PWD_NOT_MATCH",
             "NOT_ALLOWED",
+            "INVALID_PARAMETER",
         ] {
             assert!(codes.contains(&expected), "catalogue holds {expected}");
             assert!(

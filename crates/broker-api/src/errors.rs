@@ -61,6 +61,8 @@ pub enum ApiError {
     InternalError(String),
     /// Backup import rejected because a store is not yet initialised.
     StoreNotReady(String),
+    /// Malformed query or paging input the spec names `INVALID_PARAMETER`.
+    InvalidParameter(String),
 }
 
 impl ApiError {
@@ -87,6 +89,7 @@ impl ApiError {
             Self::ValidationFailed(_) => "VALIDATION_FAILED",
             Self::InternalError(_) => "INTERNAL_ERROR",
             Self::StoreNotReady(_) => "STORE_NOT_READY",
+            Self::InvalidParameter(_) => "INVALID_PARAMETER",
         }
     }
 
@@ -112,7 +115,8 @@ impl ApiError {
             | Self::NotAllowed(message)
             | Self::ValidationFailed(message)
             | Self::InternalError(message)
-            | Self::StoreNotReady(message) => message,
+            | Self::StoreNotReady(message)
+            | Self::InvalidParameter(message) => message,
         }
     }
 
@@ -132,6 +136,7 @@ impl ApiError {
             | Self::ConnectionFailed(_)
             | Self::ValidationFailed(_)
             | Self::StoreNotReady(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidParameter(_) => StatusCode::BAD_REQUEST,
             Self::BadUsernameOrPwd(_) | Self::NamePwdError(_) | Self::Unauthorized(_) => {
                 StatusCode::UNAUTHORIZED
             }
@@ -165,6 +170,7 @@ impl ApiError {
             Self::ValidationFailed(_) => Self::ValidationFailed(message),
             Self::InternalError(_) => Self::InternalError(message),
             Self::StoreNotReady(_) => Self::StoreNotReady(message),
+            Self::InvalidParameter(_) => Self::InvalidParameter(message),
         }
     }
 }
@@ -220,6 +226,7 @@ mod tests {
             ApiError::ValidationFailed("validation failed".to_string()),
             ApiError::InternalError("internal error".to_string()),
             ApiError::StoreNotReady("store not ready".to_string()),
+            ApiError::InvalidParameter("invalid parameter".to_string()),
         ]
     }
 
@@ -246,6 +253,7 @@ mod tests {
             ("VALIDATION_FAILED", StatusCode::BAD_REQUEST),
             ("INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR),
             ("STORE_NOT_READY", StatusCode::BAD_REQUEST),
+            ("INVALID_PARAMETER", StatusCode::BAD_REQUEST),
         ];
         let variants = every_variant();
         assert_eq!(variants.len(), expected.len());
@@ -337,6 +345,7 @@ mod tests {
             ApiError::ValidationFailed(_) => "VALIDATION_FAILED",
             ApiError::InternalError(_) => "INTERNAL_ERROR",
             ApiError::StoreNotReady(_) => "STORE_NOT_READY",
+            ApiError::InvalidParameter(_) => "INVALID_PARAMETER",
         }
     }
 
