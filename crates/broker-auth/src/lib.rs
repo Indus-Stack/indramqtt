@@ -214,7 +214,8 @@ impl AclRule {
 /// bcrypt, PBKDF2-SHA256 and Argon2id (B5-01). With zero users configured
 /// the broker is open; once users exist, unknown names and bad passwords
 /// fail. With zero ACL rules everything is allowed; once rules exist the
-/// first matching rule decides and anything unmatched is denied.
+/// first matching rule decides and anything unmatched follows the stored
+/// `no_match` setting (`deny` when no settings store is linked).
 ///
 /// There is no network credential store behind this type, so every
 /// failure mode denies access and never grants it: unknown users, locked
@@ -280,6 +281,17 @@ pub struct MemoryAuth {
     /// `Arc` plus lock-free atomic adds, and order consults load one
     /// lock-free snapshot of at most the capped entries.
     authz_sources: RwLock<Option<Arc<AuthzSourceRegistry>>>,
+    /// Global authorization settings served by the management API
+    /// (`AuthzSettingsStore` in `crate::authz_settings`, shared with the
+    /// management API). `None` in unit tests and standalone state, which
+    /// keep today's behaviour (unmatched denied, denied ignored). `Some`
+    /// on the kernel after boot links the same instance the API serves,
+    /// so publish/subscribe verdicts honour the stored `no_match` and
+    /// `deny_action` values. Linking is one `Arc` clone at boot. The
+    /// authorize path reads the two bools with one lock-free snapshot
+    /// load each. It loads only on the unmatched or denied path, never
+    /// a snapshot clone per message.
+    authz_settings: RwLock<Option<Arc<AuthzSettingsStore>>>,
     /// Bounds concurrent expensive verifications (bcrypt/PBKDF2/Argon2).
     /// `Arc` so the async verifier can hold an owned permit across the
     /// blocking task without borrowing `self`.
@@ -316,6 +328,7 @@ impl Default for MemoryAuth {
             save_lock: parking_lot::Mutex::new(()),
             policy: RwLock::new(PasswordHashPolicy::default()),
             authz_sources: RwLock::new(None),
+            authz_settings: RwLock::new(None),
             verify_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
             migrate_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MIGRATIONS)),
         }
@@ -683,6 +696,36 @@ impl MemoryAuth {
     /// order. Unlinked state keeps today's behaviour (open when empty).
     pub fn set_authz_sources(&self, registry: Arc<AuthzSourceRegistry>) {
         *self.authz_sources.write() = Some(registry);
+    }
+
+    /// Link the shared authorization settings store serving the
+    /// management API. Boot and management plane only: one `Arc` clone.
+    /// After linking, an unmatched rule scan follows the stored
+    /// `no_match` value and denials report the stored `deny_action`
+    /// value. Unlinked state keeps today's behaviour (unmatched denied,
+    /// denied ignored).
+    pub fn set_authz_settings(&self, store: Arc<AuthzSettingsStore>) {
+        *self.authz_settings.write() = Some(store);
+    }
+
+    /// True when an unmatched rule scan allows. Unlinked state denies.
+    /// One lock-free snapshot load with no clone; called only when no
+    /// rule matches, never per matched message.
+    fn no_match_allows(&self) -> bool {
+        self.authz_settings
+            .read()
+            .as_ref()
+            .is_some_and(|store| store.no_match_is_allow())
+    }
+
+    /// True when a denied publish or subscribe disconnects. Unlinked
+    /// state ignores. One lock-free snapshot load with no clone; called
+    /// only on the denial path, never per allowed message.
+    pub fn authz_deny_disconnects(&self) -> bool {
+        self.authz_settings
+            .read()
+            .as_ref()
+            .is_some_and(|store| store.deny_action_is_disconnect())
     }
 
     /// True when the built-in database source may execute: unlinked
@@ -1622,12 +1665,15 @@ impl MemoryAuth {
     /// Per-tenant first-match-wins check (MT-06): the default tenant with
     /// no rules stays open (today's behaviour); a non-default tenant with
     /// no rules denies (closed, counted, logged); an invalid tenant
-    /// denies the same way. Reads under the single tenant-map guard the
-    /// caller already holds no new lock for: one map lookup plus a
-    /// bounded linear scan of at most [`MAX_ACL_RULES_PER_TENANT`]
-    /// entries, so the publish/deliver path takes no new lock and no
-    /// allocation beyond the caller's clones.
+    /// denies the same way. When rules exist and none matches, the stored
+    /// `no_match` setting decides (deny when unlinked). Reads run under
+    /// the single tenant-map guard the caller already holds, plus one
+    /// lock-free settings load only on the unmatched path. The work is
+    /// one map lookup plus a bounded linear scan of at most
+    /// [`MAX_ACL_RULES_PER_TENANT`] entries, so matched messages take no
+    /// new lock and no allocation beyond the caller's clones.
     fn check_in_tenant(
+        &self,
         tenants: &HashMap<String, TenantState>,
         tenant: &str,
         client_id: &str,
@@ -1650,8 +1696,8 @@ impl MemoryAuth {
             // today's open-when-no-rules behaviour, every other tenant is
             // closed (deny) unless the whole store is still empty (open
             // broker). Unknown non-default tenants are counted by
-            // the caller, not here (this helper takes no `&self` so the
-            // publish path pays no extra atomic).
+            // the caller, not here (this helper takes no atomic itself;
+            // the settings load below runs only on the unmatched path).
             return is_default_tenant(key) || globally_empty;
         };
         if state.rules.is_empty() {
@@ -1662,7 +1708,8 @@ impl MemoryAuth {
                 return rule.allow;
             }
         }
-        false
+        // Rules exist and none matches: the stored setting decides.
+        self.no_match_allows()
     }
 
     /// Ordered snapshot of the per-client rule index: every stored rule
@@ -2123,7 +2170,7 @@ impl MemoryAuth {
         matches_rule: impl Fn(&AclRule) -> bool,
     ) -> bool {
         let tenants = self.tenants.read();
-        Self::check_in_tenant(&tenants, DEFAULT_TENANT_ID, client_id, action, matches_rule)
+        self.check_in_tenant(&tenants, DEFAULT_TENANT_ID, client_id, action, matches_rule)
     }
 }
 
@@ -2404,7 +2451,7 @@ impl Authorizer for MemoryAuth {
         }
         // Default-tenant shim through the shared first-match-wins helper
         // so single-tenant installs behave exactly as before (same
-        // open-when-empty, same deny-if-unmatched).
+        // open-when-empty; unmatched follows the stored `no_match`).
         if self.check(client_id, AclAction::Publish, |rule| {
             rule.topic_matches(topic)
         }) {
@@ -2471,9 +2518,10 @@ impl MemoryAuth {
                 "{client_id} cannot publish"
             )));
         }
-        // One short guard covers the tenant lookup plus the rule scan
-        // (no new lock, no allocation); closed-ness is derived from the
-        // same guard so the deny path takes no second lock either.
+        // One short guard covers the tenant lookup plus the rule scan;
+        // closed-ness is derived from the same guard so the deny path
+        // takes no second tenant lock. Only an unmatched scan takes one
+        // lock-free settings load for the `no_match` value.
         let (allowed, closed) = {
             let tenants = self.tenants.read();
             let closed = match tenants.get(key) {
@@ -2481,7 +2529,7 @@ impl MemoryAuth {
                 Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
             };
             let allowed =
-                Self::check_in_tenant(&tenants, key, client_id, AclAction::Publish, |rule| {
+                self.check_in_tenant(&tenants, key, client_id, AclAction::Publish, |rule| {
                     rule.topic_matches(&topic)
                 });
             (allowed, closed)
@@ -2528,7 +2576,8 @@ impl MemoryAuth {
                 "{client_id} cannot subscribe"
             )));
         }
-        // Same single-guard discipline as the publish path.
+        // Same single-guard discipline as the publish path: only an
+        // unmatched scan takes the lock-free settings load.
         let (allowed, closed) = {
             let tenants = self.tenants.read();
             let closed = match tenants.get(key) {
@@ -2536,7 +2585,7 @@ impl MemoryAuth {
                 Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
             };
             let allowed =
-                Self::check_in_tenant(&tenants, key, client_id, AclAction::Subscribe, |rule| {
+                self.check_in_tenant(&tenants, key, client_id, AclAction::Subscribe, |rule| {
                     rule.filter_covered(&filter)
                 });
             (allowed, closed)
@@ -2873,6 +2922,80 @@ mod tests {
         assert!(auth.authenticate("anon", None, None).await.is_ok());
         assert!(auth
             .authenticate("someone", Some("u"), Some(b"p"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn unmatched_scan_follows_no_match_setting() {
+        // One rule that never matches the probe topic. Unlinked state
+        // keeps today's behaviour (unmatched denied).
+        let auth = MemoryAuth::new();
+        auth.add_rule(AclRule::new(
+            "client-a",
+            AclAction::Publish,
+            "other/#",
+            true,
+        ))
+        .expect("memory-only persist cannot fail");
+        assert!(auth
+            .authorize_publish("client-a", &topic("own/data"))
+            .await
+            .is_err());
+        assert!(!auth.authz_deny_disconnects());
+
+        // Linked `no_match: allow` admits the unmatched publish and the
+        // unmatched subscribe while a matched deny still denies.
+        let store = Arc::new(AuthzSettingsStore::from_conf(
+            &broker_config::AuthzSettingsConf {
+                no_match: "allow".to_string(),
+                ..broker_config::AuthzSettingsConf::default()
+            },
+        ));
+        auth.set_authz_settings(Arc::clone(&store));
+        assert!(auth
+            .authorize_publish("client-a", &topic("own/data"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authorize_subscribe("client-a", &filter("own/#"))
+            .await
+            .is_ok());
+        auth.add_rule(AclRule::new("client-a", AclAction::Publish, "own/#", false))
+            .expect("memory-only persist cannot fail");
+        assert!(auth
+            .authorize_publish("client-a", &topic("own/data"))
+            .await
+            .is_err());
+
+        // Linked `no_match: deny` with `deny_action: disconnect` denies
+        // the unmatched probe and reports the disconnect.
+        store
+            .replace(broker_config::AuthzSettingsConf {
+                no_match: "deny".to_string(),
+                deny_action: "disconnect".to_string(),
+                ..broker_config::AuthzSettingsConf::default()
+            })
+            .expect("valid replace");
+        assert!(auth
+            .authorize_publish("client-b", &topic("own/data"))
+            .await
+            .is_err());
+        assert!(auth.authz_deny_disconnects());
+    }
+
+    #[tokio::test]
+    async fn open_broker_without_rules_stays_open() {
+        // No rules at all: the broker stays open even with an explicit
+        // `no_match: deny` linked.
+        let auth = MemoryAuth::new();
+        let store = Arc::new(AuthzSettingsStore::from_conf(
+            &broker_config::AuthzSettingsConf::default(),
+        ));
+        auth.set_authz_settings(store);
+        assert!(auth.authorize_publish("any", &topic("a/b")).await.is_ok());
+        assert!(auth
+            .authorize_subscribe("any", &filter("a/#"))
             .await
             .is_ok());
     }

@@ -185,8 +185,9 @@ pub struct ApiState {
     /// request; the kernel boot path seeds the same instance from the
     /// registry (`crates/broker-node/src/main.rs`, boot seeding); the
     /// stored `no_match`/`deny_action` values are consulted by the
-    /// rule-table tasks once they land. Publish and deliver never touch
-    /// this store.
+    /// publish and subscribe authorization events
+    /// (`crates/broker-node/src/main.rs`, publish and subscribe handling)
+    /// through lock-free bool reads with no snapshot clone.
     pub authz_settings: Arc<broker_auth::AuthzSettingsStore>,
     /// Ordered authorization source registry for `GET/POST
     /// /api/v5/authorization/sources` (W2-17): bounded ordered list with
@@ -9479,7 +9480,7 @@ mod tests {
         assert_eq!(body["cache"]["max_size"], json!(32));
         assert_eq!(body["cache"]["ttl"], json!("1m"));
         assert_eq!(body["cache"]["excludes"], json!([]));
-        assert_eq!(body["include_mountpoint"], json!(true));
+        assert_eq!(body["include_mountpoint"], json!(false));
         assert_eq!(body["ignore_backend_failures"], json!(false));
 
         // Full valid replace through the broker: the write answers 200

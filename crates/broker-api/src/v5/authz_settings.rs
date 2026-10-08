@@ -7,17 +7,16 @@
 //! under no delivery lock; the kernel boot path seeds the same instance
 //! from the config registry (`crates/broker-node/src/main.rs`, boot
 //! seeding, and `crate::ApiState::new`) so reads observe the persisted
-//! settings from the first connection; publish and deliver never touch
-//! this store.
+//! settings from the first connection. The publish and subscribe
+//! authorization events read the stored `no_match`/`deny_action` values
+//! through lock-free bool reads with no snapshot clone.
 //!
 //! Neither route is paged. Error answers use the documented
 //! `{code, message}` shape.
 //!
-//! Decision evaluation itself is a sibling task (sources, rule tables,
-//! order): the `no_match`/`deny_action` values are stored, validated and
-//! reported here, and enforcement on the publish/subscribe path lands with
-//! the rule tables behind pipeline numbers (this task's spec carries no
-//! BENCH line, so nothing here takes a hot-path lock).
+//! Decision evaluation reads the `no_match`/`deny_action` values on the
+//! authorize path; the remaining halves (`cache`, `include_mountpoint`,
+//! `ignore_backend_failures`) are stored, validated and reported only.
 // TODO(parity): does the documented PUT merge missing fields or reset
 // them to defaults, and does an empty body reset everything or fail? The
 // rulebook does not decide the merge semantics; the current choice fills
@@ -186,7 +185,7 @@ mod tests {
         assert_eq!(before["cache"]["max_size"], serde_json::json!(32));
         assert_eq!(before["cache"]["ttl"], serde_json::json!("1m"));
         assert_eq!(before["cache"]["excludes"], serde_json::json!([]));
-        assert_eq!(before["include_mountpoint"], serde_json::json!(true));
+        assert_eq!(before["include_mountpoint"], serde_json::json!(false));
         assert_eq!(before["ignore_backend_failures"], serde_json::json!(false));
 
         // Full replace with every field set; the write answers 200 with
@@ -351,7 +350,7 @@ mod tests {
         );
         assert_eq!(defaults.cache.ttl, "1m");
         assert!(defaults.cache.excludes.is_empty());
-        assert!(defaults.include_mountpoint);
+        assert!(!defaults.include_mountpoint);
         assert!(!defaults.ignore_backend_failures);
         defaults.validate().expect("documented defaults validate");
     }

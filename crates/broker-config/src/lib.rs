@@ -1182,16 +1182,11 @@ fn default_authz_settings_cache_ttl() -> String {
 /// (every verdict cacheable).
 pub const MAX_AUTHZ_SETTINGS_EXCLUDES: usize = 1024;
 
-/// Default mountpoint inclusion (true). Reason: the current default
-/// security profile's default; topics render with their mountpoint prefix
-/// unless the operator opts out.
-// TODO(parity): is the documented default profile-dependent (false under
-// one profile, true under another), and does this broker even carry that
-// profile? The rulebook does not decide the profile default; the current
-// choice keeps the current default profile's value until the checker pins
-// it.
+/// Default mountpoint inclusion (false). Reason: the documented default;
+/// the broker carries no mountpoints, so topics render bare unless the
+/// operator opts in.
 fn default_authz_settings_include_mountpoint() -> bool {
-    true
+    false
 }
 
 /// Decision-cache half of the global authorization settings: the enabled
@@ -1275,7 +1270,7 @@ pub struct AuthzSettingsConf {
     /// Decision-cache half (defaults stated on the struct).
     #[serde(default)]
     pub cache: AuthzSettingsCacheConf,
-    /// Whether topics render with their mountpoint prefix (default true).
+    /// Whether topics render with their mountpoint prefix (default false).
     #[serde(default = "default_authz_settings_include_mountpoint")]
     pub include_mountpoint: bool,
     /// Whether a backend outage is ignored (default false, fail closed).
@@ -3911,7 +3906,7 @@ mod tests {
         assert_eq!(defaults.cache.max_size, 32);
         assert_eq!(defaults.cache.ttl, "1m");
         assert!(defaults.cache.excludes.is_empty());
-        assert!(defaults.include_mountpoint);
+        assert!(!defaults.include_mountpoint);
         assert!(!defaults.ignore_backend_failures);
         defaults.validate().expect("documented defaults validate");
         AuthzSettingsCacheConf::default()

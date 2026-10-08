@@ -7,8 +7,12 @@
 //! per request; the kernel boot path seeds the same instance from the
 //! config registry (`crates/broker-node/src/main.rs`, boot seeding, and
 //! `crates/broker-api/src/lib.rs`, `ApiState::new`) so management reads
-//! observe the persisted settings from the first connection; publish and
-//! deliver never touch this store.
+//! observe the persisted settings from the first connection. The
+//! authorize path reads the `no_match`/`deny_action` values here
+//! (`MemoryAuth` in `crate::lib`, one lock-free snapshot load per
+//! unmatched or denied message, no clone). The remaining halves (`cache`,
+//! `include_mountpoint`, `ignore_backend_failures`) are stored, validated
+//! and reported only; the authorize path consults none of them.
 //!
 //! Store bounds (both stated here and enforced below):
 //! - exactly one small validated struct (two decision strings, one cache
@@ -24,18 +28,13 @@
 //!   (commit then atomic save); a failed validation or persist applies
 //!   nothing new.
 //!
-//! Decision evaluation itself is a sibling task (sources, rule tables,
-//! order): the `no_match`/`deny_action` values are stored, validated and
-//! reported here, and enforcement on the publish/subscribe path lands
-//! with the rule tables behind pipeline numbers (the spec carries no
-//! BENCH line for this task, so nothing here takes a hot-path lock).
-// TODO(parity): where does the `no_match`/`deny_action` consult land on
-// the authorize path, and does the decision cache (`cache` half) share
-// the node-cache entries or stay its own verdict table? The rulebook does
-// not decide the enforcement wiring and forbids hot-path work without
-// pipeline numbers; the current choice stores, validates and reports the
-// settings while publish and deliver keep their current behaviour, until
-// the rule-table tasks wire the consult.
+//! Decision evaluation reads the `no_match`/`deny_action` values on the
+//! authorize path. The bench hook is
+//! `crates/broker-node/tests/authz_decision_bench.rs`.
+// TODO(parity): does the decision cache (`cache` half) share the
+// node-cache entries or stay its own verdict table? The rulebook does
+// not decide the cache wiring; the current choice stores, validates and
+// reports the half while the authorize path consults no verdict cache.
 // TODO(parity): does the documented PUT merge missing fields or reset
 // them to defaults, and does an empty body reset everything or fail? The
 // rulebook does not decide the merge semantics; the current choice fills
@@ -59,8 +58,8 @@ pub enum AuthzSettingsUpdateError {
 /// read snapshot plus registry persistence.
 ///
 /// Management writes validate the candidate before swapping it into view;
-/// readers load the snapshot without taking a write lock. Publish and
-/// deliver never touch either.
+/// readers load the snapshot without taking a write lock. The authorize
+/// path never clones the snapshot; it reads the two bools below.
 pub struct AuthzSettingsStore {
     current: arc_swap::ArcSwap<AuthzSettingsConf>,
     registry: parking_lot::RwLock<Option<Arc<ConfigRegistry>>>,
@@ -102,8 +101,9 @@ impl AuthzSettingsStore {
         *self.registry.write() = Some(Arc::clone(registry));
     }
 
-    /// Lock-free snapshot for readers: one `Arc` load, no write lock.
-    /// Publish and deliver never call this.
+    /// Lock-free snapshot for management readers: one `Arc` load, no
+    /// write lock. The authorize path never calls this; it reads the two
+    /// bools below with no clone.
     pub fn snapshot(&self) -> Arc<AuthzSettingsConf> {
         self.current.load_full()
     }
@@ -113,16 +113,33 @@ impl AuthzSettingsStore {
         (*self.current.load_full()).clone()
     }
 
-    /// Decision when no rule matches (`allow` or `deny`). Consulted by
-    /// the rule-table tasks once they land; management-plane only today.
+    /// Decision when no rule matches (`allow` or `deny`). The authorize
+    /// path reads this through [`AuthzSettingsStore::no_match_is_allow`];
+    /// management reads use this clone.
     pub fn no_match(&self) -> String {
         self.current.load().no_match.clone()
     }
 
-    /// Action on an explicit deny (`ignore` or `disconnect`). Consulted by
-    /// the rule-table tasks once they land; management-plane only today.
+    /// Action on an explicit deny (`ignore` or `disconnect`). The publish
+    /// and subscribe paths read this through
+    /// [`AuthzSettingsStore::deny_action_is_disconnect`]; management
+    /// reads use this clone.
     pub fn deny_action(&self) -> String {
         self.current.load().deny_action.clone()
+    }
+
+    /// True when no-match allows. One lock-free snapshot load with no
+    /// clone and no reference-count write, so the authorize path calls
+    /// it per unmatched message. Unlinked stores deny.
+    pub fn no_match_is_allow(&self) -> bool {
+        self.current.load().no_match == "allow"
+    }
+
+    /// True when a deny disconnects. One lock-free snapshot load with no
+    /// clone and no reference-count write, so the publish and subscribe
+    /// paths call it per denied message.
+    pub fn deny_action_is_disconnect(&self) -> bool {
+        self.current.load().deny_action == "disconnect"
     }
 
     /// Whether a backend outage is ignored (fail-open) or denies access
@@ -192,7 +209,7 @@ mod tests {
         );
         assert_eq!(got.cache.ttl, "1m");
         assert!(got.cache.excludes.is_empty());
-        assert!(got.include_mountpoint);
+        assert!(!got.include_mountpoint);
         assert!(!got.ignore_backend_failures);
         assert_eq!(store.no_match(), "deny");
         assert_eq!(store.deny_action(), "ignore");

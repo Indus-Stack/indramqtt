@@ -3176,9 +3176,10 @@ struct Shared {
     /// Global authorization settings for W2-16: shared with the
     /// management API so validated settings writes are visible to reads
     /// without a restart. One `Arc` clone at boot; the kernel boot path
-    /// seeds it from the registry and management reads take one
-    /// lock-free snapshot per request; publish and deliver never touch
-    /// it. Enforcement lands with the rule-table tasks.
+    /// seeds it from the registry and management reads take one bounded
+    /// snapshot per request. The publish and subscribe authorization
+    /// events read the stored `no_match` and `deny_action` values through
+    /// lock-free bool consults with no snapshot clone.
     authz_settings: Arc<AuthzSettingsStore>,
     /// Ordered authorization source registry for W2-17: shared with the
     /// management API so validated registry writes are visible to reads
@@ -3518,7 +3519,7 @@ impl Shared {
                 },
             ));
         }
-        Self {
+        let shared = Self {
             sessions,
             router,
             conns,
@@ -3580,7 +3581,15 @@ impl Shared {
             api_listeners: Arc::new(std::sync::RwLock::new(None)),
             listener_store: Arc::new(broker_api::v5::listeners::ListenerStore::new()),
             api_startup_config: Arc::new(std::sync::RwLock::new(None)),
-        }
+        };
+        // Mirror the boot path: the rule table consults the same settings
+        // instance the management plane serves, so validated writes are
+        // visible to the authorize path without a restart. One `Arc`
+        // clone; defaults keep today's behaviour.
+        shared
+            .auth
+            .set_authz_settings(Arc::clone(&shared.authz_settings));
+        shared
     }
 
     /// Start the single delayed-delivery driver task for this node. The
@@ -5093,6 +5102,11 @@ async fn apply_subscribe(
         send_retained: bool,
     }
     let mut granted: Vec<GrantedSub> = Vec::with_capacity(subs.len());
+    // AP-11: a denied subscribe disconnects when the stored `deny_action`
+    // is `disconnect`. The flag accumulates across filters; the close is
+    // ordered once below after the SubAck is built, so every filter still
+    // gets its own code.
+    let mut authz_disconnect = false;
     // Tenant scope (MT-02, MT-03): resolved once from the subscribing
     // connection's own session, before any authorization decision is
     // recorded, so the denial/grant below lands on the owning tenant's
@@ -5203,7 +5217,12 @@ async fn apply_subscribe(
             if let Some(session) = owner.as_ref() {
                 session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, false);
             }
-            // MQTT 5 style "Not Authorized"; registers nothing.
+            // MQTT 5 style "Not Authorized"; registers nothing. With the
+            // stored `deny_action: disconnect` the connection also closes
+            // below with 0x87 after the SubAck is built.
+            if shared.auth.authz_deny_disconnects() {
+                authz_disconnect = true;
+            }
             codes.push(V5_SUBACK_NOT_AUTHORIZED);
             continue;
         }
@@ -5453,6 +5472,14 @@ async fn apply_subscribe(
                 retained.push(routed);
             }
         }
+    }
+
+    // AP-11: a denied subscribe with the stored `deny_action:
+    // disconnect` closes the connection with 0x87 after the SubAck above
+    // is built, so the client still observes its per-filter codes. The
+    // close routes immediately; the reply follows the normal path.
+    if authz_disconnect {
+        order_authz_disconnect(shared, frame.header.conn_id);
     }
 
     (reply, retained)
@@ -5872,6 +5899,14 @@ async fn apply_publish(
                 QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
                 QoS::AtMostOnce => None,
             };
+            // AP-11: a denied publish with the stored `deny_action:
+            // disconnect` closes the connection with 0x87 after the ack
+            // above is built, so the publisher still observes its ack.
+            // The close routes immediately; the ack follows the normal
+            // path. Allowed publishes take no branch here.
+            if shared.auth.authz_deny_disconnects() {
+                order_authz_disconnect(shared, frame.header.conn_id);
+            }
             return (ack, Vec::new());
         }
         // B5-03: database ACLs for users with no local record. Local
@@ -8201,6 +8236,12 @@ const V5_SUBACK_NOT_AUTHORIZED: u8 = 0x87;
 const V5_SUBACK_FILTER_INVALID: u8 = 0x8F;
 const V5_SUBACK_QUOTA_EXCEEDED: u8 = 0x97;
 
+/// `ConnClose` reason for an authorization disconnect (AP-11): 0x87 Not
+/// Authorized. Reason: the documented MQTT reason code for a refused
+/// publish or subscribe; the edge forwards it as DISCONNECT 0x87 to
+/// version-5 clients and closes older sockets with no packet.
+const AUTHZ_DISCONNECT_RC: u8 = 0x87;
+
 /// Decode `SubscribeMeta` into `(packet_id, client_id, [entries])`.
 /// Accepts the legacy form (`FilterLen | Filter | QoS`) and the X1-03
 /// extended form (`FilterLen | Filter | Opts | SubId:32be`) per filter.
@@ -8519,6 +8560,50 @@ fn order_alias_disconnect(shared: &Shared, conn_id: u64) {
         let _ = shared.conns.route(conn_id, close);
     }
     // Owner key first (MT-03), decoded id behind: a faulty connection in
+    // one tenant detaches and sweeps only its own tenant, never another
+    // tenant's namesake session.
+    match shared.sessions.key_for_conn(conn_id) {
+        Some(key) => {
+            let swept =
+                shared
+                    .sessions
+                    .unbind_connection_in_tenant(&key.tenant, &key.client_id, conn_id);
+            for filter in &swept {
+                unsubscribe_scoped_in_tenant(shared, &key.tenant, &key.client_id, filter);
+            }
+        }
+        None => {
+            if let Some(client_id) = shared.sessions.client_id_for_conn(conn_id) {
+                let swept = shared.sessions.unbind_connection(&client_id, conn_id);
+                for filter in &swept {
+                    unsubscribe_scoped(shared, &client_id, filter);
+                }
+            }
+        }
+    }
+}
+
+/// Order a DISCONNECT for one denied publish or subscribe (AP-11, stored
+/// `deny_action: disconnect`).
+///
+/// Best-effort and idempotent like [`order_alias_disconnect`]: routes a
+/// `ConnClose` frame carrying 0x87 so the edge closes the socket (a
+/// version-5 edge sends DISCONNECT 0x87 first), then detaches the session
+/// exactly like the management kick path so the denied connection holds
+/// no state. Unknown connections only count a drop inside
+/// `ConnTable::route`. Denial events only, never on the per-message fast
+/// path (allowed messages take no branch here).
+fn order_authz_disconnect(shared: &Shared, conn_id: u64) {
+    if let Ok(close) = BrokerFrame::new(
+        OpCode::ConnClose,
+        conn_id,
+        0,
+        Bytes::from(vec![AUTHZ_DISCONNECT_RC]),
+        Bytes::new(),
+    ) {
+        let _ = shared.conns.route(conn_id, close);
+    }
+    // Owner key first (MT-03), decoded id behind: a denied connection in
     // one tenant detaches and sweeps only its own tenant, never another
     // tenant's namesake session.
     match shared.sessions.key_for_conn(conn_id) {
@@ -9169,8 +9254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Authorization settings (W2-16): seed the shared store in place (the
     // same instance `serve_api` shares with `ApiState`), so management
     // reads observe the persisted decisions from the first connection.
-    // Enforcement lands with the rule-table tasks; the store itself is
-    // management-plane only.
+    // The link below exposes them to the authorize path.
     shared.authz_settings.seed_from_registry(&shared.config);
     // Authorization source registry (W2-17): seed the shared registry in
     // place (the same instance `serve_api` shares with `ApiState`), so
@@ -9183,6 +9267,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .auth
         .set_authz_sources(Arc::clone(&shared.authz_sources));
+    // Link the shared authorization settings into the shared rule table
+    // (AP-11): publish/subscribe verdicts honour the stored `no_match`
+    // and `deny_action` values. One `Arc` clone.
+    shared
+        .auth
+        .set_authz_settings(Arc::clone(&shared.authz_settings));
     // Management API keys (W2-25): seed the shared directory in place
     // (the same instance `serve_api` shares with `ApiState`), so
     // management reads observe the persisted keys from the first
@@ -17995,6 +18085,182 @@ mod tests {
         let ack = ack.expect("QoS 1 denied publish still gets a PubAck");
         assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x87u8]);
         assert!(deliveries.is_empty(), "denied publish must not fan out");
+    }
+
+    /// Write the authorization settings through the shared store: the
+    /// same store the management API writes and the authorize path
+    /// reads, so each test drives the production write entry.
+    fn authz_test_settings(shared: &Shared, no_match: &str, deny_action: &str) {
+        shared
+            .authz_settings
+            .replace(broker_config::AuthzSettingsConf {
+                no_match: no_match.to_string(),
+                deny_action: deny_action.to_string(),
+                ..broker_config::AuthzSettingsConf::default()
+            })
+            .expect("valid settings replace");
+    }
+
+    /// Bind one client id on one connection and register its close
+    /// channel. Drives the bind through the broker like the edge does.
+    /// The caller observes `ConnClose` frames on the returned receiver.
+    fn authz_test_bind(
+        shared: &Shared,
+        conn_id: u64,
+        client_id: &str,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<BrokerFrame> {
+        let bind = bind_frame(conn_id, 1, encode_bind_meta(client_id, true, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
+        let (tx, rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(conn_id, tx);
+        rx
+    }
+
+    /// Add one allow rule that never matches the `authz/#` probe tree,
+    /// so every probe verdict comes from `no_match`.
+    fn authz_test_unmatched_rule(shared: &Shared) {
+        shared
+            .auth
+            .add_rule(AclRule::new(
+                "authz-pub",
+                AclAction::Publish,
+                "other/#",
+                true,
+            ))
+            .expect("memory-only persist cannot fail");
+    }
+
+    #[tokio::test]
+    async fn authz_no_match_allow_ignore_delivers_unmatched() {
+        // AP-11 combo 1 (`allow`, `ignore`): one non-matching rule, an
+        // unmatched publish is delivered and the connection stays up.
+        // Drives bind, subscribe, publish and delivery through the
+        // broker, never the store alone.
+        let shared = test_shared();
+        let mut rx_pub = authz_test_bind(&shared, 201, "authz-pub");
+        authz_test_bind(&shared, 202, "authz-sub");
+        authz_test_unmatched_rule(&shared);
+        authz_test_settings(&shared, "allow", "ignore");
+
+        let sub = subscribe_frame(
+            202,
+            1,
+            encode_subscribe_meta(1, "authz-sub", &[("authz/#", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert_eq!(&reply.metadata[2..], &[0u8]);
+
+        let (meta, payload) = encode_publish_meta("authz/data", 5, 1, false, b"hello");
+        let (ack, deliveries) = apply_publish(&publish_frame(201, 1, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 publish gets a PubAck");
+        assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x00u8]);
+        assert_eq!(deliveries.len(), 1, "unmatched publish is delivered");
+        assert!(rx_pub.try_recv().is_err(), "an allow never disconnects");
+    }
+
+    #[tokio::test]
+    async fn authz_no_match_deny_ignore_drops_without_disconnect() {
+        // AP-11 combo 2 (`deny`, `ignore`): one non-matching rule, an
+        // unmatched publish and subscribe are refused and both
+        // connections stay up. Drives bind, subscribe and publish
+        // through the broker, never the store alone.
+        let shared = test_shared();
+        let mut rx_pub = authz_test_bind(&shared, 211, "authz-pub");
+        authz_test_bind(&shared, 212, "authz-sub");
+        authz_test_unmatched_rule(&shared);
+        authz_test_settings(&shared, "deny", "ignore");
+
+        let sub = subscribe_frame(
+            212,
+            1,
+            encode_subscribe_meta(1, "authz-sub", &[("authz/#", 0)]),
+        );
+        let (reply, retained) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert_eq!(&reply.metadata[2..], &[0x87u8]);
+        assert!(retained.is_empty());
+
+        let (meta, payload) = encode_publish_meta("authz/data", 5, 1, false, b"shh");
+        let (ack, deliveries) = apply_publish(&publish_frame(211, 1, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 denied publish still gets a PubAck");
+        assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x87u8]);
+        assert!(deliveries.is_empty(), "denied publish must not fan out");
+        assert!(rx_pub.try_recv().is_err(), "an ignore never disconnects");
+    }
+
+    #[tokio::test]
+    async fn authz_no_match_allow_disconnect_delivers_without_close() {
+        // AP-11 combo 3 (`allow`, `disconnect`): one non-matching rule,
+        // an unmatched publish is delivered and the connection stays up:
+        // only a denial disconnects. Drives bind, subscribe, publish and
+        // delivery through the broker, never the store alone.
+        let shared = test_shared();
+        let mut rx_pub = authz_test_bind(&shared, 221, "authz-pub");
+        authz_test_bind(&shared, 222, "authz-sub");
+        authz_test_unmatched_rule(&shared);
+        authz_test_settings(&shared, "allow", "disconnect");
+
+        let sub = subscribe_frame(
+            222,
+            1,
+            encode_subscribe_meta(1, "authz-sub", &[("authz/#", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert_eq!(&reply.metadata[2..], &[0u8]);
+
+        let (meta, payload) = encode_publish_meta("authz/data", 5, 1, false, b"hello");
+        let (ack, deliveries) = apply_publish(&publish_frame(221, 1, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 publish gets a PubAck");
+        assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x00u8]);
+        assert_eq!(deliveries.len(), 1, "unmatched publish is delivered");
+        assert!(rx_pub.try_recv().is_err(), "an allow never disconnects");
+    }
+
+    #[tokio::test]
+    async fn authz_deny_action_disconnect_closes_denied() {
+        // AP-11 combo 4 (`deny`, `disconnect`): one non-matching rule, a
+        // denied publish and a denied subscribe each close the connection
+        // with 0x87 after their ack. Drives bind, subscribe and publish
+        // through the broker, never the store alone.
+        let shared = test_shared();
+        let mut rx_pub = authz_test_bind(&shared, 231, "authz-pub");
+        let mut rx_sub = authz_test_bind(&shared, 232, "authz-sub");
+        authz_test_unmatched_rule(&shared);
+        authz_test_settings(&shared, "deny", "disconnect");
+
+        let (meta, payload) = encode_publish_meta("authz/data", 5, 1, false, b"shh");
+        let (ack, deliveries) = apply_publish(&publish_frame(231, 1, meta, payload), &shared).await;
+        let ack = ack.expect("QoS 1 denied publish still gets a PubAck");
+        assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x87u8]);
+        assert!(deliveries.is_empty(), "denied publish must not fan out");
+        let close = rx_pub.try_recv().expect("denied publish disconnects");
+        assert_eq!(close.header.opcode, OpCode::ConnClose);
+        assert_eq!(close.header.conn_id, 231);
+        assert_eq!(&close.metadata[..], &[0x87u8]);
+        assert!(
+            shared.sessions.client_id_for_conn(231).is_none(),
+            "denied connection is detached"
+        );
+
+        let sub = subscribe_frame(
+            232,
+            1,
+            encode_subscribe_meta(1, "authz-sub", &[("authz/#", 0)]),
+        );
+        let (reply, retained) = apply_subscribe(&sub, &shared).await;
+        let reply = reply.expect("subscribe replies");
+        assert_eq!(&reply.metadata[2..], &[0x87u8]);
+        assert!(retained.is_empty());
+        let close = rx_sub.try_recv().expect("denied subscribe disconnects");
+        assert_eq!(close.header.opcode, OpCode::ConnClose);
+        assert_eq!(close.header.conn_id, 232);
+        assert_eq!(&close.metadata[..], &[0x87u8]);
+        assert!(
+            shared.sessions.client_id_for_conn(232).is_none(),
+            "denied connection is detached"
+        );
     }
 
     /// Test mirror of the edge peer-address section: append
