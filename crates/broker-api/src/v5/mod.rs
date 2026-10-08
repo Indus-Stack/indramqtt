@@ -18,6 +18,7 @@ pub mod authz_sources;
 pub mod auto_subscribe;
 pub mod backup;
 pub mod banned;
+pub mod certs;
 pub mod clients;
 pub mod cluster;
 pub mod configs;
@@ -669,6 +670,24 @@ pub fn protected_router() -> Router<ApiState> {
                 .delete(banned::clear_banned),
         )
         .route("/banned/:as/:who", delete(banned::delete_banned_one))
+        // Managed certificate bundles (AP-15): list, read, upload and
+        // delete for the global namespace plus one managed namespace.
+        // Files persist under the data directory. Management-plane only;
+        // publish and deliver never touch them.
+        .route("/certs/global/list", get(certs::list_global_bundles))
+        .route(
+            "/certs/global/name/:name",
+            get(certs::get_global_bundle)
+                .post(certs::upload_global_bundle)
+                .delete(certs::delete_global_bundle),
+        )
+        .route("/certs/ns/:namespace/list", get(certs::list_ns_bundles))
+        .route(
+            "/certs/ns/:namespace/name/:name",
+            get(certs::get_ns_bundle)
+                .post(certs::upload_ns_bundle)
+                .delete(certs::delete_ns_bundle),
+        )
         .route(
             "/alarms",
             get(alarms::list_alarms).delete(alarms::clear_alarms),

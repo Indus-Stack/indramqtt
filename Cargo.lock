@@ -1209,6 +1209,8 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "rsa",
+ "rustls 0.23.45",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha1 0.10.7",
@@ -1216,6 +1218,7 @@ dependencies = [
  "tar",
  "tokio",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
