@@ -878,6 +878,9 @@ fn parse_select_rule(p: &mut Parser, foreach_prefix: bool) -> Result<StdRule, St
         where_clause,
         group_by,
         window,
+        window_filter: None,
+        window_trigger_condition: None,
+        window_partition_by: None,
         having,
         order_by: Vec::new(),
         limit: None,
@@ -1747,10 +1750,11 @@ pub(crate) fn rewrite_1based(expr: &Expr) -> Expr {
                 .collect(),
             else_clause: else_clause.as_ref().map(|e| Box::new(rewrite_1based(e))),
         },
-        Expr::Over { call, partition_by } => Expr::Over {
+        Expr::Over { call, partition_by, when } => Expr::Over {
             call: Box::new(rewrite_1based(call)),
             partition_by: partition_by.as_ref().map(|e| Box::new(rewrite_1based(e))),
+            when: when.as_ref().map(|e| Box::new(rewrite_1based(e))),
         },
-        Expr::Wildcard | Expr::Identifier(_) | Expr::Literal(_) => expr.clone(),
+        Expr::Wildcard | Expr::WildcardModified { .. } | Expr::Identifier(_) | Expr::Literal(_) => expr.clone(),
     }
 }

@@ -14,10 +14,10 @@ bytes = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }
 parking_lot = { workspace = true }
-rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "da6aa63eda45ef87161d7f1e8ab91cb9ea0ab30f" }
+rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "4bbf0e5e59dc0c485af717b7cc1fb4bdfa9d81f0" }
 # Same revision as rekuiper-sql: only the public user-function registry is
 # used (no engine behaviour is changed by this dependency).
-rekuiper-core = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "da6aa63eda45ef87161d7f1e8ab91cb9ea0ab30f" }
+rekuiper-core = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "4bbf0e5e59dc0c485af717b7cc1fb4bdfa9d81f0" }
 # Pinned to the revision the tree is tested with today (RQ-01); moving to a
 # newer revision is a separate, reviewed task.
 thiserror = { workspace = true }

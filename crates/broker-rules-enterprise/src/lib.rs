@@ -423,6 +423,7 @@ async fn window_worker_loop(
                 }
             }
         }
+        WindowDef::State { .. } => {}
     }
 }
 
