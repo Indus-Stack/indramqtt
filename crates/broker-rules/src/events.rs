@@ -1,21 +1,24 @@
 //! Rule-event producer registry behind the management catalogue.
 //!
-//! Covers the state behind `GET /rule_events` (C06-16): the catalogue of
-//! event types rules can trigger on. Single-node, management-plane only:
-//! the handler clones at most [`MAX_RULE_EVENTS`] small entries per
-//! request from this static registry; the rule fire path
-//! ([`crate::RuleEngine::dispatch_ingress`] in `lib.rs`, driven by every
-//! published message via the kernel ingress pipeline) never consults this
-//! registry, so the catalogue adds no work, locks or allocation to
-//! publish or deliver.
+//! Covers the state behind `GET /rule_events` (C06-16).
+//! It lists the event types that rules can trigger on.
+//! Single node only, management plane only.
+//! The handler clones at most [`MAX_RULE_EVENTS`] small entries per request.
+//! It reads from this static registry.
+//! The rule fire path never reads this registry.
+//! The fire path is [`crate::RuleEngine::dispatch_ingress`] in `lib.rs`.
+//! The kernel ingress pipeline drives it for each published message.
+//! The catalogue adds no work to publish or deliver.
+//! It adds no locks and no allocation.
 //!
-//! A catalogue entry is listed only if its producer exists: the kernel
-//! drives that event on the rule trigger path today, never an invented
-//! name. Adding a producer means adding one entry to
-//! [`EVENT_PRODUCERS`] alongside its dispatch call; the catalogue reads
-//! the same registry, so the list extends automatically and the two
-//! cannot drift. There is intentionally only one registry, not a second
-//! list shadowing it.
+//! The list contains an entry only when its producer exists.
+//! The kernel drives that event on the rule trigger path today.
+//! The list never contains an invented name.
+//! A new producer needs one entry in [`EVENT_PRODUCERS`].
+//! Add the entry next to its dispatch call.
+//! The catalogue reads the same registry.
+//! The list grows on its own and cannot drift.
+//! Only one registry exists.
 //!
 //! Store bounds (both stated here and enforced below):
 //! - at most [`MAX_RULE_EVENTS`] entries (64: caps management-plane
@@ -28,15 +31,7 @@
 //!
 //! Persistence: none per request. The registry is static within a run
 //! (compiled in); a restart serves the same fixed set.
-// TODO(parity): which per-entry fields does the documented catalogue shape
-// require beyond `event`/`description` (columns, schema, ...)? The
-// rulebook does not decide the exact shape; fields the broker cannot
-// supply are omitted rather than invented, until the checker pins it.
-// TODO(parity): which further `$events/...` names exist once event sources
-// fire (client connect/disconnect, session lifecycle, ...)? The rulebook
-// does not decide the exact vocabulary; the current choice lists only the
-// one ingress the kernel drives today and fails closed on the rest (see
-// `std_sources_match`), until the checker pins it.
+// TODO(parity): Which fields does the catalogue need beyond event and description?
 
 use serde::Serialize;
 
@@ -53,37 +48,77 @@ pub const MAX_RULE_EVENTS: usize = 64;
 /// per kernel producer that drives the rule trigger path (see
 /// [`EVENT_PRODUCERS`]); the count documents the bound the handler
 /// enforces.
-pub const RULE_EVENT_COUNT: usize = 1;
+pub const RULE_EVENT_COUNT: usize = 10;
 
 /// One catalogue entry: the stable event name plus a short
 /// operator-facing summary written in our own words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RuleEventInfo {
-    /// Stable event name (for example `$events/message_publish`).
+    /// Stable event name (for example `$events/client_connected`).
     pub event: &'static str,
     /// Short operator-facing summary of when the kernel produces it.
     pub description: &'static str,
 }
 
-/// The single producer registry: one entry per event the kernel actually
-/// produces on the rule trigger path.
+/// The single producer registry.
+/// It holds one entry per event the kernel produces on the rule trigger path.
 ///
-/// Today's sole producer is the message-ingress event: every published
-/// message drives [`crate::RuleEngine::dispatch_ingress`] (lib.rs), which
-/// the kernel ingress pipeline calls before fan-out, so rules over MQTT
-/// topic filters fire on it. Rules naming it as an `$events/...` source
-/// still fail closed until event sources land (see `std_sources_match`);
-/// the producer — the dispatch call the kernel drives — is real either
-/// way, and no unproduced name is listed.
+/// The ten `$events/...` entries below are the RQ-04 event sources.
+/// The kernel fires each source at the point the event happens.
+/// These points are connect, connack, authz, subscribe, unsubscribe,
+/// deliver, ack and drop.
+/// Rules that name them as an `$events/...` source run on the
+/// publish-path drain.
+/// No entry names an unproduced event.
 ///
 /// Bound (stated here and enforced by construction): at most
 /// [`MAX_RULE_EVENTS`] entries; the catalogue below reads this same
 /// array, so a new producer extends the served list without a second
 /// edit.
-const EVENT_PRODUCERS: [RuleEventInfo; RULE_EVENT_COUNT] = [RuleEventInfo {
-    event: "$events/message_publish",
-    description: "A client published a message; rules over topic filters fire at ingress",
-}];
+const EVENT_PRODUCERS: [RuleEventInfo; RULE_EVENT_COUNT] = [
+    RuleEventInfo {
+        event: "$events/client_connected",
+        description: "A client connected; fired at bind when the broker accepts the connection",
+    },
+    RuleEventInfo {
+        event: "$events/client_disconnected",
+        description:
+            "A client disconnected; fired at unbind on clean close and at disconnect on TCP close",
+    },
+    RuleEventInfo {
+        event: "$events/client_connack",
+        description: "The broker answered a connect; fired at bind with the return code",
+    },
+    RuleEventInfo {
+        event: "$events/client_check_authz_complete",
+        description:
+            "An authorization check finished; fired at subscribe and publish with the verdict",
+    },
+    RuleEventInfo {
+        event: "$events/session_subscribed",
+        description: "A session subscribed; fired at subscribe with the filter and options",
+    },
+    RuleEventInfo {
+        event: "$events/session_unsubscribed",
+        description: "A session unsubscribed; fired at unsubscribe with the filter",
+    },
+    RuleEventInfo {
+        event: "$events/message_delivered",
+        description: "A message reached a subscriber mailbox; fired at fan-out per delivery",
+    },
+    RuleEventInfo {
+        event: "$events/message_acked",
+        description: "A client acknowledged a message; fired at PUBACK with the packet id",
+    },
+    RuleEventInfo {
+        event: "$events/message_dropped",
+        description: "A message was dropped; fired at quota shed and at detached clean sessions",
+    },
+    RuleEventInfo {
+        event: "$events/delivery_dropped",
+        description: "A delivery missed its mailbox; fired at route failure for dead connections",
+    },
+];
 
 // Compile-time guard that the bound covers the served registry.
 const _: () = assert!(
@@ -135,7 +170,8 @@ mod tests {
             );
             assert!(!entry.description.trim().is_empty());
         }
-        assert!(is_produced_event("$events/message_publish"));
+        assert!(is_produced_event("$events/client_connected"));
+        assert!(!is_produced_event("$events/message_publish"));
         assert!(!is_produced_event("$events/no_such_event"));
         assert!(!is_produced_event("message_publish"));
     }

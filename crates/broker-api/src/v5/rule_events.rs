@@ -1,25 +1,32 @@
 //! Rule-event catalogue for the v5 management API.
 //!
-//! Covers `GET /rule_events` (C06-16): the catalogue of event types rules
-//! can trigger on, with the documented per-entry fields. Single-node,
-//! management-plane only: the handler clones at most
-//! [`broker_rules::events::MAX_RULE_EVENTS`] small entries per request
-//! from the real producer registry
+//! Covers `GET /rule_events` (C06-16).
+//! It lists the event types that rules can trigger on.
+//! It carries the documented per-entry fields.
+//! Single node only, management plane only.
+//! The handler clones at most
+//! [`broker_rules::events::MAX_RULE_EVENTS`] small entries per request.
+//! It reads from the real producer registry
 //! ([`broker_rules::events::rule_event_catalogue`] in
-//! `crates/broker-rules/src/events.rs`); the rule fire path
-//! (`broker_rules::RuleEngine::dispatch_ingress` in
-//! `crates/broker-rules/src/lib.rs`, driven by every published message
-//! via the kernel ingress pipeline) never consults this catalogue, so it
-//! adds no work, locks or allocation to publish or deliver.
+//! `crates/broker-rules/src/events.rs`).
+//! The rule fire path never reads this catalogue.
+//! The fire path is `broker_rules::RuleEngine::dispatch_ingress` in
+//! `crates/broker-rules/src/lib.rs`.
+//! The kernel ingress pipeline drives it for each published message.
+//! The catalogue adds no work to publish or deliver.
+//! It adds no locks and no allocation.
 //!
-//! Store wiring (rulebook section 2): no store. The catalogue is the
-//! producer registry itself, shared with the [`is_produced_event`]
-//! predicate below so the served list and the producer check cannot
-//! drift. There is no broker event driving it beyond serving the
-//! management read, and nothing outside `crates/broker-api` writes or
-//! consults it, so `tools/wiring_check.sh` needs no new entry (it only
-//! tracks `Arc<crate::v5::...>` store fields on `ApiState`, of which this
-//! task adds none).
+//! Store wiring (rulebook section 2): no store.
+//! The catalogue reads the producer registry itself.
+//! It shares the registry with the [`is_produced_event`]
+//! predicate below.
+//! The served list and the producer check cannot drift.
+//! No broker event drives it beyond serving the management read.
+//! Nothing outside `crates/broker-api` writes it.
+//! Nothing outside `crates/broker-api` reads it.
+//! `tools/wiring_check.sh` needs no new entry.
+//! The script tracks only `Arc<crate::v5::...>` store fields on
+//! `ApiState`, and this task adds none.
 //!
 //! Persistence: none per request. The registry is static within a run
 //! (compiled in, rebuilt at startup with the binary); a restart serves
@@ -38,7 +45,8 @@
 //! is extracted).
 // The catalogue serves `event` plus `description` per entry. Fields
 // the broker cannot supply stay omitted rather than invented. It lists
-// only the ingress the kernel drives today, never invented names.
+// only the events the kernel drives today, never invented names.
+// TODO(parity): Which fields does the catalogue need beyond event and description?
 
 use axum::{
     extract::Query,
@@ -130,7 +138,8 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), entries.len(), "events must be unique");
-        assert!(names.contains(&"$events/message_publish"));
+        assert!(names.contains(&"$events/client_connected"));
+        assert!(!names.contains(&"$events/message_publish"));
     }
 
     #[tokio::test]
@@ -174,7 +183,7 @@ mod tests {
         let entries = body.as_array().expect("catalogue is a list");
         assert!(entries
             .iter()
-            .any(|e| e["event"] == "$events/message_publish"));
+            .any(|e| e["event"] == "$events/client_connected"));
         state
             .engine
             .create_rule(

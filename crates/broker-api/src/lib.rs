@@ -764,6 +764,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/rules", get(list_rules).post(create_rule))
         .route("/api/v1/rules/test", post(test_rule))
         .route("/api/v1/rules/functions", get(list_functions))
+        .route("/api/v1/rules/sources", get(list_rule_sources))
         .route("/api/v1/rules/:id", get(get_rule).delete(delete_rule))
         .route(
             "/api/v1/config/validate",
@@ -1131,6 +1132,13 @@ async fn test_rule(State(_state): State<ApiState>, Json(req): Json<TestRuleReque
         .into_response(),
         Err(error) => bad_request(error),
     }
+}
+
+/// List available rule event sources (RQ-04).
+async fn list_rule_sources(
+    State(state): State<ApiState>,
+) -> Json<Vec<broker_rules::EventSourceInfo>> {
+    Json(state.engine.list_event_sources())
 }
 
 /// The 185-function streaming-SQL catalog for the SQL studio.
@@ -14992,8 +15000,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         }
         let names: Vec<&str> = entries.iter().filter_map(|e| e["event"].as_str()).collect();
         assert!(
-            names.contains(&"$events/message_publish"),
-            "catalogue lists the message-ingress producer"
+            names.contains(&"$events/client_connected"),
+            "catalogue lists the connect producer"
+        );
+        assert!(
+            !names.contains(&"$events/message_publish"),
+            "catalogue lists no unproduced event"
         );
 
         // Unknown query parameters are ignored, never an error.

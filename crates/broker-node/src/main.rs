@@ -1151,7 +1151,64 @@ async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame>
 /// the connection identifier and the sequence number for the reply.
 /// `looks_v5` selects the MQTT 5 shape of the refusal when `parsed` is
 /// an error.
+///
+/// RQ-04: this is the kernel bind point. It fires each connect
+/// event once per decoded bind. Rejected CONNACKs fire too. Every
+/// broker entry uses this path. The transport wrapper fires nothing.
 async fn apply_bind_request(
+    frame: &BrokerFrame,
+    parsed: Result<BindRequest, &'static str>,
+    looks_v5: bool,
+    shared: &Shared,
+) -> Option<BrokerFrame> {
+    let reply = apply_bind_request_inner(frame, parsed.clone(), looks_v5, shared).await;
+    if let (Ok(req), Some(reply)) = (parsed, reply.as_ref()) {
+        let return_code = if reply.metadata.len() >= 10 {
+            reply.metadata[9]
+        } else {
+            0x80
+        };
+        let session_present = reply.metadata.get(8).copied().unwrap_or(0) != 0;
+        let tenant = shared
+            .sessions
+            .key_for_conn(frame.header.conn_id)
+            .map(|key| key.tenant.clone())
+            .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
+        if is_default_tenant(tenant.as_str()) {
+            shared
+                .engine
+                .fire_client_connected(broker_rules::ClientConnectedEvent {
+                    client_id: req.client_id.clone(),
+                    username: req.username.clone(),
+                    peerhost: req.peerhost.clone(),
+                    keepalive: req.keepalive_secs,
+                    proto_ver: req.protocol_version,
+                    clean_start: req.clean_start,
+                    conn_ack_code: return_code,
+                });
+            shared
+                .engine
+                .fire_client_connack(broker_rules::ClientConnackEvent {
+                    client_id: req.client_id.clone(),
+                    username: req.username.clone(),
+                    peerhost: req.peerhost.clone(),
+                    return_code,
+                    session_present,
+                });
+        }
+    }
+    reply
+}
+
+/// The bind operation on a decoded request.
+///
+/// A link frame carries the request as metadata, and [`apply_bind`]
+/// decodes it. A connection that the kernel owns makes the request from
+/// the CONNECT packet and calls this function directly. `frame` gives
+/// the connection identifier and the sequence number for the reply.
+/// `looks_v5` selects the MQTT 5 shape of the refusal when `parsed` is
+/// an error.
+async fn apply_bind_request_inner(
     frame: &BrokerFrame,
     parsed: Result<BindRequest, &'static str>,
     looks_v5: bool,
@@ -3077,6 +3134,48 @@ fn decode_publish_topic_for_slow(frame: &BrokerFrame) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Fire `$events/delivery_dropped` when a downlink frame misses its
+/// mailbox. The connection is dead or unknown.
+/// Keep cost at zero when no rule selects the source.
+/// Check the flag before any lock.
+fn fire_delivery_dropped_on_route_fail(
+    engine: &Arc<broker_rules::RuleEngine>,
+    sessions: &SessionManager,
+    conn_id: u64,
+    topic: String,
+    qos: u8,
+    reason: &str,
+) {
+    use broker_rules::EventSource;
+    if !engine.is_event_source_selected(EventSource::DeliveryDropped) {
+        return;
+    }
+    // Owner session first so a shared client id resolves in its own
+    // tenant. Rules belong to the default tenant, so another tenant
+    // fires nothing.
+    let Some(session) = sessions.session_for_conn(conn_id).or_else(|| {
+        sessions
+            .client_id_for_conn(conn_id)
+            .as_deref()
+            .and_then(|id| sessions.get(id))
+    }) else {
+        return;
+    };
+    if !session.tenant_is_default.load(Ordering::Relaxed) {
+        return;
+    }
+    let username = session.username.read().clone();
+    let peerhost = session.peerhost.read().clone();
+    engine.fire_delivery_dropped(broker_rules::DeliveryDroppedEvent {
+        client_id: session.client_id.clone(),
+        username,
+        peerhost,
+        topic,
+        qos,
+        reason: reason.to_string(),
+    });
+}
+
 /// Route one PublishIn fan-out and note slow backpressure (F1-03, T-73;
 /// FX-03 extends the note to QoS 0 backlogs that have not shed yet).
 ///
@@ -3104,11 +3203,31 @@ fn route_publish_out_deliveries(
     if !shared.slow_subs_settings.is_enabled() {
         let mut enqueued = 0u64;
         let mut enqueued_bytes = 0u64;
+        // One aggregate event load per fan-out; no clone when no rule.
+        let want_drop_event = shared.engine.has_any_event_selected();
         for (conn_id, routed) in deliveries {
             let len = routed.total_frame_len() as u64;
+            let meta = if want_drop_event {
+                Some(routed.metadata.clone())
+            } else {
+                None
+            };
             if shared.conns.route(conn_id, routed) {
                 enqueued += 1;
                 enqueued_bytes += len;
+            } else if let Some(meta) = meta
+                .as_ref()
+                .and_then(|m| decode_publish_meta(m).map(|(t, _, q, _, _, _, _)| (t, q)))
+            {
+                // Fire $events/delivery_dropped for dead/unknown conn.
+                fire_delivery_dropped_on_route_fail(
+                    &shared.engine,
+                    &shared.sessions,
+                    conn_id,
+                    meta.0,
+                    meta.1,
+                    "dead_mailbox",
+                );
             }
         }
         shared.metrics.inc_messages_forwarded_by(enqueued);
@@ -3134,6 +3253,8 @@ fn route_publish_out_deliveries(
     let mut first_conn_id = 0u64;
     let mut have_first = false;
     let mut first_is_qos0 = false;
+    // One aggregate event load per fan-out; no clone when no rule.
+    let want_drop_event = shared.engine.has_any_event_selected();
     for (conn_id, routed) in deliveries {
         if !have_first {
             first_conn_id = conn_id;
@@ -3141,9 +3262,27 @@ fn route_publish_out_deliveries(
             have_first = true;
         }
         let len = routed.total_frame_len() as u64;
+        let meta = if want_drop_event {
+            Some(routed.metadata.clone())
+        } else {
+            None
+        };
         if shared.conns.route(conn_id, routed) {
             enqueued += 1;
             enqueued_bytes += len;
+        } else if let Some((decoded_topic, decoded_qos)) = meta
+            .as_ref()
+            .and_then(|m| decode_publish_meta(m).map(|(t, _, q, _, _, _, _)| (t, q)))
+        {
+            // Fire $events/delivery_dropped for dead/unknown conn.
+            fire_delivery_dropped_on_route_fail(
+                &shared.engine,
+                &shared.sessions,
+                conn_id,
+                decoded_topic,
+                decoded_qos,
+                "dead_mailbox",
+            );
         }
     }
     let delivery_ms = route_start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -3544,6 +3683,7 @@ impl Shared {
             sessions: sessions.clone(),
             conns: conns.clone(),
             metrics: metrics.clone(),
+            engine: engine.clone(),
         });
         engine.set_broker_sink(sink.clone());
 
@@ -4414,6 +4554,7 @@ struct InMemoryBrokerSink {
     sessions: Arc<SessionManager>,
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
+    engine: Arc<RuleEngine>,
 }
 
 #[async_trait]
@@ -4430,6 +4571,10 @@ impl BrokerSink for InMemoryBrokerSink {
         // cross-tenant leak, single-tenant behaviour unchanged). The open
         // question is the tenant attribution for derived messages once
         // the rule engine dispatches per tenant.
+        // Rule output must not fire delivery events. It routes here,
+        // not through ingress. A delivery event here requeues and
+        // retriggers the same rule. The drain loop then emits 64
+        // copies for one delivery.
         let deliveries = build_downlink_frames(
             &self.router,
             &self.sessions,
@@ -4439,6 +4584,7 @@ impl BrokerSink for InMemoryBrokerSink {
             retain,
             &payload,
             broker_session::tenant::DEFAULT_TENANT_ID,
+            None,
         );
         // Only frames that reached a live mailbox count as
         // forwarded/sent/delivered. Drops are already counted inside
@@ -4451,6 +4597,16 @@ impl BrokerSink for InMemoryBrokerSink {
             if self.conns.route(conn_id, frame) {
                 enqueued += 1;
                 enqueued_bytes += len;
+            } else {
+                // Fire $events/delivery_dropped (RQ-04) for dead/unknown conn.
+                fire_delivery_dropped_on_route_fail(
+                    &self.engine,
+                    &self.sessions,
+                    conn_id,
+                    topic.as_str().to_string(),
+                    u8::from(qos),
+                    "dead_mailbox",
+                );
             }
         }
         self.metrics.inc_messages_forwarded_by(enqueued);
@@ -5038,7 +5194,9 @@ where
                     shared
                         .conns
                         .set_tenant_label(frame.header.conn_id, &key.tenant);
-                    bound.push((key, frame.header.conn_id));
+                    bound.push((key.clone(), frame.header.conn_id));
+                    // RQ-04: connect events fire in `apply_bind_request`.
+                    // Never fire here. One bind fires once.
                     // Auto-subscribe hook (W1-39): only on accepted binds.
                     // Per-connect cost only; fan-out takes no new lock.
                     if accepted {
@@ -5217,6 +5375,9 @@ where
                 refresh_subscription_stats(shared);
             }
         }
+        OpCode::UnsubscribeIn => {
+            apply_unsubscribe(&frame, shared).await;
+        }
         OpCode::Credit => {
             // Egress stage 1: the owning edge connection reports its
             // pressure snapshot. Counted on receipt today; no delivery
@@ -5386,6 +5547,33 @@ async fn apply_subscribe(
             if let Some(session) = owner.as_ref() {
                 session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, false);
             }
+            // Fire $events/client_check_authz_complete.
+            // Rules belong to the default tenant, so another tenant fires
+            // nothing. Subscribe carries no retain flag, so retain stays
+            // absent. Check the flag before any lock.
+            if shared
+                .engine
+                .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
+                && is_default_tenant(&tenant)
+            {
+                if let Some(session) = owner.as_ref() {
+                    let username = session.username.read().clone();
+                    let peerhost = session.peerhost.read().clone();
+                    shared.engine.fire_client_check_authz_complete(
+                        broker_rules::ClientCheckAuthzCompleteEvent {
+                            client_id: client_id.clone(),
+                            username,
+                            peerhost,
+                            action: "subscribe".to_string(),
+                            topic: filter.as_str().to_string(),
+                            qos: qos_raw,
+                            retain: None,
+                            allow: false,
+                            source: "local".to_string(),
+                        },
+                    );
+                }
+            }
             // MQTT 5 style "Not Authorized"; registers nothing. With the
             // stored `deny_action: disconnect` the connection also closes
             // below with 0x87 after the SubAck is built.
@@ -5415,6 +5603,28 @@ async fn apply_subscribe(
                     .await
                     .is_err()
                 {
+                    if shared.engine.is_event_source_selected(
+                        broker_rules::EventSource::ClientCheckAuthzComplete,
+                    ) && is_default_tenant(&tenant)
+                    {
+                        if let Some(session) = owner.as_ref() {
+                            let username = session.username.read().clone();
+                            let peerhost = session.peerhost.read().clone();
+                            shared.engine.fire_client_check_authz_complete(
+                                broker_rules::ClientCheckAuthzCompleteEvent {
+                                    client_id: client_id.clone(),
+                                    username,
+                                    peerhost,
+                                    action: "subscribe".to_string(),
+                                    topic: filter.as_str().to_string(),
+                                    qos: qos_raw,
+                                    retain: None,
+                                    allow: false,
+                                    source: "database".to_string(),
+                                },
+                            );
+                        }
+                    }
                     codes.push(V5_SUBACK_NOT_AUTHORIZED);
                     continue;
                 }
@@ -5485,6 +5695,54 @@ async fn apply_subscribe(
             2 => false,
             _ => true,
         };
+        // Fire the subscribe events. Rules belong to the default tenant,
+        // so another tenant fires nothing. Subscribe carries no retain
+        // flag, so retain stays absent. Check flags before any lock.
+        if shared
+            .engine
+            .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
+            && is_default_tenant(&tenant)
+        {
+            if let Some(session) = owner.as_ref() {
+                let username = session.username.read().clone();
+                let peerhost = session.peerhost.read().clone();
+                shared.engine.fire_client_check_authz_complete(
+                    broker_rules::ClientCheckAuthzCompleteEvent {
+                        client_id: client_id.clone(),
+                        username,
+                        peerhost,
+                        action: "subscribe".to_string(),
+                        topic: filter.as_str().to_string(),
+                        qos: qos_raw,
+                        retain: None,
+                        allow: true,
+                        source: "local".to_string(),
+                    },
+                );
+            }
+        }
+        if shared
+            .engine
+            .is_event_source_selected(broker_rules::EventSource::SessionSubscribed)
+            && is_default_tenant(&tenant)
+        {
+            if let Some(session) = owner.as_ref() {
+                let username = session.username.read().clone();
+                let peerhost = session.peerhost.read().clone();
+                shared
+                    .engine
+                    .fire_session_subscribed(broker_rules::SessionSubscribedEvent {
+                        client_id: client_id.clone(),
+                        username,
+                        peerhost,
+                        topic: filter.as_str().to_string(),
+                        qos: qos_raw,
+                        nl: u8::from(no_local),
+                        rap: u8::from(rap),
+                        rh,
+                    });
+            }
+        }
         // Each grant goes in the list: the statistics and the cluster
         // announce use all grants. Only the retained replay uses the
         // retain-handling decision.
@@ -5652,6 +5910,135 @@ async fn apply_subscribe(
     }
 
     (reply, retained)
+}
+
+/// Handle one `UnsubscribeIn` frame and build its `UnsubAckOut` reply.
+/// Malformed framing yields `None` (the edge treats a missing UnsubAck as
+/// a hung request scoped to that connection).
+///
+/// Meta layout: `PacketId:16be | IdLen:16be | ClientId | N:16be |
+/// (FilterLen:16be | Filter) * N`. Granted filters are removed from the
+/// router and the session mirror; invalid filters are ignored.
+async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) {
+    let (packet_id, client_id, filters) = match decode_unsubscribe_meta(&frame.metadata) {
+        Some(parts) => parts,
+        None => return,
+    };
+    // Resolve the owning tenant from the connection so one tenant's
+    // unsubscribe never touches another tenant's namesake session.
+    let tenant = session_tenant_for_conn(shared, frame.header.conn_id, &client_id);
+    let owner = shared.sessions.get_in_tenant(&tenant, &client_id);
+
+    let mut granted = Vec::new();
+    for raw_filter_str in filters {
+        let filter_str = match shared.router.rewrite_subscribe(&raw_filter_str) {
+            Some(rewritten) => rewritten,
+            None => raw_filter_str,
+        };
+        let filter = match TopicFilter::new(filter_str) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        // Fire the event before removal. Rules belong to the default
+        // tenant, so another tenant fires nothing. Check flag first.
+        if shared
+            .engine
+            .is_event_source_selected(broker_rules::EventSource::SessionUnsubscribed)
+            && is_default_tenant(&tenant)
+        {
+            if let Some(session) = owner.as_ref() {
+                let username = session.username.read().clone();
+                let peerhost = session.peerhost.read().clone();
+                shared
+                    .engine
+                    .fire_session_unsubscribed(broker_rules::SessionUnsubscribedEvent {
+                        client_id: client_id.clone(),
+                        username,
+                        peerhost,
+                        topic: filter.as_str().to_string(),
+                    });
+            }
+        }
+        // Remove from router and session mirror in the owning tenant.
+        shared
+            .router
+            .unsubscribe_in_tenant(&filter, &client_id, &tenant);
+        shared
+            .sessions
+            .remove_subscription_in_tenant(&tenant, &client_id, &filter);
+        granted.push(filter);
+    }
+    if !granted.is_empty() {
+        refresh_subscription_stats(shared);
+    }
+
+    // Clustered mode: withdraw our route summary.
+    if let Some(cluster) = &shared.cluster {
+        for filter in &granted {
+            if let Err(e) = cluster.revoke_filter(filter).await {
+                warn!("Cluster revoke failed for {}: {}", filter.as_str(), e);
+            }
+        }
+    }
+
+    // Build UnsubAckOut reply.
+    let mut meta = Vec::with_capacity(2);
+    meta.extend_from_slice(&packet_id.to_be_bytes());
+    let reply = BrokerFrame::new(
+        OpCode::UnsubAckOut,
+        frame.header.conn_id,
+        frame.header.sequence_no,
+        Bytes::from(meta),
+        Bytes::new(),
+    )
+    .ok();
+    if let Some(reply) = reply {
+        // Send directly through the connection table.
+        let _ = shared.conns.route(frame.header.conn_id, reply);
+    }
+}
+
+/// Decode `UnsubscribeIn` metadata into `(packet_id, client_id, filters)`.
+/// Layout: `PacketId:16be | IdLen:16be | ClientId | N:16be | (FilterLen:16be | Filter) * N`.
+fn decode_unsubscribe_meta(meta: &[u8]) -> Option<(u16, String, Vec<String>)> {
+    if meta.len() < 4 {
+        return None;
+    }
+    let packet_id = u16::from_be_bytes([meta[0], meta[1]]);
+    if packet_id == 0 {
+        return None;
+    }
+    let mut offset = 2;
+    if meta.len() < offset + 2 {
+        return None;
+    }
+    let id_len = u16::from_be_bytes([meta[offset], meta[offset + 1]]) as usize;
+    offset += 2;
+    if meta.len() < offset + id_len {
+        return None;
+    }
+    let client_id = String::from_utf8(meta[offset..offset + id_len].to_vec()).ok()?;
+    offset += id_len;
+    if meta.len() < offset + 2 {
+        return None;
+    }
+    let n = u16::from_be_bytes([meta[offset], meta[offset + 1]]) as usize;
+    offset += 2;
+    let mut filters = Vec::with_capacity(n);
+    for _ in 0..n {
+        if meta.len() < offset + 2 {
+            return None;
+        }
+        let filter_len = u16::from_be_bytes([meta[offset], meta[offset + 1]]) as usize;
+        offset += 2;
+        if meta.len() < offset + filter_len {
+            return None;
+        }
+        let filter = String::from_utf8(meta[offset..offset + filter_len].to_vec()).ok()?;
+        filters.push(filter);
+        offset += filter_len;
+    }
+    Some((packet_id, client_id, filters))
 }
 
 /// Replay a resumed durable session's backlog onto its new connection:
@@ -6065,6 +6452,27 @@ async fn apply_publish(
             session.record_authz_decision("publish", topic.as_str(), qos_raw, retain, allowed);
         }
         if !allowed {
+            // Fire the authz event. Rules belong to the default tenant.
+            // Check flag first; publish carries a retain flag.
+            if shared
+                .engine
+                .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
+                && is_default_tenant(tenant)
+            {
+                shared.engine.fire_client_check_authz_complete(
+                    broker_rules::ClientCheckAuthzCompleteEvent {
+                        client_id: publisher.clone(),
+                        username: username.clone(),
+                        peerhost: peerhost.clone(),
+                        action: "publish".to_string(),
+                        topic: topic.to_string(),
+                        qos: qos_raw,
+                        retain: Some(retain),
+                        allow: false,
+                        source: "local".to_string(),
+                    },
+                );
+            }
             let ack = match qos {
                 QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
                 QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
@@ -6105,6 +6513,24 @@ async fn apply_publish(
                     .await
                     .is_err()
                 {
+                    if shared.engine.is_event_source_selected(
+                        broker_rules::EventSource::ClientCheckAuthzComplete,
+                    ) && is_default_tenant(tenant)
+                    {
+                        shared.engine.fire_client_check_authz_complete(
+                            broker_rules::ClientCheckAuthzCompleteEvent {
+                                client_id: publisher.clone(),
+                                username: username.clone(),
+                                peerhost: peerhost.clone(),
+                                action: "publish".to_string(),
+                                topic: topic.to_string(),
+                                qos: qos_raw,
+                                retain: Some(retain),
+                                allow: false,
+                                source: "database".to_string(),
+                            },
+                        );
+                    }
                     let ack = match qos {
                         QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
                         QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
@@ -6143,6 +6569,25 @@ async fn apply_publish(
                 .await
                 .is_err()
             {
+                if shared
+                    .engine
+                    .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
+                    && is_default_tenant(tenant)
+                {
+                    shared.engine.fire_client_check_authz_complete(
+                        broker_rules::ClientCheckAuthzCompleteEvent {
+                            client_id: publisher.clone(),
+                            username,
+                            peerhost,
+                            action: "publish".to_string(),
+                            topic: topic.to_string(),
+                            qos: qos_raw,
+                            retain: Some(retain),
+                            allow: false,
+                            source: "webhook".to_string(),
+                        },
+                    );
+                }
                 let ack = match qos {
                     QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
                     QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
@@ -6150,6 +6595,48 @@ async fn apply_publish(
                 };
                 return (ack, Vec::new());
             }
+        }
+        // Fire the allowed-publish authz event. Rules belong to the
+        // default tenant, so another tenant fires nothing. Check flag
+        // before any lock. Source names the highest backend that
+        // approved: webhook when configured, else database when the
+        // publisher has no local record, else local.
+        if shared
+            .engine
+            .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
+            && is_default_tenant(tenant)
+        {
+            let (username, peerhost) = match publisher_session.as_ref() {
+                Some(session) => (
+                    session.username.read().clone(),
+                    session.peerhost.read().clone(),
+                ),
+                None => (None, None),
+            };
+            let source = if shared.webhook.is_some() {
+                "webhook"
+            } else if shared.db_auth.as_ref().is_some_and(|d| d.is_configured())
+                && !username
+                    .as_deref()
+                    .is_some_and(|u| shared.auth.has_user_in_tenant(tenant, u))
+            {
+                "database"
+            } else {
+                "local"
+            };
+            shared.engine.fire_client_check_authz_complete(
+                broker_rules::ClientCheckAuthzCompleteEvent {
+                    client_id: publisher.clone(),
+                    username,
+                    peerhost,
+                    action: "publish".to_string(),
+                    topic: topic.to_string(),
+                    qos: qos_raw,
+                    retain: Some(retain),
+                    allow: true,
+                    source: source.to_string(),
+                },
+            );
         }
     }
 
@@ -6160,6 +6647,32 @@ async fn apply_publish(
     if !check_publish_quota(frame, shared).await {
         shared.metrics.inc_messages_dropped();
         shared.metrics.inc_overload_dropped();
+        // Fire the drop event. Rules belong to the default tenant.
+        // Check flag before any lock.
+        if shared
+            .engine
+            .is_event_source_selected(broker_rules::EventSource::MessageDropped)
+            && is_default_tenant(tenant)
+        {
+            let (client_id, username, peerhost) = match publisher_session.as_ref() {
+                Some(session) => (
+                    session.client_id.clone(),
+                    session.username.read().clone(),
+                    session.peerhost.read().clone(),
+                ),
+                None => (String::new(), None, None),
+            };
+            shared
+                .engine
+                .fire_message_dropped(broker_rules::MessageDroppedEvent {
+                    client_id,
+                    username,
+                    peerhost,
+                    topic: topic.to_string(),
+                    qos: qos_raw,
+                    reason: "quota_exceeded".to_string(),
+                });
+        }
         let ack = match qos {
             QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x97),
             QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
@@ -6927,6 +7440,7 @@ async fn ingress_pipeline_with_publisher_and_props(
         publisher,
         publisher_tenant,
         v5,
+        Some(&shared.engine),
     );
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
@@ -7372,9 +7886,10 @@ fn build_downlink_frames(
     retain: bool,
     payload: &Bytes,
     tenant: &str,
+    engine: Option<&Arc<RuleEngine>>,
 ) -> Vec<(u64, BrokerFrame)> {
     build_downlink_frames_with_publisher(
-        router, sessions, metrics, topic, qos, retain, payload, None, tenant,
+        router, sessions, metrics, topic, qos, retain, payload, None, tenant, engine,
     )
 }
 
@@ -7396,6 +7911,7 @@ fn build_downlink_frames_with_publisher(
     payload: &Bytes,
     publisher: Option<&str>,
     publisher_tenant: &str,
+    engine: Option<&Arc<RuleEngine>>,
 ) -> Vec<(u64, BrokerFrame)> {
     let empty = PublishV5Props::default();
     build_downlink_frames_with_publisher_and_props(
@@ -7409,13 +7925,16 @@ fn build_downlink_frames_with_publisher(
         publisher,
         publisher_tenant,
         &empty,
+        engine,
     )
 }
 
 /// [`build_downlink_frames_with_publisher`] with X1-03 v5 properties.
 /// The MQTT ingress path passes the parsed inbound properties so each
 /// version-5 delivery carries them; every other fan-out passes the
-/// default (no properties, bytes unchanged).
+/// default (no properties, bytes unchanged). `engine` carries the rule
+/// engine for RQ-04 event fires (checked with one relaxed load when no
+/// event rule exists, so the publish fast path pays no lock).
 #[allow(clippy::too_many_arguments)]
 fn build_downlink_frames_with_publisher_and_props(
     router: &Router,
@@ -7428,6 +7947,7 @@ fn build_downlink_frames_with_publisher_and_props(
     publisher: Option<&str>,
     publisher_tenant: &str,
     v5: &PublishV5Props,
+    engine: Option<&Arc<RuleEngine>>,
 ) -> Vec<(u64, BrokerFrame)> {
     let qos_raw = u8::from(qos);
     let topic_str = topic.as_str();
@@ -7442,6 +7962,9 @@ fn build_downlink_frames_with_publisher_and_props(
     // `clone` below shares this single root.
     let shared = payload.clone();
     let mut deliveries = Vec::new();
+    // One aggregate event load per publish. When no event rule exists
+    // all fire blocks below skip with no lock and no clone.
+    let want_events = engine.map(|e| e.has_any_event_selected()).unwrap_or(false);
     let (matched, tenant_skipped) =
         router.matches_in_tenant_counted(topic, publisher, publisher_tenant);
     if tenant_skipped > 0 {
@@ -7599,6 +8122,38 @@ fn build_downlink_frames_with_publisher_and_props(
                             &shared,
                             v5,
                         ) {
+                            // Fire $events/message_delivered.
+                            // Check flags before any lock: no cost
+                            // when no rule selects the source.
+                            if want_events {
+                                if let Some(engine) = engine {
+                                    use broker_rules::EventSource;
+                                    if engine
+                                        .is_event_source_selected(EventSource::MessageDelivered)
+                                        && is_default_tenant(&sub.tenant)
+                                        && is_default_tenant(publisher_tenant)
+                                    {
+                                        let username = session.username.read().clone();
+                                        let peerhost = session.peerhost.read().clone();
+                                        engine.fire_message_delivered(
+                                            broker_rules::MessageDeliveredEvent {
+                                                client_id: sub.client_id.to_string(),
+                                                username,
+                                                peerhost,
+                                                topic: topic_str.to_string(),
+                                                qos: effective,
+                                                retain,
+                                                payload: shared.clone(),
+                                                msg_id: if effective == 0 {
+                                                    None
+                                                } else {
+                                                    Some(downlink_id)
+                                                },
+                                            },
+                                        );
+                                    }
+                                }
+                            }
                             deliveries.push((conn_id, frame));
                         }
                     }
@@ -7633,6 +8188,30 @@ fn build_downlink_frames_with_publisher_and_props(
                                 }
                             }
                         } else {
+                            // Fire $events/message_dropped for detached clean session.
+                            // Check flags before any lock.
+                            if want_events {
+                                if let Some(engine) = engine {
+                                    use broker_rules::EventSource;
+                                    if engine.is_event_source_selected(EventSource::MessageDropped)
+                                        && is_default_tenant(&sub.tenant)
+                                        && is_default_tenant(publisher_tenant)
+                                    {
+                                        let username = session.username.read().clone();
+                                        let peerhost = session.peerhost.read().clone();
+                                        engine.fire_message_dropped(
+                                            broker_rules::MessageDroppedEvent {
+                                                client_id: sub.client_id.to_string(),
+                                                username,
+                                                peerhost,
+                                                topic: topic_str.to_string(),
+                                                qos: effective,
+                                                reason: "no_session_clean".to_string(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
                             metrics.inc_detached_clean_dropped();
                         }
                     }
@@ -7655,6 +8234,34 @@ fn build_downlink_frames_with_publisher_and_props(
                     &shared,
                     v5,
                 ) {
+                    // Fire $events/message_delivered for legacy fallback.
+                    // Check flags first: no work when no rule selects it.
+                    if want_events {
+                        if let Some(engine) = engine {
+                            use broker_rules::EventSource;
+                            if engine.is_event_source_selected(EventSource::MessageDelivered)
+                                && is_default_tenant(&sub.tenant)
+                                && is_default_tenant(publisher_tenant)
+                            {
+                                engine.fire_message_delivered(
+                                    broker_rules::MessageDeliveredEvent {
+                                        client_id: sub.client_id.to_string(),
+                                        username: None,
+                                        peerhost: None,
+                                        topic: topic_str.to_string(),
+                                        qos: effective,
+                                        retain,
+                                        payload: shared.clone(),
+                                        msg_id: if effective == 0 {
+                                            None
+                                        } else {
+                                            Some(downlink_id)
+                                        },
+                                    },
+                                );
+                            }
+                        }
+                    }
                     deliveries.push((sub.conn_id, frame));
                 }
             }
@@ -8028,9 +8635,20 @@ async fn deliver_cluster_message(shared: &Shared, msg: ClusterMessage) {
         false,
         &msg.payload,
         broker_session::tenant::DEFAULT_TENANT_ID,
+        Some(&shared.engine),
     ) {
         // A dead mailbox is already counted inside `ConnTable::route`.
-        let _ = shared.conns.route(conn_id, frame);
+        if !shared.conns.route(conn_id, frame) {
+            // Fire $events/delivery_dropped (RQ-04) for dead/unknown conn.
+            fire_delivery_dropped_on_route_fail(
+                &shared.engine,
+                &shared.sessions,
+                conn_id,
+                msg.topic.as_str().to_string(),
+                u8::from(msg.qos),
+                "dead_mailbox",
+            );
+        }
     }
     // CoAP observers see cluster forwards like local ingress (same cheap
     // empty check when the gateway never ran).
@@ -8061,7 +8679,25 @@ fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
         // The stored will is taken and dropped, but only for the verified
         // owner, so a racing teardown for a superseded conn_id never
         // clears the fresh connection's will.
-        match shared.sessions.key_for_conn(frame.header.conn_id) {
+        // Capture identity for the disconnect event before detach.
+        let key = shared.sessions.key_for_conn(frame.header.conn_id);
+        let (username, peerhost) = match key.as_ref() {
+            Some(k) => shared
+                .sessions
+                .get_in_tenant(&k.tenant, &k.client_id)
+                .map(|s| (s.username.read().clone(), s.peerhost.read().clone()))
+                .unwrap_or((None, None)),
+            None => shared
+                .sessions
+                .get(&client_id)
+                .map(|s| (s.username.read().clone(), s.peerhost.read().clone()))
+                .unwrap_or((None, None)),
+        };
+        let event_tenant: String = key
+            .as_ref()
+            .map(|k| k.tenant.to_string())
+            .unwrap_or_else(|| broker_session::tenant::DEFAULT_TENANT_ID.to_string());
+        match key {
             Some(key) => {
                 if let Some(session) = shared.sessions.get_in_tenant(&key.tenant, &key.client_id) {
                     if *session.conn_id.read() == Some(frame.header.conn_id) {
@@ -8092,6 +8728,24 @@ fn apply_unbind(frame: &BrokerFrame, shared: &Shared) {
             }
         }
         refresh_subscription_stats(shared);
+        // Fire the disconnect event. Rules belong to the default tenant.
+        // The edge forwards no reason code, so the code stays absent.
+        // Disconnect path only, never publish or deliver.
+        if shared
+            .engine
+            .is_event_source_selected(broker_rules::EventSource::ClientDisconnected)
+            && is_default_tenant(&event_tenant)
+        {
+            shared
+                .engine
+                .fire_client_disconnected(broker_rules::ClientDisconnectedEvent {
+                    client_id: client_id.clone(),
+                    username,
+                    peerhost,
+                    reason: "normal".to_string(),
+                    disconnect_code: None,
+                });
+        }
     }
     shared.conns.unregister(frame.header.conn_id);
 }
@@ -8198,6 +8852,24 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     }
     refresh_subscription_stats(shared);
     shared.conns.unregister(frame.header.conn_id);
+    // Fire the disconnect event. Rules belong to the default tenant.
+    // The edge forwards no reason code, so the code stays absent.
+    // Disconnect path only, never publish or deliver.
+    if shared
+        .engine
+        .is_event_source_selected(broker_rules::EventSource::ClientDisconnected)
+        && is_default_tenant(&tenant)
+    {
+        shared
+            .engine
+            .fire_client_disconnected(broker_rules::ClientDisconnectedEvent {
+                client_id: client_id.clone(),
+                username: username.clone(),
+                peerhost: peerhost.clone(),
+                reason: "tcp_close".to_string(),
+                disconnect_code: None,
+            });
+    }
     let Some(will) = will else {
         return Vec::new();
     };
@@ -8326,6 +8998,26 @@ fn apply_puback(frame: &BrokerFrame, shared: &Shared) {
     let Some(entry) = session.ack_inflight_timed(packet_id) else {
         return;
     };
+    // Fire the ack event. Rules belong to the default tenant.
+    // Check flag before any lock. Ack path only, never publish.
+    if shared
+        .engine
+        .is_event_source_selected(broker_rules::EventSource::MessageAcked)
+        && session.tenant_is_default.load(Ordering::Relaxed)
+    {
+        let username = session.username.read().clone();
+        let peerhost = session.peerhost.read().clone();
+        shared
+            .engine
+            .fire_message_acked(broker_rules::MessageAckedEvent {
+                client_id: session.client_id.clone(),
+                username,
+                peerhost,
+                topic: entry.topic.to_string(),
+                qos: u8::from(entry.qos),
+                msg_id: packet_id,
+            });
+    }
     // Honour `enable=false`: recording is gated on the flag the API
     // exposes, read atomically with no lock.
     if !shared.slow_subs_settings.is_enabled() {
@@ -10512,6 +11204,7 @@ mod tests {
             false,
             &Bytes::from_static(b"21.5"),
             broker_session::tenant::DEFAULT_TENANT_ID,
+            None,
         );
 
         assert!(deliveries.is_empty());
@@ -10558,6 +11251,7 @@ mod tests {
             false,
             &Bytes::from_static(b"new"),
             broker_session::tenant::DEFAULT_TENANT_ID,
+            None,
         );
 
         assert!(deliveries.is_empty());
@@ -10915,6 +11609,7 @@ mod tests {
             false,
             &Bytes::from_static(b"one"),
             broker_session::tenant::DEFAULT_TENANT_ID,
+            None,
         );
         assert_eq!(first.len(), 1, "first downlink fits the window");
         let session = sessions.get("v5-capped-rx").expect("session");
@@ -10928,6 +11623,7 @@ mod tests {
             false,
             &Bytes::from_static(b"two"),
             broker_session::tenant::DEFAULT_TENANT_ID,
+            None,
         );
         assert!(
             second.is_empty(),
@@ -10989,6 +11685,7 @@ mod tests {
             false,
             &Bytes::from(vec![0x41; 100]),
             broker_session::tenant::DEFAULT_TENANT_ID,
+            None,
         );
         assert!(
             deliveries.is_empty(),
@@ -12238,6 +12935,7 @@ mod tests {
             false,
             &big,
             broker_session::tenant::DEFAULT_TENANT_ID,
+            None,
         );
         assert_eq!(deliveries.len(), 3, "one delivery per subscriber");
         for (_, frame) in &deliveries {
@@ -12286,6 +12984,7 @@ mod tests {
             false,
             &big,
             broker_session::tenant::DEFAULT_TENANT_ID,
+            None,
         );
         assert!(deliveries.is_empty(), "detached queues buffer, not deliver");
         let a = sessions.get("off-a").expect("session a");
@@ -15147,6 +15846,7 @@ mod tests {
                 false,
                 &Bytes::from(vec![i]),
                 broker_session::tenant::DEFAULT_TENANT_ID,
+                None,
             );
             assert!(deliveries.is_empty());
         }
@@ -15293,6 +15993,7 @@ mod tests {
                 false,
                 black_box(&payload),
                 broker_session::tenant::DEFAULT_TENANT_ID,
+                None,
             );
             assert!(deliveries.is_empty());
         }
@@ -15341,6 +16042,7 @@ mod tests {
                 false,
                 black_box(&payload),
                 broker_session::tenant::DEFAULT_TENANT_ID,
+                None,
             );
             assert!(deliveries.is_empty());
         }
@@ -22216,6 +22918,7 @@ mod tests {
                 false,
                 &Bytes::from_static(b"hello"),
                 broker_session::tenant::DEFAULT_TENANT_ID,
+                None,
             );
             assert!(
                 !deliveries.is_empty(),
@@ -22587,5 +23290,533 @@ mod tests {
             "rewrite counters after workload: {:?}",
             shared.router.rewrite_stats()
         );
+    }
+
+    /// RQ-04 helpers: drive events through broker entries, never `fire_*`.
+    /// Each test below creates one event rule, causes the event with real
+    /// broker frames, drains with one probe publish, and reads the rule
+    /// output from a live mailbox. Short sentences only.
+    fn rq04_mailbox(
+        shared: &Shared,
+        conn_id: u64,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<BrokerFrame> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        shared.conns.register(conn_id, tx);
+        rx
+    }
+
+    /// Create one republish rule over an `$events/...` source.
+    /// Production entry: the same `create_rule` the API calls.
+    fn rq04_rule(shared: &Shared, id: &str, source: &str, select: &str, out: &str) {
+        shared
+            .engine
+            .create_rule(
+                id.to_string(),
+                TopicFilter::new("#").expect("filter parses"),
+                Some(format!("SELECT {select} FROM \"{source}\"")),
+                true,
+                vec![broker_rules::RuleAction::Republish {
+                    topic: Topic::new(out).expect("out topic parses"),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("rule creates");
+    }
+
+    /// Bind one client through the broker bind entry. Fails on refusal.
+    async fn rq04_bind(shared: &Shared, conn_id: u64, seq: u64, client_id: &str) {
+        let frame = bind_frame(conn_id, seq, encode_bind_meta(client_id, true, 60));
+        let reply = apply_bind(&frame, shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "bind must accept {client_id}");
+    }
+
+    /// Subscribe one client through the broker subscribe entry.
+    async fn rq04_subscribe(
+        shared: &Shared,
+        conn_id: u64,
+        seq: u64,
+        client_id: &str,
+        filter: &str,
+    ) {
+        let frame = subscribe_frame(
+            conn_id,
+            seq,
+            encode_subscribe_meta(1, client_id, &[(filter, 0)]),
+        );
+        apply_subscribe(&frame, shared)
+            .await
+            .0
+            .expect("subscribe replies");
+    }
+
+    /// Publish one message through the broker publish entry. Then route
+    /// its fan-out like the live path. Data reaches the mailbox and the
+    /// backlog. Dead drops fire the drop event through the same hook.
+    async fn rq04_publish(shared: &Shared, conn_id: u64, seq: u64, topic: &str, payload: &[u8]) {
+        let (meta, bytes) = encode_publish_meta(topic, seq as u16, 0, false, payload);
+        let frame = publish_frame(conn_id, seq, meta, bytes);
+        let (_, deliveries) = apply_publish(&frame, shared).await;
+        route_publish_out_deliveries(shared, &frame, deliveries);
+    }
+
+    /// Encode one `UnsubscribeIn` frame. Mirrors the edge contract.
+    fn rq04_unsubscribe_frame(
+        conn_id: u64,
+        seq: u64,
+        packet_id: u16,
+        client_id: &str,
+        filters: &[&str],
+    ) -> BrokerFrame {
+        let id = client_id.as_bytes();
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&packet_id.to_be_bytes());
+        meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+        meta.extend_from_slice(id);
+        meta.extend_from_slice(&(filters.len() as u16).to_be_bytes());
+        for filter in filters {
+            meta.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+            meta.extend_from_slice(filter.as_bytes());
+        }
+        BrokerFrame::new(
+            OpCode::UnsubscribeIn,
+            conn_id,
+            seq,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .expect("valid unsubscribe frame")
+    }
+
+    /// Read every republished JSON body for one connection. Drain the
+    /// mailbox and the QoS 0 backlog. Rule outputs ride QoS 0. Skip
+    /// other frames.
+    fn rq04_collect_outputs(
+        shared: &Shared,
+        conn_id: u64,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<BrokerFrame>,
+        out_topic: &str,
+    ) -> Vec<serde_json::Value> {
+        fn push_frame(frame: &BrokerFrame, out_topic: &str, out: &mut Vec<serde_json::Value>) {
+            if frame.header.opcode != OpCode::PublishOut {
+                return;
+            }
+            let (topic, _, _, _) = decode_publish_meta_parts(&frame.metadata);
+            if topic != out_topic {
+                return;
+            }
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame.payload) {
+                out.push(value);
+            }
+        }
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            push_frame(&frame, out_topic, &mut out);
+        }
+        while let Some(frame) = shared.conns.pop_qos0(conn_id) {
+            push_frame(&frame, out_topic, &mut out);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn rq04_client_connected_through_broker() {
+        let shared = test_shared();
+        // Watcher setup first so its own bind fires with no rule.
+        let mut rx = rq04_mailbox(&shared, 910);
+        rq04_bind(&shared, 910, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 910, 2, "rq04-watcher", "out/connected").await;
+        rq04_rule(
+            &shared,
+            "rq04-connected",
+            "$events/client_connected",
+            "clientid, keepalive, proto_ver, clean_start, conn_ack_code",
+            "out/connected",
+        );
+        rq04_bind(&shared, 911, 1, "rq04-joiner").await;
+        // Probe on the joiner conn drains without a new connect event.
+        rq04_publish(&shared, 911, 2, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 910, &mut rx, "out/connected");
+        assert_eq!(got.len(), 1, "one connect fires once: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-joiner");
+        assert_eq!(got[0]["keepalive"], 60);
+        assert_eq!(got[0]["proto_ver"], 4);
+        assert_eq!(got[0]["clean_start"], true);
+        assert_eq!(got[0]["conn_ack_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn rq04_client_connack_through_broker() {
+        let shared = test_shared();
+        let mut rx = rq04_mailbox(&shared, 920);
+        rq04_bind(&shared, 920, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 920, 2, "rq04-watcher", "out/connack").await;
+        rq04_rule(
+            &shared,
+            "rq04-connack",
+            "$events/client_connack",
+            "clientid, return_code, session_present",
+            "out/connack",
+        );
+        rq04_bind(&shared, 921, 1, "rq04-joiner").await;
+        rq04_publish(&shared, 921, 2, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 920, &mut rx, "out/connack");
+        assert_eq!(got.len(), 1, "one bind fires one connack: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-joiner");
+        assert_eq!(got[0]["return_code"], 0);
+        assert!(got[0].get("session_present").is_some());
+    }
+
+    #[tokio::test]
+    async fn rq04_client_disconnected_clean_through_broker() {
+        let shared = test_shared();
+        let mut rx = rq04_mailbox(&shared, 930);
+        rq04_bind(&shared, 930, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 930, 2, "rq04-watcher", "out/disconnected").await;
+        rq04_rule(
+            &shared,
+            "rq04-disconnected",
+            "$events/client_disconnected",
+            "clientid, reason",
+            "out/disconnected",
+        );
+        rq04_bind(&shared, 931, 1, "rq04-leaver").await;
+        apply_unbind(&unbind_frame(931, 2, "rq04-leaver"), &shared);
+        // Probe on the watcher conn drains without a new connect event.
+        rq04_publish(&shared, 930, 3, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 930, &mut rx, "out/disconnected");
+        assert_eq!(got.len(), 1, "one clean close fires once: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-leaver");
+        assert_eq!(got[0]["reason"], "normal");
+        assert!(got[0].get("disconnect_code").is_none());
+    }
+
+    #[tokio::test]
+    async fn rq04_client_disconnected_tcp_close_through_broker() {
+        let shared = test_shared();
+        let mut rx = rq04_mailbox(&shared, 940);
+        rq04_bind(&shared, 940, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 940, 2, "rq04-watcher", "out/tcpclose").await;
+        rq04_rule(
+            &shared,
+            "rq04-tcpclose",
+            "$events/client_disconnected",
+            "clientid, reason",
+            "out/tcpclose",
+        );
+        rq04_bind(&shared, 941, 1, "rq04-dropped").await;
+        apply_disconnect(&disconnect_frame(941, 2, "rq04-dropped"), &shared).await;
+        rq04_publish(&shared, 940, 3, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 940, &mut rx, "out/tcpclose");
+        assert_eq!(got.len(), 1, "one TCP close fires once: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-dropped");
+        assert_eq!(got[0]["reason"], "tcp_close");
+        assert!(got[0].get("disconnect_code").is_none());
+    }
+
+    #[tokio::test]
+    async fn rq04_authz_subscribe_through_broker() {
+        let shared = test_shared();
+        let mut rx = rq04_mailbox(&shared, 950);
+        rq04_bind(&shared, 950, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 950, 2, "rq04-watcher", "out/authzsub").await;
+        rq04_rule(
+            &shared,
+            "rq04-authzsub",
+            "$events/client_check_authz_complete",
+            "clientid, action, topic, allow, source",
+            "out/authzsub",
+        );
+        rq04_bind(&shared, 951, 1, "rq04-subber").await;
+        rq04_subscribe(&shared, 951, 2, "rq04-subber", "data/authz").await;
+        // Probe on the subber conn drains. It adds one publish check.
+        rq04_publish(&shared, 951, 3, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 950, &mut rx, "out/authzsub");
+        let sub_events: Vec<_> = got
+            .iter()
+            .filter(|v| v["action"] == "subscribe" && v["topic"] == "data/authz")
+            .collect();
+        assert_eq!(sub_events.len(), 1, "one subscribe check: {got:?}");
+        assert_eq!(sub_events[0]["clientid"], "rq04-subber");
+        assert_eq!(sub_events[0]["allow"], true);
+        assert!(sub_events[0]["topic"].is_string());
+        assert!(sub_events[0].get("retain").is_none());
+    }
+
+    #[tokio::test]
+    async fn rq04_authz_publish_through_broker() {
+        let shared = test_shared();
+        let mut rx = rq04_mailbox(&shared, 960);
+        rq04_bind(&shared, 960, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 960, 2, "rq04-watcher", "out/authzpub").await;
+        rq04_rule(
+            &shared,
+            "rq04-authzpub",
+            "$events/client_check_authz_complete",
+            "clientid, action, topic, allow, source, retain",
+            "out/authzpub",
+        );
+        rq04_bind(&shared, 961, 1, "rq04-pubber").await;
+        rq04_publish(&shared, 961, 2, "data/authzpub", b"{}").await;
+        // Probe on the pubber conn drains. It adds one more publish check.
+        rq04_publish(&shared, 961, 3, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 960, &mut rx, "out/authzpub");
+        let pub_events: Vec<_> = got
+            .iter()
+            .filter(|v| v["action"] == "publish" && v["topic"] == "data/authzpub")
+            .collect();
+        assert_eq!(pub_events.len(), 1, "one publish check: {got:?}");
+        assert_eq!(pub_events[0]["clientid"], "rq04-pubber");
+        assert_eq!(pub_events[0]["allow"], true);
+        assert_eq!(pub_events[0]["retain"], false);
+        assert_eq!(pub_events[0]["source"], "local");
+    }
+
+    #[tokio::test]
+    async fn rq04_session_subscribed_through_broker() {
+        let shared = test_shared();
+        let mut rx = rq04_mailbox(&shared, 970);
+        rq04_bind(&shared, 970, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 970, 2, "rq04-watcher", "out/subbed").await;
+        rq04_rule(
+            &shared,
+            "rq04-subbed",
+            "$events/session_subscribed",
+            "clientid, topic, qos",
+            "out/subbed",
+        );
+        rq04_bind(&shared, 971, 1, "rq04-subber").await;
+        rq04_subscribe(&shared, 971, 2, "rq04-subber", "data/subbed").await;
+        rq04_publish(&shared, 971, 3, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 970, &mut rx, "out/subbed");
+        let ours: Vec<_> = got.iter().filter(|v| v["topic"] == "data/subbed").collect();
+        assert_eq!(ours.len(), 1, "one subscribe fires once: {got:?}");
+        assert_eq!(ours[0]["clientid"], "rq04-subber");
+        assert_eq!(ours[0]["qos"], 0);
+    }
+
+    #[tokio::test]
+    async fn rq04_session_unsubscribed_through_broker() {
+        let shared = test_shared();
+        let mut rx = rq04_mailbox(&shared, 980);
+        rq04_bind(&shared, 980, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 980, 2, "rq04-watcher", "out/unsubbed").await;
+        rq04_rule(
+            &shared,
+            "rq04-unsubbed",
+            "$events/session_unsubscribed",
+            "clientid, topic",
+            "out/unsubbed",
+        );
+        rq04_bind(&shared, 981, 1, "rq04-subber").await;
+        rq04_subscribe(&shared, 981, 2, "rq04-subber", "data/unsub").await;
+        apply_unsubscribe(
+            &rq04_unsubscribe_frame(981, 3, 7, "rq04-subber", &["data/unsub"]),
+            &shared,
+        )
+        .await;
+        rq04_publish(&shared, 981, 4, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 980, &mut rx, "out/unsubbed");
+        assert_eq!(got.len(), 1, "one unsubscribe fires once: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-subber");
+        assert_eq!(got[0]["topic"], "data/unsub");
+    }
+
+    #[tokio::test]
+    async fn rq04_message_delivered_through_broker() {
+        let shared = test_shared();
+        let mut rx_watcher = rq04_mailbox(&shared, 990);
+        let mut rx_sub = rq04_mailbox(&shared, 991);
+        rq04_bind(&shared, 990, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 990, 2, "rq04-watcher", "out/delivered").await;
+        rq04_bind(&shared, 991, 1, "rq04-sub").await;
+        rq04_subscribe(&shared, 991, 2, "rq04-sub", "data/delivered").await;
+        rq04_rule(
+            &shared,
+            "rq04-delivered",
+            "$events/message_delivered",
+            "clientid, topic, qos",
+            "out/delivered",
+        );
+        rq04_bind(&shared, 992, 1, "rq04-pub").await;
+        rq04_publish(&shared, 992, 2, "data/delivered", b"{\"v\": 1}").await;
+        // Probe on the pub conn drains without new deliveries.
+        rq04_publish(&shared, 992, 3, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 990, &mut rx_watcher, "out/delivered");
+        assert_eq!(got.len(), 1, "one delivery fires once: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-sub");
+        assert_eq!(got[0]["topic"], "data/delivered");
+        assert_eq!(got[0]["qos"], 0);
+        // The subscriber still gets the data itself through the broker.
+        let data = rq04_collect_outputs(&shared, 991, &mut rx_sub, "data/delivered");
+        assert_eq!(data.len(), 1, "data must still deliver");
+    }
+
+    #[tokio::test]
+    async fn rq04_message_acked_through_broker() {
+        let shared = test_shared();
+        let mut rx_watcher = rq04_mailbox(&shared, 1000);
+        let mut rx_sub = rq04_mailbox(&shared, 1001);
+        rq04_bind(&shared, 1000, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 1000, 2, "rq04-watcher", "out/acked").await;
+        rq04_bind(&shared, 1001, 1, "rq04-sub").await;
+        let sub_frame = subscribe_frame(
+            1001,
+            2,
+            encode_subscribe_meta(11, "rq04-sub", &[("data/acked", 1)]),
+        );
+        apply_subscribe(&sub_frame, &shared)
+            .await
+            .0
+            .expect("subscribe replies");
+        rq04_rule(
+            &shared,
+            "rq04-acked",
+            "$events/message_acked",
+            "clientid, topic, msg_id",
+            "out/acked",
+        );
+        rq04_bind(&shared, 1002, 1, "rq04-pub").await;
+        let (meta, bytes) = encode_publish_meta("data/acked", 5, 1, false, b"hi");
+        let pub_frame = publish_frame(1002, 2, meta, bytes);
+        let (_, deliveries) = apply_publish(&pub_frame, &shared).await;
+        route_publish_out_deliveries(&shared, &pub_frame, deliveries);
+        // Read the downlink packet id from the subscriber mailbox.
+        let mut packet_id: Option<u16> = None;
+        while let Ok(frame) = rx_sub.try_recv() {
+            if frame.header.opcode != OpCode::PublishOut {
+                continue;
+            }
+            let (topic, pid, _, _) = decode_publish_meta_parts(&frame.metadata);
+            if topic == "data/acked" {
+                packet_id = Some(pid);
+            }
+        }
+        let packet_id = packet_id.expect("subscriber must get QoS 1 delivery");
+        apply_puback(&puback_frame(1001, 3, packet_id), &shared);
+        rq04_bind(&shared, 1003, 1, "rq04-probe").await;
+        rq04_publish(&shared, 1003, 2, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 1000, &mut rx_watcher, "out/acked");
+        assert_eq!(got.len(), 1, "one ack fires once: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-sub");
+        assert_eq!(got[0]["topic"], "data/acked");
+        assert_eq!(got[0]["msg_id"], packet_id);
+    }
+
+    #[tokio::test]
+    async fn rq04_message_dropped_quota_through_broker() {
+        use broker_auth::UserQuotas;
+        let shared = test_shared();
+        // Watcher binds first while the user store is still empty.
+        let mut rx = rq04_mailbox(&shared, 1010);
+        rq04_bind(&shared, 1010, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 1010, 2, "rq04-watcher", "out/dropped").await;
+        rq04_rule(
+            &shared,
+            "rq04-dropped",
+            "$events/message_dropped",
+            "clientid, topic, reason",
+            "out/dropped",
+        );
+        shared.auth.add_user("rq04-fast", b"pw").expect("user adds");
+        shared
+            .auth
+            .set_quotas(
+                "rq04-fast",
+                UserQuotas {
+                    max_connections: None,
+                    max_publish_rate: Some(1),
+                    max_publish_burst: Some(1),
+                },
+            )
+            .expect("quota sets");
+        // Capped publisher binds with credentials through the broker.
+        let frame = bind_frame(
+            1011,
+            1,
+            encode_bind_meta_creds("rq04-throttled", true, 60, "rq04-fast", b"pw"),
+        );
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        // First publish routes. Second exceeds the burst and drops.
+        let (meta, bytes) = encode_publish_meta("data/drop", 1, 0, false, b"one");
+        apply_publish(&publish_frame(1011, 2, meta, bytes), &shared).await;
+        let (meta, bytes) = encode_publish_meta("data/drop", 2, 0, false, b"two");
+        apply_publish(&publish_frame(1011, 3, meta, bytes), &shared).await;
+        // Probe on the unlimited watcher conn drains the queued event.
+        rq04_publish(&shared, 1010, 9, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 1010, &mut rx, "out/dropped");
+        assert_eq!(got.len(), 1, "one quota drop fires once: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-throttled");
+        assert_eq!(got[0]["topic"], "data/drop");
+        assert_eq!(got[0]["reason"], "quota_exceeded");
+    }
+
+    #[tokio::test]
+    async fn rq04_delivery_dropped_dead_mailbox_through_broker() {
+        let shared = test_shared();
+        rq04_rule(
+            &shared,
+            "rq04-ddropped",
+            "$events/delivery_dropped",
+            "clientid, topic, reason",
+            "out/ddropped",
+        );
+        let mut rx_watcher = rq04_mailbox(&shared, 1020);
+        rq04_bind(&shared, 1020, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 1020, 2, "rq04-watcher", "out/ddropped").await;
+        let _ = rq04_collect_outputs(&shared, 1020, &mut rx_watcher, "out/ddropped");
+        // Subscriber joins, then its mailbox dies while routing state stays.
+        let _rx_dead = rq04_mailbox(&shared, 1021);
+        rq04_bind(&shared, 1021, 1, "rq04-dead").await;
+        rq04_subscribe(&shared, 1021, 2, "rq04-dead", "data/dead").await;
+        shared.conns.unregister(1021);
+        rq04_bind(&shared, 1022, 1, "rq04-pub").await;
+        rq04_publish(&shared, 1022, 2, "data/dead", b"lost").await;
+        rq04_bind(&shared, 1023, 1, "rq04-probe").await;
+        rq04_publish(&shared, 1023, 2, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 1020, &mut rx_watcher, "out/ddropped");
+        assert_eq!(got.len(), 1, "one dead mailbox fires once: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-dead");
+        assert_eq!(got[0]["topic"], "data/dead");
+        assert_eq!(got[0]["reason"], "dead_mailbox");
+    }
+
+    #[tokio::test]
+    async fn rq04_other_tenant_event_reaches_no_rule() {
+        let shared = test_shared();
+        let mut rx_watcher = rq04_mailbox(&shared, 1030);
+        let mut rx_sub = rq04_mailbox(&shared, 1031);
+        rq04_bind(&shared, 1030, 1, "rq04-watcher").await;
+        rq04_subscribe(&shared, 1030, 2, "rq04-watcher", "out/tenant").await;
+        rq04_bind(&shared, 1031, 1, "rq04-sub").await;
+        rq04_subscribe(&shared, 1031, 2, "rq04-sub", "data/tenant").await;
+        rq04_rule(
+            &shared,
+            "rq04-tenant",
+            "$events/message_delivered",
+            "clientid, topic",
+            "out/tenant",
+        );
+        // Foreign publisher moves to another tenant before it publishes.
+        // Its publish must neither deliver nor fire an event to the rule.
+        rq04_bind(&shared, 1032, 1, "rq04-foreign-pub").await;
+        if let Some(session) = shared.sessions.get("rq04-foreign-pub") {
+            session.set_tenant_id("acme".to_string());
+        }
+        rq04_publish(&shared, 1032, 2, "data/tenant", b"{\"v\": 0}").await;
+        // Default publisher delivers and fires through the broker.
+        rq04_bind(&shared, 1033, 1, "rq04-default-pub").await;
+        rq04_publish(&shared, 1033, 2, "data/tenant", b"{\"v\": 1}").await;
+        rq04_publish(&shared, 1033, 3, "probe/drain", b"{}").await;
+        let got = rq04_collect_outputs(&shared, 1030, &mut rx_watcher, "out/tenant");
+        assert_eq!(got.len(), 1, "only the default tenant fires: {got:?}");
+        assert_eq!(got[0]["clientid"], "rq04-sub");
+        assert_eq!(got[0]["topic"], "data/tenant");
+        // The foreign publish never reaches the default subscriber.
+        // Only the default data frame arrives on the data topic.
+        let data = rq04_collect_outputs(&shared, 1031, &mut rx_sub, "data/tenant");
+        assert_eq!(data.len(), 1, "only default data delivers: {data:?}");
     }
 }

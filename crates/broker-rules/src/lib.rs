@@ -7,6 +7,14 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use rekuiper_core::{RuleCounters, StreamBus, StreamReceiver, StreamSender};
 use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
+use tokio::sync::{mpsc, Mutex};
 
 /// Rule-engine settings store: validated structs, registry persistence and
 /// the subscriber callback feeding the fire-path snapshot (W3-10).
@@ -19,7 +27,6 @@ pub mod spill;
 /// Standard rule SQL dialect front end: parser plus lowering onto the
 /// streaming engine's AST (one engine, one fast path).
 pub mod std_sql;
-
 /// Standard rule-dialect built-in functions (RQ-03): inventory in
 /// `FUNCTIONS.md`, implementations registered as user functions on the
 /// streaming engine's public registry. No engine source is changed.
@@ -34,14 +41,6 @@ pub mod runtime;
 /// The streaming-SQL function catalog (name, category, aggregate flag,
 /// arity, example) served to the dashboard SQL studio.
 pub use rekuiper_sql::{builtin_function_metadata, FunctionMeta};
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
-use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
 
 pub use engine_config::{EngineConfigStore, EngineConfigSubscriber, EngineConfigUpdateError};
 use spill::SpillLog;
@@ -49,6 +48,139 @@ pub use spill::{
     SpillConfig, SpillOutcome, SpillStats, DEFAULT_SPILL_MAX_BYTES, DEFAULT_SPILL_SEGMENT_MAX_BYTES,
 };
 pub use std_sql::{ForeachPlan, StdParseError, StdRule, StdSource};
+
+/// Event source identifiers served by the rule engine (RQ-04).
+/// The kernel fires each source at the point the event happens.
+/// A rule names the source in its FROM clause
+/// (for example "$events/client_connected").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSource {
+    ClientConnected,
+    ClientDisconnected,
+    ClientConnack,
+    ClientCheckAuthzComplete,
+    SessionSubscribed,
+    SessionUnsubscribed,
+    MessageDelivered,
+    MessageAcked,
+    MessageDropped,
+    DeliveryDropped,
+}
+
+impl EventSource {
+    /// The canonical source name used in FROM clauses.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            EventSource::ClientConnected => "$events/client_connected",
+            EventSource::ClientDisconnected => "$events/client_disconnected",
+            EventSource::ClientConnack => "$events/client_connack",
+            EventSource::ClientCheckAuthzComplete => "$events/client_check_authz_complete",
+            EventSource::SessionSubscribed => "$events/session_subscribed",
+            EventSource::SessionUnsubscribed => "$events/session_unsubscribed",
+            EventSource::MessageDelivered => "$events/message_delivered",
+            EventSource::MessageAcked => "$events/message_acked",
+            EventSource::MessageDropped => "$events/message_dropped",
+            EventSource::DeliveryDropped => "$events/delivery_dropped",
+        }
+    }
+
+    /// The canonical list of all event sources served by this broker. This
+    /// array is the single source of truth for the variant count: [`COUNT`]
+    /// and every caller of [`all`] derive from it, so adding a source grows
+    /// the per-source flags array in one place instead of a second magic
+    /// number.
+    const ALL: &'static [EventSource] = &[
+        EventSource::ClientConnected,
+        EventSource::ClientDisconnected,
+        EventSource::ClientConnack,
+        EventSource::ClientCheckAuthzComplete,
+        EventSource::SessionSubscribed,
+        EventSource::SessionUnsubscribed,
+        EventSource::MessageDelivered,
+        EventSource::MessageAcked,
+        EventSource::MessageDropped,
+        EventSource::DeliveryDropped,
+    ];
+
+    /// Number of event sources served by this broker (the length of
+    /// [`ALL`]). Used to size the per-source `event_flags` array so its
+    /// length is derived from the source inventory rather than a hardcoded
+    /// count.
+    const COUNT: usize = Self::ALL.len();
+
+    /// All event sources served by this broker.
+    pub fn all() -> &'static [EventSource] {
+        Self::ALL
+    }
+
+    /// Parse a source name from a rule's FROM clause.
+    pub fn parse(name: &str) -> Option<Self> {
+        EventSource::all()
+            .iter()
+            .find(|s| s.as_str() == name)
+            .copied()
+    }
+
+    /// Field names this event source provides in the rule record.
+    /// Used by the rule-events endpoint to document available fields.
+    pub fn fields(&self) -> &'static [&'static str] {
+        match self {
+            EventSource::ClientConnected => &[
+                "clientid",
+                "username",
+                "peerhost",
+                "keepalive",
+                "proto_ver",
+                "clean_start",
+                "conn_ack_code",
+            ],
+            EventSource::ClientDisconnected => &[
+                "clientid",
+                "username",
+                "peerhost",
+                "reason",
+                "disconnect_code",
+            ],
+            EventSource::ClientConnack => &[
+                "clientid",
+                "username",
+                "peerhost",
+                "return_code",
+                "session_present",
+            ],
+            EventSource::ClientCheckAuthzComplete => &[
+                "clientid", "username", "peerhost", "action", "topic", "qos", "retain", "allow",
+                "source",
+            ],
+            EventSource::SessionSubscribed => &[
+                "clientid", "username", "peerhost", "topic", "qos", "nl", "rap", "rh",
+            ],
+            EventSource::SessionUnsubscribed => &["clientid", "username", "peerhost", "topic"],
+            EventSource::MessageDelivered => &[
+                "clientid", "username", "peerhost", "topic", "qos", "retain", "payload", "msg_id",
+            ],
+            EventSource::MessageAcked => {
+                &["clientid", "username", "peerhost", "topic", "qos", "msg_id"]
+            }
+            EventSource::MessageDropped => {
+                &["clientid", "username", "peerhost", "topic", "qos", "reason"]
+            }
+            EventSource::DeliveryDropped => {
+                &["clientid", "username", "peerhost", "topic", "qos", "reason"]
+            }
+        }
+    }
+}
+
+/// Information about an event source for the rule-events endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventSourceInfo {
+    /// The canonical source name (e.g., "$events/client_connected").
+    pub name: String,
+    /// Field names available in the event record.
+    pub fields: Vec<String>,
+}
 
 #[derive(Error, Debug)]
 pub enum RuleEngineError {
@@ -202,11 +334,7 @@ pub fn apply_transform_steps(
                         // fans out. `ignore` keeps the previous topic
                         // and continues; `drop` and `disconnect` shed
                         // the message.
-                        // TODO(parity): does `disconnect` close the
-                        // publisher connection or only shed the
-                        // message? The rulebook does not decide; the
-                        // current choice sheds the message like `drop`
-                        // until the checker pins it.
+                        // TODO(parity): Does disconnect close the connection or shed only the message?
                         if step.failure_action == "ignore" {
                             continue;
                         }
@@ -742,6 +870,30 @@ impl BoundedEventInput {
         event
     }
 
+    /// Non-blocking dequeue: returns one event if immediately available
+    /// in memory or on disk, otherwise `None`. Unlike [`next_event`],
+    /// this never pends — used by `dispatch_ingress` to drain
+    /// event-source events pushed by `fire_event` after every ingress.
+    pub async fn try_dequeue(&self) -> Option<StreamEvent> {
+        // Fast path: one short channel lock, released before any disk.
+        {
+            let mut rx = self.rx.lock().await;
+            match rx.try_recv() {
+                Ok(event) => return Some(event),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    drop(rx);
+                    return self.replay_one_locked();
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        // Memory empty: one disk replay with no channel lock held.
+        if let Some(event) = self.replay_one_locked() {
+            return Some(event);
+        }
+        None
+    }
+
     /// Take the next queued event (consumer side): memory first (it
     /// always predates the disk backlog under sticky spill), then one
     /// disk replay, then pend for the next memory arrival. A pending
@@ -851,8 +1003,9 @@ pub struct Rule {
     pub std_foreach: Option<ForeachPlan>,
     /// Standard-dialect `FROM` sources as written. Consulted on the deliver
     /// path: `Topic` filters must match the ingress topic, `Event` sources
-    /// match nothing until event sources exist (fail closed), `Stream`
-    /// sources constrain nothing. Empty for pre-front-end rules.
+    /// match their own `$events/...` topic on the drain path (and match
+    /// nothing on MQTT ingress, keeping event-only rules fail-closed),
+    /// `Stream` sources constrain nothing. Empty for pre-front-end rules.
     #[serde(skip_serializing)]
     pub std_sources: Vec<StdSource>,
     /// True when the standard select list holds a top-level `*`. Consulted
@@ -913,11 +1066,7 @@ impl ActionCounters {
 /// An `inflight` gauge is deliberately omitted: the broker hands each fire
 /// to the connector `send` and does not track per-action in-flight depth,
 /// and a constant standing in for it would be worse than a missing field.
-// TODO(parity): which counter names plus envelope shapes does the documented
-// spec require beyond `total`/`success`/`failed` (rates, node rows, ...)?
-// The rulebook does not decide the exact shape; the current choice reports
-// the honest live subset the fire path can attribute and omits the rest
-// until the checker pins it.
+// TODO(parity): Which action counters does the specification require beyond total, success, failed?
 #[derive(Debug, Default)]
 pub struct ActionMetrics {
     /// Fires attributed to this action id (success plus failure).
@@ -974,11 +1123,7 @@ impl ActionMetrics {
 /// omitted: the broker does not track per-source queue depth, retry state
 /// or drop causes, and a constant standing in for a measurement would be
 /// worse than a missing field.
-// TODO(parity): which counter names plus envelope shapes does the documented
-// spec require beyond `received`/`dropped` (matched, success, failed, rates,
-// node rows, ...)? The rulebook does not decide the exact shape; the current
-// choice reports the honest live subset the ingress path can attribute and
-// omits the rest rather than inventing constants, until the checker pins it.
+// TODO(parity): Which source counters does the specification require beyond received and dropped?
 #[derive(Debug, Default)]
 pub struct SourceMetrics {
     /// Ingress messages attributed to this source while enabled.
@@ -1025,11 +1170,7 @@ impl SourceMetrics {
 /// hit). `succeeded` counts runs that apply without shedding.
 /// `failed` counts runs that shed the message. A shed stops the chain,
 /// so later steps observe nothing for that ingress.
-// TODO(parity): which counter names plus envelope shapes does the documented
-// spec require beyond `matched`/`succeeded`/`failed` (rates, node rows,
-// ...)? The rulebook does not decide the exact shape; the current choice
-// reports the honest live subset the ingress path attributes and omits
-// the rest rather than inventing constants, until the checker pins it.
+// TODO(parity): Which transform counters does the specification require beyond matched, succeeded, failed?
 #[derive(Debug, Default)]
 pub struct TransformMetrics {
     /// Ingress runs attributed to this name (enabled plus filter hit).
@@ -1213,6 +1354,10 @@ pub struct RuleEngine {
     /// the same as the disabled snapshot above — the publish path must
     /// never take a management lock.
     source_metrics: Arc<arc_swap::ArcSwap<HashMap<String, Arc<SourceMetrics>>>>,
+    /// True when at least one source metric record exists (W3-29).
+    /// Lets `dispatch_ingress` skip the source snapshots with one
+    /// relaxed load when no source exists.
+    source_any: AtomicBool,
     /// Embedded rule runtime transport: one [`rekuiper_core::StreamBus`]
     /// per engine plus its send handle for [`runtime::RULE_INGRESS_STREAM`].
     /// Every windowed rule's task subscribes; the publish path hands each
@@ -1238,10 +1383,10 @@ pub struct RuleEngine {
     /// management plane swaps the whole struct on every validated engine
     /// write (via [`RuleEngine::apply_engine_config`], fed by the
     /// [`EngineConfigStore`] subscriber), and the publish path loads one
-    /// `Arc` per ingress with no registry or store lock. Fixed struct, so
-    /// no list or cache grows on the message path. Reason for `ArcSwap`:
-    /// the publish path must never take a management lock, and the sys
-    /// check below stays a lock-free `Arc` clone plus one prefix test.
+    /// `Arc` only for system topics with no registry or store lock.
+    /// Fixed struct, so no list or cache grows on the message path.
+    /// Reason for `ArcSwap`: the publish path must never take a
+    /// management lock, and plain traffic pays no settings load.
     engine_config: Arc<arc_swap::ArcSwap<broker_config::RuleEngineConf>>,
     /// Lock-free message-transformation chain for the ingress path
     /// (W3-32): the management plane swaps the whole ordered chain on
@@ -1260,6 +1405,20 @@ pub struct RuleEngine {
     /// Reason for `ArcSwap`: the same as the chain above — the publish
     /// path must never take a management lock.
     transform_metrics: Arc<arc_swap::ArcSwap<HashMap<String, Arc<TransformMetrics>>>>,
+    /// Per-event-source selection flags (RQ-04). One AtomicBool per
+    /// EventSource variant; set when any enabled rule selects that source.
+    /// Checked before building an event record so firing costs nothing when
+    /// no rule selects it. Updated in `create_rule`, `remove_rule`,
+    /// `set_rule_enabled` and `seed_from_snapshot`. Its length is
+    /// [`EventSource`]'s variant count, not a second hardcoded number.
+    event_flags: [AtomicBool; EventSource::COUNT],
+    /// Aggregate drain gate (RQ-04): true when at least one event source is
+    /// selected by an enabled rule. Lets `dispatch_ingress` skip the
+    /// event-queue drain on the publish hot path with one relaxed load and
+    /// zero locks when no rule selects any event source. Kept in sync with
+    /// `event_flags` on every rule mutation and cleared in
+    /// `seed_from_snapshot`.
+    event_any_selected: AtomicBool,
 }
 
 /// Shared flush context: what a rule-task sink worker needs at emit time.
@@ -1468,6 +1627,116 @@ pub trait WindowExecutor: Send + Sync {
     fn worker_count(&self) -> usize;
 }
 
+/// Event firing argument structs (RQ-04).
+/// Group arguments to avoid clippy::too_many_arguments.
+/// Arguments for $events/client_connected
+pub struct ClientConnectedEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub keepalive: u16,
+    pub proto_ver: u8,
+    pub clean_start: bool,
+    pub conn_ack_code: u8,
+}
+
+/// Arguments for $events/client_disconnected
+/// The edge forwards no reason code, so the code stays absent.
+/// The record omits it when unknown.
+pub struct ClientDisconnectedEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub reason: String,
+    pub disconnect_code: Option<u8>,
+}
+
+/// Arguments for $events/client_connack
+pub struct ClientConnackEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub return_code: u8,
+    pub session_present: bool,
+}
+
+/// Arguments for $events/client_check_authz_complete
+/// Subscribe carries no retain flag, so retain stays absent there.
+/// The record omits it when unknown.
+pub struct ClientCheckAuthzCompleteEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub action: String,
+    pub topic: String,
+    pub qos: u8,
+    pub retain: Option<bool>,
+    pub allow: bool,
+    pub source: String,
+}
+
+/// Arguments for $events/session_subscribed
+pub struct SessionSubscribedEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub topic: String,
+    pub qos: u8,
+    pub nl: u8,
+    pub rap: u8,
+    pub rh: u8,
+}
+
+/// Arguments for $events/session_unsubscribed
+pub struct SessionUnsubscribedEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub topic: String,
+}
+
+/// Arguments for $events/message_delivered
+pub struct MessageDeliveredEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub topic: String,
+    pub qos: u8,
+    pub retain: bool,
+    pub payload: Bytes,
+    pub msg_id: Option<u16>,
+}
+
+/// Arguments for $events/message_acked
+pub struct MessageAckedEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub topic: String,
+    pub qos: u8,
+    pub msg_id: u16,
+}
+
+/// Arguments for $events/message_dropped
+pub struct MessageDroppedEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub topic: String,
+    pub qos: u8,
+    pub reason: String,
+}
+
+/// Arguments for $events/delivery_dropped
+pub struct DeliveryDroppedEvent {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub peerhost: Option<String>,
+    pub topic: String,
+    pub qos: u8,
+    pub reason: String,
+}
+
 impl RuleEngine {
     /// Create an engine with a bounded ingress queue (`capacity` floors at
     /// 1). The queue backs future async ingestion; the hot path calls
@@ -1533,6 +1802,7 @@ impl RuleEngine {
             action_metrics,
             source_disabled,
             source_metrics,
+            source_any: AtomicBool::new(false),
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
@@ -1547,6 +1817,8 @@ impl RuleEngine {
             ))),
             transforms: Arc::new(arc_swap::ArcSwap::from(Arc::new(Vec::new()))),
             transform_metrics,
+            event_flags: std::array::from_fn(|_| AtomicBool::new(false)),
+            event_any_selected: AtomicBool::new(false),
         }
     }
 
@@ -1585,6 +1857,7 @@ impl RuleEngine {
             action_metrics,
             source_disabled,
             source_metrics,
+            source_any: AtomicBool::new(false),
             stream_bus,
             ingress_sender,
             rule_tasks: RwLock::new(HashMap::new()),
@@ -1599,6 +1872,8 @@ impl RuleEngine {
             ))),
             transforms: Arc::new(arc_swap::ArcSwap::from(Arc::new(Vec::new()))),
             transform_metrics,
+            event_flags: std::array::from_fn(|_| AtomicBool::new(false)),
+            event_any_selected: AtomicBool::new(false),
         }
     }
 
@@ -1907,6 +2182,8 @@ impl RuleEngine {
         };
         let rule_arc = Arc::new(rule);
         self.rules.write().insert(id.clone(), rule_arc.clone());
+        // Keep event flags in sync (RQ-04): recompute from all rules.
+        self.refresh_event_flags();
         // Eager task start when a runtime is available and the rule is
         // enabled; otherwise the first matching ingress spawns it lazily
         // (see dispatch_ingress). A disabled windowed rule owns no task
@@ -1994,6 +2271,14 @@ impl RuleEngine {
         }
         self.rules.write().clear();
         self.next_id.store(1, Ordering::SeqCst);
+        // Re-seeding replaces every rule, so the RQ-04 event flags and the
+        // aggregate drain gate must clear too: stale flags from a prior seed
+        // would otherwise keep enqueueing events and draining the publish
+        // path even with no event rules selected.
+        for flag in &self.event_flags {
+            flag.store(false, Ordering::Relaxed);
+        }
+        self.event_any_selected.store(false, Ordering::Relaxed);
         for entry in &conf.rules {
             let topic_filter = TopicFilter::new(&entry.topic_filter).map_err(|e| {
                 RuleEngineError::InvalidRule(format!("invalid topic_filter for {}: {e}", entry.id))
@@ -2139,6 +2424,7 @@ impl RuleEngine {
         }
         let removed = self.rules.write().remove(id).is_some();
         if removed {
+            self.refresh_event_flags();
             self.persist()?;
         }
         Ok(removed)
@@ -2158,10 +2444,7 @@ impl RuleEngine {
     /// validated entry (plus the registry save lock on persist); the
     /// publish path keeps reading its per-ingress snapshot and never takes
     /// this lock beyond the snapshot clone in `dispatch_ingress`.
-    // TODO(parity): do per-rule counters reset on a full replace, or are
-    // they preserved across updates? The rulebook does not decide; the
-    // current choice preserves them (the same `Arc`s, mirroring the
-    // per-action continuity) until the checker pins it.
+    // TODO(parity): Do per-rule counters reset on replace or persist across updates?
     pub fn replace_rule(
         &self,
         id: &str,
@@ -2239,6 +2522,7 @@ impl RuleEngine {
         {
             self.ensure_rule_task(&rule_arc);
         }
+        self.refresh_event_flags();
         self.persist()?;
         Ok(Some(rule_arc.as_ref().clone()))
     }
@@ -2250,18 +2534,19 @@ impl RuleEngine {
     /// delivers nothing more, including via another rule's bus fan-out;
     /// re-enabling defers the task to the next matching ingress.
     pub fn set_rule_enabled(&self, id: &str, enabled: bool) -> Result<bool, RuleEngineError> {
-        let found = {
+        let changed = {
             let mut rules = self.rules.write();
             if let Some(arc) = rules.get(id) {
                 let mut rule = arc.as_ref().clone();
+                let was_enabled = rule.enabled;
                 rule.enabled = enabled;
                 rules.insert(id.to_string(), Arc::new(rule));
-                true
+                was_enabled != enabled
             } else {
-                false
+                return Ok(false);
             }
         };
-        if found {
+        if changed {
             if !enabled {
                 if let Some(task) = self.rule_tasks.write().remove(id) {
                     *task.status.write() = "stopped".to_string();
@@ -2270,9 +2555,373 @@ impl RuleEngine {
                     task.sink_worker.abort();
                 }
             }
+            self.refresh_event_flags();
             self.persist()?;
         }
-        Ok(found)
+        Ok(changed)
+    }
+
+    /// Recompute event flags from all enabled rules.
+    /// Runs on rule mutations only, never on the publish path.
+    fn refresh_event_flags(&self) {
+        let mut selected = [false; EventSource::COUNT];
+        {
+            let rules = self.rules.read();
+            for rule in rules.values() {
+                if !rule.enabled {
+                    continue;
+                }
+                for source in &rule.std_sources {
+                    if let StdSource::Event(name) = source {
+                        if let Some(es) = EventSource::parse(name) {
+                            selected[es as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+        for (flag, on) in self.event_flags.iter().zip(selected) {
+            flag.store(on, Ordering::Relaxed);
+        }
+        self.event_any_selected
+            .store(selected.iter().any(|b| *b), Ordering::Relaxed);
+    }
+
+    /// Check if any enabled rule selects the given event source.
+    /// Public so the kernel checks before it takes a lock or clones.
+    #[inline]
+    pub fn is_event_source_selected(&self, source: EventSource) -> bool {
+        self.event_flags[source as usize].load(Ordering::Relaxed)
+    }
+
+    /// True when at least one enabled rule selects any event source.
+    /// Public so the kernel skips all event work on the publish path
+    /// with one relaxed load when no event rule exists.
+    #[inline]
+    pub fn has_any_event_selected(&self) -> bool {
+        self.event_any_selected.load(Ordering::Relaxed)
+    }
+
+    /// Build and fire an event record for the given source.
+    /// Returns early if no rule selects this source (zero cost).
+    /// The `build_record` closure is only called when the flag is set.
+    fn fire_event<F>(&self, source: EventSource, build_record: F)
+    where
+        F: FnOnce() -> HashMap<String, serde_json::Value>,
+    {
+        if !self.is_event_source_selected(source) {
+            return;
+        }
+        let record = build_record();
+        let topic = Topic::new(source.as_str().to_string()).expect("valid event source topic");
+        let payload = Bytes::from(serde_json::to_vec(&record).expect("event record serializes"));
+        // Enqueue for deferred action execution only: matching, matchedCnt
+        // accounting and rule actions all happen once, in the drain loop of
+        // dispatch_ingress (the broker's publish path). fire_event itself
+        // stays synchronous and never snapshots the rule table.
+        let event = StreamEvent::new(topic, payload);
+        // Push to the bounded ingress queue for durability and deferred
+        // action execution; try_push never blocks.
+        let _ = self.input.try_push(event);
+    }
+
+    /// List all event sources served by this broker (RQ-04).
+    /// Returns the source names and their field schemas.
+    pub fn list_event_sources(&self) -> Vec<EventSourceInfo> {
+        EventSource::all()
+            .iter()
+            .map(|es| EventSourceInfo {
+                name: es.as_str().to_string(),
+                fields: es.fields().iter().map(|s| s.to_string()).collect(),
+            })
+            .collect()
+    }
+
+    // --- Event firing methods (RQ-04) ---
+    // Each method builds the event record with the documented fields
+    // and fires it if any rule selects the source.
+
+    /// Fire $events/client_connected
+    pub fn fire_client_connected(&self, event: ClientConnectedEvent) {
+        self.fire_event(EventSource::ClientConnected, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert(
+                "keepalive".to_string(),
+                serde_json::Value::Number(event.keepalive.into()),
+            );
+            m.insert(
+                "proto_ver".to_string(),
+                serde_json::Value::Number(event.proto_ver.into()),
+            );
+            m.insert(
+                "clean_start".to_string(),
+                serde_json::Value::Bool(event.clean_start),
+            );
+            m.insert(
+                "conn_ack_code".to_string(),
+                serde_json::Value::Number(event.conn_ack_code.into()),
+            );
+            m
+        });
+    }
+
+    /// Fire $events/client_disconnected
+    pub fn fire_client_disconnected(&self, event: ClientDisconnectedEvent) {
+        self.fire_event(EventSource::ClientDisconnected, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert(
+                "reason".to_string(),
+                serde_json::Value::String(event.reason),
+            );
+            if let Some(code) = event.disconnect_code {
+                m.insert(
+                    "disconnect_code".to_string(),
+                    serde_json::Value::Number(code.into()),
+                );
+            }
+            m
+        });
+    }
+
+    /// Fire $events/client_connack
+    pub fn fire_client_connack(&self, event: ClientConnackEvent) {
+        self.fire_event(EventSource::ClientConnack, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert(
+                "return_code".to_string(),
+                serde_json::Value::Number(event.return_code.into()),
+            );
+            m.insert(
+                "session_present".to_string(),
+                serde_json::Value::Bool(event.session_present),
+            );
+            m
+        });
+    }
+
+    /// Fire $events/client_check_authz_complete
+    pub fn fire_client_check_authz_complete(&self, event: ClientCheckAuthzCompleteEvent) {
+        self.fire_event(EventSource::ClientCheckAuthzComplete, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert(
+                "action".to_string(),
+                serde_json::Value::String(event.action),
+            );
+            m.insert("topic".to_string(), serde_json::Value::String(event.topic));
+            m.insert(
+                "qos".to_string(),
+                serde_json::Value::Number(event.qos.into()),
+            );
+            if let Some(retain) = event.retain {
+                m.insert("retain".to_string(), serde_json::Value::Bool(retain));
+            }
+            m.insert("allow".to_string(), serde_json::Value::Bool(event.allow));
+            m.insert(
+                "source".to_string(),
+                serde_json::Value::String(event.source),
+            );
+            m
+        });
+    }
+
+    /// Fire $events/session_subscribed
+    pub fn fire_session_subscribed(&self, event: SessionSubscribedEvent) {
+        self.fire_event(EventSource::SessionSubscribed, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert("topic".to_string(), serde_json::Value::String(event.topic));
+            m.insert(
+                "qos".to_string(),
+                serde_json::Value::Number(event.qos.into()),
+            );
+            m.insert("nl".to_string(), serde_json::Value::Number(event.nl.into()));
+            m.insert(
+                "rap".to_string(),
+                serde_json::Value::Number(event.rap.into()),
+            );
+            m.insert("rh".to_string(), serde_json::Value::Number(event.rh.into()));
+            m
+        });
+    }
+
+    /// Fire $events/session_unsubscribed
+    pub fn fire_session_unsubscribed(&self, event: SessionUnsubscribedEvent) {
+        self.fire_event(EventSource::SessionUnsubscribed, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert("topic".to_string(), serde_json::Value::String(event.topic));
+            m
+        });
+    }
+
+    /// Fire $events/message_delivered
+    pub fn fire_message_delivered(&self, event: MessageDeliveredEvent) {
+        self.fire_event(EventSource::MessageDelivered, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert("topic".to_string(), serde_json::Value::String(event.topic));
+            m.insert(
+                "qos".to_string(),
+                serde_json::Value::Number(event.qos.into()),
+            );
+            m.insert("retain".to_string(), serde_json::Value::Bool(event.retain));
+            m.insert(
+                "payload".to_string(),
+                serde_json::Value::String(String::from_utf8_lossy(&event.payload).to_string()),
+            );
+            if let Some(id) = event.msg_id {
+                m.insert("msg_id".to_string(), serde_json::Value::Number(id.into()));
+            }
+            m
+        });
+    }
+
+    /// Fire $events/message_acked
+    pub fn fire_message_acked(&self, event: MessageAckedEvent) {
+        self.fire_event(EventSource::MessageAcked, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert("topic".to_string(), serde_json::Value::String(event.topic));
+            m.insert(
+                "qos".to_string(),
+                serde_json::Value::Number(event.qos.into()),
+            );
+            m.insert(
+                "msg_id".to_string(),
+                serde_json::Value::Number(event.msg_id.into()),
+            );
+            m
+        });
+    }
+
+    /// Fire $events/message_dropped
+    pub fn fire_message_dropped(&self, event: MessageDroppedEvent) {
+        self.fire_event(EventSource::MessageDropped, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert("topic".to_string(), serde_json::Value::String(event.topic));
+            m.insert(
+                "qos".to_string(),
+                serde_json::Value::Number(event.qos.into()),
+            );
+            m.insert(
+                "reason".to_string(),
+                serde_json::Value::String(event.reason),
+            );
+            m
+        });
+    }
+
+    /// Fire $events/delivery_dropped
+    pub fn fire_delivery_dropped(&self, event: DeliveryDroppedEvent) {
+        self.fire_event(EventSource::DeliveryDropped, || {
+            let mut m = HashMap::new();
+            m.insert(
+                "clientid".to_string(),
+                serde_json::Value::String(event.client_id),
+            );
+            if let Some(u) = event.username {
+                m.insert("username".to_string(), serde_json::Value::String(u));
+            }
+            if let Some(p) = event.peerhost {
+                m.insert("peerhost".to_string(), serde_json::Value::String(p));
+            }
+            m.insert("topic".to_string(), serde_json::Value::String(event.topic));
+            m.insert(
+                "qos".to_string(),
+                serde_json::Value::Number(event.qos.into()),
+            );
+            m.insert(
+                "reason".to_string(),
+                serde_json::Value::String(event.reason),
+            );
+            m
+        });
     }
 
     /// Record one action's enable flag in the lock-free dispatch snapshot
@@ -2485,6 +3134,7 @@ impl RuleEngine {
         next.entry(id.to_string())
             .or_insert_with(|| Arc::new(SourceMetrics::new()));
         self.source_metrics.store(Arc::new(next));
+        self.source_any.store(true, Ordering::Relaxed);
     }
 
     /// Drop the per-source metric record for `id` (W3-29, C07-18/19).
@@ -2498,7 +3148,9 @@ impl RuleEngine {
         }
         let mut next = current.as_ref().clone();
         next.remove(id);
+        let empty = next.is_empty();
         self.source_metrics.store(Arc::new(next));
+        self.source_any.store(!empty, Ordering::Relaxed);
     }
 
     /// Rebuild the whole metric map from the live source ids (W3-29,
@@ -2511,7 +3163,9 @@ impl RuleEngine {
         for id in ids {
             next.insert(id.clone(), Arc::new(SourceMetrics::new()));
         }
+        let empty = next.is_empty();
         self.source_metrics.store(Arc::new(next));
+        self.source_any.store(!empty, Ordering::Relaxed);
     }
 
     /// Lock-free snapshot of the per-source metric map for the publish
@@ -2923,6 +3577,12 @@ async fn rule_sink_loop(mut sink_rx: mpsc::Receiver<SinkRow>, bridge: BrokerRule
     }
 }
 
+/// Max event-source events drained per publish ingress on the
+/// memory-only path. Bounds the publish tail so a burst of queued kernel
+/// events cannot stall one delivery; surplus events wait for the next
+/// ingress.
+const EVENT_DRAIN_LIMIT: u32 = 64;
+
 impl RuleEngine {
     /// Execute every enabled rule whose filter matches `topic`.
     /// Delivery QoS per republish is `min(ingress QoS, action QoS)` so a
@@ -2945,12 +3605,9 @@ impl RuleEngine {
         qos: QoS,
         broker_sink: &Arc<dyn BrokerSink>,
     ) -> usize {
-        // W3-10: one lock-free `Arc` clone of the engine settings per
-        // ingress (no registry or store lock, no allocation beyond the
-        // refcount bump). System-message topics are skipped while the flag
-        // holds, before any rule lock is taken.
-        let engine_config = self.engine_config_snapshot();
-        if engine_config.ignore_sys_message && is_system_topic(topic) {
+        // W3-10: skip system topics while the flag holds. Test the
+        // topic first so plain traffic pays no settings load.
+        if is_system_topic(topic) && self.engine_config_snapshot().ignore_sys_message {
             return 0;
         }
         // Snapshot matching rules so the sink (which may touch the router,
@@ -2964,6 +3621,33 @@ impl RuleEngine {
                 .cloned()
                 .collect()
         };
+        // RQ-04 gates: two relaxed loads. They guard the drain below.
+        let events_selected = self.event_any_selected.load(Ordering::Relaxed);
+        let spill = self.input.spill_enabled();
+        // W3-29: attribute ingress only when a source exists. The flag
+        // keeps the empty case to relaxed loads with no map clone.
+        // Every registered source observes every ingress: enabled
+        // sources count `received`, stopped sources shed into `dropped`.
+        // Sources observe raw ingress, so this runs whether or not any
+        // rule matches.
+        if self.source_any.load(Ordering::Relaxed) {
+            let source_metrics = self.source_metrics_snapshot();
+            if !source_metrics.is_empty() {
+                let source_disabled = self.source_disabled_snapshot();
+                attribute_source_ingress(&source_metrics, &source_disabled);
+            }
+        }
+        // Fast path: no rule matched and no drain runs. Skip the
+        // action snapshots below. The window feed stays empty here.
+        if matched.is_empty() && (!events_selected || spill) {
+            if spill {
+                let durability = StreamEvent::new(topic.clone(), payload.clone());
+                // Counted (spilled/dropped) inside `try_push`; overflow
+                // refuses fail-closed without blocking publish.
+                let _ = self.input.try_push(durability);
+            }
+            return 0;
+        }
         // W3-04: one lock-free `Arc` clone of the disabled-action set per
         // ingress (no store lock, no allocation beyond the refcount bump).
         // Disabled forwards are skipped at fire time below and in
@@ -2974,17 +3658,6 @@ impl RuleEngine {
         // bump). Forward outcomes attribute through it below and in
         // `BrokerRuleSink::emit` for window flushes.
         let action_metrics = self.action_metrics_snapshot();
-        // W3-29: one lock-free `Arc` clone each of the per-source metric
-        // map and the stopped-source set per ingress (no store lock, no
-        // allocation beyond the refcount bumps). Every registered source
-        // observes every ingress: enabled sources count `received`,
-        // stopped sources shed into `dropped`. Sources observe raw
-        // ingress, so this runs whether or not any rule matches.
-        let source_metrics = self.source_metrics_snapshot();
-        if !source_metrics.is_empty() {
-            let source_disabled = self.source_disabled_snapshot();
-            attribute_source_ingress(&source_metrics, &source_disabled);
-        }
         for rule in &matched {
             rule.matched_cnt.fetch_add(1, Ordering::Relaxed);
         }
@@ -3028,6 +3701,17 @@ impl RuleEngine {
                 .await;
             }
         }
+        // Drain pending event-source events so their rule actions run
+        // on the publish path. The gate uses the loads above. The
+        // drain body lives in a cold helper so the hot path keeps
+        // no event code inline. Drain at most EVENT_DRAIN_LIMIT
+        // events per call. Surplus events wait for the next ingress.
+        // Memory-only engines only; spill-backed engines drain
+        // via the spill driver.
+        if events_selected && !spill {
+            self.drain_event_queue(broker_sink, &disabled, &action_metrics)
+                .await;
+        }
         if !windowed.is_empty() {
             self.feed_rule_runtime(&windowed, topic, payload, qos).await;
         }
@@ -3053,13 +3737,91 @@ impl RuleEngine {
         // consult `crates/broker-rules/src/spill.rs:580`
         // (`SpillLog::spill`) and replays consult
         // `crates/broker-rules/src/spill.rs:637` (`SpillLog::replay_one`).
-        if self.input.spill_enabled() {
+        if spill {
             let durability = StreamEvent::new(topic.clone(), payload.clone());
             // Counted (spilled/dropped) inside `try_push`; overflow
             // refuses fail-closed without blocking publish.
             let _ = self.input.try_push(durability);
         }
         matched.len()
+    }
+
+    /// Drain queued event-source events and run their rule actions.
+    /// `dispatch_ingress` calls this only when the gate is set.
+    /// It stays out of line so the hot path stays small.
+    /// Drain at most EVENT_DRAIN_LIMIT events per call.
+    /// Surplus events wait for the next ingress.
+    #[inline(never)]
+    async fn drain_event_queue(
+        &self,
+        broker_sink: &Arc<dyn BrokerSink>,
+        disabled: &HashSet<String>,
+        action_metrics: &HashMap<String, Arc<ActionMetrics>>,
+    ) {
+        let mut drained = 0u32;
+        while drained < EVENT_DRAIN_LIMIT {
+            if let Some(event) = self.input.try_dequeue().await {
+                let matched_evt: Vec<Arc<Rule>> = {
+                    let rules = self.rules.read();
+                    rules
+                        .values()
+                        .filter(|r| {
+                            r.enabled
+                                && r.topic_filter.matches(&event.topic)
+                                && std_sources_match(&r.std_sources, &event.topic)
+                        })
+                        .cloned()
+                        .collect()
+                };
+                // Windowed event rules join the runtime bus per event.
+                let mut windowed_for_event: Vec<Arc<Rule>> = Vec::new();
+                for rule in &matched_evt {
+                    rule.matched_cnt.fetch_add(1, Ordering::Relaxed);
+                    if rule
+                        .parsed_query
+                        .as_ref()
+                        .is_some_and(|stmt| stmt.window.is_some())
+                    {
+                        windowed_for_event.push(rule.clone());
+                        continue;
+                    }
+                    let outputs = apply_rule(rule, &event.topic, &event.payload, QoS::AtMostOnce);
+                    if outputs.is_empty() {
+                        rule.failed_cnt.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    rule.passed_cnt.fetch_add(1, Ordering::Relaxed);
+                    for data in outputs {
+                        run_actions(
+                            &rule.id,
+                            &rule.actions,
+                            &event.topic,
+                            data,
+                            QoS::AtMostOnce,
+                            &self.connectors,
+                            Some(broker_sink),
+                            &ActionCounters::from_rule(rule),
+                            &self.forward_throttle,
+                            disabled,
+                            action_metrics,
+                        )
+                        .await;
+                    }
+                }
+                if !windowed_for_event.is_empty() {
+                    self.feed_rule_runtime(
+                        &windowed_for_event,
+                        &event.topic,
+                        &event.payload,
+                        QoS::AtMostOnce,
+                    )
+                    .await;
+                }
+                drained += 1;
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -3102,15 +3864,8 @@ fn attribute_source_ingress(
 /// relaxed `fetch_add`s, no lock, no per-fire allocation). Unknown ids
 /// (plain connectors with no action record) move only the per-rule
 /// counters, never the per-action map.
-// TODO(parity): do skipped disabled forwards count in the rule
-// `actions.total` metrics, or are they invisible until re-enabled? The
-// rulebook does not decide; the current choice leaves all three counters
-// untouched (the action never fired) until the checker pins it.
-// TODO(parity): do skipped disabled forwards count in the per-action
-// `total` metrics, or are they invisible until re-enabled? The rulebook
-// does not decide; the current choice leaves the per-action counters
-// untouched too (the action never fired), mirroring the per-rule choice
-// until the checker pins it.
+// TODO(parity): Do skipped disabled forwards count in rule action totals?
+// TODO(parity): Do skipped disabled forwards count in per-action totals?
 #[allow(clippy::too_many_arguments)]
 async fn run_actions(
     rule_id: &str,
@@ -3652,10 +4407,13 @@ fn parse_rule_sql(sql: &str) -> Result<ParsedStdRule, RuleEngineError> {
 /// True when the ingress topic may execute this standard rule's statement.
 ///
 /// `Topic` sources must match (via [`TopicFilter::matches`]); `Event`
-/// sources (`"$events/..."`, built in RQ-04) match nothing yet so a rule
-/// over only events never fires on MQTT ingress (fail closed); `Stream`
-/// sources (bare names, the streaming extension) constrain nothing. An
-/// empty source list is a pre-front-end rule and constrains nothing.
+/// sources (`"$events/..."`, built in RQ-04) match their own event topic so
+/// an event rule runs its actions once on the drain path; they are enqueued
+/// only by the kernel `fire_*` entry points and never arrive on MQTT
+/// ingress, so a rule over only events still never fires on MQTT ingress
+/// (fail closed); `Stream` sources (bare names, the streaming extension)
+/// constrain nothing. An empty source list is a pre-front-end rule and
+/// constrains nothing.
 fn std_sources_match(sources: &[StdSource], topic: &Topic) -> bool {
     if sources.is_empty() {
         return true;
@@ -3675,7 +4433,17 @@ fn std_sources_match(sources: &[StdSource], topic: &Topic) -> bool {
             StdSource::Stream(_) => {
                 has_stream = true;
             }
-            StdSource::Event(_) => {}
+            StdSource::Event(name) => {
+                // An event source names a `$events/...` topic that only the
+                // kernel enqueues via fire_*; matching it here lets the
+                // dispatch_ingress drain loop run an event rule's actions
+                // exactly once on the publish path. Real MQTT ingress topics
+                // never equal an event source name, so this stays
+                // fail-closed there.
+                if name.as_str() == topic.as_str() {
+                    return true;
+                }
+            }
         }
     }
     if has_topic {
@@ -4455,10 +5223,7 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
         None => return vec![payload.clone()],
     };
     if let Some(plan) = rule.std_foreach.as_ref() {
-        // TODO(parity): is `FOREACH ... WHERE` evaluated per element (with
-        // `item` bound) or once on the base message? Evaluated per element
-        // here so both base-only and `item`-referencing predicates work;
-        // the judge decides.
+        // TODO(parity): Does FOREACH WHERE evaluate per element with item bound?
         let (base, _) = build_std_record(topic, payload, qos);
         let rows = expand_foreach_rows(stmt, plan, &base);
         let mut out = Vec::with_capacity(rows.len());
