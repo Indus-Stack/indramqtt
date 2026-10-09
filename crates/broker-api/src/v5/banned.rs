@@ -3,12 +3,13 @@
 //! Covers `GET /banned` (paged list), `POST /banned` (create one entry),
 //! `DELETE /banned` (clear all) and `DELETE /banned/{as}/{who}` (drop one
 //! entry). Single-node, management-plane writes:
-//! the broker consults the store on the connect path (before the session
-//! is created) and on publish authorisation (so a client banned
-//! mid-session stops being served). Both reads take one short read lock
-//! and scan at most the stored entries; an empty store returns after one
-//! length check, so the common case costs almost nothing on the publish
-//! path (see [`BanStore::is_banned`]).
+//! the broker consults the store on the connect path (in the bind's own
+//! tenant, resolved before the check) and on publish authorisation (in
+//! the publisher's own tenant, so a client banned mid-session stops
+//! being served). Both reads take one short read lock and scan at most
+//! the stored entries; an empty store returns after one length check,
+//! so the common case costs almost nothing on the publish path (see
+//! [`BanStore::is_banned_in_tenant`]).
 //!
 //! Store bounds (both stated here and enforced below):
 //! - at most [`MAX_BANS`] entries in the matcher map; creates past the
@@ -53,9 +54,11 @@ pub(crate) const VALID_AS: &[&str] = &[
     "peerhost_net",
 ];
 
-/// One stored ban: what-kind (`as`), who-value (`who`), who added it
-/// (`by`), why (`reason`), when it starts (`at`, RFC 3339) and when it
-/// ends (`until`, RFC 3339 or the literal `"infinity"` for no expiry).
+/// One stored ban: owning tenant (`tenant`), what-kind (`as`),
+/// who-value (`who`), who added it (`by`), why (`reason`), when it
+/// starts (`at`, RFC 3339) and when it ends (`until`, RFC 3339 or the
+/// literal `"infinity"` for no expiry). A ban applies only in its own
+/// tenant, so one tenant never blocks another tenant's namesake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BanEntry {
     pub as_type: String,
@@ -64,6 +67,7 @@ pub struct BanEntry {
     pub reason: String,
     pub at: String,
     pub until: String,
+    pub tenant: String,
 }
 
 impl BanEntry {
@@ -75,18 +79,42 @@ impl BanEntry {
             "reason": self.reason,
             "at": self.at,
             "until": self.until,
+            "tenant": self.tenant,
         })
     }
 }
 
-/// In-memory ban directory keyed by (`as`, `who`).
+/// In-memory ban directory keyed by (`tenant`, `as`, `who`).
 ///
 /// Single-node map behind one lock; every method finishes quickly.
 /// Management writes take the write lock; the broker's connect and
 /// publish checks take a short read lock and never mutate, so delivery
 /// never blocks on a management write beyond one lock hold.
 pub struct BanStore {
-    inner: RwLock<HashMap<(String, String), BanEntry>>,
+    inner: RwLock<HashMap<(String, String, String), StoredBan>>,
+}
+
+/// One stored ban plus its precompiled matcher.
+///
+/// The broker compiles `clientid_re` / `username_re` patterns once at
+/// insert on the management plane. Connect and publish checks reuse the
+/// compiled value under the same read lock. No compile runs on the hot
+/// path. The cache holds at most [`MAX_BANS`] compiled values, one per
+/// stored pattern ban, so memory stays bounded.
+struct StoredBan {
+    entry: BanEntry,
+    compiled: Option<regex::Regex>,
+}
+
+impl StoredBan {
+    fn store(entry: BanEntry) -> Self {
+        let compiled = if entry.as_type == "clientid_re" || entry.as_type == "username_re" {
+            regex::Regex::new(&entry.who).ok()
+        } else {
+            None
+        };
+        Self { entry, compiled }
+    }
 }
 
 impl BanStore {
@@ -97,32 +125,45 @@ impl BanStore {
         }
     }
 
-    /// Snapshot of live entries sorted by (`as`, `who`) for stable pages.
-    /// Drops expired entries first (lazy expiry sweep).
+    /// Snapshot of live entries sorted by (`tenant`, `as`, `who`) for
+    /// stable pages. Drops expired entries first (lazy expiry sweep).
     pub fn list_live(&self) -> Vec<BanEntry> {
         let now = now_epoch_secs();
         let mut map = self.inner.write().expect("ban store lock");
         sweep_expired_locked(&mut map, now);
-        let mut out: Vec<BanEntry> = map.values().cloned().collect();
-        out.sort_by(|a, b| (&a.as_type, &a.who).cmp(&(&b.as_type, &b.who)));
+        let mut out: Vec<BanEntry> = map.values().map(|s| s.entry.clone()).collect();
+        out.sort_by(|a, b| (&a.tenant, &a.as_type, &a.who).cmp(&(&b.tenant, &b.as_type, &b.who)));
         out
     }
 
-    /// Insert one entry. Fails cleanly when the (`as`, `who`) pair already
-    /// exists (caller maps to `ALREADY_EXISTS`) or the store is at
-    /// [`MAX_BANS`] (caller maps to `BAD_REQUEST`).
+    /// Snapshot of live entries in one tenant, sorted by (`as`, `who`).
+    pub fn list_live_in_tenant(&self, tenant: &str) -> Vec<BanEntry> {
+        self.list_live()
+            .into_iter()
+            .filter(|e| e.tenant == tenant)
+            .collect()
+    }
+
+    /// Insert one entry. Fails cleanly when the (`tenant`, `as`, `who`)
+    /// triple already exists (caller maps to `ALREADY_EXISTS`) or the
+    /// store is at [`MAX_BANS`] (caller maps to `BAD_REQUEST`).
+    /// Compiles a pattern kind once here, never on the hot path.
     pub fn insert(&self, entry: BanEntry) -> Result<BanEntry, BanInsertError> {
         let now = now_epoch_secs();
         let mut map = self.inner.write().expect("ban store lock");
         sweep_expired_locked(&mut map, now);
-        let key = (entry.as_type.clone(), entry.who.clone());
+        let key = (
+            entry.tenant.clone(),
+            entry.as_type.clone(),
+            entry.who.clone(),
+        );
         if map.contains_key(&key) {
             return Err(BanInsertError::Duplicate);
         }
         if map.len() >= MAX_BANS {
             return Err(BanInsertError::Full);
         }
-        map.insert(key, entry.clone());
+        map.insert(key, StoredBan::store(entry.clone()));
         Ok(entry)
     }
 
@@ -131,14 +172,35 @@ impl BanStore {
         self.inner.write().expect("ban store lock").clear();
     }
 
-    /// Drop the (`as`, `who`) entry. Sweeps expired entries first so an
-    /// already-expired row reads as absent. Returns true when a live
-    /// entry was removed, false when nothing was stored under the key.
+    /// Drop the (`as`, `who`) entries in every tenant. Sweeps expired
+    /// entries first so an already-expired row reads as absent. Returns
+    /// true when a live entry was removed, false when nothing was
+    /// stored under the pair.
     pub fn remove(&self, as_type: &str, who: &str) -> bool {
         let now = now_epoch_secs();
         let mut map = self.inner.write().expect("ban store lock");
         sweep_expired_locked(&mut map, now);
-        map.remove(&(as_type.to_string(), who.to_string()))
+        let keys: Vec<(String, String, String)> = map
+            .keys()
+            .filter(|(_, a, w)| a == as_type && w == who)
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return false;
+        }
+        for key in keys {
+            map.remove(&key);
+        }
+        true
+    }
+
+    /// Drop the (`tenant`, `as`, `who`) entry. Returns true when a live
+    /// entry was removed, false when nothing was stored under the key.
+    pub fn remove_in_tenant(&self, tenant: &str, as_type: &str, who: &str) -> bool {
+        let now = now_epoch_secs();
+        let mut map = self.inner.write().expect("ban store lock");
+        sweep_expired_locked(&mut map, now);
+        map.remove(&(tenant.to_string(), as_type.to_string(), who.to_string()))
             .is_some()
     }
 
@@ -152,12 +214,31 @@ impl BanStore {
     /// Cost: one read lock plus a scan of at most the stored entries. An
     /// empty store returns after one length check. Exact kinds
     /// (`clientid`, `username`, `peerhost`) compare by value; pattern
-    /// kinds compile their stored pattern per call (`clientid_re` /
-    /// `username_re` as regex search, `peerhost_net` as CIDR containment),
-    /// so a store holding pattern bans costs more per publish than an
-    /// exact-only store. Unknown kinds never match.
+    /// kinds reuse the value compiled at insert (`clientid_re` /
+    /// `username_re` as regex search, `peerhost_net` as CIDR containment).
+    /// Unknown kinds never match. No allocation runs here. Checks the
+    /// default tenant only; tenant-aware callers use
+    /// [`Self::is_banned_in_tenant`].
     pub fn is_banned(
         &self,
+        client_id: &str,
+        username: Option<&str>,
+        peerhost: Option<&str>,
+    ) -> bool {
+        self.is_banned_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            client_id,
+            username,
+            peerhost,
+        )
+    }
+
+    /// Whether the given identity is banned in `tenant`. Only bans of
+    /// that tenant match, so one tenant never blocks another tenant's
+    /// namesake. Same cost as [`Self::is_banned`].
+    pub fn is_banned_in_tenant(
+        &self,
+        tenant: &str,
         client_id: &str,
         username: Option<&str>,
         peerhost: Option<&str>,
@@ -170,11 +251,21 @@ impl BanStore {
         // Parse the peer address once: the edge always sends an IP
         // literal, so an unparseable value simply matches no address ban.
         let peer_ip: Option<std::net::IpAddr> = peerhost.and_then(|s| s.trim().parse().ok());
-        for entry in map.values() {
-            if until_is_expired(&entry.until, now) {
+        for stored in map.values() {
+            if stored.entry.tenant != tenant {
                 continue;
             }
-            if entry_matches_identity(entry, client_id, username, peerhost, peer_ip) {
+            if until_is_expired(&stored.entry.until, now) {
+                continue;
+            }
+            if entry_matches_identity(
+                &stored.entry,
+                client_id,
+                username,
+                peerhost,
+                peer_ip,
+                stored.compiled.as_ref(),
+            ) {
                 return true;
             }
         }
@@ -191,7 +282,7 @@ impl Default for BanStore {
 /// Why [`BanStore::insert`] refused an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BanInsertError {
-    /// The (`as`, `who`) pair is already stored.
+    /// The (`tenant`, `as`, `who`) triple is already stored.
     Duplicate,
     /// The store holds [`MAX_BANS`] live entries.
     Full,
@@ -216,16 +307,38 @@ pub struct BannedFilters {
     pub like_peerhost: Option<String>,
     #[serde(default)]
     pub like_peerhost_net: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 /// `GET /banned`: wrapped page (`data` plus `meta`). An empty store reads
-/// as an empty page, never an error. Unknown query keys are ignored and
-/// malformed `page`/`limit` fall back to defaults via [`PageParams`].
+/// as an empty page, never an error. Filters are mutually exclusive:
+/// more than one filter in a query fails with 400 `BAD_REQUEST`.
+/// Unknown query keys are ignored and malformed `page`/`limit` fall
+/// back to defaults via [`PageParams`].
 pub async fn list_banned(
     State(state): State<ApiState>,
     params: PageParams,
     Query(filters): Query<BannedFilters>,
 ) -> Response {
+    let set = [
+        filters.clientid.as_deref(),
+        filters.username.as_deref(),
+        filters.peerhost.as_deref(),
+        filters.like_clientid.as_deref(),
+        filters.like_username.as_deref(),
+        filters.like_peerhost.as_deref(),
+        filters.like_peerhost_net.as_deref(),
+    ]
+    .into_iter()
+    .filter(|v| v.map(|s| !s.trim().is_empty()).unwrap_or(false))
+    .count();
+    if set > 1 {
+        return ApiError::BadRequest(
+            "banned filters are mutually exclusive: use only one filter".to_string(),
+        )
+        .into_response();
+    }
     let live = state.bans.list_live();
     let matching: Vec<BanEntry> = live
         .into_iter()
@@ -245,6 +358,11 @@ pub async fn list_banned(
 }
 
 fn entry_matches(entry: &BanEntry, filters: &BannedFilters) -> bool {
+    if let Some(want) = filters.tenant.as_deref() {
+        if !want.trim().is_empty() && entry.tenant != want.trim() {
+            return false;
+        }
+    }
     if let Some(want) = filters.clientid.as_deref() {
         if entry.as_type != "clientid" || entry.who != want {
             return false;
@@ -288,9 +406,10 @@ fn entry_matches(entry: &BanEntry, filters: &BannedFilters) -> bool {
 }
 
 /// `POST /banned`: create one entry from a who-value plus what-kind and
-/// why, with an optional expiry. Returns the stored entry with 200.
-/// Malformed bodies fail with `BAD_REQUEST`; an existing (`as`, `who`)
-/// pair fails with `ALREADY_EXISTS` instead of being overwritten.
+/// why, with an optional expiry and an optional tenant. Returns the
+/// stored entry in a `data` list with 200. Malformed bodies fail with
+/// `BAD_REQUEST`; an existing (`tenant`, `as`, `who`) triple fails with
+/// `ALREADY_EXISTS` instead of being overwritten.
 pub async fn create_banned(State(state): State<ApiState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -303,7 +422,11 @@ pub async fn create_banned(State(state): State<ApiState>, body: Bytes) -> Respon
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.bans.insert(entry) {
-        Ok(stored) => (StatusCode::OK, Json(stored.to_json())).into_response(),
+        Ok(stored) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "data": [stored.to_json()] })),
+        )
+            .into_response(),
         Err(BanInsertError::Duplicate) => {
             ApiError::AlreadyExists("ban already exists".to_string()).into_response()
         }
@@ -341,8 +464,9 @@ pub async fn delete_banned_one(
 ///
 /// Required: `as` (one of the six kinds) and `who` (non-empty, length
 /// capped; address kinds additionally shape-checked). Optional: `by`,
-/// `reason` (defaulted when absent) and `at`/`until` (RFC 3339 or epoch
-/// seconds; `until` also accepts `"infinity"` and defaults to it).
+/// `reason` (defaulted when absent), `tenant` (defaults to the default
+/// tenant) and `at`/`until` (RFC 3339 or epoch seconds; `until` also
+/// accepts `"infinity"` and defaults to it).
 fn parse_ban_request(value: &serde_json::Value) -> Result<BanEntry, String> {
     let obj = value
         .as_object()
@@ -391,6 +515,20 @@ fn parse_ban_request(value: &serde_json::Value) -> Result<BanEntry, String> {
         Some(v) => parse_until_value(v)
             .ok_or_else(|| "field `until` must be RFC 3339, epoch or infinity".to_string())?,
     };
+    let tenant = obj
+        .get("tenant")
+        .and_then(|v| v.as_str())
+        .unwrap_or(broker_session::tenant::DEFAULT_TENANT_ID)
+        .trim()
+        .to_string();
+    let tenant = if tenant.is_empty() {
+        broker_session::tenant::DEFAULT_TENANT_ID.to_string()
+    } else {
+        tenant
+    };
+    if tenant.len() > 128 {
+        return Err("field `tenant` is too long".to_string());
+    }
     // An expiry in the past is still stored (reads sweep it lazily); only
     // the shape is validated here so callers get a clean client error for
     // malformed times instead of a silent drop.
@@ -401,12 +539,13 @@ fn parse_ban_request(value: &serde_json::Value) -> Result<BanEntry, String> {
         reason,
         at,
         until,
+        tenant,
     })
 }
 
 /// Shape-check `who` for the address kinds. Identifier and pattern kinds
-/// accept any non-empty value (patterns are stored verbatim; matching
-/// happens against the stored string without compiling here).
+/// accept any non-empty value (patterns are stored verbatim and compiled
+/// once at insert; an invalid pattern matches nothing).
 fn validate_who_shape(as_type: &str, who: &str) -> Result<(), String> {
     match as_type {
         "peerhost" => {
@@ -477,20 +616,22 @@ fn parse_until_value(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn sweep_expired_locked(map: &mut HashMap<(String, String), BanEntry>, now: u64) {
-    map.retain(|_, e| !until_is_expired(&e.until, now));
+fn sweep_expired_locked(map: &mut HashMap<(String, String, String), StoredBan>, now: u64) {
+    map.retain(|_, s| !until_is_expired(&s.entry.until, now));
 }
 
 /// Whether one stored ban matches the connecting/publishing identity.
 /// Exact kinds compare by value; `clientid_re` / `username_re` run the
-/// stored pattern as a regex search; `peerhost_net` checks CIDR
-/// containment of the parsed peer address.
+/// precompiled pattern as a regex search; `peerhost_net` checks CIDR
+/// containment of the parsed peer address. A pattern that did not
+/// compile at insert matches nothing.
 fn entry_matches_identity(
     entry: &BanEntry,
     client_id: &str,
     username: Option<&str>,
     peerhost: Option<&str>,
     peer_ip: Option<std::net::IpAddr>,
+    compiled: Option<&regex::Regex>,
 ) -> bool {
     match entry.as_type.as_str() {
         "clientid" => entry.who == client_id,
@@ -501,26 +642,14 @@ fn entry_matches_identity(
             // exact literal still matches instead of silently missing.
             _ => peerhost == Some(entry.who.as_str()),
         },
-        "clientid_re" => regex_ban_matches(&entry.who, client_id),
+        "clientid_re" => compiled.map(|re| re.is_match(client_id)).unwrap_or(false),
         "username_re" => username
-            .map(|name| regex_ban_matches(&entry.who, name))
+            .map(|name| compiled.map(|re| re.is_match(name)).unwrap_or(false))
             .unwrap_or(false),
         "peerhost_net" => peer_ip
             .map(|ip| cidr_ban_contains(&entry.who, ip))
             .unwrap_or(false),
         _ => false,
-    }
-}
-
-/// Regex search of a stored pattern against a value. Patterns are stored
-/// verbatim (management validation does not compile them), so an invalid
-/// pattern matches nothing instead of failing the lookup. Compiled per
-/// call: ban checks run per connect and per publish, and the store holds
-/// no compiled cache (B1-03 keeps no new cache layer).
-fn regex_ban_matches(pattern: &str, value: &str) -> bool {
-    match regex::Regex::new(pattern) {
-        Ok(re) => re.is_match(value),
-        Err(_) => false,
     }
 }
 
@@ -711,7 +840,31 @@ mod ban_match_tests {
             reason: "test".to_string(),
             at: epoch_to_rfc3339(now_epoch_secs()),
             until: until.to_string(),
+            tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
         }
+    }
+
+    #[test]
+    fn bans_stay_in_their_own_tenant() {
+        let store = BanStore::new();
+        store
+            .insert(BanEntry {
+                as_type: "clientid".to_string(),
+                who: "shared-id".to_string(),
+                by: "test".to_string(),
+                reason: "test".to_string(),
+                at: epoch_to_rfc3339(now_epoch_secs()),
+                until: "infinity".to_string(),
+                tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
+            })
+            .expect("default ban inserts");
+        assert!(store.is_banned_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "shared-id",
+            None,
+            None
+        ));
+        assert!(!store.is_banned_in_tenant("tenant-b", "shared-id", None, None));
     }
 
     fn store_with(entries: Vec<BanEntry>) -> BanStore {

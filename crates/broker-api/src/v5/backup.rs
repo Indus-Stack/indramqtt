@@ -607,9 +607,15 @@ fn parse_bans(value: &Value) -> Result<Vec<BanEntry>, ApiError> {
                 "banned[{index}].who is empty or too long (field `who`)"
             )));
         }
-        if !seen.insert((as_type.clone(), who.clone())) {
+        let tenant_key = obj
+            .get("tenant")
+            .and_then(Value::as_str)
+            .unwrap_or(broker_session::tenant::DEFAULT_TENANT_ID)
+            .trim()
+            .to_string();
+        if !seen.insert((tenant_key.clone(), as_type.clone(), who.clone())) {
             return Err(ApiError::ValidationFailed(format!(
-                "banned[{index}] ({as_type:?}, {who:?}) is duplicated"
+                "banned[{index}] ({tenant_key:?}, {as_type:?}, {who:?}) is duplicated"
             )));
         }
         let string_or_empty = |key: &str| {
@@ -618,6 +624,17 @@ fn parse_bans(value: &Value) -> Result<Vec<BanEntry>, ApiError> {
                 .unwrap_or("")
                 .to_string()
         };
+        let tenant = obj
+            .get("tenant")
+            .and_then(Value::as_str)
+            .unwrap_or(broker_session::tenant::DEFAULT_TENANT_ID)
+            .trim()
+            .to_string();
+        let tenant = if tenant.is_empty() {
+            broker_session::tenant::DEFAULT_TENANT_ID.to_string()
+        } else {
+            tenant
+        };
         out.push(BanEntry {
             as_type,
             who,
@@ -625,6 +642,7 @@ fn parse_bans(value: &Value) -> Result<Vec<BanEntry>, ApiError> {
             reason: string_or_empty("reason"),
             at: string_or_empty("at"),
             until: string_or_empty("until"),
+            tenant,
         });
     }
     Ok(out)

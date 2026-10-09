@@ -45,19 +45,16 @@ fn live_counters(state: &ApiState) -> crate::v5::monitor::LiveCounters {
 ///
 /// Gauges (`connections`, `live_connections`, `topics`, `subscriptions`,
 /// `cluster_sessions`, `retained_msg_count`) are read live from the
-/// session directory, the lock-free metrics and the statistics store. The
-/// durable gauges have no kernel tracking and carry over from the newest
-/// history point, else zero.
+/// session directory, the lock-free metrics and the statistics store.
 ///
 /// Each `*_rate` field is the change of one cumulative counter between the
 /// two newest points of the monitor history, divided by the time between
 /// the points. The sampler in the kernel writes a point on a timer, so the
 /// rate covers one sampling window. Before two points exist, and after
 /// `DELETE /monitor`, every rate reads zero because no window has passed.
-/// Counters that no subsystem records yet (persistence, validation,
-/// transformation and action counters) keep their rate at zero. The fields
-/// `license_quota`, `shared_subscriptions` and `sessions_hist_hwmark` are
-/// left out because the broker keeps no such value.
+/// Fields without kernel tracking stay out, never zero: durable gauges,
+/// persistence, validation, transformation and action rates plus
+/// `license_quota`, `shared_subscriptions` and `sessions_hist_hwmark`.
 ///
 /// Never paged; always succeeds when the node is up. The query string is
 /// not read, so unknown query parameters are ignored instead of rejected.
@@ -85,17 +82,8 @@ fn current_snapshot_value(state: &ApiState) -> serde_json::Value {
     put("subscriptions", live.subscriptions);
     put("cluster_sessions", state.sessions.session_count() as u64);
     put("retained_msg_count", state.stats.snapshot().retained);
-    put(
-        "subscriptions_durable",
-        newest.as_ref().map_or(0, |s| s.subscriptions_durable),
-    );
-    put(
-        "disconnected_durable_sessions",
-        newest
-            .as_ref()
-            .map_or(0, |s| s.disconnected_durable_sessions),
-    );
     // Rates need two points. Without them no window has passed.
+    // Only tracked counters get a rate. Untracked fields stay out.
     let rate = |counter: fn(&crate::v5::monitor::MonitorSample) -> u64| -> u64 {
         match (&newest, &previous) {
             (Some(newer), Some(older)) => rate_per_sec(
@@ -110,22 +98,6 @@ fn current_snapshot_value(state: &ApiState) -> serde_json::Value {
     put("sent_msg_rate", rate(|s| s.sent));
     put("dropped_msg_rate", rate(|s| s.dropped));
     put("rules_matched_rate", rate(|s| s.rules_matched));
-    put("persisted_rate", rate(|s| s.persisted));
-    put("actions_executed_rate", rate(|s| s.actions_executed));
-    put("actions_messages_rate", rate(|s| s.actions_messages));
-    put(
-        "validation_succeeded_rate",
-        rate(|s| s.validation_succeeded),
-    );
-    put("validation_failed_rate", rate(|s| s.validation_failed));
-    put(
-        "transformation_succeeded_rate",
-        rate(|s| s.transformation_succeeded),
-    );
-    put(
-        "transformation_failed_rate",
-        rate(|s| s.transformation_failed),
-    );
     serde_json::Value::Object(body)
 }
 
@@ -194,16 +166,14 @@ pub async fn get_stats(State(state): State<ApiState>) -> Response {
 /// per-message path. All `set_*` updates already happen at kernel
 /// lifecycle points; this read only copies.
 ///
-/// Mapping follows the documented names: `connections`, `live_connections`,
-/// `channels`, `sessions` and `cluster_sessions` all read the connection
-/// gauge (single node: one channel and one session per bound connection);
-/// `suboptions` reads the subscription gauge (one options record per
-/// subscription); `subscribers` is bounded by both gauges (distinct
-/// subscriber clients can be neither more than bound connections nor more
-/// than subscription entries under active-only counting); `delayed` and
-/// `subscriptions.shared` read zero (no kernel tracking yet, shape stays
-/// stable and they rise once their subsystem records them).
-/// Management-plane only; never touched on fan-out or fan-in.
+/// Mapping follows the documented names. Each session name reads the
+/// measured connection gauge from the store snapshot: this node keeps
+/// one channel and one session per bound connection, so the gauge is
+/// the exact value for each name. `suboptions` reads the measured
+/// subscription gauge. `subscribers` reads the smaller of the two
+/// measured gauges. The broker does not track `delayed` or shared
+/// subscriptions yet; both read zero until their subsystem records
+/// them. Management-plane only; never touched on fan-out or fan-in.
 fn stats_snapshot_value(state: &ApiState) -> serde_json::Value {
     let snap = state.stats.snapshot();
     let conns = snap.connections;
@@ -339,11 +309,12 @@ pub async fn get_stats_node(State(state): State<ApiState>, Path(node): Path<Stri
 /// All increments already happen on the message path; this read only copies.
 ///
 /// Grouping follows the documented names: `bytes`, `packets`, `messages`,
-/// `delivery`, `client` and `session`. Fields with no kernel tracking yet
-/// (QoS 2 acknowledgement flows, unsubscribe/disconnect packet splits,
-/// delayed/retained message stores, session lifecycle) read zero so the
-/// shape stays stable; they rise once their subsystem records them.
-/// Management-plane only; never touched on fan-out or fan-in.
+/// `delivery`, `client` and `session`. Tracked fields read their
+/// lock-free counter. The broker does not track QoS 2 acknowledgement
+/// flows, unsubscribe/disconnect packet splits, delayed/retained
+/// message stores or session lifecycle yet; those fields read zero
+/// until their subsystem records them. Management-plane only; never
+/// touched on fan-out or fan-in.
 fn metrics_snapshot_value(state: &ApiState) -> serde_json::Value {
     let snap = state.metrics.snapshot();
     let packets_received = snap
@@ -651,7 +622,7 @@ mod tests {
         (status, body)
     }
 
-    fn documented_fields() -> [&'static str; 19] {
+    fn documented_fields() -> [&'static str; 10] {
         [
             "connections",
             "live_connections",
@@ -659,12 +630,17 @@ mod tests {
             "subscriptions",
             "cluster_sessions",
             "retained_msg_count",
-            "subscriptions_durable",
-            "disconnected_durable_sessions",
             "received_msg_rate",
             "sent_msg_rate",
             "dropped_msg_rate",
             "rules_matched_rate",
+        ]
+    }
+
+    fn omitted_fields() -> [&'static str; 11] {
+        [
+            "subscriptions_durable",
+            "disconnected_durable_sessions",
             "persisted_rate",
             "actions_executed_rate",
             "actions_messages_rate",
@@ -672,6 +648,8 @@ mod tests {
             "validation_failed_rate",
             "transformation_succeeded_rate",
             "transformation_failed_rate",
+            "license_quota",
+            "shared_subscriptions",
         ]
     }
 
@@ -682,19 +660,11 @@ mod tests {
             live_connections: 0,
             topics: 0,
             subscriptions: 0,
-            subscriptions_durable: 4,
-            disconnected_durable_sessions: 5,
             received: 0,
             sent: 0,
             dropped: 0,
-            persisted: 0,
-            validation_succeeded: 0,
-            validation_failed: 0,
-            transformation_succeeded: 0,
-            transformation_failed: 0,
             rules_matched: 0,
-            actions_executed: 0,
-            actions_messages: 0,
+            tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
         }
     }
 
@@ -720,6 +690,10 @@ mod tests {
         // The cumulative counters are not part of the documented shape.
         for field in ["received", "sent", "dropped", "time_stamp"] {
             assert!(body.get(field).is_none(), "unexpected field {field}");
+        }
+        // Fields without kernel tracking stay out, never zero.
+        for field in omitted_fields() {
+            assert!(body.get(field).is_none(), "untracked field {field}");
         }
     }
 
@@ -747,7 +721,6 @@ mod tests {
         newer.sent = 1200;
         newer.dropped = 5;
         newer.rules_matched = 40;
-        newer.persisted = 20;
         state.monitor.record(older);
         state.monitor.record(newer);
 
@@ -758,10 +731,10 @@ mod tests {
         assert_eq!(body["sent_msg_rate"], serde_json::json!(100));
         assert_eq!(body["dropped_msg_rate"], serde_json::json!(0));
         assert_eq!(body["rules_matched_rate"], serde_json::json!(3));
-        assert_eq!(body["persisted_rate"], serde_json::json!(2));
-        // Gauges with no kernel tracking carry over from the newest point.
-        assert_eq!(body["subscriptions_durable"], serde_json::json!(4));
-        assert_eq!(body["disconnected_durable_sessions"], serde_json::json!(5));
+        // Fields without kernel tracking stay out, never zero.
+        for field in omitted_fields() {
+            assert!(body.get(field).is_none(), "untracked field {field}");
+        }
     }
 
     #[tokio::test]

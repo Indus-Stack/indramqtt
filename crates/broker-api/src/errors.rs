@@ -63,6 +63,8 @@ pub enum ApiError {
     StoreNotReady(String),
     /// Malformed query or paging input the spec names `INVALID_PARAMETER`.
     InvalidParameter(String),
+    /// Monitor query the node cannot serve, named `BAD_RPC` by the spec.
+    BadRpc(String),
 }
 
 impl ApiError {
@@ -90,6 +92,7 @@ impl ApiError {
             Self::InternalError(_) => "INTERNAL_ERROR",
             Self::StoreNotReady(_) => "STORE_NOT_READY",
             Self::InvalidParameter(_) => "INVALID_PARAMETER",
+            Self::BadRpc(_) => "BAD_RPC",
         }
     }
 
@@ -116,7 +119,8 @@ impl ApiError {
             | Self::ValidationFailed(message)
             | Self::InternalError(message)
             | Self::StoreNotReady(message)
-            | Self::InvalidParameter(message) => message,
+            | Self::InvalidParameter(message)
+            | Self::BadRpc(message) => message,
         }
     }
 
@@ -137,6 +141,7 @@ impl ApiError {
             | Self::ValidationFailed(_)
             | Self::StoreNotReady(_) => StatusCode::BAD_REQUEST,
             Self::InvalidParameter(_) => StatusCode::BAD_REQUEST,
+            Self::BadRpc(_) => StatusCode::BAD_REQUEST,
             Self::BadUsernameOrPwd(_) | Self::NamePwdError(_) | Self::Unauthorized(_) => {
                 StatusCode::UNAUTHORIZED
             }
@@ -171,6 +176,7 @@ impl ApiError {
             Self::InternalError(_) => Self::InternalError(message),
             Self::StoreNotReady(_) => Self::StoreNotReady(message),
             Self::InvalidParameter(_) => Self::InvalidParameter(message),
+            Self::BadRpc(_) => Self::BadRpc(message),
         }
     }
 }
@@ -227,6 +233,7 @@ mod tests {
             ApiError::InternalError("internal error".to_string()),
             ApiError::StoreNotReady("store not ready".to_string()),
             ApiError::InvalidParameter("invalid parameter".to_string()),
+            ApiError::BadRpc("bad rpc".to_string()),
         ]
     }
 
@@ -254,6 +261,7 @@ mod tests {
             ("INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR),
             ("STORE_NOT_READY", StatusCode::BAD_REQUEST),
             ("INVALID_PARAMETER", StatusCode::BAD_REQUEST),
+            ("BAD_RPC", StatusCode::BAD_REQUEST),
         ];
         let variants = every_variant();
         assert_eq!(variants.len(), expected.len());
@@ -346,6 +354,7 @@ mod tests {
             ApiError::InternalError(_) => "INTERNAL_ERROR",
             ApiError::StoreNotReady(_) => "STORE_NOT_READY",
             ApiError::InvalidParameter(_) => "INVALID_PARAMETER",
+            ApiError::BadRpc(_) => "BAD_RPC",
         }
     }
 

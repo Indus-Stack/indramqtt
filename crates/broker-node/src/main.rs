@@ -474,7 +474,7 @@ struct Args {
     /// Monitor sampling interval in seconds (F1-02, T-72): how often the
     /// background sampler copies live counters into the bounded monitor
     /// ring behind `GET /monitor`. Default 10 keeps four hours of history
-    /// in the 1440-point ring (one point holds nineteen integers, well
+    /// in the 1440-point ring (one point holds nine integers, well
     /// under one megabyte) while waking the timer six times a minute;
     /// each tick does a handful of atomic loads plus one short ring lock.
     /// Clamped to 1..3600 at boot; 0 records a single boot sample and
@@ -1171,6 +1171,11 @@ async fn apply_bind_request(
     // `SessionBinding` reply, including refusals, so the client always
     // learns it on the CONNECT event.
     let alias_max = shared.sessions.max_topic_alias();
+    // Cache one render per distinct input for this bind.
+    // The registry counts one rejection per render.
+    // Reuse keeps one bind at one count.
+    let mut cached_none_tenant: Option<String> = None;
+    let mut cached_verified_tenant: Option<String> = None;
     if let Ok(req) = parsed.clone() {
         // X1-02: a Receive Maximum of 0 is a protocol error on the wire
         // (see the synchronous path for the code-choice rationale).
@@ -1186,18 +1191,55 @@ async fn apply_bind_request(
                 alias_max,
             ));
         }
-        // B1-03: banned identities never reach the session. Checked
-        // before credentials and quotas so a banned client is refused
-        // with the banned return code (0x8A, mapped to CONNACK 5 on the
-        // edge) with no session created and no quota slot consumed.
-        // A connect is not the delivery path, so one read lock here
-        // costs the message path nothing.
-        if shared.bans.is_banned(
+        // B1-03: banned identities never reach the session. The bind's
+        // own tenant is resolved first, so a ban in one tenant never
+        // blocks another tenant's namesake. Checked before credentials
+        // and quotas so a banned client is refused with the banned
+        // return code (0x8A, mapped to CONNACK 5 on the edge) with no
+        // session created and no quota slot consumed. A connect is not
+        // the delivery path, so one read lock here costs the message
+        // path nothing.
+        let tenant_for_ban = bind_tenant_for_req(shared, &req, None);
+        // Store the render for later steps in this bind.
+        cached_none_tenant = Some(tenant_for_ban.clone());
+        if shared.bans.is_banned_in_tenant(
+            &tenant_for_ban,
             &req.client_id,
             req.username.as_deref(),
             req.peerhost.as_deref(),
         ) {
             shared.metrics.inc_auth_failures();
+            // CONNECT drives the alarm store.
+            // A banned CONNECT raises a bounded alarm in its own tenant.
+            // CONNECT is rare, so the write stays off the hot path.
+            shared.alarms.activate_in_tenant(
+                &tenant_for_ban,
+                "banned_connect_rejected",
+                &format!("banned CONNECT refused for '{}'", req.client_id),
+                serde_json::json!({"clientid": req.client_id}),
+            );
+            // CONNECT drives the audit ring.
+            // Record the refusal with measured values only.
+            // CONNECT is rare, so the write stays off the hot path.
+            shared
+                .audit
+                .record(broker_api::v5::audit::AuditRecordInput {
+                    created_at_us: broker_api::v5::audit::now_micros(),
+                    node: shared.node_id.clone(),
+                    from: broker_api::v5::audit::AUDIT_FROM_MQTT.to_string(),
+                    source: req
+                        .username
+                        .clone()
+                        .unwrap_or_else(|| req.client_id.clone()),
+                    source_ip: req.peerhost.clone().unwrap_or_default(),
+                    operation_id: "/mqtt/connect".to_string(),
+                    operation_type: broker_api::v5::audit::operation_type_for_path("/mqtt/connect"),
+                    operation_result: broker_api::v5::audit::outcome_for_status(403).to_string(),
+                    http_method: "connect".to_string(),
+                    http_status_code: 403,
+                    duration_ms: 0,
+                    tenant: tenant_for_ban.clone(),
+                });
             return Some(refusal_for_req(frame, &req, 0x8A, alias_max));
         }
         // W2-02: authenticator-chain consult. Loads one lock-free
@@ -1288,7 +1330,9 @@ async fn apply_bind_request(
             // resolution re-render from the verified identity as before).
             // Same pure function of the bind the session path renders, no
             // shared state. CONNECT-only; publish/deliver never touch it.
-            let tenant_for_auth = bind_tenant_for_req(shared, &req, None);
+            // Reuse the ban render here.
+            // It uses the same input, so reuse avoids a second count.
+            let tenant_for_auth = tenant_for_ban.clone();
             let kerberos_enabled = shared.kerberos.as_ref().is_some_and(|k| k.is_enabled());
             let looks_kerberos =
                 password.is_some_and(|p| !p.is_empty() && (p[0] == 0x60 || p[0] == 0x6E));
@@ -1629,11 +1673,16 @@ async fn apply_bind_request(
             // the previous holder was orphaned by this very bind. Resolved
             // through the bind's own tenant (rendered here from this
             // connection's credentials), so a takeover in another tenant
-            // never releases this tenant's slot. The tenant render is
-            // repeated at session resolution below (same pure function of
-            // the bind, no shared state) because quota admission must
-            // precede session creation on this path.
-            let tenant_for_quota = bind_tenant_for_req(shared, &req, kerberos_principal.as_deref());
+            // never releases this tenant's slot. Reuse the earlier render
+            // when the input matches, so one bind counts one rejection.
+            // A verified principal uses a fresh render instead.
+            let tenant_for_quota = if kerberos_principal.is_none() {
+                tenant_for_ban.clone()
+            } else {
+                let resolved = bind_tenant_for_req(shared, &req, kerberos_principal.as_deref());
+                cached_verified_tenant = Some(resolved.clone());
+                resolved
+            };
             let already_live = shared
                 .sessions
                 .get_in_tenant(&tenant_for_quota, &req.client_id)
@@ -1724,7 +1773,22 @@ async fn apply_bind_request(
     // client in a fresh session under the new tenant key; the old
     // tenant's session stays detached in place for its own reconnect.
     let tenant_for_bind: String = match parsed.clone() {
-        Ok(req) => bind_tenant_for_req(shared, &req, kerberos_principal.as_deref()),
+        Ok(req) => {
+            // Reuse the render from this bind when the input matches.
+            // A verified principal reuses its own render instead.
+            // Fresh renders run only when no cached render fits.
+            if kerberos_principal.is_some() {
+                if let Some(cached) = cached_verified_tenant.clone() {
+                    cached
+                } else {
+                    bind_tenant_for_req(shared, &req, kerberos_principal.as_deref())
+                }
+            } else if let Some(cached) = cached_none_tenant.clone() {
+                cached
+            } else {
+                bind_tenant_for_req(shared, &req, kerberos_principal.as_deref())
+            }
+        }
         Err(_) => broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
     };
     // Clean-start bind discards any previous state for this
@@ -1815,6 +1879,29 @@ async fn apply_bind_request(
             session.set_tenant_id(tenant_for_bind.clone());
             shared.sessions.bind_session(&session, frame.header.conn_id);
             *session.keepalive_secs.write() = req.keepalive_secs;
+            // CONNECT drives the audit ring.
+            // Record the success with measured values only, in the
+            // bind's own tenant. CONNECT is rare, so the write stays
+            // off the hot path.
+            shared
+                .audit
+                .record(broker_api::v5::audit::AuditRecordInput {
+                    created_at_us: broker_api::v5::audit::now_micros(),
+                    node: shared.node_id.clone(),
+                    from: broker_api::v5::audit::AUDIT_FROM_MQTT.to_string(),
+                    source: req
+                        .username
+                        .clone()
+                        .unwrap_or_else(|| req.client_id.clone()),
+                    source_ip: req.peerhost.clone().unwrap_or_default(),
+                    operation_id: "/mqtt/connect".to_string(),
+                    operation_type: broker_api::v5::audit::operation_type_for_path("/mqtt/connect"),
+                    operation_result: broker_api::v5::audit::outcome_for_status(200).to_string(),
+                    http_method: "connect".to_string(),
+                    http_status_code: 200,
+                    duration_ms: 0,
+                    tenant: tenant_for_bind.clone(),
+                });
             // B4-05: a new connection renegotiates aliases. The inbound
             // bound is the manager default (advertised below in CONNACK);
             // the outbound bound is the client's CONNECT maximum (0 when
@@ -3122,9 +3209,9 @@ struct Shared {
     /// API so validated installs are visible without a restart. One Arc
     /// clone; the publish path never touches it.
     licence: Arc<broker_api::licence::LicenceStore>,
-    /// Alarm directory shared with the management API so licence lifecycle
-    /// events (trial/expiry/grace/lapse/ceiling) are visible via the API.
-    /// One Arc clone; management-plane only.
+    /// Alarm directory shared with the management API so CONNECT refusals
+    /// (ban path below) are visible via the API.
+    /// One Arc clone; CONNECT-only, never on the per-message path.
     alarms: Arc<broker_api::v5::alarms::AlarmStore>,
     /// Monitor history ring shared with the management API (F1-02, T-72)
     /// so the sampler below and the `GET /monitor` reads observe the same
@@ -3201,11 +3288,11 @@ struct Shared {
     /// The licence settings and the session history of the management API.
     license: Arc<broker_api::v5::license::LicenseState>,
     /// Management audit ring for W2-28: shared with the management API
-    /// so middleware records and `GET /audit` reads observe the same
-    /// bounded buffer. One `Arc` clone at boot; writes are non-blocking
-    /// `try_write` from the management middleware and reads take one
-    /// short read lock. Publish and deliver never touch it. Memory-only;
-    /// a restart starts from an empty ring (persist-or-trim: trim).
+    /// so middleware records and CONNECT outcomes plus `GET /audit`
+    /// reads observe the same bounded buffer. One `Arc` clone at boot;
+    /// writes are non-blocking `try_write` from the management middleware
+    /// and the CONNECT bind path. Publish and deliver never touch it.
+    /// Memory-only; a restart starts from an empty ring (persist-or-trim: trim).
     audit: Arc<broker_api::v5::audit::AuditLog>,
     /// Configured single-sign-on backend registry for W2-32: shared with
     /// the management API so registry writes are visible to `GET /sso`
@@ -4723,10 +4810,9 @@ fn monitor_now_secs() -> u64 {
 /// The publish path never touches `Shared.monitor`, so a slow management
 /// read can never stall fan-out or fan-in. Constant-time per tick and
 /// bounded by `MAX_MONITOR_SAMPLES` in the ring.
-// TODO(parity): the ring shape carries durable/validation/transformation
-// and action counters that no kernel subsystem records yet; samples read
-// zero there until those subsystems report. Which counters should the
-// sampler combine next?
+// TODO(parity): which untracked counters should the sampler combine
+// next? Durable, validation, transformation, persistence and action
+// counters have no kernel source yet, so the shape omits them.
 fn sample_monitor(shared: &Shared) {
     let conns = shared.metrics.connections_active().max(0) as u64;
     let counters = broker_api::v5::monitor::LiveCounters {
@@ -5866,10 +5952,12 @@ async fn apply_publish(
             ),
             None => (None, None),
         };
-        if shared
-            .bans
-            .is_banned(&publisher, username.as_deref(), peerhost.as_deref())
-        {
+        if shared.bans.is_banned_in_tenant(
+            tenant,
+            &publisher,
+            username.as_deref(),
+            peerhost.as_deref(),
+        ) {
             let ack = match qos {
                 QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
                 QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
@@ -8036,14 +8124,18 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
         will.topic.as_str()
     );
     // Bans, the publish ACL and the webhook verdict gate the will like
-    // any other publish from this client (fail closed); an empty will
-    // payload with retain set clears retained state through the shared
-    // pipeline, exactly like a normal retained clear. Disconnect events
-    // only; never on the publish or delivery hot path.
-    if shared
-        .bans
-        .is_banned(&client_id, username.as_deref(), peerhost.as_deref())
-    {
+    // any other publish from this client (fail closed); the ban check
+    // runs in the session's own tenant, so one tenant's ban never
+    // blocks another tenant's namesake. An empty will payload with
+    // retain set clears retained state through the shared pipeline,
+    // exactly like a normal retained clear. Disconnect events only;
+    // never on the publish or delivery hot path.
+    if shared.bans.is_banned_in_tenant(
+        &tenant,
+        &client_id,
+        username.as_deref(),
+        peerhost.as_deref(),
+    ) {
         return Vec::new();
     }
     // Per-client decision cache (W2-01): record the will-publish decision
@@ -15169,6 +15261,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_sample_secs_from_file_reaches_sampler_and_api() {
+        // R-APPLIED: start from indra.toml, observe through the API.
+        // The file sets the interval. The sampler uses it. The API
+        // shows the samples. A value test alone proves nothing.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            dir.join("indra.toml"),
+            "[node]\nid = \"mon-file\"\n[observability]\nmonitor_sample_secs = 0\n",
+        )
+        .expect("write indra.toml");
+
+        // The file value reaches the field that startup reads.
+        let args = resolve_boot(&dir, &[]);
+        assert_eq!(args.monitor_sample_secs, 0);
+        // A typed flag wins over the file.
+        let args = resolve_boot(&dir, &["--monitor-sample-secs", "7"]);
+        assert_eq!(args.monitor_sample_secs, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The resolved interval drives the sampler. Zero records one
+        // boot sample and stops the tick. The API shows that sample.
+        let shared = Shared::new();
+        spawn_monitor_sampler(shared.clone(), 0);
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind api");
+        let api_port = api_listener.local_addr().expect("api addr").port();
+        let api_task = tokio::spawn(serve_api(api_listener, shared.clone()));
+        let token = http_admin_token(api_port).await;
+        let (status, body) =
+            http_request_text(api_port, "GET", "/api/v5/monitor", None, Some(&token)).await;
+        assert_eq!(status, 200);
+        let rows: serde_json::Value = serde_json::from_str(&body).expect("monitor is JSON");
+        let rows = rows.as_array().expect("monitor history is an array");
+        assert_eq!(rows.len(), 1, "zero interval keeps one boot sample");
+        assert!(
+            rows[0]["time_stamp"].as_u64().unwrap_or(0) > 0,
+            "boot sample carries a time stamp: {}",
+            rows[0]
+        );
+        api_task.abort();
+    }
+
+    #[tokio::test]
     async fn slow_shed_records_through_broker() {
         // F1-03 (T-73): connect a slow subscriber (never drains) and a
         // publisher, flood QoS 0 through the broker until the per-subscriber
@@ -18323,6 +18460,7 @@ mod tests {
             reason: "test".to_string(),
             at: "2026-01-01T00:00:00+00:00".to_string(),
             until: until.to_string(),
+            tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
         }
     }
 

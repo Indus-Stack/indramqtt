@@ -2497,12 +2497,15 @@ mod tests {
     #[tokio::test]
     async fn publish_json_returns_stable_id_key() {
         let api = LiveApi::start().await;
+        // Publish needs a live subscriber. Else it reports 202.
+        let _rx = api.connect_client("ctl-json-sub", 7033);
+        api.subscribe("ctl-json-sub", 7033, "ctl/json/t");
         let json = run_ctl(&api.ctl(
             true,
             CtlCommand::Publish {
                 topic: "ctl/json/t".to_string(),
                 payload: "p".to_string(),
-                qos: 0,
+                qos: 1,
                 retain: false,
             },
         ))

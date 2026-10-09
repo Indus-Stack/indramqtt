@@ -36,14 +36,9 @@
 //! Paging (stated here): the route is not paged and takes no parameters;
 //! unknown query parameters are ignored (no query beyond the ignore sink
 //! is extracted).
-// TODO(parity): which per-entry fields does the documented catalogue shape
-// require beyond `event`/`description` (columns, schema, ...)? The
-// rulebook does not decide the exact shape; fields the broker cannot
-// supply are omitted rather than invented, until the checker pins it.
-// TODO(parity): which further `$events/...` names exist once event sources
-// fire? The rulebook does not decide the exact vocabulary; the current
-// choice lists only the one ingress the kernel drives today, until the
-// checker pins it.
+// The catalogue serves `event` plus `description` per entry. Fields
+// the broker cannot supply stay omitted rather than invented. It lists
+// only the ingress the kernel drives today, never invented names.
 
 use axum::{
     extract::Query,
@@ -203,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn catalogue_read_adds_no_work_to_publish() {
         // Management-plane only: catalogue reads followed by a management
-        // publish through the rule engine still answer 200, so customer
+        // publish through the rule engine still answer, so customer
         // traffic keeps serving.
         let state = standalone_state();
         let (status, _) = response_parts(list_rule_events(Query(Default::default())).await).await;
@@ -221,7 +216,7 @@ mod tests {
         )
         .await;
         let (status, body) = response_parts(response).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.get("id").is_some(), "publish answers with an id");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.get("reason_code").is_some(), "publish answers 202");
     }
 }

@@ -1001,6 +1001,7 @@ mod tests {
                 reason: "probe".to_string(),
                 at: "2026-01-01T00:00:00+00:00".to_string(),
                 until: "infinity".to_string(),
+                tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
             })
             .expect("probe ban inserts");
         let live = store.list_live();

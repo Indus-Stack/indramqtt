@@ -16,9 +16,9 @@ use crate::pagination::{meta_page, paginate, PageParams};
 use crate::ApiState;
 
 /// Documented `GET /clients` filters. Every field is optional; unknown
-/// query keys are ignored by the `Query` extractor and unknown
-/// `conn_state` values match everything, so new spec filters degrade to
-/// an unfiltered page instead of a 400.
+/// query keys are ignored by the `Query` extractor. `conn_state` holds
+/// a documented value (`connected`, `idle` or `disconnected`); any
+/// other value fails with 400 `INVALID_PARAMETER`.
 #[derive(Deserialize, Default)]
 pub struct ClientFilters {
     #[serde(default)]
@@ -28,6 +28,14 @@ pub struct ClientFilters {
 }
 
 /// Render one client session in the documented detail shape.
+///
+/// `connected_at` is the instant recorded where the session is already
+/// being written (creation, reconnect, bind), omitted for sessions that
+/// predate timestamp recording rather than substituted. `ip_address`
+/// comes from the stored peer address, `proto_ver` from the negotiated
+/// version, `clean_start` and `expiry_interval` from the bind, and the
+/// counts from the live queues. Fields without a stored value stay
+/// omitted, never substituted.
 fn client_detail_json(
     client_id: &str,
     session: Option<&std::sync::Arc<broker_session::Session>>,
@@ -140,6 +148,17 @@ pub async fn list_clients(
     // snapshot is bounded by the live connection count.
     let all_client_ids = state.sessions.active_client_ids();
 
+    // The documented filter accepts only the three named states. Any
+    // other value is a client error (400 `INVALID_PARAMETER`).
+    if let Some(state_filter) = filters.conn_state.as_deref() {
+        if state_filter != "connected" && state_filter != "idle" && state_filter != "disconnected" {
+            return ApiError::InvalidParameter(
+                "query parameter `conn_state` must be `connected`, `idle` or `disconnected`"
+                    .to_string(),
+            )
+            .into_response();
+        }
+    }
     // Filter first, then paginate: slicing before filtering would drop
     // matching rows that fall outside the raw page window and report a
     // pre-filter count in `meta`.
@@ -157,9 +176,10 @@ pub async fn list_clients(
             .map(|s| *s.connected.read())
             .unwrap_or(false);
         if let Some(state_filter) = filters.conn_state.as_deref() {
-            if (state_filter == "connected" && !is_connected)
-                || (state_filter == "disconnected" && is_connected)
-            {
+            // `idle` names connected sessions: the broker keeps no
+            // idle tracking, so idle reads as the connected set.
+            let wants_connected = state_filter != "disconnected";
+            if wants_connected != is_connected {
                 continue;
             }
         }
@@ -1062,8 +1082,37 @@ pub async fn put_client_keepalive(
 /// The snapshot is bounded and sorted.
 /// Unknown query keys are ignored.
 /// Returns a bare list with no envelope.
-pub async fn list_subscriptions(State(state): State<ApiState>, params: PageParams) -> Response {
+/// Only `qos` narrows the read; a `qos` outside 0, 1 or 2 fails
+/// with 400 `BAD_REQUEST`.
+#[derive(Deserialize, Default)]
+pub struct SubscriptionsQuery {
+    #[serde(default)]
+    pub qos: Option<String>,
+}
+
+pub async fn list_subscriptions(
+    State(state): State<ApiState>,
+    params: PageParams,
+    Query(query): Query<SubscriptionsQuery>,
+) -> Response {
+    let qos_filter: Option<u8> = match query.qos.as_deref() {
+        None => None,
+        Some(raw) => match raw.trim().parse::<u8>() {
+            Ok(value) if value <= 2 => Some(value),
+            _ => {
+                return ApiError::BadRequest("query parameter `qos` must be 0, 1 or 2".to_string())
+                    .into_response();
+            }
+        },
+    };
     let rows = state.sessions.global_subscriptions();
+    let rows: Vec<_> = match qos_filter {
+        None => rows,
+        Some(want) => rows
+            .into_iter()
+            .filter(|entry| u8::from(entry.options.qos) == want)
+            .collect(),
+    };
     let page_items = paginate(&rows, params.page, params.limit);
     let data: Vec<serde_json::Value> = page_items
         .iter()
@@ -1638,11 +1687,9 @@ async fn handle_mgmt_retained(
     retain: bool,
     payload: &Bytes,
 ) {
-    // TODO(parity): management publishes carry no client tenant yet, so the
-    // mirror stores in the default tenant only (fail closed: never another
-    // tenant's; single-tenant behaviour unchanged). The open question is the
-    // tenant attribution for management publishes once authenticated callers
-    // carry a tenant.
+    // Management publishes carry no client tenant. The mirror stores
+    // in the default tenant only (fail closed: never another tenant's).
+    // Single-tenant behaviour stays unchanged.
     handle_mgmt_retained_in_tenant(
         state,
         topic,
@@ -1727,7 +1774,7 @@ async fn do_mgmt_publish(
     payload: &Bytes,
     qos: QoS,
     retain: bool,
-) -> usize {
+) -> (usize, u64, usize) {
     state.metrics.inc_messages_received();
     state.metrics.inc_publish_received();
     match qos {
@@ -1758,9 +1805,9 @@ async fn do_mgmt_publish(
     // insert; delivery proceeds even when the index is full.
     // Management-plane index only, no work on fan-out or fan-in.
     state.router.record_topic(topic.as_str());
-    let (frames, _offline, matched) = build_publish_deliveries(state, topic, qos, retain, payload);
-    route_publish_frames(state, frames);
-    matched
+    let (frames, offline, matched) = build_publish_deliveries(state, topic, qos, retain, payload);
+    let enqueued = route_publish_frames(state, frames);
+    (matched, enqueued, offline)
 }
 
 pub async fn publish_message(State(state): State<ApiState>, body: Bytes) -> Response {
@@ -1774,7 +1821,27 @@ pub async fn publish_message(State(state): State<ApiState>, body: Bytes) -> Resp
         Ok(parts) => parts,
         Err(message) => return ApiError::BadRequest(message).into_response(),
     };
-    do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
+    let (matched, enqueued, offline) = do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
+    if matched == 0 {
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "message": "no_matching_subscribers",
+                "reason_code": 16,
+            })),
+        )
+            .into_response();
+    }
+    if enqueued == 0 && offline == 0 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "message": "failed to deliver the message to subscriber(s)",
+                "reason_code": 131,
+            })),
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({ "id": publish_id() })),
@@ -1787,13 +1854,13 @@ pub async fn publish_message(State(state): State<ApiState>, body: Bytes) -> Resp
 /// Takes a JSON array of publish entries (same shape as `POST /publish`)
 /// and injects each through `parse_publish_entry` plus `do_mgmt_publish`,
 /// so bulk output observes identical validation, rule, retained and
-/// fan-out semantics. One bad entry never fails the batch: it is marked
-/// with the documented error shape in the result while the good ones
-/// still deliver. A wholly malformed body (invalid JSON or not an array)
-/// is a client error. Bounded iteration over the request itself: one
-/// parse plus one fan-out per entry, plus a result list of the same
-/// length. No extra buffering beyond the request and result lists;
-/// management-plane only.
+/// fan-out semantics. A wholly malformed body (invalid JSON or not an
+/// array) is a client error. One invalid entry fails the batch with 400;
+/// otherwise one undelivered entry reports 202 and one failed delivery
+/// reports 503, mirroring `POST /publish` per entry. Bounded iteration
+/// over the request itself: one parse plus one fan-out per entry, plus a
+/// result list of the same length. No extra buffering beyond the request
+/// and result lists; management-plane only.
 pub async fn publish_bulk(State(state): State<ApiState>, body: Bytes) -> Response {
     let entries: Vec<serde_json::Value> = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -1803,27 +1870,57 @@ pub async fn publish_bulk(State(state): State<ApiState>, body: Bytes) -> Respons
         }
     };
     let mut results = Vec::with_capacity(entries.len());
+    let mut has_invalid = false;
+    let mut has_no_match = false;
+    let mut has_failed = false;
     for entry in &entries {
         match parse_publish_entry(entry) {
             Ok((topic, payload, qos, retain)) => {
-                do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
-                results.push(serde_json::json!({
-                    "topic": topic.as_str(),
-                    "id": publish_id(),
-                }));
+                let (matched, enqueued, offline) =
+                    do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
+                if matched == 0 {
+                    has_no_match = true;
+                    results.push(serde_json::json!({
+                        "topic": topic.as_str(),
+                        "message": "no_matching_subscribers",
+                        "reason_code": 16,
+                    }));
+                } else if enqueued == 0 && offline == 0 {
+                    has_failed = true;
+                    results.push(serde_json::json!({
+                        "topic": topic.as_str(),
+                        "message": "failed to deliver the message to subscriber(s)",
+                        "reason_code": 131,
+                    }));
+                } else {
+                    results.push(serde_json::json!({
+                        "topic": topic.as_str(),
+                        "id": publish_id(),
+                    }));
+                }
             }
             Err(message) => {
+                has_invalid = true;
                 let topic = entry
                     .get("topic")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
                 results.push(serde_json::json!({
                     "topic": topic,
-                    "code": "BAD_REQUEST",
                     "message": message,
+                    "reason_code": 144,
                 }));
             }
         }
+    }
+    if has_invalid {
+        return (StatusCode::BAD_REQUEST, Json(results)).into_response();
+    }
+    if has_failed {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(results)).into_response();
+    }
+    if has_no_match {
+        return (StatusCode::ACCEPTED, Json(results)).into_response();
     }
     (StatusCode::OK, Json(results)).into_response()
 }

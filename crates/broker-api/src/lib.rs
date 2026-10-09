@@ -70,8 +70,9 @@ pub struct ApiState {
     /// per-message path.
     pub bans: Arc<crate::v5::banned::BanStore>,
     /// Alarm directory for `/api/v5/alarms` (W1-16): bounded active map
-    /// plus deactivated history. Management-plane only; never touched on
-    /// the per-message path.
+    /// plus deactivated history. The kernel raises entries on CONNECT
+    /// (`crates/broker-node/src/main.rs`, ban refusal path) and reads
+    /// them here. Never touched on the per-message path.
     pub alarms: Arc<crate::v5::alarms::AlarmStore>,
     /// Monitor history for `/api/v5/monitor` (W1-19): bounded ring of
     /// sampled points. Management-plane only; never touched on the
@@ -213,13 +214,12 @@ pub struct ApiState {
     /// this store only manages the key records.
     pub api_keys: Arc<crate::v5::api_keys::ApiKeyStore>,
     /// Management audit ring for `GET /api/v5/audit` (W2-28): bounded
-    /// oldest-evicted log of authenticated management requests. The
-    /// routes read one bounded snapshot per request; the kernel boot
-    /// path shares the same instance (`crates/broker-node/src/main.rs`,
-    /// `Shared.audit` plus the `serve_api` share below) and the
-    /// management auth middleware records one fire-and-forget entry per
-    /// authenticated request (`crate::api_auth::require_api_auth`).
-    /// Publish and deliver never touch this store.
+    /// oldest-evicted log of authenticated management requests plus
+    /// CONNECT outcomes. The kernel records CONNECT success and refusal
+    /// (`crates/broker-node/src/main.rs`, bind path) and the management
+    /// auth middleware records each authenticated request
+    /// (`crate::api_auth::require_api_auth`). Publish and deliver never
+    /// touch this store.
     pub audit: Arc<crate::v5::audit::AuditLog>,
     /// Configured single-sign-on backend registry for `GET /api/v5/sso`
     /// (W2-32) and the per-backend `GET/PUT/DELETE /api/v5/sso/{backend}`
@@ -3823,7 +3823,7 @@ mod tests {
                     &token,
                 )
                 .await;
-            assert_eq!(status, 200);
+            assert_eq!(status, 202);
         }
 
         // List shows both entries with the documented per-entry fields.
@@ -3939,7 +3939,7 @@ mod tests {
             assert!(entry["activate_at"]
                 .as_str()
                 .is_some_and(|s| s.contains('T')));
-            assert_eq!(entry["deactivate_at"], json!("infinity"));
+            assert!(entry.get("deactivate_at").is_none());
         }
         assert_eq!(data[0]["message"], json!("first alarm"));
         assert_eq!(data[0]["details"], json!({"high_watermark": 70}));
@@ -4010,7 +4010,11 @@ mod tests {
         assert_eq!(body["meta"]["count"], json!(1));
 
         let (status, _) = server
-            .post_auth("/api/v5/alarms/force_deactivate", json!({}), &token)
+            .post_auth(
+                "/api/v5/alarms/force_deactivate",
+                json!({"name": "w1-17-alarm"}),
+                &token,
+            )
             .await;
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
@@ -4018,11 +4022,12 @@ mod tests {
         assert_eq!(body["data"], json!([]));
         assert_eq!(body["meta"]["count"], json!(0));
 
-        // Repeating with no alarms still reports success.
-        let (status, _) = server
+        // An empty body fails with bad request.
+        let (status, body) = server
             .post_auth("/api/v5/alarms/force_deactivate", json!({}), &token)
             .await;
-        assert_eq!(status, 204);
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
 
         // A named body deactivates just that alarm; the other stays listed.
         state
@@ -4044,21 +4049,25 @@ mod tests {
         assert_eq!(body["meta"]["count"], json!(1));
         assert_eq!(body["data"][0]["name"], json!("w1-17-b-alarm"));
 
-        // Deactivating an unknown name still reports success and changes
-        // nothing; clearing the last alarm by empty body empties the list.
-        let (status, _) = server
+        // Deactivating an unknown name fails and changes nothing.
+        let (status, body) = server
             .post_auth(
                 "/api/v5/alarms/force_deactivate",
                 json!({"name": "w1-17-missing"}),
                 &token,
             )
             .await;
-        assert_eq!(status, 204);
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
         let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["meta"]["count"], json!(1));
         let (status, _) = server
-            .post_auth("/api/v5/alarms/force_deactivate", json!({}), &token)
+            .post_auth(
+                "/api/v5/alarms/force_deactivate",
+                json!({"name": "w1-17-b-alarm"}),
+                &token,
+            )
             .await;
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/alarms", &token).await;
@@ -4853,8 +4862,8 @@ mod tests {
             )
             .await;
         assert_eq!(status, 200);
-        assert_eq!(created["as"], json!("clientid"));
-        assert_eq!(created["who"], json!("w1-01-c1"));
+        assert_eq!(created["data"][0]["as"], json!("clientid"));
+        assert_eq!(created["data"][0]["who"], json!("w1-01-c1"));
 
         // Listing now carries the entry plus paging metadata.
         let (status, body) = server.get_auth("/api/v5/banned", &token).await;
@@ -17686,8 +17695,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert!(body["id"].is_string());
+        assert_eq!(status, 202);
+        assert_eq!(body["reason_code"], json!(16));
+        assert!(body["message"].is_string());
     }
 
     #[tokio::test]
@@ -17789,7 +17799,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 400);
         let results = body.as_array().expect("bulk result is a list");
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["topic"], json!("w1-12/bulk/good"));
@@ -17798,8 +17808,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             "bulk good entry accepts with id: {results:?}"
         );
         assert_eq!(results[1]["topic"], json!("bad/#/topic"));
-        assert_eq!(results[1]["code"], json!("BAD_REQUEST"));
         assert!(results[1]["message"].is_string());
+        assert!(results[1]["reason_code"].is_number());
 
         let (status, body) = server
             .get_auth("/api/v5/clients/w1-12-a/mqueue_messages", &token)
@@ -17975,6 +17985,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
+        // Spec reports 204 with no body. Absent still succeeds.
         assert_eq!(status, 204);
 
         let (status, body) = server
@@ -18468,19 +18479,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // Query the log: both entries read back with paging metadata.
         let (status, body) = server.get_auth("/api/v5/audit", &token).await;
         assert_eq!(status, 200);
-        let data = body["data"].as_array().expect("data is a list");
+        let data = body[0]["data"].as_array().expect("data is a list");
         assert!(
             data.len() >= 2,
             "both management operations are audited: {body:?}"
         );
-        assert!(body["meta"].is_object(), "page envelope carries meta");
+        assert!(body[0]["meta"].is_object(), "page envelope carries meta");
         assert_eq!(
-            body["meta"]["page"],
+            body[0]["meta"]["page"],
             json!(1),
             "default page reports: {body:?}"
         );
         assert_eq!(
-            body["meta"]["limit"],
+            body[0]["meta"]["limit"],
             json!(100),
             "default limit reports: {body:?}"
         );
@@ -18504,9 +18515,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/audit?page=1&limit=1", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(paged["meta"]["page"], json!(1));
-        assert_eq!(paged["meta"]["limit"], json!(1));
-        assert_eq!(paged["data"].as_array().expect("paged data").len(), 1);
+        assert_eq!(paged[0]["meta"]["page"], json!(1));
+        assert_eq!(paged[0]["meta"]["limit"], json!(1));
+        assert_eq!(paged[0]["data"].as_array().expect("paged data").len(), 1);
 
         // Unknown query parameters are ignored, not errors.
         let (status, _) = server
@@ -18520,8 +18531,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/audit?gte_created_at=4102444800000000", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(empty["data"], json!([]));
-        assert_eq!(empty["meta"]["count"], json!(0));
+        assert_eq!(empty[0]["data"], json!([]));
+        assert_eq!(empty[0]["meta"]["count"], json!(0));
 
         // The outcome filter honours success.
         let (status, filtered) = server
@@ -18529,7 +18540,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         assert!(
-            filtered["meta"]["count"].as_u64().expect("count") >= 2,
+            filtered[0]["meta"]["count"].as_u64().expect("count") >= 2,
             "success filter keeps both entries: {filtered:?}"
         );
 
@@ -19473,7 +19484,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
+        assert_eq!(status, 202);
         let payload_new = base64::engine::general_purpose::STANDARD.encode(b"new-retained");
         let file = build_test_backup_with_tables(
             "retained-rt-0",

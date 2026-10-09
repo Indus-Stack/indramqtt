@@ -32,12 +32,10 @@
 //! Paging (stated here): the list is a bare array and takes no paging
 //! parameters, as the reference API documents. Query parameters are
 //! ignored.
-// TODO(parity): which per-entry fields beyond `code`/`status`/`desc`
-// does the documented catalogue shape require? The rulebook does not
-// decide the exact shape; the current choice serves the stable code name,
-// the numeric HTTP status our error mapping assigns, and a short summary
-// in our own words (omitting fields the broker cannot supply, never a
-// constant standing in for a measurement) until the checker pins it.
+// The catalogue serves the stable code name, the numeric HTTP status
+// the shared error mapping assigns, and a short operator summary. It
+// omits fields the broker cannot supply, never a constant standing in
+// for a measurement.
 
 use axum::{
     extract::Path,
@@ -49,8 +47,9 @@ use axum::{
 use crate::errors::ApiError;
 
 /// One catalogue entry: the stable code name, the numeric HTTP status
-/// our shared error mapping assigns to it, and a short operator-facing
-/// summary written in our own words.
+/// the shared error mapping assigns to it, and a short operator-facing
+/// summary. The summary is static help text for operators, not a
+/// measured value.
 pub struct ErrorCatalogEntry {
     code: &'static str,
     status: u16,
@@ -68,9 +67,9 @@ pub struct ErrorCatalogEntry {
 /// documents; a new error variant grows this array with its own reason.
 /// The catalogue is code-defined, so the cap is enforced by
 /// construction and management memory cannot grow from this route. The
-/// default is finite (`20`); the operator cannot opt into more because
+/// default is finite (`22`); the operator cannot opt into more because
 /// writes are out of scope (read-only routes).
-const ERROR_CATALOG: [ErrorCatalogEntry; 21] = [
+const ERROR_CATALOG: [ErrorCatalogEntry; 22] = [
     ErrorCatalogEntry {
         code: "NOT_FOUND",
         status: 404,
@@ -176,13 +175,18 @@ const ERROR_CATALOG: [ErrorCatalogEntry; 21] = [
         status: 400,
         desc: "Request query or paging input is malformed",
     },
+    ErrorCatalogEntry {
+        code: "BAD_RPC",
+        status: 400,
+        desc: "Monitor query failed on the node",
+    },
 ];
 
 /// Stated count of the fixed bounded set served by these routes. Reason:
 /// one entry per shared error variant above is the whole vocabulary the
 /// management plane can render, so the count documents the bound the
 /// handlers enforce.
-pub const ERROR_CODE_COUNT: usize = 21;
+pub const ERROR_CODE_COUNT: usize = 22;
 
 // Compile-time guard that the bound covers the served catalogue.
 const _: () = assert!(ERROR_CATALOG.len() == ERROR_CODE_COUNT);
@@ -303,6 +307,7 @@ mod tests {
             "ERROR_PWD_NOT_MATCH",
             "NOT_ALLOWED",
             "INVALID_PARAMETER",
+            "BAD_RPC",
         ] {
             assert!(codes.contains(&expected), "catalogue holds {expected}");
             assert!(
@@ -355,7 +360,7 @@ mod tests {
     async fn error_code_read_adds_no_work_to_publish() {
         // Management-plane only: catalogue reads followed by a
         // management publish through the rule engine and deliver path
-        // still answer 200, so customer traffic keeps serving.
+        // still answer, so customer traffic keeps serving.
         let state = standalone_state();
         let (status, _) = response_parts(list_error_codes().await).await;
         assert_eq!(status, StatusCode::OK);
@@ -375,7 +380,7 @@ mod tests {
         )
         .await;
         let (status, body) = response_parts(response).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.get("id").is_some(), "publish answers with an id");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.get("reason_code").is_some(), "publish answers 202");
     }
 }

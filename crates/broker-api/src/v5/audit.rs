@@ -1,9 +1,9 @@
 //! Management-plane audit log for the v5 management API.
 //!
 //! Covers `GET /audit` (paged query over real management entries,
-//! C05-07). Single-node, management-plane only: entries are recorded by
-//! the management authentication middleware after each authenticated
-//! management request finishes, and reads serve the same bounded ring.
+//! C05-07). Entries come from the management authentication middleware
+//! and from the kernel CONNECT path
+//! (`crates/broker-node/src/main.rs`, bind path).
 //! Publish and deliver never touch this store, and audit writes never
 //! take a blocking lock on any message path.
 //!
@@ -83,9 +83,17 @@ const MAX_SOURCE_IP_LEN: usize = 128;
 /// Reason: cloned per entry and per list snapshot; 128 covers long
 /// node ids with headroom.
 const MAX_NODE_LEN: usize = 128;
+/// Longest stored origin tag (`from`).
+/// Reason: rendered in every row and cloned per list snapshot, so an
+/// unbounded tag bloats each read; 64 covers known origins with headroom.
+const MAX_FROM_LEN: usize = 64;
 
 /// Origin tag rendered on entries recorded by the management middleware.
-const AUDIT_FROM: &str = "rest_api";
+/// Reason: the middleware is the only writer using this value.
+pub const AUDIT_FROM: &str = "rest_api";
+/// Origin tag rendered on entries recorded by the kernel CONNECT path.
+/// Reason: the bind path is the only writer using this value.
+pub const AUDIT_FROM_MQTT: &str = "mqtt";
 /// Outcome rendered when the audited response status is below 400.
 const OUTCOME_SUCCESS: &str = "success";
 /// Outcome rendered when the audited response status is 400 or above.
@@ -93,10 +101,12 @@ const OUTCOME_FAILURE: &str = "failure";
 
 /// One management audit entry: when the request finished
 /// (`created_at_us`, microseconds since the Unix epoch, plus the
-/// RFC 3339 rendering), where (`node`, `from`, `source`, `source_ip`),
-/// what (`operation_id` is the request path, `operation_type` is the
-/// first path group) and how it ended (`operation_result`,
-/// `http_method`, `http_status_code`, `duration_ms`).
+/// RFC 3339 rendering), where (`node`, `from`, `source`, `source_ip`,
+/// `tenant`), what (`operation_id` is the request path,
+/// `operation_type` is the first path group) and how it ended
+/// (`operation_result`, `http_method`, `http_status_code`,
+/// `duration_ms`). The tenant marks which bind or request produced the
+/// entry, so one tenant never reads another tenant's entry as its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEntry {
     pub created_at_us: u64,
@@ -110,6 +120,7 @@ pub struct AuditEntry {
     pub http_method: String,
     pub http_status_code: u16,
     pub duration_ms: u64,
+    pub tenant: String,
 }
 
 impl AuditEntry {
@@ -127,6 +138,7 @@ impl AuditEntry {
             "http_method": self.http_method,
             "http_status_code": self.http_status_code,
             "duration_ms": self.duration_ms,
+            "tenant": self.tenant,
         });
         if !self.source_ip.trim().is_empty() {
             entry["source_ip"] = serde_json::Value::String(self.source_ip.clone());
@@ -142,6 +154,7 @@ impl AuditEntry {
 pub struct AuditRecordInput {
     pub created_at_us: u64,
     pub node: String,
+    pub from: String,
     pub source: String,
     pub source_ip: String,
     pub operation_id: String,
@@ -150,6 +163,7 @@ pub struct AuditRecordInput {
     pub http_method: String,
     pub http_status_code: u16,
     pub duration_ms: u64,
+    pub tenant: String,
 }
 
 /// Bounded audit ring behind one short lock.
@@ -177,10 +191,22 @@ impl AuditLog {
     /// the lock is contended the entry is dropped and counted instead
     /// of blocking the audited request.
     pub fn record(&self, input: AuditRecordInput) {
+        let tenant = if input.tenant.trim().is_empty() {
+            broker_session::tenant::DEFAULT_TENANT_ID.to_string()
+        } else {
+            input.tenant
+        };
+        // Each path records its own origin. The middleware passes
+        // `rest_api`. The kernel CONNECT path passes `mqtt`.
+        let from = if input.from.trim().is_empty() {
+            AUDIT_FROM.to_string()
+        } else {
+            truncate(&input.from, MAX_FROM_LEN).to_string()
+        };
         let entry = AuditEntry {
             created_at_us: input.created_at_us,
             node: truncate(&input.node, MAX_NODE_LEN).to_string(),
-            from: AUDIT_FROM.to_string(),
+            from,
             source: truncate(&input.source, MAX_SOURCE_LEN).to_string(),
             source_ip: truncate(&input.source_ip, MAX_SOURCE_IP_LEN).to_string(),
             operation_id: truncate(&input.operation_id, MAX_OPERATION_ID_LEN).to_string(),
@@ -189,6 +215,7 @@ impl AuditLog {
             http_method: input.http_method,
             http_status_code: input.http_status_code,
             duration_ms: input.duration_ms,
+            tenant,
         };
         let Ok(mut ring) = self.inner.try_write() else {
             self.dropped_contention.fetch_add(1, Ordering::Relaxed);
@@ -277,6 +304,8 @@ pub struct AuditFilterQuery {
     pub gte_duration_ms: Option<String>,
     #[serde(default)]
     pub lte_duration_ms: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 /// Parsed filter bounds over one [`AuditLog`] snapshot.
@@ -295,6 +324,7 @@ pub struct AuditFilter {
     pub lte_created_at_us: Option<u64>,
     pub gte_duration_ms: Option<u64>,
     pub lte_duration_ms: Option<u64>,
+    pub tenant: Option<String>,
 }
 
 impl AuditFilter {
@@ -322,6 +352,7 @@ impl AuditFilter {
                 .lte_duration_ms
                 .as_deref()
                 .and_then(|raw| raw.trim().parse::<u64>().ok()),
+            tenant: non_empty(query.tenant.clone()),
         }
     }
 
@@ -388,6 +419,11 @@ impl AuditFilter {
         }
         if let Some(lte) = self.lte_duration_ms {
             if entry.duration_ms > lte {
+                return false;
+            }
+        }
+        if let Some(tenant) = &self.tenant {
+            if entry.tenant != *tenant {
                 return false;
             }
         }
@@ -597,13 +633,15 @@ pub fn operation_type_for_path(path: &str) -> String {
     first.to_string()
 }
 
-/// `GET /audit`: paged audit page (`data` plus `meta`). An empty log
-/// reads as an empty page, never an error. Time-range
-/// (`gte_created_at`/`lte_created_at`) and outcome (`operation_result`)
-/// filters narrow the read plus the other documented management
-/// filters; unknown query keys are ignored and malformed bounds fall
-/// back to unfiltered for that side. Malformed `page`/`limit` fall back
-/// to defaults via [`PageParams`].
+/// `GET /audit`: audit pages in a list with one page (`data` plus
+/// `meta`). An empty log reads as one empty page, never an error.
+/// Time-range (`gte_created_at`/`lte_created_at`) and outcome
+/// (`operation_result`) filters narrow the read plus the other
+/// documented management filters; unknown query keys are ignored and
+/// malformed bounds fall back to unfiltered for that side. A documented
+/// enum filter holding an undocumented value (`operation_result` other
+/// than `success` or `failure`) fails with 400 `BAD_REQUEST`. Malformed
+/// `page`/`limit` fall back to defaults via [`PageParams`].
 ///
 /// Management-plane only: one short read lock per request; publish and
 /// deliver never touch this store.
@@ -612,6 +650,15 @@ pub async fn list_audit(
     params: PageParams,
     Query(query): Query<AuditFilterQuery>,
 ) -> Response {
+    if let Some(raw) = query.operation_result.as_deref() {
+        let value = raw.trim();
+        if !value.is_empty() && value != OUTCOME_SUCCESS && value != OUTCOME_FAILURE {
+            return crate::errors::ApiError::BadRequest(
+                "query parameter `operation_result` must be `success` or `failure`".to_string(),
+            )
+            .into_response();
+        }
+    }
     let filter = AuditFilter::from_query(&query);
     let all = state.audit.query(&filter);
     let total = all.len();
@@ -619,10 +666,10 @@ pub async fn list_audit(
     let data: Vec<serde_json::Value> = page_items.iter().map(AuditEntry::to_json).collect();
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        Json(serde_json::json!([{
             "data": data,
             "meta": meta_page(params.page, params.limit, total),
-        })),
+        }])),
     )
         .into_response()
 }
@@ -635,6 +682,7 @@ mod tests {
         AuditRecordInput {
             created_at_us,
             node: "indra-node-1".to_string(),
+            from: AUDIT_FROM.to_string(),
             source: "admin".to_string(),
             source_ip: String::new(),
             operation_id: operation_id.to_string(),
@@ -643,6 +691,7 @@ mod tests {
             http_method: "post".to_string(),
             http_status_code: if result == OUTCOME_SUCCESS { 200 } else { 400 },
             duration_ms: 1,
+            tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
         }
     }
 
@@ -728,6 +777,7 @@ mod tests {
             "http_method",
             "http_status_code",
             "duration_ms",
+            "tenant",
         ] {
             assert!(rendered.get(field).is_some(), "missing field {field}");
         }
@@ -795,6 +845,36 @@ mod tests {
         assert_eq!(parse_time_bound(""), None);
         // Non-UTC offsets are not accepted (writer only emits UTC).
         assert_eq!(parse_time_bound("2023-11-14T22:13:20.000000+08:00"), None);
+    }
+
+    #[test]
+    fn entries_stay_in_their_own_tenant() {
+        let log = AuditLog::new();
+        let mut first = entry_at(1_700_000_000_000_000, OUTCOME_SUCCESS, "/api/v5/api_key");
+        first.tenant = broker_session::tenant::DEFAULT_TENANT_ID.to_string();
+        let mut second = entry_at(1_700_000_000_000_001, OUTCOME_SUCCESS, "/api/v5/api_key");
+        second.tenant = "tenant-b".to_string();
+        log.record(first);
+        log.record(second);
+        let scoped = log.query(&AuditFilter {
+            tenant: Some("tenant-b".to_string()),
+            ..AuditFilter::default()
+        });
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].tenant, "tenant-b");
+    }
+
+    #[test]
+    fn record_keeps_caller_origin() {
+        // Each path records its own origin. The store keeps the
+        // caller value. It never substitutes a fixed tag.
+        let log = AuditLog::new();
+        let mut input = entry_at(1_700_000_000_000_000, OUTCOME_SUCCESS, "/mqtt/connect");
+        input.from = AUDIT_FROM_MQTT.to_string();
+        log.record(input);
+        let all = log.query(&AuditFilter::default());
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].from, AUDIT_FROM_MQTT);
     }
 
     #[test]

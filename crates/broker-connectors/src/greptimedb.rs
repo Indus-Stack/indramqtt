@@ -819,6 +819,11 @@ impl Sink for GreptimeDbSink {
         };
 
         if should_flush {
+            // Buffer rows during backoff. Keep rows and skip flush.
+            // Flush fails fast while backing off.
+            if self.backoff.lock().check().is_err() {
+                return Ok(());
+            }
             self.flush().await?;
         }
         Ok(())

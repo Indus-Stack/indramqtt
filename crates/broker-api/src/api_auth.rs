@@ -339,6 +339,7 @@ pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next:
     state.audit.record(crate::v5::audit::AuditRecordInput {
         created_at_us: crate::v5::audit::now_micros(),
         node: state.node_id.clone(),
+        from: crate::v5::audit::AUDIT_FROM.to_string(),
         source: info.username.clone(),
         source_ip: String::new(),
         operation_id: path.clone(),
@@ -347,6 +348,7 @@ pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next:
         http_method: method.as_str().to_lowercase(),
         http_status_code: status,
         duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
     });
     response
 }

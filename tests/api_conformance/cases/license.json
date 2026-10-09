@@ -1,0 +1,120 @@
+[
+  {
+    "operation": "GET /license",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /license",
+    "path_params": {},
+    "query": {},
+    "body": {"key": "conf-test-key"},
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /license",
+    "path_params": {},
+    "query": {},
+    "body": {},
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /license",
+    "path_params": {},
+    "query": {},
+    "body": {"key": 123},
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /license/setting",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /license/setting",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "connection_low_watermark": "70%",
+      "connection_high_watermark": "85%",
+      "high_watermark_timezone": "system"
+    },
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "PUT",
+          "path": "/license/setting",
+          "body": {
+            "connection_low_watermark": "75%",
+            "connection_high_watermark": "80%",
+            "high_watermark_timezone": "system"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "operation": "PUT /license/setting",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "connection_low_watermark": "90%",
+      "connection_high_watermark": "80%"
+    },
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /license/setting",
+    "path_params": {},
+    "query": {},
+    "body": {"connection_low_watermark": "75"},
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /license/session_hwm_history",
+    "path_params": {},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /license/session_hwm_history",
+    "path_params": {},
+    "query": {"period": "daily"},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /license/session_hwm_history",
+    "path_params": {},
+    "query": {"period": "monthly", "limit": 1},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  }
+]
