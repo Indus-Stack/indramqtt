@@ -3766,9 +3766,14 @@ struct Shared {
     /// Read on connect only.
     wss_peer_cert_as_username: String,
     /// Source for the bind client identifier from the client
-    /// certificate on the secure WebSocket listener (K1-05).
-    /// Set once at boot. Read on connect only.
+    /// certificate on the secure WebSocket listener (K1-05). Set once at boot.
+    /// Read on connect only.
     wss_peer_cert_as_clientid: String,
+    /// Pre-shared-key identity store for the kernel TLS listener (K1-04).
+    /// Shared with the PSK handshake callbacks. One `Arc` clone at boot;
+    /// handshakes take one short read lock per lookup. The keys file fills
+    /// it at boot. Empty by default, so every handshake fails closed.
+    psk: Arc<broker_auth::PskStore>,
 }
 
 impl Shared {
@@ -3943,6 +3948,7 @@ impl Shared {
             wss_fail_if_no_peer_cert: false,
             wss_peer_cert_as_username: "disabled".to_string(),
             wss_peer_cert_as_clientid: "disabled".to_string(),
+            psk: Arc::new(broker_auth::PskStore::new()),
         }
     }
 
@@ -9734,6 +9740,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .wss_peer_cert_as_clientid
         .clone_from(&cfg.listeners.wss.peer_cert_as_clientid);
+    // K1-04: load the static PSK table before any bind.
+    // The file gives the store its identities. An empty path keeps
+    // the store empty, so every handshake fails closed. A bad file
+    // fails boot loudly, never with an empty store.
+    if cfg.listeners.tls.enabled
+        && cfg.listeners.tls.native
+        && cfg.listeners.tls.psk_enabled
+        && !cfg.listeners.tls.psk_keys_file.trim().is_empty()
+    {
+        let count = shared
+            .psk
+            .load_file(cfg.listeners.tls.psk_keys_file.trim())
+            .map_err(|e| format!("listeners.tls.psk_keys_file: {e}"))?;
+        info!("PSK table loaded: {} identities", count);
+    }
     // Tenants (MT-01): install the configured assignment rules before
     // any edge binds. Validated whole; a bad row fails boot loudly.
     install_tenant_rules(&shared, &cfg)?;
@@ -10415,28 +10436,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
     if cfg.listeners.tls.enabled && cfg.listeners.tls.native {
-        let tls_config = native::load_tls_config(
-            &cfg.listeners.tls.cert_file,
-            &cfg.listeners.tls.key_file,
-            &native::TlsClientAuth {
-                verify_peer: cfg.listeners.tls.verify == "verify_peer",
-                legacy_verify: cfg.listeners.tls.verify_client_cert,
-                cacertfile: cfg.listeners.tls.cacertfile.clone(),
-                fail_if_no_peer_cert: cfg.listeners.tls.fail_if_no_peer_cert,
-            },
-        )
-        .map_err(|e| format!("listeners.tls: {e}"))?;
         // The TLS listener has no connection limit of its own in the
         // configuration. It uses the limit of the plaintext listener.
         let listener = native::bind_listener(&cfg.listeners.tls.bind, cfg.listeners.tcp.backlog)
             .map_err(|e| format!("listeners.tls.bind {}: {e}", cfg.listeners.tls.bind))?;
-        info!("Kernel MQTT TLS listener on {}", cfg.listeners.tls.bind);
-        tokio::spawn(native::serve_native_mqtts(
-            listener,
-            tls_config,
-            cfg.listeners.tcp.max_connections,
-            shared.clone(),
-        ));
+        if cfg.listeners.tls.psk_enabled {
+            // PSK serves the identity store with PSK suites only.
+            // An unknown identity and a wrong key both fail the
+            // handshake. The failure never names the identity.
+            info!("Kernel MQTT TLS PSK listener on {}", cfg.listeners.tls.bind);
+            tokio::spawn(native::serve_native_mqtt_psk(
+                listener,
+                shared.psk.clone(),
+                cfg.listeners.tcp.max_connections,
+                shared.clone(),
+            ));
+        } else {
+            let tls_config = native::load_tls_config(
+                &cfg.listeners.tls.cert_file,
+                &cfg.listeners.tls.key_file,
+                &native::TlsClientAuth {
+                    verify_peer: cfg.listeners.tls.verify == "verify_peer",
+                    legacy_verify: cfg.listeners.tls.verify_client_cert,
+                    cacertfile: cfg.listeners.tls.cacertfile.clone(),
+                    fail_if_no_peer_cert: cfg.listeners.tls.fail_if_no_peer_cert,
+                },
+            )
+            .map_err(|e| format!("listeners.tls: {e}"))?;
+            info!("Kernel MQTT TLS listener on {}", cfg.listeners.tls.bind);
+            tokio::spawn(native::serve_native_mqtts(
+                listener,
+                tls_config,
+                cfg.listeners.tcp.max_connections,
+                shared.clone(),
+            ));
+        }
     }
     if cfg.listeners.ws.enabled && cfg.listeners.ws.native {
         // The WebSocket listener has no connection limit of its own in

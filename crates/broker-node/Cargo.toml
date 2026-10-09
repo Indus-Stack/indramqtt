@@ -56,6 +56,12 @@ toml = { workspace = true }
 rustls = { version = "0.23.45" }
 tokio-rustls = { version = "0.26" }
 rustls-pemfile = { version = "1" }
+# TLS PSK for the native PSK listener path only. The certificate
+# TLS listener keeps rustls. Versions already in the workspace
+# lock file. Licences: Apache-2.0 (openssl), MIT OR Apache-2.0
+# (tokio-openssl).
+openssl = { version = "0.10" }
+tokio-openssl = { version = "0.6" }
 # Client certificate request and chain check use Mozilla roots.
 # Licence: ISC (roots data under CDLA-Permissive-2.0, CTO exception DEV-013).
 webpki-roots = { version = "1" }

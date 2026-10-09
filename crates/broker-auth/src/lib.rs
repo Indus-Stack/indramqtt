@@ -14,6 +14,7 @@ pub mod jwks_test_support;
 pub mod kerberos;
 pub mod ldap;
 pub mod node_cache;
+pub mod psk;
 pub mod settings;
 pub mod webhook;
 
@@ -39,6 +40,8 @@ pub use jwks::{
 pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 pub use node_cache::NodeAuthCache;
+pub use psk::{PskInsertError, PskStore};
+pub use psk::{MAX_PSK_ENTRIES, MAX_PSK_IDENTITY_BYTES, MAX_PSK_KEY_BYTES, MIN_PSK_KEY_BYTES};
 pub use settings::{AuthnSettingsStore, SettingsSubscriber, SettingsUpdateError};
 pub use webhook::{
     WebhookAuth, WebhookConfig, WEBHOOK_BREAKER_RESET_MS, WEBHOOK_BREAKER_THRESHOLD,

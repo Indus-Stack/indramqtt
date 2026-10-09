@@ -139,6 +139,20 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
             },
             FieldDoc {
+                path: "listeners.tls.psk_enabled",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the kernel TLS listener accepts pre-shared-key handshakes. Takes effect with native enabled.",
+            },
+            FieldDoc {
+                path: "listeners.tls.psk_keys_file",
+                setting_type: "path string",
+                default: "\"\"",
+                range: "file path; empty means no identities",
+                doc: "Path to the PSK identity file of the kernel TLS listener. Takes effect with native and PSK enabled.",
+            },
+            FieldDoc {
                 path: "listeners.tls.verify_client_cert",
                 setting_type: "bool",
                 default: "false",
@@ -982,6 +996,17 @@ pub struct TlsListenerConf {
     /// Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.
     #[serde(default = "default_false")]
     pub native: bool,
+    /// Whether the kernel TLS listener accepts pre-shared-key handshakes.
+    /// Takes effect with native enabled. Off by default keeps
+    /// certificate handshakes unchanged. On serves PSK suites from the
+    /// identity store with no certificate.
+    #[serde(default = "default_false")]
+    pub psk_enabled: bool,
+    /// Path to the PSK identity file of the kernel TLS listener.
+    /// Takes effect with native and PSK enabled. Empty keeps the
+    /// store empty, so every handshake fails closed.
+    #[serde(default)]
+    pub psk_keys_file: String,
     /// Whether the TLS listener requests and verifies a client certificate.
     #[serde(default = "default_false")]
     pub verify_client_cert: bool,
@@ -1030,6 +1055,8 @@ impl Default for TlsListenerConf {
             cert_file: String::new(),
             key_file: String::new(),
             native: false,
+            psk_enabled: false,
+            psk_keys_file: String::new(),
             verify_client_cert: default_verify_client_cert(),
             verify: default_tls_verify(),
             cacertfile: String::new(),
@@ -1044,19 +1071,22 @@ impl TlsListenerConf {
     /// Validates the TLS listener.
     pub fn validate(&self) -> Result<(), ConfigError> {
         check_bind("listeners.tls.bind", &self.bind, false)?;
-        if self.enabled {
+        // A native PSK-only listener carries no certificate. The pure
+        // PSK form needs no certificate files. Other forms still do.
+        let needs_cert = self.enabled && !(self.psk_enabled && self.native);
+        if needs_cert {
             if self.cert_file.trim().is_empty() {
                 return Err(invalid(
                     "listeners.tls.cert_file",
                     &self.cert_file,
-                    "is required when TLS is enabled",
+                    "is required when TLS is enabled without native PSK",
                 ));
             }
             if self.key_file.trim().is_empty() {
                 return Err(invalid(
                     "listeners.tls.key_file",
                     &self.key_file,
-                    "is required when TLS is enabled",
+                    "is required when TLS is enabled without native PSK",
                 ));
             }
         }
@@ -2920,6 +2950,16 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 ),
                 bool_field("tls.native", false, "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them."),
                 bool_field(
+                    "tls.psk_enabled",
+                    false,
+                    "Whether the kernel TLS listener accepts pre-shared-key handshakes. Takes effect with native enabled.",
+                ),
+                str_field(
+                    "tls.psk_keys_file",
+                    "",
+                    "Path to the PSK identity file of the kernel TLS listener. Takes effect with native and PSK enabled.",
+                ),
+                bool_field(
                     "tls.verify_client_cert",
                     false,
                     "Whether the TLS listener requests and verifies a client certificate.",
@@ -3936,6 +3976,36 @@ mod tests {
                 row.path
             );
         }
+    }
+
+    #[test]
+    fn tls_psk_setting_parses_and_drives_validation() {
+        // Off by default keeps certificate handshakes unchanged.
+        assert!(!BrokerConfig::default().listeners.tls.psk_enabled);
+        assert!(BrokerConfig::default()
+            .listeners
+            .tls
+            .psk_keys_file
+            .is_empty());
+        // The file layer accepts the setting.
+        let parsed = BrokerConfig::parse_toml("[listeners.tls]\npsk_enabled = true\n")
+            .expect("psk setting parses");
+        assert!(parsed.listeners.tls.psk_enabled);
+        // The file layer accepts the keys file.
+        let parsed =
+            BrokerConfig::parse_toml("[listeners.tls]\npsk_keys_file = \"/etc/indra/psk.txt\"\n")
+                .expect("keys file parses");
+        assert_eq!(parsed.listeners.tls.psk_keys_file, "/etc/indra/psk.txt");
+        // A native PSK-only listener needs no certificate files.
+        let mut psk = BrokerConfig::default();
+        psk.listeners.tls.enabled = true;
+        psk.listeners.tls.native = true;
+        psk.listeners.tls.psk_enabled = true;
+        psk.validate().expect("psk needs no certificate");
+        // A certificate listener still needs them.
+        let mut cert = BrokerConfig::default();
+        cert.listeners.tls.enabled = true;
+        assert!(cert.validate().is_err(), "certificate needs files");
     }
 
     #[test]

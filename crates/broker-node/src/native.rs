@@ -417,6 +417,279 @@ pub(super) async fn serve_native_mqtts(
     }
 }
 
+/// PSK cipher suites for TLS 1.2.
+/// Reason: AEAD only, so no CBC padding-oracle class.
+/// Matches the cipher suites of the edge reference.
+const PSK_CIPHER_LIST: &str = "PSK-AES128-GCM-SHA256:PSK-AES256-GCM-SHA384";
+/// PSK cipher suites for TLS 1.3.
+/// Reason: the two GCM suites cover 128 and 256 bit keys.
+const PSK_CIPHERSUITES: &str = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384";
+
+/// Raw OpenSSL handshake hooks for TLS 1.3 external PSK.
+/// The safe wrapper exposes only the TLS 1.2 callback, so this
+/// module calls `SSL_CTX_set_psk_find_session_callback` directly.
+/// Both callbacks read the same store.
+mod psk_tls13 {
+    use std::collections::HashMap;
+    use std::os::raw::{c_char, c_int, c_uchar, c_void};
+    use std::sync::{Arc, OnceLock};
+
+    /// TLS 1.3 version number for the session object.
+    /// Reason: the protocol version comes from the TLS specification.
+    const TLS1_3_VERSION: c_int = 0x0304;
+
+    extern "C" {
+        fn SSL_CTX_set_psk_find_session_callback(
+            ctx: *mut c_void,
+            cb: Option<
+                unsafe extern "C" fn(*mut c_void, *const c_uchar, usize, *mut *mut c_void) -> c_int,
+            >,
+        );
+        fn SSL_get_SSL_CTX(ssl: *const c_void) -> *mut c_void;
+        fn SSL_SESSION_new() -> *mut c_void;
+        fn SSL_SESSION_free(sess: *mut c_void);
+        fn SSL_SESSION_set1_master_key(
+            sess: *mut c_void,
+            key: *const c_uchar,
+            keylen: usize,
+        ) -> c_int;
+        fn SSL_SESSION_set_cipher(sess: *mut c_void, cipher: *const c_void) -> c_int;
+        fn SSL_SESSION_set_protocol_version(sess: *mut c_void, version: c_int) -> c_int;
+        fn SSL_get_ciphers(ssl: *const c_void) -> *mut c_void;
+        fn SSL_CIPHER_get_name(cipher: *const c_void) -> *const c_char;
+        fn OPENSSL_sk_num(stack: *const c_void) -> c_int;
+        fn OPENSSL_sk_value(stack: *const c_void, index: c_int) -> *mut c_void;
+    }
+
+    /// Context pointer to store map. One entry for each PSK listener.
+    /// Holds at most [`MAX_PSK_CONTEXTS`] entries.
+    fn ctx_stores() -> &'static parking_lot::Mutex<HashMap<usize, Arc<broker_auth::PskStore>>> {
+        static CELL: OnceLock<parking_lot::Mutex<HashMap<usize, Arc<broker_auth::PskStore>>>> =
+            OnceLock::new();
+        CELL.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+    }
+
+    /// Most TLS 1.3 PSK contexts remembered at once.
+    /// Reason: the kernel runs one PSK listener, so one entry is live.
+    /// The rest covers restarts and tests.
+    pub(super) const MAX_PSK_CONTEXTS: usize = 16;
+
+    /// Remembers the store for one context pointer.
+    /// Refuses a new context past the bound and reports false.
+    /// The caller fails the listener start on false.
+    pub(super) fn register(ctx: *mut c_void, store: Arc<broker_auth::PskStore>) -> bool {
+        let mut map = ctx_stores().lock();
+        if !map.contains_key(&(ctx as usize)) && map.len() >= MAX_PSK_CONTEXTS {
+            return false;
+        }
+        map.insert(ctx as usize, store);
+        true
+    }
+
+    /// Sets the TLS 1.3 find-session callback on one context.
+    pub(super) fn set_callback(ctx: *mut c_void) {
+        unsafe {
+            SSL_CTX_set_psk_find_session_callback(ctx, Some(find_session_cb));
+        }
+    }
+
+    /// Picks a TLS 1.3 cipher for the new session.
+    /// Prefers an AES GCM suite, else takes the first suite.
+    unsafe fn pick_cipher(ssl: *const c_void) -> *const c_void {
+        let stack = SSL_get_ciphers(ssl);
+        if stack.is_null() {
+            return std::ptr::null();
+        }
+        let count = OPENSSL_sk_num(stack);
+        let mut first: *const c_void = std::ptr::null();
+        let mut index = 0;
+        while index < count {
+            let cipher = OPENSSL_sk_value(stack, index) as *const c_void;
+            if !cipher.is_null() {
+                if first.is_null() {
+                    first = cipher;
+                }
+                let name = SSL_CIPHER_get_name(cipher);
+                if !name.is_null()
+                    && std::ffi::CStr::from_ptr(name)
+                        .to_bytes()
+                        .starts_with(b"TLS_AES_")
+                {
+                    return cipher;
+                }
+            }
+            index += 1;
+        }
+        first
+    }
+
+    /// TLS 1.3 session lookup. Runs during the handshake.
+    /// Unknown identity fails with 0, same as a wrong key later does.
+    /// It never logs the identity.
+    unsafe extern "C" fn find_session_cb(
+        ssl: *mut c_void,
+        identity: *const c_uchar,
+        idlen: usize,
+        sess_out: *mut *mut c_void,
+    ) -> c_int {
+        if identity.is_null() || sess_out.is_null() {
+            return 0;
+        }
+        let id = std::slice::from_raw_parts(identity, idlen);
+        let ctx = SSL_get_SSL_CTX(ssl);
+        let key = ctx_stores()
+            .lock()
+            .get(&(ctx as usize))
+            .and_then(|store| store.lookup(id));
+        let Some(key) = key else {
+            return 0;
+        };
+        let sess = SSL_SESSION_new();
+        if sess.is_null() {
+            return 0;
+        }
+        if SSL_SESSION_set1_master_key(sess, key.as_ptr(), key.len()) != 1 {
+            SSL_SESSION_free(sess);
+            return 0;
+        }
+        let cipher = pick_cipher(ssl);
+        if cipher.is_null() || SSL_SESSION_set_cipher(sess, cipher) != 1 {
+            SSL_SESSION_free(sess);
+            return 0;
+        }
+        if SSL_SESSION_set_protocol_version(sess, TLS1_3_VERSION) != 1 {
+            SSL_SESSION_free(sess);
+            return 0;
+        }
+        *sess_out = sess;
+        1
+    }
+}
+
+/// Builds the OpenSSL server context for the PSK listener.
+/// Uses only PSK suites and no certificate. Wires the TLS 1.2
+/// server callback and the TLS 1.3 find-session callback to
+/// the same store. Releases idle buffers. Fails closed on
+/// any OpenSSL error.
+pub(super) fn build_psk_ssl_context(
+    store: Arc<broker_auth::PskStore>,
+) -> Result<openssl::ssl::SslContext, Box<dyn std::error::Error + Send + Sync>> {
+    use openssl::ssl::{SslContextBuilder, SslMethod, SslVersion};
+    let mut builder = SslContextBuilder::new(SslMethod::tls_server())?;
+    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+    builder.set_cipher_list(PSK_CIPHER_LIST)?;
+    builder.set_ciphersuites(PSK_CIPHERSUITES)?;
+    // Reason: every PSK handshake runs the full lookup, so no
+    // session resumes and the cache would only spend memory.
+    builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::OFF);
+    builder.set_mode(openssl::ssl::SslMode::RELEASE_BUFFERS);
+    let lookup = store.clone();
+    // An unknown identity fails here. A wrong key fails at the
+    // Finished check. The two paths differ as far as the library
+    // permits. Neither path names the identity.
+    builder.set_psk_server_callback(move |_ssl, identity, psk| {
+        let id = identity.unwrap_or_default();
+        let key = lookup
+            .lookup(id)
+            .ok_or_else(openssl::error::ErrorStack::get)?;
+        if key.len() > psk.len() {
+            return Err(openssl::error::ErrorStack::get());
+        }
+        psk[..key.len()].copy_from_slice(&key);
+        Ok(key.len())
+    });
+    if !psk_tls13::register(builder.as_ptr() as *mut std::ffi::c_void, store) {
+        return Err(format!(
+            "PSK context table holds {} entries",
+            psk_tls13::MAX_PSK_CONTEXTS
+        )
+        .into());
+    }
+    psk_tls13::set_callback(builder.as_ptr() as *mut std::ffi::c_void);
+    Ok(builder.build())
+}
+
+/// Accepts MQTT clients over TLS PSK. The caller enables PSK by
+/// starting this listener. The certificate TLS listener stays
+/// unchanged and keeps its rustls path. Each handshake runs in
+/// the task of the connection with the TLS time limit. An
+/// unknown identity and a wrong key both fail the handshake.
+/// The failure never names the identity. The listener name is
+/// `tls` for tenant rules. The same packet limits, the connect
+/// timeout from accept, and `max_connections` apply as on TCP.
+pub(super) async fn serve_native_mqtt_psk(
+    listener: TcpListener,
+    psk: Arc<broker_auth::PskStore>,
+    max_connections: u32,
+    shared: Shared,
+) {
+    let context = match build_psk_ssl_context(psk) {
+        Ok(context) => Arc::new(context),
+        Err(e) => {
+            warn!("Kernel MQTT PSK listener failed to start: {}", e);
+            return;
+        }
+    };
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                warn!("Kernel MQTT PSK accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Some(slot) = ConnectionSlot::take(max_connections) else {
+            debug!("Kernel MQTT PSK listener is at its connection limit");
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let shared = shared.clone();
+        let context = context.clone();
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let accepted_at = Instant::now();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let ssl = match openssl::ssl::Ssl::new(&context) {
+                Ok(ssl) => ssl,
+                Err(e) => {
+                    debug!("Kernel MQTT PSK handshake setup failed: {}", e);
+                    return;
+                }
+            };
+            let mut tls = match tokio_openssl::SslStream::new(ssl, stream) {
+                Ok(tls) => tls,
+                Err(e) => {
+                    debug!("Kernel MQTT PSK stream setup failed: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) =
+                tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, std::pin::Pin::new(&mut tls).accept())
+                    .await
+                    .map_err(|_| "timeout")
+                    .and_then(|handshake| handshake.map_err(|_| "refused"))
+            {
+                debug!("Kernel MQTT PSK handshake with {} failed: {}", peer, e);
+                return;
+            }
+            if let Err(e) = run_connection(
+                tls,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "tls",
+                PeerCert::default(),
+                accepted_at,
+            )
+            .await
+            {
+                debug!("Kernel MQTT PSK connection {} ended: {}", conn_id, e);
+            }
+        });
+    }
+}
+
 /// WebSocket frame and message bound in bytes.
 /// Reason: matches the MQTT packet bound, so one peer cannot grow memory.
 const MAX_WS_FRAME_BYTES: usize = MAX_PACKET_BYTES;
@@ -3709,5 +3982,386 @@ mod tests {
             "valid certificate connects"
         );
         let _ = valid.close(None).await;
+    }
+
+    /// Test PSK identity and key. The key has 32 bytes.
+    const PSK_TEST_IDENTITY: &str = "psk-device";
+    /// Makes a store with one test identity. Goes through the store.
+    fn psk_test_store() -> std::sync::Arc<broker_auth::PskStore> {
+        let store = std::sync::Arc::new(broker_auth::PskStore::new());
+        store
+            .insert(PSK_TEST_IDENTITY, &[0x2Au8; 32])
+            .expect("test identity stores");
+        store
+    }
+
+    /// Starts one kernel PSK listener. Returns the port.
+    /// The task runs until the test aborts it.
+    async fn psk_test_listener(
+        shared: Shared,
+        store: std::sync::Arc<broker_auth::PskStore>,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("psk binds");
+        let port = listener.local_addr().expect("psk addr").port();
+        tokio::spawn(async move {
+            serve_native_mqtt_psk(listener, store, 1000, shared).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// Opens a TLS PSK session to the test port. Forces TLS 1.2,
+    /// the version the edge reference offers for PSK. Returns the
+    /// handshake result as a string for the leak check.
+    async fn psk_test_dial(port: u16, identity: &str, key: Vec<u8>) -> Result<(), String> {
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+        use std::pin::Pin;
+        let mut builder =
+            SslContextBuilder::new(SslMethod::tls_client()).map_err(|e| e.to_string())?;
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_cipher_list(super::PSK_CIPHER_LIST)
+            .map_err(|e| e.to_string())?;
+        let id = identity.to_string();
+        builder.set_psk_client_callback(move |_ssl, _hint, identity_out, psk_out| {
+            if id.len() + 1 > identity_out.len() || key.len() > psk_out.len() {
+                return Err(openssl::error::ErrorStack::get());
+            }
+            identity_out[..id.len()].copy_from_slice(id.as_bytes());
+            identity_out[id.len()] = 0;
+            psk_out[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        });
+        let context = builder.build();
+        let ssl = Ssl::new(&context).map_err(|e| e.to_string())?;
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut stream = tokio_openssl::SslStream::new(ssl, tcp).map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
+            .await
+            .map_err(|_| "handshake timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        // The handshake holds the stream. Drop it at once.
+        Ok(())
+    }
+
+    /// Opens a PSK session and keeps it for MQTT bytes.
+    /// Forces TLS 1.2. Returns the live stream.
+    async fn psk_test_connect(
+        port: u16,
+        identity: &str,
+        key: Vec<u8>,
+    ) -> tokio_openssl::SslStream<tokio::net::TcpStream> {
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+        use std::pin::Pin;
+        let mut builder = SslContextBuilder::new(SslMethod::tls_client()).expect("client builds");
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .expect("min holds");
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .expect("max holds");
+        builder
+            .set_cipher_list(super::PSK_CIPHER_LIST)
+            .expect("ciphers hold");
+        let id = identity.to_string();
+        builder.set_psk_client_callback(move |_ssl, _hint, identity_out, psk_out| {
+            identity_out[..id.len()].copy_from_slice(id.as_bytes());
+            identity_out[id.len()] = 0;
+            psk_out[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        });
+        let context = builder.build();
+        let ssl = Ssl::new(&context).expect("ssl builds");
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let mut stream = tokio_openssl::SslStream::new(ssl, tcp).expect("stream builds");
+        tokio::time::timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
+            .await
+            .expect("handshake ends in time")
+            .expect("valid PSK dials");
+        stream
+    }
+
+    /// The PSK context builds with a store. Goes through the builder.
+    #[test]
+    fn psk_ssl_context_builds_with_store() {
+        let context = super::build_psk_ssl_context(psk_test_store());
+        assert!(context.is_ok(), "PSK context builds");
+    }
+
+    /// A client with the correct identity and key connects and
+    /// exchanges MQTT bytes. Goes through the broker.
+    #[tokio::test]
+    async fn psk_valid_identity_connects_and_exchanges_mqtt() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        let port = psk_test_listener(shared, psk_test_store()).await;
+        let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        client
+            .write_all(&ws_test_connect("k1-04-psk-valid"))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "valid PSK connects");
+        client
+            .write_all(&ws_test_subscribe(1, "k1-04/psk/#"))
+            .await
+            .expect("SUBSCRIBE sends");
+        let suback = k1_05_recv(&mut client).await;
+        assert_eq!(suback[0], 0x90, "SUBACK answers");
+        client
+            .write_all(&ws_test_publish("k1-04/psk/x", b"psk-secret"))
+            .await
+            .expect("PUBLISH sends");
+        let delivered = k1_05_recv(&mut client).await;
+        assert!(delivered.ends_with(b"psk-secret"), "own publish delivers");
+    }
+
+    /// An unknown identity and a wrong key both fail before MQTT.
+    /// Neither failure names the identity. Goes through the broker.
+    /// Both failures run in the same handshake budget, as far as
+    /// the library permits. The two alerts may differ.
+    #[tokio::test]
+    async fn psk_unknown_identity_and_wrong_key_fail_without_leak() {
+        let shared = Shared::new();
+        let port = psk_test_listener(shared, psk_test_store()).await;
+        // The library fails the two cases at different stages, so
+        // exact equality is impossible. Both must fail inside the
+        // handshake budget and within one order of magnitude.
+        let start = std::time::Instant::now();
+        let unknown = psk_test_dial(port, "no-such-device", vec![0x2Au8; 32]).await;
+        let unknown_ms = start.elapsed().as_millis();
+        assert!(unknown.is_err(), "unknown identity fails");
+        let unknown_text = unknown.err().unwrap_or_default();
+        assert!(
+            !unknown_text.contains("no-such-device"),
+            "failure names no identity"
+        );
+        let start = std::time::Instant::now();
+        let wrong = psk_test_dial(port, PSK_TEST_IDENTITY, vec![0x33u8; 32]).await;
+        let wrong_ms = start.elapsed().as_millis();
+        assert!(wrong.is_err(), "wrong key fails");
+        let wrong_text = wrong.err().unwrap_or_default();
+        assert!(
+            !wrong_text.contains(PSK_TEST_IDENTITY),
+            "failure names no identity"
+        );
+        assert!(
+            unknown_ms < 10_000 && wrong_ms < 10_000,
+            "both fail inside the handshake budget, got {unknown_ms}ms and {wrong_ms}ms"
+        );
+        let (fast, slow) = if unknown_ms < wrong_ms {
+            (unknown_ms, wrong_ms)
+        } else {
+            (wrong_ms, unknown_ms)
+        };
+        assert!(
+            slow <= 10 * fast.max(1) + 50,
+            "both fail in the same time, got {unknown_ms}ms and {wrong_ms}ms"
+        );
+        // The broker stays up after both failed handshakes.
+        let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        client
+            .write_all(&ws_test_connect("k1-04-psk-after-denials"))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "broker stays up");
+    }
+
+    /// Opens a TLS 1.3 PSK session to the test port. Forces TLS 1.3,
+    /// so only the find-session callback can serve it. Returns the
+    /// handshake result as a string for the leak check.
+    async fn psk_test_dial_tls13(port: u16, identity: &str, key: Vec<u8>) -> Result<(), String> {
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+        use std::pin::Pin;
+        let mut builder =
+            SslContextBuilder::new(SslMethod::tls_client()).map_err(|e| e.to_string())?;
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_ciphersuites(super::PSK_CIPHERSUITES)
+            .map_err(|e| e.to_string())?;
+        let id = identity.to_string();
+        builder.set_psk_client_callback(move |_ssl, _hint, identity_out, psk_out| {
+            if id.len() + 1 > identity_out.len() || key.len() > psk_out.len() {
+                return Err(openssl::error::ErrorStack::get());
+            }
+            identity_out[..id.len()].copy_from_slice(id.as_bytes());
+            identity_out[id.len()] = 0;
+            psk_out[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        });
+        let context = builder.build();
+        let ssl = Ssl::new(&context).map_err(|e| e.to_string())?;
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut stream = tokio_openssl::SslStream::new(ssl, tcp).map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
+            .await
+            .map_err(|_| "handshake timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        // The handshake holds the stream. Drop it at once.
+        Ok(())
+    }
+
+    /// Opens a TLS 1.3 PSK session and keeps it for MQTT bytes.
+    /// Forces TLS 1.3. Returns the live stream.
+    async fn psk_test_connect_tls13(
+        port: u16,
+        identity: &str,
+        key: Vec<u8>,
+    ) -> tokio_openssl::SslStream<tokio::net::TcpStream> {
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+        use std::pin::Pin;
+        let mut builder = SslContextBuilder::new(SslMethod::tls_client()).expect("client builds");
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .expect("min holds");
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .expect("max holds");
+        builder
+            .set_ciphersuites(super::PSK_CIPHERSUITES)
+            .expect("ciphers hold");
+        let id = identity.to_string();
+        builder.set_psk_client_callback(move |_ssl, _hint, identity_out, psk_out| {
+            identity_out[..id.len()].copy_from_slice(id.as_bytes());
+            identity_out[id.len()] = 0;
+            psk_out[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        });
+        let context = builder.build();
+        let ssl = Ssl::new(&context).expect("ssl builds");
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let mut stream = tokio_openssl::SslStream::new(ssl, tcp).expect("stream builds");
+        tokio::time::timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
+            .await
+            .expect("handshake ends in time")
+            .expect("valid PSK dials");
+        stream
+    }
+
+    /// A TLS 1.3 client with the correct identity and key connects
+    /// and exchanges MQTT bytes. Forces TLS 1.3, so only the
+    /// find-session callback serves the handshake. Goes through
+    /// the broker.
+    #[tokio::test]
+    async fn psk_tls13_valid_identity_connects_and_exchanges_mqtt() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        let port = psk_test_listener(shared, psk_test_store()).await;
+        let mut client = psk_test_connect_tls13(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        client
+            .write_all(&ws_test_connect("k1-04-psk-tls13-valid"))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "valid PSK connects");
+        client
+            .write_all(&ws_test_subscribe(1, "k1-04/psk13/#"))
+            .await
+            .expect("SUBSCRIBE sends");
+        let suback = k1_05_recv(&mut client).await;
+        assert_eq!(suback[0], 0x90, "SUBACK answers");
+        client
+            .write_all(&ws_test_publish("k1-04/psk13/x", b"psk13-secret"))
+            .await
+            .expect("PUBLISH sends");
+        let delivered = k1_05_recv(&mut client).await;
+        assert!(delivered.ends_with(b"psk13-secret"), "own publish delivers");
+        // An unknown identity and a wrong key both fail over TLS 1.3.
+        // Neither failure names the identity.
+        let unknown = psk_test_dial_tls13(port, "no-such-device", vec![0x2Au8; 32]).await;
+        assert!(unknown.is_err(), "unknown identity fails");
+        assert!(
+            !unknown.err().unwrap_or_default().contains("no-such-device"),
+            "failure names no identity"
+        );
+        let wrong = psk_test_dial_tls13(port, PSK_TEST_IDENTITY, vec![0x33u8; 32]).await;
+        assert!(wrong.is_err(), "wrong key fails");
+        assert!(
+            !wrong.err().unwrap_or_default().contains(PSK_TEST_IDENTITY),
+            "failure names no identity"
+        );
+    }
+
+    /// An empty store fails every handshake. Goes through the broker.
+    /// Proves the fail-closed default: no identity connects.
+    #[tokio::test]
+    async fn psk_empty_store_fails_closed() {
+        let shared = Shared::new();
+        let empty = std::sync::Arc::new(broker_auth::PskStore::new());
+        let port = psk_test_listener(shared, empty).await;
+        let denied = psk_test_dial(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        assert!(denied.is_err(), "empty store denies");
+    }
+
+    /// Identities from a keys file connect through the broker.
+    /// Writes one `identity:hexkey` line, loads it through the file
+    /// entry, then connects and exchanges MQTT bytes.
+    #[tokio::test]
+    async fn psk_keys_file_loads_and_connects_through_broker() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let path =
+            std::env::temp_dir().join(format!("indra-psk-k104-{}-file.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            format!("{}:{}\n", PSK_TEST_IDENTITY, "2a".repeat(32)),
+        )
+        .expect("psk file writes");
+        let store = std::sync::Arc::new(broker_auth::PskStore::new());
+        let count = store
+            .load_file(path.to_str().expect("path shows"))
+            .expect("psk file loads");
+        assert_eq!(count, 1, "one identity loads");
+        let shared = Shared::new();
+        let port = psk_test_listener(shared, store).await;
+        let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        client
+            .write_all(&ws_test_connect("k1-04-psk-file"))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "file identity connects");
+        let _ = std::fs::remove_file(&path);
     }
 }
