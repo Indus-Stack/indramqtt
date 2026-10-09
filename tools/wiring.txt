@@ -30,3 +30,4 @@ wired  connectors
 wired  transformations
 wired  schema_registry
 wired  listener_store
+wired  prometheus

@@ -1,0 +1,18 @@
+version: 6.3.0 paths: 296
+securitySchemes: {
+ "basicAuth": {
+  "description": "Authorize with [API Keys](https://www.emqx.io/docs/en/v5.0/admin/api.html#api-keys)",
+  "scheme": "basic",
+  "type": "http"
+ },
+ "bearerAuth": {
+  "description": "Authorize with Bearer Token",
+  "scheme": "bearer",
+  "type": "http"
+ }
+}
+global security: None
+
+## GET /stats | security: [{'basicAuth': []}, {'bearerAuth': []}] | tags: ['Metrics']
+  desc: EMQX stats.
+  -> 200 {"oneOf": [{"properties": {"channels.count": {"minimum": 0, "type": "integer"}, "channels.max": {"minimum": 0, "type": "integer"}, "cluster_sessions.count": {"minimum": 0, "type": "integer"}, "cluster_sessions.max": {"minimum": 0, "type": "integer"}, "connections.count": {"minimum": 0, "type": "integer"}, "connections.max": {"minimum": 0, "type": "integer"}, "delayed.count": {"minimum": 0, "type": "integer"}, "delayed.max": {"minimum": 0, "type": "integer"}, "live_connections.count": {"minimum": 0, "type": "integer"}, "live_connections.max": {"minimum": 0, "type": "integer"}, "retained.count": {"minimum": 0, "type": "integer"}, "retained.max": {"minimum": 0, "type": "integer"}, "sessions.count": {"minimum": 0, "type": "integer"}, "sessions.max": {"minimum": 0, "type": "integer"}, "suboptions.count": {"minimum": 0, "type": "integer"}, "suboptions.max": {"minimum": 0, "type": "integer"}, "

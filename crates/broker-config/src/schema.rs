@@ -15,6 +15,7 @@
 //! with its owner; this task only defines, validates and documents them.
 
 pub use crate::ConfigError;
+use crate::PrometheusConf;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -562,6 +563,19 @@ pub fn field_docs() -> Vec<FieldDoc> {
             FieldDoc { path: "webhook.breaker_reset_ms", setting_type: "u64", default: "30000", range: "1000..=600000", doc: "Milliseconds an open circuit breaker waits before retrying the webhook." },
             FieldDoc { path: "webhook.cache_size", setting_type: "usize", default: "1024", range: "0..=100000", doc: "Cached webhook verdicts; 0 disables the cache." },
             FieldDoc { path: "webhook.cache_ttl_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Seconds a cached webhook verdict stays valid." },
+            FieldDoc { path: "prometheus.enable_basic_auth", setting_type: "bool", default: "true", range: "true | false", doc: "Require credentials on the scrape endpoints." },
+            FieldDoc { path: "prometheus.latency_buckets", setting_type: "string", default: "\"10ms, 100ms, 1s, 5s, 30s\"", range: "comma-separated durations", doc: "Latency histogram buckets for the exposition." },
+            FieldDoc { path: "prometheus.push_gateway.enable", setting_type: "bool", default: "false", range: "true | false", doc: "Push the exposition to the push target." },
+            FieldDoc { path: "prometheus.push_gateway.url", setting_type: "string", default: "\"http://127.0.0.1:9091\"", range: "http(s) URL", doc: "Push target URL for the exposition." },
+            FieldDoc { path: "prometheus.push_gateway.interval", setting_type: "string", default: "\"15s\"", range: "duration text", doc: "Push interval for the exposition." },
+            FieldDoc { path: "prometheus.push_gateway.job_name", setting_type: "string", default: "\"${name}/instance/${name}~${host}\"", range: "template text", doc: "Job name template for each push." },
+            FieldDoc { path: "prometheus.push_gateway.method", setting_type: "string", default: "\"put\"", range: "put | post", doc: "Push method for the exposition." },
+            FieldDoc { path: "prometheus.collectors.mnesia", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Store collector switch for load analysis." },
+            FieldDoc { path: "prometheus.collectors.vm_dist", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Distribution collector switch for load analysis." },
+            FieldDoc { path: "prometheus.collectors.vm_memory", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Memory collector switch for load analysis." },
+            FieldDoc { path: "prometheus.collectors.vm_msacc", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Microstate accounting collector switch for load analysis." },
+            FieldDoc { path: "prometheus.collectors.vm_statistics", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Statistics collector switch for load analysis." },
+            FieldDoc { path: "prometheus.collectors.vm_system_info", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "System information collector switch for load analysis." },
         ]
 }
 
@@ -2005,6 +2019,11 @@ pub struct BrokerConfig {
     /// Observability sampling.
     #[serde(default)]
     pub observability: ObservabilityConf,
+    /// Metrics exporter file settings (AP-09). Only scalar settings
+    /// have a file home; push headers and the namespaced limiter stay
+    /// managed through the management API.
+    #[serde(default)]
+    pub prometheus: PrometheusConf,
 }
 
 /// Delayed-publish scheduler bounds.
@@ -2339,6 +2358,7 @@ impl BrokerConfig {
         self.jwks.validate()?;
         self.dbauth.validate()?;
         self.webhook.validate()?;
+        self.prometheus.validate()?;
         Ok(())
     }
 
@@ -3185,6 +3205,83 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     0,
                     3_600,
                     "Seconds a cached webhook verdict stays valid.",
+                ),
+            ],
+        ),
+        (
+            "prometheus",
+            vec![
+                bool_field(
+                    "enable_basic_auth",
+                    true,
+                    "Require credentials on the scrape endpoints.",
+                ),
+                str_field(
+                    "latency_buckets",
+                    "10ms, 100ms, 1s, 5s, 30s",
+                    "Latency histogram buckets for the exposition.",
+                ),
+                bool_field(
+                    "push_gateway.enable",
+                    false,
+                    "Push the exposition to the push target.",
+                ),
+                str_field(
+                    "push_gateway.url",
+                    "http://127.0.0.1:9091",
+                    "Push target URL for the exposition.",
+                ),
+                str_field(
+                    "push_gateway.interval",
+                    "15s",
+                    "Push interval for the exposition.",
+                ),
+                str_field(
+                    "push_gateway.job_name",
+                    "${name}/instance/${name}~${host}",
+                    "Job name template for each push.",
+                ),
+                enum_field(
+                    "push_gateway.method",
+                    "put",
+                    &["put", "post"],
+                    "Push method for the exposition.",
+                ),
+                enum_field(
+                    "collectors.mnesia",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Store collector switch for load analysis.",
+                ),
+                enum_field(
+                    "collectors.vm_dist",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Distribution collector switch for load analysis.",
+                ),
+                enum_field(
+                    "collectors.vm_memory",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Memory collector switch for load analysis.",
+                ),
+                enum_field(
+                    "collectors.vm_msacc",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Microstate accounting collector switch for load analysis.",
+                ),
+                enum_field(
+                    "collectors.vm_statistics",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "Statistics collector switch for load analysis.",
+                ),
+                enum_field(
+                    "collectors.vm_system_info",
+                    "disabled",
+                    &["enabled", "disabled"],
+                    "System information collector switch for load analysis.",
                 ),
             ],
         ),

@@ -34,6 +34,7 @@ pub mod mfa;
 pub mod monitor;
 pub mod monitoring;
 pub mod nodes;
+pub mod prometheus;
 pub mod retainer;
 pub mod rewrite;
 pub mod rule_engine;
@@ -451,6 +452,37 @@ pub fn protected_router() -> Router<ApiState> {
         .route("/sso/mfa/verify", post(mfa::verify_route))
         // Live Monitoring & Rates
         .route("/metrics", get(monitoring::get_metrics))
+        // Exporter settings plus text exposition (AP-09): the stored
+        // settings round-trip through the config registry, and every
+        // exposition route serves the same true counters as the JSON
+        // rows above. Management-plane only; publish and deliver never
+        // touch the store.
+        .route(
+            "/prometheus",
+            get(prometheus::get_prometheus).put(prometheus::put_prometheus),
+        )
+        .route("/prometheus/stats", get(prometheus::get_prometheus_stats))
+        .route("/prometheus/auth", get(prometheus::get_prometheus_auth))
+        .route(
+            "/prometheus/data_integration",
+            get(prometheus::get_prometheus_data_integration),
+        )
+        .route(
+            "/prometheus/message_transformation",
+            get(prometheus::get_prometheus_message_transformation),
+        )
+        .route(
+            "/prometheus/namespaced_stats",
+            get(prometheus::get_prometheus_namespaced_stats),
+        )
+        .route(
+            "/prometheus/schema_validation",
+            get(prometheus::get_prometheus_schema_validation),
+        )
+        .route(
+            "/prometheus/topic_metrics",
+            get(prometheus::get_prometheus_topic_metrics),
+        )
         .route(
             "/monitor",
             get(monitor::list_monitor).delete(monitor::clear_monitor),

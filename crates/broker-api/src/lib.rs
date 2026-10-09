@@ -84,6 +84,16 @@ pub struct ApiState {
     /// handlers below read one constant-time snapshot per request.
     /// Management-plane only; never touched on the per-message path.
     pub stats: Arc<StatsStore>,
+    /// Exporter settings for `GET`/`PUT /api/v5/prometheus` (AP-09):
+    /// one validated struct persisted across a restart via the config
+    /// core. The routes read one small snapshot per request; the store
+    /// seeds from the shared registry at boot (`from_registry` in both
+    /// constructors below, fed by the kernel registry), so management
+    /// reads observe the persisted settings and no second copy can
+    /// diverge. The text exposition routes render the same true
+    /// counters as the JSON rows. Management-plane only; publish and
+    /// deliver never touch this store.
+    pub prometheus: Arc<crate::v5::prometheus::PrometheusStore>,
     /// Node readiness flag for `GET /api/v5/status` (W1-27): single
     /// atomic bool shared with the kernel. The handler does one
     /// constant-time load per request and reports the documented up
@@ -556,6 +566,9 @@ impl ApiState {
             alarms: Arc::new(crate::v5::alarms::AlarmStore::new()),
             monitor: Arc::new(crate::v5::monitor::MonitorHistory::new()),
             stats: Arc::new(StatsStore::new()),
+            prometheus: Arc::new(crate::v5::prometheus::PrometheusStore::from_registry(
+                &config,
+            )),
             readiness: Arc::new(NodeReadiness::new()),
             retainer_config: Arc::new(crate::v5::retainer::RetainerConfigStore::new()),
             retained: Arc::new(broker_storage::MemoryStore::new()),
@@ -654,13 +667,16 @@ impl ApiState {
             conns: Arc::new(ConnTable::default()),
             admin_users: Arc::new(AdminUsers::with_default_admin()),
             tokens: Arc::new(ApiTokens::new()),
-            config,
+            config: Arc::clone(&config),
             node_id: "indra-node-1".to_string(),
             edge_tx,
             bans: Arc::new(crate::v5::banned::BanStore::new()),
             alarms: Arc::new(crate::v5::alarms::AlarmStore::new()),
             monitor: Arc::new(crate::v5::monitor::MonitorHistory::new()),
             stats: Arc::new(StatsStore::new()),
+            prometheus: Arc::new(crate::v5::prometheus::PrometheusStore::from_registry(
+                &config,
+            )),
             readiness: Arc::new(NodeReadiness::new()),
             retainer_config: Arc::new(crate::v5::retainer::RetainerConfigStore::new()),
             retained: Arc::new(broker_storage::MemoryStore::new()),

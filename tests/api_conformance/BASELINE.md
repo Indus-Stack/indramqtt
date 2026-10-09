@@ -365,4 +365,46 @@ is not changed.
   no message identifier, so the broker omits it. The inflight list keeps
   the downlink packet id as `msgid`. No identifier was added to the queue:
   stamping one where the kernel queues the message would add work on the
-  publish path. The checker reports a missing field for this row.
+  publish path. The    checker reports a missing field for this row.
+- `GET /stats` and `GET /nodes/{node}/stats`, fields `delayed.max`,
+  `subscribers.count`, `subscribers.max`, `subscriptions.shared.count` and
+  `subscriptions.shared.max`. The specification lists them as optional. The
+  broker omits them: it keeps no high water mark for delayed entries, no
+  distinct-subscriber counter and no shared-entry counter,
+  and the session mirror stores shared entries under their inner filter.
+  The management console tolerates the absence: its node detail reads
+  `stats['subscriptions.shared.count'] ?? 0`.
+- `GET /metrics` and `GET /nodes/{node}/metrics`, omitted keys. The
+  specification lists every key as optional. The broker serves each key
+  it truly counts (packet families, byte counts, QoS splits, delivery
+  drops, `rules.matched`, `actions.executed`, `messages.delayed`,
+  transformation outcomes) and omits the rest (QoS 2 splits,
+  unsubscribe/disconnect splits, retained writes, session and
+  authentication lifecycles, validation splits). A constant would fake
+  a measurement. The management console reads the served keys only.
+- `GET /prometheus/*` area routes (`auth`, `data_integration`,
+  `message_transformation`, `namespaced_stats`, `schema_validation`,
+  `topic_metrics`). The specification declares one text exposition per
+  area. One node holds every counter, so each route serves the same
+  text: the true counters of `GET /metrics` and `GET /stats`, one line
+  per key. The management console scrapes only `/prometheus/stats`
+  (its generated scrape config points there) and never parses an area
+  split, so the shared body keeps every scrape target working.
+- `GET /prometheus/*`, query `mode`, `ns` and `only_global`. The
+  specification offers node and aggregate modes plus namespace
+  filters. One node holds every counter, so each mode reads the same
+  values; the broker accepts the keys and ignores them. The management
+  console sends no such query.
+- `PUT /prometheus`, legacy body. The specification accepts the legacy
+  shape or the recommend shape and answers the recommend shape. The
+  broker maps each legacy field onto the recommend field
+  (`push_gateway_server` to `push_gateway.url`, `vm_*_collector` to
+  `collectors.*`, top-level `enable`, `interval`, `job_name` and
+  `headers` to the push target) and answers the recommend shape. A mix
+  of both shapes fails closed with `BAD_REQUEST`.
+- `GET /prometheus`, field `enable_basic_auth`. The specification
+  defaults it to true and documents public scrape endpoints while it
+  is false. The broker stores and returns the flag honestly, but the
+  scrape routes stay behind credentials either way: opening them would
+  fail open, and the rulebook fails closed. The management console
+   reads and writes the flag through the settings form.

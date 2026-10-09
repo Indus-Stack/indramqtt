@@ -91,6 +91,16 @@ bind = "127.0.0.1:$API_PORT"
 [logging]
 level = "warn"
 
+# Exporter settings (AP-09). The kernel seeds the registry from these
+# file values at boot, so the settings read and the text exposition
+# observe them without any API write.
+[prometheus]
+latency_buckets = "7ms, 70ms, 700ms"
+
+[prometheus.push_gateway]
+url = "http://127.0.0.1:9199"
+interval = "31s"
+
 # A client with a username goes into the tenant of that username.
 [[tenants.rules]]
 expression = "t-\${username}"
@@ -345,6 +355,62 @@ def upgrade(path):
 
 report("listeners.ws.path from indra.toml is the WebSocket path in operation",
        b"101" in upgrade("/smoke") and b"404" in upgrade("/mqtt"))
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 5. Exporter settings from indra.toml apply in operation ---
+# The kernel seeds the registry from the file at boot. This check reads
+# the settings and the text exposition over HTTP through the production
+# entries, proving the file values drive operation.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request, urllib.error
+port, key = sys.argv[1], sys.argv[2]
+
+def api(method, path):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/v5{path}",
+        method=method,
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.headers.get_content_type(), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, "", e.read()
+
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+
+status, _, raw = api("GET", "/prometheus")
+try:
+    settings = json.loads(raw.decode())
+except ValueError:
+    settings = {}
+gateway = settings.get("push_gateway") or {}
+report("prometheus settings from indra.toml are the settings in operation",
+       status == 200
+       and settings.get("latency_buckets") == "7ms, 70ms, 700ms"
+       and gateway.get("url") == "http://127.0.0.1:9199"
+       and gateway.get("interval") == "31s")
+
+status, ctype, raw = api("GET", "/prometheus/stats")
+text = raw.decode(errors="replace")
+received = None
+for line in text.splitlines():
+    if line.startswith("indramqtt_messages_received_total "):
+        try:
+            received = int(line.rsplit(" ", 1)[1])
+        except ValueError:
+            pass
+# The smoke publishes above went through the kernel, so the live
+# exposition must count at least one received message.
+report("the metrics exposition serves live counters over HTTP",
+       status == 200 and ctype.startswith("text/plain")
+       and received is not None and received >= 1)
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))

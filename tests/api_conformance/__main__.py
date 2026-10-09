@@ -498,9 +498,38 @@ def check_one(spec, op, case, runner, authed, api_json_fn=None):
         if status != case["expect_status"]:
             errors.append("expected status %r, got %r"
                           % (case["expect_status"], status))
+    if case is not None and case.get("expect_json") is not None:
+        errors += check_expect_json(parsed, case["expect_json"])
     return {"method": op["method"], "path": op["path"], "tag": op["tag"],
             "outcome": "pass" if not errors else "fail",
             "status": status, "errors": errors, "warnings": warnings}
+
+
+def check_expect_json(parsed, expected):
+    """Check exact body values by JSON pointer.
+
+    ``expected`` maps one JSON pointer (``/0/delayed.count``) to the
+    value the live body must hold there. A plain value means exact
+    equality. A ``{"gte": N}`` value means the live number must read
+    at least N (shared wheels hold entries from other cases, so an
+    exact delayed count would flake).
+    """
+    errors = []
+    if not isinstance(expected, dict):
+        return ["/expect_json: must be an object"]
+    for pointer, want in expected.items():
+        try:
+            got = walk_pointer(parsed, pointer)
+        except (KeyError, IndexError, ValueError, TypeError) as exc:
+            errors.append("%s: missing in body (%s)" % (pointer, exc))
+            continue
+        if isinstance(want, dict) and set(want) == {"gte"}:
+            if not isinstance(got, (int, float)) or got < want["gte"]:
+                errors.append("%s: expected at least %r, got %r"
+                              % (pointer, want["gte"], got))
+        elif got != want:
+            errors.append("%s: expected %r, got %r" % (pointer, want, got))
+    return errors
 
 
 def _empty_or_non_json(parsed, raw):

@@ -195,3 +195,21 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `webhook.cache_size` | integer | `1024` | 0..=100000 | Cached webhook verdicts; 0 disables the cache. |
 | `webhook.cache_ttl_secs` | integer | `60` | 0..=3600 | Seconds a cached webhook verdict stays valid. |
 
+## prometheus
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `prometheus.enable_basic_auth` | boolean | `true` | boolean | Require credentials on the scrape endpoints. |
+| `prometheus.latency_buckets` | string | `10ms, 100ms, 1s, 5s, 30s` | string | Latency histogram buckets for the exposition. |
+| `prometheus.push_gateway.enable` | boolean | `false` | boolean | Push the exposition to the push target. |
+| `prometheus.push_gateway.url` | string | `http://127.0.0.1:9091` | string | Push target URL for the exposition. |
+| `prometheus.push_gateway.interval` | string | `15s` | string | Push interval for the exposition. |
+| `prometheus.push_gateway.job_name` | string | `${name}/instance/${name}~${host}` | string | Job name template for each push. |
+| `prometheus.push_gateway.method` | string | `put` | ["put","post"] | Push method for the exposition. |
+| `prometheus.collectors.mnesia` | string | `disabled` | ["enabled","disabled"] | Store collector switch for load analysis. |
+| `prometheus.collectors.vm_dist` | string | `disabled` | ["enabled","disabled"] | Distribution collector switch for load analysis. |
+| `prometheus.collectors.vm_memory` | string | `disabled` | ["enabled","disabled"] | Memory collector switch for load analysis. |
+| `prometheus.collectors.vm_msacc` | string | `disabled` | ["enabled","disabled"] | Microstate accounting collector switch for load analysis. |
+| `prometheus.collectors.vm_statistics` | string | `disabled` | ["enabled","disabled"] | Statistics collector switch for load analysis. |
+| `prometheus.collectors.vm_system_info` | string | `disabled` | ["enabled","disabled"] | System information collector switch for load analysis. |
+

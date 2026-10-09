@@ -9,7 +9,7 @@
 //! (`state.toml`) written atomically (write-temp-then-rename with an
 //! fsync before the rename).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -2979,6 +2979,228 @@ impl GlobalZoneConf {
     }
 }
 
+/// One exporter collector switch. Only the documented values exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PrometheusCollector {
+    /// Collector is off. This is the default for every collector.
+    #[default]
+    Disabled,
+    /// Collector is on.
+    Enabled,
+}
+
+/// Internal exporter collectors. Every switch defaults to off: the
+/// switches add CPU load and are only enabled for load analysis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PrometheusCollectorsConf {
+    /// Store collector switch.
+    #[serde(default)]
+    pub mnesia: PrometheusCollector,
+    /// Distribution collector switch.
+    #[serde(default)]
+    pub vm_dist: PrometheusCollector,
+    /// Memory collector switch.
+    #[serde(default)]
+    pub vm_memory: PrometheusCollector,
+    /// Microstate accounting collector switch.
+    #[serde(default)]
+    pub vm_msacc: PrometheusCollector,
+    /// Statistics collector switch.
+    #[serde(default)]
+    pub vm_statistics: PrometheusCollector,
+    /// System information collector switch.
+    #[serde(default)]
+    pub vm_system_info: PrometheusCollector,
+}
+
+/// Default push interval. Reason: the documented default is 15 seconds.
+fn default_prometheus_push_interval() -> String {
+    "15s".to_string()
+}
+
+/// Default push job name. Reason: the documented default names the node
+/// and host through the node and host variables.
+fn default_prometheus_push_job() -> String {
+    "${name}/instance/${name}~${host}".to_string()
+}
+
+/// Default push method. Reason: the documented default replaces the
+/// grouped metrics on each push.
+fn default_prometheus_push_method() -> String {
+    "put".to_string()
+}
+
+/// Default push target. Reason: the documented default is the local
+/// push target on its default port.
+fn default_prometheus_push_url() -> String {
+    "http://127.0.0.1:9091".to_string()
+}
+
+/// Push target for the text exposition. Disabled by default: no push
+/// target is configured unless the operator sets one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrometheusPushGatewayConf {
+    /// Push switch. Off by default.
+    #[serde(default)]
+    pub enable: bool,
+    /// Headers sent with each push. Empty by default.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Push interval text (for example `15s`).
+    #[serde(default = "default_prometheus_push_interval")]
+    pub interval: String,
+    /// Job name template for each push.
+    #[serde(default = "default_prometheus_push_job")]
+    pub job_name: String,
+    /// Push method: `put` or `post`.
+    #[serde(default = "default_prometheus_push_method")]
+    pub method: String,
+    /// Push target URL.
+    #[serde(default = "default_prometheus_push_url")]
+    pub url: String,
+}
+
+/// Defaults match the documented push target.
+impl Default for PrometheusPushGatewayConf {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            headers: BTreeMap::new(),
+            interval: default_prometheus_push_interval(),
+            job_name: default_prometheus_push_job(),
+            method: default_prometheus_push_method(),
+            url: default_prometheus_push_url(),
+        }
+    }
+}
+
+/// Rate limit for the namespaced exposition. Only the rate text is
+/// stored; enforcement lands with namespaced metrics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PrometheusRateLimiterConf {
+    /// Rate text (for example `1000/s`). Absent means no limit set.
+    #[serde(default)]
+    pub rate: Option<String>,
+}
+
+/// Default scrape authentication flag. Reason: the documented default
+/// requires credentials on the scrape endpoints.
+fn default_prometheus_basic_auth() -> bool {
+    true
+}
+
+/// Default latency histogram buckets. Reason: the documented default
+/// covers 10 ms to 30 s.
+fn default_prometheus_latency_buckets() -> String {
+    "10ms, 100ms, 1s, 5s, 30s".to_string()
+}
+
+/// Longest accepted free-form exporter text (512 bytes). Reason: the
+/// fields hold URLs, job templates and bucket lists; longer values are
+/// almost certainly a typo, and the write fails closed.
+pub const MAX_PROMETHEUS_TEXT_LEN: usize = 512;
+
+/// Most headers accepted on the push target (16). Reason: a push needs
+/// at most an authorization header plus a few extras; more entries only
+/// grow the stored root.
+pub const MAX_PROMETHEUS_HEADERS: usize = 16;
+
+/// Exporter settings behind `GET`/`PUT /prometheus`. The broker only
+/// stores the settings and serves the text exposition from live
+/// counters; it runs no push client and no collector beyond the
+/// counters the kernel already keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrometheusConf {
+    /// Internal collector switches. All off by default.
+    #[serde(default)]
+    pub collectors: PrometheusCollectorsConf,
+    /// Require credentials on the scrape endpoints. On by default.
+    #[serde(default = "default_prometheus_basic_auth")]
+    pub enable_basic_auth: bool,
+    /// Latency histogram bucket list text.
+    #[serde(default = "default_prometheus_latency_buckets")]
+    pub latency_buckets: String,
+    /// Push target. Disabled by default.
+    #[serde(default)]
+    pub push_gateway: PrometheusPushGatewayConf,
+    /// Namespaced exposition rate limit. Absent by default.
+    #[serde(default)]
+    pub namespaced_metrics_limiter: Option<PrometheusRateLimiterConf>,
+}
+
+impl Default for PrometheusConf {
+    fn default() -> Self {
+        Self {
+            collectors: PrometheusCollectorsConf::default(),
+            enable_basic_auth: default_prometheus_basic_auth(),
+            latency_buckets: default_prometheus_latency_buckets(),
+            push_gateway: PrometheusPushGatewayConf::default(),
+            namespaced_metrics_limiter: None,
+        }
+    }
+}
+
+impl PrometheusConf {
+    /// Validates the method, the text lengths and the header count; the
+    /// first bad field names itself.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.latency_buckets.len() > MAX_PROMETHEUS_TEXT_LEN {
+            return Err(ConfigError::Invalid(format!(
+                "prometheus.latency_buckets holds {} bytes, at most {} (field `latency_buckets`)",
+                self.latency_buckets.len(),
+                MAX_PROMETHEUS_TEXT_LEN
+            )));
+        }
+        let gateway = &self.push_gateway;
+        if gateway.method != "put" && gateway.method != "post" {
+            return Err(ConfigError::Invalid(format!(
+                "prometheus.push_gateway.method holds {:?}, must be `put` or `post` (field `method`)",
+                gateway.method
+            )));
+        }
+        for (field, value) in [
+            ("interval", gateway.interval.as_str()),
+            ("job_name", gateway.job_name.as_str()),
+            ("url", gateway.url.as_str()),
+        ] {
+            if value.len() > MAX_PROMETHEUS_TEXT_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "prometheus.push_gateway.{field} holds {} bytes, at most {} (field `{field}`)",
+                    value.len(),
+                    MAX_PROMETHEUS_TEXT_LEN
+                )));
+            }
+        }
+        if gateway.headers.len() > MAX_PROMETHEUS_HEADERS {
+            return Err(ConfigError::Invalid(format!(
+                "prometheus.push_gateway.headers holds {} entries, at most {} (field `headers`)",
+                gateway.headers.len(),
+                MAX_PROMETHEUS_HEADERS
+            )));
+        }
+        for (key, value) in &gateway.headers {
+            if key.len() > MAX_PROMETHEUS_TEXT_LEN || value.len() > MAX_PROMETHEUS_TEXT_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "prometheus.push_gateway.headers holds an entry past {MAX_PROMETHEUS_TEXT_LEN} bytes (field `headers`)"
+                )));
+            }
+        }
+        if let Some(limiter) = &self.namespaced_metrics_limiter {
+            if let Some(rate) = &limiter.rate {
+                if rate.len() > MAX_PROMETHEUS_TEXT_LEN {
+                    return Err(ConfigError::Invalid(format!(
+                        "prometheus.namespaced_metrics_limiter.rate holds {} bytes, at most {} (field `rate`)",
+                        rate.len(),
+                        MAX_PROMETHEUS_TEXT_LEN
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The full validated configuration: all roots in one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FullSnapshot {
@@ -3022,6 +3244,9 @@ pub struct FullSnapshot {
     /// Default-zone MQTT knobs (AP-03).
     #[serde(default)]
     pub global_zone: GlobalZoneConf,
+    /// Exporter settings (AP-09).
+    #[serde(default)]
+    pub prometheus: PrometheusConf,
 }
 
 impl FullSnapshot {
@@ -3046,6 +3271,7 @@ impl FullSnapshot {
         self.schemas.validate()?;
         self.cluster_meta.validate()?;
         self.global_zone.validate()?;
+        self.prometheus.validate()?;
         Ok(())
     }
 
@@ -3097,6 +3323,8 @@ pub enum ConfigRoot {
     ClusterMeta(ClusterMetaConf),
     /// Validated default-zone MQTT root.
     GlobalZone(GlobalZoneConf),
+    /// Validated exporter settings root.
+    Prometheus(PrometheusConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3206,6 +3434,7 @@ impl ConfigRegistry {
             ConfigRoot::Schemas(conf) => self.commit_schemas(conf),
             ConfigRoot::ClusterMeta(conf) => self.commit_cluster_meta(conf),
             ConfigRoot::GlobalZone(conf) => self.commit_global_zone(conf),
+            ConfigRoot::Prometheus(conf) => self.commit_prometheus(conf),
         }
     }
 
@@ -3609,6 +3838,17 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits validated exporter settings without touching other roots.
+    pub fn commit_prometheus(&self, conf: PrometheusConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.prometheus = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Serialises the current snapshot to TOML and writes it atomically.
     ///
     /// The snapshot is written to a unique temp file in the same
@@ -3732,6 +3972,7 @@ mod tests {
             schemas: SchemasConf::default(),
             cluster_meta: ClusterMetaConf::default(),
             global_zone: GlobalZoneConf::default(),
+            prometheus: PrometheusConf::default(),
         }
     }
 
@@ -4293,5 +4534,63 @@ mod tests {
             .expect_err("zero queue cap must fail");
         // A refused commit leaves the kept knobs untouched.
         assert_eq!(registry.snapshot().global_zone.max_inflight, 64);
+    }
+
+    #[test]
+    fn prometheus_settings_default_validate_commit_and_round_trip() {
+        let defaults = PrometheusConf::default();
+        defaults.validate().expect("defaults validate");
+        assert!(defaults.enable_basic_auth);
+        assert_eq!(defaults.latency_buckets, "10ms, 100ms, 1s, 5s, 30s");
+        assert_eq!(defaults.collectors.vm_memory, PrometheusCollector::Disabled);
+        assert!(!defaults.push_gateway.enable);
+        assert_eq!(defaults.push_gateway.method, "put");
+
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-prometheus-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let registry = ConfigRegistry::load(&dir).expect("scratch registry loads");
+        let changed = PrometheusConf {
+            enable_basic_auth: false,
+            collectors: PrometheusCollectorsConf {
+                vm_memory: PrometheusCollector::Enabled,
+                ..Default::default()
+            },
+            push_gateway: PrometheusPushGatewayConf {
+                enable: true,
+                method: "post".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        registry
+            .commit(ConfigRoot::Prometheus(changed.clone()))
+            .expect("valid settings commit");
+        assert_eq!(registry.snapshot().prometheus, changed);
+        registry.save().expect("settings save");
+        let reloaded = ConfigRegistry::load(&dir).expect("saved registry reloads");
+        assert_eq!(reloaded.snapshot().prometheus, changed);
+        std::fs::remove_dir_all(&dir).ok();
+
+        for bad in [
+            PrometheusConf {
+                latency_buckets: "x".repeat(MAX_PROMETHEUS_TEXT_LEN + 1),
+                ..PrometheusConf::default()
+            },
+            PrometheusConf {
+                push_gateway: PrometheusPushGatewayConf {
+                    method: "delete".to_string(),
+                    ..PrometheusPushGatewayConf::default()
+                },
+                ..PrometheusConf::default()
+            },
+        ] {
+            bad.validate().expect_err("bad settings must fail");
+        }
     }
 }

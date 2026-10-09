@@ -563,6 +563,114 @@
       },
       "type": "object"
     },
+    "prometheus": {
+      "properties": {
+        "collectors": {
+          "properties": {
+            "mnesia": {
+              "default": "disabled",
+              "description": "Store collector switch for load analysis.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_dist": {
+              "default": "disabled",
+              "description": "Distribution collector switch for load analysis.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_memory": {
+              "default": "disabled",
+              "description": "Memory collector switch for load analysis.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_msacc": {
+              "default": "disabled",
+              "description": "Microstate accounting collector switch for load analysis.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_statistics": {
+              "default": "disabled",
+              "description": "Statistics collector switch for load analysis.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            },
+            "vm_system_info": {
+              "default": "disabled",
+              "description": "System information collector switch for load analysis.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "enable_basic_auth": {
+          "default": true,
+          "description": "Require credentials on the scrape endpoints.",
+          "type": "boolean"
+        },
+        "latency_buckets": {
+          "default": "10ms, 100ms, 1s, 5s, 30s",
+          "description": "Latency histogram buckets for the exposition.",
+          "type": "string"
+        },
+        "push_gateway": {
+          "properties": {
+            "enable": {
+              "default": false,
+              "description": "Push the exposition to the push target.",
+              "type": "boolean"
+            },
+            "interval": {
+              "default": "15s",
+              "description": "Push interval for the exposition.",
+              "type": "string"
+            },
+            "job_name": {
+              "default": "${name}/instance/${name}~${host}",
+              "description": "Job name template for each push.",
+              "type": "string"
+            },
+            "method": {
+              "default": "put",
+              "description": "Push method for the exposition.",
+              "enum": [
+                "put",
+                "post"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "default": "http://127.0.0.1:9091",
+              "description": "Push target URL for the exposition.",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "quotas": {
       "properties": {
         "burst_multiplier": {

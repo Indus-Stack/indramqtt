@@ -173,7 +173,11 @@ impl Metrics {
 
     /// One MQTT ingress message accepted over BrokerLink.
     pub fn inc_messages_received(&self) -> u64 {
-        self.messages_received.fetch_add(1, Ordering::Relaxed) + 1
+        self.inc_messages_received_by(1)
+    }
+
+    pub fn inc_messages_received_by(&self, n: u64) -> u64 {
+        self.messages_received.fetch_add(n, Ordering::Relaxed) + n
     }
 
     /// One `PublishOut` frame admitted into the shard transport mailbox

@@ -3927,6 +3927,89 @@ fn load_data_dir_registry(data_dir: &str) -> Result<ConfigRegistry, ConfigError>
     ConfigRegistry::load(std::path::Path::new(data_dir))
 }
 
+/// Copy exporter settings set through the startup layers into the
+/// config registry (AP-09).
+///
+/// Only the scalar file homes move (`enable_basic_auth`,
+/// `latency_buckets`, the push target scalars and the collector
+/// switches). Push headers and the namespaced limiter have no file
+/// home and stay managed through `PUT /prometheus`. A key moves only
+/// when a startup layer set it, so runtime changes keep every other
+/// key; an unchanged registry is left alone with no save. Boot-time
+/// only: one snapshot clone plus at most one commit and one save.
+fn apply_prometheus_file_settings(
+    layered: &LayeredConfig,
+    registry: &ConfigRegistry,
+) -> Result<(), ConfigError> {
+    const PATHS: [&str; 13] = [
+        "prometheus.enable_basic_auth",
+        "prometheus.latency_buckets",
+        "prometheus.push_gateway.enable",
+        "prometheus.push_gateway.url",
+        "prometheus.push_gateway.interval",
+        "prometheus.push_gateway.job_name",
+        "prometheus.push_gateway.method",
+        "prometheus.collectors.mnesia",
+        "prometheus.collectors.vm_dist",
+        "prometheus.collectors.vm_memory",
+        "prometheus.collectors.vm_msacc",
+        "prometheus.collectors.vm_statistics",
+        "prometheus.collectors.vm_system_info",
+    ];
+    let provenance = layered.provenance();
+    if !PATHS.iter().any(|path| provenance.contains_key(*path)) {
+        return Ok(());
+    }
+    let file = &layered.config().prometheus;
+    let mut next = registry.snapshot().prometheus.clone();
+    if provenance.contains_key(PATHS[0]) {
+        next.enable_basic_auth = file.enable_basic_auth;
+    }
+    if provenance.contains_key(PATHS[1]) {
+        next.latency_buckets = file.latency_buckets.clone();
+    }
+    if provenance.contains_key(PATHS[2]) {
+        next.push_gateway.enable = file.push_gateway.enable;
+    }
+    if provenance.contains_key(PATHS[3]) {
+        next.push_gateway.url = file.push_gateway.url.clone();
+    }
+    if provenance.contains_key(PATHS[4]) {
+        next.push_gateway.interval = file.push_gateway.interval.clone();
+    }
+    if provenance.contains_key(PATHS[5]) {
+        next.push_gateway.job_name = file.push_gateway.job_name.clone();
+    }
+    if provenance.contains_key(PATHS[6]) {
+        next.push_gateway.method = file.push_gateway.method.clone();
+    }
+    if provenance.contains_key(PATHS[7]) {
+        next.collectors.mnesia = file.collectors.mnesia;
+    }
+    if provenance.contains_key(PATHS[8]) {
+        next.collectors.vm_dist = file.collectors.vm_dist;
+    }
+    if provenance.contains_key(PATHS[9]) {
+        next.collectors.vm_memory = file.collectors.vm_memory;
+    }
+    if provenance.contains_key(PATHS[10]) {
+        next.collectors.vm_msacc = file.collectors.vm_msacc;
+    }
+    if provenance.contains_key(PATHS[11]) {
+        next.collectors.vm_statistics = file.collectors.vm_statistics;
+    }
+    if provenance.contains_key(PATHS[12]) {
+        next.collectors.vm_system_info = file.collectors.vm_system_info;
+    }
+    if next == registry.snapshot().prometheus {
+        return Ok(());
+    }
+    next.validate()?;
+    registry.commit_prometheus(next)?;
+    registry.save()?;
+    Ok(())
+}
+
 /// Resolve the startup configuration through the typed-schema layers
 /// (SY-02): schema defaults, `indra.toml`, `conf.d/*.toml`,
 /// `INDRA_*` environment, then explicitly passed flags. Main's defaults
@@ -9251,6 +9334,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // file is a fatal boot error naming the file and the field, never a
     // silent boot with defaults.
     shared.config = Arc::new(load_data_dir_registry(&args.data_dir)?);
+    // Exporter file settings (AP-09): seed the registry rows the
+    // operator set through the startup layers (`indra.toml`,
+    // `conf.d`, `INDRA_*`), so the management API and the text
+    // exposition observe them from boot. Only keys a layer set move;
+    // runtime changes through `PUT /prometheus` keep every other key.
+    apply_prometheus_file_settings(&layered, &shared.config)?;
     // Delayed publishes (B4-03): apply the configured delay bound, point
     // the wheel at the kernel data dir, reload pending entries, then
     // start the single driver task. Torn or expired rows are discarded
@@ -12531,6 +12620,401 @@ mod tests {
         assert_eq!(
             replay_pid, first_pid,
             "redelivery reuses the downlink packet id"
+        );
+    }
+
+    /// AP-09: stats and metrics read true kernel values through the
+    /// broker path. One client binds (connect), subscribes (plain plus
+    /// shared), publishes a normal message and one delayed publish; the
+    /// monitoring handlers built on the same shared objects then report
+    /// the true amounts. Nothing here writes the stores directly: the
+    /// publish event drives the scheduler and the counters.
+    #[tokio::test]
+    async fn ap09_stats_and_metrics_read_true_broker_values() {
+        use axum::extract::State;
+        let shared = test_shared();
+
+        // Baseline reads before any traffic.
+        let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let mut api_state = broker_api::ApiState::standalone(engine);
+        api_state.metrics = shared.metrics.clone();
+        api_state.sessions = shared.sessions.clone();
+        api_state.delayed = shared.delayed.clone();
+        api_state.stats = shared.stats.clone();
+        api_state.engine = shared.engine.clone();
+        async fn stats_body(state: &broker_api::ApiState) -> serde_json::Value {
+            let response = broker_api::v5::monitoring::get_stats(State(state.clone())).await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .expect("stats body is small and readable");
+            serde_json::from_slice(&bytes).expect("stats body is JSON")
+        }
+        async fn metrics_body(state: &broker_api::ApiState) -> serde_json::Value {
+            let response = broker_api::v5::monitoring::get_metrics(State(state.clone())).await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .expect("metrics body is small and readable");
+            serde_json::from_slice(&bytes).expect("metrics body is JSON")
+        }
+        let before_stats = stats_body(&api_state).await;
+        let before_metrics = metrics_body(&api_state).await;
+        assert_eq!(before_stats[0]["delayed.count"], serde_json::json!(0));
+        let received_before = before_metrics["messages.received"].as_u64().expect("count");
+        let sent_before = before_metrics["messages.sent"].as_u64().expect("count");
+        let delivered_before = before_metrics["messages.delivered"]
+            .as_u64()
+            .expect("count");
+
+        // Connect through the production bind entry.
+        let bind_reply = apply_bind(
+            &bind_frame(81, 1, encode_bind_meta("ap09-c1", true, 60)),
+            &shared,
+        )
+        .await
+        .expect("bind replies");
+        let (_, _, bind_rc) = decode_session_binding_meta(&bind_reply.metadata);
+        assert_eq!(bind_rc, 0);
+        // Mirror the connection loop lifecycle update exactly.
+        let active = shared.metrics.inc_connections();
+        shared.stats.set_connections(active.max(0) as u64);
+        // Subscribe through the production subscribe entry.
+        let sub = subscribe_frame(
+            81,
+            2,
+            encode_subscribe_meta(
+                7,
+                "ap09-c1",
+                &[("ap09/data", 0), ("$share/pool/ap09/work", 0)],
+            ),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        refresh_subscription_stats(&shared);
+
+        // One normal publish through the publish event, routed like the
+        // connection loop routes it (mailbox send plus the loop's own
+        // delivery accounting).
+        let (tx81, _rx81) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(81, tx81);
+        let (meta, payload) = encode_publish_meta("ap09/data", 1, 0, false, b"v");
+        let (_, deliveries) = apply_publish(&publish_frame(81, 3, meta, payload), &shared).await;
+        assert!(!deliveries.is_empty(), "subscriber receives the publish");
+        let mut enqueued = 0u64;
+        for (conn_id, frame) in deliveries {
+            if shared.conns.route(conn_id, frame) {
+                enqueued += 1;
+            }
+        }
+        shared.metrics.inc_messages_forwarded_by(enqueued);
+        shared.metrics.inc_publish_sent_by(enqueued);
+        shared.metrics.inc_delivered_by(enqueued);
+        shared
+            .conns
+            .pop_qos0(81)
+            .expect("downlink reaches the backlog");
+        // One delayed publish through the same event.
+        let (delayed_meta, delayed_payload) =
+            encode_publish_meta("$delayed/60/ap09/later", 2, 0, false, b"later");
+        apply_publish(
+            &publish_frame(81, 4, delayed_meta, delayed_payload),
+            &shared,
+        )
+        .await;
+        assert_eq!(shared.delayed.len(), 1, "wheel holds the entry");
+
+        // Each key the broker tracks changes by the true amount.
+        let after_stats = stats_body(&api_state).await;
+        assert_eq!(after_stats[0]["delayed.count"], serde_json::json!(1));
+        assert_eq!(after_stats[0]["connections.count"], serde_json::json!(1));
+        // Shared and subscriber keys stay out: the kernel keeps no
+        // counter for them, so no constant stands in for a measurement.
+        assert!(after_stats[0].get("subscriptions.shared.count").is_none());
+        assert!(after_stats[0].get("subscriptions.shared.max").is_none());
+        assert!(after_stats[0].get("subscribers.count").is_none());
+        assert!(after_stats[0].get("subscribers.max").is_none());
+        assert!(after_stats[0].get("delayed.max").is_none());
+        let after_metrics = metrics_body(&api_state).await;
+        assert_eq!(
+            after_metrics["messages.received"].as_u64().expect("count"),
+            received_before + 2
+        );
+        // Sent reads transport admission while delivered reads live
+        // deliveries: one fanned-out publish moves each by one, never
+        // sharing one value.
+        assert_eq!(
+            after_metrics["messages.sent"].as_u64().expect("count"),
+            sent_before + 1
+        );
+        assert_eq!(
+            after_metrics["messages.delivered"].as_u64().expect("count"),
+            delivered_before + 1
+        );
+        // Connected reads the current gauge after one bind, not the
+        // cumulative connect count.
+        assert_eq!(
+            after_metrics["client.connected"].as_u64().expect("count"),
+            1
+        );
+        assert_eq!(
+            after_metrics["messages.delayed"].as_u64().expect("count"),
+            before_metrics["messages.delayed"].as_u64().unwrap_or(0) + 1
+        );
+        // The exposition carries the same true counters as text.
+        let exposition = broker_api::v5::prometheus::get_prometheus_stats(
+            State(api_state),
+            axum::extract::Query(broker_api::v5::prometheus::PrometheusQuery::default()),
+        )
+        .await;
+        assert_eq!(exposition.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(exposition.into_body(), 1024 * 1024)
+            .await
+            .expect("exposition is small and readable");
+        let text = String::from_utf8(bytes.to_vec()).expect("exposition is UTF-8");
+        assert!(
+            text.contains("indramqtt_messages_delayed_total 1\n"),
+            "{text}"
+        );
+        assert!(text.contains("indramqtt_delayed_count 1\n"), "{text}");
+    }
+
+    /// AP-09 sampler uses the kernel timer path.
+    ///
+    /// Bind, subscribe and publish drive live traffic. The kernel
+    /// sampler records each point. Reads observe true values. No
+    /// test writes the monitor ring directly here.
+    #[tokio::test]
+    async fn ap09_monitor_sampler_records_live_through_kernel_timer() {
+        use axum::extract::State;
+        let shared = test_shared();
+        let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let mut api_state = broker_api::ApiState::standalone(engine);
+        api_state.metrics = shared.metrics.clone();
+        api_state.sessions = shared.sessions.clone();
+        api_state.delayed = shared.delayed.clone();
+        api_state.stats = shared.stats.clone();
+        api_state.engine = shared.engine.clone();
+        api_state.monitor = shared.monitor.clone();
+        // Bind one client through the production bind entry.
+        let bind_reply = apply_bind(
+            &bind_frame(82, 1, encode_bind_meta("ap09-mon-1", true, 60)),
+            &shared,
+        )
+        .await
+        .expect("bind replies");
+        let (_, _, bind_rc) = decode_session_binding_meta(&bind_reply.metadata);
+        assert_eq!(bind_rc, 0);
+        // Mirror the connection loop update exactly.
+        let active = shared.metrics.inc_connections();
+        shared.stats.set_connections(active.max(0) as u64);
+        // Subscribe through the production subscribe entry.
+        let sub = subscribe_frame(
+            82,
+            2,
+            encode_subscribe_meta(7, "ap09-mon-1", &[("ap09/mon/data", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        refresh_subscription_stats(&shared);
+        // Register the downlink mailbox for delivery.
+        let (tx82, _rx82) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(82, tx82);
+        // Publish one message through the publish event.
+        let (meta, payload) = encode_publish_meta("ap09/mon/data", 1, 0, false, b"one");
+        let (_, deliveries) = apply_publish(&publish_frame(82, 3, meta, payload), &shared).await;
+        assert!(!deliveries.is_empty(), "subscriber receives the publish");
+        // Record the first point through the kernel timer.
+        sample_monitor(&shared);
+        // Publish a second message through the publish event.
+        let (meta2, payload2) = encode_publish_meta("ap09/mon/data", 1, 0, false, b"two");
+        let (_, deliveries2) = apply_publish(&publish_frame(82, 4, meta2, payload2), &shared).await;
+        assert!(!deliveries2.is_empty(), "subscriber receives the publish");
+        // Record the second point through the kernel timer.
+        sample_monitor(&shared);
+        // History holds two timer points with live values.
+        let rows = shared.monitor.list(None, u64::MAX);
+        assert!(rows.len() >= 2, "timer stores two points");
+        let newest = rows.last().expect("newest point exists");
+        assert_eq!(newest.connections, 1);
+        assert_eq!(newest.received, shared.metrics.messages_received());
+        assert!(newest.received >= 2, "timer sees true ingress");
+        assert!(newest.time_stamp > 0, "timer stamps the point");
+        // Current snapshot reads live gauges from the same points.
+        let response = broker_api::v5::monitoring::monitor_current(State(api_state.clone())).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("snapshot reads");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("snapshot is JSON");
+        assert_eq!(body["connections"], serde_json::json!(1));
+        assert_eq!(body["subscriptions"], serde_json::json!(1));
+        assert_eq!(body["topics"], serde_json::json!(1));
+        // History read serves the timer points in order.
+        let response = broker_api::v5::monitor::list_monitor(
+            State(api_state),
+            axum::extract::Query(broker_api::v5::monitor::MonitorListQuery { latest: None }),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("history reads");
+        let history: serde_json::Value = serde_json::from_slice(&bytes).expect("history is JSON");
+        let items = history.as_array().expect("history is an array");
+        assert!(items.len() >= 2, "history serves timer points");
+        assert_eq!(
+            items.last().expect("last item")["connections"],
+            serde_json::json!(1)
+        );
+    }
+
+    /// AP-09 rule and transform counters use real fire.
+    ///
+    /// One rule and one transform are registered. Publishes pass
+    /// through the publish event. The fire path moves each counter.
+    /// No test bumps a rule or transform counter directly here.
+    #[tokio::test]
+    async fn ap09_rule_and_transform_counters_move_through_real_fire() {
+        use axum::extract::State;
+        use broker_api::v5::transformations::{TransformOperation, TransformRecord};
+        let shared = test_shared();
+        let mut api_state = broker_api::ApiState::standalone(shared.engine.clone());
+        api_state.metrics = shared.metrics.clone();
+        api_state.sessions = shared.sessions.clone();
+        api_state.delayed = shared.delayed.clone();
+        api_state.stats = shared.stats.clone();
+        api_state.engine = shared.engine.clone();
+        api_state.monitor = shared.monitor.clone();
+        // Create one rule through the validated create path.
+        shared
+            .engine
+            .create_rule(
+                "ap09-live-fire".to_string(),
+                broker_protocol::TopicFilter::new("ap09/rule/#").expect("filter parses"),
+                None,
+                true,
+                vec![broker_rules::RuleAction::Log],
+            )
+            .expect("rule creates");
+        // Register one transform through the management chain.
+        shared
+            .transformations
+            .insert(TransformRecord {
+                name: "ap09-live-t".to_string(),
+                topics: vec!["ap09/tr/#".to_string()],
+                failure_action: "drop".to_string(),
+                enable: true,
+                operations: vec![TransformOperation {
+                    key: "payload".to_string(),
+                    value: "${payload}[m]".to_string(),
+                }],
+                params: serde_json::json!({}),
+            })
+            .expect("transform inserts");
+        // Wire the metric record and the engine snapshot.
+        shared.engine.ensure_transform_metrics("ap09-live-t");
+        shared
+            .engine
+            .sync_transforms(shared.transformations.steps_snapshot());
+        async fn metrics_body(state: &broker_api::ApiState) -> serde_json::Value {
+            let response = broker_api::v5::monitoring::get_metrics(State(state.clone())).await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                .await
+                .expect("metrics body reads");
+            serde_json::from_slice(&bytes).expect("metrics body is JSON")
+        }
+        let before = metrics_body(&api_state).await;
+        let actions_before = before["actions.executed"].as_u64().expect("count");
+        let ok_before = before["messages.transformation_succeeded"]
+            .as_u64()
+            .expect("count");
+        // Bind one client through the production bind entry.
+        let bind_reply = apply_bind(
+            &bind_frame(83, 1, encode_bind_meta("ap09-fire-1", true, 60)),
+            &shared,
+        )
+        .await
+        .expect("bind replies");
+        let (_, _, bind_rc) = decode_session_binding_meta(&bind_reply.metadata);
+        assert_eq!(bind_rc, 0);
+        // Mirror the connection loop update exactly.
+        let active = shared.metrics.inc_connections();
+        shared.stats.set_connections(active.max(0) as u64);
+        let (tx83, _rx83) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(83, tx83);
+        // Publish one message that matches the rule.
+        let (rule_meta, rule_payload) = encode_publish_meta("ap09/rule/one", 1, 0, false, b"fire");
+        apply_publish(&publish_frame(83, 3, rule_meta, rule_payload), &shared).await;
+        // Publish one message that matches the transform.
+        let (tr_meta, tr_payload) = encode_publish_meta("ap09/tr/one", 1, 0, false, b"m");
+        apply_publish(&publish_frame(83, 4, tr_meta, tr_payload), &shared).await;
+        // Real fire moves the action counter by one.
+        let after = metrics_body(&api_state).await;
+        assert_eq!(
+            after["actions.executed"].as_u64().expect("count"),
+            actions_before + 1
+        );
+        // Real transform run moves the success counter by one.
+        assert_eq!(
+            after["messages.transformation_succeeded"]
+                .as_u64()
+                .expect("count"),
+            ok_before + 1
+        );
+        // Engine record agrees with the API read.
+        let (_, ok, err) = shared
+            .engine
+            .transform_metrics_snapshot_for("ap09-live-t")
+            .expect("record exists");
+        assert_eq!(ok, 1);
+        assert_eq!(err, 0);
+        // Node twin reads the same true values.
+        let response = broker_api::v5::monitoring::get_metrics_node(
+            State(api_state.clone()),
+            axum::extract::Path(broker_api::node_scope::local_node_name().to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("node metrics read");
+        let node: serde_json::Value = serde_json::from_slice(&bytes).expect("node metrics is JSON");
+        assert_eq!(
+            node["actions.executed"].as_u64().expect("count"),
+            actions_before + 1
+        );
+        assert_eq!(
+            node["messages.transformation_succeeded"]
+                .as_u64()
+                .expect("count"),
+            ok_before + 1
+        );
+        // Exposition carries the same true counters as text.
+        let exposition = broker_api::v5::prometheus::get_prometheus_stats(
+            State(api_state),
+            axum::extract::Query(broker_api::v5::prometheus::PrometheusQuery::default()),
+        )
+        .await;
+        assert_eq!(exposition.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(exposition.into_body(), 1024 * 1024)
+            .await
+            .expect("exposition reads");
+        let text = String::from_utf8(bytes.to_vec()).expect("exposition is UTF-8");
+        assert!(
+            text.contains("indramqtt_actions_executed_total 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("indramqtt_messages_transformation_succeeded_total 1\n"),
+            "{text}"
         );
     }
 
