@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub mod tenant;
+pub mod tenant_limits;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
@@ -2131,6 +2132,33 @@ impl SessionManager {
     /// empty until CONNECT carries the client's maximum.
     pub fn apply_topic_alias_limits(&self, session: &Arc<Session>) {
         session.set_inbound_alias_max(self.max_topic_alias());
+    }
+
+    /// Sessions held in one tenant (live plus detached with state).
+    ///
+    /// Reads the inner map length under one short read. Connect path
+    /// only; the publish and deliver paths never call this.
+    pub fn session_count_in_tenant(&self, tenant: &str) -> usize {
+        self.sessions
+            .read()
+            .get(tenant)
+            .map(|inner| inner.len())
+            .unwrap_or(0)
+    }
+
+    /// Live connections held in one tenant.
+    ///
+    /// Counts sessions with a live edge binding under one short read.
+    /// Connect path only; the publish and deliver paths never call this.
+    pub fn live_connection_count_in_tenant(&self, tenant: &str) -> usize {
+        let map = self.sessions.read();
+        let Some(inner) = map.get(tenant) else {
+            return 0;
+        };
+        inner
+            .values()
+            .filter(|session| *session.connected.read())
+            .count()
     }
 
     /// Buffer one message for a detached session, applying this

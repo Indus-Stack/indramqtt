@@ -1750,11 +1750,17 @@ pub(crate) fn rewrite_1based(expr: &Expr) -> Expr {
                 .collect(),
             else_clause: else_clause.as_ref().map(|e| Box::new(rewrite_1based(e))),
         },
-        Expr::Over { call, partition_by, when } => Expr::Over {
+        Expr::Over {
+            call,
+            partition_by,
+            when,
+        } => Expr::Over {
             call: Box::new(rewrite_1based(call)),
             partition_by: partition_by.as_ref().map(|e| Box::new(rewrite_1based(e))),
             when: when.as_ref().map(|e| Box::new(rewrite_1based(e))),
         },
-        Expr::Wildcard | Expr::WildcardModified { .. } | Expr::Identifier(_) | Expr::Literal(_) => expr.clone(),
+        Expr::Wildcard | Expr::WildcardModified { .. } | Expr::Identifier(_) | Expr::Literal(_) => {
+            expr.clone()
+        }
     }
 }

@@ -14,6 +14,7 @@ pub mod jwks_test_support;
 pub mod kerberos;
 pub mod ldap;
 pub mod node_cache;
+pub mod psk;
 pub mod settings;
 pub mod webhook;
 
@@ -39,6 +40,8 @@ pub use jwks::{
 pub use kerberos::{KerberosAuthenticator, KerberosConfig, REPLAY_MAX_ENTRIES};
 pub use ldap::{LdapAuthenticator, LdapConfig};
 pub use node_cache::NodeAuthCache;
+pub use psk::{PskInsertError, PskStore};
+pub use psk::{MAX_PSK_ENTRIES, MAX_PSK_IDENTITY_BYTES, MAX_PSK_KEY_BYTES, MIN_PSK_KEY_BYTES};
 pub use settings::{AuthnSettingsStore, SettingsSubscriber, SettingsUpdateError};
 pub use webhook::{
     WebhookAuth, WebhookConfig, WEBHOOK_BREAKER_RESET_MS, WEBHOOK_BREAKER_THRESHOLD,
@@ -254,10 +257,11 @@ pub struct MemoryAuth {
     /// tenant with no users/rules): counted exactly where the denial
     /// happens, fail closed and logged there.
     tenant_denials: std::sync::atomic::AtomicU64,
-    /// Kernel config registry receiving every default-tenant user/ACL
-    /// mutation (`None` in unit tests and standalone state, which stay
-    /// memory-only). Only the default tenant persists (per-tenant config
-    /// is MT-07); non-default tenants are memory-only.
+    /// Kernel config registry receiving every user/ACL mutation (`None`
+    /// in unit tests and standalone state, which stay memory-only).
+    /// Every tenant persists through it: each mutation commits the
+    /// exported root (all tenants) and saves it atomically, so a restart
+    /// and a reload keep all tenants.
     registry: RwLock<Option<Arc<ConfigRegistry>>>,
     /// Serialises export-commit-save so concurrent mutations cannot
     /// interleave into a lost update on disk.
@@ -608,7 +612,7 @@ fn is_default_tenant(tenant: &str) -> bool {
 // tenant (as MT-01 assignment does) or deny outright here? The rulebook
 // does not decide the lookup policy; current choice denies outright as
 // the conservative fail-closed answer until the checker pins it.
-fn is_valid_tenant_id(id: &str) -> bool {
+pub fn is_valid_tenant_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_TENANT_ID_LEN && !id.chars().any(|c| c.is_control())
 }
 
@@ -886,8 +890,90 @@ impl MemoryAuth {
         &self,
         conf: &MqttUsersConf,
     ) -> std::result::Result<(), broker_config::ConfigError> {
-        let mut users = HashMap::with_capacity(conf.users.len());
-        for entry in &conf.users {
+        // Build every table before swapping, so a bad write leaves the
+        // running state unchanged. The default tenant comes from the root
+        // fields (pre-change files carry only these and load as the
+        // default tenant with the same passwords and rules); each
+        // `tenants` entry becomes one non-default table.
+        let default_state = self.build_tenant_state(&conf.users, &conf.acls)?;
+        if conf.tenants.len() + 1 > MAX_AUTH_TENANTS {
+            return Err(broker_config::ConfigError::Invalid(format!(
+                "mqtt_users holds {} tenants, at most {MAX_AUTH_TENANTS} (field `tenants`)",
+                conf.tenants.len() + 1,
+            )));
+        }
+        let mut total_users = default_state.users.len();
+        let mut next: HashMap<String, TenantState> = HashMap::with_capacity(conf.tenants.len() + 1);
+        for (index, table) in conf.tenants.iter().enumerate() {
+            if !is_valid_tenant_id(&table.tenant) {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].tenant {:?} is not a valid tenant id (field `tenant`)",
+                    table.tenant
+                )));
+            }
+            if is_default_tenant(&table.tenant) {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].tenant {:?} must live in the root users/acls fields (field `tenant`)",
+                    table.tenant
+                )));
+            }
+            if next.contains_key(&table.tenant) {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].tenant {:?} is duplicated (field `tenant`)",
+                    table.tenant
+                )));
+            }
+            let state = self.build_tenant_state(&table.users, &table.acls)?;
+            if state.rules.len() > MAX_ACL_RULES_PER_TENANT {
+                return Err(broker_config::ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].acls holds {} entries, at most {MAX_ACL_RULES_PER_TENANT} (field `acls`)",
+                    state.rules.len(),
+                )));
+            }
+            total_users += state.users.len();
+            next.insert(table.tenant.clone(), state);
+        }
+        if default_state.rules.len() > MAX_ACL_RULES_PER_TENANT {
+            return Err(broker_config::ConfigError::Invalid(format!(
+                "mqtt_users.acls holds {} entries, at most {MAX_ACL_RULES_PER_TENANT} (field `acls`)",
+                default_state.rules.len(),
+            )));
+        }
+        if total_users > MAX_AUTHN_USERS {
+            return Err(broker_config::ConfigError::Invalid(format!(
+                "mqtt_users holds {total_users} users, at most {MAX_AUTHN_USERS} (field `users`)"
+            )));
+        }
+        // Replace every tenant at once: the snapshot is the full truth,
+        // so a reload keeps exactly the tenants it carries (a restart
+        // reads the same file and lands in the same state). A table that
+        // is empty on both sides stays absent: unknown and empty tenants
+        // both deny (closed, counted, logged).
+        // TODO(parity): should a reload prune tenants absent from disk or
+        // keep live tenants that the snapshot does not carry? The rulebook
+        // does not decide the prune policy; current choice prunes (the
+        // snapshot is the full truth) as the conservative fail-closed
+        // answer until the checker pins it.
+        next.insert(DEFAULT_TENANT_ID.to_string(), default_state);
+        *self.tenants.write() = next;
+        Ok(())
+    }
+
+    /// Build one tenant table from its snapshot rows. Secret references
+    /// resolve at use time (a missing secret fails closed with an error
+    /// naming the reference, never the value); undecodable verifiers lock
+    /// the account (fail closed, still listed). Unknown ACL actions are
+    /// skipped (deny-safe: no rule means denied) rather than widened.
+    fn build_tenant_state(
+        &self,
+        users: &[broker_config::MqttUser],
+        acls: &[broker_config::AclConf],
+    ) -> std::result::Result<TenantState, broker_config::ConfigError> {
+        let mut state = TenantState {
+            users: HashMap::with_capacity(users.len()),
+            rules: Vec::with_capacity(acls.len()),
+        };
+        for entry in users {
             let trimmed = entry.password_hash.trim();
             let verifier = if broker_config::secrets::is_secret_ref(trimmed) {
                 // Fail closed: propagate the resolve error (it names the
@@ -915,7 +1001,7 @@ impl MemoryAuth {
                     }
                 }
             };
-            users.insert(
+            state.users.insert(
                 entry.username.clone(),
                 UserEntry {
                     verifier,
@@ -933,8 +1019,7 @@ impl MemoryAuth {
         // so `parse` succeeds on every round-trip. An unvalidated caller
         // passing an unknown action gets that entry skipped (deny-safe:
         // no rule means denied) rather than widened into `All`.
-        let rules = conf
-            .acls
+        state.rules = acls
             .iter()
             .filter_map(|entry| {
                 AclAction::parse(&entry.action).map(|action| {
@@ -947,31 +1032,19 @@ impl MemoryAuth {
                 })
             })
             .collect();
-        // The persisted snapshot is the default tenant's state: seeding
-        // replaces the default tenant in place and leaves every other
-        // tenant untouched, so a reload never drops a live tenant's
-        // credentials. Boot seeds from an empty snapshot into the same
-        // default tenant, preserving today's open behaviour exactly.
-        // TODO(parity): per-tenant persisted config (including whether a
-        // reload should prune tenants absent from disk) is MT-07; until
-        // then non-default tenants are memory-only and survive reloads.
-        let mut tenants = self.tenants.write();
-        let state = tenants.entry(DEFAULT_TENANT_ID.to_string()).or_default();
-        state.users = users;
-        state.rules = rules;
-        Ok(())
+        Ok(state)
     }
 
-    /// Export the current contents as a validated config root: users
-    /// sorted by username so the persisted file is deterministic, rules
-    /// in evaluation order (first match wins, so order is significant).
-    /// Passwords export in their stored verifier encoding (legacy SHA-256
-    /// hex round-trips until migration, then the new PHC-style encoding;
-    /// never plaintext); quota bounds export alongside the user record
-    /// they belong to.
+    /// Export the current contents as a validated config root: the
+    /// default tenant in the root fields plus one table per non-default
+    /// tenant, users sorted by username so the persisted file is
+    /// deterministic, tables sorted by tenant id, rules in evaluation order
+    /// (first match wins, so order is significant). Passwords export in
+    /// their stored verifier encoding (legacy SHA-256 hex round-trips
+    /// until migration, then the new PHC-style encoding; never plaintext);
+    /// quota bounds export alongside the user record they belong to. Every
+    /// table persists, so a restart and a reload keep all tenants.
     fn export_conf(&self) -> MqttUsersConf {
-        // Only the default tenant persists (per-tenant config is MT-07);
-        // non-default tenants are memory-only and never reach disk.
         let tenants = self.tenants.read();
         let state = tenants.get(DEFAULT_TENANT_ID);
         let mut entries: Vec<MqttUser> = state
@@ -1002,9 +1075,49 @@ impl MemoryAuth {
                     .collect()
             })
             .unwrap_or_default();
+        // One table per non-default tenant with users or rules. Tables
+        // that are empty on both sides stay absent: unknown and empty
+        // tenants both deny (closed, counted, logged).
+        let mut tables: Vec<broker_config::TenantMqttConf> = tenants
+            .iter()
+            .filter(|(id, state)| {
+                *id != DEFAULT_TENANT_ID && (!state.users.is_empty() || !state.rules.is_empty())
+            })
+            .map(|(id, state)| {
+                let mut users: Vec<MqttUser> = state
+                    .users
+                    .iter()
+                    .map(|(username, entry)| MqttUser {
+                        username: username.clone(),
+                        password_hash: encode_stored_verifier(&entry.verifier),
+                        max_connections: entry.quotas.max_connections,
+                        max_publish_rate: entry.quotas.max_publish_rate,
+                        max_publish_burst: entry.quotas.max_publish_burst,
+                    })
+                    .collect();
+                users.sort_by(|a, b| a.username.cmp(&b.username));
+                let acls: Vec<AclConf> = state
+                    .rules
+                    .iter()
+                    .map(|rule| AclConf {
+                        username: rule.client_pattern.clone(),
+                        topic: rule.topic_pattern.clone(),
+                        action: action_to_conf(rule.action).to_string(),
+                        allow: rule.allow,
+                    })
+                    .collect();
+                broker_config::TenantMqttConf {
+                    tenant: id.clone(),
+                    users,
+                    acls,
+                }
+            })
+            .collect();
+        tables.sort_by(|a, b| a.tenant.cmp(&b.tenant));
         MqttUsersConf {
             users: entries,
             acls,
+            tenants: tables,
         }
     }
 
@@ -1048,15 +1161,9 @@ impl MemoryAuth {
     }
 
     /// Store (or replace) a username in one tenant (MT-06). The default
-    /// tenant behaves exactly like [`MemoryAuth::add_user`] and persists;
-    /// non-default tenants are memory-only (per-tenant config is MT-07)
-    /// and start closed until this call creates them. Creating a new
-    /// tenant past [`MAX_AUTH_TENANTS`] is rejected instead of growing
-    /// without limit.
-    // TODO(parity): should non-default tenants persist alongside the
-    // default snapshot, and in which file/shape? The rulebook does not
-    // decide per-tenant persistence; current choice keeps them
-    // memory-only (fail safe: a restart closes them) until MT-07 pins it.
+    /// tenant behaves exactly like [`MemoryAuth::add_user`]; every tenant
+    /// persists (TM-01) through the registry. Creating a new tenant past
+    /// [`MAX_AUTH_TENANTS`] is rejected instead of growing without limit.
     pub fn add_user_in_tenant(
         &self,
         tenant: &str,
@@ -1138,9 +1245,9 @@ impl MemoryAuth {
             state.users.insert(username, UserEntry { verifier, quotas });
         }
         zero_bytes(&mut password);
-        if is_default_tenant(key) {
-            self.persist()?;
-        }
+        // Every tenant persists (TM-01): the exported root carries all
+        // tenants, so each mutation commits and saves.
+        self.persist()?;
         Ok(())
     }
 
@@ -1362,8 +1469,8 @@ impl MemoryAuth {
         self.remove_user_in_tenant(DEFAULT_TENANT_ID, username)
     }
 
-    /// Remove a user in one tenant (MT-06). Only the default tenant
-    /// persists; other tenants are memory-only.
+    /// Remove a user in one tenant (MT-06). Every tenant persists
+    /// (TM-01) through the registry.
     pub fn remove_user_in_tenant(
         &self,
         tenant: &str,
@@ -1375,7 +1482,7 @@ impl MemoryAuth {
             .write()
             .get_mut(key)
             .is_some_and(|state| state.users.remove(username).is_some());
-        if removed && is_default_tenant(key) {
+        if removed {
             self.persist()?;
         }
         Ok(removed)
@@ -1419,7 +1526,7 @@ impl MemoryAuth {
     }
 
     /// Attach quota bounds to an existing user in one tenant (MT-06).
-    /// Only the default tenant persists; other tenants are memory-only.
+    /// Every tenant persists (TM-01) through the registry.
     pub fn set_quotas_in_tenant(
         &self,
         tenant: &str,
@@ -1438,9 +1545,7 @@ impl MemoryAuth {
             }
             None => return Ok(false),
         }
-        if is_default_tenant(key) {
-            self.persist()?;
-        }
+        self.persist()?;
         Ok(true)
     }
 
@@ -1479,6 +1584,48 @@ impl MemoryAuth {
         names
     }
 
+    /// Every live user as `(tenant, username)` (TM-01): tenants sorted,
+    /// then names sorted. Management-plane export only: clones at most
+    /// the capped user set under one short read lock; the CONNECT path
+    /// keeps reading under its own short locks and publish/deliver never
+    /// touch this store.
+    pub fn all_users_with_tenants(&self) -> Vec<(String, String)> {
+        let tenants = self.tenants.read();
+        let mut ids: Vec<&String> = tenants.keys().collect();
+        ids.sort();
+        let mut out = Vec::new();
+        for id in ids {
+            let mut names: Vec<&String> = tenants
+                .get(id)
+                .map(|state| state.users.keys().collect())
+                .unwrap_or_default();
+            names.sort();
+            for name in names {
+                out.push((id.clone(), name.clone()));
+            }
+        }
+        out
+    }
+
+    /// Every live ACL rule as `(tenant, rule)` (TM-01): tenants sorted,
+    /// rules in evaluation order (first match wins, so order is
+    /// significant). Management-plane export only: same lock discipline
+    /// as [`MemoryAuth::all_users_with_tenants`].
+    pub fn all_rules_with_tenants(&self) -> Vec<(String, AclRule)> {
+        let tenants = self.tenants.read();
+        let mut ids: Vec<&String> = tenants.keys().collect();
+        ids.sort();
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(state) = tenants.get(id) {
+                for rule in state.rules.iter() {
+                    out.push((id.clone(), rule.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// Append an ACL rule (first match wins). Persists through the
     /// registry when one is attached.
     pub fn add_rule(&self, rule: AclRule) -> std::result::Result<(), broker_config::ConfigError> {
@@ -1486,14 +1633,10 @@ impl MemoryAuth {
     }
 
     /// Append an ACL rule in one tenant (MT-06): first match wins within
-    /// the tenant; a rule in one tenant never grants in another. The
-    /// default tenant persists; other tenants are memory-only. Writes
-    /// past [`MAX_ACL_RULES_PER_TENANT`] are rejected instead of growing
-    /// the per-check scan without limit.
-    // TODO(parity): should non-default tenants persist alongside the
-    // default snapshot, and in which file/shape? The rulebook does not
-    // decide per-tenant persistence; current choice keeps them
-    // memory-only (fail safe: a restart closes them) until MT-07 pins it.
+    /// the tenant; a rule in one tenant never grants in another. Every
+    /// tenant persists (TM-01) through the registry. Writes past
+    /// [`MAX_ACL_RULES_PER_TENANT`] are rejected instead of growing the
+    /// per-check scan without limit.
     pub fn add_rule_in_tenant(
         &self,
         tenant: &str,
@@ -1530,9 +1673,9 @@ impl MemoryAuth {
             }
             state.rules.push(rule);
         }
-        if is_default_tenant(key) {
-            self.persist()?;
-        }
+        // Every tenant persists (TM-01): the exported root carries all
+        // tenants, so each mutation commits and saves.
+        self.persist()?;
         Ok(())
     }
 
@@ -1604,7 +1747,8 @@ impl MemoryAuth {
         self.clear_rules_in_tenant(DEFAULT_TENANT_ID)
     }
 
-    /// Drop every ACL rule in one tenant (MT-06).
+    /// Drop every ACL rule in one tenant (MT-06). Every tenant persists
+    /// (TM-01) through the registry.
     pub fn clear_rules_in_tenant(
         &self,
         tenant: &str,
@@ -1621,7 +1765,7 @@ impl MemoryAuth {
             state.rules.clear();
             true
         };
-        if was_nonempty && is_default_tenant(key) {
+        if was_nonempty {
             self.persist()?;
         }
         Ok(())
@@ -1637,7 +1781,8 @@ impl MemoryAuth {
         self.remove_rule_in_tenant(DEFAULT_TENANT_ID, index)
     }
 
-    /// Remove the rule at `index` in one tenant (MT-06).
+    /// Remove the rule at `index` in one tenant (MT-06). Every tenant
+    /// persists (TM-01) through the registry.
     pub fn remove_rule_in_tenant(
         &self,
         tenant: &str,
@@ -1656,7 +1801,7 @@ impl MemoryAuth {
                 return Ok(false);
             }
         };
-        if removed && is_default_tenant(key) {
+        if removed {
             self.persist()?;
         }
         Ok(removed)
@@ -2378,8 +2523,8 @@ async fn migrate_legacy_hash_gated(auth: &MemoryAuth, username: &str, password: 
 
 /// Per-tenant legacy-hash migration (MT-06): re-hashes in the connection's
 /// own tenant so one tenant's login never rewrites another tenant's
-/// entry. Only the default tenant persists (a persist failure keeps the
-/// in-memory migration); other tenants are memory-only by design.
+/// entry. Every tenant persists (TM-01); a persist failure keeps the
+/// in-memory migration and the next login retries it.
 async fn migrate_legacy_hash_gated_in_tenant(
     auth: &MemoryAuth,
     tenant: &str,
@@ -2423,9 +2568,6 @@ async fn migrate_legacy_hash_gated_in_tenant(
             return;
         }
         entry.verifier = next;
-    }
-    if !is_default_tenant(tenant_key(tenant)) {
-        return;
     }
     if let Err(error) = auth.persist() {
         tracing::warn!(
@@ -3140,6 +3282,7 @@ mod tests {
                 },
             ],
             acls: vec![],
+            tenants: vec![],
         };
         let auth = MemoryAuth::with_policy(PasswordHashPolicy::for_tests());
         auth.seed_from_snapshot(&conf)
@@ -3844,5 +3987,197 @@ mod tests {
             err.to_string().contains("acls"),
             "error must name the field, got: {err}"
         );
+    }
+
+    /// TM-01: two tenants hold the same username with different passwords
+    /// and different rules. Each username authenticates only in its own
+    /// tenant, through the CONNECT-time lookup (not the map alone).
+    #[tokio::test]
+    async fn tm01_two_tenants_share_username_with_independent_credentials() {
+        let auth = MemoryAuth::with_policy(PasswordHashPolicy::for_tests());
+        auth.add_user_in_tenant("tenant-a", "sam", b"pw-for-a")
+            .expect("tenant-a user stores");
+        auth.add_user_in_tenant("tenant-b", "sam", b"pw-for-b")
+            .expect("tenant-b user stores");
+        auth.add_rule_in_tenant(
+            "tenant-a",
+            AclRule::new("*", AclAction::Publish, "t/a/#", true),
+        )
+        .expect("tenant-a rule stores");
+        auth.add_rule_in_tenant(
+            "tenant-b",
+            AclRule::new("*", AclAction::Publish, "t/b/#", true),
+        )
+        .expect("tenant-b rule stores");
+        // Each password works only in its own tenant.
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-b"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-b"))
+            .await
+            .is_err());
+        assert!(auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-a"))
+            .await
+            .is_err());
+        // Each rule grants only in its own tenant.
+        assert!(auth
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic("t/a/1"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic("t/b/1"))
+            .await
+            .is_err());
+        assert!(auth
+            .authorize_publish_in_tenant("tenant-b", "sam", &topic("t/b/1"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authorize_publish_in_tenant("tenant-b", "sam", &topic("t/a/1"))
+            .await
+            .is_err());
+    }
+
+    /// TM-01: the exported snapshot carries both tenants. A fresh store
+    /// seeded from it (restart) and the same store re-seeded from it
+    /// (reload) keep both tenants with the same passwords and rules.
+    #[tokio::test]
+    async fn tm01_restart_and_reload_keep_both_tenants() {
+        let auth = MemoryAuth::with_policy(PasswordHashPolicy::for_tests());
+        auth.add_user_in_tenant("tenant-a", "sam", b"pw-for-a")
+            .expect("tenant-a user stores");
+        auth.add_user_in_tenant("tenant-b", "sam", b"pw-for-b")
+            .expect("tenant-b user stores");
+        auth.add_rule_in_tenant(
+            "tenant-a",
+            AclRule::new("*", AclAction::Publish, "t/a/#", true),
+        )
+        .expect("tenant-a rule stores");
+        auth.add_rule_in_tenant(
+            "tenant-b",
+            AclRule::new("*", AclAction::Subscribe, "t/b/#", true),
+        )
+        .expect("tenant-b rule stores");
+        // The export carries both tables, tenants sorted.
+        let exported = auth.export_conf();
+        assert_eq!(exported.tenants.len(), 2);
+        assert_eq!(exported.tenants[0].tenant, "tenant-a");
+        assert_eq!(exported.tenants[1].tenant, "tenant-b");
+        // Restart: a fresh store from the exported root keeps both.
+        let rebooted = MemoryAuth::from_snapshot(&exported);
+        for (tenant, password) in [("tenant-a", b"pw-for-a"), ("tenant-b", b"pw-for-b")] {
+            assert!(rebooted
+                .authenticate_in_tenant(tenant, "c", Some("sam"), Some(password))
+                .await
+                .is_ok());
+        }
+        assert!(rebooted
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic("t/a/1"))
+            .await
+            .is_ok());
+        assert!(rebooted
+            .authorize_subscribe_in_tenant("tenant-b", "sam", &filter("t/b/#"))
+            .await
+            .is_ok());
+        // Reload: the live store re-seeded from the same root keeps both.
+        auth.apply_snapshot_conf(&exported)
+            .expect("reload of the exported root succeeds");
+        for (tenant, password) in [("tenant-a", b"pw-for-a"), ("tenant-b", b"pw-for-b")] {
+            assert!(auth
+                .authenticate_in_tenant(tenant, "c", Some("sam"), Some(password))
+                .await
+                .is_ok());
+        }
+    }
+
+    /// TM-01: a snapshot from before per-tenant storage (root fields
+    /// only, no `tenants` list) loads as the default tenant with the same
+    /// passwords and rules; other tenants stay closed.
+    #[tokio::test]
+    async fn tm01_pre_change_snapshot_loads_as_default_tenant() {
+        let conf = MqttUsersConf {
+            users: vec![MqttUser {
+                username: "base".to_string(),
+                password_hash: encode_stored_verifier(&PasswordVerifier::Sha256(
+                    MemoryAuth::digest(b"base-pw"),
+                )),
+                max_connections: None,
+                max_publish_rate: None,
+                max_publish_burst: None,
+            }],
+            acls: vec![AclConf {
+                username: "base".to_string(),
+                topic: "t/#".to_string(),
+                action: "all".to_string(),
+                allow: true,
+            }],
+            tenants: vec![],
+        };
+        let auth = MemoryAuth::from_snapshot(&conf);
+        assert!(auth
+            .authenticate("c", Some("base"), Some(b"base-pw"))
+            .await
+            .is_ok());
+        assert!(auth
+            .authenticate("c", Some("base"), Some(b"wrong"))
+            .await
+            .is_err());
+        assert!(auth.authorize_publish("base", &topic("t/1")).await.is_ok());
+        // Another tenant with no table stays closed (deny, counted).
+        let before = auth.tenant_denial_count();
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("base"), Some(b"base-pw"))
+            .await
+            .is_err());
+        assert!(
+            auth.tenant_denial_count() > before,
+            "unknown-tenant denials stay counted"
+        );
+    }
+
+    /// TM-01: each bad per-tenant write fails with the field named and
+    /// leaves the running state unchanged.
+    #[tokio::test]
+    async fn tm01_bad_tenant_write_fails_and_keeps_running_state() {
+        let auth = MemoryAuth::with_policy(PasswordHashPolicy::for_tests());
+        auth.add_user_in_tenant("tenant-a", "sam", b"pw-for-a")
+            .expect("tenant-a user stores");
+        // A snapshot that names the default tenant inside `tenants` is
+        // invalid; the reload rejects it and the live user still works.
+        let mut bad = auth.export_conf();
+        bad.tenants.push(broker_config::TenantMqttConf {
+            tenant: "default".to_string(),
+            users: vec![],
+            acls: vec![],
+        });
+        let err = bad
+            .validate()
+            .expect_err("default tenant inside `tenants` must fail");
+        assert!(err.to_string().contains("tenant"), "got: {err}");
+        assert!(auth.apply_snapshot_conf(&bad).is_err());
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a"))
+            .await
+            .is_ok());
+        // A duplicated tenant table is invalid too; state stays.
+        let mut dup = auth.export_conf();
+        dup.tenants.push(broker_config::TenantMqttConf {
+            tenant: "tenant-a".to_string(),
+            users: vec![],
+            acls: vec![],
+        });
+        let err = dup.validate().expect_err("duplicated tenant must fail");
+        assert!(err.to_string().contains("tenant"), "got: {err}");
+        assert!(auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a"))
+            .await
+            .is_ok());
     }
 }

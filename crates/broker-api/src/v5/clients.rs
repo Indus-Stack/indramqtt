@@ -18,17 +18,77 @@ use crate::ApiState;
 /// Documented `GET /clients` filters. Every field is optional; unknown
 /// query keys are ignored by the `Query` extractor. `conn_state` holds
 /// a documented value (`connected`, `idle` or `disconnected`); any
-/// other value fails with 400 `INVALID_PARAMETER`.
+/// other value fails with 400 `INVALID_PARAMETER`. `tenant` keeps one
+/// tenant: an unknown tenant matches no row, never another tenant's row.
 #[derive(Deserialize, Default)]
 pub struct ClientFilters {
     #[serde(default)]
     pub conn_state: Option<String>,
     #[serde(default)]
     pub clientid: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+/// One optional tenant scope for a per-client read (`GET
+/// /clients/:clientid` and its subscription list). Absent or empty rides
+/// as the default tenant, so bare reads keep the current shape. A set
+/// value reads that tenant only; an unknown tenant misses, never another
+/// tenant's session.
+// TODO(parity): does a bare id with namesakes in two tenants miss or
+// need a tenant? The rulebook does not decide the bare-id policy; the
+// current choice keeps the default tenant so old callers work.
+#[derive(Deserialize, Default)]
+pub struct TenantScope {
+    #[serde(default)]
+    pub tenant: Option<String>,
+}
+
+/// Resolve one tenant scope to the tenant to read. `None` means the
+/// default tenant (bare reads keep the current shape).
+fn scoped_tenant(scope: &TenantScope) -> &str {
+    match scope.tenant.as_deref() {
+        None => broker_session::tenant::DEFAULT_TENANT_ID,
+        Some("") => broker_session::tenant::DEFAULT_TENANT_ID,
+        Some(raw) => raw,
+    }
+}
+
+/// Fallback keepalive when the session record is gone.
+/// Reason: 60 seconds is the common MQTT default.
+/// The read uses it only during a snapshot race.
+const MISSING_SESSION_KEEPALIVE_SECS: u16 = 60;
+
+/// Resolve one list filter to the tenant to keep, if any. `None` means
+/// no filter (the global list the reference API documents). An empty
+/// value also means no filter, so `?tenant=` keeps the current shape.
+// TODO(parity): does an empty `tenant` value select the default tenant
+// or no filter? The rulebook does not decide the empty-filter policy;
+// the current choice keeps no filter so old callers work.
+fn list_tenant(filters: &ClientFilters) -> Option<&str> {
+    match filters.tenant.as_deref() {
+        None => None,
+        Some("") => None,
+        Some(raw) => Some(raw),
+    }
+}
+
+/// Resolve the tenant filter of the global subscription list to the
+/// tenant to keep, if any. `None` means no filter (the global list the
+/// reference API documents). An empty value also means no filter.
+fn subscription_list_tenant(query: &SubscriptionsQuery) -> Option<&str> {
+    match query.tenant.as_deref() {
+        None => None,
+        Some("") => None,
+        Some(raw) => Some(raw),
+    }
 }
 
 /// Render one client session in the documented detail shape.
 ///
+/// `mountpoint` carries the owning tenant id (the reference API
+/// documents `mountpoint` on the client; the console reads it). The
+/// default tenant renders as `default`, its true stored id.
 /// `connected_at` is the instant recorded where the session is already
 /// being written (creation, reconnect, bind), omitted for sessions that
 /// predate timestamp recording rather than substituted. `ip_address`
@@ -38,12 +98,14 @@ pub struct ClientFilters {
 /// omitted, never substituted.
 fn client_detail_json(
     client_id: &str,
+    tenant: &str,
     session: Option<&std::sync::Arc<broker_session::Session>>,
     is_connected: bool,
     keepalive: u16,
 ) -> serde_json::Value {
     let mut map = serde_json::Map::with_capacity(20);
     map.insert("clientid".to_string(), serde_json::Value::from(client_id));
+    map.insert("mountpoint".to_string(), serde_json::Value::from(tenant));
     match session.and_then(|s| s.username.read().clone()) {
         Some(name) => {
             map.insert("username".to_string(), serde_json::Value::from(name));
@@ -142,11 +204,25 @@ pub async fn list_clients(
     params: PageParams,
     Query(filters): Query<ClientFilters>,
 ) -> Response {
-    // Indexed session snapshot: `active_client_ids` returns the sorted
-    // ids of connected sessions from the session map. Management-plane
-    // read only; no per-message work, no full scan per message, and the
-    // snapshot is bounded by the live connection count.
-    let all_client_ids = state.sessions.active_client_ids();
+    // Tenant-scoped session snapshot over live sessions only. Each live
+    // session yields one row keyed by its own `(tenant, client id)`, so
+    // the same client id in two tenants renders two rows with two tenant
+    // ids. A `tenant` filter keeps that tenant only; an unknown tenant
+    // matches no row, never another tenant's row. Without a filter the
+    // list stays global, as the reference API documents. Management-plane
+    // read only; the snapshot is bounded by the live connection count,
+    // with no per-message work and no full scan per message.
+    let wanted = list_tenant(&filters);
+    let mut keys: Vec<(String, String)> = state
+        .sessions
+        .active_sessions()
+        .iter()
+        .map(|session| (session.tenant_id.read().clone(), session.client_id.clone()))
+        .collect();
+    keys.sort();
+    if let Some(tenant) = wanted {
+        keys.retain(|(row_tenant, _)| row_tenant.as_str() == tenant);
+    }
 
     // The documented filter accepts only the three named states. Any
     // other value is a client error (400 `INVALID_PARAMETER`).
@@ -162,8 +238,8 @@ pub async fn list_clients(
     // Filter first, then paginate: slicing before filtering would drop
     // matching rows that fall outside the raw page window and report a
     // pre-filter count in `meta`.
-    let mut matching: Vec<(String, bool)> = Vec::new();
-    for cid in all_client_ids {
+    let mut matching: Vec<(String, String, bool)> = Vec::new();
+    for (tenant, cid) in keys {
         if let Some(want) = filters.clientid.as_deref() {
             if cid != want {
                 continue;
@@ -171,7 +247,7 @@ pub async fn list_clients(
         }
         let is_connected = state
             .sessions
-            .get(&cid)
+            .get_in_tenant(&tenant, &cid)
             .as_ref()
             .map(|s| *s.connected.read())
             .unwrap_or(false);
@@ -183,22 +259,25 @@ pub async fn list_clients(
                 continue;
             }
         }
-        matching.push((cid, is_connected));
+        matching.push((tenant, cid, is_connected));
     }
     let total = matching.len();
     let page_ids = paginate(&matching, params.page, params.limit);
 
     let mut data = Vec::new();
-    for (cid, is_connected) in page_ids {
-        let session = state.sessions.get(cid);
+    for (tenant, cid, is_connected) in page_ids {
+        let session = state.sessions.get_in_tenant(tenant, cid);
 
+        // Use the fallback only during a snapshot race.
+        // Reason lives at `MISSING_SESSION_KEEPALIVE_SECS`.
         let keepalive = session
             .as_ref()
             .map(|s| *s.keepalive_secs.read())
-            .unwrap_or(60);
+            .unwrap_or(MISSING_SESSION_KEEPALIVE_SECS);
 
         data.push(client_detail_json(
             cid,
+            tenant,
             session.as_ref(),
             *is_connected,
             keepalive,
@@ -215,8 +294,16 @@ pub async fn list_clients(
         .into_response()
 }
 
-pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<String>) -> Response {
-    let session = state.sessions.get(&client_id);
+pub async fn get_client(
+    State(state): State<ApiState>,
+    Path(client_id): Path<String>,
+    Query(scope): Query<TenantScope>,
+) -> Response {
+    // Tenant-scoped detail read. A bare id reads the default tenant
+    // (the current shape); `?tenant=` reads that tenant only. A miss in
+    // the scoped tenant answers not-found, never another tenant's row.
+    let tenant = scoped_tenant(&scope);
+    let session = state.sessions.get_in_tenant(tenant, &client_id);
     let is_connected = session
         .as_ref()
         .map(|s| *s.connected.read())
@@ -226,15 +313,18 @@ pub async fn get_client(State(state): State<ApiState>, Path(client_id): Path<Str
         return ApiError::ClientIdNotFound("Client not found".to_string()).into_response();
     }
 
+    // Use the fallback only during a snapshot race.
+    // Reason lives at `MISSING_SESSION_KEEPALIVE_SECS`.
     let keepalive = session
         .as_ref()
         .map(|s| *s.keepalive_secs.read())
-        .unwrap_or(60);
+        .unwrap_or(MISSING_SESSION_KEEPALIVE_SECS);
 
     (
         StatusCode::OK,
         Json(client_detail_json(
             &client_id,
+            tenant,
             session.as_ref(),
             is_connected,
             keepalive,
@@ -386,8 +476,15 @@ const MAX_CLIENT_SUBSCRIPTIONS: usize = 1000;
 pub async fn get_client_subscriptions(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
+    Query(scope): Query<TenantScope>,
 ) -> Response {
-    let session = match state.sessions.get(&client_id) {
+    // Tenant-scoped per-client list. A bare id reads the default
+    // tenant (the current shape); `?tenant=` reads that tenant only. A
+    // miss in the scoped tenant answers not-found, never another
+    // tenant's rows. Rows keep the documented shape (the reference API
+    // has no tenant field here), so the tenant selects the rows only.
+    let tenant = scoped_tenant(&scope);
+    let session = match state.sessions.get_in_tenant(tenant, &client_id) {
         Some(session) => session,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
@@ -1068,6 +1165,7 @@ pub async fn put_client_keepalive(
         StatusCode::OK,
         Json(client_detail_json(
             &client_id,
+            broker_session::tenant::DEFAULT_TENANT_ID,
             Some(&session),
             is_connected,
             interval,
@@ -1076,18 +1174,24 @@ pub async fn put_client_keepalive(
         .into_response()
 }
 
-/// Global subscription list as a bare array.
+/// Query of the global subscription list.
 ///
 /// Reads the session mirror, not the router trie.
 /// The snapshot is bounded and sorted.
 /// Unknown query keys are ignored.
 /// Returns a bare list with no envelope.
-/// Only `qos` narrows the read; a `qos` outside 0, 1 or 2 fails
-/// with 400 `BAD_REQUEST`.
+/// `qos` narrows the read; a `qos` outside 0, 1 or 2 fails with 400
+/// `BAD_REQUEST`. `tenant` keeps one tenant; an unknown tenant matches
+/// no row, never another tenant's row. Without it the list stays global,
+/// as the reference API documents. Rows keep the documented shape (the
+/// reference API has no tenant field here), so the tenant selects the
+/// rows only.
 #[derive(Deserialize, Default)]
 pub struct SubscriptionsQuery {
     #[serde(default)]
     pub qos: Option<String>,
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 pub async fn list_subscriptions(
@@ -1105,7 +1209,10 @@ pub async fn list_subscriptions(
             }
         },
     };
-    let rows = state.sessions.global_subscriptions();
+    let rows = match subscription_list_tenant(&query) {
+        None => state.sessions.global_subscriptions(),
+        Some(tenant) => state.sessions.global_subscriptions_in_tenant(tenant),
+    };
     let rows: Vec<_> = match qos_filter {
         None => rows,
         Some(want) => rows
@@ -1516,25 +1623,35 @@ impl broker_rules::BrokerSink for ApiBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
+        self.publish_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            topic,
+            payload,
+            qos,
+            retain,
+        )
+        .await
+    }
+    /// Fan out one derived message inside one tenant. The match and
+    /// the session reads use that tenant only, so output never
+    /// leaves it.
+    async fn publish_in_tenant(
+        &self,
+        tenant: &str,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), broker_rules::RuleEngineError> {
         let qos_raw = u8::from(qos);
         let topic_str = topic.as_str();
         let mut frames = Vec::new();
         let mut offline_failed = false;
-        // Tenant scope (MT-02, MT-03): rule republishes fan out in the
-        // default tenant only (fail closed, single-tenant behaviour
-        // unchanged); the tenant attribution for derived messages is open
-        // until the rule engine dispatches per tenant.
-        let (matched, _tenant_skipped) = self.router.matches_in_tenant_counted(
-            &topic,
-            None,
-            broker_session::tenant::DEFAULT_TENANT_ID,
-        );
+        let (matched, _tenant_skipped) =
+            self.router.matches_in_tenant_counted(&topic, None, tenant);
         for sub in matched {
             let effective = std::cmp::min(qos_raw, u8::from(sub.qos));
-            match self.sessions.get_in_tenant(
-                broker_session::tenant::DEFAULT_TENANT_ID,
-                sub.client_id.as_ref(),
-            ) {
+            match self.sessions.get_in_tenant(tenant, sub.client_id.as_ref()) {
                 Some(session) => {
                     let connected = *session.connected.read();
                     let live = *session.conn_id.read();
@@ -1714,10 +1831,10 @@ async fn handle_mgmt_retained_in_tenant(
     }
     // Per-tenant accounting: the global `backend.max_retained_messages` cap
     // (and the hard `broker_storage::MAX_RETAINED_MESSAGES` cap inside the
-    // store) counts `(tenant, topic)` pairs across all tenants, so every
-    // tenant's retained usage counts toward the same finite bound with no
-    // second unlimited default. Consults state the store already holds with
-    // one short-lock lookup, never a scan, so the per-lookup cost stays flat.
+    // store) counts `(tenant, topic)` pairs across all tenants. The
+    // per-tenant bound drops the new topic in its own tenant only, while
+    // delivery keeps working. One short-lock lookup per check, never a
+    // scan. Management-plane only; the deliver path takes no lock here.
     if payload.is_empty() {
         if state
             .retained
@@ -1746,6 +1863,32 @@ async fn handle_mgmt_retained_in_tenant(
             .is_some();
         if !already && state.stats.retained() >= cap {
             return;
+        }
+    }
+    let tenant_cap = state.retained.retained_cap_for_tenant(tenant);
+    if tenant_cap > 0 {
+        let already = state
+            .retained
+            .get_retained_in_tenant(topic, tenant)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !already {
+            let used = state
+                .retained
+                .count_retained_in_tenant(tenant)
+                .await
+                .unwrap_or(usize::MAX);
+            if used >= tenant_cap {
+                state.metrics.inc_tenant_retained_dropped();
+                tracing::warn!(
+                    tenant = %tenant,
+                    topic = %topic.as_str(),
+                    "tenant retained limit reached: dropping new retained topic"
+                );
+                return;
+            }
         }
     }
     if state
@@ -2086,8 +2229,15 @@ mod tests {
         );
 
         // The detail read reports the live inflight count from the broker.
-        let (status, detail) =
-            response_parts(get_client(State(state), Path("b110-inflight".to_string())).await).await;
+        let (status, detail) = response_parts(
+            get_client(
+                State(state),
+                Path("b110-inflight".to_string()),
+                Query(TenantScope::default()),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(detail["inflight_cnt"], serde_json::json!(1));
     }
@@ -2124,8 +2274,15 @@ mod tests {
         state.sessions.bind_session(&session, 9002);
         let after = crate::v5::retainer::now_ms();
 
-        let (status, body) =
-            response_parts(get_client(State(state), Path("b110-conn".to_string())).await).await;
+        let (status, body) = response_parts(
+            get_client(
+                State(state),
+                Path("b110-conn".to_string()),
+                Query(TenantScope::default()),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let connected = body
             .get("connected_at")
@@ -2145,7 +2302,7 @@ mod tests {
         let state = standalone_state();
         let (session, _) = state.sessions.get_or_create("b110-legacy", true);
         *session.connected_at_ms.write() = None;
-        let rendered = client_detail_json("b110-legacy", Some(&session), true, 60);
+        let rendered = client_detail_json("b110-legacy", "default", Some(&session), true, 60);
         assert!(
             rendered.get("connected_at").is_none(),
             "sessions predating timestamp recording must omit connected_at: {rendered}"
@@ -2226,7 +2383,12 @@ mod tests {
             apply_single_subscribe(&state, "trunc-client", &entry).expect("broker subscribe lands");
         }
         let (status, body) = response_parts(
-            get_client_subscriptions(State(state), Path("trunc-client".to_string())).await,
+            get_client_subscriptions(
+                State(state),
+                Path("trunc-client".to_string()),
+                Query(TenantScope::default()),
+            )
+            .await,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -2448,5 +2610,434 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(rx_a.try_recv().is_err(), "will fires at most once");
         assert_eq!(state.conns.qos0_len(5002), 0, "no second fire queued");
+    }
+
+    /// TM-09 broker-path harness: real HTTP through the production
+    /// router. Setup writes mirror the kernel bind and subscribe
+    /// writes. Each proof reads through the API, never the store.
+    struct Tm09Server {
+        port: u16,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Tm09Server {
+        async fn start() -> (Self, ApiState) {
+            let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+                16,
+                broker_rules::BackpressurePolicy::DropOldest,
+            ));
+            let state = ApiState::standalone(engine);
+            state
+                .admin_users
+                .create(
+                    "tm09-admin",
+                    "Tm09-admin-pass!",
+                    crate::admin_users::AdminRole::Administrator,
+                    "",
+                )
+                .expect("admin creates");
+            state
+                .admin_users
+                .create(
+                    "tm09-viewer",
+                    "Tm09-viewer-pass!",
+                    crate::admin_users::AdminRole::Viewer,
+                    "",
+                )
+                .expect("viewer creates");
+            let inner = state.clone();
+            let app = crate::router(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let port = listener.local_addr().expect("local addr").port();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve test app");
+            });
+            (Self { port, task }, inner)
+        }
+
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            token: Option<&str>,
+        ) -> (u16, serde_json::Value) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let mut head = format!("{method} {path} HTTP/1.0\r\nHost: test\r\n");
+            if let Some(token) = token {
+                head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            }
+            head.push_str("Connection: close\r\n\r\n");
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                .await
+                .expect("connect test server");
+            stream
+                .write_all(head.as_bytes())
+                .await
+                .expect("write request");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let text = String::from_utf8(buf).expect("response is UTF-8");
+            let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
+            let status: u16 = head.lines().next().expect("status line")[9..12]
+                .parse()
+                .expect("status code");
+            let json = if body.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(body).expect("response body is JSON")
+            };
+            (status, json)
+        }
+    }
+
+    impl Drop for Tm09Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Seed one connected session with one subscription in one tenant.
+    /// The writes mirror the kernel bind hook (create, pin the edge
+    /// connection, record the keepalive) and the subscribe path (one
+    /// router copy plus one session mirror row).
+    fn tm09_seed(state: &ApiState, tenant: &str, client_id: &str, conn_id: u64, filter: &str) {
+        let (session, _) = state
+            .sessions
+            .get_or_create_in_tenant(tenant, client_id, true);
+        state.sessions.bind_session(&session, conn_id);
+        *session.keepalive_secs.write() = 60;
+        let parsed = TopicFilter::new(filter).expect("seed filter is valid");
+        state.router.subscribe(
+            &parsed,
+            Subscription::new_in_tenant(client_id, conn_id, QoS::AtMostOnce, tenant),
+        );
+        state.sessions.add_subscription_with_options_in_tenant(
+            tenant,
+            client_id,
+            parsed,
+            QoS::AtMostOnce,
+            0,
+            0,
+            0,
+        );
+    }
+
+    fn tm09_admin(state: &ApiState) -> String {
+        state
+            .tokens
+            .issue("tm09-admin", crate::admin_users::AdminRole::Administrator)
+    }
+
+    fn tm09_viewer(state: &ApiState) -> String {
+        state
+            .tokens
+            .issue("tm09-viewer", crate::admin_users::AdminRole::Viewer)
+    }
+
+    /// Two clients with the same client id in two tenants render two
+    /// records with two tenant ids through the API.
+    #[tokio::test]
+    async fn tm09_same_id_in_two_tenants_renders_two_tenant_rows() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-dup", 7201, "tm09/check");
+        tm09_seed(&state, "tm09-b", "tm09-dup", 7202, "tm09/check");
+        tm09_seed(
+            &state,
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "tm09-base",
+            7203,
+            "tm09/base",
+        );
+
+        let (status, body) = server.request("GET", "/api/v5/clients", Some(&admin)).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("client list has data");
+        let mut dups: Vec<&str> = Vec::new();
+        for row in data.iter().filter(|row| row["clientid"] == "tm09-dup") {
+            dups.push(row["mountpoint"].as_str().expect("row carries mountpoint"));
+        }
+        dups.sort_unstable();
+        assert_eq!(dups, vec!["tm09-a", "tm09-b"]);
+        let base = data
+            .iter()
+            .find(|row| row["clientid"] == "tm09-base")
+            .expect("default client listed");
+        assert_eq!(base["mountpoint"], serde_json::json!("default"));
+    }
+
+    /// A read filtered by one tenant returns that tenant rows only.
+    /// An unknown tenant returns an empty page, never another tenant.
+    #[tokio::test]
+    async fn tm09_tenant_filter_keeps_own_rows_only() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-dup", 7211, "tm09/check");
+        tm09_seed(&state, "tm09-b", "tm09-dup", 7212, "tm09/check");
+
+        for tenant in ["tm09-a", "tm09-b"] {
+            let (status, body) = server
+                .request(
+                    "GET",
+                    &format!("/api/v5/clients?tenant={tenant}"),
+                    Some(&admin),
+                )
+                .await;
+            assert_eq!(status, 200, "filter {tenant}");
+            let data = body["data"].as_array().expect("client list has data");
+            assert!(!data.is_empty(), "filter {tenant} keeps its rows");
+            for row in data {
+                assert_eq!(row["mountpoint"], serde_json::json!(tenant));
+            }
+            assert!(
+                data.iter().all(|row| row["clientid"] == "tm09-dup"),
+                "only the tenant rows show"
+            );
+        }
+        let (status, body) = server
+            .request("GET", "/api/v5/clients?tenant=tm09-ghost", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], serde_json::json!([]));
+        assert_eq!(body["meta"]["count"], serde_json::json!(0));
+
+        // Client id plus tenant selects one of the two namesakes.
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients?clientid=tm09-dup&tenant=tm09-a",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("client list has data");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["mountpoint"], serde_json::json!("tm09-a"));
+    }
+
+    /// A per-client read with a tenant scope selects that tenant only.
+    /// A bare id keeps the default tenant. A miss answers not-found,
+    /// never another tenant session.
+    #[tokio::test]
+    async fn tm09_tenant_scope_selects_per_client_reads() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-dup", 7221, "tm09/a");
+        tm09_seed(&state, "tm09-b", "tm09-dup", 7222, "tm09/b");
+
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup?tenant=tm09-a",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["mountpoint"], serde_json::json!("tm09-a"));
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup?tenant=tm09-b",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["mountpoint"], serde_json::json!("tm09-b"));
+
+        // No default-tenant namesake exists, so the bare read misses.
+        let (status, body) = server
+            .request("GET", "/api/v5/clients/tm09-dup", Some(&admin))
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], serde_json::json!("CLIENTID_NOT_FOUND"));
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup?tenant=tm09-ghost",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], serde_json::json!("CLIENTID_NOT_FOUND"));
+
+        // Subscription rows keep the documented shape and scope.
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup/subscriptions?tenant=tm09-a",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["topic"], serde_json::json!("tm09/a"));
+        assert!(rows[0].get("tenant").is_none());
+        assert!(rows[0].get("mountpoint").is_none());
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup/subscriptions?tenant=tm09-b",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["topic"], serde_json::json!("tm09/b"));
+        let (status, _) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-dup/subscriptions",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 404);
+    }
+
+    /// The global subscription list keeps its shape without a filter
+    /// and keeps one tenant with a filter. The rows carry no tenant
+    /// field (the reference API has none there).
+    #[tokio::test]
+    async fn tm09_subscription_list_filter_keeps_shape_and_scope() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-sub-a", 7231, "tm09/a");
+        tm09_seed(&state, "tm09-b", "tm09-sub-b", 7232, "tm09/b");
+
+        let (status, body) = server
+            .request("GET", "/api/v5/subscriptions", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(row.get("tenant").is_none());
+            assert!(row.get("mountpoint").is_none());
+            assert!(row.get("clientid").is_some());
+            assert!(row.get("topic").is_some());
+            assert!(row.get("node").is_some());
+        }
+
+        let (status, body) = server
+            .request("GET", "/api/v5/subscriptions?tenant=tm09-a", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["clientid"], serde_json::json!("tm09-sub-a"));
+        let (status, body) = server
+            .request("GET", "/api/v5/subscriptions?tenant=tm09-b", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["clientid"], serde_json::json!("tm09-sub-b"));
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/subscriptions?tenant=tm09-ghost",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    /// Default-tenant reads keep the current shapes. Client rows add
+    /// only the documented tenant field; subscription, topic and
+    /// session-count reads change nothing.
+    #[tokio::test]
+    async fn tm09_default_tenant_reads_keep_current_shapes() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(
+            &state,
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "tm09-base",
+            7241,
+            "tm09/base",
+        );
+        state.router.record_topic("tm09/known");
+
+        let (status, body) = server.request("GET", "/api/v5/clients", Some(&admin)).await;
+        assert_eq!(status, 200);
+        let data = body["data"].as_array().expect("client list has data");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["clientid"], serde_json::json!("tm09-base"));
+        assert_eq!(data[0]["mountpoint"], serde_json::json!("default"));
+        assert!(data[0].get("node").is_some());
+
+        let (status, body) = server
+            .request("GET", "/api/v5/clients/tm09-base", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["mountpoint"], serde_json::json!("default"));
+
+        let (status, body) = server
+            .request("GET", "/api/v5/subscriptions", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("tenant").is_none());
+
+        let (status, body) = server.request("GET", "/api/v5/topics", Some(&admin)).await;
+        assert_eq!(status, 200);
+        let topics: Vec<&str> = body["data"]
+            .as_array()
+            .expect("topic list has data")
+            .iter()
+            .filter_map(|row| row["topic"].as_str())
+            .collect();
+        assert!(topics.contains(&"tm09/known"));
+
+        let (status, body) = server
+            .request("GET", "/api/v5/sessions_count", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, serde_json::json!("1"));
+    }
+
+    /// Each changed read needs a token. A viewer reads but never
+    /// writes on the changed paths.
+    #[tokio::test]
+    async fn tm09_changed_reads_need_token_and_viewer_reads_only() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        let viewer = tm09_viewer(&state);
+        tm09_seed(&state, "tm09-a", "tm09-dup", 7251, "tm09/check");
+
+        let paths = [
+            "/api/v5/clients",
+            "/api/v5/clients?tenant=tm09-a",
+            "/api/v5/clients/tm09-dup?tenant=tm09-a",
+            "/api/v5/clients/tm09-dup/subscriptions?tenant=tm09-a",
+            "/api/v5/subscriptions",
+            "/api/v5/subscriptions?tenant=tm09-a",
+        ];
+        for path in paths {
+            let (status, body) = server.request("GET", path, None).await;
+            assert_eq!(status, 401, "no token on {path}");
+            assert_eq!(body["code"], serde_json::json!("UNAUTHORIZED"));
+            let (status, _) = server.request("GET", path, Some(&viewer)).await;
+            assert_eq!(status, 200, "viewer reads {path}");
+            let (status, _) = server.request("GET", path, Some(&admin)).await;
+            assert_eq!(status, 200, "admin reads {path}");
+        }
+
+        // A viewer never kicks; an admin kick of an unknown id misses.
+        let (status, body) = server
+            .request("DELETE", "/api/v5/clients/tm09-ghost", Some(&viewer))
+            .await;
+        assert_eq!(status, 403);
+        assert_eq!(body["code"], serde_json::json!("FORBIDDEN"));
+        let (status, _) = server
+            .request("DELETE", "/api/v5/clients/tm09-ghost", Some(&admin))
+            .await;
+        assert_eq!(status, 404);
     }
 }

@@ -174,6 +174,14 @@ pub fn openapi_spec_json() -> &'static str {
         "tags": ["Authentication & ACL"],
         "summary": "List all configured users and quotas",
         "operationId": "listUsers",
+        "parameters": [
+          {
+            "name": "tenant",
+            "in": "query",
+            "description": "Tenant table to list; absent lists the default tenant",
+            "schema": { "type": "string", "example": "tenant-a" }
+          }
+        ],
         "responses": {
           "200": {
             "description": "List of users with quota allocations",
@@ -200,6 +208,14 @@ pub fn openapi_spec_json() -> &'static str {
         "tags": ["Authentication & ACL"],
         "summary": "Create or update user credentials and quotas",
         "operationId": "createUser",
+        "parameters": [
+          {
+            "name": "tenant",
+            "in": "query",
+            "description": "Tenant table to write; absent writes the default tenant",
+            "schema": { "type": "string", "example": "tenant-a" }
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -229,6 +245,14 @@ pub fn openapi_spec_json() -> &'static str {
         "tags": ["Authentication & ACL"],
         "summary": "List ordered ACL rules",
         "operationId": "listAcls",
+        "parameters": [
+          {
+            "name": "tenant",
+            "in": "query",
+            "description": "Tenant table to list; absent lists the default tenant",
+            "schema": { "type": "string", "example": "tenant-a" }
+          }
+        ],
         "responses": {
           "200": {
             "description": "List of ACL rules evaluated in order",
@@ -255,6 +279,14 @@ pub fn openapi_spec_json() -> &'static str {
         "tags": ["Authentication & ACL"],
         "summary": "Add new ACL rule",
         "operationId": "createAcl",
+        "parameters": [
+          {
+            "name": "tenant",
+            "in": "query",
+            "description": "Tenant table to write; absent writes the default tenant",
+            "schema": { "type": "string", "example": "tenant-a" }
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -294,6 +326,7 @@ pub fn openapi_spec_json() -> &'static str {
                     "properties": {
                       "id": { "type": "string", "example": "rule-1" },
                       "name": { "type": "string", "example": "high-temp-alert" },
+                      "tenant": { "type": "string", "example": "default" },
                       "topic_filter": { "type": "string", "example": "sensors/+" },
                       "sql_query": { "type": "string", "example": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 40.0" },
                       "enabled": { "type": "boolean", "example": true }
@@ -318,6 +351,7 @@ pub fn openapi_spec_json() -> &'static str {
                 "required": ["name", "topic_filter"],
                 "properties": {
                   "name": { "type": "string", "example": "high-temp-alert" },
+                  "tenant": { "type": "string", "example": "default" },
                   "topic_filter": { "type": "string", "example": "sensors/+" },
                   "sql_query": { "type": "string", "example": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 40.0" },
                   "enabled": { "type": "boolean", "default": true }

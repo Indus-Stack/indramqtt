@@ -65,8 +65,9 @@ pub enum ListenerMaxConnections {
 
 /// One listener row: stored configuration plus live state.
 ///
-/// `kernel_owned` is true only for the plaintext and TLS listeners the
-/// kernel binds itself (`listeners.tcp.native`, `listeners.tls.native`).
+/// `kernel_owned` is true only for the listeners the kernel binds
+/// itself (`listeners.tcp.native`, `listeners.tls.native`,
+/// `listeners.ws.native`, `listeners.wss.native`).
 /// Every other row belongs to the edge, and lifecycle calls on it fail
 /// closed with 400. `running` is true only while the kernel holds the
 /// socket open.
@@ -108,8 +109,9 @@ pub struct ListenerRecord {
     /// Stored TLS options. `certfile` and `keyfile` apply at the next
     /// start of a kernel TLS row; the rest only round-trip.
     pub ssl_options: Option<serde_json::Value>,
-    /// Stored WebSocket options. The edge serves WebSocket rows: the
-    /// kernel applies none of these keys, and only defaults round-trip.
+    /// Stored WebSocket options. The kernel applies none of these keys,
+    /// and only defaults round-trip. A kernel WebSocket row takes its
+    /// path from the boot configuration.
     pub websocket: Option<serde_json::Value>,
 }
 
@@ -226,8 +228,12 @@ impl ListenerStore {
                 bind: conf.ws.bind.clone(),
                 enable: conf.ws.enabled,
                 running: false,
-                kernel_owned: false,
-                max_connections: None,
+                kernel_owned: conf.ws.native,
+                // A kernel row uses the limit of the plaintext listener.
+                max_connections: conf
+                    .ws
+                    .native
+                    .then_some(ListenerMaxConnections::Finite(conf.tcp.max_connections)),
                 acceptors: None,
                 backlog: 0,
                 cert_file: String::new(),
@@ -248,8 +254,12 @@ impl ListenerStore {
                 bind: conf.wss.bind.clone(),
                 enable: conf.wss.enabled,
                 running: false,
-                kernel_owned: false,
-                max_connections: None,
+                kernel_owned: conf.wss.native,
+                // A kernel row uses the limit of the plaintext listener.
+                max_connections: conf
+                    .wss
+                    .native
+                    .then_some(ListenerMaxConnections::Finite(conf.tcp.max_connections)),
                 acceptors: None,
                 backlog: 0,
                 cert_file: String::new(),

@@ -140,6 +140,62 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
             },
             FieldDoc {
+                path: "listeners.tls.psk_enabled",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the kernel TLS listener accepts pre-shared-key handshakes. Takes effect with native enabled.",
+            },
+            FieldDoc {
+                path: "listeners.tls.psk_keys_file",
+                setting_type: "path string",
+                default: "\"\"",
+                range: "file path; empty means no identities",
+                doc: "Path to the PSK identity file of the kernel TLS listener. Takes effect with native and PSK enabled.",
+            },
+            FieldDoc {
+                path: "listeners.tls.verify_client_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the TLS listener requests and verifies a client certificate.",
+            },
+            FieldDoc {
+                path: "listeners.tls.verify",
+                setting_type: "string",
+                default: "\"verify_none\"",
+                range: "verify_none | verify_peer",
+                doc: "Client certificate chain check mode of the TLS listener.",
+            },
+            FieldDoc {
+                path: "listeners.tls.cacertfile",
+                setting_type: "path string",
+                default: "\"\"",
+                range: "PEM file path; empty uses system roots",
+                doc: "CA file for client certificate checks of the TLS listener.",
+            },
+            FieldDoc {
+                path: "listeners.tls.fail_if_no_peer_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the TLS listener refuses a handshake without a certificate.",
+            },
+            FieldDoc {
+                path: "listeners.tls.peer_cert_as_username",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind username from the client certificate.",
+            },
+            FieldDoc {
+                path: "listeners.tls.peer_cert_as_clientid",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind client identifier from the client certificate.",
+            },
+            FieldDoc {
                 path: "listeners.ws.enabled",
                 setting_type: "bool",
                 default: "true",
@@ -159,6 +215,13 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"/mqtt\"",
                 range: "must start with '/'",
                 doc: "HTTP path serving MQTT-over-WebSocket traffic.",
+            },
+            FieldDoc {
+                path: "listeners.ws.native",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them.",
             },
             FieldDoc {
                 path: "listeners.wss.enabled",
@@ -196,6 +259,55 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "Path to the PEM private key for the secure WebSocket listener.",
             },
             FieldDoc {
+                path: "listeners.wss.verify_client_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the secure WebSocket listener requests and verifies a client certificate.",
+            },
+            FieldDoc {
+                path: "listeners.wss.verify",
+                setting_type: "string",
+                default: "\"verify_none\"",
+                range: "verify_none | verify_peer",
+                doc: "Client certificate chain check mode of the secure WebSocket listener.",
+            },
+            FieldDoc {
+                path: "listeners.wss.cacertfile",
+                setting_type: "path string",
+                default: "\"\"",
+                range: "PEM file path; empty uses system roots",
+                doc: "CA file for client certificate checks of the secure WebSocket listener.",
+            },
+            FieldDoc {
+                path: "listeners.wss.fail_if_no_peer_cert",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the secure WebSocket listener refuses a handshake without a certificate.",
+            },
+            FieldDoc {
+                path: "listeners.wss.peer_cert_as_username",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind username from the client certificate.",
+            },
+            FieldDoc {
+                path: "listeners.wss.peer_cert_as_clientid",
+                setting_type: "string",
+                default: "\"disabled\"",
+                range: "disabled | cn | dn",
+                doc: "Source for the bind client identifier from the client certificate.",
+            },
+            FieldDoc {
+                path: "listeners.wss.native",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them.",
+            },
+            FieldDoc {
                 path: "listeners.api.enabled",
                 setting_type: "bool",
                 default: "true",
@@ -215,6 +327,27 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "10000",
                 range: "0..=1000000 (0 = unlimited opt-in)",
                 doc: "Default max connections per authenticated username (0 = unlimited).",
+            },
+            FieldDoc {
+                path: "quotas.max_connections_per_tenant",
+                setting_type: "u32",
+                default: "10000",
+                range: "0..=1000000 (0 = unlimited opt-in)",
+                doc: "Default max live connections per tenant (0 = unlimited).",
+            },
+            FieldDoc {
+                path: "quotas.max_sessions_per_tenant",
+                setting_type: "u32",
+                default: "10000",
+                range: "0..=100000 (0 = unlimited opt-in)",
+                doc: "Default max sessions per tenant (0 = unlimited).",
+            },
+            FieldDoc {
+                path: "quotas.max_retained_per_tenant",
+                setting_type: "u32",
+                default: "10000",
+                range: "0..=100000 (0 = unlimited opt-in)",
+                doc: "Default max retained topics per tenant (0 = unlimited).",
             },
             FieldDoc {
                 path: "quotas.default_max_publish_rate",
@@ -877,6 +1010,50 @@ pub struct TlsListenerConf {
     /// Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.
     #[serde(default = "default_false")]
     pub native: bool,
+    /// Whether the kernel TLS listener accepts pre-shared-key handshakes.
+    /// Takes effect with native enabled. Off by default keeps
+    /// certificate handshakes unchanged. On serves PSK suites from the
+    /// identity store with no certificate.
+    #[serde(default = "default_false")]
+    pub psk_enabled: bool,
+    /// Path to the PSK identity file of the kernel TLS listener.
+    /// Takes effect with native and PSK enabled. Empty keeps the
+    /// store empty, so every handshake fails closed.
+    #[serde(default)]
+    pub psk_keys_file: String,
+    /// Whether the TLS listener requests and verifies a client certificate.
+    #[serde(default = "default_false")]
+    pub verify_client_cert: bool,
+    /// Client certificate chain check mode.
+    #[serde(default = "default_tls_verify")]
+    pub verify: String,
+    /// Path to the PEM CA file for client certificate checks.
+    #[serde(default)]
+    pub cacertfile: String,
+    /// Whether the TLS listener refuses a handshake without a certificate.
+    #[serde(default = "default_false")]
+    pub fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_clientid: String,
+}
+
+// Reason: off by default keeps current handshakes unchanged; the operator opts into client certificates.
+fn default_verify_client_cert() -> bool {
+    false
+}
+
+// Reason: no check by default keeps current handshakes unchanged.
+fn default_tls_verify() -> String {
+    "verify_none".to_string()
+}
+
+// Reason: no mapping by default keeps CONNECT credentials unchanged.
+fn default_cert_as() -> String {
+    "disabled".to_string()
 }
 
 // Reason: the standard secure MQTT port.
@@ -892,6 +1069,14 @@ impl Default for TlsListenerConf {
             cert_file: String::new(),
             key_file: String::new(),
             native: false,
+            psk_enabled: false,
+            psk_keys_file: String::new(),
+            verify_client_cert: default_verify_client_cert(),
+            verify: default_tls_verify(),
+            cacertfile: String::new(),
+            fail_if_no_peer_cert: false,
+            peer_cert_as_username: default_cert_as(),
+            peer_cert_as_clientid: default_cert_as(),
         }
     }
 }
@@ -900,24 +1085,94 @@ impl TlsListenerConf {
     /// Validates the TLS listener.
     pub fn validate(&self) -> Result<(), ConfigError> {
         check_bind("listeners.tls.bind", &self.bind, false)?;
-        if self.enabled {
+        // A native PSK-only listener carries no certificate. The pure
+        // PSK form needs no certificate files. Other forms still do.
+        let needs_cert = self.enabled && !(self.psk_enabled && self.native);
+        if needs_cert {
             if self.cert_file.trim().is_empty() {
                 return Err(invalid(
                     "listeners.tls.cert_file",
                     &self.cert_file,
-                    "is required when TLS is enabled",
+                    "is required when TLS is enabled without native PSK",
                 ));
             }
             if self.key_file.trim().is_empty() {
                 return Err(invalid(
                     "listeners.tls.key_file",
                     &self.key_file,
-                    "is required when TLS is enabled",
+                    "is required when TLS is enabled without native PSK",
                 ));
             }
         }
+        validate_client_cert_opts(
+            "listeners.tls",
+            &self.verify,
+            &self.peer_cert_as_username,
+            &self.peer_cert_as_clientid,
+            self.fail_if_no_peer_cert,
+            self.verify_client_cert,
+        )?;
         Ok(())
     }
+}
+
+/// Validates client certificate options shared by TLS and secure WebSocket.
+/// Rejects unknown modes. Refuses `fail_if_no_peer_cert` without
+/// verification. Refuses identity mapping without verification.
+/// TODO(parity): which of `crt`, `pem`, `md5` sources does the broker
+/// support for `peer_cert_as_username` and `peer_cert_as_clientid`?
+/// The rulebook does not decide the set. Only `disabled`, `cn` and
+/// `dn` apply today. Other values fail closed at boot.
+fn validate_client_cert_opts(
+    prefix: &str,
+    verify: &str,
+    as_username: &str,
+    as_clientid: &str,
+    fail_if_no_peer_cert: bool,
+    legacy_verify: bool,
+) -> Result<(), ConfigError> {
+    if verify != "verify_none" && verify != "verify_peer" {
+        return Err(invalid(
+            &format!("{prefix}.verify"),
+            verify,
+            "must be verify_none or verify_peer",
+        ));
+    }
+    for (name, value) in [
+        ("peer_cert_as_username", as_username),
+        ("peer_cert_as_clientid", as_clientid),
+    ] {
+        if value != "disabled" && value != "cn" && value != "dn" {
+            if ["crt", "pem", "md5"].contains(&value) {
+                return Err(invalid(
+                    &format!("{prefix}.{name}"),
+                    value,
+                    "is not supported yet: use disabled, cn or dn",
+                ));
+            }
+            return Err(invalid(
+                &format!("{prefix}.{name}"),
+                value,
+                "must be disabled, cn or dn",
+            ));
+        }
+    }
+    let verify_on = verify == "verify_peer" || legacy_verify;
+    if fail_if_no_peer_cert && !verify_on {
+        return Err(invalid(
+            &format!("{prefix}.fail_if_no_peer_cert"),
+            "true",
+            "needs verify set to verify_peer",
+        ));
+    }
+    if (as_username != "disabled" || as_clientid != "disabled") && !verify_on {
+        return Err(invalid(
+            &format!("{prefix}.peer_cert_as_username"),
+            as_username,
+            "needs verify set to verify_peer",
+        ));
+    }
+    Ok(())
 }
 
 /// MQTT-over-WebSocket listener.
@@ -932,6 +1187,9 @@ pub struct WsListenerConf {
     /// HTTP path serving MQTT-over-WebSocket traffic.
     #[serde(default = "default_ws_path")]
     pub path: String,
+    /// Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them.
+    #[serde(default = "default_false")]
+    pub native: bool,
 }
 
 // Reason: keeps the dashboard test console reachable without extra setup.
@@ -949,6 +1207,7 @@ impl Default for WsListenerConf {
             enabled: true,
             bind: default_ws_bind(),
             path: default_ws_path(),
+            native: false,
         }
     }
 }
@@ -986,6 +1245,27 @@ pub struct WssListenerConf {
     /// Path to the PEM private key for the secure WebSocket listener.
     #[serde(default)]
     pub key_file: String,
+    /// Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them.
+    #[serde(default = "default_false")]
+    pub native: bool,
+    /// Whether the secure WebSocket listener requests and verifies a client certificate.
+    #[serde(default = "default_false")]
+    pub verify_client_cert: bool,
+    /// Client certificate chain check mode.
+    #[serde(default = "default_tls_verify")]
+    pub verify: String,
+    /// Path to the PEM CA file for client certificate checks.
+    #[serde(default)]
+    pub cacertfile: String,
+    /// Whether the secure WebSocket listener refuses a handshake without a certificate.
+    #[serde(default = "default_false")]
+    pub fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client certificate.
+    #[serde(default = "default_cert_as")]
+    pub peer_cert_as_clientid: String,
 }
 
 // Reason: TODO(parity): no canonical secure-WebSocket port is decided yet;
@@ -1002,6 +1282,13 @@ impl Default for WssListenerConf {
             path: default_ws_path(),
             cert_file: String::new(),
             key_file: String::new(),
+            native: false,
+            verify_client_cert: false,
+            verify: default_tls_verify(),
+            cacertfile: String::new(),
+            fail_if_no_peer_cert: false,
+            peer_cert_as_username: default_cert_as(),
+            peer_cert_as_clientid: default_cert_as(),
         }
     }
 }
@@ -1033,6 +1320,14 @@ impl WssListenerConf {
                 ));
             }
         }
+        validate_client_cert_opts(
+            "listeners.wss",
+            &self.verify,
+            &self.peer_cert_as_username,
+            &self.peer_cert_as_clientid,
+            self.fail_if_no_peer_cert,
+            self.verify_client_cert,
+        )?;
         Ok(())
     }
 }
@@ -1117,6 +1412,15 @@ pub struct QuotasConf {
     /// Token bucket burst multiplier (allows bursts up to burst times rate).
     #[serde(default = "default_burst_multiplier")]
     pub burst_multiplier: f64,
+    /// Default max live connections per tenant (0 = unlimited).
+    #[serde(default = "default_quota_max_connections_per_tenant")]
+    pub max_connections_per_tenant: u32,
+    /// Default max sessions per tenant (0 = unlimited).
+    #[serde(default = "default_quota_max_sessions_per_tenant")]
+    pub max_sessions_per_tenant: u32,
+    /// Default max retained topics per tenant (0 = unlimited).
+    #[serde(default = "default_quota_max_retained_per_tenant")]
+    pub max_retained_per_tenant: u32,
 }
 
 // Reason: 10k connections per user fits a large tenant without letting one
@@ -1134,6 +1438,21 @@ fn default_quota_max_publish_rate() -> u32 {
 fn default_burst_multiplier() -> f64 {
     2.0
 }
+// Reason: 10k live connections per tenant share the 1M listener bound
+// across many tenants without letting one tenant take it all.
+fn default_quota_max_connections_per_tenant() -> u32 {
+    10_000
+}
+// Reason: 10k sessions per tenant keep per-tenant session memory near
+// tens of MB while covering fleets far past real installs.
+fn default_quota_max_sessions_per_tenant() -> u32 {
+    10_000
+}
+// Reason: 10k retained topics per tenant keep per-tenant retained memory
+// bounded while covering fleet state far past real installs.
+fn default_quota_max_retained_per_tenant() -> u32 {
+    10_000
+}
 
 impl Default for QuotasConf {
     fn default() -> Self {
@@ -1141,6 +1460,9 @@ impl Default for QuotasConf {
             default_max_connections: default_quota_max_connections(),
             default_max_publish_rate: default_quota_max_publish_rate(),
             burst_multiplier: default_burst_multiplier(),
+            max_connections_per_tenant: default_quota_max_connections_per_tenant(),
+            max_sessions_per_tenant: default_quota_max_sessions_per_tenant(),
+            max_retained_per_tenant: default_quota_max_retained_per_tenant(),
         }
     }
 }
@@ -1159,6 +1481,24 @@ impl QuotasConf {
             u64::from(self.default_max_publish_rate),
             0,
             10_000_000,
+        )?;
+        check_range_u64(
+            "quotas.max_connections_per_tenant",
+            u64::from(self.max_connections_per_tenant),
+            0,
+            1_000_000,
+        )?;
+        check_range_u64(
+            "quotas.max_sessions_per_tenant",
+            u64::from(self.max_sessions_per_tenant),
+            0,
+            100_000,
+        )?;
+        check_range_u64(
+            "quotas.max_retained_per_tenant",
+            u64::from(self.max_retained_per_tenant),
+            0,
+            100_000,
         )?;
         if !(1.0..=10.0).contains(&self.burst_multiplier) {
             return Err(invalid(
@@ -2630,6 +2970,49 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 ),
                 bool_field("tls.native", false, "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them."),
                 bool_field(
+                    "tls.psk_enabled",
+                    false,
+                    "Whether the kernel TLS listener accepts pre-shared-key handshakes. Takes effect with native enabled.",
+                ),
+                str_field(
+                    "tls.psk_keys_file",
+                    "",
+                    "Path to the PSK identity file of the kernel TLS listener. Takes effect with native and PSK enabled.",
+                ),
+                bool_field(
+                    "tls.verify_client_cert",
+                    false,
+                    "Whether the TLS listener requests and verifies a client certificate.",
+                ),
+                enum_field(
+                    "tls.verify",
+                    "verify_none",
+                    &["verify_none", "verify_peer"],
+                    "Client certificate chain check mode of the TLS listener.",
+                ),
+                str_field(
+                    "tls.cacertfile",
+                    "",
+                    "CA file for client certificate checks of the TLS listener.",
+                ),
+                bool_field(
+                    "tls.fail_if_no_peer_cert",
+                    false,
+                    "Whether the TLS listener refuses a handshake without a certificate.",
+                ),
+                enum_field(
+                    "tls.peer_cert_as_username",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind username from the client certificate.",
+                ),
+                enum_field(
+                    "tls.peer_cert_as_clientid",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind client identifier from the client certificate.",
+                ),
+                bool_field(
                     "ws.enabled",
                     true,
                     "Whether the MQTT-over-WebSocket listener accepts connections.",
@@ -2644,6 +3027,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "/mqtt",
                     "HTTP path serving MQTT-over-WebSocket traffic.",
                 ),
+                bool_field("ws.native", false, "Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them."),
                 bool_field(
                     "wss.enabled",
                     false,
@@ -2668,6 +3052,40 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "wss.key_file",
                     "",
                     "Path to the PEM private key for the secure WebSocket listener.",
+                ),
+                bool_field("wss.native", false, "Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them."),
+                bool_field(
+                    "wss.verify_client_cert",
+                    false,
+                    "Whether the secure WebSocket listener requests and verifies a client certificate.",
+                ),
+                enum_field(
+                    "wss.verify",
+                    "verify_none",
+                    &["verify_none", "verify_peer"],
+                    "Client certificate chain check mode of the secure WebSocket listener.",
+                ),
+                str_field(
+                    "wss.cacertfile",
+                    "",
+                    "CA file for client certificate checks of the secure WebSocket listener.",
+                ),
+                bool_field(
+                    "wss.fail_if_no_peer_cert",
+                    false,
+                    "Whether the secure WebSocket listener refuses a handshake without a certificate.",
+                ),
+                enum_field(
+                    "wss.peer_cert_as_username",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind username from the client certificate.",
+                ),
+                enum_field(
+                    "wss.peer_cert_as_clientid",
+                    "disabled",
+                    &["disabled", "cn", "dn"],
+                    "Source for the bind client identifier from the client certificate.",
                 ),
                 bool_field(
                     "api.enabled",
@@ -2704,6 +3122,27 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     1.0,
                     10.0,
                     "Token bucket burst multiplier (allows bursts up to burst times rate).",
+                ),
+                int_field(
+                    "max_connections_per_tenant",
+                    10_000,
+                    0,
+                    1_000_000,
+                    "Default max live connections per tenant (0 = unlimited).",
+                ),
+                int_field(
+                    "max_sessions_per_tenant",
+                    10_000,
+                    0,
+                    100_000,
+                    "Default max sessions per tenant (0 = unlimited).",
+                ),
+                int_field(
+                    "max_retained_per_tenant",
+                    10_000,
+                    0,
+                    100_000,
+                    "Default max retained topics per tenant (0 = unlimited).",
                 ),
             ],
         ),
@@ -3634,6 +4073,36 @@ mod tests {
                 row.path
             );
         }
+    }
+
+    #[test]
+    fn tls_psk_setting_parses_and_drives_validation() {
+        // Off by default keeps certificate handshakes unchanged.
+        assert!(!BrokerConfig::default().listeners.tls.psk_enabled);
+        assert!(BrokerConfig::default()
+            .listeners
+            .tls
+            .psk_keys_file
+            .is_empty());
+        // The file layer accepts the setting.
+        let parsed = BrokerConfig::parse_toml("[listeners.tls]\npsk_enabled = true\n")
+            .expect("psk setting parses");
+        assert!(parsed.listeners.tls.psk_enabled);
+        // The file layer accepts the keys file.
+        let parsed =
+            BrokerConfig::parse_toml("[listeners.tls]\npsk_keys_file = \"/etc/indra/psk.txt\"\n")
+                .expect("keys file parses");
+        assert_eq!(parsed.listeners.tls.psk_keys_file, "/etc/indra/psk.txt");
+        // A native PSK-only listener needs no certificate files.
+        let mut psk = BrokerConfig::default();
+        psk.listeners.tls.enabled = true;
+        psk.listeners.tls.native = true;
+        psk.listeners.tls.psk_enabled = true;
+        psk.validate().expect("psk needs no certificate");
+        // A certificate listener still needs them.
+        let mut cert = BrokerConfig::default();
+        cert.listeners.tls.enabled = true;
+        assert!(cert.validate().is_err(), "certificate needs files");
     }
 
     #[test]

@@ -26,14 +26,28 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `listeners.tls.cert_file` | string | `` | string | Path to the PEM server certificate for the TLS listener. |
 | `listeners.tls.key_file` | string | `` | string | Path to the PEM private key for the TLS listener. |
 | `listeners.tls.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them. |
+| `listeners.tls.verify_client_cert` | boolean | `false` | boolean | Whether the TLS listener requests and verifies a client certificate. |
+| `listeners.tls.verify` | string | `verify_none` | ["verify_none","verify_peer"] | Client certificate chain check mode of the TLS listener. |
+| `listeners.tls.cacertfile` | string | `` | string | CA file for client certificate checks of the TLS listener. |
+| `listeners.tls.fail_if_no_peer_cert` | boolean | `false` | boolean | Whether the TLS listener refuses a handshake without a certificate. |
+| `listeners.tls.peer_cert_as_username` | string | `disabled` | ["disabled","cn","dn"] | Source for the bind username from the client certificate. |
+| `listeners.tls.peer_cert_as_clientid` | string | `disabled` | ["disabled","cn","dn"] | Source for the bind client identifier from the client certificate. |
 | `listeners.ws.enabled` | boolean | `true` | boolean | Whether the MQTT-over-WebSocket listener accepts connections. |
 | `listeners.ws.bind` | string | `0.0.0.0:8083` | string | Bind address for the MQTT-over-WebSocket listener. |
 | `listeners.ws.path` | string | `/mqtt` | string | HTTP path serving MQTT-over-WebSocket traffic. |
+| `listeners.ws.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them. |
 | `listeners.wss.enabled` | boolean | `false` | boolean | Whether the secure WebSocket listener accepts connections. |
 | `listeners.wss.bind` | string | `0.0.0.0:8084` | string | Bind address for the secure WebSocket listener. |
 | `listeners.wss.path` | string | `/mqtt` | string | HTTP path serving secure WebSocket traffic. |
 | `listeners.wss.cert_file` | string | `` | string | Path to the PEM server certificate for the secure WebSocket listener. |
 | `listeners.wss.key_file` | string | `` | string | Path to the PEM private key for the secure WebSocket listener. |
+| `listeners.wss.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them. |
+| `listeners.wss.verify_client_cert` | boolean | `false` | boolean | Whether the secure WebSocket listener requests and verifies a client certificate. |
+| `listeners.wss.verify` | string | `verify_none` | ["verify_none","verify_peer"] | Client certificate chain check mode of the secure WebSocket listener. |
+| `listeners.wss.cacertfile` | string | `` | string | CA file for client certificate checks of the secure WebSocket listener. |
+| `listeners.wss.fail_if_no_peer_cert` | boolean | `false` | boolean | Whether the secure WebSocket listener refuses a handshake without a certificate. |
+| `listeners.wss.peer_cert_as_username` | string | `disabled` | ["disabled","cn","dn"] | Source for the bind username from the client certificate. |
+| `listeners.wss.peer_cert_as_clientid` | string | `disabled` | ["disabled","cn","dn"] | Source for the bind client identifier from the client certificate. |
 | `listeners.api.enabled` | boolean | `true` | boolean | Whether the management REST API and dashboard serve requests. |
 | `listeners.api.bind` | string | `0.0.0.0:18083` | string | Bind address for the management REST API. Empty disables the API. |
 
@@ -44,6 +58,9 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `quotas.default_max_connections` | integer | `10000` | 0..=1000000 | Default max connections per authenticated username (0 = unlimited). |
 | `quotas.default_max_publish_rate` | integer | `50000` | 0..=10000000 | Default token-bucket publish rate limit in messages per second (0 = unlimited). |
 | `quotas.burst_multiplier` | number | `2.0` | 1.0..=10.0 | Token bucket burst multiplier (allows bursts up to burst times rate). |
+| `quotas.max_connections_per_tenant` | integer | `10000` | 0..=1000000 | Default max live connections per tenant (0 = unlimited). |
+| `quotas.max_sessions_per_tenant` | integer | `10000` | 0..=100000 | Default max sessions per tenant (0 = unlimited). |
+| `quotas.max_retained_per_tenant` | integer | `10000` | 0..=100000 | Default max retained topics per tenant (0 = unlimited). |
 
 ## session
 

@@ -574,6 +574,20 @@ pub trait BrokerSink: Send + Sync {
         qos: QoS,
         retain: bool,
     ) -> Result<(), RuleEngineError>;
+    /// Publish one derived message inside one tenant. The default
+    /// impl keeps the old default-tenant path so test sinks stay
+    /// valid. Production sinks fan out in the named tenant.
+    async fn publish_in_tenant(
+        &self,
+        tenant: &str,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), RuleEngineError> {
+        let _ = tenant;
+        self.publish(topic, payload, qos, retain).await
+    }
 }
 
 /// Bounded in-memory event queue implementing [`EventInput`].
@@ -992,6 +1006,9 @@ pub enum RuleTier {
 pub struct Rule {
     pub id: String,
     pub name: String,
+    /// Tenant that owns the rule. One rule serves one tenant. Rules
+    /// stored before tenancy carry the default tenant.
+    pub tenant: String,
     pub topic_filter: TopicFilter,
     pub sql_query: Option<String>,
     #[serde(skip_serializing)]
@@ -1441,7 +1458,8 @@ struct FlushContext {
 
 /// One timestamped record waiting inside a window buffer. The ingress
 /// topic travels along so flush dispatches carry real routing context.
-/// `qos` carries the ingress QoS so flush delivery stays
+/// `tenant` names the owning tenant, so flush output fans out in the
+/// same tenant. `qos` carries the ingress QoS so flush delivery stays
 /// `min(ingress QoS, action QoS)` and a rule can never upgrade delivery
 /// guarantees. `injected` plus `std_has_wildcard`/`std_explicit_keys` carry the
 /// standard front-end projection state so window flushes strip injected
@@ -1449,6 +1467,7 @@ struct FlushContext {
 #[derive(Debug, Clone)]
 struct TimedRecord {
     arrived_ms: u64,
+    tenant: String,
     topic: Topic,
     qos: QoS,
     record: HashMap<String, serde_json::Value>,
@@ -1476,11 +1495,13 @@ struct RuleTask {
     status: Arc<RwLock<String>>,
 }
 
-/// One evaluated output row waiting in a rule-task sink queue: the
-/// partition's first record topic (real routing context), the ingress QoS
-/// floor (`min` over the flushed batch) so republish stays
-/// `min(ingress QoS, action QoS)`, plus the encoded row bytes.
+/// One evaluated output row waiting in a rule-task sink queue. It
+/// carries the partition's first record topic (real routing context),
+/// the owning tenant (so republish fans out in the same tenant), the
+/// ingress QoS floor (`min` over the flushed batch, so republish stays
+/// `min(ingress QoS, action QoS)`), plus the encoded row bytes.
 struct SinkRow {
+    tenant: String,
     topic: Topic,
     qos: QoS,
     payload: Bytes,
@@ -1521,6 +1542,7 @@ struct RuleTaskConfig {
 /// clippy::too_many_arguments.
 struct RuleFeederConfig {
     rule_id: String,
+    tenant: String,
     topic_filter: TopicFilter,
     std_sources: Vec<StdSource>,
     has_foreach: bool,
@@ -1542,6 +1564,7 @@ struct RuleFeederConfig {
 /// inline path.
 struct BrokerRuleSink {
     rule_id: String,
+    tenant: String,
     actions: Vec<RuleAction>,
     flush_ctx: Arc<FlushContext>,
     counters: ActionCounters,
@@ -1559,8 +1582,9 @@ impl runtime::RuleOutputSink for BrokerRuleSink {
         // flush, lock-free atomic bumps per forward, no per-fire
         // allocation).
         let action_metrics = self.flush_ctx.action_metrics.load_full();
-        run_actions(
+        run_actions_in_tenant(
             &self.rule_id,
+            &self.tenant,
             &self.actions,
             &topic,
             payload,
@@ -2012,8 +2036,9 @@ impl RuleEngine {
         let sink = self.broker_sink();
         let disabled = self.flush_ctx.action_disabled.load_full();
         let action_metrics = self.flush_ctx.action_metrics.load_full();
-        run_actions(
+        run_actions_in_tenant(
             rule_id,
+            &rule.tenant,
             &rule.actions,
             topic,
             payload,
@@ -2028,7 +2053,9 @@ impl RuleEngine {
         .await;
     }
 
-    /// Build and store a rule, assigning its id (`rule-<n>`).
+    /// Build and store a rule in the default tenant, assigning its id
+    /// (`rule-<n>`). Pre-tenancy callers use this; it keeps their
+    /// behaviour. Tenant callers use `create_rule_in_tenant`.
     /// Callers pass already-validated types; fallible parsing
     /// ([`TopicFilter::new`], [`Topic::new`]) happens at the API boundary.
     /// A present `sql_query` is parsed immediately: invalid SQL fails
@@ -2045,8 +2072,46 @@ impl RuleEngine {
         enabled: bool,
         actions: Vec<RuleAction>,
     ) -> Result<Rule, RuleEngineError> {
+        self.create_rule_in_tenant(
+            "default".to_string(),
+            name,
+            topic_filter,
+            sql_query,
+            enabled,
+            actions,
+        )
+    }
+
+    /// Build and store a rule in one tenant, assigning its id
+    /// (`rule-<n>`). The tenant must pass `is_valid_rule_tenant`;
+    /// blank maps to the default tenant. Shares the same SQL
+    /// compilation, duplicate rejection and rule-cap bound as
+    /// [`RuleEngine::create_rule`].
+    pub fn create_rule_in_tenant(
+        &self,
+        tenant: String,
+        name: String,
+        topic_filter: TopicFilter,
+        sql_query: Option<String>,
+        enabled: bool,
+        actions: Vec<RuleAction>,
+    ) -> Result<Rule, RuleEngineError> {
+        let tenant = broker_config::canonical_rule_tenant(&tenant);
+        if !broker_config::is_valid_rule_tenant(&tenant) {
+            return Err(RuleEngineError::InvalidRule(format!(
+                "tenant {tenant:?} is not valid (field `tenant`)"
+            )));
+        }
         let id = format!("rule-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
-        self.create_rule_with_id(id, name, topic_filter, sql_query, enabled, actions)
+        self.create_rule_with_id_in_tenant(
+            id,
+            tenant,
+            name,
+            topic_filter,
+            sql_query,
+            enabled,
+            actions,
+        )
     }
 
     /// Build and store a rule under a caller-chosen id (management-plane
@@ -2057,7 +2122,8 @@ impl RuleEngine {
     /// live, a duplicate id fails loudly instead of overwriting, and a
     /// full store (at most [`broker_config::MAX_RULES`] entries) fails
     /// loudly instead of growing without limit. Persists through the
-    /// registry like [`RuleEngine::create_rule`].
+    /// registry like [`RuleEngine::create_rule`]. Pre-tenancy callers
+    /// use this; it stores in the default tenant.
     pub fn create_rule_with_id(
         &self,
         id: String,
@@ -2067,7 +2133,46 @@ impl RuleEngine {
         enabled: bool,
         actions: Vec<RuleAction>,
     ) -> Result<Rule, RuleEngineError> {
-        let rule = self.insert_rule_with_id(id, name, topic_filter, sql_query, enabled, actions)?;
+        self.create_rule_with_id_in_tenant(
+            id,
+            "default".to_string(),
+            name,
+            topic_filter,
+            sql_query,
+            enabled,
+            actions,
+        )
+    }
+
+    /// Build and store a rule under a caller-chosen id in one tenant.
+    /// The tenant must pass `is_valid_rule_tenant`; blank maps to the
+    /// default tenant. Shares the same bounds as `create_rule_with_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_rule_with_id_in_tenant(
+        &self,
+        id: String,
+        tenant: String,
+        name: String,
+        topic_filter: TopicFilter,
+        sql_query: Option<String>,
+        enabled: bool,
+        actions: Vec<RuleAction>,
+    ) -> Result<Rule, RuleEngineError> {
+        let tenant = broker_config::canonical_rule_tenant(&tenant);
+        if !broker_config::is_valid_rule_tenant(&tenant) {
+            return Err(RuleEngineError::InvalidRule(format!(
+                "tenant {tenant:?} is not valid (field `tenant`)"
+            )));
+        }
+        let rule = self.insert_rule_with_id_in_tenant(
+            id,
+            tenant,
+            name,
+            topic_filter,
+            sql_query,
+            enabled,
+            actions,
+        )?;
         self.persist()?;
         Ok(rule)
     }
@@ -2079,15 +2184,19 @@ impl RuleEngine {
         self.rules.read().len()
     }
 
-    /// Insert a rule under a preserved id (boot replay path). Shares the
-    /// same SQL validation as [`RuleEngine::create_rule`]: invalid SQL
-    /// fails loudly instead of being skipped. A duplicate id fails
-    /// loudly. Advances `next_id` past any numeric `rule-<n>` suffix so
-    /// later creates never collide. Does not persist; callers persist
-    /// once after bulk loads.
-    fn insert_rule_with_id(
+    /// Insert a rule under a preserved id in one tenant (boot replay
+    /// path). Shares the same SQL validation as
+    /// [`RuleEngine::create_rule`]: invalid SQL fails loudly instead of
+    /// being skipped. A duplicate id fails loudly. Advances `next_id`
+    /// past any numeric `rule-<n>` suffix so later creates never
+    /// collide. Does not persist; callers persist once after bulk
+    /// loads. Files stored before tenancy carry no tenant and load as
+    /// the default tenant.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_rule_with_id_in_tenant(
         &self,
         id: String,
+        tenant: String,
         name: String,
         topic_filter: TopicFilter,
         sql_query: Option<String>,
@@ -2160,9 +2269,16 @@ impl RuleEngine {
             Some(stmt) if stmt.window.is_some() => RuleTier::Enterprise,
             _ => RuleTier::Community,
         };
+        let tenant = broker_config::canonical_rule_tenant(&tenant);
+        if !broker_config::is_valid_rule_tenant(&tenant) {
+            return Err(RuleEngineError::InvalidRule(format!(
+                "tenant {tenant:?} is not valid (field `tenant`)"
+            )));
+        }
         let rule = Rule {
             id: id.clone(),
             name,
+            tenant,
             topic_filter,
             sql_query,
             parsed_query,
@@ -2287,8 +2403,12 @@ impl RuleEngine {
             for action in &entry.actions {
                 actions.push(Self::action_from_entry(&entry.id, action)?);
             }
-            self.insert_rule_with_id(
+            // Files stored before tenancy carry no tenant. The serde
+            // default maps them to the default tenant here.
+            let tenant = broker_config::canonical_rule_tenant(&entry.tenant);
+            self.insert_rule_with_id_in_tenant(
                 entry.id.clone(),
+                tenant,
                 entry.name.clone(),
                 topic_filter,
                 entry.sql_query.clone(),
@@ -2316,6 +2436,7 @@ impl RuleEngine {
             .map(|rule| broker_config::RuleEntry {
                 id: rule.id.clone(),
                 name: rule.name.clone(),
+                tenant: rule.tenant.clone(),
                 topic_filter: rule.topic_filter.as_str().to_string(),
                 sql_query: rule.sql_query.clone(),
                 enabled: rule.enabled,
@@ -2452,6 +2573,29 @@ impl RuleEngine {
         topic_filter: TopicFilter,
         sql_query: Option<String>,
         enabled: bool,
+        actions: Vec<RuleAction>,
+    ) -> Result<Option<Rule>, RuleEngineError> {
+        let tenant = self
+            .rules
+            .read()
+            .get(id)
+            .map(|arc| arc.tenant.clone())
+            .unwrap_or_else(|| "default".to_string());
+        self.replace_rule_in_tenant(id, tenant, name, topic_filter, sql_query, enabled, actions)
+    }
+
+    /// Replace a stored rule in full in one tenant. Same bounds as
+    /// `replace_rule`. The tenant must pass `is_valid_rule_tenant`.
+    /// Counters carry over from the old rule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_rule_in_tenant(
+        &self,
+        id: &str,
+        tenant: String,
+        name: String,
+        topic_filter: TopicFilter,
+        sql_query: Option<String>,
+        enabled: bool,
         mut actions: Vec<RuleAction>,
     ) -> Result<Option<Rule>, RuleEngineError> {
         let old = self.rules.read().get(id).map(|arc| arc.as_ref().clone());
@@ -2486,9 +2630,16 @@ impl RuleEngine {
             Some(stmt) if stmt.window.is_some() => RuleTier::Enterprise,
             _ => RuleTier::Community,
         };
+        let tenant = broker_config::canonical_rule_tenant(&tenant);
+        if !broker_config::is_valid_rule_tenant(&tenant) {
+            return Err(RuleEngineError::InvalidRule(format!(
+                "tenant {tenant:?} is not valid (field `tenant`)"
+            )));
+        }
         let rule = Rule {
             id: id.to_string(),
             name,
+            tenant,
             topic_filter,
             sql_query,
             parsed_query,
@@ -3351,6 +3502,7 @@ impl RuleEngine {
     /// runtime, ever.
     async fn feed_rule_runtime(
         &self,
+        tenant: &str,
         windowed: &[Arc<Rule>],
         topic: &Topic,
         payload: &Bytes,
@@ -3359,7 +3511,7 @@ impl RuleEngine {
         for rule in windowed {
             self.ensure_rule_task(rule);
         }
-        let record = runtime::ingress_to_stream_record(topic, payload, qos);
+        let record = runtime::ingress_to_stream_record(tenant, topic, payload, qos);
         if let Err(e) = self.ingress_sender.send(record).await {
             self.runtime_feed_dropped.fetch_add(1, Ordering::Relaxed);
             let ids = windowed
@@ -3420,6 +3572,7 @@ impl RuleEngine {
         let status = Arc::new(RwLock::new("running".to_string()));
         let feeder = RuleFeederConfig {
             rule_id: rule.id.clone(),
+            tenant: rule.tenant.clone(),
             topic_filter: rule.topic_filter.clone(),
             std_sources: rule.std_sources.clone(),
             has_foreach: rule.std_foreach.is_some(),
@@ -3441,6 +3594,7 @@ impl RuleEngine {
         };
         let bridge = BrokerRuleSink {
             rule_id: rule.id.clone(),
+            tenant: rule.tenant.clone(),
             actions: rule.actions.clone(),
             flush_ctx: self.flush_ctx.clone(),
             counters: ActionCounters::from_rule(rule),
@@ -3467,6 +3621,7 @@ impl RuleEngine {
 async fn rule_feeder_loop(config: RuleFeederConfig) {
     let RuleFeederConfig {
         rule_id,
+        tenant,
         topic_filter,
         std_sources,
         has_foreach,
@@ -3486,6 +3641,11 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
         let Some(feeder) = runtime::split_stream_record(stream_record.data) else {
             continue;
         };
+        // One task serves one tenant. Records of other tenants
+        // never enter the feed.
+        if feeder.tenant != tenant {
+            continue;
+        }
         if !topic_filter.matches(&feeder.topic) {
             continue;
         }
@@ -3549,6 +3709,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
         if feed_tx
             .try_send(TimedRecord {
                 arrived_ms: now_ms(),
+                tenant: tenant.clone(),
                 topic: feeder.topic,
                 qos: ingress_qos,
                 record,
@@ -3573,6 +3734,11 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
 async fn rule_sink_loop(mut sink_rx: mpsc::Receiver<SinkRow>, bridge: BrokerRuleSink) {
     use runtime::RuleOutputSink;
     while let Some(row) = sink_rx.recv().await {
+        // One task serves one tenant. A row of another tenant never
+        // leaves; it drops here, fail closed.
+        if row.tenant != bridge.tenant {
+            continue;
+        }
         bridge.emit(row.topic, row.payload, row.qos).await;
     }
 }
@@ -3584,22 +3750,29 @@ async fn rule_sink_loop(mut sink_rx: mpsc::Receiver<SinkRow>, bridge: BrokerRule
 const EVENT_DRAIN_LIMIT: u32 = 64;
 
 impl RuleEngine {
-    /// Execute every enabled rule whose filter matches `topic`.
-    /// Delivery QoS per republish is `min(ingress QoS, action QoS)` so a
-    /// rule can never upgrade delivery guarantees. Rules carrying SQL
-    /// first run the payload through `rekuiper-sql`: non-JSON or
-    /// non-object payloads cannot be evaluated and skip the rule, a false
-    /// WHERE skips its actions, and SELECT projection replaces the bytes
-    /// forwarded to the sink. Sink failures are logged; remaining actions
-    /// still run. Returns the number of rules that matched (for the
-    /// `indramqtt_rules_executed_total` counter).
-    ///
-    /// Windowed rules never execute inline: matching ingress is converted
-    /// once and fed to the rule's task on the embedded runtime (still
-    /// counted as matched). Tier labels stay for display and never select
-    /// the path: the window clause does.
+    /// Execute every enabled rule whose filter matches `topic` in the
+    /// default tenant. Pre-tenancy callers use this; it keeps their
+    /// behaviour. Tenant callers use `dispatch_ingress_in_tenant`.
     pub async fn dispatch_ingress(
         &self,
+        topic: &Topic,
+        payload: &Bytes,
+        qos: QoS,
+        broker_sink: &Arc<dyn BrokerSink>,
+    ) -> usize {
+        self.dispatch_ingress_in_tenant("default", topic, payload, qos, broker_sink)
+            .await
+    }
+
+    /// Execute every enabled rule of one tenant whose filter matches
+    /// `topic`. Only rules of the ingress tenant run. Each republish
+    /// fans out in the same tenant. A blank tenant maps to the default
+    /// tenant. The match reads the per-ingress rule snapshot the route
+    /// already holds. It pays one string compare per rule, no new
+    /// lock, no new allocation, no new queue, no unbounded work.
+    pub async fn dispatch_ingress_in_tenant(
+        &self,
+        tenant: &str,
         topic: &Topic,
         payload: &Bytes,
         qos: QoS,
@@ -3610,6 +3783,17 @@ impl RuleEngine {
         if is_system_topic(topic) && self.engine_config_snapshot().ignore_sys_message {
             return 0;
         }
+        // Tenant scope: only rules of the ingress tenant run. Blank
+        // maps to the default tenant, so old callers keep behaviour.
+        // Borrowed compare only: no allocation on this path.
+        let tenant = {
+            let trimmed = tenant.trim();
+            if trimmed.is_empty() {
+                "default"
+            } else {
+                trimmed
+            }
+        };
         // Snapshot matching rules so the sink (which may touch the router,
         // never this map) runs without holding the lock.
         // B4-07 live wiring (durability push after match, see below).
@@ -3617,7 +3801,9 @@ impl RuleEngine {
             let rules = self.rules.read();
             rules
                 .values()
-                .filter(|rule| rule.enabled && rule.topic_filter.matches(topic))
+                .filter(|rule| {
+                    rule.enabled && rule.tenant == tenant && rule.topic_filter.matches(topic)
+                })
                 .cloned()
                 .collect()
         };
@@ -3685,8 +3871,9 @@ impl RuleEngine {
             }
             rule.passed_cnt.fetch_add(1, Ordering::Relaxed);
             for data in outputs {
-                run_actions(
+                run_actions_in_tenant(
                     &rule.id,
+                    &rule.tenant,
                     &rule.actions,
                     topic,
                     data,
@@ -3713,7 +3900,8 @@ impl RuleEngine {
                 .await;
         }
         if !windowed.is_empty() {
-            self.feed_rule_runtime(&windowed, topic, payload, qos).await;
+            self.feed_rule_runtime(tenant, &windowed, topic, payload, qos)
+                .await;
         }
         // B4-07 live wiring: every broker ingress (see
         // `crates/broker-node/src/main.rs:ingress_pipeline_with_publisher`,
@@ -3758,6 +3946,9 @@ impl RuleEngine {
         disabled: &HashSet<String>,
         action_metrics: &HashMap<String, Arc<ActionMetrics>>,
     ) {
+        // Kernel events carry no tenant. Only rules of the default
+        // tenant react to them, so a tenant rule never sees them.
+        let tenant = "default";
         let mut drained = 0u32;
         while drained < EVENT_DRAIN_LIMIT {
             if let Some(event) = self.input.try_dequeue().await {
@@ -3767,6 +3958,7 @@ impl RuleEngine {
                         .values()
                         .filter(|r| {
                             r.enabled
+                                && r.tenant == tenant
                                 && r.topic_filter.matches(&event.topic)
                                 && std_sources_match(&r.std_sources, &event.topic)
                         })
@@ -3792,8 +3984,9 @@ impl RuleEngine {
                     }
                     rule.passed_cnt.fetch_add(1, Ordering::Relaxed);
                     for data in outputs {
-                        run_actions(
+                        run_actions_in_tenant(
                             &rule.id,
+                            tenant,
                             &rule.actions,
                             &event.topic,
                             data,
@@ -3810,6 +4003,7 @@ impl RuleEngine {
                 }
                 if !windowed_for_event.is_empty() {
                     self.feed_rule_runtime(
+                        tenant,
                         &windowed_for_event,
                         &event.topic,
                         &event.payload,
@@ -3845,12 +4039,17 @@ fn attribute_source_ingress(
     }
 }
 
-/// Execute one rule's actions for a single output row. Shared by the
-/// inline stateless path and rule-task sink workers. `qos_cap` floors delivery:
-/// the inline path passes the ingress QoS (`min(action, ingress)`), the
-/// flush path passes the flushed batch's ingress-QoS floor
-/// (`min(action, ingress floor)`). A missing broker sink drops republish
-/// actions with a warning instead of panicking.
+/// Execute one rule's actions for a single output row in one tenant.
+/// Shared by the inline stateless path and rule-task sink workers.
+/// `qos_cap` floors delivery: the inline path passes the ingress QoS
+/// (`min(action, ingress)`), the flush path passes the flushed batch's
+/// ingress-QoS floor (`min(action, ingress floor)`). A missing broker
+/// sink drops republish actions with a warning instead of panicking.
+/// Republish fans out in the rule tenant only, so output never leaves
+/// it. Forward actions send the owning rule's messages only. Dispatch
+/// already limits each rule to its own tenant, so a forward never
+/// carries another tenant's message. The connector target itself
+/// carries no tenant label.
 ///
 /// `disabled` is the lock-free disabled-action snapshot loaded once per
 /// ingress (W3-04, C06-07): a `ForwardConnector` naming a disabled action
@@ -3861,14 +4060,15 @@ fn attribute_source_ingress(
 /// `action_metrics` is the lock-free per-action metric map loaded once per
 /// ingress (W3-05, C06-08/09): a `ForwardConnector` whose id names a known
 /// action attributes one outcome through it (one `HashMap` lookup plus
-/// relaxed `fetch_add`s, no lock, no per-fire allocation). Unknown ids
+/// relaxed `fetch_add`s, no lock, no allocation). Unknown ids
 /// (plain connectors with no action record) move only the per-rule
 /// counters, never the per-action map.
 // TODO(parity): Do skipped disabled forwards count in rule action totals?
 // TODO(parity): Do skipped disabled forwards count in per-action totals?
 #[allow(clippy::too_many_arguments)]
-async fn run_actions(
+async fn run_actions_in_tenant(
     rule_id: &str,
+    tenant: &str,
     actions: &[RuleAction],
     topic: &Topic,
     payload: Bytes,
@@ -3890,7 +4090,13 @@ async fn run_actions(
                 match broker_sink {
                     Some(sink) => {
                         if let Err(e) = sink
-                            .publish(dst.clone(), payload.clone(), effective, false)
+                            .publish_in_tenant(
+                                tenant,
+                                dst.clone(),
+                                payload.clone(),
+                                effective,
+                                false,
+                            )
                             .await
                         {
                             counters.total.fetch_add(1, Ordering::Relaxed);
@@ -4201,6 +4407,12 @@ async fn flush_rule_window(
     if batch.is_empty() {
         return;
     }
+    // One task serves one tenant: the feeder drops other tenants, so
+    // the batch carries one tenant. Flush output fans out in it.
+    let batch_tenant = batch
+        .first()
+        .map(|timed| timed.tenant.clone())
+        .unwrap_or_else(|| "default".to_string());
     // Ingress-QoS floor over the flushed batch: the most conservative
     // (lowest) ingress QoS, so `min(ingress, action)` never upgrades.
     let qos_floor = batch
@@ -4269,6 +4481,7 @@ async fn flush_rule_window(
         };
         if sink_tx
             .send(SinkRow {
+                tenant: batch_tenant.clone(),
                 topic,
                 qos: qos_floor,
                 payload: bytes,
@@ -5528,6 +5741,157 @@ mod tests {
                 false
             )]
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct TenantSink {
+        published: StdMutex<Vec<(String, Topic, Bytes)>>,
+    }
+
+    #[async_trait]
+    impl BrokerSink for TenantSink {
+        async fn publish(
+            &self,
+            topic: Topic,
+            payload: Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> Result<(), RuleEngineError> {
+            self.published
+                .lock()
+                .unwrap()
+                .push(("default".to_string(), topic, payload));
+            Ok(())
+        }
+
+        async fn publish_in_tenant(
+            &self,
+            tenant: &str,
+            topic: Topic,
+            payload: Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> Result<(), RuleEngineError> {
+            self.published
+                .lock()
+                .unwrap()
+                .push((tenant.to_string(), topic, payload));
+            Ok(())
+        }
+    }
+
+    fn tenant_republish_rule(
+        engine: &RuleEngine,
+        tenant: &str,
+        name: &str,
+        filter: &str,
+        out: &str,
+    ) -> Rule {
+        engine
+            .create_rule_in_tenant(
+                tenant.to_string(),
+                name.to_string(),
+                TopicFilter::new(filter).expect("filter parses"),
+                None,
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new(out).expect("topic parses"),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("rule creates")
+    }
+
+    /// A rule of tenant A runs for a publish of tenant A only.
+    /// A publish of tenant B never runs it.
+    #[tokio::test]
+    async fn tenant_rule_fires_only_in_own_tenant() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        tenant_republish_rule(&engine, "tenant-a", "rule-a", "sensors/#", "out/a");
+        let sink = Arc::new(TenantSink::default());
+        let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+        let topic = Topic::new("sensors/1").expect("topic parses");
+        let payload = Bytes::from_static(b"hello");
+        let fired = engine
+            .dispatch_ingress_in_tenant("tenant-a", &topic, &payload, QoS::AtMostOnce, &sink_obj)
+            .await;
+        assert_eq!(fired, 1);
+        let fired = engine
+            .dispatch_ingress_in_tenant("tenant-b", &topic, &payload, QoS::AtMostOnce, &sink_obj)
+            .await;
+        assert_eq!(fired, 0);
+        let rows = sink.published.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "tenant-a");
+        assert_eq!(rows[0].1.as_str(), "out/a");
+    }
+
+    /// Output of a rule of tenant A fans out in tenant A only.
+    /// Two rules on one filter each serve their own tenant.
+    #[tokio::test]
+    async fn tenant_rule_output_stays_in_own_tenant() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        tenant_republish_rule(&engine, "tenant-a", "rule-a", "sensors/#", "out/shared");
+        tenant_republish_rule(&engine, "tenant-b", "rule-b", "sensors/#", "out/shared");
+        let sink = Arc::new(TenantSink::default());
+        let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+        let topic = Topic::new("sensors/1").expect("topic parses");
+        let payload = Bytes::from_static(b"data");
+        let fired = engine
+            .dispatch_ingress_in_tenant("tenant-a", &topic, &payload, QoS::AtMostOnce, &sink_obj)
+            .await;
+        assert_eq!(fired, 1);
+        let rows = sink.published.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "tenant-a");
+    }
+
+    /// The window transport carries the ingress tenant. The feeder
+    /// rebuilds it, so a task of another tenant drops the record.
+    #[test]
+    fn window_transport_carries_ingress_tenant() {
+        let topic = Topic::new("sensors/1").expect("topic parses");
+        let payload = Bytes::from_static(br#"{"temp": 21}"#);
+        let record =
+            runtime::ingress_to_stream_record("tenant-a", &topic, &payload, QoS::AtMostOnce);
+        let feeder = runtime::split_stream_record(record.data).expect("record splits");
+        assert_eq!(feeder.tenant, "tenant-a");
+        assert_eq!(feeder.topic.as_str(), "sensors/1");
+    }
+
+    /// A rule stored before tenancy serves the default tenant.
+    /// It runs as before for default ingress, never for others.
+    #[tokio::test]
+    async fn pre_tenancy_rule_serves_default_tenant() {
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        let rule = engine
+            .create_rule(
+                "legacy".to_string(),
+                TopicFilter::new("sensors/#").unwrap(),
+                None,
+                true,
+                vec![RuleAction::Republish {
+                    topic: Topic::new("out/legacy").unwrap(),
+                    qos: QoS::AtMostOnce,
+                }],
+            )
+            .expect("rule creates");
+        assert_eq!(rule.tenant, "default");
+        let sink = Arc::new(TenantSink::default());
+        let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+        let topic = Topic::new("sensors/1").expect("topic parses");
+        let payload = Bytes::from_static(b"data");
+        let fired = engine
+            .dispatch_ingress(&topic, &payload, QoS::AtMostOnce, &sink_obj)
+            .await;
+        assert_eq!(fired, 1);
+        let fired = engine
+            .dispatch_ingress_in_tenant("tenant-a", &topic, &payload, QoS::AtMostOnce, &sink_obj)
+            .await;
+        assert_eq!(fired, 0);
+        let rows = sink.published.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "default");
     }
 
     #[tokio::test]
@@ -7139,6 +7503,8 @@ mod tests {
         }
     }
 
+    // Needs the `kafka` heavy SDK (X1-10); runs on feature builds.
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn test_into_connector_desugars_to_forward_action() {
         use broker_connectors::{KafkaSink, KafkaSinkConfig, MemoryKafkaTransport};
@@ -7242,6 +7608,8 @@ mod tests {
     /// (Kafka, Redis, MySQL, ClickHouse, InfluxDB) via distinct
     /// connectors. TCP sinks use in-memory transports, HTTP sinks use
     /// in-process axum fakes: no broker anywhere in the loop.
+    // Needs the `kafka` + `clickhouse` heavy SDKs (X1-10).
+    #[cfg(all(feature = "kafka", feature = "clickhouse"))]
     #[tokio::test]
     async fn test_rule_fans_out_to_five_analytical_sinks() {
         use axum::{extract::State, routing::post, Router};
@@ -7699,8 +8067,13 @@ mod tests {
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the Kinesis, GCP Pub/Sub, Azure Event Hubs
     /// and Pulsar mocks. All transports are in-memory.
-    /// X1-09: needs the `azure_eventhubs` feature (absent by default).
-    #[cfg(feature = "azure_eventhubs")]
+    // Needs the `azure_eventhubs`, `gcp_pubsub` and `kinesis` heavy
+    // SDKs; runs on feature builds.
+    #[cfg(all(
+        feature = "azure_eventhubs",
+        feature = "gcp_pubsub",
+        feature = "kinesis"
+    ))]
     #[tokio::test]
     async fn test_into_fans_out_to_cloud_sinks() {
         use broker_connectors_enterprise::{
@@ -8269,6 +8642,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the MongoDB, MSSQL, Cassandra and Couchbase
     /// mocks with zero drops. All transports are in-memory.
+    // Needs the `mongodb` + `cassandra` + `couchbase` heavy SDKs (X1-10).
+    #[cfg(all(feature = "mongodb", feature = "cassandra", feature = "couchbase"))]
     #[tokio::test]
     async fn test_into_fans_out_to_database_sinks() {
         use broker_connectors_enterprise::{
@@ -8761,8 +9136,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// streaming SQL `INTO connector(...)` rules and fans out
     /// simultaneously to the Snowflake, Databricks, Doris, BigQuery
     /// and Redshift mocks with zero drops. All transports in-memory.
-    /// X1-09: needs the `bigquery` feature (absent by default).
-    #[cfg(feature = "bigquery")]
+    // Needs the `bigquery` heavy SDK (with its `gcp_pubsub` auth stack);
+    // runs on feature builds.
+    #[cfg(all(feature = "bigquery", feature = "gcp_pubsub"))]
     #[tokio::test]
     async fn test_into_fans_out_to_lakehouse_sinks() {
         use broker_connectors_enterprise::{
@@ -9045,8 +9421,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// `SdkBigQueryTransport` to a loopback `insertAll` fake. Row count is
     /// asserted on the fake (not just the sink counters), plus selective
     /// requeue of only failed rows through the same rule path.
-    /// X1-09: needs the `bigquery` feature (absent by default).
-    #[cfg(feature = "bigquery")]
+    // Needs the `bigquery` heavy SDK (with its `gcp_pubsub` auth stack);
+    // runs on feature builds.
+    #[cfg(all(feature = "bigquery", feature = "gcp_pubsub"))]
     #[tokio::test]
     async fn test_bigquery_sdk_sink_via_rule_against_fake() {
         use axum::{extract::State, http::StatusCode, routing::post, Router};
@@ -9381,8 +9758,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     /// through five streaming SQL `INTO connector(...)` rules and lands
     /// simultaneously in the Azure Blob, Tablestore, S3 Tables,
     /// Confluent and RocketMQ mocks. All transports are in-memory.
-    /// X1-09: needs the `azure_blob` feature (absent by default).
-    #[cfg(feature = "azure_blob")]
+    // Needs the `azure_blob` and `confluent` heavy SDKs; runs on feature
+    // builds.
+    #[cfg(all(feature = "azure_blob", feature = "confluent"))]
     #[tokio::test]
     async fn test_into_fans_out_to_storage_messaging_sinks() {
         use broker_connectors_enterprise::{
@@ -10483,6 +10861,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             rules: vec![broker_config::RuleEntry {
                 id: "rule-1".to_string(),
                 name: "bad".to_string(),
+                tenant: "default".to_string(),
                 topic_filter: "sensors/#".to_string(),
                 sql_query: None,
                 enabled: true,
@@ -10504,6 +10883,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             rules: vec![broker_config::RuleEntry {
                 id: "rule-1".to_string(),
                 name: "bad".to_string(),
+                tenant: "default".to_string(),
                 topic_filter: "sensors/#".to_string(),
                 sql_query: Some("SELECT FROM WHERE".to_string()),
                 enabled: true,

@@ -658,7 +658,9 @@ pub async fn restore_history_version(
 /// by file name, environment variable by name, flag) or report defaults
 /// when no layer set them. Registry keys (`mqtt_users.users.<name>`,
 /// `rules.rules.<id>`, `connectors.connectors.<id>`,
-/// `admin_users.users.<name>`, `mqtt_users.acls`) report the current
+/// `admin_users.users.<name>`, `mqtt_users.acls`,
+/// `mqtt_users.tenants.<tenant>.users.<name>`,
+/// `mqtt_users.tenants.<tenant>.acls`) report the current
 /// runtime version. Secret values render as
 /// `<redacted:file:...>` / `<redacted:env:...>` markers, never plaintext.
 pub async fn explain_config(
@@ -741,6 +743,23 @@ fn registry_key_to_diff_setting(key: &str) -> String {
             return format!("{root}[{name}]");
         }
     }
+    // Per-tenant keys (TM-01): `mqtt_users.tenants.<tenant>.users.<name>`
+    // maps to `mqtt_users.tenants[<tenant>].users[<name>]`, and
+    // `mqtt_users.tenants.<tenant>.acls` to
+    // `mqtt_users.tenants[<tenant>].acls`. Best effort on dotted names:
+    // the split runs on the `.users.` marker and the `.acls` suffix.
+    if let Some(rest) = key.strip_prefix("mqtt_users.tenants.") {
+        if let Some(tenant) = rest.strip_suffix(".acls") {
+            return format!("mqtt_users.tenants[{tenant}].acls");
+        }
+        if let Some(pos) = rest.find(".users.") {
+            let (tenant, name) = rest.split_at(pos);
+            return format!(
+                "mqtt_users.tenants[{tenant}].users[{}]",
+                &name[".users.".len()..]
+            );
+        }
+    }
     key.to_string()
 }
 
@@ -764,6 +783,32 @@ fn registry_value(snapshot: &Arc<FullSnapshot>, key: &str) -> Option<String> {
         let mut value = serde_json::to_value(&snapshot.mqtt_users.acls).ok()?;
         redact_json_in_place(&mut value);
         return serde_json::to_string(&value).ok();
+    }
+    // Per-tenant tables (TM-01): `mqtt_users.tenants.<tenant>.acls`
+    // renders one tenant ACL list; `mqtt_users.tenants.<tenant>.users.<name>`
+    // renders one tenant user. Secrets stay redacted. Dotted tenant ids
+    // match by prefix against the stored tables.
+    if let Some(rest) = key.strip_prefix("mqtt_users.tenants.") {
+        for table in &snapshot.mqtt_users.tenants {
+            let Some(suffix) = rest
+                .strip_prefix(table.tenant.as_str())
+                .and_then(|rest| rest.strip_prefix('.'))
+            else {
+                continue;
+            };
+            if let Some(name) = suffix.strip_prefix("users.") {
+                let user = table.users.iter().find(|entry| entry.username == name)?;
+                let mut value = serde_json::to_value(user).ok()?;
+                redact_json_in_place(&mut value);
+                return serde_json::to_string(&value).ok();
+            }
+            if suffix == "acls" {
+                let mut value = serde_json::to_value(&table.acls).ok()?;
+                redact_json_in_place(&mut value);
+                return serde_json::to_string(&value).ok();
+            }
+        }
+        return None;
     }
     if let Some(id) = key.strip_prefix("rules.rules.") {
         let rule = snapshot.rules.rules.iter().find(|entry| entry.id == id)?;
@@ -1028,6 +1073,7 @@ mod tests {
         broker_config::RuleEntry {
             id: id.to_string(),
             name: id.to_string(),
+            tenant: "default".to_string(),
             topic_filter: filter.to_string(),
             sql_query: None,
             enabled: true,
@@ -1185,6 +1231,7 @@ mod tests {
         snapshot.rules.rules.push(broker_config::RuleEntry {
             id: "dangling".to_string(),
             name: "dangling".to_string(),
+            tenant: "default".to_string(),
             topic_filter: "a/#".to_string(),
             sql_query: None,
             enabled: true,

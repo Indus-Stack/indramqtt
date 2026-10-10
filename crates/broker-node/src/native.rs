@@ -19,13 +19,18 @@ use broker_protocol::wire::{self, kind, ConnackProperties, PublishOut, WireError
 use broker_session::SessionKey;
 use brokerlink::{BrokerFrame, BrokerLinkError, BrokerLinkTransport, OpCode};
 use bytes::{Bytes, BytesMut};
+use futures::{Sink, Stream};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tracing::{debug, error, warn};
 
 /// Connection identifiers of kernel-owned connections start here. The
@@ -128,6 +133,10 @@ pub(super) fn bind_listener(bind: &str, backlog: u32) -> std::io::Result<TcpList
 /// only; publish and deliver never touch these handles.
 pub(super) struct NativeListenerController {
     shared: Shared,
+    /// Boot settings of the built-in listeners. They carry the keys
+    /// that a listener row does not hold: the client certificate policy,
+    /// the PSK switch and the WebSocket paths.
+    listeners: broker_config::schema::ListenersConf,
     /// Accept tasks by `{type}:{name}` id.
     handles: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Live connection counts by `{type}:{name}` id.
@@ -135,10 +144,12 @@ pub(super) struct NativeListenerController {
 }
 
 impl NativeListenerController {
-    /// Control that serves new sockets with a clone of `shared`.
-    pub(super) fn new(shared: Shared) -> Self {
+    /// Control that serves new sockets with a clone of `shared` and the
+    /// boot settings `listeners`.
+    pub(super) fn new(shared: Shared, listeners: broker_config::schema::ListenersConf) -> Self {
         Self {
             shared,
+            listeners,
             handles: std::sync::Mutex::new(HashMap::new()),
             counts: std::sync::Mutex::new(HashMap::new()),
         }
@@ -166,30 +177,83 @@ impl broker_api::v5::listeners::ListenerController for NativeListenerController 
             Some(broker_api::v5::listeners::ListenerMaxConnections::Finite(count)) => Some(count),
             Some(broker_api::v5::listeners::ListenerMaxConnections::Infinite) | None => None,
         };
+        let conf = &self.listeners;
+        // Build the serving future first. A bad certificate fails the
+        // start before the socket opens and before a count is stored.
+        let kind = record.kind.as_str();
+        let tls = match kind {
+            "ssl" if !conf.tls.psk_enabled => Some(
+                load_tls_config(
+                    &record.cert_file,
+                    &record.key_file,
+                    &TlsClientAuth {
+                        verify_peer: conf.tls.verify == "verify_peer",
+                        legacy_verify: conf.tls.verify_client_cert,
+                        cacertfile: conf.tls.cacertfile.clone(),
+                        fail_if_no_peer_cert: conf.tls.fail_if_no_peer_cert,
+                    },
+                )
+                .map_err(|e| e.to_string())?,
+            ),
+            "wss" => Some(
+                load_tls_config(
+                    &conf.wss.cert_file,
+                    &conf.wss.key_file,
+                    &TlsClientAuth {
+                        verify_peer: conf.wss.verify == "verify_peer",
+                        legacy_verify: conf.wss.verify_client_cert,
+                        cacertfile: conf.wss.cacertfile.clone(),
+                        fail_if_no_peer_cert: conf.wss.fail_if_no_peer_cert,
+                    },
+                )
+                .map_err(|e| e.to_string())?,
+            ),
+            "tcp" | "ssl" | "ws" => None,
+            other => return Err(format!("the kernel does not serve {other} listeners")),
+        };
+        let listener =
+            bind_listener(&record.bind, backlog).map_err(|e| format!("{}: {e}", record.bind))?;
         let count = Arc::new(AtomicU64::new(0));
+        let shared = self.shared.clone();
+        let task = match (kind, tls) {
+            ("ssl", Some(tls)) => tokio::spawn(serve_native_mqtts(
+                listener,
+                tls,
+                max,
+                count.clone(),
+                shared,
+            )),
+            // PSK serves the identity store with PSK suites only. An
+            // unknown identity and a wrong key both fail the handshake.
+            ("ssl", None) => tokio::spawn(serve_native_mqtt_psk(
+                listener,
+                shared.psk.clone(),
+                max,
+                count.clone(),
+                shared,
+            )),
+            ("wss", Some(tls)) => tokio::spawn(serve_native_wss(
+                listener,
+                tls,
+                conf.wss.path.clone(),
+                max,
+                count.clone(),
+                shared,
+            )),
+            ("ws", _) => tokio::spawn(serve_native_ws(
+                listener,
+                conf.ws.path.clone(),
+                max,
+                count.clone(),
+                shared,
+            )),
+            _ => tokio::spawn(serve_native_mqtt(listener, max, count.clone(), shared)),
+        };
         self.counts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(record.id.clone(), count.clone());
-        if record.kind == "ssl" {
-            let tls =
-                load_tls_config(&record.cert_file, &record.key_file).map_err(|e| e.to_string())?;
-            let listener = bind_listener(&record.bind, backlog)
-                .map_err(|e| format!("{}: {e}", record.bind))?;
-            let shared = self.shared.clone();
-            handles.insert(
-                record.id.clone(),
-                tokio::spawn(serve_native_mqtts(listener, tls, max, count, shared)),
-            );
-            return Ok(());
-        }
-        let listener =
-            bind_listener(&record.bind, backlog).map_err(|e| format!("{}: {e}", record.bind))?;
-        let shared = self.shared.clone();
-        handles.insert(
-            record.id.clone(),
-            tokio::spawn(serve_native_mqtt(listener, max, count, shared)),
-        );
+            .insert(record.id.clone(), count);
+        handles.insert(record.id.clone(), task);
         Ok(())
     }
 
@@ -219,7 +283,8 @@ impl broker_api::v5::listeners::ListenerController for NativeListenerController 
 }
 
 /// Accepts MQTT clients and runs one task for each of them. A client
-/// above `max_connections` is closed at once.
+/// above `max_connections` is closed at once. The listener name is
+/// `tcp` for tenant rules and certificate checks.
 pub(super) async fn serve_native_mqtt(
     listener: TcpListener,
     max_connections: Option<u32>,
@@ -242,11 +307,19 @@ pub(super) async fn serve_native_mqtt(
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-        let (reader, writer) = stream.into_split();
+        let accepted_at = Instant::now();
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) =
-                run_connection(reader, writer, peer.ip().to_string(), conn_id, shared).await
+            if let Err(e) = run_connection(
+                stream,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "tcp",
+                PeerCert::default(),
+                accepted_at,
+            )
+            .await
             {
                 debug!("Kernel MQTT connection {} ended: {}", conn_id, e);
             }
@@ -258,12 +331,77 @@ pub(super) async fn serve_native_mqtt(
 /// and sends nothing does not keep a task for a longer time.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Client certificate policy of one secure listener.
+/// The fields mirror the listener settings with the same names.
+/// `verify_peer` mirrors `verify = "verify_peer"`.
+/// `legacy_verify` mirrors `verify_client_cert`.
+/// `cacertfile` mirrors `cacertfile`.
+/// `fail_if_no_peer_cert` mirrors `fail_if_no_peer_cert`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct TlsClientAuth {
+    /// True when the mode setting requests a chain check.
+    pub verify_peer: bool,
+    /// True when the legacy switch requests a chain check.
+    pub legacy_verify: bool,
+    /// CA file for the chain check. Empty selects the system roots.
+    pub cacertfile: String,
+    /// True when a missing certificate fails the handshake.
+    pub fail_if_no_peer_cert: bool,
+}
+
+impl TlsClientAuth {
+    /// True when the listener checks any client certificate chain.
+    fn verify_on(&self) -> bool {
+        self.verify_peer || self.legacy_verify
+    }
+
+    /// True when a missing certificate fails the handshake.
+    /// The bind check repeats the refusal for defense in depth.
+    fn require_cert(&self) -> bool {
+        self.fail_if_no_peer_cert && self.verify_on()
+    }
+}
+
+/// Loads the trust roots for client certificate checks.
+/// An empty path selects the bundled system roots.
+/// A set path must name a PEM file with at least one certificate.
+/// A missing file, an unreadable file and an empty file return an
+/// error. The caller fails the listener start on an error.
+fn load_client_roots(
+    cacertfile: &str,
+) -> Result<rustls::RootCertStore, Box<dyn std::error::Error + Send + Sync>> {
+    if cacertfile.trim().is_empty() {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        return Ok(roots);
+    }
+    let file = std::fs::File::open(cacertfile)?;
+    let mut reader = std::io::BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)?;
+    if certs.is_empty() {
+        return Err(format!("no CA certificate in {cacertfile}").into());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for der in certs {
+        roots.add(rustls::pki_types::CertificateDer::from(der))?;
+    }
+    Ok(roots)
+}
+
 /// Reads the certificate chain and the private key of the TLS listener
 /// and makes the server configuration. The protocol versions are TLS 1.2
 /// and TLS 1.3 with the default cipher suites of the library.
+/// Without verification the server requests no client certificate.
+/// With optional verification the server requests a client certificate
+/// and checks a sent chain against the CA file. A missing certificate
+/// passes the handshake and fails at the bind when required there.
+/// With required verification a missing certificate fails the handshake.
+/// A bad chain (wrong CA, expired, not yet valid) fails the handshake.
+/// Off by default keeps handshakes unchanged.
 pub(super) fn load_tls_config(
     cert_file: &str,
     key_file: &str,
+    client_auth: &TlsClientAuth,
 ) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error + Send + Sync>> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -288,16 +426,119 @@ pub(super) fn load_tls_config(
     }
     let key = key.ok_or_else(|| format!("no private key in {key_file}"))?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
+    let builder = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?;
+    if !client_auth.verify_on() {
+        let config = builder.with_no_client_auth().with_single_cert(certs, key)?;
+        return Ok(Arc::new(config));
+    }
+    let roots = load_client_roots(&client_auth.cacertfile)?;
+    let verifier_builder = rustls::server::WebPkiClientVerifier::builder(roots.into());
+    let verifier = if client_auth.require_cert() {
+        verifier_builder.build()?
+    } else {
+        verifier_builder.allow_unauthenticated().build()?
+    };
+    let config = builder
+        .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)?;
     Ok(Arc::new(config))
 }
 
+/// Largest certificate field kept for tenant rules.
+/// Reason: matches the bind section bound, so one peer cannot grow memory.
+const MAX_NATIVE_CERT_FIELD_LEN: usize = 1024;
+/// Most SANs kept for tenant rules.
+/// Reason: matches the bind section bound.
+const MAX_NATIVE_CERT_SANS: usize = 16;
+
+/// Client certificate fields pulled from the TLS handshake.
+/// The kernel native path fills them. Plain TCP keeps them empty.
+#[derive(Clone, Debug, Default)]
+pub(super) struct PeerCert {
+    /// Common name of the leaf, if present.
+    pub cn: Option<String>,
+    /// Subject name of the leaf, if present.
+    pub subject: Option<String>,
+    /// DNS and IP subject-alt names of the leaf.
+    pub sans: Vec<String>,
+}
+
+/// Pulls CN, subject and SANs from the leaf peer certificate.
+/// Runs once at handshake, never on publish or deliver.
+/// A missing or bad certificate yields empty fields.
+/// The bind check then denies when verification is on.
+fn peer_cert_fields(certs: Option<&[rustls::pki_types::CertificateDer<'_>]>) -> PeerCert {
+    use x509_parser::prelude::*;
+    let Some(certs) = certs else {
+        return PeerCert::default();
+    };
+    let Some(leaf) = certs.first() else {
+        return PeerCert::default();
+    };
+    let Ok((_, cert)) = parse_x509_certificate(leaf.as_ref()) else {
+        return PeerCert::default();
+    };
+    let cn = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.attr_value().as_str().ok().map(str::to_string))
+        .filter(|text| !text.is_empty())
+        .map(|mut text| {
+            text.truncate(MAX_NATIVE_CERT_FIELD_LEN);
+            text
+        });
+    let mut subject = cert.subject().to_string();
+    if subject.is_empty() {
+        return PeerCert {
+            cn,
+            subject: None,
+            sans: Vec::new(),
+        };
+    }
+    subject.truncate(MAX_NATIVE_CERT_FIELD_LEN);
+    let mut sans: Vec<String> = Vec::new();
+    for ext in cert.extensions().iter() {
+        if let ParsedExtension::SubjectAlternativeName(names) = ext.parsed_extension() {
+            for name in &names.general_names {
+                let text = match name {
+                    GeneralName::DNSName(value) => Some(value.to_string()),
+                    GeneralName::IPAddress(bytes) => {
+                        if bytes.len() == 4 {
+                            Some(format!(
+                                "{}.{}.{}.{}",
+                                bytes[0], bytes[1], bytes[2], bytes[3]
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(mut text) = text {
+                    if !text.is_empty() && sans.len() < MAX_NATIVE_CERT_SANS {
+                        text.truncate(MAX_NATIVE_CERT_FIELD_LEN);
+                        sans.push(text);
+                    }
+                }
+            }
+        }
+    }
+    PeerCert {
+        cn,
+        subject: Some(subject),
+        sans,
+    }
+}
+
 /// Accepts MQTT clients over TLS. The handshake runs in the task of the
 /// connection, thus a slow handshake does not delay the accept of other
-/// clients. A client above `max_connections` is closed at once.
+/// clients. A client above `max_connections` is closed at once. The
+/// listener name is `tls` for tenant rules and certificate checks.
+/// The handshake pulls the peer certificate fields for the bind.
+/// A bad chain fails the handshake. A missing certificate reaches
+/// the bind check, which denies it only when verification is on.
 pub(super) async fn serve_native_mqtts(
     listener: TcpListener,
     config: Arc<rustls::ServerConfig>,
@@ -323,6 +564,7 @@ pub(super) async fn serve_native_mqtts(
         let shared = shared.clone();
         let acceptor = acceptor.clone();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let accepted_at = Instant::now();
         tokio::spawn(async move {
             let _slot = slot;
             let tls =
@@ -337,13 +579,767 @@ pub(super) async fn serve_native_mqtts(
                         return;
                     }
                 };
-            let (reader, writer) = tokio::io::split(tls);
-            if let Err(e) =
-                run_connection(reader, writer, peer.ip().to_string(), conn_id, shared).await
+            let peer_cert = peer_cert_fields(tls.get_ref().1.peer_certificates());
+            if let Err(e) = run_connection(
+                tls,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "tls",
+                peer_cert,
+                accepted_at,
+            )
+            .await
             {
                 debug!("Kernel MQTT TLS connection {} ended: {}", conn_id, e);
             }
         });
+    }
+}
+
+/// PSK cipher suites for TLS 1.2.
+/// Reason: AEAD only, so no CBC padding-oracle class.
+/// Matches the cipher suites of the edge reference.
+const PSK_CIPHER_LIST: &str = "PSK-AES128-GCM-SHA256:PSK-AES256-GCM-SHA384";
+/// PSK cipher suites for TLS 1.3.
+/// Reason: the two GCM suites cover 128 and 256 bit keys.
+const PSK_CIPHERSUITES: &str = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384";
+
+/// Raw OpenSSL handshake hooks for TLS 1.3 external PSK.
+/// The safe wrapper exposes only the TLS 1.2 callback, so this
+/// module calls `SSL_CTX_set_psk_find_session_callback` directly.
+/// Both callbacks read the same store.
+mod psk_tls13 {
+    use std::collections::HashMap;
+    use std::os::raw::{c_char, c_int, c_uchar, c_void};
+    use std::sync::{Arc, OnceLock};
+
+    /// TLS 1.3 version number for the session object.
+    /// Reason: the protocol version comes from the TLS specification.
+    const TLS1_3_VERSION: c_int = 0x0304;
+
+    extern "C" {
+        fn SSL_CTX_set_psk_find_session_callback(
+            ctx: *mut c_void,
+            cb: Option<
+                unsafe extern "C" fn(*mut c_void, *const c_uchar, usize, *mut *mut c_void) -> c_int,
+            >,
+        );
+        fn SSL_get_SSL_CTX(ssl: *const c_void) -> *mut c_void;
+        fn SSL_SESSION_new() -> *mut c_void;
+        fn SSL_SESSION_free(sess: *mut c_void);
+        fn SSL_SESSION_set1_master_key(
+            sess: *mut c_void,
+            key: *const c_uchar,
+            keylen: usize,
+        ) -> c_int;
+        fn SSL_SESSION_set_cipher(sess: *mut c_void, cipher: *const c_void) -> c_int;
+        fn SSL_SESSION_set_protocol_version(sess: *mut c_void, version: c_int) -> c_int;
+        fn SSL_get_ciphers(ssl: *const c_void) -> *mut c_void;
+        fn SSL_CIPHER_get_name(cipher: *const c_void) -> *const c_char;
+        fn OPENSSL_sk_num(stack: *const c_void) -> c_int;
+        fn OPENSSL_sk_value(stack: *const c_void, index: c_int) -> *mut c_void;
+    }
+
+    /// Context pointer to store map. One entry for each PSK listener.
+    /// Holds at most [`MAX_PSK_CONTEXTS`] entries.
+    fn ctx_stores() -> &'static parking_lot::Mutex<HashMap<usize, Arc<broker_auth::PskStore>>> {
+        static CELL: OnceLock<parking_lot::Mutex<HashMap<usize, Arc<broker_auth::PskStore>>>> =
+            OnceLock::new();
+        CELL.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+    }
+
+    /// Most TLS 1.3 PSK contexts remembered at once.
+    /// Reason: the kernel runs one PSK listener, so one entry is live.
+    /// The rest covers restarts and tests.
+    pub(super) const MAX_PSK_CONTEXTS: usize = 16;
+
+    /// Remembers the store for one context pointer.
+    /// Refuses a new context past the bound and reports false.
+    /// The caller fails the listener start on false.
+    pub(super) fn register(ctx: *mut c_void, store: Arc<broker_auth::PskStore>) -> bool {
+        let mut map = ctx_stores().lock();
+        if !map.contains_key(&(ctx as usize)) && map.len() >= MAX_PSK_CONTEXTS {
+            return false;
+        }
+        map.insert(ctx as usize, store);
+        true
+    }
+
+    /// Sets the TLS 1.3 find-session callback on one context.
+    pub(super) fn set_callback(ctx: *mut c_void) {
+        unsafe {
+            SSL_CTX_set_psk_find_session_callback(ctx, Some(find_session_cb));
+        }
+    }
+
+    /// Picks a TLS 1.3 cipher for the new session.
+    /// Prefers an AES GCM suite, else takes the first suite.
+    unsafe fn pick_cipher(ssl: *const c_void) -> *const c_void {
+        let stack = SSL_get_ciphers(ssl);
+        if stack.is_null() {
+            return std::ptr::null();
+        }
+        let count = OPENSSL_sk_num(stack);
+        let mut first: *const c_void = std::ptr::null();
+        let mut index = 0;
+        while index < count {
+            let cipher = OPENSSL_sk_value(stack, index) as *const c_void;
+            if !cipher.is_null() {
+                if first.is_null() {
+                    first = cipher;
+                }
+                let name = SSL_CIPHER_get_name(cipher);
+                if !name.is_null()
+                    && std::ffi::CStr::from_ptr(name)
+                        .to_bytes()
+                        .starts_with(b"TLS_AES_")
+                {
+                    return cipher;
+                }
+            }
+            index += 1;
+        }
+        first
+    }
+
+    /// TLS 1.3 session lookup. Runs during the handshake.
+    /// Unknown identity fails with 0, same as a wrong key later does.
+    /// It never logs the identity.
+    unsafe extern "C" fn find_session_cb(
+        ssl: *mut c_void,
+        identity: *const c_uchar,
+        idlen: usize,
+        sess_out: *mut *mut c_void,
+    ) -> c_int {
+        if identity.is_null() || sess_out.is_null() {
+            return 0;
+        }
+        let id = std::slice::from_raw_parts(identity, idlen);
+        let ctx = SSL_get_SSL_CTX(ssl);
+        let key = ctx_stores()
+            .lock()
+            .get(&(ctx as usize))
+            .and_then(|store| store.lookup(id));
+        let Some(key) = key else {
+            return 0;
+        };
+        let sess = SSL_SESSION_new();
+        if sess.is_null() {
+            return 0;
+        }
+        if SSL_SESSION_set1_master_key(sess, key.as_ptr(), key.len()) != 1 {
+            SSL_SESSION_free(sess);
+            return 0;
+        }
+        let cipher = pick_cipher(ssl);
+        if cipher.is_null() || SSL_SESSION_set_cipher(sess, cipher) != 1 {
+            SSL_SESSION_free(sess);
+            return 0;
+        }
+        if SSL_SESSION_set_protocol_version(sess, TLS1_3_VERSION) != 1 {
+            SSL_SESSION_free(sess);
+            return 0;
+        }
+        *sess_out = sess;
+        1
+    }
+}
+
+/// Builds the OpenSSL server context for the PSK listener.
+/// Uses only PSK suites and no certificate. Wires the TLS 1.2
+/// server callback and the TLS 1.3 find-session callback to
+/// the same store. Releases idle buffers. Fails closed on
+/// any OpenSSL error.
+pub(super) fn build_psk_ssl_context(
+    store: Arc<broker_auth::PskStore>,
+) -> Result<openssl::ssl::SslContext, Box<dyn std::error::Error + Send + Sync>> {
+    use openssl::ssl::{SslContextBuilder, SslMethod, SslVersion};
+    let mut builder = SslContextBuilder::new(SslMethod::tls_server())?;
+    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+    builder.set_cipher_list(PSK_CIPHER_LIST)?;
+    builder.set_ciphersuites(PSK_CIPHERSUITES)?;
+    // Reason: every PSK handshake runs the full lookup, so no
+    // session resumes and the cache would only spend memory.
+    builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::OFF);
+    builder.set_mode(openssl::ssl::SslMode::RELEASE_BUFFERS);
+    let lookup = store.clone();
+    // An unknown identity fails here. A wrong key fails at the
+    // Finished check. The two paths differ as far as the library
+    // permits. Neither path names the identity.
+    builder.set_psk_server_callback(move |_ssl, identity, psk| {
+        let id = identity.unwrap_or_default();
+        let key = lookup
+            .lookup(id)
+            .ok_or_else(openssl::error::ErrorStack::get)?;
+        if key.len() > psk.len() {
+            return Err(openssl::error::ErrorStack::get());
+        }
+        psk[..key.len()].copy_from_slice(&key);
+        Ok(key.len())
+    });
+    if !psk_tls13::register(builder.as_ptr() as *mut std::ffi::c_void, store) {
+        return Err(format!(
+            "PSK context table holds {} entries",
+            psk_tls13::MAX_PSK_CONTEXTS
+        )
+        .into());
+    }
+    psk_tls13::set_callback(builder.as_ptr() as *mut std::ffi::c_void);
+    Ok(builder.build())
+}
+
+/// Accepts MQTT clients over TLS PSK. The caller enables PSK by
+/// starting this listener. The certificate TLS listener stays
+/// unchanged and keeps its rustls path. Each handshake runs in
+/// the task of the connection with the TLS time limit. An
+/// unknown identity and a wrong key both fail the handshake.
+/// The failure never names the identity. The listener name is
+/// `tls` for tenant rules. The same packet limits, the connect
+/// timeout from accept, and `max_connections` apply as on TCP.
+pub(super) async fn serve_native_mqtt_psk(
+    listener: TcpListener,
+    psk: Arc<broker_auth::PskStore>,
+    max_connections: Option<u32>,
+    count: Arc<AtomicU64>,
+    shared: Shared,
+) {
+    let context = match build_psk_ssl_context(psk) {
+        Ok(context) => Arc::new(context),
+        Err(e) => {
+            warn!("Kernel MQTT PSK listener failed to start: {}", e);
+            return;
+        }
+    };
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                warn!("Kernel MQTT PSK accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Some(slot) = PerListenerSlot::take(&count, max_connections) else {
+            debug!("Kernel MQTT PSK listener is at its connection limit");
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let shared = shared.clone();
+        let context = context.clone();
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let accepted_at = Instant::now();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let ssl = match openssl::ssl::Ssl::new(&context) {
+                Ok(ssl) => ssl,
+                Err(e) => {
+                    debug!("Kernel MQTT PSK handshake setup failed: {}", e);
+                    return;
+                }
+            };
+            let mut tls = match tokio_openssl::SslStream::new(ssl, stream) {
+                Ok(tls) => tls,
+                Err(e) => {
+                    debug!("Kernel MQTT PSK stream setup failed: {}", e);
+                    return;
+                }
+            };
+            if let Err(e) =
+                tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, std::pin::Pin::new(&mut tls).accept())
+                    .await
+                    .map_err(|_| "timeout")
+                    .and_then(|handshake| handshake.map_err(|_| "refused"))
+            {
+                debug!("Kernel MQTT PSK handshake with {} failed: {}", peer, e);
+                return;
+            }
+            if let Err(e) = run_connection(
+                tls,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "tls",
+                PeerCert::default(),
+                accepted_at,
+            )
+            .await
+            {
+                debug!("Kernel MQTT PSK connection {} ended: {}", conn_id, e);
+            }
+        });
+    }
+}
+
+/// WebSocket frame and message bound in bytes.
+/// Reason: matches the MQTT packet bound, so one peer cannot grow memory.
+const MAX_WS_FRAME_BYTES: usize = MAX_PACKET_BYTES;
+/// Target size of the WebSocket write buffer in bytes.
+/// Reason: keeps the tungstenite WebSocketConfig default of 128 KiB, so small frames share one write.
+const WS_WRITE_BUFFER_BYTES: usize = 128 * 1024;
+
+/// Builds the WebSocket bound config.
+/// The frame bound matches the MQTT packet bound.
+fn ws_bound_config() -> WebSocketConfig {
+    WebSocketConfig {
+        write_buffer_size: WS_WRITE_BUFFER_BYTES,
+        max_write_buffer_size: MAX_WS_FRAME_BYTES,
+        max_message_size: Some(MAX_WS_FRAME_BYTES),
+        max_frame_size: Some(MAX_WS_FRAME_BYTES),
+        accept_unmasked_frames: false,
+        ..WebSocketConfig::default()
+    }
+}
+
+/// Checks the WebSocket upgrade request.
+/// The path must match. The client must offer the `mqtt` subprotocol.
+/// The answer selects `mqtt`. A wrong path gets 404.
+/// A missing subprotocol gets 400.
+// The callback returns the HTTP response type of the library.
+// That type exceeds the lint limit. The signature is fixed.
+#[allow(clippy::result_large_err)]
+fn ws_upgrade_answer(
+    req: &Request,
+    path: &str,
+    mut resp: Response,
+) -> Result<Response, http::Response<Option<String>>> {
+    if req.uri().path() != path {
+        let denied = http::Response::builder()
+            .status(404)
+            .body(Some("Unknown WS path".to_string()))
+            .unwrap_or_else(|_| {
+                http::Response::builder()
+                    .status(404)
+                    .body(None)
+                    .expect("empty 404 builds")
+            });
+        return Err(denied);
+    }
+    let wants_mqtt = req
+        .headers()
+        .get("Sec-WebSocket-Protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("mqtt"))
+        })
+        .unwrap_or(false);
+    if !wants_mqtt {
+        let denied = http::Response::builder()
+            .status(400)
+            .body(Some("mqtt subprotocol required".to_string()))
+            .unwrap_or_else(|_| {
+                http::Response::builder()
+                    .status(400)
+                    .body(None)
+                    .expect("empty 400 builds")
+            });
+        return Err(denied);
+    }
+    resp.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        "mqtt".parse().expect("static header parses"),
+    );
+    Ok(resp)
+}
+
+/// Accepts MQTT clients over WebSocket and runs one task for each.
+/// The HTTP upgrade requires the configured path and the `mqtt`
+/// subprotocol. A wrong path gets 404. A missing subprotocol gets
+/// 400. MQTT travels in binary frames. A text frame is a protocol
+/// error and closes the connection. Ping gets pong. The listener
+/// name is `ws` for tenant rules. The same packet limits, the
+/// connect timeout from accept, and `max_connections` apply as on TCP.
+// The handshake callback returns the HTTP response type of the library.
+// That type exceeds the lint limit. The signature is fixed.
+#[allow(clippy::result_large_err)]
+pub(super) async fn serve_native_ws(
+    listener: TcpListener,
+    path: String,
+    max_connections: Option<u32>,
+    count: Arc<AtomicU64>,
+    shared: Shared,
+) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                warn!("Kernel MQTT WebSocket accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Some(slot) = PerListenerSlot::take(&count, max_connections) else {
+            debug!("Kernel MQTT WebSocket listener is at its connection limit");
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let shared = shared.clone();
+        let path = path.clone();
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let accepted_at = Instant::now();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let ws = match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                tokio_tungstenite::accept_hdr_async_with_config(
+                    stream,
+                    |req: &Request, resp: Response| ws_upgrade_answer(req, &path, resp),
+                    Some(ws_bound_config()),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(ws)) => ws,
+                Ok(Err(e)) => {
+                    debug!(
+                        "Kernel MQTT WebSocket handshake with {} failed: {}",
+                        peer, e
+                    );
+                    return;
+                }
+                Err(_) => {
+                    debug!("Kernel MQTT WebSocket handshake with {} timed out", peer);
+                    return;
+                }
+            };
+            let io = WsIo::new(ws);
+            if let Err(e) = run_connection(
+                io,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "ws",
+                PeerCert::default(),
+                accepted_at,
+            )
+            .await
+            {
+                debug!("Kernel MQTT WebSocket connection {} ended: {}", conn_id, e);
+            }
+        });
+    }
+}
+
+/// Accepts MQTT clients over secure WebSocket and runs one task for each.
+/// TLS wraps the socket first. The upgrade then runs on the TLS stream
+/// with the same path and subprotocol checks as the plain WebSocket
+/// listener. The handshake uses the same certificate settings as the
+/// TLS listener with TLS 1.2 and 1.3. A client without TLS fails the
+/// TLS handshake and the task ends. The TLS handshake has the TLS time
+/// limit. The upgrade has the connect time limit. The listener name is
+/// `wss` for tenant rules. The same packet limits, the connect timeout
+/// from accept, and `max_connections` apply as on TCP.
+// The handshake callback returns the HTTP response type of the library.
+// That type exceeds the lint limit. The signature is fixed.
+#[allow(clippy::result_large_err)]
+pub(super) async fn serve_native_wss(
+    listener: TcpListener,
+    config: Arc<rustls::ServerConfig>,
+    path: String,
+    max_connections: Option<u32>,
+    count: Arc<AtomicU64>,
+    shared: Shared,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                warn!("Kernel MQTT secure WebSocket accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let Some(slot) = PerListenerSlot::take(&count, max_connections) else {
+            debug!("Kernel MQTT secure WebSocket listener is at its connection limit");
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let shared = shared.clone();
+        let acceptor = acceptor.clone();
+        let path = path.clone();
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let accepted_at = Instant::now();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let tls =
+                match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(tls)) => tls,
+                    Ok(Err(e)) => {
+                        debug!(
+                            "Kernel MQTT secure WebSocket TLS handshake with {} failed: {}",
+                            peer, e
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        debug!(
+                            "Kernel MQTT secure WebSocket TLS handshake with {} timed out",
+                            peer
+                        );
+                        return;
+                    }
+                };
+            let peer_cert = peer_cert_fields(tls.get_ref().1.peer_certificates());
+            let ws = match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                tokio_tungstenite::accept_hdr_async_with_config(
+                    tls,
+                    |req: &Request, resp: Response| ws_upgrade_answer(req, &path, resp),
+                    Some(ws_bound_config()),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(ws)) => ws,
+                Ok(Err(e)) => {
+                    debug!(
+                        "Kernel MQTT secure WebSocket handshake with {} failed: {}",
+                        peer, e
+                    );
+                    return;
+                }
+                Err(_) => {
+                    debug!(
+                        "Kernel MQTT secure WebSocket handshake with {} timed out",
+                        peer
+                    );
+                    return;
+                }
+            };
+            let io = WsIo::new(ws);
+            if let Err(e) = run_connection(
+                io,
+                peer.ip().to_string(),
+                conn_id,
+                shared,
+                "wss",
+                peer_cert,
+                accepted_at,
+            )
+            .await
+            {
+                debug!(
+                    "Kernel MQTT secure WebSocket connection {} ended: {}",
+                    conn_id, e
+                );
+            }
+        });
+    }
+}
+
+/// One WebSocket connection as a byte transport.
+/// Binary payloads are MQTT bytes. Ping gets pong. Text is an error.
+struct WsIo<S> {
+    /// The WebSocket stream. It yields messages and takes replies.
+    inner: S,
+    /// Binary bytes not yet read by the MQTT layer.
+    pending_in: BytesMut,
+    /// MQTT bytes not yet sent as a binary frame.
+    pending_out: Vec<u8>,
+    /// Pong payloads that wait for the next flush.
+    pending_pong: Vec<Vec<u8>>,
+}
+
+impl<S> WsIo<S> {
+    /// Wraps a WebSocket stream as a byte transport.
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            pending_in: BytesMut::new(),
+            pending_out: Vec::new(),
+            pending_pong: Vec::new(),
+        }
+    }
+}
+
+/// Starts one send when the sink is ready. Queues nothing.
+fn ws_poll_send<S>(
+    inner: Pin<&mut S>,
+    cx: &mut Context<'_>,
+    message: Message,
+) -> Poll<std::io::Result<()>>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let mut inner = inner;
+    match inner.as_mut().poll_ready(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(())) => match inner.as_mut().start_send(message) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("websocket send failed: {e}"),
+            ))),
+        },
+        Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!("websocket send failed: {e}"),
+        ))),
+    }
+}
+
+impl<S> AsyncRead for WsIo<S>
+where
+    S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if !this.pending_in.is_empty() {
+            let take = this.pending_in.len().min(buf.remaining());
+            buf.put_slice(&this.pending_in[..take]);
+            let _ = this.pending_in.split_to(take);
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            let next = Pin::new(&mut this.inner).poll_next(cx);
+            match next {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("websocket read failed: {e}"),
+                    )));
+                }
+                Poll::Ready(Some(Ok(message))) => match message {
+                    Message::Binary(data) => {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if data.len() > MAX_WS_FRAME_BYTES {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionAborted,
+                                "websocket frame is too large",
+                            )));
+                        }
+                        let take = data.len().min(buf.remaining());
+                        buf.put_slice(&data[..take]);
+                        if take < data.len() {
+                            this.pending_in.extend_from_slice(&data[take..]);
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                    Message::Ping(payload) => {
+                        match ws_poll_send(
+                            Pin::new(&mut this.inner),
+                            cx,
+                            Message::Pong(payload.clone()),
+                        ) {
+                            Poll::Ready(Ok(())) => {}
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => this.pending_pong.push(payload),
+                        }
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Text(_) => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "text frame on an MQTT transport",
+                        )));
+                    }
+                    Message::Close(_) => return Poll::Ready(Ok(())),
+                    _ => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "unsupported websocket frame",
+                        )));
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl<S> AsyncWrite for WsIo<S>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        // One flush sends the batch as one binary frame. The batch
+        // holds at most EGRESS_BATCH_BYTES, far below the frame bound.
+        self.pending_out.extend_from_slice(data);
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        // Readiness runs before any take, so no bytes are lost.
+        while !this.pending_pong.is_empty() {
+            match Pin::new(&mut this.inner).poll_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("websocket send failed: {e}"),
+                    )));
+                }
+                Poll::Ready(Ok(())) => {}
+            }
+            let Some(payload) = this.pending_pong.pop() else {
+                break;
+            };
+            if let Err(e) = Pin::new(&mut this.inner).start_send(Message::Pong(payload)) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("websocket send failed: {e}"),
+                )));
+            }
+        }
+        if !this.pending_out.is_empty() {
+            match Pin::new(&mut this.inner).poll_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("websocket send failed: {e}"),
+                    )));
+                }
+                Poll::Ready(Ok(())) => {}
+            }
+            let data = std::mem::take(&mut this.pending_out);
+            if let Err(e) = Pin::new(&mut this.inner).start_send(Message::Binary(data)) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("websocket send failed: {e}"),
+                )));
+            }
+        }
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("websocket flush failed: {e}"),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_close(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("websocket close failed: {e}"),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -582,6 +1578,14 @@ fn encode_frame(frame: &BrokerFrame, level: u8, out: &mut Vec<u8>) -> FrameEffec
             wire::encode_suback(packet_id, &meta[2..], level, out);
             FrameEffect::None
         }
+        OpCode::UnsubAckOut => {
+            if meta.len() < 2 {
+                return FrameEffect::Close;
+            }
+            let packet_id = u16::from_be_bytes([meta[0], meta[1]]);
+            wire::encode_unsuback(packet_id, &meta[2..], level, out);
+            FrameEffect::None
+        }
         OpCode::PubAckOut | OpCode::PubRecOut | OpCode::PubRelOut | OpCode::PubCompOut => {
             if meta.len() < 2 {
                 return FrameEffect::Close;
@@ -645,13 +1649,49 @@ impl Conn {
     }
 }
 
-fn bind_request(connect: wire::Connect, peer: &str) -> BindRequest {
+/// Takes one `peer_cert_as_*` mode and returns the certificate value.
+/// `cn` selects the common name. `dn` selects the subject name.
+/// `disabled` and unknown modes return `None`.
+/// An absent or empty source returns `None`.
+/// TODO(parity): the rulebook does not decide whether a bind with
+/// mapping on but no certificate keeps the CONNECT values (current)
+/// or fails. The current choice keeps accepted behavior unchanged.
+fn cert_identity_value(mode: &str, peer_cert: &PeerCert) -> Option<String> {
+    let value = match mode {
+        "cn" => peer_cert.cn.clone(),
+        "dn" => peer_cert.subject.clone(),
+        _ => None,
+    }?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Makes the bind request of one CONNECT on a kernel-owned connection.
+/// The verified certificate fills the same bind fields the edge sends:
+/// common name, subject and SANs. The listener policy takes the bind
+/// username and client identifier from the certificate when set.
+/// Connections the edge holds keep their CONNECT values: the edge
+/// has no such setting.
+/// TODO(parity): the rulebook does not decide whether edge-held binds
+/// honor `peer_cert_as_*`. The current code maps only kernel-held
+/// connections and keeps edge behavior unchanged.
+fn bind_request(
+    connect: wire::Connect,
+    peer: &str,
+    listener: &str,
+    peer_cert: &PeerCert,
+    peer_as_username: &str,
+    peer_as_clientid: &str,
+) -> BindRequest {
     let props = connect.properties;
     BindRequest {
-        client_id: connect.client_id,
+        client_id: cert_identity_value(peer_as_clientid, peer_cert).unwrap_or(connect.client_id),
         clean_start: connect.clean_start,
         keepalive_secs: connect.keepalive,
-        username: connect.username,
+        username: cert_identity_value(peer_as_username, peer_cert).or(connect.username),
         password: connect.password,
         peerhost: Some(peer.to_string()),
         client_alias_max: props
@@ -664,9 +1704,9 @@ fn bind_request(connect: wire::Connect, peer: &str) -> BindRequest {
             qos: will.qos,
             retain: will.retain,
         }),
-        cert_cn: None,
-        cert_subject: None,
-        cert_sans: Vec::new(),
+        cert_cn: peer_cert.cn.clone(),
+        cert_subject: peer_cert.subject.clone(),
+        cert_sans: peer_cert.sans.clone(),
         protocol_version: if connect.level == 5 { 5 } else { 4 },
         session_expiry: props.as_ref().and_then(|p| p.session_expiry).unwrap_or(0),
         receive_maximum: props
@@ -678,6 +1718,7 @@ fn bind_request(connect: wire::Connect, peer: &str) -> BindRequest {
             .and_then(|p| p.maximum_packet_size)
             .unwrap_or(0),
         user_properties: props.map(|p| p.user_properties.into_iter().collect()),
+        listener: listener.to_string(),
     }
 }
 
@@ -709,6 +1750,21 @@ fn publish_in_meta(publish: &wire::Publish<'_>, level: u8) -> Vec<u8> {
         // The alias section alone. An alias of 0 stays in the frame,
         // thus the kernel refuses it with reason code 0x94.
         meta.extend_from_slice(&alias.to_be_bytes());
+    }
+    meta
+}
+
+/// The metadata of an `UnsubscribeIn` frame.
+fn unsubscribe_in_meta(client_id: &str, unsubscribe: &wire::Unsubscribe<'_>) -> Vec<u8> {
+    let id = client_id.as_bytes();
+    let mut meta = Vec::with_capacity(6 + id.len() + unsubscribe.filters.len() * 16);
+    meta.extend_from_slice(&unsubscribe.packet_id.to_be_bytes());
+    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    meta.extend_from_slice(id);
+    meta.extend_from_slice(&(unsubscribe.filters.len() as u16).to_be_bytes());
+    for filter in &unsubscribe.filters {
+        meta.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+        meta.extend_from_slice(filter.as_bytes());
     }
     meta
 }
@@ -804,16 +1860,17 @@ impl Drop for ConnGuard {
     }
 }
 
-async fn run_connection<R, W>(
-    mut reader: R,
-    mut writer: W,
+async fn run_connection<S>(
+    mut io: S,
     peer: String,
     conn_id: u64,
     shared: Shared,
+    listener: &str,
+    peer_cert: PeerCert,
+    accepted_at: Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
     let waker = Arc::new(tokio::sync::Notify::new());
@@ -837,7 +1894,6 @@ where
         keepalive: None,
         peer,
     };
-    let started = Instant::now();
     let mut last_packet = Instant::now();
 
     let stop = loop {
@@ -845,7 +1901,7 @@ where
         let deadline = if conn.connected {
             conn.keepalive.map(|keepalive| last_packet + keepalive)
         } else {
-            Some(started + CONNECT_TIMEOUT)
+            Some(accepted_at + CONNECT_TIMEOUT)
         };
         let timer = async {
             match deadline {
@@ -854,7 +1910,7 @@ where
             }
         };
         tokio::select! {
-            read = reader.read_buf(&mut inbuf) => {
+            read = io.read_buf(&mut inbuf) => {
                 match read {
                     Ok(0) | Err(_) => break Stop::Abnormal,
                     Ok(_) => {}
@@ -868,6 +1924,8 @@ where
                     &sink,
                     &mut guard.bound,
                     &waker,
+                    listener,
+                    &peer_cert,
                 )
                 .await;
                 // The guard must know the state for a release after a panic.
@@ -878,7 +1936,7 @@ where
                 match drained {
                     Ok(None) => {}
                     Ok(Some(stop)) => {
-                        let _ = flush(&sink, &mut writer).await;
+                        let _ = flush(&sink, &mut io).await;
                         break stop;
                     }
                     Err(reason) => {
@@ -901,7 +1959,7 @@ where
             }
             () = timer => break Stop::Abnormal,
         }
-        if flush(&sink, &mut writer).await.is_err() {
+        if flush(&sink, &mut io).await.is_err() {
             break Stop::Abnormal;
         }
         if sink.close.load(Ordering::Relaxed) {
@@ -922,7 +1980,7 @@ where
         fire_will,
     )
     .await;
-    let _ = writer.shutdown().await;
+    let _ = io.shutdown().await;
     Ok(())
 }
 
@@ -1000,6 +2058,8 @@ async fn drain_inbound(
     sink: &NativeSink,
     bound: &mut Vec<(SessionKey, u64)>,
     waker: &Arc<tokio::sync::Notify>,
+    listener: &str,
+    peer_cert: &PeerCert,
 ) -> Result<Option<Stop>, WireError> {
     loop {
         let Some(header) = wire::fixed_header(inbuf)? else {
@@ -1032,7 +2092,28 @@ async fn drain_inbound(
                 sink.level.store(conn.level, Ordering::Relaxed);
                 conn.keepalive = (connect.keepalive > 0)
                     .then(|| Duration::from_millis(u64::from(connect.keepalive) * 1500));
-                let request = bind_request(connect, &conn.peer);
+                // The listener policy selects the certificate identity
+                // for kernel-owned connections. Other listeners keep
+                // the CONNECT values.
+                let (peer_as_username, peer_as_clientid) = match listener {
+                    "tls" => (
+                        shared.tls_peer_cert_as_username.as_str(),
+                        shared.tls_peer_cert_as_clientid.as_str(),
+                    ),
+                    "wss" => (
+                        shared.wss_peer_cert_as_username.as_str(),
+                        shared.wss_peer_cert_as_clientid.as_str(),
+                    ),
+                    _ => ("disabled", "disabled"),
+                };
+                let request = bind_request(
+                    connect,
+                    &conn.peer,
+                    listener,
+                    peer_cert,
+                    peer_as_username,
+                    peer_as_clientid,
+                );
                 conn.client_id = request.client_id.clone();
                 let Some(frame) = conn.frame(OpCode::BindConnection, Vec::new(), Bytes::new())
                 else {
@@ -1070,6 +2151,11 @@ async fn drain_inbound(
                 let meta = subscribe_in_meta(&conn.client_id, &subscribe, conn.level);
                 conn.frame(OpCode::SubscribeIn, meta, Bytes::new())
             }
+            kind::UNSUBSCRIBE => {
+                let unsubscribe = wire::decode_unsubscribe(&body, conn.level)?;
+                let meta = unsubscribe_in_meta(&conn.client_id, &unsubscribe);
+                conn.frame(OpCode::UnsubscribeIn, meta, Bytes::new())
+            }
             kind::PUBACK | kind::PUBREC | kind::PUBREL | kind::PUBCOMP => {
                 let (packet_id, reason) = wire::decode_ack(&body, conn.level)?;
                 let mut meta = packet_id.to_be_bytes().to_vec();
@@ -1105,8 +2191,6 @@ async fn drain_inbound(
                 conn.connected = false;
                 return Ok(Some(Stop::Clean));
             }
-            // UNSUBSCRIBE is not available in the kernel yet. The edge
-            // closes the connection for it also.
             _ => return Err(WireError::Unsupported("packet type")),
         };
         let Some(frame) = frame else {
@@ -1173,6 +2257,7 @@ mod tests {
             OpCode::PublishOut,
             OpCode::SessionBinding,
             OpCode::SubAckOut,
+            OpCode::UnsubAckOut,
             OpCode::PubAckOut,
             OpCode::PubRecOut,
             OpCode::PubRelOut,
@@ -1222,6 +2307,10 @@ mod tests {
                 properties: None,
             },
             "127.0.0.1",
+            "tcp",
+            &PeerCert::default(),
+            "disabled",
+            "disabled",
         );
         let frame = BrokerFrame::new(
             OpCode::BindConnection,
@@ -1252,6 +2341,137 @@ mod tests {
             "CONNACK for the client"
         );
         (tx, rx, bound)
+    }
+
+    /// Binds one client with credentials through the production frame
+    /// handler. Gives back whether the kernel accepted the bind plus the
+    /// CONNACK bytes, so tests observe refusals as well as accepts.
+    async fn bind_client_with_password(
+        shared: &Shared,
+        conn_id: u64,
+        client_id: &str,
+        username: &str,
+        password: &[u8],
+    ) -> (bool, Vec<u8>) {
+        let (tx, _rx) = unbounded_channel::<BrokerFrame>();
+        let waker = Arc::new(tokio::sync::Notify::new());
+        let sink = NativeSink::new();
+        let mut bound = Vec::new();
+        let request = bind_request(
+            wire::Connect {
+                level: 4,
+                clean_start: true,
+                keepalive: 60,
+                client_id: client_id.to_string(),
+                will: None,
+                username: Some(username.to_string()),
+                password: Some(password.to_vec()),
+                properties: None,
+            },
+            "127.0.0.1",
+            "tcp",
+            &PeerCert::default(),
+            "disabled",
+            "disabled",
+        );
+        let frame = BrokerFrame::new(
+            OpCode::BindConnection,
+            conn_id,
+            1,
+            Bytes::new(),
+            Bytes::new(),
+        )
+        .expect("frame");
+        handle_inbound_frame_with(
+            frame,
+            shared,
+            &tx,
+            &sink,
+            &mut bound,
+            &waker,
+            Some(&request),
+        )
+        .await
+        .expect("bind is handled");
+        let accepted = sink.accepted.load(Ordering::Relaxed);
+        (accepted, sink.take())
+    }
+
+    /// TM-01: two tenants hold the same username with different
+    /// passwords. Each CONNECT authenticates only in its own tenant,
+    /// through the production bind handler (not the store alone). The
+    /// tenant rule keys on the client id, so the same username in two
+    /// connections lands in two tenants.
+    #[tokio::test]
+    async fn tm01_connect_authenticates_same_username_in_two_tenants() {
+        let shared = Shared::new();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .tenant_registry
+            .replace(vec![broker_session::tenant::TenantRule::new(
+                "",
+                "tenant",
+                "t-${client_id}",
+            )])
+            .expect("tenant rule installs");
+        shared
+            .auth
+            .add_user_in_tenant("t-c-a", "sam", b"pw-for-a")
+            .expect("first tenant user stores");
+        shared
+            .auth
+            .add_user_in_tenant("t-c-b", "sam", b"pw-for-b")
+            .expect("second tenant user stores");
+        // Each password opens only its own tenant.
+        let (accepted, connack) = bind_client_with_password(
+            &shared,
+            NATIVE_CONN_ID_BASE + 910_001,
+            "c-a",
+            "sam",
+            b"pw-for-a",
+        )
+        .await;
+        assert!(accepted, "own password binds");
+        assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+        let (accepted, connack) = bind_client_with_password(
+            &shared,
+            NATIVE_CONN_ID_BASE + 910_002,
+            "c-b",
+            "sam",
+            b"pw-for-b",
+        )
+        .await;
+        assert!(accepted, "own password binds");
+        assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+        // Each password refuses in the other tenant.
+        let (accepted, connack) = bind_client_with_password(
+            &shared,
+            NATIVE_CONN_ID_BASE + 910_003,
+            "c-a",
+            "sam",
+            b"pw-for-b",
+        )
+        .await;
+        assert!(!accepted, "other tenant password refuses");
+        assert!(
+            connack.len() == 4 && connack[3] != 0,
+            "refusal carries a CONNACK code, got: {connack:?}"
+        );
+        let (accepted, connack) = bind_client_with_password(
+            &shared,
+            NATIVE_CONN_ID_BASE + 910_004,
+            "c-b",
+            "sam",
+            b"pw-for-a",
+        )
+        .await;
+        assert!(!accepted, "other tenant password refuses");
+        assert!(
+            connack.len() == 4 && connack[3] != 0,
+            "refusal carries a CONNACK code, got: {connack:?}"
+        );
     }
 
     #[tokio::test]
@@ -1338,5 +2558,2030 @@ mod tests {
         assert_eq!(connack_return_code(0x87), 5);
         assert_eq!(connack_return_code(0x8A), 5);
         assert_eq!(connack_return_code(0x97), 3);
+    }
+
+    /// No peer certificate yields empty fields.
+    /// The bind check then denies only when verification is on.
+    #[test]
+    fn peer_cert_fields_empty_when_no_cert() {
+        let fields = peer_cert_fields(None);
+        assert!(fields.cn.is_none());
+        assert!(fields.subject.is_none());
+        assert!(fields.sans.is_empty());
+        let bad: Vec<rustls::pki_types::CertificateDer<'static>> = Vec::new();
+        let fields = peer_cert_fields(Some(&bad));
+        assert!(fields.cn.is_none());
+    }
+
+    /// Real leaf certificate yields its common name.
+    /// The fixture is the test client certificate.
+    /// The bind check uses this name for tenant rules.
+    #[test]
+    fn peer_cert_fields_pull_cn_from_real_cert() {
+        let cert_pem = include_str!("../../broker-connectors-enterprise/testdata/client-cert.pem");
+        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut reader)
+                .expect("fixture reads")
+                .into_iter()
+                .map(rustls::pki_types::CertificateDer::from)
+                .collect();
+        assert!(!certs.is_empty());
+        let fields = peer_cert_fields(Some(&certs));
+        assert_eq!(fields.cn.as_deref(), Some("test-device"));
+    }
+
+    /// Unsubscribe on the native path stops delivery and keeps the
+    /// socket. The wire bytes decode, the shared broker handler
+    /// removes the router copy, and the reply encodes as UNSUBACK.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn native_unsubscribe_stops_delivery_with_unsuback() {
+        let shared = Shared::new();
+        let conn_id = NATIVE_CONN_ID_BASE + 920_001;
+        let (tx, mut rx, mut bound) = bind_client(&shared, conn_id, "native-unsub").await;
+        let waker = Arc::new(tokio::sync::Notify::new());
+        let sink = NativeSink::new();
+        // Subscribe through the production frame handler.
+        let sub = wire::Subscribe {
+            packet_id: 1,
+            subscription_id: 0,
+            filters: vec![("nsub/data", 0)],
+        };
+        let meta = subscribe_in_meta("native-unsub", &sub, 4);
+        let frame = BrokerFrame::new(
+            OpCode::SubscribeIn,
+            conn_id,
+            2,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .expect("frame");
+        handle_inbound_frame_with(frame, &shared, &tx, &sink, &mut bound, &waker, None)
+            .await
+            .expect("subscribe is handled");
+        let suback = sink.take();
+        assert_eq!(&suback[0..2], &[0x90, 0x03], "SUBACK for the client");
+        // Unsubscribe through the wire decode and the shared handler.
+        // Body: packet id 2 plus one filter.
+        let mut body = vec![0x00, 0x02];
+        body.extend_from_slice(&[0x00, 0x09]);
+        body.extend_from_slice(b"nsub/data");
+        let unsub = wire::decode_unsubscribe(&body, 4).expect("wire decodes");
+        assert_eq!(unsub.packet_id, 2);
+        let meta = unsubscribe_in_meta("native-unsub", &unsub);
+        let frame = BrokerFrame::new(
+            OpCode::UnsubscribeIn,
+            conn_id,
+            3,
+            Bytes::from(meta),
+            Bytes::new(),
+        )
+        .expect("frame");
+        handle_inbound_frame_with(frame, &shared, &tx, &sink, &mut bound, &waker, None)
+            .await
+            .expect("unsubscribe is handled");
+        let unsuback = sink.take();
+        assert_eq!(
+            unsuback,
+            vec![0xB0, 0x02, 0x00, 0x02],
+            "UNSUBACK for the client"
+        );
+        // No routed delivery remains for the filter.
+        let _ = rx.try_recv();
+        let topic = broker_protocol::Topic::new("nsub/data".to_string()).expect("topic");
+        let matched = shared.router.matches(&topic);
+        assert!(matched.is_empty(), "router drops the filter");
+    }
+
+    /// Server config loads with and without client verification.
+    /// The fixture is the test server certificate and key.
+    /// Verification on requests a client certificate.
+    /// An empty CA path selects the bundled system roots.
+    /// A missing CA file returns an error.
+    #[test]
+    fn tls_config_loads_with_and_without_verify() {
+        let base = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../broker-connectors-enterprise/testdata"
+        );
+        let cert = format!("{base}/server-cert.pem");
+        let key = format!("{base}/server-key.pem");
+        let off = TlsClientAuth::default();
+        assert!(super::load_tls_config(&cert, &key, &off).is_ok());
+        let on = TlsClientAuth {
+            verify_peer: true,
+            ..TlsClientAuth::default()
+        };
+        assert!(super::load_tls_config(&cert, &key, &on).is_ok());
+        let missing_ca = TlsClientAuth {
+            verify_peer: true,
+            cacertfile: "/nonexistent-ca.pem".to_string(),
+            ..TlsClientAuth::default()
+        };
+        assert!(super::load_tls_config(&cert, &key, &missing_ca).is_err());
+    }
+
+    /// Builds a small MQTT 3.1.1 CONNECT packet.
+    fn ws_test_connect(client_id: &str) -> Vec<u8> {
+        let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id.as_bytes());
+        let mut packet = vec![0x10, body.len() as u8];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Builds a CONNECT packet with username and password.
+    fn ws_test_connect_with_auth(client_id: &str, username: &str, password: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0xC2, 0x00, 0x3C];
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id.as_bytes());
+        body.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        body.extend_from_slice(username.as_bytes());
+        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        body.extend_from_slice(password);
+        let mut packet = vec![0x10, body.len() as u8];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Builds a small SUBSCRIBE packet for one filter.
+    fn ws_test_subscribe(packet_id: u16, filter: &str) -> Vec<u8> {
+        let mut body = packet_id.to_be_bytes().to_vec();
+        body.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+        body.extend_from_slice(filter.as_bytes());
+        body.push(0x00);
+        let mut packet = vec![0x82, body.len() as u8];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Builds a small QoS 0 PUBLISH packet.
+    fn ws_test_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(topic.as_bytes());
+        body.extend_from_slice(payload);
+        let mut packet = vec![0x30, body.len() as u8];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Starts one TCP and one WebSocket kernel listener on one [`Shared`].
+    /// Returns the two ports. The tasks run until the test aborts them.
+    async fn ws_test_listeners(shared: Shared) -> (u16, u16) {
+        use tokio::net::TcpListener as Listener;
+        let tcp = Listener::bind("127.0.0.1:0").await.expect("tcp binds");
+        let ws = Listener::bind("127.0.0.1:0").await.expect("ws binds");
+        let tcp_port = tcp.local_addr().expect("tcp addr").port();
+        let ws_port = ws.local_addr().expect("ws addr").port();
+        let tcp_shared = shared.clone();
+        tokio::spawn(async move {
+            serve_native_mqtt(tcp, Some(1000), Arc::new(AtomicU64::new(0)), tcp_shared).await;
+        });
+        let ws_shared = shared;
+        tokio::spawn(async move {
+            serve_native_ws(
+                ws,
+                "/mqtt".to_string(),
+                Some(1000),
+                Arc::new(AtomicU64::new(0)),
+                ws_shared,
+            )
+            .await;
+        });
+        // The accept loops need a moment to start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (tcp_port, ws_port)
+    }
+
+    /// Connects a WebSocket client with the `mqtt` subprotocol.
+    /// Returns the stream. The server must select `mqtt`.
+    async fn ws_test_dial(
+        ws_port: u16,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
+        let uri: http::Uri = format!("ws://127.0.0.1:{ws_port}/mqtt")
+            .parse()
+            .expect("uri parses");
+        let builder = ClientRequestBuilder::new(uri).with_sub_protocol("mqtt");
+        let (stream, response) = tokio_tungstenite::connect_async(builder)
+            .await
+            .expect("websocket dials");
+        let selected = response
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(selected, "mqtt", "server selects mqtt");
+        stream
+    }
+
+    /// Reads one binary MQTT packet from a WebSocket client.
+    async fn ws_test_recv(
+        stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Vec<u8> {
+        use futures::StreamExt as _;
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a message in time")
+            .expect("the stream stays open")
+            .expect("a correct frame");
+        match message {
+            tokio_tungstenite::tungstenite::protocol::Message::Binary(data) => data,
+            other => panic!("binary expected, got: {other:?}"),
+        }
+    }
+
+    /// Reads one MQTT packet from a plaintext TCP client.
+    async fn tcp_test_recv(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let mut head = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+            .await
+            .expect("a header in time")
+            .expect("the socket stays open");
+        let length = head[1] as usize;
+        let mut packet = head.to_vec();
+        if length > 0 {
+            let mut body = vec![0u8; length];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut body))
+                .await
+                .expect("a body in time")
+                .expect("the socket stays open");
+            packet.extend_from_slice(&body);
+        }
+        packet
+    }
+
+    /// A WebSocket client and a TCP client exchange publishes both ways.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn ws_and_tcp_clients_exchange_publishes_both_ways() {
+        use futures::SinkExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let (tcp_port, ws_port) = ws_test_listeners(shared).await;
+
+        // A TCP subscriber waits on the topic.
+        let mut tcp_sub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_sub
+            .write_all(&ws_test_connect("ws-tcp-sub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_sub
+            .write_all(&ws_test_subscribe(1, "ws/share"))
+            .await
+            .expect("tcp SUBSCRIBE sends");
+        let suback = tcp_test_recv(&mut tcp_sub).await;
+        assert_eq!(suback[0], 0x90, "TCP SUBACK answers");
+
+        // A WebSocket client publishes. TCP gets it.
+        let mut ws_pub = ws_test_dial(ws_port).await;
+        ws_pub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-pub"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut ws_pub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        ws_pub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("ws/share", b"from-ws"),
+            ))
+            .await
+            .expect("ws PUBLISH sends");
+        let delivered = tcp_test_recv(&mut tcp_sub).await;
+        assert!(delivered.ends_with(b"from-ws"), "TCP gets the WS publish");
+
+        // The reverse: WS subscribes, TCP publishes, WS gets it.
+        let mut ws_sub = ws_test_dial(ws_port).await;
+        ws_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-sub"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut ws_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        ws_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "ws/back"),
+            ))
+            .await
+            .expect("ws SUBSCRIBE sends");
+        let ws_suback = ws_test_recv(&mut ws_sub).await;
+        assert_eq!(ws_suback[0], 0x90, "WS SUBACK answers");
+        let mut tcp_pub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_pub
+            .write_all(&ws_test_connect("ws-tcp-pub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_pub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_pub
+            .write_all(&ws_test_publish("ws/back", b"from-tcp"))
+            .await
+            .expect("tcp PUBLISH sends");
+        let back = ws_test_recv(&mut ws_sub).await;
+        assert!(back.ends_with(b"from-tcp"), "WS gets the TCP publish");
+        let _ = ws_pub.close(None).await;
+        let _ = ws_sub.close(None).await;
+    }
+
+    /// One packet split over three frames and two packets in one frame
+    /// decode. Goes through the broker.
+    #[tokio::test]
+    async fn ws_split_and_batched_packets_decode() {
+        use futures::SinkExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let (tcp_port, ws_port) = ws_test_listeners(shared).await;
+
+        // A TCP subscriber waits on two topics.
+        let mut tcp_sub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_sub
+            .write_all(&ws_test_connect("ws-split-tcp"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_sub
+            .write_all(&ws_test_subscribe(1, "ws/split/#"))
+            .await
+            .expect("tcp SUBSCRIBE sends");
+        assert_eq!(tcp_test_recv(&mut tcp_sub).await[0], 0x90);
+
+        // A WebSocket client connects, then sends SUBSCRIBE in 3 parts.
+        let mut ws = ws_test_dial(ws_port).await;
+        ws.send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+            ws_test_connect("ws-split"),
+        ))
+        .await
+        .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut ws).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        let subscribe = ws_test_subscribe(7, "ws/split/a");
+        let first = subscribe.len() / 3;
+        let second = 2 * subscribe.len() / 3;
+        for part in [
+            &subscribe[..first],
+            &subscribe[first..second],
+            &subscribe[second..],
+        ] {
+            ws.send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                part.to_vec(),
+            ))
+            .await
+            .expect("ws part sends");
+        }
+        let suback = ws_test_recv(&mut ws).await;
+        assert_eq!(suback[0], 0x90, "split SUBSCRIBE gets SUBACK");
+
+        // Two PUBLISH packets in one binary frame both deliver.
+        let mut batched = ws_test_publish("ws/split/a", b"one");
+        batched.extend_from_slice(&ws_test_publish("ws/split/a", b"two"));
+        ws.send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+            batched,
+        ))
+        .await
+        .expect("ws batch sends");
+        let first_got = tcp_test_recv(&mut tcp_sub).await;
+        assert!(first_got.ends_with(b"one"), "first publish delivers");
+        let second_got = tcp_test_recv(&mut tcp_sub).await;
+        assert!(second_got.ends_with(b"two"), "second publish delivers");
+        let _ = ws.close(None).await;
+    }
+
+    /// Reads the status line of a raw HTTP upgrade answer.
+    async fn ws_test_raw_status(port: u16, path: &str, subprotocol: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let mut request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        );
+        if let Some(protocol) = subprotocol {
+            request.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("request sends");
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.expect("a byte");
+                answer.extend_from_slice(&byte);
+                if answer.ends_with(b"\r\n\r\n") || answer.len() > 512 {
+                    break;
+                }
+                if answer.ends_with(b"\n") && answer.len() > 12 {
+                    break;
+                }
+            }
+        })
+        .await;
+        String::from_utf8_lossy(&answer)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Bad upgrades are refused. Bad frames close only that connection.
+    /// Goes through the broker. The broker stays up after each close.
+    #[tokio::test]
+    async fn ws_refusals_and_frame_errors_close_only_that_connection() {
+        use futures::{SinkExt as _, StreamExt as _};
+        let shared = Shared::new();
+        let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
+
+        let no_protocol = ws_test_raw_status(ws_port, "/mqtt", None).await;
+        assert!(
+            no_protocol.contains("400"),
+            "no subprotocol gets 400: {no_protocol}"
+        );
+        let wrong_path = ws_test_raw_status(ws_port, "/wrong", Some("mqtt")).await;
+        assert!(
+            wrong_path.contains("404"),
+            "wrong path gets 404: {wrong_path}"
+        );
+
+        // A text frame closes the connection.
+        let mut text_client = ws_test_dial(ws_port).await;
+        text_client
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-text"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut text_client).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        text_client
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Text(
+                "hello".into(),
+            ))
+            .await
+            .expect("text sends");
+        let text_end = tokio::time::timeout(Duration::from_secs(5), text_client.next()).await;
+        let text_closed = match text_end {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Close(_)))) => true,
+            Ok(Some(Err(_))) => true,
+            Ok(None) => true,
+            other => panic!("text closes the connection, got: {other:?}"),
+        };
+        assert!(text_closed, "a text frame closes the connection");
+
+        // A frame over the limit closes the connection.
+        let mut big_client = ws_test_dial(ws_port).await;
+        big_client
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-big"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut big_client).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        big_client
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                vec![0u8; MAX_PACKET_BYTES + 1],
+            ))
+            .await
+            .expect("big frame sends");
+        let big_end = tokio::time::timeout(Duration::from_secs(5), big_client.next()).await;
+        let big_closed = match big_end {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::protocol::Message::Close(_)))) => true,
+            Ok(Some(Err(_))) => true,
+            Ok(None) => true,
+            other => panic!("an oversize frame closes the connection, got: {other:?}"),
+        };
+        assert!(big_closed, "an oversize frame closes the connection");
+
+        // The broker still serves a new client after each close.
+        let mut fresh = ws_test_dial(ws_port).await;
+        fresh
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("ws-fresh"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut fresh).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "the broker stays up"
+        );
+        let _ = fresh.close(None).await;
+    }
+
+    /// Two tenants stay apart on the WebSocket path. Goes through the
+    /// broker. Each publish reaches its own tenant only.
+    #[tokio::test]
+    async fn ws_two_tenants_stay_apart() {
+        use futures::SinkExt as _;
+        let shared = Shared::new();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .tenant_registry
+            .replace(vec![broker_session::tenant::TenantRule::new(
+                "",
+                "tenant",
+                "t-${client_id}",
+            )])
+            .expect("tenant rule installs");
+        for (tenant, user, password) in [
+            ("t-ws-a", "alice", b"pw-a".as_slice()),
+            ("t-ws-b", "bob", b"pw-b".as_slice()),
+        ] {
+            shared
+                .auth
+                .add_user_in_tenant(tenant, user, password)
+                .expect("tenant user stores");
+            for action in [
+                broker_auth::AclAction::Publish,
+                broker_auth::AclAction::Subscribe,
+            ] {
+                shared
+                    .auth
+                    .add_rule_in_tenant(
+                        tenant,
+                        broker_auth::AclRule::new("*", action, "ws/tenant/#", true),
+                    )
+                    .expect("tenant rule stores");
+            }
+        }
+        let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
+
+        // Each tenant connects with its own client id and credentials.
+        let mut client_a = ws_test_dial(ws_port).await;
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect_with_auth("ws-a", "alice", b"pw-a"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut client_a).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "first tenant CONNECT accepts"
+        );
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "ws/tenant/x"),
+            ))
+            .await
+            .expect("ws SUBSCRIBE sends");
+        assert_eq!(ws_test_recv(&mut client_a).await[0], 0x90);
+
+        let mut client_b = ws_test_dial(ws_port).await;
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect_with_auth("ws-b", "bob", b"pw-b"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut client_b).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "second tenant CONNECT accepts"
+        );
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "ws/tenant/x"),
+            ))
+            .await
+            .expect("ws SUBSCRIBE sends");
+        assert_eq!(ws_test_recv(&mut client_b).await[0], 0x90);
+
+        // A publish in the first tenant reaches its own subscriber only.
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("ws/tenant/x", b"secret-a"),
+            ))
+            .await
+            .expect("ws PUBLISH sends");
+        let got_a = ws_test_recv(&mut client_a).await;
+        assert!(got_a.ends_with(b"secret-a"), "own tenant delivers");
+        let other_a =
+            tokio::time::timeout(Duration::from_millis(300), ws_test_recv(&mut client_b)).await;
+        assert!(other_a.is_err(), "other tenant gets nothing");
+
+        // A publish in the second tenant reaches its own subscriber only.
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("ws/tenant/x", b"secret-b"),
+            ))
+            .await
+            .expect("ws PUBLISH sends");
+        let got_b = ws_test_recv(&mut client_b).await;
+        assert!(got_b.ends_with(b"secret-b"), "own tenant delivers");
+        let other_b =
+            tokio::time::timeout(Duration::from_millis(300), ws_test_recv(&mut client_a)).await;
+        assert!(other_b.is_err(), "other tenant gets nothing");
+        let _ = client_a.close(None).await;
+        let _ = client_b.close(None).await;
+    }
+
+    /// Opens a TLS session to the secure WebSocket port.
+    /// Trusts the test CA only. Sends no HTTP yet.
+    async fn wss_test_tls(port: u16) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let base = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../broker-connectors-enterprise/testdata"
+        );
+        let ca_pem = std::fs::read(format!("{base}/ca-cert.pem")).expect("test CA reads");
+        let mut reader = std::io::BufReader::new(ca_pem.as_slice());
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut reader)
+                .expect("test CA parses")
+                .into_iter()
+                .map(rustls::pki_types::CertificateDer::from)
+                .collect();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert).expect("test CA trusts");
+        }
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions hold")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client));
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("name holds");
+        connector.connect(name, tcp).await.expect("TLS opens")
+    }
+
+    /// Starts one TCP and one secure WebSocket kernel listener.
+    /// Returns the two ports. The tasks run until the test aborts them.
+    async fn wss_test_listeners(shared: Shared) -> (u16, u16) {
+        use tokio::net::TcpListener as Listener;
+        let base = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../broker-connectors-enterprise/testdata"
+        );
+        let cert = format!("{base}/server-cert.pem");
+        let key = format!("{base}/server-key.pem");
+        let tls = super::load_tls_config(&cert, &key, &super::TlsClientAuth::default())
+            .expect("test TLS loads");
+        let tcp = Listener::bind("127.0.0.1:0").await.expect("tcp binds");
+        let wss = Listener::bind("127.0.0.1:0").await.expect("wss binds");
+        let tcp_port = tcp.local_addr().expect("tcp addr").port();
+        let wss_port = wss.local_addr().expect("wss addr").port();
+        let tcp_shared = shared.clone();
+        tokio::spawn(async move {
+            serve_native_mqtt(tcp, Some(1000), Arc::new(AtomicU64::new(0)), tcp_shared).await;
+        });
+        let wss_shared = shared;
+        tokio::spawn(async move {
+            serve_native_wss(
+                wss,
+                tls,
+                "/mqtt".to_string(),
+                Some(1000),
+                Arc::new(AtomicU64::new(0)),
+                wss_shared,
+            )
+            .await;
+        });
+        // The accept loops need a moment to start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (tcp_port, wss_port)
+    }
+
+    /// Connects a secure WebSocket client with the `mqtt` subprotocol.
+    /// Returns the stream. The server must select `mqtt`.
+    async fn wss_test_dial(
+        wss_port: u16,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>
+    {
+        use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
+        let tls = wss_test_tls(wss_port).await;
+        let uri: http::Uri = format!("wss://127.0.0.1:{wss_port}/mqtt")
+            .parse()
+            .expect("uri parses");
+        let builder = ClientRequestBuilder::new(uri).with_sub_protocol("mqtt");
+        let (stream, response) = tokio_tungstenite::client_async_with_config(builder, tls, None)
+            .await
+            .expect("websocket dials");
+        let selected = response
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(selected, "mqtt", "server selects mqtt");
+        stream
+    }
+
+    /// Reads one binary MQTT packet from a secure WebSocket client.
+    async fn wss_test_recv(
+        stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Vec<u8> {
+        use futures::StreamExt as _;
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a message in time")
+            .expect("the stream stays open")
+            .expect("a correct frame");
+        match message {
+            tokio_tungstenite::tungstenite::protocol::Message::Binary(data) => data,
+            other => panic!("binary expected, got: {other:?}"),
+        }
+    }
+
+    /// Reads the status line of a raw HTTPS upgrade answer.
+    async fn wss_test_raw_status(port: u16, path: &str, subprotocol: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut tls = wss_test_tls(port).await;
+        let mut request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        );
+        if let Some(protocol) = subprotocol {
+            request.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
+        }
+        request.push_str("\r\n");
+        tls.write_all(request.as_bytes())
+            .await
+            .expect("request sends");
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut byte = [0u8; 1];
+                tls.read_exact(&mut byte).await.expect("a byte");
+                answer.extend_from_slice(&byte);
+                if answer.ends_with(b"\r\n\r\n") || answer.len() > 512 {
+                    break;
+                }
+                if answer.ends_with(b"\n") && answer.len() > 12 {
+                    break;
+                }
+            }
+        })
+        .await;
+        String::from_utf8_lossy(&answer)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// A secure WebSocket client and a TCP client exchange publishes.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn wss_and_tcp_clients_exchange_publishes_both_ways() {
+        use futures::SinkExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let (tcp_port, wss_port) = wss_test_listeners(shared).await;
+
+        // A TCP subscriber waits on the topic.
+        let mut tcp_sub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_sub
+            .write_all(&ws_test_connect("wss-tcp-sub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_sub
+            .write_all(&ws_test_subscribe(1, "wss/share"))
+            .await
+            .expect("tcp SUBSCRIBE sends");
+        let suback = tcp_test_recv(&mut tcp_sub).await;
+        assert_eq!(suback[0], 0x90, "TCP SUBACK answers");
+
+        // A secure WebSocket client publishes. TCP gets it.
+        let mut wss_pub = wss_test_dial(wss_port).await;
+        wss_pub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("wss-pub"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut wss_pub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WSS CONNACK accepts"
+        );
+        wss_pub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("wss/share", b"from-wss"),
+            ))
+            .await
+            .expect("wss PUBLISH sends");
+        let delivered = tcp_test_recv(&mut tcp_sub).await;
+        assert!(delivered.ends_with(b"from-wss"), "TCP gets the WSS publish");
+
+        // The reverse: WSS subscribes, TCP publishes, WSS gets it.
+        let mut wss_sub = wss_test_dial(wss_port).await;
+        wss_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("wss-sub"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut wss_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WSS CONNACK accepts"
+        );
+        wss_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "wss/back"),
+            ))
+            .await
+            .expect("wss SUBSCRIBE sends");
+        let wss_suback = wss_test_recv(&mut wss_sub).await;
+        assert_eq!(wss_suback[0], 0x90, "WSS SUBACK answers");
+        let mut tcp_pub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_pub
+            .write_all(&ws_test_connect("wss-tcp-pub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_pub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_pub
+            .write_all(&ws_test_publish("wss/back", b"from-tcp"))
+            .await
+            .expect("tcp PUBLISH sends");
+        let back = wss_test_recv(&mut wss_sub).await;
+        assert!(back.ends_with(b"from-tcp"), "WSS gets the TCP publish");
+        let _ = wss_pub.close(None).await;
+        let _ = wss_sub.close(None).await;
+    }
+
+    /// Bad upgrades and plain clients are refused on the secure port.
+    /// Goes through the broker. The broker stays up after each close.
+    #[tokio::test]
+    async fn wss_refusals_close_only_that_connection() {
+        use futures::SinkExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        let (_tcp_port, wss_port) = wss_test_listeners(shared).await;
+
+        let no_protocol = wss_test_raw_status(wss_port, "/mqtt", None).await;
+        assert!(
+            no_protocol.contains("400"),
+            "no subprotocol gets 400: {no_protocol}"
+        );
+        let wrong_path = wss_test_raw_status(wss_port, "/wrong", Some("mqtt")).await;
+        assert!(
+            wrong_path.contains("404"),
+            "wrong path gets 404: {wrong_path}"
+        );
+
+        // A client without TLS gets no upgrade answer.
+        let mut plain = tokio::net::TcpStream::connect(("127.0.0.1", wss_port))
+            .await
+            .expect("tcp dials");
+        plain
+            .write_all(
+                b"GET /mqtt HTTP/1.1\r\nHost: smoke\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n",
+            )
+            .await
+            .expect("request sends");
+        let mut head = [0u8; 12];
+        let answer =
+            tokio::time::timeout(Duration::from_secs(5), plain.read_exact(&mut head)).await;
+        if let Ok(Ok(_)) = answer {
+            assert!(
+                !head.starts_with(b"HTTP/1.1 101"),
+                "plain client gets no upgrade"
+            );
+        }
+
+        // The broker still serves a secure client after each refusal.
+        let mut fresh = wss_test_dial(wss_port).await;
+        fresh
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("wss-fresh"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut fresh).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "the broker stays up"
+        );
+        let _ = fresh.close(None).await;
+    }
+
+    /// A TLS handshake that sends nothing ends in the time limit.
+    /// Goes through the broker. The broker stays up after the close.
+    #[tokio::test]
+    async fn wss_idle_tls_handshake_times_out() {
+        use futures::SinkExt as _;
+        use tokio::io::AsyncReadExt as _;
+        let shared = Shared::new();
+        let (_tcp_port, wss_port) = wss_test_listeners(shared).await;
+
+        // A client opens the socket and sends nothing.
+        let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", wss_port))
+            .await
+            .expect("tcp dials");
+        let mut byte = [0u8; 1];
+        let end = tokio::time::timeout(Duration::from_secs(15), idle.read_exact(&mut byte)).await;
+        assert!(end.is_ok(), "an idle handshake ends in the limit");
+
+        // The broker still serves a secure client after the close.
+        let mut fresh = wss_test_dial(wss_port).await;
+        fresh
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("wss-after-idle"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut fresh).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "the broker stays up"
+        );
+        let _ = fresh.close(None).await;
+    }
+
+    /// Two tenants stay apart on the secure WebSocket path.
+    /// Goes through the broker. Each publish reaches its own tenant only.
+    #[tokio::test]
+    async fn wss_two_tenants_stay_apart() {
+        use futures::SinkExt as _;
+        let shared = Shared::new();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .tenant_registry
+            .replace(vec![broker_session::tenant::TenantRule::new(
+                "",
+                "tenant",
+                "t-${client_id}",
+            )])
+            .expect("tenant rule installs");
+        for (tenant, user, password) in [
+            ("t-wss-a", "alice", b"pw-a".as_slice()),
+            ("t-wss-b", "bob", b"pw-b".as_slice()),
+        ] {
+            shared
+                .auth
+                .add_user_in_tenant(tenant, user, password)
+                .expect("tenant user stores");
+            for action in [
+                broker_auth::AclAction::Publish,
+                broker_auth::AclAction::Subscribe,
+            ] {
+                shared
+                    .auth
+                    .add_rule_in_tenant(
+                        tenant,
+                        broker_auth::AclRule::new("*", action, "wss/tenant/#", true),
+                    )
+                    .expect("tenant rule stores");
+            }
+        }
+        let (_tcp_port, wss_port) = wss_test_listeners(shared).await;
+
+        // Each tenant connects with its own client id and credentials.
+        let mut client_a = wss_test_dial(wss_port).await;
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect_with_auth("wss-a", "alice", b"pw-a"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut client_a).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "first tenant CONNECT accepts"
+        );
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "wss/tenant/x"),
+            ))
+            .await
+            .expect("wss SUBSCRIBE sends");
+        assert_eq!(wss_test_recv(&mut client_a).await[0], 0x90);
+
+        let mut client_b = wss_test_dial(wss_port).await;
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect_with_auth("wss-b", "bob", b"pw-b"),
+            ))
+            .await
+            .expect("wss CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut client_b).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "second tenant CONNECT accepts"
+        );
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "wss/tenant/x"),
+            ))
+            .await
+            .expect("wss SUBSCRIBE sends");
+        assert_eq!(wss_test_recv(&mut client_b).await[0], 0x90);
+
+        // A publish in the first tenant reaches its own subscriber only.
+        client_a
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("wss/tenant/x", b"secret-a"),
+            ))
+            .await
+            .expect("wss PUBLISH sends");
+        let got_a = wss_test_recv(&mut client_a).await;
+        assert!(got_a.ends_with(b"secret-a"), "own tenant delivers");
+        let other_a =
+            tokio::time::timeout(Duration::from_millis(300), wss_test_recv(&mut client_b)).await;
+        assert!(other_a.is_err(), "other tenant gets nothing");
+
+        // A publish in the second tenant reaches its own subscriber only.
+        client_b
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_publish("wss/tenant/x", b"secret-b"),
+            ))
+            .await
+            .expect("wss PUBLISH sends");
+        let got_b = wss_test_recv(&mut client_b).await;
+        assert!(got_b.ends_with(b"secret-b"), "own tenant delivers");
+        let other_b =
+            tokio::time::timeout(Duration::from_millis(300), wss_test_recv(&mut client_a)).await;
+        assert!(other_b.is_err(), "other tenant gets nothing");
+        let _ = client_a.close(None).await;
+        let _ = client_b.close(None).await;
+    }
+
+    /// Path of one K1-05 test PKI file.
+    /// The files live under `crates/broker-node/tests/k1_05`.
+    /// OpenSSL commands generate them: one CA, one server certificate
+    /// for 127.0.0.1, two client certificates, one other CA with its
+    /// own client certificate, one expired client certificate.
+    /// Each client certificate is version 3 with clientAuth use.
+    /// The sign step uses an extension file with clientAuth use.
+    /// No new crate was added for them: `rcgen` is not in the lock file.
+    fn k1_05_file(name: &str) -> String {
+        format!("{}/tests/k1_05/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Trust roots of the K1-05 test CA.
+    fn k1_05_roots() -> rustls::RootCertStore {
+        let pem = std::fs::read(k1_05_file("ca-cert.pem")).expect("test CA reads");
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        let certs = rustls_pemfile::certs(&mut reader).expect("test CA parses");
+        let mut roots = rustls::RootCertStore::empty();
+        for der in certs {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(der))
+                .expect("test CA trusts");
+        }
+        roots
+    }
+
+    /// Private key in a PEM file. Accepts PKCS#8, RSA and SEC1 forms.
+    fn k1_05_key(path: &str) -> rustls::pki_types::PrivateKeyDer<'static> {
+        use rustls::pki_types::PrivateKeyDer;
+        let bytes = std::fs::read(path).expect("test key reads");
+        for item in rustls_pemfile::read_all(&mut bytes.as_slice()).expect("test key parses") {
+            match item {
+                rustls_pemfile::Item::PKCS8Key(der) => return PrivateKeyDer::Pkcs8(der.into()),
+                rustls_pemfile::Item::RSAKey(der) => return PrivateKeyDer::Pkcs1(der.into()),
+                rustls_pemfile::Item::ECKey(der) => return PrivateKeyDer::Sec1(der.into()),
+                _ => continue,
+            }
+        }
+        panic!("no private key in test file");
+    }
+
+    /// Certificate chain in a PEM file.
+    fn k1_05_chain(path: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+        let pem = std::fs::read(path).expect("test chain reads");
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        rustls_pemfile::certs(&mut reader)
+            .expect("test chain parses")
+            .into_iter()
+            .map(rustls::pki_types::CertificateDer::from)
+            .collect()
+    }
+
+    /// TLS client config for the K1-05 tests. Trusts the test CA only.
+    /// `client` selects the client certificate, if any.
+    fn k1_05_client_config(client: Option<&str>) -> std::sync::Arc<rustls::ClientConfig> {
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let base = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions hold")
+            .with_root_certificates(k1_05_roots());
+        let config = match client {
+            Some(name) => base
+                .with_client_auth_cert(
+                    k1_05_chain(&k1_05_file(&format!("{name}-cert.pem"))),
+                    k1_05_key(&k1_05_file(&format!("{name}-key.pem"))),
+                )
+                .expect("client identity loads"),
+            None => base.with_no_client_auth(),
+        };
+        std::sync::Arc::new(config)
+    }
+
+    /// Opens a TLS session to the test port. `client` selects the
+    /// client certificate, if any. Returns the handshake result.
+    async fn k1_05_dial(
+        port: u16,
+        client: Option<&str>,
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, std::io::Error> {
+        let connector = tokio_rustls::TlsConnector::from(k1_05_client_config(client));
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("name holds");
+        tokio::time::timeout(Duration::from_secs(10), connector.connect(name, tcp))
+            .await
+            .expect("handshake ends in time")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e))
+    }
+
+    /// Starts one kernel TLS listener with the K1-05 test server
+    /// certificate and the given client policy. Returns the port.
+    /// The task runs until the test aborts it.
+    /// The listener copies the policy into the shared bind flags.
+    /// The bind then refuses a missing certificate when required.
+    async fn k1_05_listener(mut shared: Shared, policy: super::TlsClientAuth) -> u16 {
+        shared.tls_verify_peer = policy.verify_peer;
+        shared.tls_verify_client_cert = policy.legacy_verify;
+        shared.tls_fail_if_no_peer_cert = policy.fail_if_no_peer_cert;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("tls binds");
+        let port = listener.local_addr().expect("tls addr").port();
+        let config = super::load_tls_config(
+            &k1_05_file("server-cert.pem"),
+            &k1_05_file("server-key.pem"),
+            &policy,
+        )
+        .expect("test TLS loads");
+        tokio::spawn(async move {
+            serve_native_mqtts(
+                listener,
+                config,
+                Some(1000),
+                Arc::new(AtomicU64::new(0)),
+                shared,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// Server policy for the K1-05 tests. Trusts the test CA file.
+    /// `require` selects the require mode.
+    fn k1_05_policy(require: bool) -> super::TlsClientAuth {
+        super::TlsClientAuth {
+            verify_peer: true,
+            legacy_verify: false,
+            cacertfile: k1_05_file("ca-cert.pem"),
+            fail_if_no_peer_cert: require,
+        }
+    }
+
+    /// Reads one MQTT packet from a TLS client.
+    async fn k1_05_recv<S>(stream: &mut S) -> Vec<u8>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt as _;
+        let mut head = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+            .await
+            .expect("a header in time")
+            .expect("the socket stays open");
+        let length = head[1] as usize;
+        let mut packet = head.to_vec();
+        if length > 0 {
+            let mut body = vec![0u8; length];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut body))
+                .await
+                .expect("a body in time")
+                .expect("the socket stays open");
+            packet.extend_from_slice(&body);
+        }
+        packet
+    }
+
+    /// In require mode a client without a certificate fails the
+    /// handshake. Before the change it connected. Goes through
+    /// the broker. The broker stays up after the failed handshake.
+    /// TLS 1.3 reports the refusal after the client flight.
+    /// The test accepts a dial error or a refused CONNECT.
+    #[tokio::test]
+    async fn k1_05_require_mode_refuses_client_without_certificate() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let port = k1_05_listener(shared, k1_05_policy(true)).await;
+
+        // No certificate: the handshake fails or the bind refuses.
+        match k1_05_dial(port, None).await {
+            Err(_) => {}
+            Ok(mut stream) => {
+                let _ = stream.write_all(&ws_test_connect("k1-05-no-cert")).await;
+                use tokio::io::AsyncReadExt as _;
+                let mut head = [0u8; 4];
+                let denied =
+                    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+                        .await;
+                match denied {
+                    Err(_) => {}
+                    Ok(Err(_)) => {}
+                    Ok(Ok(_)) => {
+                        assert_ne!(
+                            head,
+                            [0x20, 0x02, 0x00, 0x00],
+                            "no certificate must not connect"
+                        );
+                    }
+                }
+            }
+        }
+
+        // A valid certificate still connects. The broker stays up.
+        let mut valid = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        valid
+            .write_all(&ws_test_connect("k1-05-valid"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut valid).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "valid certificate connects"
+        );
+    }
+
+    /// A client with a valid certificate connects. With the common
+    /// name as username the session username is the common name.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn k1_05_valid_certificate_maps_common_name_to_username() {
+        use tokio::io::AsyncWriteExt as _;
+        let mut shared = Shared::new();
+        shared.tls_peer_cert_as_username = "cn".to_string();
+        let port = k1_05_listener(shared.clone(), k1_05_policy(false)).await;
+
+        let mut client = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        client
+            .write_all(&ws_test_connect("k1-05-cn-user"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut client).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "valid certificate connects"
+        );
+        let session = shared
+            .sessions
+            .get("k1-05-cn-user")
+            .expect("session exists");
+        assert_eq!(
+            session.username.read().as_deref(),
+            Some("k1-05-a"),
+            "session username is the common name"
+        );
+    }
+
+    /// With the common name as client identifier the session uses
+    /// the common name. A publish through the broker still delivers.
+    /// Goes through the broker, not the store alone.
+    #[tokio::test]
+    async fn k1_05_certificate_client_id_carries_publish() {
+        use tokio::io::AsyncWriteExt as _;
+        let mut shared = Shared::new();
+        shared.tls_peer_cert_as_clientid = "cn".to_string();
+        let port = k1_05_listener(shared.clone(), k1_05_policy(false)).await;
+
+        let mut client = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        client
+            .write_all(&ws_test_connect("k1-05-ignored-id"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut client).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "mapped identifier connects"
+        );
+        assert!(
+            shared.sessions.get("k1-05-a").is_some(),
+            "session uses the common name"
+        );
+        client
+            .write_all(&ws_test_subscribe(1, "k1-05/cert/#"))
+            .await
+            .expect("SUBSCRIBE sends");
+        assert_eq!(k1_05_recv(&mut client).await[0], 0x90, "SUBACK answers");
+        client
+            .write_all(&ws_test_publish("k1-05/cert/x", b"secret"))
+            .await
+            .expect("PUBLISH sends");
+        let delivered = k1_05_recv(&mut client).await;
+        assert!(delivered.ends_with(b"secret"), "own publish delivers");
+    }
+
+    /// A certificate from a different CA fails the handshake.
+    /// An expired certificate fails the handshake. Goes through
+    /// the broker. The broker stays up after each failed handshake.
+    /// TLS 1.3 reports the refusal after the client flight.
+    /// The test accepts a dial error or a refused CONNECT.
+    #[tokio::test]
+    async fn k1_05_wrong_ca_and_expired_certificates_fail() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let port = k1_05_listener(shared, k1_05_policy(true)).await;
+
+        for client in ["wrong-client", "expired-client"] {
+            match k1_05_dial(port, Some(client)).await {
+                Err(_) => {}
+                Ok(mut stream) => {
+                    let _ = stream.write_all(&ws_test_connect("k1-05-bad-cert")).await;
+                    use tokio::io::AsyncReadExt as _;
+                    let mut head = [0u8; 4];
+                    let denied =
+                        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+                            .await;
+                    match denied {
+                        Err(_) => {}
+                        Ok(Err(_)) => {}
+                        Ok(Ok(_)) => {
+                            assert_ne!(
+                                head,
+                                [0x20, 0x02, 0x00, 0x00],
+                                "a bad certificate must not connect"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut valid = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        valid
+            .write_all(&ws_test_connect("k1-05-after-denials"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut valid).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "the broker stays up"
+        );
+    }
+
+    /// Without verification the behavior of today does not change.
+    /// A client without a certificate connects. Goes through the broker.
+    #[tokio::test]
+    async fn k1_05_no_verification_keeps_today_behavior() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let port = k1_05_listener(shared, super::TlsClientAuth::default()).await;
+
+        let mut plain = k1_05_dial(port, None).await.expect("plain TLS dials");
+        plain
+            .write_all(&ws_test_connect("k1-05-plain"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut plain).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "no verification connects"
+        );
+    }
+
+    /// Two tenants stay apart on the certificate path. Each client
+    /// carries its own certificate. A publish reaches its own tenant
+    /// only. Goes through the broker.
+    #[tokio::test]
+    async fn k1_05_two_tenants_stay_apart_on_certificate_path() {
+        use tokio::io::AsyncWriteExt as _;
+        let mut shared = Shared::new();
+        shared.tls_peer_cert_as_username = "cn".to_string();
+        shared
+            .tenant_registry
+            .replace(vec![broker_session::tenant::TenantRule::new(
+                "",
+                "tenant",
+                "t-${username}",
+            )])
+            .expect("tenant rule installs");
+        let port = k1_05_listener(shared.clone(), k1_05_policy(false)).await;
+
+        // Each tenant connects with its own certificate.
+        let mut client_a = k1_05_dial(port, Some("client-a"))
+            .await
+            .expect("first dials");
+        client_a
+            .write_all(&ws_test_connect("k1-05-tenant-a"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut client_a).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "first tenant connects"
+        );
+        client_a
+            .write_all(&ws_test_subscribe(1, "k1-05/tenant/x"))
+            .await
+            .expect("SUBSCRIBE sends");
+        assert_eq!(k1_05_recv(&mut client_a).await[0], 0x90);
+
+        let mut client_b = k1_05_dial(port, Some("client-b"))
+            .await
+            .expect("second dials");
+        client_b
+            .write_all(&ws_test_connect("k1-05-tenant-b"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut client_b).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "second tenant connects"
+        );
+        client_b
+            .write_all(&ws_test_subscribe(1, "k1-05/tenant/x"))
+            .await
+            .expect("SUBSCRIBE sends");
+        assert_eq!(k1_05_recv(&mut client_b).await[0], 0x90);
+
+        // A publish in the first tenant reaches its own subscriber only.
+        client_a
+            .write_all(&ws_test_publish("k1-05/tenant/x", b"secret-a"))
+            .await
+            .expect("PUBLISH sends");
+        let got_a = k1_05_recv(&mut client_a).await;
+        assert!(got_a.ends_with(b"secret-a"), "own tenant delivers");
+        let other_a =
+            tokio::time::timeout(Duration::from_millis(300), k1_05_recv(&mut client_b)).await;
+        assert!(other_a.is_err(), "other tenant gets nothing");
+
+        // A publish in the second tenant reaches its own subscriber only.
+        client_b
+            .write_all(&ws_test_publish("k1-05/tenant/x", b"secret-b"))
+            .await
+            .expect("PUBLISH sends");
+        let got_b = k1_05_recv(&mut client_b).await;
+        assert!(got_b.ends_with(b"secret-b"), "own tenant delivers");
+        let other_b =
+            tokio::time::timeout(Duration::from_millis(300), k1_05_recv(&mut client_a)).await;
+        assert!(other_b.is_err(), "other tenant gets nothing");
+    }
+
+    /// Starts one kernel secure WebSocket listener with the K1-05
+    /// test server certificate and the given client policy.
+    /// Returns the port. The task runs until the test aborts it.
+    /// The listener copies the policy into the shared bind flags.
+    /// The bind then refuses a missing certificate when required.
+    async fn k1_05_wss_listener(mut shared: Shared, policy: super::TlsClientAuth) -> u16 {
+        shared.wss_verify_peer = policy.verify_peer;
+        shared.wss_verify_client_cert = policy.legacy_verify;
+        shared.wss_fail_if_no_peer_cert = policy.fail_if_no_peer_cert;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("wss binds");
+        let port = listener.local_addr().expect("wss addr").port();
+        let config = super::load_tls_config(
+            &k1_05_file("server-cert.pem"),
+            &k1_05_file("server-key.pem"),
+            &policy,
+        )
+        .expect("test TLS loads");
+        tokio::spawn(async move {
+            serve_native_wss(
+                listener,
+                config,
+                "/mqtt".to_string(),
+                Some(1000),
+                Arc::new(AtomicU64::new(0)),
+                shared,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// Opens a secure WebSocket session to the test port.
+    /// `client` selects the client certificate, if any.
+    /// Returns the handshake result. The server selects `mqtt`.
+    // The result error type is large. The signature is fixed.
+    #[allow(clippy::result_large_err)]
+    async fn k1_05_wss_dial(
+        port: u16,
+        client: Option<&str>,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
+        let connector = tokio_rustls::TlsConnector::from(k1_05_client_config(client));
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).expect("name holds");
+        let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, tcp))
+            .await
+            .expect("handshake ends in time")?;
+        let uri: http::Uri = format!("wss://127.0.0.1:{port}/mqtt")
+            .parse()
+            .expect("uri parses");
+        let builder = ClientRequestBuilder::new(uri).with_sub_protocol("mqtt");
+        let (stream, response) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::client_async_with_config(builder, tls, None),
+        )
+        .await
+        .expect("upgrade ends in time")?;
+        let selected = response
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(selected, "mqtt", "server selects mqtt");
+        Ok(stream)
+    }
+
+    /// In require mode a secure WebSocket client without a certificate
+    /// fails. A valid certificate connects. Goes through the broker.
+    /// The broker stays up after the failed handshake.
+    #[tokio::test]
+    async fn k1_05_wss_require_mode_checks_client_certificate() {
+        use futures::SinkExt as _;
+        let shared = Shared::new();
+        let port = k1_05_wss_listener(shared, k1_05_policy(true)).await;
+
+        let denied = k1_05_wss_dial(port, None).await;
+        assert!(denied.is_err(), "no certificate fails");
+
+        let mut valid = k1_05_wss_dial(port, Some("client-a"))
+            .await
+            .expect("valid dials");
+        valid
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("k1-05-wss-valid"),
+            ))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            wss_test_recv(&mut valid).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "valid certificate connects"
+        );
+        let _ = valid.close(None).await;
+    }
+
+    /// Test PSK identity and key. The key has 32 bytes.
+    const PSK_TEST_IDENTITY: &str = "psk-device";
+    /// Makes a store with one test identity. Goes through the store.
+    fn psk_test_store() -> std::sync::Arc<broker_auth::PskStore> {
+        let store = std::sync::Arc::new(broker_auth::PskStore::new());
+        store
+            .insert(PSK_TEST_IDENTITY, &[0x2Au8; 32])
+            .expect("test identity stores");
+        store
+    }
+
+    /// Starts one kernel PSK listener. Returns the port.
+    /// The task runs until the test aborts it.
+    async fn psk_test_listener(
+        shared: Shared,
+        store: std::sync::Arc<broker_auth::PskStore>,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("psk binds");
+        let port = listener.local_addr().expect("psk addr").port();
+        tokio::spawn(async move {
+            serve_native_mqtt_psk(
+                listener,
+                store,
+                Some(1000),
+                Arc::new(AtomicU64::new(0)),
+                shared,
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// Opens a TLS PSK session to the test port. Forces TLS 1.2,
+    /// the version the edge reference offers for PSK. Returns the
+    /// handshake result as a string for the leak check.
+    async fn psk_test_dial(port: u16, identity: &str, key: Vec<u8>) -> Result<(), String> {
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+        use std::pin::Pin;
+        let mut builder =
+            SslContextBuilder::new(SslMethod::tls_client()).map_err(|e| e.to_string())?;
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_cipher_list(super::PSK_CIPHER_LIST)
+            .map_err(|e| e.to_string())?;
+        let id = identity.to_string();
+        builder.set_psk_client_callback(move |_ssl, _hint, identity_out, psk_out| {
+            if id.len() + 1 > identity_out.len() || key.len() > psk_out.len() {
+                return Err(openssl::error::ErrorStack::get());
+            }
+            identity_out[..id.len()].copy_from_slice(id.as_bytes());
+            identity_out[id.len()] = 0;
+            psk_out[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        });
+        let context = builder.build();
+        let ssl = Ssl::new(&context).map_err(|e| e.to_string())?;
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut stream = tokio_openssl::SslStream::new(ssl, tcp).map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
+            .await
+            .map_err(|_| "handshake timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        // The handshake holds the stream. Drop it at once.
+        Ok(())
+    }
+
+    /// Opens a PSK session and keeps it for MQTT bytes.
+    /// Forces TLS 1.2. Returns the live stream.
+    async fn psk_test_connect(
+        port: u16,
+        identity: &str,
+        key: Vec<u8>,
+    ) -> tokio_openssl::SslStream<tokio::net::TcpStream> {
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+        use std::pin::Pin;
+        let mut builder = SslContextBuilder::new(SslMethod::tls_client()).expect("client builds");
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .expect("min holds");
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .expect("max holds");
+        builder
+            .set_cipher_list(super::PSK_CIPHER_LIST)
+            .expect("ciphers hold");
+        let id = identity.to_string();
+        builder.set_psk_client_callback(move |_ssl, _hint, identity_out, psk_out| {
+            identity_out[..id.len()].copy_from_slice(id.as_bytes());
+            identity_out[id.len()] = 0;
+            psk_out[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        });
+        let context = builder.build();
+        let ssl = Ssl::new(&context).expect("ssl builds");
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let mut stream = tokio_openssl::SslStream::new(ssl, tcp).expect("stream builds");
+        tokio::time::timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
+            .await
+            .expect("handshake ends in time")
+            .expect("valid PSK dials");
+        stream
+    }
+
+    /// The PSK context builds with a store. Goes through the builder.
+    #[test]
+    fn psk_ssl_context_builds_with_store() {
+        let context = super::build_psk_ssl_context(psk_test_store());
+        assert!(context.is_ok(), "PSK context builds");
+    }
+
+    /// A client with the correct identity and key connects and
+    /// exchanges MQTT bytes. Goes through the broker.
+    #[tokio::test]
+    async fn psk_valid_identity_connects_and_exchanges_mqtt() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        let port = psk_test_listener(shared, psk_test_store()).await;
+        let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        client
+            .write_all(&ws_test_connect("k1-04-psk-valid"))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "valid PSK connects");
+        client
+            .write_all(&ws_test_subscribe(1, "k1-04/psk/#"))
+            .await
+            .expect("SUBSCRIBE sends");
+        let suback = k1_05_recv(&mut client).await;
+        assert_eq!(suback[0], 0x90, "SUBACK answers");
+        client
+            .write_all(&ws_test_publish("k1-04/psk/x", b"psk-secret"))
+            .await
+            .expect("PUBLISH sends");
+        let delivered = k1_05_recv(&mut client).await;
+        assert!(delivered.ends_with(b"psk-secret"), "own publish delivers");
+    }
+
+    /// An unknown identity and a wrong key both fail before MQTT.
+    /// Neither failure names the identity. Goes through the broker.
+    /// Both failures run in the same handshake budget, as far as
+    /// the library permits. The two alerts may differ.
+    #[tokio::test]
+    async fn psk_unknown_identity_and_wrong_key_fail_without_leak() {
+        let shared = Shared::new();
+        let port = psk_test_listener(shared, psk_test_store()).await;
+        // The library fails the two cases at different stages, so
+        // exact equality is impossible. Both must fail inside the
+        // handshake budget and within one order of magnitude.
+        let start = std::time::Instant::now();
+        let unknown = psk_test_dial(port, "no-such-device", vec![0x2Au8; 32]).await;
+        let unknown_ms = start.elapsed().as_millis();
+        assert!(unknown.is_err(), "unknown identity fails");
+        let unknown_text = unknown.err().unwrap_or_default();
+        assert!(
+            !unknown_text.contains("no-such-device"),
+            "failure names no identity"
+        );
+        let start = std::time::Instant::now();
+        let wrong = psk_test_dial(port, PSK_TEST_IDENTITY, vec![0x33u8; 32]).await;
+        let wrong_ms = start.elapsed().as_millis();
+        assert!(wrong.is_err(), "wrong key fails");
+        let wrong_text = wrong.err().unwrap_or_default();
+        assert!(
+            !wrong_text.contains(PSK_TEST_IDENTITY),
+            "failure names no identity"
+        );
+        assert!(
+            unknown_ms < 10_000 && wrong_ms < 10_000,
+            "both fail inside the handshake budget, got {unknown_ms}ms and {wrong_ms}ms"
+        );
+        let (fast, slow) = if unknown_ms < wrong_ms {
+            (unknown_ms, wrong_ms)
+        } else {
+            (wrong_ms, unknown_ms)
+        };
+        assert!(
+            slow <= 10 * fast.max(1) + 50,
+            "both fail in the same time, got {unknown_ms}ms and {wrong_ms}ms"
+        );
+        // The broker stays up after both failed handshakes.
+        let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        client
+            .write_all(&ws_test_connect("k1-04-psk-after-denials"))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "broker stays up");
+    }
+
+    /// Opens a TLS 1.3 PSK session to the test port. Forces TLS 1.3,
+    /// so only the find-session callback can serve it. Returns the
+    /// handshake result as a string for the leak check.
+    async fn psk_test_dial_tls13(port: u16, identity: &str, key: Vec<u8>) -> Result<(), String> {
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+        use std::pin::Pin;
+        let mut builder =
+            SslContextBuilder::new(SslMethod::tls_client()).map_err(|e| e.to_string())?;
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_ciphersuites(super::PSK_CIPHERSUITES)
+            .map_err(|e| e.to_string())?;
+        let id = identity.to_string();
+        builder.set_psk_client_callback(move |_ssl, _hint, identity_out, psk_out| {
+            if id.len() + 1 > identity_out.len() || key.len() > psk_out.len() {
+                return Err(openssl::error::ErrorStack::get());
+            }
+            identity_out[..id.len()].copy_from_slice(id.as_bytes());
+            identity_out[id.len()] = 0;
+            psk_out[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        });
+        let context = builder.build();
+        let ssl = Ssl::new(&context).map_err(|e| e.to_string())?;
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut stream = tokio_openssl::SslStream::new(ssl, tcp).map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
+            .await
+            .map_err(|_| "handshake timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        // The handshake holds the stream. Drop it at once.
+        Ok(())
+    }
+
+    /// Opens a TLS 1.3 PSK session and keeps it for MQTT bytes.
+    /// Forces TLS 1.3. Returns the live stream.
+    async fn psk_test_connect_tls13(
+        port: u16,
+        identity: &str,
+        key: Vec<u8>,
+    ) -> tokio_openssl::SslStream<tokio::net::TcpStream> {
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+        use std::pin::Pin;
+        let mut builder = SslContextBuilder::new(SslMethod::tls_client()).expect("client builds");
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .expect("min holds");
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .expect("max holds");
+        builder
+            .set_ciphersuites(super::PSK_CIPHERSUITES)
+            .expect("ciphers hold");
+        let id = identity.to_string();
+        builder.set_psk_client_callback(move |_ssl, _hint, identity_out, psk_out| {
+            identity_out[..id.len()].copy_from_slice(id.as_bytes());
+            identity_out[id.len()] = 0;
+            psk_out[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        });
+        let context = builder.build();
+        let ssl = Ssl::new(&context).expect("ssl builds");
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        let mut stream = tokio_openssl::SslStream::new(ssl, tcp).expect("stream builds");
+        tokio::time::timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
+            .await
+            .expect("handshake ends in time")
+            .expect("valid PSK dials");
+        stream
+    }
+
+    /// A TLS 1.3 client with the correct identity and key connects
+    /// and exchanges MQTT bytes. Forces TLS 1.3, so only the
+    /// find-session callback serves the handshake. Goes through
+    /// the broker.
+    #[tokio::test]
+    async fn psk_tls13_valid_identity_connects_and_exchanges_mqtt() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        let port = psk_test_listener(shared, psk_test_store()).await;
+        let mut client = psk_test_connect_tls13(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        client
+            .write_all(&ws_test_connect("k1-04-psk-tls13-valid"))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "valid PSK connects");
+        client
+            .write_all(&ws_test_subscribe(1, "k1-04/psk13/#"))
+            .await
+            .expect("SUBSCRIBE sends");
+        let suback = k1_05_recv(&mut client).await;
+        assert_eq!(suback[0], 0x90, "SUBACK answers");
+        client
+            .write_all(&ws_test_publish("k1-04/psk13/x", b"psk13-secret"))
+            .await
+            .expect("PUBLISH sends");
+        let delivered = k1_05_recv(&mut client).await;
+        assert!(delivered.ends_with(b"psk13-secret"), "own publish delivers");
+        // An unknown identity and a wrong key both fail over TLS 1.3.
+        // Neither failure names the identity.
+        let unknown = psk_test_dial_tls13(port, "no-such-device", vec![0x2Au8; 32]).await;
+        assert!(unknown.is_err(), "unknown identity fails");
+        assert!(
+            !unknown.err().unwrap_or_default().contains("no-such-device"),
+            "failure names no identity"
+        );
+        let wrong = psk_test_dial_tls13(port, PSK_TEST_IDENTITY, vec![0x33u8; 32]).await;
+        assert!(wrong.is_err(), "wrong key fails");
+        assert!(
+            !wrong.err().unwrap_or_default().contains(PSK_TEST_IDENTITY),
+            "failure names no identity"
+        );
+    }
+
+    /// An empty store fails every handshake. Goes through the broker.
+    /// Proves the fail-closed default: no identity connects.
+    #[tokio::test]
+    async fn psk_empty_store_fails_closed() {
+        let shared = Shared::new();
+        let empty = std::sync::Arc::new(broker_auth::PskStore::new());
+        let port = psk_test_listener(shared, empty).await;
+        let denied = psk_test_dial(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        assert!(denied.is_err(), "empty store denies");
+    }
+
+    /// Identities from a keys file connect through the broker.
+    /// Writes one `identity:hexkey` line, loads it through the file
+    /// entry, then connects and exchanges MQTT bytes.
+    #[tokio::test]
+    async fn psk_keys_file_loads_and_connects_through_broker() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let path =
+            std::env::temp_dir().join(format!("indra-psk-k104-{}-file.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            format!("{}:{}\n", PSK_TEST_IDENTITY, "2a".repeat(32)),
+        )
+        .expect("psk file writes");
+        let store = std::sync::Arc::new(broker_auth::PskStore::new());
+        let count = store
+            .load_file(path.to_str().expect("path shows"))
+            .expect("psk file loads");
+        assert_eq!(count, 1, "one identity loads");
+        let shared = Shared::new();
+        let port = psk_test_listener(shared, store).await;
+        let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        client
+            .write_all(&ws_test_connect("k1-04-psk-file"))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "file identity connects");
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,9 +1,8 @@
 //! Node status endpoint for the v5 REST API.
 //!
-//! Covers `GET /status` (health check of the node). Single-node,
-//! management-plane only: nothing here runs on the per-message path, so
-//! reads never take a delivery lock and no new buffering is added to
-//! fan-out or fan-in.
+//! Covers `GET /api/v5/status` and its public alias `GET /status`.
+//! Single node, management-plane only: one relaxed atomic load serves
+//! each request, no delivery locks, no new buffering.
 //!
 //! Store bounds (both stated here and enforced by construction):
 //! - readiness is exactly one atomic bool shared with the kernel;
@@ -42,9 +41,11 @@ pub struct StatusQuery {
     format: Option<String>,
 }
 
-/// `GET /status`: health check of the node. It needs no authentication.
+/// `GET /api/v5/status`: node status read. It needs no token, as the
+/// reference API documents. `GET /status` is the same answer for load
+/// balancers.
 ///
-/// Single node, management-plane only: one relaxed atomic load per
+/// Single node, management-plane only: one relaxed atomic load serves
 /// request, no delivery locks, no new buffering.
 ///
 /// While the node is ready the answer is 200. While it is not ready the

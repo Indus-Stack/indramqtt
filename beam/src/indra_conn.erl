@@ -1012,11 +1012,13 @@ handle_connect_packet(Payload, Rest, #{broker := Broker, conn_id := ConnId, seq 
                             %% certificate fields and will together (/8); a WebSocket
                             %% connection gets PSK, will and alias handling exactly
                             %% as TCP does. X1-01 appends the v5 section (/9).
+                            %% TM-08 appends the listener name (/10).
                             Meta = (catch indra_brokerlink:encode_bind_meta(
                                          ClientId, CleanStart, Keepalive,
                                          {MappedUser, Pass},
                                          peer_ip_opt(Data), ClientAliasMax,
-                                         cert_info_opt(Data), Will, V5Info)),
+                                         cert_info_opt(Data), Will, V5Info,
+                                         listener_name_opt(Data))),
                             case Meta of
                                 <<_/binary>> ->
                                     case catch indra_brokerlink:send(Broker, ?BIND_CONNECTION,
@@ -1160,12 +1162,14 @@ resend_bind(#{broker := Broker, conn_id := ConnId, seq := Seq,
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {Username, Password},
                                                      peer_ip_opt(Data), ClientAliasMax,
-                                             cert_info_opt(Data), undefined, V5Info));
+                                             cert_info_opt(Data), undefined, V5Info,
+                                             listener_name_opt(Data)));
         _ ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {Username, Password},
                                                      peer_ip_opt(Data), ClientAliasMax,
-                                             cert_info_opt(Data), Will, V5Info))
+                                             cert_info_opt(Data), Will, V5Info,
+                                             listener_name_opt(Data)))
     end,
     case Meta of
         <<_/binary>> ->
@@ -1190,6 +1194,15 @@ peer_ip_opt(#{sock := Sock, sockmod := SockMod}) ->
     peer_ip(Sock, SockMod);
 peer_ip_opt(_) ->
     undefined.
+
+%% @private Listener name for the bind listener section (TM-08).
+%% The kernel uses it for tenant rules and certificate checks.
+%% `undefined' means the default scope.
+listener_name_opt(#{sockmod := gen_tcp}) -> <<"tcp">>;
+listener_name_opt(#{sockmod := ssl}) -> <<"tls">>;
+listener_name_opt(#{sockmod := ws}) -> <<"ws">>;
+listener_name_opt(#{sockmod := wss}) -> <<"wss">>;
+listener_name_opt(_) -> undefined.
 
 peer_ip(Sock, gen_tcp) ->
     case catch inet:peername(Sock) of
@@ -1495,12 +1508,14 @@ start_rebind(#{broker := Broker, conn_id := ConnId, seq := Seq,
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {undefined, undefined},
                                                      peer_ip_opt(Data), ClientAliasMax,
-                                             cert_info_opt(Data), undefined, V5Info));
+                                             cert_info_opt(Data), undefined, V5Info,
+                                             listener_name_opt(Data)));
         _ ->
             (catch indra_brokerlink:encode_bind_meta(ClientId, false, Keepalive,
                                                      {undefined, undefined},
                                                      peer_ip_opt(Data), ClientAliasMax,
-                                             cert_info_opt(Data), Will, V5Info))
+                                             cert_info_opt(Data), Will, V5Info,
+                                             listener_name_opt(Data)))
     end,
     case Meta of
         <<_/binary>> ->

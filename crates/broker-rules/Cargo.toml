@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 broker-protocol = { workspace = true }
 broker-connectors = { workspace = true }
+broker-connectors-enterprise = { workspace = true, optional = true }
 broker-config = { workspace = true }
 broker-observability = { workspace = true }
 bytes = { workspace = true }
@@ -36,24 +37,38 @@ chrono = "0.4"
 regex = "1.13.1"
 lz4_flex = "0.14"
 
+[features]
+# Default build: light sinks only (no vendor SDK). Each heavy SDK is off
+# unless its feature is enabled (X1-09 first half plus X1-10 rest); a
+# feature build (or `--all-features`) restores the full set. The
+# enterprise forwarding features enable the optional enterprise
+# dependency for tests that go through the gated enterprise sinks.
+default = []
+s3 = ["broker-connectors/s3"]
+clickhouse = ["broker-connectors/clickhouse"]
+kafka = ["broker-connectors/kafka"]
+elasticsearch = ["broker-connectors/elasticsearch"]
+rabbitmq = ["broker-connectors/rabbitmq"]
+cassandra = ["broker-connectors-enterprise/cassandra"]
+confluent = ["broker-connectors-enterprise/confluent"]
+couchbase = ["broker-connectors-enterprise/couchbase"]
+mongodb = ["broker-connectors-enterprise/mongodb"]
+gcp_pubsub = ["broker-connectors-enterprise/gcp_pubsub"]
+bigquery = ["broker-connectors-enterprise/bigquery"]
+aws_iot = ["broker-connectors-enterprise/aws_iot"]
+azure_blob = ["broker-connectors-enterprise/azure_blob"]
+azure_eventhubs = ["broker-connectors-enterprise/azure_eventhubs"]
+azure_iot = ["broker-connectors-enterprise/azure_iot"]
+dynamodb = ["broker-connectors-enterprise/dynamodb"]
+gcp_iot = ["broker-connectors-enterprise/gcp_iot"]
+kinesis = ["broker-connectors-enterprise/kinesis"]
+
 [dev-dependencies]
 broker-connectors-enterprise = { workspace = true }
+broker-router = { workspace = true }
+broker-session = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
 rsa = { workspace = true }
 rand = { workspace = true }
-
-[features]
-# X1-09: mirrors the enterprise cloud-IoT/cloud-store gates so the e2e
-# below builds both with default features (gated tests absent) and with
-# `--features <name>` (each gated test runs). Each forwards to the owning
-# enterprise crate feature.
-default = []
-aws_iot = ["broker-connectors-enterprise/aws_iot"]
-azure_blob = ["broker-connectors-enterprise/azure_blob"]
-azure_eventhubs = ["broker-connectors-enterprise/azure_eventhubs"]
-azure_iot = ["broker-connectors-enterprise/azure_iot"]
-bigquery = ["broker-connectors-enterprise/bigquery"]
-dynamodb = ["broker-connectors-enterprise/dynamodb"]
-gcp_iot = ["broker-connectors-enterprise/gcp_iot"]

@@ -513,56 +513,179 @@ fn default_acl_allow() -> bool {
     true
 }
 
+/// Upper bound for persisted per-tenant credential tables (TM-01).
+/// Reason: one table is one map header plus short strings, so 1024
+/// entries bound the persisted file near tens of KiB while covering
+/// multi-tenant installs far past real deployments; writes past the cap
+/// are rejected instead of growing the file without limit. Mirrors the
+/// credential-store tenant cap.
+pub const MAX_MQTT_TENANT_TABLES: usize = 1024;
+
+/// Longest persisted tenant id (TM-01). Reason: the tenant id joins
+/// session keys, credential keys and log lines, so 128 chars bound key
+/// memory while covering hierarchical names. Mirrors the session bound.
+pub const MAX_MQTT_TENANT_ID_LEN: usize = 128;
+
+/// Upper bound for MQTT users across all persisted tenants (TM-01).
+/// Reason: each entry holds a verifier plus map overhead, so an
+/// unbounded file lets one write exhaust the kernel; 100,000 entries
+/// cover fleet provisioning while keeping per-CONNECT lookups cheap.
+/// Mirrors the credential-store user cap.
+pub const MAX_MQTT_USERS_TOTAL: usize = 100_000;
+
+/// Upper bound for ACL rules in one persisted tenant table (TM-01).
+/// Reason: authorisation scans first-match-wins linearly, so 10,000
+/// entries bound per-check work to a small constant while covering
+/// large fleets; writes past the cap are rejected instead of growing
+/// the scan without limit. Mirrors the credential-store rule cap.
+pub const MAX_MQTT_ACL_PER_TENANT: usize = 10_000;
+
+/// One tenant credential table inside the persisted snapshot (TM-01).
+///
+/// `tenant` names a non-default tenant; the default tenant lives in the
+/// root `users`/`acls` fields so files written before per-tenant storage
+/// load unchanged as the default tenant. `users` and `acls` follow the
+/// same shape and validation as the root fields, scoped to this tenant:
+/// the same username in two tenants is two independent identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TenantMqttConf {
+    /// Tenant id; must be non-empty, unique within the root, and must not
+    /// name the default tenant (field `tenant`).
+    pub tenant: String,
+    /// Tenant users; usernames must be unique within this table.
+    #[serde(default)]
+    pub users: Vec<MqttUser>,
+    /// Tenant ACLs in evaluation order (first match wins).
+    #[serde(default)]
+    pub acls: Vec<AclConf>,
+}
+
 /// Root: MQTT users and their ACLs.
+///
+/// `users`/`acls` hold the default tenant, exactly as before per-tenant
+/// storage: files written before this change load with an empty
+/// `tenants` list and behave identically. `tenants` holds one table per
+/// non-default tenant; every table persists in `state.toml`, survives a
+/// restart and a reload, and ships in the export and the backup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MqttUsersConf {
     #[serde(default)]
     pub users: Vec<MqttUser>,
     #[serde(default)]
     pub acls: Vec<AclConf>,
+    /// Per-tenant credential tables (TM-01; empty for pre-change files).
+    #[serde(default)]
+    pub tenants: Vec<TenantMqttConf>,
+}
+
+/// True when `id` may name a persisted tenant table: non-empty, at most
+/// [`MAX_MQTT_TENANT_ID_LEN`] chars and free of control characters.
+#[must_use]
+pub fn is_valid_mqtt_tenant_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_MQTT_TENANT_ID_LEN && !id.chars().any(|c| c.is_control())
 }
 
 impl MqttUsersConf {
     /// Validates users (non-empty, unique, password present) and ACLs.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let mut seen = HashSet::with_capacity(self.users.len());
-        for (index, user) in self.users.iter().enumerate() {
+        Self::validate_users("mqtt_users.users", &self.users)?;
+        Self::validate_acls("mqtt_users.acls", &self.acls)?;
+        if self.acls.len() > MAX_MQTT_ACL_PER_TENANT {
+            return Err(ConfigError::Invalid(format!(
+                "mqtt_users.acls holds {} entries, at most {MAX_MQTT_ACL_PER_TENANT} (field `acls`)",
+                self.acls.len(),
+            )));
+        }
+        if self.tenants.len() > MAX_MQTT_TENANT_TABLES {
+            return Err(ConfigError::Invalid(format!(
+                "mqtt_users.tenants holds {} entries, at most {MAX_MQTT_TENANT_TABLES} (field `tenants`)",
+                self.tenants.len(),
+            )));
+        }
+        let mut seen_tenants = HashSet::with_capacity(self.tenants.len());
+        let mut total_users = self.users.len();
+        for (index, table) in self.tenants.iter().enumerate() {
+            if !is_valid_mqtt_tenant_id(&table.tenant) {
+                return Err(ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].tenant {:?} is not a valid tenant id (field `tenant`)",
+                    table.tenant
+                )));
+            }
+            if table.tenant == "default" {
+                return Err(ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].tenant {:?} must live in the root users/acls fields (field `tenant`)",
+                    table.tenant
+                )));
+            }
+            if !seen_tenants.insert(table.tenant.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].tenant {:?} is duplicated (field `tenant`)",
+                    table.tenant
+                )));
+            }
+            Self::validate_users(&format!("mqtt_users.tenants[{index}].users"), &table.users)?;
+            Self::validate_acls(&format!("mqtt_users.tenants[{index}].acls"), &table.acls)?;
+            if table.acls.len() > MAX_MQTT_ACL_PER_TENANT {
+                return Err(ConfigError::Invalid(format!(
+                    "mqtt_users.tenants[{index}].acls holds {} entries, at most {MAX_MQTT_ACL_PER_TENANT} (field `acls`)",
+                    table.acls.len(),
+                )));
+            }
+            total_users += table.users.len();
+        }
+        if total_users > MAX_MQTT_USERS_TOTAL {
+            return Err(ConfigError::Invalid(format!(
+                "mqtt_users holds {total_users} users, at most {MAX_MQTT_USERS_TOTAL} (field `users`)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validates one user list (non-empty, unique, password present).
+    fn validate_users(path: &str, users: &[MqttUser]) -> Result<(), ConfigError> {
+        let mut seen = HashSet::with_capacity(users.len());
+        for (index, user) in users.iter().enumerate() {
             if user.username.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "mqtt_users.users[{index}].username must not be empty (field `username`)"
+                    "{path}[{index}].username must not be empty (field `username`)"
                 )));
             }
             if user.password_hash.is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "mqtt_users.users[{index}].password_hash must not be empty (field `password_hash`)"
+                    "{path}[{index}].password_hash must not be empty (field `password_hash`)"
                 )));
             }
             if !seen.insert(user.username.clone()) {
                 return Err(ConfigError::Invalid(format!(
-                    "mqtt_users.users[{index}].username {:?} is duplicated (field `username`)",
+                    "{path}[{index}].username {:?} is duplicated (field `username`)",
                     user.username
                 )));
             }
         }
-        for (index, acl) in self.acls.iter().enumerate() {
+        Ok(())
+    }
+
+    /// Validates one ACL list (known action, non-empty fields).
+    fn validate_acls(path: &str, acls: &[AclConf]) -> Result<(), ConfigError> {
+        for (index, acl) in acls.iter().enumerate() {
             if acl.username.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "mqtt_users.acls[{index}].username must not be empty (field `username`)"
+                    "{path}[{index}].username must not be empty (field `username`)"
                 )));
             }
             if acl.topic.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "mqtt_users.acls[{index}].topic must not be empty (field `topic`)"
+                    "{path}[{index}].topic must not be empty (field `topic`)"
                 )));
             }
             if acl.action.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "mqtt_users.acls[{index}].action must not be empty (field `action`)"
+                    "{path}[{index}].action must not be empty (field `action`)"
                 )));
             }
             if !is_known_acl_action(&acl.action) {
                 return Err(ConfigError::Invalid(format!(
-                    "mqtt_users.acls[{index}].action {:?} is unknown (field `action`)",
+                    "{path}[{index}].action {:?} is unknown (field `action`)",
                     acl.action
                 )));
             }
@@ -599,6 +722,34 @@ fn default_rule_enabled() -> bool {
     true
 }
 
+/// Serde default for a missing rule tenant: historical entries predate
+/// tenancy and ran in the default tenant.
+fn default_rule_tenant() -> String {
+    "default".to_string()
+}
+
+/// Longest accepted rule tenant id (128 chars). Reason: mirrors the
+/// session tenant bound, so the id joins routing keys with bounded
+/// key memory.
+pub const MAX_RULE_TENANT_LEN: usize = 128;
+
+/// True when a rule tenant id may own a rule: non-empty, at most
+/// 128 chars, no control chars. Empty fails here; callers map empty
+/// to the default tenant before this check.
+pub fn is_valid_rule_tenant(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_RULE_TENANT_LEN && !id.chars().any(|c| c.is_control())
+}
+
+/// Map an absent or blank rule tenant to the default tenant.
+pub fn canonical_rule_tenant(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Upper bound for stored routing rules. Creates past this size are
 /// rejected instead of growing the map without limit. Reason: the list
 /// handler clones the whole snapshot once per request, so the catalogue
@@ -623,6 +774,10 @@ pub struct RuleEntry {
     /// Rule name; free-form (pre-persistence files load as empty).
     #[serde(default)]
     pub name: String,
+    /// Tenant that owns the rule. Empty loads as the default tenant so
+    /// files written before tenancy keep their behaviour.
+    #[serde(default = "default_rule_tenant")]
+    pub tenant: String,
     /// MQTT topic filter; must be non-empty.
     pub topic_filter: String,
     /// Optional streaming-SQL program (`None` = match without SQL).
@@ -667,6 +822,12 @@ impl RulesConf {
                 return Err(ConfigError::Invalid(format!(
                     "rules.rules[{index}].id {:?} is too long (field `id`)",
                     rule.id
+                )));
+            }
+            if !is_valid_rule_tenant(&rule.tenant) {
+                return Err(ConfigError::Invalid(format!(
+                    "rules.rules[{index}].tenant {:?} is not valid (field `tenant`)",
+                    rule.tenant
                 )));
             }
             if rule.topic_filter.trim().is_empty() {
@@ -3938,11 +4099,13 @@ mod tests {
                     action: "all".to_string(),
                     allow: true,
                 }],
+                tenants: Vec::new(),
             },
             rules: RulesConf {
                 rules: vec![RuleEntry {
                     id: "rule-1".to_string(),
                     name: "rule-1".to_string(),
+                    tenant: "default".to_string(),
                     topic_filter: "sensors/#".to_string(),
                     sql_query: Some("SELECT * FROM 'sensors/#'".to_string()),
                     enabled: true,
@@ -4075,6 +4238,7 @@ mod tests {
         let rule = RuleEntry {
             id: "rule-1".to_string(),
             name: "rule-1".to_string(),
+            tenant: "default".to_string(),
             topic_filter: "a/#".to_string(),
             sql_query: Some("SELECT * FROM 'a/#'".to_string()),
             enabled: true,
@@ -4421,6 +4585,7 @@ mod tests {
             rules: vec![RuleEntry {
                 id: "rule-1".to_string(),
                 name: "rule-1".to_string(),
+                tenant: "default".to_string(),
                 topic_filter: "sensors/#".to_string(),
                 sql_query: Some("SELECT * FROM 'sensors/#'".to_string()),
                 enabled: true,
@@ -4472,6 +4637,7 @@ mod tests {
             rules: vec![RuleEntry {
                 id: String::new(),
                 name: String::new(),
+                tenant: "default".to_string(),
                 topic_filter: "a/#".to_string(),
                 sql_query: Some("SELECT 1".to_string()),
                 enabled: true,
@@ -4592,5 +4758,60 @@ mod tests {
         ] {
             bad.validate().expect_err("bad settings must fail");
         }
+    }
+
+    /// TM-01: files from before per-tenant storage carry no `tenants`
+    /// key. They load as the default tenant with the same rows.
+    #[test]
+    fn pre_change_mqtt_file_loads_as_default_tenant() {
+        let parsed: MqttUsersConf =
+            toml::from_str("[[users]]\nusername = \"base\"\npassword_hash = \"h\"\n")
+                .expect("old file parses");
+        assert!(parsed.tenants.is_empty());
+        assert!(parsed.validate().is_ok());
+        assert_eq!(parsed.users.len(), 1);
+    }
+
+    /// TM-01: each bad per-tenant table fails with the field named.
+    #[test]
+    fn per_tenant_tables_validate_fully_before_apply() {
+        fn table(tenant: &str) -> TenantMqttConf {
+            TenantMqttConf {
+                tenant: tenant.to_string(),
+                users: vec![MqttUser {
+                    username: "sam".to_string(),
+                    password_hash: "h".to_string(),
+                    max_connections: None,
+                    max_publish_rate: None,
+                    max_publish_burst: None,
+                }],
+                acls: vec![],
+            }
+        }
+        // The default tenant must live in the root fields.
+        let mut conf = MqttUsersConf {
+            users: vec![],
+            acls: vec![],
+            tenants: vec![table("default")],
+        };
+        let err = conf.validate().expect_err("default in tenants must fail");
+        assert!(err.to_string().contains("tenant"), "got: {err}");
+        // Duplicated tables fail.
+        conf.tenants = vec![table("a"), table("a")];
+        let err = conf.validate().expect_err("duplicated tenant must fail");
+        assert!(err.to_string().contains("tenant"), "got: {err}");
+        // Bad ids fail.
+        conf.tenants = vec![table("")];
+        let err = conf.validate().expect_err("empty tenant must fail");
+        assert!(err.to_string().contains("tenant"), "got: {err}");
+        // One valid table passes.
+        conf.tenants = vec![table("tenant-a")];
+        assert!(conf.validate().is_ok());
+        // Same username in two tenants passes (independent identities).
+        conf.tenants.push(table("tenant-b"));
+        assert!(conf.validate().is_ok());
+        // Tenant helper accepts ordinary ids and refuses bad ones.
+        assert!(is_valid_mqtt_tenant_id("tenant-a"));
+        assert!(!is_valid_mqtt_tenant_id(""));
     }
 }

@@ -229,9 +229,10 @@ type E2eBind = (String, bool, u16, Option<String>, Option<Vec<u8>>);
 
 /// Decode a `BindConnection` metadata body into [`E2eBind`], mirroring
 /// the kernel's `decode_bind_meta` contract (`ClientIdLen:16be |
-/// ClientId | Flags:8 | Keepalive:16be`, plus the optional trailing
-/// `UserLen | Username | PassLen | Password` credentials section and the
-/// optional trailing `PeerLen:16be | PeerIp` peer-address section).
+/// ClientId | Flags:8 | Keepalive:16be`, plus flagged sections).
+/// Flags decide the parse. Bit 0 is clean start. Bit 1 marks a head
+/// will section. Bits 3, 4, 5 and 6 mark credentials, peer, certificate
+/// and listener sections. The tail holds the alias maximum.
 fn decode_e2e_bind(meta: &[u8]) -> Option<E2eBind> {
     if meta.len() < 5 {
         return None;
@@ -243,7 +244,106 @@ fn decode_e2e_bind(meta: &[u8]) -> Option<E2eBind> {
     let client_id = std::str::from_utf8(&meta[2..2 + id_len]).ok()?.to_string();
     let flags = meta[2 + id_len];
     let keepalive = u16::from_be_bytes([meta[3 + id_len], meta[4 + id_len]]);
-    let rest = &meta[5 + id_len..];
+    let mut rest = &meta[5 + id_len..];
+    // Skip the head will section when bit 1 is set.
+    // Layout: QoS:8 | Retain:8 | TopicLen:16be | Topic | PayloadLen:32be | Payload.
+    if flags & 0x02 != 0 {
+        if rest.len() < 8 {
+            return None;
+        }
+        let topic_len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
+        if rest.len() < 4 + topic_len + 4 {
+            return None;
+        }
+        let payload_len = u32::from_be_bytes([
+            rest[4 + topic_len],
+            rest[5 + topic_len],
+            rest[6 + topic_len],
+            rest[7 + topic_len],
+        ]) as usize;
+        if rest.len() < 4 + topic_len + 4 + payload_len {
+            return None;
+        }
+        rest = &rest[4 + topic_len + 4 + payload_len..];
+    }
+    // Flagged parse. The kernel reads credentials, peer, certificate,
+    // then listener. Each set flag needs its section.
+    if flags & (0x08 | 0x10 | 0x20 | 0x40) != 0 {
+        let mut cursor = rest;
+        let (username, password) = if flags & 0x08 != 0 {
+            if cursor.len() < 2 {
+                return None;
+            }
+            let user_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+            if cursor.len() < 2 + user_len + 2 {
+                return None;
+            }
+            let username = std::str::from_utf8(&cursor[2..2 + user_len])
+                .ok()?
+                .to_string();
+            let base = 2 + user_len;
+            let pass_len = u16::from_be_bytes([cursor[base], cursor[base + 1]]) as usize;
+            if cursor.len() < base + 2 + pass_len {
+                return None;
+            }
+            let password = cursor[base + 2..base + 2 + pass_len].to_vec();
+            cursor = &cursor[base + 2 + pass_len..];
+            (Some(username), Some(password))
+        } else {
+            (None, None)
+        };
+        if flags & 0x10 != 0 {
+            if cursor.len() < 2 {
+                return None;
+            }
+            let peer_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+            if cursor.len() < 2 + peer_len {
+                return None;
+            }
+            let literal = std::str::from_utf8(&cursor[2..2 + peer_len]).ok()?;
+            literal.parse::<std::net::IpAddr>().ok()?;
+            cursor = &cursor[2 + peer_len..];
+        }
+        if flags & 0x20 != 0 {
+            if cursor.len() < 2 {
+                return None;
+            }
+            let cert_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+            if cursor.len() < 2 + cert_len {
+                return None;
+            }
+            cursor = &cursor[2 + cert_len..];
+        }
+        if flags & 0x40 != 0 {
+            if cursor.len() < 2 {
+                return None;
+            }
+            let name_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+            if !(1..=64).contains(&name_len) || cursor.len() < 2 + name_len {
+                return None;
+            }
+            std::str::from_utf8(&cursor[2..2 + name_len]).ok()?;
+            cursor = &cursor[2 + name_len..];
+        }
+        // Strip the v5 section when bit 2 is set.
+        // Layout: AliasMax:16be | V5Payload | V5Len:16be.
+        if flags & 0x04 != 0 {
+            if cursor.len() < 4 {
+                return None;
+            }
+            let v5_len =
+                u16::from_be_bytes([cursor[cursor.len() - 2], cursor[cursor.len() - 1]]) as usize;
+            if cursor.len() < 2 + v5_len + 2 {
+                return None;
+            }
+            cursor = &cursor[..2];
+        }
+        // The tail holds nothing or the alias maximum.
+        if !(cursor.is_empty() || cursor.len() == 2) {
+            return None;
+        }
+        return Some((client_id, flags & 0x01 != 0, keepalive, username, password));
+    }
     let (username, password) = if rest.is_empty() {
         (None, None)
     } else {
@@ -3985,6 +4085,304 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected_through_edge() {
     assert!(silent.is_err(), "A holds none of B's publish");
 
     edge.finish().await;
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+/// TM-09: tenant in client and subscription reads, through real
+/// sockets and the real API.
+///
+/// The kernel boots from `indra.toml` with one tenant rule and its own
+/// MQTT listener, so no edge is needed. Two tenants connect the same
+/// client id. Each tenant publishes a random value the broker cannot
+/// know. Delivery stays in-tenant. The API then shows each tenant its
+/// own rows only, and the default-tenant reads keep their shapes.
+#[tokio::test]
+async fn tm09_tenant_client_reads_through_sockets_and_api() {
+    use tokio::io::AsyncWriteExt;
+
+    const STEP: std::time::Duration = SHARD_E2E_STEP;
+    let tag = format!(
+        "tm09-reads-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
+    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+
+    let bl_port = shard_ephemeral_port();
+    let mqtt_port = shard_ephemeral_port();
+    let api_port = shard_ephemeral_port();
+    std::fs::write(
+        config_dir.join("indra.toml"),
+        format!(
+            "[node]\n\
+             id = \"tm09-e2e\"\n\
+             data_dir = \"{}\"\n\
+             brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
+             \n\
+             [listeners.tcp]\n\
+             bind = \"127.0.0.1:{mqtt_port}\"\n\
+             native = true\n\
+             \n\
+             [listeners.api]\n\
+             bind = \"127.0.0.1:{api_port}\"\n\
+             \n\
+             [logging]\n\
+             level = \"warn\"\n\
+             \n\
+             [[tenants.rules]]\n\
+             expression = \"t-${{username}}\"\n",
+            scratch.display(),
+        ),
+    )
+    .expect("write indra.toml");
+
+    // Operator key: 21 chars, above the 16-char minimum. Bearer auth
+    // opens the management API with no user setup.
+    let api_key = "tm09-e2e-test-key-0001";
+    let mut child = tokio::process::Command::new(shard_kernel_binary())
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .arg("--allow-anonymous")
+        .env("INDRA_API_KEYS", api_key)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real kernel");
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{api_port}");
+    let deadline = std::time::Instant::now() + SHARD_E2E_BOOT;
+    loop {
+        let up = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            http.get(format!("{base}/healthz")).send(),
+        )
+        .await;
+        if let Ok(Ok(res)) = up {
+            if let Ok(text) = res.text().await {
+                if text == "OK"
+                    && tokio::net::TcpStream::connect(("127.0.0.1", mqtt_port))
+                        .await
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            panic!("tm09 kernel never opened API {api_port} and MQTT {mqtt_port}");
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("tm09 kernel exited during boot: {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    async fn dial(port: u16) -> tokio::net::TcpStream {
+        tokio::time::timeout(STEP, tokio::net::TcpStream::connect(("127.0.0.1", port)))
+            .await
+            .expect("dial in time")
+            .expect("dial")
+    }
+    async fn connect_user(sock: &mut tokio::net::TcpStream, client_id: &str, username: &str) {
+        tokio::time::timeout(
+            STEP,
+            sock.write_all(&sy02_connect311(
+                client_id,
+                true,
+                60,
+                Some((username, b"pw")),
+            )),
+        )
+        .await
+        .expect("CONNECT in time")
+        .expect("CONNECT send");
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
+            .await
+            .expect("CONNACK in time")
+            .expect("CONNACK");
+        assert_eq!(head, 0x20, "kernel answers {client_id} with CONNACK");
+        assert_eq!(body, vec![0x00, 0x00], "CONNECT of {client_id} is accepted");
+    }
+    async fn subscribe(sock: &mut tokio::net::TcpStream, filter: &str) {
+        tokio::time::timeout(STEP, sock.write_all(&sy02_subscribe(1, &[(filter, 0)])))
+            .await
+            .expect("SUBSCRIBE in time")
+            .expect("SUBSCRIBE send");
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
+            .await
+            .expect("SUBACK in time")
+            .expect("SUBACK");
+        assert_eq!(head & 0xF0, 0x90, "kernel answers with SUBACK");
+        assert_eq!(body, vec![0x00, 0x01, 0x00], "subscribe is granted");
+    }
+
+    // Same client id in two tenants. Both connects succeed.
+    let mut a_sub = dial(mqtt_port).await;
+    let mut b_sub = dial(mqtt_port).await;
+    let mut a_pub = dial(mqtt_port).await;
+    let mut b_pub = dial(mqtt_port).await;
+    connect_user(&mut a_sub, "tm09-dup", "tm09-a").await;
+    connect_user(&mut b_sub, "tm09-dup", "tm09-b").await;
+    subscribe(&mut a_sub, "tm09/check").await;
+    subscribe(&mut b_sub, "tm09/check").await;
+    connect_user(&mut a_pub, "tm09-a-pub", "tm09-a").await;
+    connect_user(&mut b_pub, "tm09-b-pub", "tm09-b").await;
+
+    // Random values the broker cannot know. Delivery stays in-tenant.
+    let secret_a = format!("tm09-{}-a-{}", std::process::id(), rand::random::<u64>());
+    let secret_b = format!("tm09-{}-b-{}", std::process::id(), rand::random::<u64>());
+    tokio::time::timeout(
+        STEP,
+        a_pub.write_all(&sy02_publish311(
+            "tm09/check",
+            0,
+            0,
+            false,
+            secret_a.as_bytes(),
+        )),
+    )
+    .await
+    .expect("publish in time")
+    .expect("publish send");
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut a_sub))
+        .await
+        .expect("downlink in time")
+        .expect("downlink");
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let own = sy02_parse_publish_classic(head, &body);
+    assert_eq!(own.topic, "tm09/check");
+    assert_eq!(own.payload, secret_a.as_bytes());
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "tenant B holds none of tenant A publish");
+
+    tokio::time::timeout(
+        STEP,
+        b_pub.write_all(&sy02_publish311(
+            "tm09/check",
+            0,
+            0,
+            false,
+            secret_b.as_bytes(),
+        )),
+    )
+    .await
+    .expect("publish in time")
+    .expect("publish send");
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut b_sub))
+        .await
+        .expect("downlink in time")
+        .expect("downlink");
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let own = sy02_parse_publish_classic(head, &body);
+    assert_eq!(own.payload, secret_b.as_bytes());
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "tenant A holds none of tenant B publish");
+
+    // Reads through the API. Each tenant filter shows its rows only.
+    async fn api_get(
+        http: &reqwest::Client,
+        base: &str,
+        key: &str,
+        path: &str,
+    ) -> (u16, serde_json::Value) {
+        let res = tokio::time::timeout(
+            STEP,
+            http.get(format!("{base}{path}")).bearer_auth(key).send(),
+        )
+        .await
+        .expect("API in time")
+        .expect("API send");
+        let status = res.status().as_u16();
+        let body: serde_json::Value = tokio::time::timeout(STEP, res.json())
+            .await
+            .expect("body in time")
+            .expect("body is JSON");
+        (status, body)
+    }
+    for tenant in ["t-tm09-a", "t-tm09-b"] {
+        let (status, body) = api_get(
+            &http,
+            &base,
+            api_key,
+            &format!("/api/v5/clients?tenant={tenant}"),
+        )
+        .await;
+        assert_eq!(status, 200, "client list of {tenant}");
+        let data = body["data"].as_array().expect("client list has data");
+        assert!(!data.is_empty(), "{tenant} keeps its rows");
+        for row in data {
+            assert_eq!(row["mountpoint"], serde_json::json!(tenant));
+        }
+        assert!(
+            data.iter().any(|row| row["clientid"] == "tm09-dup"),
+            "{tenant} shows its namesake"
+        );
+    }
+    let (status, body) = api_get(&http, &base, api_key, "/api/v5/clients").await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().expect("client list has data");
+    let mut mounts: Vec<&str> = data
+        .iter()
+        .filter(|row| row["clientid"] == "tm09-dup")
+        .map(|row| row["mountpoint"].as_str().expect("row carries mountpoint"))
+        .collect();
+    mounts.sort_unstable();
+    assert_eq!(mounts, vec!["t-tm09-a", "t-tm09-b"]);
+
+    // The bare detail read keeps the default tenant, so it misses
+    // here instead of leaking another tenant session.
+    let (status, _) = api_get(&http, &base, api_key, "/api/v5/clients/tm09-dup").await;
+    assert_eq!(status, 404);
+    let (status, body) = api_get(
+        &http,
+        &base,
+        api_key,
+        "/api/v5/clients/tm09-dup?tenant=t-tm09-a",
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["mountpoint"], serde_json::json!("t-tm09-a"));
+
+    // Subscription reads scope the same way with the current shape.
+    let (status, body) = api_get(
+        &http,
+        &base,
+        api_key,
+        "/api/v5/subscriptions?tenant=t-tm09-a",
+    )
+    .await;
+    assert_eq!(status, 200);
+    let rows = body.as_array().expect("subscription list is an array");
+    assert!(!rows.is_empty(), "tenant A keeps its subscriptions");
+    for row in rows {
+        assert!(row.get("tenant").is_none());
+    }
+    assert!(
+        rows.iter().any(|row| row["topic"] == "tm09/check"),
+        "tenant A shows its subscription"
+    );
+    let (status, _) = api_get(&http, &base, api_key, "/api/v5/topics").await;
+    assert_eq!(status, 200);
+    let (status, _) = api_get(&http, &base, api_key, "/api/v5/sessions_count").await;
+    assert_eq!(status, 200);
+
     let _ = child.kill().await;
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_dir_all(&config_dir);

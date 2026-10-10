@@ -276,6 +276,22 @@ pub fn validate_whole(snapshot: &FullSnapshot) -> Result<(), ConfigError> {
             }
         }
     }
+    // Same fail-closed secret check for each per-tenant table (TM-01):
+    // an unresolvable tenant password rejects the change set instead of
+    // applying with a locked account.
+    for (table_index, table) in snapshot.mqtt_users.tenants.iter().enumerate() {
+        for (index, user) in table.users.iter().enumerate() {
+            let trimmed = user.password_hash.trim();
+            if crate::secrets::is_secret_ref(trimmed) {
+                if let Err(err) = crate::secrets::resolve_secret(trimmed) {
+                    problems.push(format!(
+                        "mqtt_users.tenants[{table_index}].users[{index}].password_hash cannot resolve {}: {err} (field `mqtt_users.tenants[{table_index}].users[{index}].password_hash`)",
+                        crate::secrets::redact_value(trimmed)
+                    ));
+                }
+            }
+        }
+    }
     if problems.is_empty() {
         Ok(())
     } else {
@@ -489,6 +505,89 @@ pub fn diff_snapshots(old: &FullSnapshot, new: &FullSnapshot) -> Vec<ConfigDiff>
                 .unwrap_or_else(|_| format!("{} entries", new.mqtt_users.acls.len())),
         ));
     }
+    // Per-tenant tables (TM-01), keyed by tenant id. A table that only
+    // one side holds is one row; a table both hold diffs per user plus
+    // one row when its ACL list changes. Secrets stay redacted.
+    {
+        let old_tables: HashMap<&str, &crate::TenantMqttConf> = old
+            .mqtt_users
+            .tenants
+            .iter()
+            .map(|t| (t.tenant.as_str(), t))
+            .collect();
+        let new_tables: HashMap<&str, &crate::TenantMqttConf> = new
+            .mqtt_users
+            .tenants
+            .iter()
+            .map(|t| (t.tenant.as_str(), t))
+            .collect();
+        for tenant in sorted_keys(&old_tables, &new_tables) {
+            match (
+                old_tables.get(tenant.as_str()),
+                new_tables.get(tenant.as_str()),
+            ) {
+                (Some(a), Some(b)) => {
+                    let old_users: HashMap<&str, &crate::MqttUser> =
+                        a.users.iter().map(|u| (u.username.as_str(), u)).collect();
+                    let new_users: HashMap<&str, &crate::MqttUser> =
+                        b.users.iter().map(|u| (u.username.as_str(), u)).collect();
+                    for username in sorted_keys(&old_users, &new_users) {
+                        match (
+                            old_users.get(username.as_str()),
+                            new_users.get(username.as_str()),
+                        ) {
+                            (Some(u), Some(v)) => {
+                                if u != v {
+                                    out.push(row(
+                                        format!("mqtt_users.tenants[{tenant}].users[{username}]"),
+                                        &render_mqtt_user(u),
+                                        &render_mqtt_user(v),
+                                    ));
+                                }
+                            }
+                            (None, Some(_)) => out.push(row(
+                                format!("mqtt_users.tenants[{tenant}].users[{username}]"),
+                                "<absent>",
+                                "<present>",
+                            )),
+                            (Some(_), None) => out.push(row(
+                                format!("mqtt_users.tenants[{tenant}].users[{username}]"),
+                                "<present>",
+                                "<absent>",
+                            )),
+                            (None, None) => {}
+                        }
+                    }
+                    if a.acls != b.acls {
+                        let mut old_value =
+                            serde_json::to_value(&a.acls).unwrap_or(serde_json::Value::Null);
+                        redact_json_value(&mut old_value);
+                        let mut new_value =
+                            serde_json::to_value(&b.acls).unwrap_or(serde_json::Value::Null);
+                        redact_json_value(&mut new_value);
+                        out.push(row(
+                            format!("mqtt_users.tenants[{tenant}].acls"),
+                            &serde_json::to_string(&old_value)
+                                .unwrap_or_else(|_| format!("{} entries", a.acls.len())),
+                            &serde_json::to_string(&new_value)
+                                .unwrap_or_else(|_| format!("{} entries", b.acls.len())),
+                        ));
+                    }
+                }
+                (None, Some(_)) => out.push(row(
+                    format!("mqtt_users.tenants[{tenant}]"),
+                    "<absent>",
+                    "<present>",
+                )),
+                (Some(_), None) => out.push(row(
+                    format!("mqtt_users.tenants[{tenant}]"),
+                    "<present>",
+                    "<absent>",
+                )),
+                (None, None) => {}
+            }
+        }
+    }
     // Rules keyed by id.
     let old_rules: HashMap<&str, &crate::RuleEntry> =
         old.rules.rules.iter().map(|r| (r.id.as_str(), r)).collect();
@@ -634,11 +733,13 @@ mod tests {
             mqtt_users: MqttUsersConf {
                 users: Vec::new(),
                 acls: Vec::new(),
+                tenants: Vec::new(),
             },
             rules: crate::RulesConf {
                 rules: vec![crate::RuleEntry {
                     id: "r1".to_string(),
                     name: "r1".to_string(),
+                    tenant: "default".to_string(),
                     topic_filter: "a/#".to_string(),
                     sql_query: None,
                     enabled: true,
@@ -695,6 +796,7 @@ mod tests {
                 max_publish_burst: None,
             }],
             acls: Vec::new(),
+            tenants: Vec::new(),
         };
         let err = validate_whole(&bad).expect_err("must fail");
         let text = err.to_string();

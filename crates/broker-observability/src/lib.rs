@@ -64,6 +64,11 @@ pub struct Metrics {
     // Reads via `tenant_mismatch_dropped`; management snapshots stay
     // unchanged (management output belongs to MT-07).
     tenant_mismatch_dropped: AtomicU64,
+    // Per-tenant limit refusals (TM-06). Each bumps where the refusal
+    // already happens; the refused use never proceeds.
+    tenant_conn_refused: AtomicU64,
+    tenant_sess_refused: AtomicU64,
+    tenant_retained_dropped: AtomicU64,
     // QoS 1 downlinks spilled past the in-memory window into the bounded
     // per-session overflow buffer (B4-01). Each bump means one live
     // delivery that IS still tracked for DUP redelivery, unlike
@@ -156,6 +161,9 @@ pub struct MetricsSnapshot {
     pub rule_spill_torn: u64,
     pub rule_spill_recovered: u64,
     pub tenant_mismatch_dropped: u64,
+    pub tenant_conn_refused: u64,
+    pub tenant_sess_refused: u64,
+    pub tenant_retained_dropped: u64,
     pub transport_sent: u64,
     pub transport_send_failed: u64,
     pub egress_qos0_shed: u64,
@@ -689,6 +697,33 @@ impl Metrics {
         self.tenant_mismatch_dropped.load(Ordering::Relaxed)
     }
 
+    /// One CONNECT refused by the per-tenant connection bound.
+    pub fn inc_tenant_conn_refused(&self) -> u64 {
+        self.tenant_conn_refused.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// One CONNECT refused by the per-tenant session bound.
+    pub fn inc_tenant_sess_refused(&self) -> u64 {
+        self.tenant_sess_refused.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// One retained write dropped by the per-tenant retained bound.
+    pub fn inc_tenant_retained_dropped(&self) -> u64 {
+        self.tenant_retained_dropped.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn tenant_conn_refused(&self) -> u64 {
+        self.tenant_conn_refused.load(Ordering::Relaxed)
+    }
+
+    pub fn tenant_sess_refused(&self) -> u64 {
+        self.tenant_sess_refused.load(Ordering::Relaxed)
+    }
+
+    pub fn tenant_retained_dropped(&self) -> u64 {
+        self.tenant_retained_dropped.load(Ordering::Relaxed)
+    }
+
     pub fn inflight_spilled(&self) -> u64 {
         self.inflight_spilled.load(Ordering::Relaxed)
     }
@@ -791,6 +826,9 @@ impl Metrics {
             rule_spill_torn: self.rule_spill_torn(),
             rule_spill_recovered: self.rule_spill_recovered(),
             tenant_mismatch_dropped: self.tenant_mismatch_dropped(),
+            tenant_conn_refused: self.tenant_conn_refused(),
+            tenant_sess_refused: self.tenant_sess_refused(),
+            tenant_retained_dropped: self.tenant_retained_dropped(),
             transport_sent: self.transport_sent(),
             transport_send_failed: self.transport_send_failed(),
             egress_qos0_shed: self.egress_qos0_shed(),

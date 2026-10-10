@@ -125,6 +125,7 @@ async fn password_verify_per_algorithm_bench() {
             snapshot_user("bench-migrate", LEGACY_HEX),
         ],
         acls: vec![],
+        tenants: vec![],
     };
     let auth = MemoryAuth::from_snapshot(&conf);
 

@@ -242,6 +242,73 @@ bind_meta_bad_credentials_rejected_test() ->
                  indra_brokerlink:encode_bind_meta(<<"d">>, true, 60,
                                                   {<<"alice">>, undefined})).
 
+%% TM-07 cross-language vectors. The Rust test decodes the same
+%% bytes. Flags decide the parse. A short section fails closed.
+tm07_explicit_sections_crosslang_test() ->
+    %% Anonymous bind. No section flags.
+    Anon = <<0, 6, "tm07-a", 1, 0, 60>>,
+    {ok, ADec} = indra_brokerlink:decode_bind_meta(Anon),
+    ?assertEqual(<<"tm07-a">>, maps:get(client_id, ADec)),
+    ?assertEqual(undefined, maps:get(username, ADec)),
+    ?assertEqual(undefined, maps:get(peerhost, ADec)),
+    ?assertEqual(undefined, maps:get(cert_cn, ADec)),
+    %% Credentialed bind with flags. Flags = clean plus creds.
+    Creds = <<0, 6, "tm07-b", 9, 0, 60, 0, 5, "alice", 0, 2, "pw">>,
+    {ok, CDec} = indra_brokerlink:decode_bind_meta(Creds),
+    ?assertEqual(<<"tm07-b">>, maps:get(client_id, CDec)),
+    ?assertEqual(<<"alice">>, maps:get(username, CDec)),
+    ?assertEqual(<<"pw">>, maps:get(password, CDec)),
+    ?assertEqual(undefined, maps:get(peerhost, CDec)),
+    %% Same bytes without flags still decode to the same fields.
+    LegacyCreds = <<0, 6, "tm07-b", 1, 0, 60, 0, 5, "alice", 0, 2, "pw">>,
+    {ok, LDec} = indra_brokerlink:decode_bind_meta(LegacyCreds),
+    ?assertEqual(maps:get(username, CDec), maps:get(username, LDec)),
+    ?assertEqual(maps:get(password, CDec), maps:get(password, LDec)),
+    %% Peer bind with flags. Flags = peer only, clean is false.
+    Peer = <<0, 6, "tm07-c", 16, 0, 30, 0, 9, "127.0.0.1">>,
+    {ok, PDec} = indra_brokerlink:decode_bind_meta(Peer),
+    ?assertEqual(<<"tm07-c">>, maps:get(client_id, PDec)),
+    ?assertEqual(undefined, maps:get(username, PDec)),
+    ?assertEqual(<<"127.0.0.1">>, maps:get(peerhost, PDec)),
+    %% Same peer bytes without flags decode to the same peer.
+    LegacyPeer = <<0, 6, "tm07-c", 0, 0, 30, 0, 9, "127.0.0.1">>,
+    {ok, LPDec} = indra_brokerlink:decode_bind_meta(LegacyPeer),
+    ?assertEqual(maps:get(peerhost, PDec), maps:get(peerhost, LPDec)),
+    %% Certificate bind with flags. Flags = clean plus all sections.
+    Cert = <<0, 6, "tm07-d", 57, 0, 60,
+             0, 3, "bob", 0, 6, "secret",
+             0, 10, "192.0.2.10",
+             0, 9, 0, 3, "cn1", 0, 0, 0, 0>>,
+    {ok, CertDec} = indra_brokerlink:decode_bind_meta(Cert),
+    ?assertEqual(<<"tm07-d">>, maps:get(client_id, CertDec)),
+    ?assertEqual(<<"bob">>, maps:get(username, CertDec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, CertDec)),
+    ?assertEqual(<<"cn1">>, maps:get(cert_cn, CertDec)),
+    %% Same certificate bytes without flags decode to the same fields.
+    LegacyCert = <<0, 6, "tm07-d", 1, 0, 60,
+                   0, 3, "bob", 0, 6, "secret",
+                   0, 10, "192.0.2.10",
+                   0, 9, 0, 3, "cn1", 0, 0, 0, 0>>,
+    {ok, LCertDec} = indra_brokerlink:decode_bind_meta(LegacyCert),
+    ?assertEqual(maps:get(username, CertDec), maps:get(username, LCertDec)),
+    ?assertEqual(maps:get(peerhost, CertDec), maps:get(peerhost, LCertDec)),
+    ?assertEqual(maps:get(cert_cn, CertDec), maps:get(cert_cn, LCertDec)),
+    %% The encoder sets the same flag bits.
+    EncCreds = indra_brokerlink:encode_bind_meta(<<"tm07-b">>, true, 60,
+                                                {<<"alice">>, <<"pw">>}),
+    ?assertEqual(Creds, EncCreds),
+    EncPeer = indra_brokerlink:encode_bind_meta(<<"tm07-c">>, false, 30,
+                                               {undefined, undefined},
+                                               <<"127.0.0.1">>),
+    ?assertEqual(Peer, EncPeer),
+    %% A short section fails with the documented error.
+    Short = binary:part(Creds, 0, byte_size(Creds) - 1),
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(Short)),
+    ShortCert = binary:part(Cert, 0, byte_size(Cert) - 1),
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(ShortCert)).
+
 bind_meta_peer_roundtrip_test() ->
     %% Credentials plus peer address decode together (B1-03).
     Meta = indra_brokerlink:encode_bind_meta(<<"dev-1">>, true, 60,
@@ -690,6 +757,48 @@ bind_meta_v5_undefined_is_byte_identical_to_v8_test() ->
     ?assertEqual(65535, maps:get(receive_maximum, Dec)),
     ?assertEqual(0, maps:get(max_packet_size, Dec)),
     ?assertEqual([], maps:get(user_properties, Dec)).
+
+bind_meta_listener_roundtrip_test() ->
+    %% The /10 encoding carries the listener name after the
+    %% certificate section. The name decodes back. Empty means
+    %% the default scope and encodes exactly like /9.
+    Base = indra_brokerlink:encode_bind_meta(<<"dev-lis">>, true, 60,
+                                            {<<"alice">>, <<"s3cret">>},
+                                            <<"192.0.2.10">>, 7,
+                                            #{cn => <<"cn1">>, subject => undefined,
+                                              sans => []},
+                                            undefined, undefined),
+    WithTls = indra_brokerlink:encode_bind_meta(<<"dev-lis">>, true, 60,
+                                               {<<"alice">>, <<"s3cret">>},
+                                               <<"192.0.2.10">>, 7,
+                                               #{cn => <<"cn1">>, subject => undefined,
+                                                 sans => []},
+                                               undefined, undefined, <<"tls">>),
+    {ok, Dec} = indra_brokerlink:decode_bind_meta(WithTls),
+    ?assertEqual(<<"tls">>, maps:get(listener, Dec)),
+    ?assertEqual(<<"cn1">>, maps:get(cert_cn, Dec)),
+    ?assertEqual(<<"alice">>, maps:get(username, Dec)),
+    ?assertEqual(<<"192.0.2.10">>, maps:get(peerhost, Dec)),
+    ?assertEqual(Base, indra_brokerlink:encode_bind_meta(
+                         <<"dev-lis">>, true, 60,
+                         {<<"alice">>, <<"s3cret">>},
+                         <<"192.0.2.10">>, 7,
+                         #{cn => <<"cn1">>, subject => undefined,
+                           sans => []},
+                         undefined, undefined, undefined)),
+    {ok, LDec} = indra_brokerlink:decode_bind_meta(Base),
+    ?assertEqual(<<>>, maps:get(listener, LDec)),
+    %% A truncated listener section fails closed.
+    Short = binary:part(WithTls, 0, byte_size(WithTls) - 1),
+    ?assertEqual({error, malformed_bind_meta},
+                 indra_brokerlink:decode_bind_meta(Short)),
+    %% An overlong name is rejected at encode time.
+    Long = binary:copy(<<"x">>, 65),
+    ?assertError(badarg,
+                 indra_brokerlink:encode_bind_meta(<<"d">>, true, 60,
+                                                  {undefined, undefined},
+                                                  undefined, 0,
+                                                  undefined, undefined, undefined, Long)).
 
 bind_meta_v5_malformed_rejected_test() ->
     %% Truncated v5 section (declared length beyond the bytes present).

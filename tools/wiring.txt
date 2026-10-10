@@ -24,6 +24,7 @@ wired  sso_backends
 wired  license
 wired  hwm_history
 wired  license_setting
+wired  license
 wired  sources
 wired  actions
 wired  connectors
@@ -31,3 +32,4 @@ wired  transformations
 wired  schema_registry
 wired  listener_store
 wired  prometheus
+wired  namespaces

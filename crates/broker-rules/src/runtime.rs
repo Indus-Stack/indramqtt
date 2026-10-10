@@ -106,19 +106,28 @@ pub const RULE_INGRESS_STREAM: &str = "broker/ingress";
 pub const RUNTIME_TOPIC_KEY: &str = "__runtime_topic__";
 pub const RUNTIME_QOS_KEY: &str = "__runtime_qos__";
 pub const RUNTIME_ADDED_KEY: &str = "__runtime_added__";
+/// Tenant of the ingress that produced the record. One rule task
+/// serves one tenant, so the feeder drops records of other tenants.
+pub const RUNTIME_TENANT_KEY: &str = "__runtime_tenant__";
 
-/// Convert one ingress `(topic, payload, qos)` to a [`StreamRecord`].
+/// Convert one ingress `(tenant, topic, payload, qos)` to a [`StreamRecord`].
 /// Called exactly once per windowed ingress in `dispatch_ingress`.
 ///
 /// The data map mirrors [`crate::build_std_record`]: the JSON object keys
 /// stay at top level, and `payload`/`topic`/`qos` are injected only when
 /// absent (the returned record carries the injected names in
 /// [`RUNTIME_ADDED_KEY`] so the feeder can rebuild the exact evaluation
-/// record for either dialect mode). The real routing topic and QoS always
-/// travel under [`RUNTIME_TOPIC_KEY`]/[`RUNTIME_QOS_KEY`]. Fields the broker
+/// record for either dialect mode). The real routing tenant, topic and
+/// QoS always travel under [`RUNTIME_TENANT_KEY`]/[`RUNTIME_TOPIC_KEY`]/
+/// [`RUNTIME_QOS_KEY`]. Fields the broker
 /// cannot supply are omitted, never a constant standing in for a
 /// measurement. The timestamp is wall-clock millis at conversion.
-pub fn ingress_to_stream_record(topic: &Topic, payload: &Bytes, qos: QoS) -> StreamRecord {
+pub fn ingress_to_stream_record(
+    tenant: &str,
+    topic: &Topic,
+    payload: &Bytes,
+    qos: QoS,
+) -> StreamRecord {
     let parsed: Option<serde_json::Value> = serde_json::from_slice(payload).ok();
     let is_object = matches!(parsed, Some(serde_json::Value::Object(_)));
     let mut data: HashMap<String, serde_json::Value> = match parsed.clone() {
@@ -153,6 +162,10 @@ pub fn ingress_to_stream_record(topic: &Topic, payload: &Bytes, qos: QoS) -> Str
         serde_json::Value::from(qos as u8),
     );
     data.insert(
+        RUNTIME_TENANT_KEY.to_string(),
+        serde_json::Value::String(tenant.to_string()),
+    );
+    data.insert(
         RUNTIME_ADDED_KEY.to_string(),
         serde_json::json!({
             "added": added,
@@ -165,10 +178,12 @@ pub fn ingress_to_stream_record(topic: &Topic, payload: &Bytes, qos: QoS) -> Str
     }
 }
 
-/// Rebuilt feeder input: the real ingress topic, its QoS number, the
-/// evaluation record and the injected-key list, plus whether the payload
-/// carried a JSON object at top level.
+/// Rebuilt feeder input: the real ingress tenant and topic, its QoS
+/// number, the evaluation record and the injected-key list, plus
+/// whether the payload carried a JSON object at top level.
 pub struct FeederRecord {
+    /// Tenant of the ingress (routing context; rules serve one tenant).
+    pub tenant: String,
     /// Real ingress topic (routing context; never the payload's `topic`).
     pub topic: Topic,
     /// Real ingress QoS number (0/1/2).
@@ -187,6 +202,7 @@ pub struct FeederRecord {
 pub fn split_stream_record(mut data: HashMap<String, serde_json::Value>) -> Option<FeederRecord> {
     let topic_value = data.remove(RUNTIME_TOPIC_KEY)?;
     let topic_str = topic_value.as_str()?.to_string();
+    let tenant = data.remove(RUNTIME_TENANT_KEY)?.as_str()?.to_string();
     let qos = data
         .remove(RUNTIME_QOS_KEY)?
         .as_u64()
@@ -213,6 +229,7 @@ pub fn split_stream_record(mut data: HashMap<String, serde_json::Value>) -> Opti
     };
     let topic = Topic::new(&topic_str).ok()?;
     Some(FeederRecord {
+        tenant,
         topic,
         qos,
         record: data,

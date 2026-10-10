@@ -36,6 +36,18 @@ enabled = false
 bind = "0.0.0.0:8883"
 cert_file = "/etc/indramqtt/certs/server.crt"
 key_file = "/etc/indramqtt/certs/server.key"
+# Request and verify a client certificate. Off by default.
+verify_client_cert = false
+# Client certificate chain check mode: verify_none or verify_peer.
+verify = "verify_none"
+# CA file for client certificate checks. Empty uses system roots.
+cacertfile = ""
+# Refuse a handshake without a certificate. Needs verification on.
+fail_if_no_peer_cert = false
+# Take the bind username from the certificate: disabled, cn or dn.
+peer_cert_as_username = "disabled"
+# Take the bind client identifier from the certificate: disabled, cn or dn.
+peer_cert_as_clientid = "disabled"
 
 [listeners.ws]
 # Binary MQTT-over-WebSocket listener (older files may use
@@ -51,6 +63,18 @@ bind = "0.0.0.0:8084"
 path = "/mqtt"
 cert_file = ""
 key_file = ""
+# Request and verify a client certificate. Off by default.
+verify_client_cert = false
+# Client certificate chain check mode: verify_none or verify_peer.
+verify = "verify_none"
+# CA file for client certificate checks. Empty uses system roots.
+cacertfile = ""
+# Refuse a handshake without a certificate. Needs verification on.
+fail_if_no_peer_cert = false
+# Take the bind username from the certificate: disabled, cn or dn.
+peer_cert_as_username = "disabled"
+# Take the bind client identifier from the certificate: disabled, cn or dn.
+peer_cert_as_clientid = "disabled"
 
 [listeners.api]
 # Axum REST Management API & Embedded Web Dashboard SPA
@@ -70,6 +94,15 @@ default_max_publish_rate = 50000
 
 # Token bucket burst multiplier (allows burst up to burst * rate)
 burst_multiplier = 2.0
+
+# Default max live connections per tenant (0 = unlimited)
+max_connections_per_tenant = 10000
+
+# Default max sessions per tenant (0 = unlimited)
+max_sessions_per_tenant = 10000
+
+# Default max retained topics per tenant (0 = unlimited)
+max_retained_per_tenant = 10000
 
 # =============================================================================
 # Session & Protocol Invariants

@@ -726,7 +726,7 @@ pub fn access_for_path(path: &str) -> PathAccess {
             PathAccess::Scope("cluster_operations")
         }
         "listeners" | "listeners_status" | "mqtt" | "data" | "configs" | "configs_reset"
-        | "certs" => PathAccess::Scope("system"),
+        | "certs" | "mt" => PathAccess::Scope("system"),
         "audit" => PathAccess::Scope("audit"),
         "license" => PathAccess::Scope("license"),
         _ => PathAccess::Closed,

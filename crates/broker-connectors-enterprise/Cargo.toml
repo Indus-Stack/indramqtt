@@ -36,9 +36,12 @@ webpki-roots = { version = "0.25" }
 tokio-postgres = { version = "0.7" }
 tokio-postgres-rustls = { version = "0.14", features = ["native-certs"] }
 google-cloud-auth = { version = "1" }
+# BigQuery driver (Apache-2.0). Optional (X1-10): the `bigquery` module is
+# off unless its feature is enabled, so the default build stays light.
 gcp-bigquery-client = { version = "0.28", default-features = false, features = ["native-tls", "aws-lc-rs"], optional = true }
-scylla = { version = "1.9" }
-clickhouse = { version = "0.15", features = ["native-tls"] }
+# Wide-column driver (Apache-2.0). Optional (X1-10): the `cassandra`
+# module is off unless its feature is enabled.
+scylla = { version = "1.9", optional = true }
 aws-sigv4 = { version = "1", optional = true }
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"], optional = true }
 # Redshift sink on the maintained official driver (Apache-2.0):
@@ -53,7 +56,9 @@ aws-sdk-redshiftdata = { version = "1", default-features = false, features = ["b
 # session token when configured, endpoint override for local servers).
 # The hand-written `HttpKinesisTransport` stays for offline unit tests
 # only; production wiring uses `SdkKinesisTransport` below.
-aws-sdk-kinesis = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# Optional (X1-10): the `kinesis` module is off unless its feature is
+# enabled, so the default build stays light.
+aws-sdk-kinesis = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"], optional = true }
 # S3 / MinIO sink on the maintained official driver (Apache-2.0):
 # `PutObject` with driver-owned SigV4 (static access-key credentials,
 # endpoint override for local servers, path-style for IP endpoints).
@@ -62,19 +67,24 @@ aws-sdk-kinesis = { version = "1", default-features = false, features = ["behavi
 # The hand-written `HttpS3Transport` stays for offline unit tests
 # only; production wiring uses `SdkS3Transport` below.
 futures = { workspace = true }
-rdkafka = { version = "0.39", features = ["ssl"] }
-schema-registry-client = { version = "0.4" }
+# Kafka driver (Apache-2.0) plus schema-registry client. Optional (X1-10):
+# the `confluent` module is off unless its feature is enabled.
+rdkafka = { version = "0.39", features = ["ssl"], optional = true }
+schema-registry-client = { version = "0.4", optional = true }
 # Elasticsearch/OpenSearch bulk sink on the maintained official driver
 # (Apache-2.0). `http` (MIT/Apache-2.0) builds the per-request headers.
 # Pinned to the latest 8.x prerelease: the `elasticsearch` crate has no
 # stable 8.x on crates.io (only `-alpha.1` prereleases), so a plain
 # `version = "8"` never resolves and the gates fail version selection.
-elasticsearch = { version = "8.19.0-alpha.1" }
+# The sink lives in the community crate: `elasticsearch` below forwards
+# to it, so no driver line stays here.
 http = { version = "1" }
 # Couchbase sink on the maintained official driver (Apache-2.0). The
 # hand-written `NativeCouchbaseTransport` stays for offline unit tests
 # only; production wiring uses `DriverCouchbaseTransport` below.
-couchbase = { version = "1" }
+# Optional (X1-10): the `couchbase` module is off unless its feature is
+# enabled, so the default build stays light.
+couchbase = { version = "1", optional = true }
 # MySQL / MariaDB sink on the maintained `mysql_async` driver
 # (MIT/Apache-2.0): native protocol (handshake, mysql_native_password +
 # caching_sha2_password, COM_STMT_PREPARE/EXECUTE) with driver-owned
@@ -89,14 +99,19 @@ mysql_async = { version = "0.36", default-features = false, features = ["minimal
 # enables exactly one rustls provider (`aws-lc-rs`), and enabling both
 # `ring` and `aws_lc_rs` makes `CryptoProvider::from_crate_features`
 # ambiguous so `get_default_or_install_from_crate_features` panics.
-mongodb = { version = "3", default-features = false, features = ["compat-3-0-0", "dns-resolver", "rustls-tls-aws-lc"] }
+# Optional (X1-10): the `mongodb` module is off unless its feature is
+# enabled, so the default build stays light.
+mongodb = { version = "3", default-features = false, features = ["compat-3-0-0", "dns-resolver", "rustls-tls-aws-lc"], optional = true }
 # Google Cloud Pub/Sub sink on the maintained official driver
 # (Apache-2.0). The sink publishes through `google-cloud-pubsub` gRPC
 # `Publisher` (base64 data, ordering keys, attributes); the hand-written
 # REST `HttpGcpPubSubTransport` is retained for offline unit tests only.
-google-cloud-pubsub = { version = "1" }
+# Optional (X1-10): the `gcp_pubsub` module is off unless its feature is
+# enabled, so the default build stays light.
+google-cloud-pubsub = { version = "1", optional = true }
 # Error-code mapping for the Pub/Sub driver tests (Apache-2.0).
-google-cloud-gax = { version = "1" }
+# Optional with the driver above for the same reason.
+google-cloud-gax = { version = "1", optional = true }
 # Remote MQTT bridge sink on the maintained `rumqttc` driver
 # (Apache-2.0). Plain TCP only (`default-features = false`, no TLS
 # backend): `mqtts://` endpoints fail closed with a clear error until
@@ -116,7 +131,8 @@ prost = { version = "0.13" }
 # requesting `rustls--ring` as well would enable both `ring` and
 # `aws-lc-rs` for `rustls`, and `CryptoProvider::from_crate_features`
 # then returns `None` so every `ClientConfig::builder` panics.
-lapin = { version = "4", default-features = false, features = ["tokio", "rustls"] }
+# The sink lives in the community crate: `rabbitmq` below forwards
+# to it, so no driver line stays here.
 # Redis sink on the maintained `redis` driver (BSD-3-Clause): RESP with
 # AUTH/SELECT from the URL, multiplexed tokio connection, pipelining via
 # `redis::pipe`. The hand-written `TcpRedisTransport` stays for offline
@@ -143,21 +159,39 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # `DriverTdengineTransport` below (`reqwest` REST, Basic + plaintext).
 
 [features]
-# Default build: light enterprise sinks only (no cloud-IoT/cloud-store
-# SDKs from X1-09). Each heavy SDK/sink is off unless its feature is
-# enabled. X1-09 gates the first half (cloud-IoT + cloud-store):
-# `aws_iot`, `azure_iot`, `gcp_iot`, `dynamodb`, `bigquery`,
-# `azure_blob`, `azure_eventhubs`. X1-10 gates the rest. A feature build
-# (e.g. `--features dynamodb`) restores that sink; the release set (or
-# `--all-features`) restores all.
+# Default build holds light sinks only (no vendor SDK).
+# Each heavy SDK stays off unless its feature is on.
+# X1-09 gates `aws_iot`, `azure_iot`, `gcp_iot`, `dynamodb`,
+# `bigquery`, `azure_blob` and `azure_eventhubs`. X1-10 gates
+# `cassandra` (scylla driver), `confluent` (rdkafka plus
+# schema-registry client), `couchbase`, `mongodb`,
+# `gcp_pubsub` (google-cloud-pubsub driver) and `kinesis`
+# (aws-sdk-kinesis driver). `confluent`
+# reuses the community `kafka` framing, so it enables
+# `broker-connectors/kafka`. `kafka`, `clickhouse`,
+# `elasticsearch` and `rabbitmq` live in the community
+# crate. Each has its feature there. A feature build
+# (for example `--features dynamodb`) restores one sink.
+# The release set (or `--all-features`) restores all.
+# New B3 sinks land behind features from the start.
 default = []
 aws_iot = ["dep:aws-sigv4"]
 dynamodb = ["dep:aws-sdk-dynamodb"]
-bigquery = ["dep:gcp-bigquery-client"]
+bigquery = ["dep:gcp-bigquery-client", "gcp_pubsub"]
 azure_blob = []
 azure_eventhubs = []
 azure_iot = []
 gcp_iot = []
+cassandra = ["dep:scylla"]
+confluent = [
+    "dep:rdkafka",
+    "dep:schema-registry-client",
+    "broker-connectors/kafka",
+]
+couchbase = ["dep:couchbase"]
+mongodb = ["dep:mongodb"]
+gcp_pubsub = ["dep:google-cloud-pubsub", "dep:google-cloud-gax"]
+kinesis = ["dep:aws-sdk-kinesis"]
 
 [dev-dependencies]
 axum = { workspace = true }

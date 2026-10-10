@@ -33,6 +33,7 @@ pub mod listeners;
 pub mod mfa;
 pub mod monitor;
 pub mod monitoring;
+pub mod mt;
 pub mod nodes;
 pub mod prometheus;
 pub mod retainer;
@@ -1144,4 +1145,35 @@ pub fn protected_router() -> Router<ApiState> {
             "/node_eviction/status",
             get(empty_states::get_node_eviction_status),
         )
+        // Tenant namespaces (TM-02, C17): the 16 `/mt/...` operations.
+        // Reads serve live broker state per tenant; writes touch only the
+        // managed registry plus the tenant credential rows. Auth and the
+        // viewer read-only rule come from the shared middleware.
+        // Management-plane only; publish and deliver never touch it.
+        .route("/mt/bulk_delete_ns", delete(mt::bulk_delete_ns))
+        .route(
+            "/mt/bulk_export_ns_configs",
+            post(mt::bulk_export_ns_configs),
+        )
+        .route("/mt/bulk_import_configs", post(mt::bulk_import_configs))
+        .route(
+            "/mt/bulk_import_ns_configs",
+            post(mt::bulk_import_ns_configs),
+        )
+        .route("/mt/managed_ns_list", get(mt::list_managed_ns))
+        .route(
+            "/mt/managed_ns_list_details",
+            get(mt::list_managed_ns_details),
+        )
+        .route("/mt/ns_list", get(mt::list_ns))
+        .route("/mt/ns_list_details", get(mt::list_ns_details))
+        .route("/mt/ns/:ns", post(mt::create_ns).delete(mt::delete_ns))
+        .route("/mt/ns/:ns/client_count", get(mt::ns_client_count))
+        .route("/mt/ns/:ns/client_list", get(mt::ns_client_list))
+        .route(
+            "/mt/ns/:ns/config",
+            get(mt::get_ns_config).put(mt::put_ns_config),
+        )
+        .route("/mt/ns/:ns/kick_all_clients", post(mt::kick_ns_clients))
+        .route("/mt/ns/:ns/metrics", get(mt::ns_metrics))
 }

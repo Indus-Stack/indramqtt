@@ -339,6 +339,15 @@ pub struct ApiState {
     /// request. No publish path reads this store. Publish and deliver take
     /// no lock here.
     pub schema_registry: Arc<crate::v5::schema_registry::SchemaRegistryStore>,
+    /// Managed tenant namespaces for the 16 `GET/POST/PUT/DELETE
+    /// /api/v5/mt/...` operations (TM-02): bounded name-keyed map with
+    /// creation times plus stored configs. Reads join live broker state
+    /// (sessions per tenant, credential tables per tenant); writes touch
+    /// only this registry plus the tenant rows. The instance is created
+    /// once in `ApiState::new`, so the served API and the kernel observe
+    /// one registry with no second copy. Management-plane only; publish
+    /// and deliver never touch this store.
+    pub namespaces: Arc<crate::v5::mt::NamespaceStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -605,6 +614,7 @@ impl ApiState {
             schema_registry: Arc::new(
                 crate::v5::schema_registry::SchemaRegistryStore::from_registry(&config),
             ),
+            namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -711,6 +721,7 @@ impl ApiState {
             startup_config: Arc::new(std::sync::RwLock::new(None)),
             transformations: Arc::new(crate::v5::transformations::TransformChainStore::new()),
             schema_registry: Arc::new(crate::v5::schema_registry::SchemaRegistryStore::new()),
+            namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -804,7 +815,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/version", get(get_dashboard_version))
         .route("/ws/mqtt", get(ws::ws_mqtt_handler))
         .route("/healthz", get(|| async { "OK" }))
-        // Alias of `GET /api/v5/status` without the API prefix.
+        // Public alias of `GET /api/v5/status` for load balancers. It needs no token.
         .route("/status", get(v5::status::get_status))
         .nest("/api/v5", v5::public_router())
         .merge(protected);
@@ -961,6 +972,8 @@ async fn get_dashboard_version() -> Response {
 }
 
 /// Creation payload: identifiers are assigned server-side (`rule-<n>`).
+/// `tenant` selects the owning tenant; absent or blank selects the
+/// default tenant, so calls without it behave as before.
 #[derive(Debug, Deserialize)]
 struct CreateRuleRequest {
     name: String,
@@ -971,6 +984,8 @@ struct CreateRuleRequest {
     enabled: bool,
     #[serde(default)]
     actions: Vec<ActionDto>,
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -1045,6 +1060,16 @@ async fn create_rule(
     if req.name.trim().is_empty() {
         return bad_request("rule name must not be empty");
     }
+    // Tenant scope: absent or blank rides as the default tenant.
+    // A malformed id fails with 400. An unknown tenant (no managed
+    // namespace) fails with 400 and stores nothing.
+    let tenant = broker_config::canonical_rule_tenant(req.tenant.as_deref().unwrap_or(""));
+    if !broker_config::is_valid_rule_tenant(&tenant) {
+        return bad_request(format!("tenant {tenant:?} is not valid (field `tenant`)"));
+    }
+    if !state.namespaces.contains(&tenant) {
+        return bad_request(format!("unknown tenant {tenant:?} (field `tenant`)"));
+    }
     let topic_filter = match TopicFilter::new(req.topic_filter) {
         Ok(filter) => filter,
         Err(e) => return bad_request(format!("invalid topic_filter: {e}")),
@@ -1073,17 +1098,20 @@ async fn create_rule(
         }
     }
 
-    let rule: Rule =
-        match state
-            .engine
-            .create_rule(req.name, topic_filter, req.sql_query, req.enabled, actions)
-        {
-            Ok(rule) => rule,
-            // A persist failure is a 500 (the in-memory rule stays but the
-            // disk save failed); validation failures stay 400.
-            Err(error @ RuleEngineError::Persist(_)) => return rule_persist_error(error),
-            Err(e) => return bad_request(format!("invalid sql_query: {e}")),
-        };
+    let rule: Rule = match state.engine.create_rule_in_tenant(
+        tenant,
+        req.name,
+        topic_filter,
+        req.sql_query,
+        req.enabled,
+        actions,
+    ) {
+        Ok(rule) => rule,
+        // A persist failure is a 500 (the in-memory rule stays but the
+        // disk save failed); validation failures stay 400.
+        Err(error @ RuleEngineError::Persist(_)) => return rule_persist_error(error),
+        Err(e) => return bad_request(format!("invalid sql_query: {e}")),
+    };
     (StatusCode::CREATED, Json(rule)).into_response()
 }
 
@@ -1141,7 +1169,7 @@ async fn list_rule_sources(
     Json(state.engine.list_event_sources())
 }
 
-/// The 185-function streaming-SQL catalog for the SQL studio.
+/// The streaming-SQL function catalog for the SQL studio.
 async fn list_functions() -> Json<&'static [broker_rules::FunctionMeta]> {
     Json(broker_rules::builtin_function_metadata())
 }
@@ -1166,36 +1194,82 @@ struct QuotasDto {
     max_publish_burst: Option<u32>,
 }
 
+/// Optional tenant scope for the v1 user and ACL routes (TM-01):
+/// `?tenant=<id>` selects one tenant table. Absent or empty selects the
+/// default tenant, so calls without the parameter behave exactly as
+/// before. Each write validates the tenant id before it applies: a bad
+/// id fails with 400 naming the field and leaves state unchanged.
+#[derive(Debug, Deserialize, Default)]
+struct TenantScope {
+    #[serde(default)]
+    tenant: Option<String>,
+}
+
+/// Resolve the tenant scope to its store key: empty rides as the default
+/// tenant; other ids must pass the credential-store tenant rule.
+fn resolve_tenant_scope(query: &TenantScope) -> Result<String, Box<Response>> {
+    let raw = query.tenant.as_deref().unwrap_or("");
+    if raw.is_empty() {
+        return Ok(broker_auth::DEFAULT_TENANT_ID.to_string());
+    }
+    if !broker_auth::is_valid_tenant_id(raw) {
+        return Err(Box::new(bad_request(format!(
+            "tenant {raw:?} is not a valid tenant id (field `tenant`)"
+        ))));
+    }
+    Ok(raw.to_string())
+}
+
 /// Users with their quota bounds (passwords are write-only, never listed).
-async fn list_users(State(state): State<ApiState>) -> Json<Vec<serde_json::Value>> {
+/// `?tenant=<id>` lists one tenant; absent lists the default tenant.
+async fn list_users(
+    State(state): State<ApiState>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
+) -> Response {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
     Json(
         state
             .auth
-            .usernames()
+            .usernames_in_tenant(&tenant)
             .iter()
             .map(|username| {
                 serde_json::json!({
                     "username": username,
-                    "quotas": state.auth.get_quotas(username),
+                    "quotas": state.auth.get_quotas_in_tenant(&tenant, username),
                 })
             })
-            .collect(),
+            .collect::<Vec<_>>(),
     )
+    .into_response()
 }
 
+/// Create one user credential (password is write-only).
+/// `?tenant=<id>` stores in one tenant; absent stores in the default
+/// tenant. The same username in two tenants is two independent
+/// identities. The write persists through the registry, so it survives a
+/// restart and a reload and ships in the export and the backup.
 async fn create_user(
     State(state): State<ApiState>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
     Json(req): Json<CreateUserRequest>,
 ) -> Response {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
     if req.username.trim().is_empty() {
         return bad_request("username must not be empty");
     }
     if req.password.is_empty() {
         return bad_request("password must not be empty");
     }
-    if let Err(error) = state
-        .auth
-        .add_user(req.username.clone(), req.password.as_bytes())
+    if let Err(error) =
+        state
+            .auth
+            .add_user_in_tenant(&tenant, req.username.clone(), req.password.as_bytes())
     {
         return persist_error(error);
     }
@@ -1206,13 +1280,16 @@ async fn create_user(
     }) {
         // The user was just created, so this always finds it; a persist
         // failure is still surfaced instead of silently dropped.
-        if let Err(error) = state.auth.set_quotas(&req.username, quotas) {
+        if let Err(error) = state
+            .auth
+            .set_quotas_in_tenant(&tenant, &req.username, quotas)
+        {
             return persist_error(error);
         }
     }
     // Quotas always render as an object (all-null when unset) so GET
     // and POST share one shape.
-    let stored = state.auth.get_quotas(&req.username);
+    let stored = state.auth.get_quotas_in_tenant(&tenant, &req.username);
     (
         StatusCode::CREATED,
         Json(serde_json::json!({ "username": req.username, "quotas": stored })),
@@ -1230,11 +1307,31 @@ struct CreateAclRequest {
 }
 
 /// Ordered ACL snapshot (first match wins on evaluation).
-async fn list_acls(State(state): State<ApiState>) -> Json<Vec<AclRule>> {
-    Json(state.auth.acl_rules())
+/// `?tenant=<id>` reads one tenant; absent reads the default tenant.
+async fn list_acls(
+    State(state): State<ApiState>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
+) -> Response {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    Json(state.auth.acl_rules_in_tenant(&tenant)).into_response()
 }
 
-async fn create_acl(State(state): State<ApiState>, Json(req): Json<CreateAclRequest>) -> Response {
+/// Append one ordered ACL entry (first match wins within the tenant).
+/// `?tenant=<id>` writes one tenant; absent writes the default tenant.
+/// The write persists through the registry, so it survives a restart
+/// and a reload and ships in the export and the backup.
+async fn create_acl(
+    State(state): State<ApiState>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
+    Json(req): Json<CreateAclRequest>,
+) -> Response {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
     if req.client_pattern.trim().is_empty() {
         return bad_request("client_pattern must not be empty");
     }
@@ -1245,12 +1342,15 @@ async fn create_acl(State(state): State<ApiState>, Json(req): Json<CreateAclRequ
     if TopicFilter::new(req.topic_pattern.clone()).is_err() {
         return bad_request("topic_pattern must be a valid MQTT filter");
     }
-    if let Err(error) = state.auth.add_rule(AclRule::new(
-        req.client_pattern.clone(),
-        action,
-        req.topic_pattern.clone(),
-        req.allow,
-    )) {
+    if let Err(error) = state.auth.add_rule_in_tenant(
+        &tenant,
+        AclRule::new(
+            req.client_pattern.clone(),
+            action,
+            req.topic_pattern.clone(),
+            req.allow,
+        ),
+    ) {
         return persist_error(error);
     }
     (
@@ -1264,22 +1364,36 @@ async fn create_acl(State(state): State<ApiState>, Json(req): Json<CreateAclRequ
         .into_response()
 }
 
+/// Delete one user. `?tenant=<id>` deletes in one tenant; absent deletes
+/// in the default tenant.
 async fn delete_user(
     State(state): State<ApiState>,
     axum::extract::Path(username): axum::extract::Path<String>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
 ) -> Response {
-    match state.auth.remove_user(&username) {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    match state.auth.remove_user_in_tenant(&tenant, &username) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => persist_error(error),
     }
 }
 
+/// Delete one ACL entry by index within its tenant list.
+/// `?tenant=<id>` deletes in one tenant; absent deletes in the default.
 async fn delete_acl(
     State(state): State<ApiState>,
     axum::extract::Path(id): axum::extract::Path<usize>,
+    axum::extract::Query(scope): axum::extract::Query<TenantScope>,
 ) -> Response {
-    match state.auth.remove_rule(id) {
+    let tenant = match resolve_tenant_scope(&scope) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
+    match state.auth.remove_rule_in_tenant(&tenant, id) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => persist_error(error),
@@ -1377,6 +1491,7 @@ async fn build_connector(
 ) -> Result<(String, std::sync::Arc<dyn broker_connectors::Sink>), String> {
     let kind = req.kind.to_ascii_lowercase();
     match kind.as_str() {
+            #[cfg(feature = "kafka")]
             "kafka" => {
                 let config: broker_connectors::KafkaSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1396,6 +1511,10 @@ async fn build_connector(
                 Ok(("kafka".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "kafka"))]
+            "kafka" => Err("connector kind `kafka` is not compiled in: missing feature `kafka`; rebuild with `--features kafka` or `--all-features`"
+                .to_string()),
+            #[cfg(feature = "rabbitmq")]
             "rabbitmq" | "rabbit" | "amqp" => {
                 let config: broker_connectors::RabbitMqSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1415,6 +1534,9 @@ async fn build_connector(
                 Ok(("rabbitmq".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "rabbitmq"))]
+            "rabbitmq" | "rabbit" | "amqp" => Err("connector kind `rabbitmq` is not compiled in: missing feature `rabbitmq`; rebuild with `--features rabbitmq` or `--all-features`"
+                .to_string()),
             "logger" | "console" => {
                 let sink = broker_connectors::ConsoleLoggerSink::new(req.id.clone());
                 Ok((
@@ -1477,6 +1599,7 @@ async fn build_connector(
                 Ok(("mysql".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(feature = "clickhouse")]
             "clickhouse" | "ch" => {
                 let config: broker_connectors::ClickHouseSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1493,6 +1616,9 @@ async fn build_connector(
                 Ok(("clickhouse".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "clickhouse"))]
+            "clickhouse" | "ch" => Err("connector kind `clickhouse` is not compiled in: missing feature `clickhouse`; rebuild with `--features clickhouse` or `--all-features`"
+                .to_string()),
             "influxdb" | "influx" => {
                 let config: broker_connectors::InfluxDbSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1505,10 +1631,6 @@ async fn build_connector(
                 Ok(("influxdb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
-            #[cfg(not(feature = "s3"))]
-            "s3" | "minio" => Err(
-                "connector kind 's3' needs cargo feature 's3' (disabled in this build)".to_string(),
-            ),
             #[cfg(feature = "s3")]
             "s3" | "minio" => {
                 let config: broker_connectors::S3SinkConfig =
@@ -1526,6 +1648,10 @@ async fn build_connector(
                 Ok(("s3".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "s3"))]
+            "s3" | "minio" => Err("connector kind `s3` is not compiled in: missing feature `s3`; rebuild with `--features s3` or `--all-features`"
+                .to_string()),
+            #[cfg(feature = "elasticsearch")]
             "elasticsearch" | "elastic" | "es" | "opensearch" => {
                 let config: broker_connectors::ElasticsearchSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1542,6 +1668,9 @@ async fn build_connector(
                 Ok(("elasticsearch".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "elasticsearch"))]
+            "elasticsearch" | "elastic" | "es" | "opensearch" => Err("connector kind `elasticsearch` is not compiled in: missing feature `elasticsearch`; rebuild with `--features elasticsearch` or `--all-features`"
+                .to_string()),
             "timescaledb" | "timescale" => {
                 let config: broker_connectors::TimescaleDbSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1641,6 +1770,7 @@ async fn build_connector(
                 Ok(("sparkplug_b".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(feature = "kinesis")]
             "kinesis" | "aws_kinesis" => {
                 let config: broker_connectors_enterprise::KinesisSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1657,6 +1787,10 @@ async fn build_connector(
                 Ok(("kinesis".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "kinesis"))]
+            "kinesis" | "aws_kinesis" => Err("connector kind `kinesis` is not compiled in: missing feature `kinesis`; rebuild with `--features kinesis` or `--all-features`"
+                .to_string()),
+            #[cfg(feature = "gcp_pubsub")]
             "gcp_pubsub" | "gcp" | "pubsub" => {
                 let config: broker_connectors_enterprise::GcpPubSubSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1673,6 +1807,9 @@ async fn build_connector(
                 Ok(("gcp_pubsub".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "gcp_pubsub"))]
+            "gcp_pubsub" | "gcp" | "pubsub" => Err("connector kind `gcp_pubsub` is not compiled in: missing feature `gcp_pubsub`; rebuild with `--features gcp_pubsub` or `--all-features`"
+                .to_string()),
             #[cfg(not(feature = "azure_eventhubs"))]
             "azure_eventhubs" | "azure" | "eventhubs" => Err(
                 "connector kind 'azure_eventhubs' needs cargo feature 'azure_eventhubs' (disabled in this build)"
@@ -1875,6 +2012,7 @@ async fn build_connector(
                 Ok(("s3_tables".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(feature = "confluent")]
             "confluent" | "confluent_kafka" | "confluent_cloud" => {
                 let config: broker_connectors_enterprise::ConfluentKafkaConfig =
                     serde_json::from_value(req.config.clone())
@@ -1891,6 +2029,9 @@ async fn build_connector(
                 Ok(("confluent".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "confluent"))]
+            "confluent" | "confluent_kafka" | "confluent_cloud" => Err("connector kind `confluent` is not compiled in: missing feature `confluent`; rebuild with `--features confluent` or `--all-features`"
+                .to_string()),
             "rocketmq" | "rocket_mq" | "apache_rocketmq" => {
                 let config: broker_connectors_enterprise::RocketMqSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1907,6 +2048,7 @@ async fn build_connector(
                 Ok(("rocketmq".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(feature = "mongodb")]
             "mongodb" | "mongo" | "documentdb" => {
                 let config: broker_connectors_enterprise::MongoDbSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1923,6 +2065,9 @@ async fn build_connector(
                 Ok(("mongodb".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "mongodb"))]
+            "mongodb" | "mongo" | "documentdb" => Err("connector kind `mongodb` is not compiled in: missing feature `mongodb`; rebuild with `--features mongodb` or `--all-features`"
+                .to_string()),
             "mssql" | "sqlserver" | "azuresql" => {
                 let config: broker_connectors_enterprise::MssqlSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1939,6 +2084,7 @@ async fn build_connector(
                 Ok(("mssql".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(feature = "cassandra")]
             "cassandra" | "scylla" | "cql" => {
                 let config: broker_connectors_enterprise::CassandraSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1955,6 +2101,10 @@ async fn build_connector(
                 Ok(("cassandra".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "cassandra"))]
+            "cassandra" | "scylla" | "cql" => Err("connector kind `cassandra` is not compiled in: missing feature `cassandra`; rebuild with `--features cassandra` or `--all-features`"
+                .to_string()),
+            #[cfg(feature = "couchbase")]
             "couchbase" | "couch" | "cb" => {
                 let config: broker_connectors_enterprise::CouchbaseSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -1971,6 +2121,9 @@ async fn build_connector(
                 Ok(("couchbase".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "couchbase"))]
+            "couchbase" | "couch" | "cb" => Err("connector kind `couchbase` is not compiled in: missing feature `couchbase`; rebuild with `--features couchbase` or `--all-features`"
+                .to_string()),
             "tdengine" | "td" | "taos" => {
                 let config: broker_connectors_enterprise::TdengineSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -2113,11 +2266,6 @@ async fn build_connector(
                 Ok(("doris".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
-            #[cfg(not(feature = "bigquery"))]
-            "bigquery" | "bq" | "gbq" => Err(
-                "connector kind 'bigquery' needs cargo feature 'bigquery' (disabled in this build)"
-                    .to_string(),
-            ),
             #[cfg(feature = "bigquery")]
             "bigquery" | "bq" | "gbq" => {
                 let config: broker_connectors_enterprise::BigQuerySinkConfig =
@@ -2135,6 +2283,9 @@ async fn build_connector(
                 Ok(("bigquery".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "bigquery"))]
+            "bigquery" | "bq" | "gbq" => Err("connector kind `bigquery` is not compiled in: missing feature `bigquery`; rebuild with `--features bigquery` or `--all-features`"
+                .to_string()),
             "redshift" | "rs" | "aws_redshift" => {
                 let config: broker_connectors_enterprise::RedshiftSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -3227,6 +3378,264 @@ mod tests {
             .delete_auth(&format!("/api/v1/rules/{id}"), &token)
             .await;
         assert_eq!(status, 404);
+    }
+
+    /// Record the tenant of each rule output through the broker sink.
+    struct TenantProbe {
+        recorded: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl broker_rules::BrokerSink for TenantProbe {
+        async fn publish(
+            &self,
+            topic: Topic,
+            _payload: bytes::Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> Result<(), broker_rules::RuleEngineError> {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push(("default".to_string(), topic.as_str().to_string()));
+            Ok(())
+        }
+
+        async fn publish_in_tenant(
+            &self,
+            tenant: &str,
+            topic: Topic,
+            _payload: bytes::Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> Result<(), broker_rules::RuleEngineError> {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push((tenant.to_string(), topic.as_str().to_string()));
+            Ok(())
+        }
+    }
+
+    /// Unknown rule tenants fail closed through the v1 API: an unknown
+    /// tenant and a malformed tenant both answer 400 and store nothing.
+    #[tokio::test]
+    async fn test_rules_tenant_unknown_rejected_through_api() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for tenant in ["tm04-ghost", "bad\u{7}tenant"] {
+            let (status, body) = server
+                .post_auth(
+                    "/api/v1/rules",
+                    json!({
+                        "name": "tm04-bad",
+                        "topic_filter": "tm04/#",
+                        "tenant": tenant,
+                        "actions": []
+                    }),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "tenant {tenant:?} must fail");
+            assert!(
+                body["error"].as_str().unwrap().contains("tenant"),
+                "error names the field: {body}"
+            );
+        }
+        let (status, body) = server.get_auth("/api/v1/rules", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]), "nothing stored");
+        assert!(state.engine.list_rules().is_empty());
+    }
+
+    /// One rule of tenant A is created through the v1 API. It reads
+    /// back with its tenant. It fires only for a publish of tenant A
+    /// through the broker dispatch. Its output carries tenant A only.
+    #[tokio::test]
+    async fn test_rules_tenant_round_trip_through_api_and_broker() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Two tenants through the production namespace entry.
+        for ns in ["tm04-a", "tm04-b"] {
+            let (status, _) = server
+                .post_auth(&format!("/api/v5/mt/ns/{ns}"), json!({}), &token)
+                .await;
+            assert_eq!(status, 204, "namespace {ns} creates");
+        }
+        // Random value the broker cannot know.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|span| span.as_nanos())
+            .unwrap_or(0);
+        let secret = format!("tm04-secret-{nanos}");
+        // Create the rule of tenant A with a republish action.
+        let (status, created) = server
+            .post_auth(
+                "/api/v1/rules",
+                json!({
+                    "name": "tm04-a-rule",
+                    "topic_filter": "tm04/in",
+                    "tenant": "tm04-a",
+                    "actions": [{"type": "republish", "topic": "tm04/out", "qos": 0}]
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule creates: {created}");
+        assert_eq!(created["tenant"], json!("tm04-a"));
+        let id = created["id"]
+            .as_str()
+            .expect("created rule has id")
+            .to_string();
+        // The read shows the same tenant.
+        let (status, fetched) = server
+            .get_auth(&format!("/api/v1/rules/{id}"), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["tenant"], json!("tm04-a"));
+        // No tenant in the body means the default tenant, as before.
+        let (status, created) = server
+            .post_auth(
+                "/api/v1/rules",
+                json!({
+                    "name": "tm04-plain",
+                    "topic_filter": "tm04/in",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["tenant"], json!("default"));
+        // Through the broker: a publish of A fires only the A rule,
+        // and the output carries tenant A. A publish of B fires
+        // nothing: no rule of B matches.
+        let probe = Arc::new(TenantProbe {
+            recorded: std::sync::Mutex::new(Vec::new()),
+        });
+        let probe_obj: Arc<dyn broker_rules::BrokerSink> = probe.clone();
+        let topic = Topic::new("tm04/in").expect("topic parses");
+        let payload = bytes::Bytes::from(secret.clone());
+        let fired = state
+            .engine
+            .dispatch_ingress_in_tenant("tm04-a", &topic, &payload, QoS::AtMostOnce, &probe_obj)
+            .await;
+        assert_eq!(fired, 1, "only the A rule fires for an A publish");
+        let fired = state
+            .engine
+            .dispatch_ingress_in_tenant("tm04-b", &topic, &payload, QoS::AtMostOnce, &probe_obj)
+            .await;
+        assert_eq!(fired, 0, "no rule fires for a B publish");
+        let recorded = probe.recorded.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one output, from the A publish");
+        assert_eq!(recorded[0], ("tm04-a".to_string(), "tm04/out".to_string()));
+        // Cleanup through the API.
+        for rule_id in [id, created["id"].as_str().unwrap().to_string()] {
+            let (status, _) = server
+                .delete_auth(&format!("/api/v1/rules/{rule_id}"), &token)
+                .await;
+            assert_eq!(status, 204);
+        }
+    }
+
+    /// The v5 rule API carries the tenant: create validates it, the
+    /// read shows it, update moves it, and dispatch honours it.
+    #[tokio::test]
+    async fn test_v5_rules_tenant_create_update_dispatch_through_api() {
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for ns in ["tm04-v5a", "tm04-v5b"] {
+            let (status, _) = server
+                .post_auth(&format!("/api/v5/mt/ns/{ns}"), json!({}), &token)
+                .await;
+            assert_eq!(status, 204, "namespace {ns} creates");
+        }
+        // Unknown tenant fails with the documented shape.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "tm04-v5-bad",
+                    "sql": "SELECT * FROM \"tm04v5/in\"",
+                    "tenant": "tm04-ghost",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        // Create in the first tenant.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "tm04-v5-rule",
+                    "sql": "SELECT * FROM \"tm04v5/in\"",
+                    "tenant": "tm04-v5a",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule creates: {created}");
+        assert_eq!(created["tenant"], json!("tm04-v5a"));
+        let id = created["id"]
+            .as_str()
+            .expect("created rule has id")
+            .to_string();
+        // Update moves the rule to the second tenant.
+        let (status, updated) = server
+            .put_auth(
+                &format!("/api/v5/rules/{id}"),
+                json!({
+                    "name": "tm04-v5-rule",
+                    "sql": "SELECT * FROM \"tm04v5/in\"",
+                    "tenant": "tm04-v5b",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "update moves tenant: {updated}");
+        assert_eq!(updated["tenant"], json!("tm04-v5b"));
+        // Update to an unknown tenant fails and keeps the old rule.
+        let (status, body) = server
+            .put_auth(
+                &format!("/api/v5/rules/{id}"),
+                json!({
+                    "name": "tm04-v5-rule",
+                    "sql": "SELECT * FROM \"tm04v5/in\"",
+                    "tenant": "tm04-ghost",
+                    "actions": []
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, fetched) = server
+            .get_auth(&format!("/api/v5/rules/{id}"), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["tenant"], json!("tm04-v5b"));
+        // Dispatch honours the moved tenant.
+        let probe = Arc::new(TenantProbe {
+            recorded: std::sync::Mutex::new(Vec::new()),
+        });
+        let probe_obj: Arc<dyn broker_rules::BrokerSink> = probe.clone();
+        let topic = Topic::new("tm04v5/in").expect("topic parses");
+        let payload = bytes::Bytes::from_static(br#"{"temp": 21}"#);
+        let fired = state
+            .engine
+            .dispatch_ingress_in_tenant("tm04-v5a", &topic, &payload, QoS::AtMostOnce, &probe_obj)
+            .await;
+        assert_eq!(fired, 0, "the moved rule no longer fires in A");
+        let fired = state
+            .engine
+            .dispatch_ingress_in_tenant("tm04-v5b", &topic, &payload, QoS::AtMostOnce, &probe_obj)
+            .await;
+        assert_eq!(fired, 1, "the moved rule fires in B");
     }
 
     #[tokio::test]
@@ -5019,6 +5428,220 @@ mod tests {
             assert!(!text.contains("password_hash"));
             assert!(!text.contains("Sup3r-secret-pw!"));
         }
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TM-01: two tenants share one username with different passwords.
+    /// Real API calls create the users and rules per tenant; the CONNECT
+    /// and publish checks run through the broker auth store; a reload
+    /// keeps both tenants; a restart on the same data dir keeps both;
+    /// the export file carries both tenants without secrets.
+    #[tokio::test]
+    async fn tm01_two_tenants_persist_across_reload_restart_and_export() {
+        let dir = unique_data_dir("tm01-storage");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        state
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        let token = server.login_as_admin().await;
+        // Same username, different passwords, disjoint rules per tenant.
+        for (tenant, password, topic) in [
+            ("tenant-a", "pw-for-a-7x", "t/a/#"),
+            ("tenant-b", "pw-for-b-9q", "t/b/#"),
+        ] {
+            let (status, _) = server
+                .post_auth(
+                    &format!("/api/v1/auth/users?tenant={tenant}"),
+                    json!({"username": "sam", "password": password}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201, "user creates in {tenant}");
+            for action in ["publish", "subscribe"] {
+                let (status, _) = server
+                    .post_auth(
+                        &format!("/api/v1/auth/acls?tenant={tenant}"),
+                        json!({
+                            "client_pattern": "*",
+                            "action": action,
+                            "topic_pattern": topic,
+                            "allow": true,
+                        }),
+                        &token,
+                    )
+                    .await;
+                assert_eq!(status, 201, "{action} rule creates in {tenant}");
+            }
+        }
+        // Default tenant rows work through the same routes with no change.
+        let (status, _) = server
+            .post_auth(
+                "/api/v1/auth/users",
+                json!({"username": "base", "password": "base-pw-3z"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v1/auth/acls",
+                json!({
+                    "client_pattern": "base",
+                    "action": "all",
+                    "topic_pattern": "t/#",
+                    "allow": true,
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // A bad tenant id fails with 400 and applies nothing.
+        let long = "t".repeat(129);
+        let (status, _) = server
+            .get_auth(&format!("/api/v1/auth/users?tenant={long}"), &token)
+            .await;
+        assert_eq!(status, 400);
+        // Broker-path checks: the same calls the kernel makes per CONNECT
+        // and per message. Each password works only in its own tenant.
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a-7x"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-b-9q"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-b-9q"))
+            .await
+            .is_err());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-a-7x"))
+            .await
+            .is_err());
+        // A publish allowed in A is refused in B and vice versa.
+        let topic_a = Topic::new("t/a/1").expect("topic");
+        let topic_b = Topic::new("t/b/1").expect("topic");
+        assert!(state
+            .auth
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic_a)
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authorize_publish_in_tenant("tenant-b", "sam", &topic_a)
+            .await
+            .is_err());
+        assert!(state
+            .auth
+            .authorize_publish_in_tenant("tenant-b", "sam", &topic_b)
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authorize_publish_in_tenant("tenant-a", "sam", &topic_b)
+            .await
+            .is_err());
+        // Delivery isolation: one subscription per tenant on the same
+        // filter; a publish in A matches only the subscriber in A.
+        let filter = TopicFilter::new("t/#").expect("filter");
+        state.router.subscribe(
+            &filter,
+            broker_router::Subscription::new_in_tenant("sub-a", 7101, QoS::AtMostOnce, "tenant-a"),
+        );
+        state.router.subscribe(
+            &filter,
+            broker_router::Subscription::new_in_tenant("sub-b", 7102, QoS::AtMostOnce, "tenant-b"),
+        );
+        let (matched_a, _) = state
+            .router
+            .matches_in_tenant_counted(&topic_a, None, "tenant-a");
+        assert!(matched_a.iter().any(|s| s.client_id.as_ref() == "sub-a"));
+        assert!(!matched_a.iter().any(|s| s.client_id.as_ref() == "sub-b"));
+        let (matched_b, _) = state
+            .router
+            .matches_in_tenant_counted(&topic_b, None, "tenant-b");
+        assert!(matched_b.iter().any(|s| s.client_id.as_ref() == "sub-b"));
+        assert!(!matched_b.iter().any(|s| s.client_id.as_ref() == "sub-a"));
+        // Reload keeps both tenants.
+        let candidate = registry.snapshot().as_ref().clone();
+        let (status, body) = server
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": candidate, "actor": "tm01", "summary": "keep both tenants"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "reload keeps both tenants: {body}");
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a-7x"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-b-9q"))
+            .await
+            .is_ok());
+        // The state file carries both tenants; plaintext never persists.
+        let text = std::fs::read_to_string(dir.join("state.toml")).expect("state file written");
+        assert!(text.contains("tenant-a") && text.contains("tenant-b"));
+        assert!(!text.contains("pw-for-a-7x") && !text.contains("pw-for-b-9q"));
+        // The export file carries both tenants without secrets.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/export",
+                json!({"root_keys": ["mqtt_users"], "table_sets": ["builtin_authn", "builtin_authz"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let filename = body["filename"].as_str().expect("export names its file");
+        let parts = read_backup_file(&dir.join("backup").join(filename));
+        let snap = parts
+            .iter()
+            .find(|(name, _)| name.ends_with("/snapshot/mqtt_users.json"))
+            .expect("mqtt_users root ships");
+        assert!(snap.1.contains("tenant-a") && snap.1.contains("tenant-b"));
+        let authn = parts
+            .iter()
+            .find(|(name, _)| name.ends_with("/tables/builtin_authn.json"))
+            .expect("authn table ships");
+        assert!(authn.1.contains("tenant-a") && authn.1.contains("tenant-b"));
+        for (_, text) in &parts {
+            assert!(!text.contains("password_hash"));
+            assert!(!text.contains("pw-for-a-7x"));
+            assert!(!text.contains("pw-for-b-9q"));
+        }
+        // Restart on the same data dir keeps both tenants.
+        drop(server);
+        drop(state);
+        drop(registry);
+        let registry =
+            Arc::new(ConfigRegistry::load(&dir).expect("registry reloads after a restart"));
+        let (server, state) = TestServer::start_with_registry(registry).await;
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-a", "c", Some("sam"), Some(b"pw-for-a-7x"))
+            .await
+            .is_ok());
+        assert!(state
+            .auth
+            .authenticate_in_tenant("tenant-b", "c", Some("sam"), Some(b"pw-for-b-9q"))
+            .await
+            .is_ok());
+        use broker_auth::Authenticator as _;
+        assert!(state
+            .auth
+            .authenticate("device-1", Some("base"), Some(b"base-pw-3z"))
+            .await
+            .is_ok());
         drop(server);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -10015,6 +10638,24 @@ mod tests {
         );
     }
 
+    // Full-matrix creation test (X1-10): exercises every connector kind,
+    // including the feature-gated heavy SDKs, so it runs only when all
+    // gating features are enabled (default and per-feature builds skip
+    // it; the full-feature build runs it).
+    #[cfg(all(
+        feature = "kafka",
+        feature = "rabbitmq",
+        feature = "clickhouse",
+        feature = "s3",
+        feature = "elasticsearch",
+        feature = "mongodb",
+        feature = "cassandra",
+        feature = "couchbase",
+        feature = "confluent",
+        feature = "gcp_pubsub",
+        feature = "bigquery",
+        feature = "kinesis"
+    ))]
     #[tokio::test]
     async fn test_connectors_create_kafka_rabbitmq_logger() {
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
@@ -10055,6 +10696,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         .to_string();
 
         // Kafka sink: validated, lazily connected, listed with its kind.
+        // X1-10: gated behind Cargo feature `kafka`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -10069,11 +10711,20 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["id"], json!("kafka-sink-1"));
-        assert_eq!(created["kind"], json!("kafka"));
+        if cfg!(feature = "kafka") {
+            assert_eq!(status, 201);
+            assert_eq!(created["id"], json!("kafka-sink-1"));
+            assert_eq!(created["kind"], json!("kafka"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"].as_str().unwrap_or("").contains("kafka"),
+                "disabled kafka must name the feature, got: {created}"
+            );
+        }
 
         // RabbitMQ sink: slash translation config accepted.
+        // X1-10: gated behind Cargo feature `rabbitmq`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -10086,8 +10737,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("rabbitmq"));
+        if cfg!(feature = "rabbitmq") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("rabbitmq"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"].as_str().unwrap_or("").contains("rabbitmq"),
+                "disabled rabbitmq must name the feature, got: {created}"
+            );
+        }
 
         // Logger sink needs no config at all.
         let (status, created) = server
@@ -10151,6 +10810,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("mysql"));
 
         // ClickHouse sink: validated without touching any server.
+        // X1-10: gated behind Cargo feature `clickhouse`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -10165,8 +10825,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("clickhouse"));
+        if cfg!(feature = "clickhouse") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("clickhouse"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("clickhouse"),
+                "disabled clickhouse must name the feature, got: {created}"
+            );
+        }
 
         // InfluxDB sink: validated without touching any server.
         let (status, created) = server
@@ -10219,6 +10890,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         }
 
         // Elasticsearch sink: validated without touching any cluster.
+        // X1-10: gated behind Cargo feature `elasticsearch`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -10233,8 +10905,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("elasticsearch"));
+        if cfg!(feature = "elasticsearch") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("elasticsearch"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("elasticsearch"),
+                "disabled elasticsearch must name the feature, got: {created}"
+            );
+        }
 
         // TimescaleDB sink: validated without touching any database.
         let (status, created) = server
@@ -10338,6 +11021,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("sparkplug_b"));
 
         // Kinesis sink: validated without touching AWS.
+        // X1-10: gated behind Cargo feature `kinesis`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -10357,10 +11041,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("kinesis"));
+        if cfg!(feature = "kinesis") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("kinesis"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"].as_str().unwrap_or("").contains("kinesis"),
+                "disabled kinesis must name the feature, got: {created}"
+            );
+        }
 
         // GCP Pub/Sub sink: validated without touching Google.
+        // X1-10: gated behind Cargo feature `gcp_pubsub`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -10378,8 +11071,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("gcp_pubsub"));
+        if cfg!(feature = "gcp_pubsub") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("gcp_pubsub"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("gcp_pubsub"),
+                "disabled gcp_pubsub must name the feature, got: {created}"
+            );
+        }
 
         // Azure Event Hubs sink: validated without touching Azure.
         // X1-09: gated behind Cargo feature `azure_eventhubs`.
@@ -10440,6 +11144,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("pulsar"));
 
         // MongoDB sink: validated without opening any socket.
+        // X1-10: gated behind Cargo feature `mongodb`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -10458,8 +11163,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("mongodb"));
+        if cfg!(feature = "mongodb") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("mongodb"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"].as_str().unwrap_or("").contains("mongodb"),
+                "disabled mongodb must name the feature, got: {created}"
+            );
+        }
 
         // MSSQL sink: validated without opening any socket.
         let (status, created) = server
@@ -10486,6 +11199,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("mssql"));
 
         // Cassandra sink: validated without opening any socket.
+        // X1-10: gated behind Cargo feature `cassandra`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -10507,10 +11221,22 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("cassandra"));
+        if cfg!(feature = "cassandra") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("cassandra"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("cassandra"),
+                "disabled cassandra must name the feature, got: {created}"
+            );
+        }
 
         // Couchbase sink: validated without opening any socket.
+        // X1-10: gated behind Cargo feature `couchbase`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -10530,8 +11256,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("couchbase"));
+        if cfg!(feature = "couchbase") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("couchbase"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("couchbase"),
+                "disabled couchbase must name the feature, got: {created}"
+            );
+        }
 
         // TDengine sink: validated without touching any server.
         let (status, created) = server
@@ -11003,6 +11740,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(created["kind"], json!("s3_tables"));
 
         // Confluent Cloud sink: validated without opening any socket.
+        // X1-10: gated behind Cargo feature `confluent`.
         let (status, created) = server
             .post_auth(
                 "/api/v1/connectors",
@@ -11019,8 +11757,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("confluent"));
+        if cfg!(feature = "confluent") {
+            assert_eq!(status, 201);
+            assert_eq!(created["kind"], json!("confluent"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                created["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("confluent"),
+                "disabled confluent must name the feature, got: {created}"
+            );
+        }
 
         // RocketMQ sink: validated without opening any socket.
         let (status, created) = server
@@ -11151,7 +11900,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
         let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
-        // X1-09: the eight gated kinds are present only when their Cargo
+        // X1-09/X1-10: each gated kind is present only when its Cargo
         // feature is enabled; otherwise creation above failed closed and
         // the list omits them. Assert presence conditionally.
         {
@@ -11161,25 +11910,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             for always in [
                 "alloydb-1",
                 "bridge-1",
-                "cassandra-1",
-                "ch-sink-1",
                 "cockroach-1",
-                "confluent-1",
-                "couchbase-1",
                 "databricks-1",
                 "datalayers-1",
                 "diag",
                 "disk-1",
                 "doris-1",
-                "es-sink-1",
-                "gcp-1",
                 "greptimedb-1",
                 "hook-1",
                 "influx-sink-1",
                 "iotdb-1",
-                "kafka-sink-1",
-                "kinesis-1",
-                "mongo-1",
                 "mssql-1",
                 "mysql-sink-1",
                 "oci-1",
@@ -11189,7 +11929,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "ots-1",
                 "pg-sink-1",
                 "pulsar-1",
-                "rabbit-sink-1",
                 "redis-sink-1",
                 "redshift-1",
                 "rmq-1",
@@ -11211,10 +11950,20 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 ("azure-iot-1", cfg!(feature = "azure_iot")),
                 ("gcp-iot-1", cfg!(feature = "gcp_iot")),
                 ("azblob-1", cfg!(feature = "azure_blob")),
+                ("kafka-sink-1", cfg!(feature = "kafka")),
+                ("rabbit-sink-1", cfg!(feature = "rabbitmq")),
+                ("ch-sink-1", cfg!(feature = "clickhouse")),
+                ("es-sink-1", cfg!(feature = "elasticsearch")),
+                ("gcp-1", cfg!(feature = "gcp_pubsub")),
+                ("mongo-1", cfg!(feature = "mongodb")),
+                ("cassandra-1", cfg!(feature = "cassandra")),
+                ("couchbase-1", cfg!(feature = "couchbase")),
+                ("confluent-1", cfg!(feature = "confluent")),
+                ("kinesis-1", cfg!(feature = "kinesis")),
             ] {
                 assert_eq!(ids.contains(id), enabled, "gated connector {id} presence");
             }
-            let expected = 40
+            let expected = 30
                 + (cfg!(feature = "s3") as usize)
                 + (cfg!(feature = "azure_eventhubs") as usize)
                 + (cfg!(feature = "dynamodb") as usize)
@@ -11222,7 +11971,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 + (cfg!(feature = "aws_iot") as usize)
                 + (cfg!(feature = "azure_iot") as usize)
                 + (cfg!(feature = "gcp_iot") as usize)
-                + (cfg!(feature = "azure_blob") as usize);
+                + (cfg!(feature = "azure_blob") as usize)
+                + (cfg!(feature = "kafka") as usize)
+                + (cfg!(feature = "rabbitmq") as usize)
+                + (cfg!(feature = "clickhouse") as usize)
+                + (cfg!(feature = "elasticsearch") as usize)
+                + (cfg!(feature = "gcp_pubsub") as usize)
+                + (cfg!(feature = "mongodb") as usize)
+                + (cfg!(feature = "cassandra") as usize)
+                + (cfg!(feature = "couchbase") as usize)
+                + (cfg!(feature = "confluent") as usize)
+                + (cfg!(feature = "kinesis") as usize);
             assert_eq!(list.len(), expected, "connector count");
         }
 
@@ -11436,8 +12195,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         }
         let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
-        // X1-09: count follows the enabled gated features (40 always + 8 gated).
-        let expected = 40
+        // X1-09/X1-10: count follows the enabled gated features (30 always
+        // plus each gated kind when its feature is on).
+        let expected = 30
             + (cfg!(feature = "s3") as usize)
             + (cfg!(feature = "azure_eventhubs") as usize)
             + (cfg!(feature = "dynamodb") as usize)
@@ -11445,7 +12205,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             + (cfg!(feature = "aws_iot") as usize)
             + (cfg!(feature = "azure_iot") as usize)
             + (cfg!(feature = "gcp_iot") as usize)
-            + (cfg!(feature = "azure_blob") as usize);
+            + (cfg!(feature = "azure_blob") as usize)
+            + (cfg!(feature = "kafka") as usize)
+            + (cfg!(feature = "rabbitmq") as usize)
+            + (cfg!(feature = "clickhouse") as usize)
+            + (cfg!(feature = "elasticsearch") as usize)
+            + (cfg!(feature = "gcp_pubsub") as usize)
+            + (cfg!(feature = "mongodb") as usize)
+            + (cfg!(feature = "cassandra") as usize)
+            + (cfg!(feature = "couchbase") as usize)
+            + (cfg!(feature = "confluent") as usize)
+            + (cfg!(feature = "kinesis") as usize);
         assert_eq!(body.as_array().expect("list").len(), expected);
     }
 
@@ -11709,8 +12479,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         );
         assert!(state.engine.connectors().get("s101-conf-no-key").is_none());
 
-        // confluent with credentials is 201 and live.
-        let (status, _) = server
+        // Confluent with credentials is 201 and live when enabled.
+        // Disabled builds fail closed and name the feature.
+        let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
                 json!({"name": "s101-conf-1", "type": "confluent",
@@ -11721,8 +12492,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 201);
-        assert!(state.engine.connectors().get("s101-conf-1").is_some());
+        if cfg!(feature = "confluent") {
+            assert_eq!(status, 201);
+            assert!(state.engine.connectors().get("s101-conf-1").is_some());
+        } else {
+            assert_eq!(status, 400);
+            assert!(
+                body["message"].as_str().unwrap_or("").contains("confluent"),
+                "disabled confluent must name the feature, got: {body}"
+            );
+            assert!(state.engine.connectors().get("s101-conf-1").is_none());
+        }
 
         // azure_eventhubs without a key is 400 naming the field.
         let (status, body) = server
@@ -12149,7 +12929,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server.get_auth("/api/v1/rules/functions", &token).await;
         assert_eq!(status, 200);
         let catalog = body.as_array().expect("function array");
-        assert_eq!(catalog.len(), 185);
+        // The engine revision in the lock file lists 219 functions.
+        assert_eq!(catalog.len(), 219);
         let sin = catalog
             .iter()
             .find(|entry| entry["name"] == json!("sin"))
@@ -18839,7 +19620,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // documented names run on the runtime of their base kind.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        let cases = [
+        let mut cases = vec![
             (
                 "ap05-conn-http",
                 json!({"type": "http", "name": "ap05-conn-http", "url": "http://127.0.0.1:9"}),
@@ -18850,12 +19631,26 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 json!({"type": "mqtt", "name": "ap05-conn-mqtt", "server": "127.0.0.1:1883"}),
                 "mqtt:ap05-conn-mqtt",
             ),
-            (
-                "ap05-conn-kafka",
-                json!({"type": "kafka_producer", "name": "ap05-conn-kafka", "bootstrap_hosts": "127.0.0.1:9092"}),
-                "kafka_producer:ap05-conn-kafka",
-            ),
         ];
+
+        let kafka_case = (
+            "ap05-conn-kafka",
+            json!({"type": "kafka_producer", "name": "ap05-conn-kafka", "bootstrap_hosts": "127.0.0.1:9092"}),
+            "kafka_producer:ap05-conn-kafka",
+        );
+        if cfg!(feature = "kafka") {
+            cases.push(kafka_case);
+        } else {
+            // The Kafka runtime is a Cargo feature. A build without it
+            // refuses the create and names the feature.
+            let (_, body, _) = kafka_case;
+            let (status, refused) = server.post_auth("/api/v5/connectors", body, &token).await;
+            assert_eq!(status, 400);
+            assert!(
+                refused.to_string().contains("kafka"),
+                "the refusal names the feature: {refused}"
+            );
+        }
         for (bare, body, key) in cases {
             let (status, created) = server.post_auth("/api/v5/connectors", body, &token).await;
             assert_eq!(status, 201, "create for {bare}");

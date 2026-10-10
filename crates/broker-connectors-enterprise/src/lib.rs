@@ -15,15 +15,15 @@
 //!
 //! Licence: MIT OR Apache-2.0, as the other crates of this repository.
 //!
-//! Default build (no features): every module except the X1-09 first half
-//! is compiled in. The gated kinds are absent from the build and the
-//! binary unless their Cargo feature is enabled: `aws_iot` (feature
-//! `aws_iot`), `azure_blob` (feature `azure_blob`), `azure_eventhubs`
-//! (feature `azure_eventhubs`), `azure_iot` (feature `azure_iot`),
-//! `bigquery` (feature `bigquery`), `dynamodb` (feature `dynamodb`),
-//! `gcp_iot` (feature `gcp_iot`). Unresolvable kinds under a disabled
-//! feature fail registration closed with an error naming the missing
-//! feature.
+//! Default build (no features): only light sinks are compiled in.
+//! The X1-09 first half stays off (`aws_iot`, `azure_blob`,
+//! `azure_eventhubs`, `azure_iot`, `bigquery`, `dynamodb`, `gcp_iot`).
+//! The X1-10 heavy SDK set stays off too (`cassandra`, `confluent`,
+//! `couchbase`, `mongodb`, `gcp_pubsub`, `kinesis`). Each gated kind is absent
+//! from the build and the binary unless its Cargo feature is enabled.
+//! Unresolvable kinds under a disabled feature fail registration closed
+//! with an error naming the missing feature. The remaining B3 connectors
+//! land behind features from the start.
 
 pub mod alloydb;
 #[cfg(feature = "aws_iot")]
@@ -36,9 +36,12 @@ pub mod azure_eventhubs;
 pub mod azure_iot;
 #[cfg(feature = "bigquery")]
 pub mod bigquery;
+#[cfg(feature = "cassandra")]
 pub mod cassandra;
 pub mod cockroachdb;
+#[cfg(feature = "confluent")]
 pub mod confluent;
+#[cfg(feature = "couchbase")]
 pub mod couchbase;
 pub mod databricks;
 pub mod datalayers;
@@ -47,9 +50,12 @@ pub mod doris;
 pub mod dynamodb;
 #[cfg(feature = "gcp_iot")]
 pub mod gcp_iot;
+#[cfg(feature = "gcp_pubsub")]
 pub mod gcp_pubsub;
 pub mod iotdb;
+#[cfg(feature = "kinesis")]
 pub mod kinesis;
+#[cfg(feature = "mongodb")]
 pub mod mongodb;
 pub mod mssql;
 pub mod oci_streaming;
@@ -106,6 +112,7 @@ pub use bigquery::{
     BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport, CapturedBigQueryInsert,
     HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport, SdkBigQueryTransport,
 };
+#[cfg(feature = "cassandra")]
 pub use cassandra::{
     decode_frame as decode_cql_frame, encode_batch as encode_cql_batch, murmur3_token,
     parse_contact_point, CapturedCqlBatch, CassandraAuth, CassandraConnector, CassandraSink,
@@ -121,6 +128,7 @@ pub use cockroachdb::{
     CockroachQueryResult, CockroachRow, CockroachValue, MockCockroachDbTransport,
     PgDriverCockroachDbTransport, TcpCockroachDbTransport,
 };
+#[cfg(feature = "confluent")]
 pub use confluent::{
     classify_driver_error, classify_kafka_error, frame_schema_registry, is_terminal_driver_message,
     parse_scram_server_first, rdkafka_client_config, registry_subject_for_topic,
@@ -133,6 +141,7 @@ pub use confluent::{
     MemoryConfluentTransport, RdkafkaConfluentTransport, RegistrySchemaClient, SaslMechanism,
     ScramHash, ScramServerFirst, TcpConfluentTransport,
 };
+#[cfg(feature = "couchbase")]
 pub use couchbase::{
     decode_response as decode_kv_response, encode_mutation as encode_kv_mutation,
     parse_connection_string as parse_couchbase_connection_string, CapturedCouchbaseBatch,
@@ -172,6 +181,7 @@ pub use gcp_iot::{
     GcpIotAlgorithm, GcpIotConfig, GcpIotConnector, GcpIotSink, GcpIotTokenCache, GcpIotTransport,
     MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport, TlsGcpIotTransport,
 };
+#[cfg(feature = "gcp_pubsub")]
 pub use gcp_pubsub::{
     build_jwt_assertion, driver_message_for, parse_publish_response, render_publish_body,
     CapturedGcpPublish, GcpAuth, GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink,
@@ -183,12 +193,14 @@ pub use iotdb::{
     IotDbDataType, IotDbSink, IotDbSinkConfig, IotDbTabletRequest, IotDbTransport,
     MockIotDbOutcome, MockIotDbTransport,
 };
+#[cfg(feature = "kinesis")]
 pub use kinesis::{
     HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse,
     KinesisRecordEntry, KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport,
     MockKinesisOutcome, MockKinesisTransport, SdkKinesisTransport, KINESIS_CONTENT_TYPE,
     KINESIS_TARGET,
 };
+#[cfg(feature = "mongodb")]
 pub use mongodb::{
     decode_op_msg, encode_op_msg, generate_object_id, json_to_bson, parse_connection_string,
     scram_client_proof, BsonDocument, BsonValue, CapturedMongoBulk, DriverMongoDbTransport,

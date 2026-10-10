@@ -482,6 +482,20 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_MONITOR_SAMPLE_SECS)]
     monitor_sample_secs: u64,
 
+    /// Require a client certificate on the TLS listener (TM-08). Off by
+    /// default keeps current handshakes unchanged. On requests a client
+    /// certificate and refuses the connect when none is present.
+    /// Schema home: `listeners.tls.verify_client_cert`.
+    #[arg(long)]
+    tls_verify_client_cert: Option<bool>,
+
+    /// Require a client certificate on the secure WebSocket listener
+    /// (TM-08). Off by default mirrors the TLS listener. On requests a
+    /// client certificate and refuses the connect when none is present.
+    /// Schema home: `listeners.wss.verify_client_cert`.
+    #[arg(long)]
+    wss_verify_client_cert: Option<bool>,
+
     /// Print the `erl` arguments of the edge and exit. The output has
     /// one argument on each line. The arguments contain the resolved
     /// listener settings. The edge holds the MQTT, TLS and WebSocket
@@ -1299,6 +1313,20 @@ async fn apply_bind_request_inner(
                 });
             return Some(refusal_for_req(frame, &req, 0x8A, alias_max));
         }
+        // TM-08: client-certificate check. Runs on connect only, never
+        // on publish or deliver. No lock, no queue, no per-client store.
+        // The accept loop bounds the rate (50 ms backoff plus the
+        // connection limit). When the listener verifies, the bind must
+        // carry a certificate field. Else deny, count and log.
+        if client_cert_required(shared, &req.listener) && !has_client_cert(&req) {
+            shared.metrics.inc_auth_failures();
+            tracing::warn!(
+                client_id = %req.client_id,
+                listener = %req.listener,
+                "client certificate is missing or not valid: refusing CONNECT"
+            );
+            return Some(refusal_for_req(frame, &req, 0x87, alias_max));
+        }
         // W2-02: authenticator-chain consult. Loads one lock-free
         // snapshot per connect and never takes the chain write lock;
         // publish and deliver never touch this store. An empty chain
@@ -1786,6 +1814,55 @@ async fn apply_bind_request_inner(
                     };
                     return Some(refusal_for_req(frame, &req, rc, alias_max));
                 }
+                // TM-06: per-tenant connection bound. Counts live
+                // sessions in the bind's own tenant only, so one full
+                // tenant never gates another. A takeover of the same
+                // client id still succeeds. Refuses with the documented
+                // quota code, counted and logged.
+                let is_takeover = shared
+                    .sessions
+                    .get_in_tenant(&tenant_for_quota, &req.client_id)
+                    .map(|session| *session.connected.read())
+                    .unwrap_or(false);
+                if !is_takeover && !tenant_connection_fits(shared, &tenant_for_quota) {
+                    shared
+                        .sessions
+                        .release_connection_slot_in_tenant(&tenant_for_quota, username);
+                    shared.metrics.inc_tenant_conn_refused();
+                    shared.tenant_limits.count_conn_refused();
+                    tracing::warn!(
+                        tenant = %tenant_for_quota,
+                        client_id = %req.client_id,
+                        "tenant connection limit reached: refusing CONNECT"
+                    );
+                    let rc = if req.protocol_version == 5 {
+                        V5_RC_CONNECT_QUOTA
+                    } else {
+                        0x8B
+                    };
+                    return Some(refusal_for_req(frame, &req, rc, alias_max));
+                }
+            } else {
+                // TM-06: anonymous binds carry no username slot, but the
+                // per-tenant connection bound still applies. A full
+                // tenant refuses with the documented quota code.
+                let tenant_for_anon =
+                    bind_tenant_for_req(shared, &req, kerberos_principal.as_deref());
+                if !tenant_connection_fits(shared, &tenant_for_anon) {
+                    shared.metrics.inc_tenant_conn_refused();
+                    shared.tenant_limits.count_conn_refused();
+                    tracing::warn!(
+                        tenant = %tenant_for_anon,
+                        client_id = %req.client_id,
+                        "tenant connection limit reached: refusing anonymous CONNECT"
+                    );
+                    let rc = if req.protocol_version == 5 {
+                        V5_RC_CONNECT_QUOTA
+                    } else {
+                        0x8B
+                    };
+                    return Some(refusal_for_req(frame, &req, rc, alias_max));
+                }
             }
             // W2-03: record the successful credentialed CONNECT in the
             // node auth cache (one short lock, CONNECT-only; publish and
@@ -1815,10 +1892,9 @@ async fn apply_bind_request_inner(
     // Kerberos principal, else the MQTT username): never from stored
     // state of another tenant's namesake session, so a client can never
     // be placed into a tenant it did not authenticate for (fail closed).
-    // TODO(parity): the bind carries no listener name or MQTT 5
-    // user-property map yet (the edge terminates CONNECT as 3.1.1 only),
-    // so both ride as absent: the default listener scope and no user
-    // properties. Absent means the default tenant, never another
+    // The bind carries the listener name on flagged binds and the
+    // kernel native path. Edge binds without the flag still carry the
+    // default scope. Absent means the default tenant, never another
     // tenant's (fail closed).
     // TODO(parity): an anonymous reconnect carries no username, so it
     // renders the default tenant even when a previous credentialed bind
@@ -1876,6 +1952,30 @@ async fn apply_bind_request_inner(
     // supervision lives on the edge. Malformed binds answer return code
     // 2 exactly like the synchronous reply path (0x82 with a reason
     // string when the peer negotiated version 5).
+    // TM-06: per-tenant session bound. A full tenant refuses with
+    // the documented quota code, counted and logged. Another tenant
+    // still creates sessions. Connect path only.
+    if let Ok(req) = parsed.clone() {
+        let is_new_session = shared
+            .sessions
+            .get_in_tenant(&tenant_for_bind, &req.client_id)
+            .is_none();
+        if is_new_session && !tenant_session_fits(shared, &tenant_for_bind) {
+            shared.metrics.inc_tenant_sess_refused();
+            shared.tenant_limits.count_sess_refused();
+            tracing::warn!(
+                tenant = %tenant_for_bind,
+                client_id = %req.client_id,
+                "tenant session limit reached: refusing CONNECT"
+            );
+            let rc = if req.protocol_version == 5 {
+                V5_RC_CONNECT_QUOTA
+            } else {
+                0x8B
+            };
+            return Some(refusal_for_req(frame, &req, rc, alias_max));
+        }
+    }
     let reply = match parsed.clone() {
         Ok(req) => {
             // F1-01: validate the CONNECT last will before touching
@@ -2201,24 +2301,42 @@ const MAX_CERT_FIELD_LEN: usize = 1024;
 /// bind-time allocation while covering multi-SAN certificates.
 const MAX_CERT_SANS: usize = 16;
 
+/// Bind flag for a credentials section in the bind tail.
+/// Reason: the bit removes the peer-as-username ambiguity.
+const BIND_FLAG_CREDS: u8 = 0x08;
+
+/// Bind flag for a peer-address section in the bind tail.
+/// Reason: the bit tells the peer section from credentials bytes.
+const BIND_FLAG_PEER: u8 = 0x10;
+
+/// Bind flag for a certificate section in the bind tail.
+/// Reason: the bit tells the certificate section from other bytes.
+const BIND_FLAG_CERT: u8 = 0x20;
+
 /// Decode `BindConnection` metadata.
 ///
 /// Layout: `ClientIdLen:16be | ClientId | Flags:8 | Keepalive:16be`,
 /// optionally followed by an F1-01 will section (present iff Flags bit 1
 /// is set) `WillQos:8 | WillRetain:8 | TopicLen:16be | Topic |
 /// PayloadLen:32be | Payload`, optionally followed by a credentials
-/// section `UserLen:16be | Username | PassLen:16be | Password` (absent
-/// entirely when the client connects anonymously), optionally followed by
-/// a peer-address section `PeerLen:16be | PeerIp` carrying the client IP
+/// section `UserLen:16be | Username | PassLen:16be | Password` (present
+/// iff Flags bit 3 is set; absent entirely when the client connects
+/// anonymously), followed by a peer-address section `PeerLen:16be |
+/// PeerIp` (present iff Flags bit 4 is set) carrying the client IP
 /// literal the edge saw on its socket (B1-03: drives `peerhost` /
-/// `peerhost_net` bans), optionally followed by a certificate section
+/// `peerhost_net` bans), followed by a certificate section
 /// `CertLen:16be | CnLen:16be | Cn | SubjectLen:16be | Subject |
-/// SanCount:16be | (SanLen:16be | San)*` carrying the TLS
-/// client-certificate fields the edge extracted where TLS terminates
-/// (MT-01: expression inputs for tenant assignment), optionally followed
-/// by a B4-05 alias section `ClientAliasMax:16be` carrying the client's
-/// receive limit (the kernel outbound bound; 0 or absent means the kernel
-/// never assigns an alias toward the client).
+/// SanCount:16be | (SanLen:16be | San)*` (present iff Flags bit 5 is
+/// set) carrying the TLS client-certificate fields the edge extracted
+/// where TLS terminates (MT-01: expression inputs for tenant
+/// assignment), optionally followed by a B4-05 alias section
+/// `ClientAliasMax:16be` carrying the client's receive limit (the
+/// kernel outbound bound; 0 or absent means the kernel never assigns
+/// an alias toward the client).
+/// Parse rule: flags decide. A set flag means the section is present.
+/// A clear flag means the section is absent. Binds without the new
+/// flags use the old position parse. Both decoders use this rule.
+/// A short section fails closed with a truncation error.
 /// Binds encoded before the peer/alias/will/cert sections existed carry
 /// no trailing bytes and still decode with `peerhost` unset, alias
 /// maximum 0, no will and no certificate. The keepalive is
@@ -2282,7 +2400,18 @@ struct BindRequest {
     /// omit them. No session, routing, auth or tenant logic reads
     /// them beyond the echo.
     user_properties: Option<std::collections::HashMap<String, String>>,
+    /// Listener name the connection arrived on (`""` means default).
+    /// The edge reports it. The kernel native path sets it.
+    listener: String,
 }
+
+/// Longest accepted listener name in a bind.
+/// Reason: listener names are short labels, so 64 chars bound bind memory.
+const MAX_BIND_LISTENER_LEN: usize = 64;
+
+/// Bind flag for a listener-name section in the bind tail.
+/// Reason: the bit tells the listener section from other bytes.
+const BIND_FLAG_LISTENER: u8 = 0x40;
 
 /// Largest v5 bind section in bytes (see [`BindRequest`]).
 const MAX_V5_SECTION_LEN: usize = 4096;
@@ -2324,6 +2453,13 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     } else {
         None
     };
+    // TM-07: flags decide. A set section flag means the section is
+    // present. A clear flag means it is absent. Flagged binds parse
+    // by flags, so peer bytes never become a username. Binds without
+    // the flags keep the old position parse below.
+    if flags & (BIND_FLAG_CREDS | BIND_FLAG_PEER | BIND_FLAG_CERT | BIND_FLAG_LISTENER) != 0 {
+        return decode_flagged_bind(client_id, flags, keepalive_secs, will, rest);
+    }
     // X1-01: Flags bit 2 marks a trailing v5 section
     // `AliasMax:16be | V5Payload | V5Len:16be'. The section is stripped
     // from the end first; the remainder (ending in the alias maximum)
@@ -2351,6 +2487,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             receive_maximum: v5.receive_maximum,
             max_packet_size: v5.max_packet_size,
             user_properties: Some(v5.user_properties),
+            listener: identity.listener,
         });
     }
     // Preferred: exact legacy parse (no alias section).
@@ -2372,6 +2509,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
             receive_maximum: u16::MAX,
             max_packet_size: 0,
             user_properties: None,
+            listener: identity.listener,
         });
     }
     // Otherwise the last two bytes may be the alias section: the prefix
@@ -2399,6 +2537,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
                 receive_maximum: u16::MAX,
                 max_packet_size: 0,
                 user_properties: None,
+                listener: identity.listener,
             });
         }
     }
@@ -2422,6 +2561,186 @@ fn decode_legacy_tail(rest: &[u8]) -> Result<(BindIdentity, u16), &'static str> 
         }
     }
     Err("bind meta length mismatch")
+}
+
+/// Decode a flagged bind tail. Flags decide each section.
+/// A short section fails closed with a truncation error.
+fn decode_flagged_bind(
+    client_id: &str,
+    flags: u8,
+    keepalive_secs: u16,
+    will: Option<BindWill>,
+    rest: &[u8],
+) -> Result<BindRequest, &'static str> {
+    // X1-01: strip the v5 section first when bit 2 is set.
+    // The remainder keeps the alias maximum for the tail decoder.
+    let (tail, v5) = if flags & 0x04 != 0 {
+        let (legacy_rest, parsed) = decode_bind_v5_section(rest)?;
+        (legacy_rest, Some(parsed))
+    } else {
+        (rest, None)
+    };
+    let (identity, client_alias_max) = decode_flagged_tail(tail, flags)?;
+    let (protocol_version, session_expiry, receive_maximum, max_packet_size, user_properties) =
+        match v5 {
+            Some(parsed) => (
+                parsed.version,
+                parsed.session_expiry,
+                parsed.receive_maximum,
+                parsed.max_packet_size,
+                Some(parsed.user_properties),
+            ),
+            None => (4, 0, u16::MAX, 0, None),
+        };
+    Ok(BindRequest {
+        client_id: client_id.to_string(),
+        clean_start: flags & 0x01 != 0,
+        keepalive_secs,
+        username: identity.username,
+        password: identity.password,
+        peerhost: identity.peerhost,
+        client_alias_max,
+        will,
+        cert_cn: identity.cert_cn,
+        cert_subject: identity.cert_subject,
+        cert_sans: identity.cert_sans,
+        protocol_version,
+        session_expiry,
+        receive_maximum,
+        max_packet_size,
+        user_properties,
+        listener: identity.listener,
+    })
+}
+
+/// Decode the flagged tail allowing the trailing alias section.
+/// Exact flagged parse first (no alias), else the last two bytes
+/// carry the alias maximum over a flagged prefix. Fail closed.
+fn decode_flagged_tail(rest: &[u8], flags: u8) -> Result<(BindIdentity, u16), &'static str> {
+    if let Ok(identity) = decode_flagged_identity(rest, flags) {
+        return Ok((identity, 0));
+    }
+    if rest.len() >= 2 {
+        let (prefix, suffix) = rest.split_at(rest.len() - 2);
+        if let Ok(identity) = decode_flagged_identity(prefix, flags) {
+            let client_alias_max =
+                protocol_v5::decode_alias_maximum(suffix).unwrap_or(protocol_v5::NO_TOPIC_ALIAS);
+            return Ok((identity, client_alias_max));
+        }
+    }
+    Err("bind meta length mismatch")
+}
+
+/// Decode flagged credentials, peer, certificate and listener sections.
+/// A set flag needs its section. A clear flag needs no bytes.
+/// A short section fails with a truncation error.
+fn decode_flagged_identity(rest: &[u8], flags: u8) -> Result<BindIdentity, &'static str> {
+    let mut cursor = rest;
+    let (username, password) = if flags & BIND_FLAG_CREDS != 0 {
+        let (user, pass, tail) = take_flagged_creds(cursor)?;
+        cursor = tail;
+        (Some(user), Some(pass))
+    } else {
+        (None, None)
+    };
+    let peerhost = if flags & BIND_FLAG_PEER != 0 {
+        let (peer, tail) = take_flagged_peer(cursor)?;
+        cursor = tail;
+        Some(peer)
+    } else {
+        None
+    };
+    let (cert_cn, cert_subject, cert_sans) = if flags & BIND_FLAG_CERT != 0 {
+        let (cn, subject, sans, tail) = take_flagged_cert(cursor)?;
+        cursor = tail;
+        (cn, subject, sans)
+    } else {
+        (None, None, Vec::new())
+    };
+    let listener = if flags & BIND_FLAG_LISTENER != 0 {
+        let (name, tail) = take_flagged_listener(cursor)?;
+        cursor = tail;
+        name
+    } else {
+        String::new()
+    };
+    if !cursor.is_empty() {
+        return Err("bind meta length mismatch");
+    }
+    Ok(BindIdentity {
+        username,
+        password,
+        peerhost,
+        cert_cn,
+        cert_subject,
+        cert_sans,
+        listener,
+    })
+}
+
+/// Take one flagged listener section off the front.
+/// The name is UTF-8 and at most 64 chars. Short input fails.
+fn take_flagged_listener(cursor: &[u8]) -> Result<(String, &[u8]), &'static str> {
+    if cursor.len() < 2 {
+        return Err("bind listener truncated");
+    }
+    let len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if len > MAX_BIND_LISTENER_LEN || cursor.len() < 2 + len {
+        return Err("bind listener truncated");
+    }
+    let name = std::str::from_utf8(&cursor[2..2 + len]).map_err(|_| "listener not UTF-8")?;
+    Ok((name.to_string(), &cursor[2 + len..]))
+}
+
+/// Take one flagged credentials section off the front.
+/// Empty password fails. Short input fails as truncated.
+fn take_flagged_creds(cursor: &[u8]) -> Result<(String, Vec<u8>, &[u8]), &'static str> {
+    if cursor.len() < 2 {
+        return Err("bind credentials truncated");
+    }
+    let user_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if cursor.len() < 2 + user_len + 2 {
+        return Err("bind credentials truncated");
+    }
+    let username =
+        std::str::from_utf8(&cursor[2..2 + user_len]).map_err(|_| "username not UTF-8")?;
+    let base = 2 + user_len;
+    let pass_len = u16::from_be_bytes([cursor[base], cursor[base + 1]]) as usize;
+    if pass_len == 0 || cursor.len() < base + 2 + pass_len {
+        return Err("bind credentials truncated");
+    }
+    let password = cursor[base + 2..base + 2 + pass_len].to_vec();
+    Ok((
+        username.to_string(),
+        password,
+        &cursor[base + 2 + pass_len..],
+    ))
+}
+
+/// Take one flagged peer section off the front.
+/// Only IP literals pass. Short input fails as truncated.
+fn take_flagged_peer(cursor: &[u8]) -> Result<(String, &[u8]), &'static str> {
+    let (peer, tail) = split_peer_prefix(cursor).ok_or("bind peer truncated")?;
+    Ok((peer, tail))
+}
+
+/// Decoded flagged certificate section plus the rest.
+type FlaggedCert<'a> = (Option<String>, Option<String>, Vec<String>, &'a [u8]);
+
+/// Take one flagged certificate section off the front.
+/// Short input fails as truncated.
+fn take_flagged_cert(cursor: &[u8]) -> Result<FlaggedCert<'_>, &'static str> {
+    if cursor.len() < 2 {
+        return Err("bind certificate truncated");
+    }
+    let cert_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    if cursor.len() < 2 + cert_len {
+        return Err("bind certificate truncated");
+    }
+    let section = &cursor[..2 + cert_len];
+    let tail = &cursor[2 + cert_len..];
+    let (cn, subject, sans) = decode_cert_section(section).ok_or("bind certificate truncated")?;
+    Ok((cn, subject, sans, tail))
 }
 
 /// Decoded X1-01 v5 section: the negotiated version plus the CONNECT
@@ -2581,7 +2900,7 @@ fn observe_bind_v5(req: &BindRequest) {
 }
 
 /// Credentials plus peer address plus certificate fields decoded from
-/// the bind tail.
+/// the bind tail. The listener name rides only in flagged binds.
 struct BindIdentity {
     username: Option<String>,
     password: Option<Vec<u8>>,
@@ -2589,6 +2908,7 @@ struct BindIdentity {
     cert_cn: Option<String>,
     cert_subject: Option<String>,
     cert_sans: Vec<String>,
+    listener: String,
 }
 
 /// Decode the optional trailing credentials, peer-address and
@@ -2612,6 +2932,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
             cert_cn: None,
             cert_subject: None,
             cert_sans: Vec::new(),
+            listener: String::new(),
         });
     }
     if rest.len() < 2 {
@@ -2632,6 +2953,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
                     cert_cn,
                     cert_subject,
                     cert_sans,
+                    listener: String::new(),
                 })
             }
             None => match decode_cert_tail(rest) {
@@ -2642,6 +2964,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
                     cert_cn,
                     cert_subject,
                     cert_sans,
+                    listener: String::new(),
                 }),
                 None => Err("bind credentials truncated"),
             },
@@ -2653,17 +2976,13 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
     if rest.len() < base + 2 + pass_len {
         return Err("bind credentials truncated");
     }
-    // Wire ambiguity (documented, not parsed around): an anonymous bind
-    // carrying peer plus certificate sections is byte-identical to
-    // credentials whose username is the peer literal and whose password
-    // is the certificate payload, and credentials win this parse. The
-    // edge sends no certificate section today, so no producer hits the
-    // ambiguous shape; certificate-only and credentialed
-    // credentials-plus-peer-plus-certificate binds decode correctly.
-    // TODO(parity): which side should win once the edge forwards
-    // certificates on anonymous binds? The rulebook does not decide the
-    // wire precedence; current choice keeps every bind the edge sends
-    // today decoding exactly as before.
+    // Parse rule: flags decide. Flagged binds never reach this
+    // legacy path, so peer bytes never become a username there.
+    // This legacy path keeps the old position parse for binds
+    // without the flags. Credentials win here, exactly as before.
+    // An anonymous bind carrying peer plus certificate sections is
+    // byte-identical to credentials whose username is the peer
+    // literal and whose password is the certificate payload.
     // B4-05 alias collision: an anonymous peer section plus the trailing
     // `ClientAliasMax:16be' of 0 is byte-identical to credentials with the
     // peer literal as username and an empty password (`PeerLen|Peer|0x0000'
@@ -2687,6 +3006,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
             cert_cn: None,
             cert_subject: None,
             cert_sans: Vec::new(),
+            listener: String::new(),
         });
     }
     // After credentials: optional peer prefix, then optional certificate
@@ -2701,6 +3021,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
             cert_cn,
             cert_subject,
             cert_sans,
+            listener: String::new(),
         });
     }
     if let Some((cert_cn, cert_subject, cert_sans)) = decode_cert_tail(tail) {
@@ -2714,6 +3035,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
             cert_cn,
             cert_subject,
             cert_sans,
+            listener: String::new(),
         });
     }
     Err("bind meta length mismatch")
@@ -3486,6 +3808,12 @@ struct Shared {
     /// at boot. Reads take one short lock per request. No publish path
     /// reads this store. Publish and deliver take no lock here.
     schema_registry: Arc<broker_api::v5::schema_registry::SchemaRegistryStore>,
+    /// Managed tenant namespaces for TM-02 (`GET/POST/PUT/DELETE
+    /// /api/v5/mt/...`): shared with the management API so validated
+    /// creates and deletes are visible to reads without a restart. One
+    /// `Arc` clone at boot. Management-plane only; publish and deliver
+    /// never touch it.
+    namespaces: Arc<broker_api::v5::mt::NamespaceStore>,
     /// Directory authenticator for B2-01 (`None` disables LDAP). Consulted
     /// at CONNECT when the local store refuses the credentials; a
     /// directory outage fails closed. One `Arc` clone at boot; connects
@@ -3643,6 +3971,53 @@ struct Shared {
     /// per setting. `serve_api` shares it into `ApiState` so explain
     /// reports the file, variable or flag that set each value.
     api_startup_config: Arc<std::sync::RwLock<Option<Arc<LayeredConfig>>>>,
+    /// Per-tenant limit defaults and overrides (TM-06). Defaults come
+    /// from the file configuration. Overrides come from the namespace
+    /// config. The connect path reads the effective triple. The publish
+    /// path never touches this store directly; retained caps live in
+    /// the retained store under its own lock.
+    tenant_limits: Arc<broker_session::tenant_limits::TenantLimitStore>,
+    /// Whether the TLS listener verifies a client certificate (TM-08).
+    /// Set once at boot from the resolved config. Read on connect only.
+    /// Off by default keeps handshakes unchanged.
+    tls_verify_client_cert: bool,
+    /// Whether the secure WebSocket listener verifies a client
+    /// certificate (TM-08). Mirrors the TLS listener. Off by default.
+    wss_verify_client_cert: bool,
+    /// True when `listeners.tls.verify` is `verify_peer` (K1-05).
+    /// Set once at boot from the resolved config. Read on connect only.
+    tls_verify_peer: bool,
+    /// True when the TLS listener refuses a handshake without a
+    /// certificate (K1-05). Set once at boot. Read on connect only.
+    tls_fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate
+    /// on the TLS listener (K1-05). Set once at boot.
+    /// Read on connect only.
+    tls_peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client
+    /// certificate on the TLS listener (K1-05). Set once at boot.
+    /// Read on connect only.
+    tls_peer_cert_as_clientid: String,
+    /// True when `listeners.wss.verify` is `verify_peer` (K1-05).
+    /// Set once at boot from the resolved config. Read on connect only.
+    wss_verify_peer: bool,
+    /// True when the secure WebSocket listener refuses a handshake
+    /// without a certificate (K1-05). Set once at boot.
+    /// Read on connect only.
+    wss_fail_if_no_peer_cert: bool,
+    /// Source for the bind username from the client certificate
+    /// on the secure WebSocket listener (K1-05). Set once at boot.
+    /// Read on connect only.
+    wss_peer_cert_as_username: String,
+    /// Source for the bind client identifier from the client
+    /// certificate on the secure WebSocket listener (K1-05). Set once at boot.
+    /// Read on connect only.
+    wss_peer_cert_as_clientid: String,
+    /// Pre-shared-key identity store for the kernel TLS listener (K1-04).
+    /// Shared with the PSK handshake callbacks. One `Arc` clone at boot;
+    /// handshakes take one short read lock per lookup. The keys file fills
+    /// it at boot. Empty by default, so every handshake fails closed.
+    psk: Arc<broker_auth::PskStore>,
 }
 
 impl Shared {
@@ -3780,6 +4155,7 @@ impl Shared {
             rule_engine_config,
             transformations: Arc::new(broker_api::v5::transformations::TransformChainStore::new()),
             schema_registry: Arc::new(broker_api::v5::schema_registry::SchemaRegistryStore::new()),
+            namespaces: Arc::new(broker_api::v5::mt::NamespaceStore::new()),
             ldap: None,
             kerberos: None,
             jwks: None,
@@ -3808,6 +4184,18 @@ impl Shared {
             api_listeners: Arc::new(std::sync::RwLock::new(None)),
             listener_store: Arc::new(broker_api::v5::listeners::ListenerStore::new()),
             api_startup_config: Arc::new(std::sync::RwLock::new(None)),
+            tenant_limits: Arc::new(broker_session::tenant_limits::TenantLimitStore::default()),
+            tls_verify_client_cert: false,
+            wss_verify_client_cert: false,
+            tls_verify_peer: false,
+            tls_fail_if_no_peer_cert: false,
+            tls_peer_cert_as_username: "disabled".to_string(),
+            tls_peer_cert_as_clientid: "disabled".to_string(),
+            wss_verify_peer: false,
+            wss_fail_if_no_peer_cert: false,
+            wss_peer_cert_as_username: "disabled".to_string(),
+            wss_peer_cert_as_clientid: "disabled".to_string(),
+            psk: Arc::new(broker_auth::PskStore::new()),
         };
         // Mirror the boot path: the rule table consults the same settings
         // instance the management plane serves, so validated writes are
@@ -4238,13 +4626,13 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
     listener(
         "ws",
         "listeners.ws.bind",
-        listeners.ws.enabled,
+        listeners.ws.enabled && !listeners.ws.native,
         &listeners.ws.bind,
     )?;
     listener(
         "wss",
         "listeners.wss.bind",
-        listeners.wss.enabled,
+        listeners.wss.enabled && !listeners.wss.native,
         &listeners.wss.bind,
     )?;
     put("ws_path", quoted(&listeners.ws.path));
@@ -4259,6 +4647,16 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
             put(key, quoted(value));
         }
     }
+    // TM-08: the edge needs the verify switches to request client
+    // certificates. Off by default keeps handshakes unchanged.
+    put(
+        "tls_verify_client_cert",
+        listeners.tls.verify_client_cert.to_string(),
+    );
+    put(
+        "wss_verify_client_cert",
+        listeners.wss.verify_client_cert.to_string(),
+    );
     Ok(out)
 }
 
@@ -4348,6 +4746,8 @@ fn cli_overrides(args: &Args, matches: &clap::ArgMatches) -> CliOverrides {
         delayed_max_secs: typed("delayed_max_secs").then_some(args.delayed_max_secs),
         topic_alias_maximum: args.topic_alias_maximum,
         monitor_sample_secs: typed("monitor_sample_secs").then_some(args.monitor_sample_secs),
+        tls_verify_client_cert: args.tls_verify_client_cert,
+        wss_verify_client_cert: args.wss_verify_client_cert,
     }
 }
 
@@ -4517,6 +4917,12 @@ fn apply_resolved_config(args: &mut Args, layered: &LayeredConfig) -> Result<(),
     if let Some(value) = number("observability.monitor_sample_secs")? {
         args.monitor_sample_secs = value;
     }
+    if set_by_a_layer("listeners.tls.verify_client_cert") {
+        args.tls_verify_client_cert = Some(layered.config().listeners.tls.verify_client_cert);
+    }
+    if set_by_a_layer("listeners.wss.verify_client_cert") {
+        args.wss_verify_client_cert = Some(layered.config().listeners.wss.verify_client_cert);
+    }
     Ok(())
 }
 
@@ -4547,6 +4953,24 @@ fn install_tenant_rules(
     Ok(())
 }
 
+/// Apply the file defaults for per-tenant limits (TM-06).
+///
+/// Copies the three quota bounds into the limit store and the
+/// retained store before any edge binds. The file and the
+/// environment already resolved into `cfg`, so both entries apply
+/// here. Management overrides apply later per namespace.
+fn apply_tenant_limit_defaults(shared: &Shared, cfg: &broker_config::schema::BrokerConfig) {
+    let defaults = broker_session::tenant_limits::TenantLimits {
+        max_connections: cfg.quotas.max_connections_per_tenant,
+        max_sessions: cfg.quotas.max_sessions_per_tenant,
+        max_retained: cfg.quotas.max_retained_per_tenant,
+    };
+    shared.tenant_limits.set_defaults(defaults);
+    shared
+        .retained
+        .set_default_retained_per_tenant_cap(defaults.max_retained as usize);
+}
+
 /// [`BrokerSink`] that forwards rule output directly to local router
 /// subscribers. Pure in-memory fan-out: no sockets, no MQTT loopback.
 struct InMemoryBrokerSink {
@@ -4566,11 +4990,25 @@ impl BrokerSink for InMemoryBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
-        // TODO(parity): rule republished output carries no tenant yet, so
-        // it fans out in the default tenant only (fail closed: no
-        // cross-tenant leak, single-tenant behaviour unchanged). The open
-        // question is the tenant attribution for derived messages once
-        // the rule engine dispatches per tenant.
+        self.publish_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            topic,
+            payload,
+            qos,
+            retain,
+        )
+        .await
+    }
+    /// Fan out one derived message inside one tenant. The match reads
+    /// only that tenant, so output never leaves it.
+    async fn publish_in_tenant(
+        &self,
+        tenant: &str,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), broker_rules::RuleEngineError> {
         // Rule output must not fire delivery events. It routes here,
         // not through ingress. A delivery event here requeues and
         // retriggers the same rule. The drain loop then emits 64
@@ -4583,7 +5021,7 @@ impl BrokerSink for InMemoryBrokerSink {
             qos,
             retain,
             &payload,
-            broker_session::tenant::DEFAULT_TENANT_ID,
+            tenant,
             None,
         );
         // Only frames that reached a live mailbox count as
@@ -5251,6 +5689,17 @@ where
                 );
             }
         },
+        OpCode::UnsubscribeIn => match apply_unsubscribe(&frame, shared).await {
+            Some(reply) => {
+                transport.send(reply).await?;
+            }
+            None => {
+                warn!(
+                    "Dropping malformed UnsubscribeIn from conn {}",
+                    frame.header.conn_id
+                );
+            }
+        },
         OpCode::PublishIn => {
             let (ack, deliveries) = apply_publish(&frame, shared).await;
             if let Some(ack) = ack {
@@ -5374,9 +5823,6 @@ where
             if before != bound.len() {
                 refresh_subscription_stats(shared);
             }
-        }
-        OpCode::UnsubscribeIn => {
-            apply_unsubscribe(&frame, shared).await;
         }
         OpCode::Credit => {
             // Egress stage 1: the owning edge connection reports its
@@ -5912,33 +6358,44 @@ async fn apply_subscribe(
     (reply, retained)
 }
 
-/// Handle one `UnsubscribeIn` frame and build its `UnsubAckOut` reply.
-/// Malformed framing yields `None` (the edge treats a missing UnsubAck as
-/// a hung request scoped to that connection).
+/// Remove the subscriptions of one `UnsubscribeIn` frame and build its
+/// `UnsubAckOut` reply. Both transports share this function: the edge
+/// path and the kernel listener path build the same frame.
+/// Malformed framing yields `None` (the caller drops the frame).
 ///
 /// Meta layout: `PacketId:16be | IdLen:16be | ClientId | N:16be |
-/// (FilterLen:16be | Filter) * N`. Granted filters are removed from the
-/// router and the session mirror; invalid filters are ignored.
-async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) {
-    let (packet_id, client_id, filters) = match decode_unsubscribe_meta(&frame.metadata) {
-        Some(parts) => parts,
-        None => return,
-    };
-    // Resolve the owning tenant from the connection so one tenant's
-    // unsubscribe never touches another tenant's namesake session.
+/// (FilterLen:16be | Filter) * N`. Each reply code covers one filter:
+/// `0x00` success, `0x11` no subscription existed, `0x8F` topic filter
+/// invalid. Version-4 peers observe the packet identifier only; the
+/// wider set rides the same bytes for version-5 peers.
+/// A `$share/<group>/` prefix removes the inner filter, like subscribe.
+/// A rewrite rule applies before removal, like subscribe.
+async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
+    let (packet_id, client_id, filters) = decode_unsubscribe_meta(&frame.metadata)?;
+    // Tenant scope: resolve once from the owning connection, like subscribe.
+    // Two tenants with one client id unsubscribe independently.
     let tenant = session_tenant_for_conn(shared, frame.header.conn_id, &client_id);
     let owner = shared.sessions.get_in_tenant(&tenant, &client_id);
-
-    let mut granted = Vec::new();
-    for raw_filter_str in filters {
-        let filter_str = match shared.router.rewrite_subscribe(&raw_filter_str) {
+    let mut codes = Vec::with_capacity(filters.len());
+    let mut removed_any = false;
+    let mut removed = Vec::new();
+    for raw in &filters {
+        // Subscribe rewrites before it stores. Unsubscribe rewrites
+        // before it removes, so it removes the stored form.
+        let filter_str = match shared.router.rewrite_subscribe(raw) {
             Some(rewritten) => rewritten,
-            None => raw_filter_str,
+            None => raw.clone(),
         };
-        let filter = match TopicFilter::new(filter_str) {
-            Ok(f) => f,
-            Err(_) => continue,
+        let parsed = TopicFilter::new(filter_str)
+            .ok()
+            .and_then(|filter| split_shared_filter(&filter).map(|(_, inner)| inner));
+        let Some(inner) = parsed else {
+            codes.push(V5_UNSUBACK_FILTER_INVALID);
+            continue;
         };
+        let existed = owner
+            .as_ref()
+            .is_some_and(|session| session.subscriptions.read().contains_key(&inner));
         // Fire the event before removal. Rules belong to the default
         // tenant, so another tenant fires nothing. Check flag first.
         if shared
@@ -5955,90 +6412,49 @@ async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) {
                         client_id: client_id.clone(),
                         username,
                         peerhost,
-                        topic: filter.as_str().to_string(),
+                        topic: inner.as_str().to_string(),
                     });
             }
         }
-        // Remove from router and session mirror in the owning tenant.
         shared
             .router
-            .unsubscribe_in_tenant(&filter, &client_id, &tenant);
+            .unsubscribe_in_tenant(&inner, &client_id, &tenant);
         shared
             .sessions
-            .remove_subscription_in_tenant(&tenant, &client_id, &filter);
-        granted.push(filter);
+            .remove_subscription_in_tenant(&tenant, &client_id, &inner);
+        if existed {
+            removed_any = true;
+            removed.push(inner.clone());
+            codes.push(V5_UNSUBACK_SUCCESS);
+        } else {
+            // TODO(parity): the reference answer for an unknown filter
+            // is open (success vs no-subscription-existed). Current
+            // choice answers 0x11 when the session holds no such filter.
+            codes.push(V5_UNSUBACK_NO_SUBSCRIPTION);
+        }
     }
-    if !granted.is_empty() {
+    if removed_any {
         refresh_subscription_stats(shared);
     }
-
     // Clustered mode: withdraw our route summary.
     if let Some(cluster) = &shared.cluster {
-        for filter in &granted {
+        for filter in &removed {
             if let Err(e) = cluster.revoke_filter(filter).await {
                 warn!("Cluster revoke failed for {}: {}", filter.as_str(), e);
             }
         }
     }
-
-    // Build UnsubAckOut reply.
-    let mut meta = Vec::with_capacity(2);
+    let mut meta = Vec::with_capacity(2 + codes.len());
     meta.extend_from_slice(&packet_id.to_be_bytes());
-    let reply = BrokerFrame::new(
+    meta.extend_from_slice(&codes);
+    BrokerFrame::new(
         OpCode::UnsubAckOut,
         frame.header.conn_id,
         frame.header.sequence_no,
         Bytes::from(meta),
         Bytes::new(),
     )
-    .ok();
-    if let Some(reply) = reply {
-        // Send directly through the connection table.
-        let _ = shared.conns.route(frame.header.conn_id, reply);
-    }
-}
-
-/// Decode `UnsubscribeIn` metadata into `(packet_id, client_id, filters)`.
-/// Layout: `PacketId:16be | IdLen:16be | ClientId | N:16be | (FilterLen:16be | Filter) * N`.
-fn decode_unsubscribe_meta(meta: &[u8]) -> Option<(u16, String, Vec<String>)> {
-    if meta.len() < 4 {
-        return None;
-    }
-    let packet_id = u16::from_be_bytes([meta[0], meta[1]]);
-    if packet_id == 0 {
-        return None;
-    }
-    let mut offset = 2;
-    if meta.len() < offset + 2 {
-        return None;
-    }
-    let id_len = u16::from_be_bytes([meta[offset], meta[offset + 1]]) as usize;
-    offset += 2;
-    if meta.len() < offset + id_len {
-        return None;
-    }
-    let client_id = String::from_utf8(meta[offset..offset + id_len].to_vec()).ok()?;
-    offset += id_len;
-    if meta.len() < offset + 2 {
-        return None;
-    }
-    let n = u16::from_be_bytes([meta[offset], meta[offset + 1]]) as usize;
-    offset += 2;
-    let mut filters = Vec::with_capacity(n);
-    for _ in 0..n {
-        if meta.len() < offset + 2 {
-            return None;
-        }
-        let filter_len = u16::from_be_bytes([meta[offset], meta[offset + 1]]) as usize;
-        offset += 2;
-        if meta.len() < offset + filter_len {
-            return None;
-        }
-        let filter = String::from_utf8(meta[offset..offset + filter_len].to_vec()).ok()?;
-        filters.push(filter);
-        offset += filter_len;
-    }
-    Some((packet_id, client_id, filters))
+    .ok()
 }
 
 /// Replay a resumed durable session's backlog onto its new connection:
@@ -7360,6 +7776,7 @@ async fn ingress_pipeline_with_publisher_and_props(
                 broker_api::v5::retainer::parse_bytesize_to_bytes(&cfg.max_payload_size)
                     .unwrap_or(1_048_576);
             let mut drop_new = false;
+            let mut tenant_limited = false;
             if (payload.len() as u64) > max_bytes {
                 drop_new = true;
             } else {
@@ -7376,17 +7793,59 @@ async fn ingress_pipeline_with_publisher_and_props(
                         drop_new = true;
                     }
                 }
+                // TM-06: per-tenant retained bound lives in the store.
+                // The store checks the cap inside its write lock.
+                // Caps sync off path at boot and on API writes.
+                // This path takes no new lock. It reads one atomic
+                // for the unreachable flag. It counts and logs each
+                // refusal.
+                if !drop_new && shared.tenant_limits.is_unreachable() {
+                    drop_new = true;
+                    tenant_limited = true;
+                    shared.tenant_limits.count_store_denied();
+                }
+            }
+            if tenant_limited {
+                shared.metrics.inc_tenant_retained_dropped();
+                shared.tenant_limits.count_retained_dropped();
+                tracing::warn!(
+                    tenant = %publisher_tenant,
+                    topic = %topic.as_str(),
+                    "tenant retained limit reached: dropping new retained topic"
+                );
             }
             if drop_new {
                 // Delivered but not stored, matching the management path.
-            } else if let Err(e) = shared
-                .retained
-                .set_retained_in_tenant(topic.clone(), qos, payload.clone(), publisher_tenant)
-                .await
-            {
-                warn!("Retained store failed for {}: {}", topic.as_str(), e);
             } else {
-                sync_retained_stat(shared).await;
+                match shared
+                    .retained
+                    .set_retained_in_tenant_checked(
+                        topic.clone(),
+                        qos,
+                        payload.clone(),
+                        publisher_tenant,
+                    )
+                    .await
+                {
+                    Ok(broker_storage::RetainedWriteOutcome::Stored) => {
+                        sync_retained_stat(shared).await;
+                    }
+                    Ok(broker_storage::RetainedWriteOutcome::DroppedPerTenantLimit) => {
+                        shared.metrics.inc_tenant_retained_dropped();
+                        shared.tenant_limits.count_retained_dropped();
+                        tracing::warn!(
+                            tenant = %publisher_tenant,
+                            topic = %topic.as_str(),
+                            "tenant retained limit reached: dropping new retained topic"
+                        );
+                    }
+                    Ok(broker_storage::RetainedWriteOutcome::DroppedGlobalLimit) => {
+                        // Delivered but not stored at the global cap.
+                    }
+                    Err(e) => {
+                        warn!("Retained store failed for {}: {}", topic.as_str(), e);
+                    }
+                }
             }
         }
     }
@@ -7395,19 +7854,14 @@ async fn ingress_pipeline_with_publisher_and_props(
     // Republished output re-enters through the sink only, so rules can
     // never recurse through their own output.
     //
-    // The rules and the CoAP observers do not contain a tenant. A rule
-    // publishes its output in the default tenant. An observer reads the
-    // default tenant. Thus they get only the messages of the default
-    // tenant. A message of a different tenant does not go to them. An
-    // installation with the default tenant only operates as before.
-    let default_tenant = is_default_tenant(publisher_tenant);
-    if default_tenant {
-        let rules_fired = shared
-            .engine
-            .dispatch_ingress(topic, payload, qos, &shared.sink)
-            .await;
-        shared.metrics.inc_rules_executed_by(rules_fired as u64);
-    }
+    // Each rule serves one tenant. Only rules of the publisher tenant
+    // run. Each output fans out in the same tenant. A default-only
+    // setup runs as before.
+    let rules_fired = shared
+        .engine
+        .dispatch_ingress_in_tenant(publisher_tenant, topic, payload, qos, &shared.sink)
+        .await;
+    shared.metrics.inc_rules_executed_by(rules_fired as u64);
 
     // Topic index (W1-15): remember the concrete publish topic so the
     // management list/detail reads observe edge publishes as well as
@@ -7445,7 +7899,9 @@ async fn ingress_pipeline_with_publisher_and_props(
     // CoAP observe fan-out (B1-04): notify bounded observers off the
     // hot path. Empty when the gateway never ran: one read lock that
     // returns after a length check, no spawn, no socket work.
-    if default_tenant {
+    // Observers read the default tenant only. A message of another
+    // tenant never reaches them (fail closed, TM-05 owns gateways).
+    if is_default_tenant(publisher_tenant) {
         maybe_notify_coap_observers(shared, topic.as_str(), payload);
     }
     deliveries
@@ -7763,13 +8219,114 @@ fn bind_tenant_for_req(
             .map(str::to_string)
             .or_else(|| req.username.clone()),
         peer_host: req.peerhost.clone(),
-        listener: String::new(),
+        listener: req.listener.clone(),
         cert_cn: req.cert_cn.clone(),
         cert_subject: req.cert_subject.clone(),
         cert_sans: req.cert_sans.clone(),
         user_properties: req.user_properties.clone(),
     };
     shared.tenant_registry.assign(&ctx)
+}
+
+/// True when the listener of this bind must carry a client certificate.
+/// The legacy switches deny at the bind for compatibility.
+/// The new settings deny at the bind when `fail_if_no_peer_cert` is set
+/// with verification on. The handshake already refuses a missing
+/// certificate in that mode. Optional verification never denies
+/// a missing certificate here. Off by default keeps handshakes unchanged.
+/// Connect only.
+fn client_cert_required(shared: &Shared, listener: &str) -> bool {
+    match listener {
+        "tls" => {
+            shared.tls_verify_client_cert
+                || (shared.tls_verify_peer && shared.tls_fail_if_no_peer_cert)
+        }
+        "wss" => {
+            shared.wss_verify_client_cert
+                || (shared.wss_verify_peer && shared.wss_fail_if_no_peer_cert)
+        }
+        _ => false,
+    }
+}
+
+/// True when the bind carries a client certificate field.
+/// At least one of common name, subject or SANs is present.
+fn has_client_cert(req: &BindRequest) -> bool {
+    req.cert_cn.as_ref().is_some_and(|value| !value.is_empty())
+        || req
+            .cert_subject
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || !req.cert_sans.is_empty()
+}
+
+/// Effective per-tenant bounds for one tenant (TM-06).
+///
+/// Defaults come from the limit store. A namespace config override
+/// wins when present. An invalid override or an unreachable store
+/// denies new use (fail closed) and logs the event. Reads take short
+/// locks on the connect path only; the deliver path never calls this.
+/// TODO(parity): the exact wire shape of limit fields stays open;
+/// the current JSON shape applies until the checker pins it.
+fn effective_tenant_limits(
+    shared: &Shared,
+    tenant: &str,
+) -> Result<broker_session::tenant_limits::TenantLimits, &'static str> {
+    if shared.tenant_limits.is_unreachable() {
+        shared.tenant_limits.count_store_denied();
+        tracing::warn!(tenant = %tenant, "tenant limit store is unreachable: denying new use");
+        return Err("limit store is unreachable");
+    }
+    let mut effective = shared.tenant_limits.effective(tenant);
+    let Some(entry) = shared.namespaces.get(tenant) else {
+        return Ok(effective);
+    };
+    let parsed = broker_api::v5::mt::ns_limit_override(&entry.config)
+        .map_err(|_| "namespace limit config is not valid")?;
+    if let Some(value) = parsed.max_connections {
+        effective.max_connections = value;
+    }
+    if let Some(value) = parsed.max_sessions {
+        effective.max_sessions = value;
+    }
+    if let Some(value) = parsed.max_retained {
+        effective.max_retained = value;
+    }
+    Ok(effective)
+}
+
+/// True when one more live connection fits in `tenant`.
+///
+/// Counts live sessions in the owning tenant only. A full tenant
+/// refuses with the documented quota code, counted and logged.
+/// Connect path only; the publish and deliver paths never call this.
+fn tenant_connection_fits(shared: &Shared, tenant: &str) -> bool {
+    let limits = match effective_tenant_limits(shared, tenant) {
+        Ok(limits) => limits,
+        Err(_) => return false,
+    };
+    if limits.max_connections == 0 {
+        return true;
+    }
+    let live = shared.sessions.live_connection_count_in_tenant(tenant);
+    (live as u64) < u64::from(limits.max_connections)
+}
+
+/// True when one more session fits in `tenant`.
+///
+/// Counts sessions in the owning tenant only. A full tenant refuses
+/// with the documented quota code, counted and logged. Connect path
+/// only; the publish and deliver paths never call this.
+fn tenant_session_fits(shared: &Shared, tenant: &str) -> bool {
+    let limits = match effective_tenant_limits(shared, tenant) {
+        Ok(limits) => limits,
+        Err(_) => return false,
+    };
+    if limits.max_sessions == 0 {
+        return true;
+    }
+    let total = shared.sessions.session_count_in_tenant(tenant);
+    (total as u64) < u64::from(limits.max_sessions)
 }
 
 /// Tenant id recorded on one session, or the default tenant when the
@@ -9110,6 +9667,14 @@ const V5_SUBACK_QUOTA_EXCEEDED: u8 = 0x97;
 /// version-5 clients and closes older sockets with no packet.
 const AUTHZ_DISCONNECT_RC: u8 = 0x87;
 
+/// v5 UNSUBACK reason codes carried per filter: success, no
+/// subscription existed and topic filter invalid. Version-4 peers
+/// observe the packet identifier only. A malformed filter answers
+/// 0x8F, failing only the affected filter.
+const V5_UNSUBACK_SUCCESS: u8 = 0x00;
+const V5_UNSUBACK_NO_SUBSCRIPTION: u8 = 0x11;
+const V5_UNSUBACK_FILTER_INVALID: u8 = 0x8F;
+
 /// Decode `SubscribeMeta` into `(packet_id, client_id, [entries])`.
 /// Accepts the legacy form (`FilterLen | Filter | QoS`) and the X1-03
 /// extended form (`FilterLen | Filter | Opts | SubId:32be`) per filter.
@@ -9201,6 +9766,50 @@ fn decode_subscribe_entries_v5(
         return None;
     }
     Some(subs)
+}
+
+/// Decode `UnsubscribeMeta` into `(packet_id, client_id, [filters])`.
+/// Layout: `PacketId:16be | IdLen:16be | ClientId | N:16be |
+/// (FilterLen:16be | Filter) * N`. Structural truncation, bad UTF-8,
+/// an empty filter or an empty list fails the frame (`None`).
+fn decode_unsubscribe_meta(meta: &[u8]) -> Option<(u16, String, Vec<String>)> {
+    if meta.len() < 6 {
+        return None;
+    }
+    let packet_id = u16::from_be_bytes([meta[0], meta[1]]);
+    if packet_id == 0 {
+        return None;
+    }
+    let id_len = u16::from_be_bytes([meta[2], meta[3]]) as usize;
+    if meta.len() < 4 + id_len + 2 {
+        return None;
+    }
+    let client_id = std::str::from_utf8(&meta[4..4 + id_len]).ok()?.to_string();
+    let mut cursor = 4 + id_len;
+    let count = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
+    cursor += 2;
+    if count == 0 {
+        return None;
+    }
+    let mut filters = Vec::with_capacity(count);
+    for _ in 0..count {
+        if meta.len() < cursor + 2 {
+            return None;
+        }
+        let filter_len = u16::from_be_bytes([meta[cursor], meta[cursor + 1]]) as usize;
+        if filter_len == 0 || meta.len() < cursor + 2 + filter_len {
+            return None;
+        }
+        let filter = std::str::from_utf8(&meta[cursor + 2..cursor + 2 + filter_len])
+            .ok()?
+            .to_string();
+        filters.push(filter);
+        cursor += 2 + filter_len;
+    }
+    if cursor != meta.len() {
+        return None;
+    }
+    Some((packet_id, client_id, filters))
 }
 
 /// Encode one extended subscription entry for tests (mirror of the edge
@@ -9904,6 +10513,10 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Reads take one short lock per request. No publish path reads this
     // store. Publish and deliver take no lock here.
     state.schema_registry = shared.schema_registry.clone();
+    // Share the managed namespaces (TM-02) so validated creates and
+    // deletes are visible to reads without a restart. One `Arc` clone.
+    // Management-plane only; publish and deliver never touch it.
+    state.namespaces = shared.namespaces.clone();
     // Share the licence store and alarms (B2-04) so validated management
     // installs and lifecycle alarms are visible without a restart. One
     // Arc clone each; management-plane only, never on the delivery path.
@@ -10018,9 +10631,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .sessions
         .set_max_topic_alias(cfg.session.topic_alias_maximum);
+    // TM-08: apply the client-certificate switches before any bind.
+    // Off by default keeps handshakes unchanged. On denies binds
+    // without a certificate on that listener. Connect only.
+    shared.tls_verify_client_cert = cfg.listeners.tls.verify_client_cert;
+    shared.wss_verify_client_cert = cfg.listeners.wss.verify_client_cert;
+    // K1-05: apply the client-certificate policy before any bind.
+    // The verifier and the bind read these. Connect only.
+    shared.tls_verify_peer = cfg.listeners.tls.verify == "verify_peer";
+    shared.tls_fail_if_no_peer_cert = cfg.listeners.tls.fail_if_no_peer_cert;
+    shared
+        .tls_peer_cert_as_username
+        .clone_from(&cfg.listeners.tls.peer_cert_as_username);
+    shared
+        .tls_peer_cert_as_clientid
+        .clone_from(&cfg.listeners.tls.peer_cert_as_clientid);
+    shared.wss_verify_peer = cfg.listeners.wss.verify == "verify_peer";
+    shared.wss_fail_if_no_peer_cert = cfg.listeners.wss.fail_if_no_peer_cert;
+    shared
+        .wss_peer_cert_as_username
+        .clone_from(&cfg.listeners.wss.peer_cert_as_username);
+    shared
+        .wss_peer_cert_as_clientid
+        .clone_from(&cfg.listeners.wss.peer_cert_as_clientid);
+    // K1-04: load the static PSK table before any bind.
+    // The file gives the store its identities. An empty path keeps
+    // the store empty, so every handshake fails closed. A bad file
+    // fails boot loudly, never with an empty store.
+    if cfg.listeners.tls.enabled
+        && cfg.listeners.tls.native
+        && cfg.listeners.tls.psk_enabled
+        && !cfg.listeners.tls.psk_keys_file.trim().is_empty()
+    {
+        let count = shared
+            .psk
+            .load_file(cfg.listeners.tls.psk_keys_file.trim())
+            .map_err(|e| format!("listeners.tls.psk_keys_file: {e}"))?;
+        info!("PSK table loaded: {} identities", count);
+    }
     // Tenants (MT-01): install the configured assignment rules before
     // any edge binds. Validated whole; a bad row fails boot loudly.
     install_tenant_rules(&shared, &cfg)?;
+    // Tenant limits (TM-06): apply the file defaults before any edge
+    // binds. One store write at boot; the connect path reads the
+    // effective triple and the retained store holds the same default.
+    apply_tenant_limit_defaults(&shared, &cfg);
     // Config registry: create the data dir when missing, then load
     // `state.toml` (missing file yields validated defaults). A corrupt
     // file is a fatal boot error naming the file and the field, never a
@@ -10762,10 +11417,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // socket control, so the v5 start, stop and restart routes drive the
     // same sockets the boot binds here.
     shared.listener_store.reset_from_config(&cfg.listeners);
-    let control: Arc<native::NativeListenerController> =
-        Arc::new(native::NativeListenerController::new(shared.clone()));
+    let control: Arc<native::NativeListenerController> = Arc::new(
+        native::NativeListenerController::new(shared.clone(), cfg.listeners.clone()),
+    );
     shared.listener_store.set_controller(control.clone());
-    for id in ["tcp:default", "ssl:default"] {
+    for id in ["tcp:default", "ssl:default", "ws:default", "wss:default"] {
         let Some(mut record) = shared.listener_store.get(id) else {
             continue;
         };
@@ -10858,6 +11514,35 @@ mod tests {
     }
 
     #[test]
+    fn tm08_verify_flags_apply_from_file_and_layers() {
+        // The production entries are the file and the flag layer.
+        // The broker applies the setting through the resolved config.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            dir.join("indra.toml"),
+            "[listeners.tls]\nverify_client_cert = true\n\
+             [listeners.wss]\nverify_client_cert = true\n",
+        )
+        .expect("write indra.toml");
+        let args = resolve_boot(&dir, &[]);
+        assert_eq!(args.tls_verify_client_cert, Some(true));
+        assert_eq!(args.wss_verify_client_cert, Some(true));
+        let layered = load_startup_config(&args, &{
+            let cmd = <Args as clap::CommandFactory>::command();
+            cmd.get_matches_from(vec!["indramqtt", "--config-dir", dir.to_str().unwrap()])
+        })
+        .expect("config resolves");
+        assert!(layered.config().listeners.tls.verify_client_cert);
+        assert!(layered.config().listeners.wss.verify_client_cert);
+        let _ = std::fs::remove_dir_all(&dir);
+        // Defaults stay off, so current handshakes keep working.
+        let defaults = broker_config::schema::BrokerConfig::default();
+        assert!(!defaults.listeners.tls.verify_client_cert);
+        assert!(!defaults.listeners.wss.verify_client_cert);
+    }
+
+    #[test]
     fn edge_args_carry_the_resolved_listeners() {
         let mut cfg = broker_config::schema::BrokerConfig::default();
         let defaults = edge_args(&cfg).expect("defaults resolve");
@@ -10878,6 +11563,16 @@ mod tests {
         );
         assert_eq!(triple(&defaults, "kernel_port").as_deref(), Some("18883"));
         assert_eq!(triple(&defaults, "tls_certfile"), None);
+        // Verify switches stay off by default, so the edge requests
+        // no client certificate.
+        assert_eq!(
+            triple(&defaults, "tls_verify_client_cert").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            triple(&defaults, "wss_verify_client_cert").as_deref(),
+            Some("false")
+        );
 
         cfg.listeners.tcp.enabled = false;
         cfg.listeners.tcp.bind = "10.0.0.5:11883".to_string();
@@ -10892,6 +11587,24 @@ mod tests {
         assert_eq!(
             triple(&changed, "wss_certfile").as_deref(),
             Some("\"/etc/indramqtt/tls/cert.pem\"")
+        );
+        // A native secure WebSocket listener belongs to the kernel.
+        // The edge stands down, so the two never bind one port.
+        cfg.listeners.wss.native = true;
+        let native = edge_args(&cfg).expect("native config resolves");
+        assert_eq!(triple(&native, "wss_enabled").as_deref(), Some("false"));
+        cfg.listeners.wss.native = false;
+        // The edge gets the verify switches from the resolved config.
+        cfg.listeners.tls.verify_client_cert = true;
+        cfg.listeners.wss.verify_client_cert = true;
+        let verified = edge_args(&cfg).expect("verify flags resolve");
+        assert_eq!(
+            triple(&verified, "tls_verify_client_cert").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            triple(&verified, "wss_verify_client_cert").as_deref(),
+            Some("true")
         );
 
         // The edge binds to an address. The error for a host name gives the setting.
@@ -11032,6 +11745,32 @@ mod tests {
         Bytes::from(meta)
     }
 
+    /// Set section flags on an encoded bind (test mirror of the edge
+    /// flag patch). Bytes stay the same except the flag bits.
+    fn mark_bind_sections_flagged(
+        mut meta: Vec<u8>,
+        creds: bool,
+        peer: bool,
+        cert: bool,
+        listener: bool,
+    ) -> Bytes {
+        let id_len = u16::from_be_bytes([meta[0], meta[1]]) as usize;
+        let flag_pos = 2 + id_len;
+        if creds {
+            meta[flag_pos] |= super::BIND_FLAG_CREDS;
+        }
+        if peer {
+            meta[flag_pos] |= super::BIND_FLAG_PEER;
+        }
+        if cert {
+            meta[flag_pos] |= super::BIND_FLAG_CERT;
+        }
+        if listener {
+            meta[flag_pos] |= super::BIND_FLAG_LISTENER;
+        }
+        Bytes::from(meta)
+    }
+
     /// Encode `SubscribeMeta` (test mirror of the BEAM contract).
     fn encode_subscribe_meta(packet_id: u16, client_id: &str, subs: &[(&str, u8)]) -> Bytes {
         let id = client_id.as_bytes();
@@ -11167,6 +11906,26 @@ mod tests {
     fn subscribe_frame(conn_id: u64, seq: u64, meta: Bytes) -> BrokerFrame {
         BrokerFrame::new(OpCode::SubscribeIn, conn_id, seq, meta, Bytes::new())
             .expect("valid subscribe frame")
+    }
+
+    /// Encode `UnsubscribeMeta` for tests. Mirrors the native path layout.
+    fn encode_unsubscribe_meta(packet_id: u16, client_id: &str, filters: &[&str]) -> Bytes {
+        let id = client_id.as_bytes();
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&packet_id.to_be_bytes());
+        meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
+        meta.extend_from_slice(id);
+        meta.extend_from_slice(&(filters.len() as u16).to_be_bytes());
+        for filter in filters {
+            meta.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+            meta.extend_from_slice(filter.as_bytes());
+        }
+        Bytes::from(meta)
+    }
+
+    fn unsubscribe_frame(conn_id: u64, seq: u64, meta: Bytes) -> BrokerFrame {
+        BrokerFrame::new(OpCode::UnsubscribeIn, conn_id, seq, meta, Bytes::new())
+            .expect("valid unsubscribe frame")
     }
 
     fn publish_frame(conn_id: u64, seq: u64, meta: Bytes, payload: Bytes) -> BrokerFrame {
@@ -12014,6 +12773,176 @@ mod tests {
         let (reply, retained) = apply_subscribe(&frame, &shared).await;
         assert!(reply.is_none());
         assert!(retained.is_empty());
+    }
+
+    /// Unsubscribe removes the router copy and the session mirror
+    /// through the broker. A publish after it delivers nothing.
+    /// Goes through `apply_subscribe` and `apply_unsubscribe`, not
+    /// the store alone.
+    #[tokio::test]
+    async fn unsubscribe_removes_subscription_and_stops_delivery() {
+        let shared = test_shared();
+        let bind_meta = encode_bind_meta("unsub-1", true, 60);
+        let bind_reply = apply_bind(&bind_frame(21, 1, bind_meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, bind_rc) = decode_session_binding_meta(&bind_reply.metadata);
+        assert_eq!(bind_rc, 0);
+        let sub_frame = subscribe_frame(
+            21,
+            2,
+            encode_subscribe_meta(1, "unsub-1", &[("k1/data", 0)]),
+        );
+        apply_subscribe(&sub_frame, &shared)
+            .await
+            .0
+            .expect("subscribe");
+        let (meta, payload) = encode_publish_meta("k1/data", 0, 0, false, b"first");
+        let (_, before) = apply_publish(&publish_frame(40, 1, meta, payload), &shared).await;
+        assert!(!before.is_empty(), "delivery before unsubscribe");
+        let unsub = unsubscribe_frame(21, 3, encode_unsubscribe_meta(2, "unsub-1", &["k1/data"]));
+        let reply = apply_unsubscribe(&unsub, &shared)
+            .await
+            .expect("unsuback replies");
+        assert_eq!(reply.header.opcode, OpCode::UnsubAckOut);
+        assert_eq!(&reply.metadata[0..2], &2u16.to_be_bytes());
+        assert_eq!(&reply.metadata[2..], &[0x00u8]);
+        assert!(
+            shared
+                .sessions
+                .get("unsub-1")
+                .expect("session exists")
+                .subscriptions
+                .read()
+                .is_empty(),
+            "session mirror drops the filter"
+        );
+        let (meta, payload) = encode_publish_meta("k1/data", 0, 0, false, b"second");
+        let (_, after) = apply_publish(&publish_frame(40, 2, meta, payload), &shared).await;
+        assert!(after.is_empty(), "no delivery after unsubscribe");
+    }
+
+    /// An unknown filter answers 0x11 and an invalid filter answers
+    /// 0x8F, each failing only its filter. Goes through the broker.
+    #[tokio::test]
+    async fn unsubscribe_unknown_and_invalid_filters_get_their_codes() {
+        let shared = test_shared();
+        let bind_meta = encode_bind_meta("unsub-2", true, 60);
+        apply_bind(&bind_frame(22, 1, bind_meta), &shared)
+            .await
+            .expect("bind");
+        let sub_frame = subscribe_frame(
+            22,
+            2,
+            encode_subscribe_meta(1, "unsub-2", &[("k2/kept", 0)]),
+        );
+        apply_subscribe(&sub_frame, &shared)
+            .await
+            .0
+            .expect("subscribe");
+        let unsub = unsubscribe_frame(
+            22,
+            3,
+            encode_unsubscribe_meta(5, "unsub-2", &["k2/missing", "sport/#/bogus", "k2/kept"]),
+        );
+        let reply = apply_unsubscribe(&unsub, &shared)
+            .await
+            .expect("unsuback replies");
+        assert_eq!(&reply.metadata[0..2], &5u16.to_be_bytes());
+        assert_eq!(&reply.metadata[2..], &[0x11u8, 0x8Fu8, 0x00u8]);
+        let (meta, payload) = encode_publish_meta("k2/kept", 0, 0, false, b"x");
+        let (_, deliveries) = apply_publish(&publish_frame(40, 1, meta, payload), &shared).await;
+        assert!(
+            deliveries.is_empty(),
+            "kept filter is gone, missing never existed"
+        );
+    }
+
+    /// A shared subscription leaves through its `$share` form. Goes
+    /// through the broker subscribe and unsubscribe events.
+    #[tokio::test]
+    async fn unsubscribe_shared_group_form_removes_the_member() {
+        let shared = test_shared();
+        let bind_meta = encode_bind_meta("unsub-share", true, 60);
+        apply_bind(&bind_frame(23, 1, bind_meta), &shared)
+            .await
+            .expect("bind");
+        let sub_frame = subscribe_frame(
+            23,
+            2,
+            encode_subscribe_meta(1, "unsub-share", &[("$share/pool/k3/tasks", 0)]),
+        );
+        apply_subscribe(&sub_frame, &shared)
+            .await
+            .0
+            .expect("subscribe");
+        let (meta, payload) = encode_publish_meta("k3/tasks", 0, 0, false, b"job");
+        let (_, before) = apply_publish(&publish_frame(40, 1, meta, payload), &shared).await;
+        assert_eq!(before.len(), 1, "shared member delivers before unsubscribe");
+        let unsub = unsubscribe_frame(
+            23,
+            3,
+            encode_unsubscribe_meta(2, "unsub-share", &["$share/pool/k3/tasks"]),
+        );
+        let reply = apply_unsubscribe(&unsub, &shared)
+            .await
+            .expect("unsuback replies");
+        assert_eq!(&reply.metadata[2..], &[0x00u8]);
+        let (meta, payload) = encode_publish_meta("k3/tasks", 0, 0, false, b"job2");
+        let (_, after) = apply_publish(&publish_frame(40, 2, meta, payload), &shared).await;
+        assert!(
+            after.is_empty(),
+            "shared member is silent after unsubscribe"
+        );
+    }
+
+    /// Malformed unsubscribe metadata yields no reply and changes
+    /// nothing. Goes through the broker.
+    #[tokio::test]
+    async fn unsubscribe_malformed_meta_yields_no_reply() {
+        let shared = test_shared();
+        let frame = unsubscribe_frame(21, 4, Bytes::from(vec![0x00, 0x07, 0xAA]));
+        assert!(apply_unsubscribe(&frame, &shared).await.is_none());
+    }
+
+    /// One client id in two tenants unsubscribes independently. A
+    /// removal in one tenant keeps the other tenant delivery.
+    /// Goes through the broker bind, subscribe, unsubscribe and
+    /// publish events.
+    #[tokio::test]
+    async fn unsubscribe_keeps_the_other_tenant_subscription() {
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "u-${username}")])
+            .expect("tenant rules store");
+        for (conn, client, user) in [(211u64, "dup-unsub", "alice"), (212u64, "dup-unsub", "bob")] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        for (conn, client) in [(211u64, "dup-unsub"), (212u64, "dup-unsub")] {
+            let frame =
+                subscribe_frame(conn, 2, encode_subscribe_meta(1, client, &[("k4/data", 0)]));
+            apply_subscribe(&frame, &shared).await.0.expect("subscribe");
+        }
+        let unsub = unsubscribe_frame(
+            211,
+            3,
+            encode_unsubscribe_meta(2, "dup-unsub", &["k4/data"]),
+        );
+        let reply = apply_unsubscribe(&unsub, &shared)
+            .await
+            .expect("unsuback replies");
+        assert_eq!(&reply.metadata[2..], &[0x00u8]);
+        let (meta, payload) = encode_publish_meta("k4/data", 0, 0, false, b"from-b");
+        let (_, deliveries) = apply_publish(&publish_frame(212, 4, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "other tenant still delivers");
+        assert_eq!(deliveries[0].0, 212);
     }
 
     /// X1-03: each subscription option round-trips through the extended
@@ -19605,10 +20534,11 @@ mod tests {
         Bytes::from(meta)
     }
 
-    /// Test mirror of the edge certificate section: append
-    /// `CertLen:16be | CnLen:16be | Cn | SubjectLen:16be | Subject |
-    /// SanCount:16be | (SanLen:16be | San)*` to an encoded bind, ahead of
-    /// any trailing alias section.
+    /// Mirror of the edge certificate section (`encode_cert_payload`):
+    /// append `CertLen:16be | CnLen:16be | Cn | SubjectLen:16be |
+    /// Subject | SanCount:16be | (SanLen:16be | San)*` to an encoded
+    /// bind, ahead of any trailing alias section. Same bytes the edge
+    /// sends, so the test drives the production bind entry.
     fn encode_bind_meta_cert(
         base: Bytes,
         cn: Option<&str>,
@@ -19807,6 +20737,366 @@ mod tests {
         let mut truncated = encode_bind_meta("dev-bad", true, 60).to_vec();
         truncated.extend_from_slice(&[0, 10, 0, 3, b'a', b'b']);
         assert!(decode_bind_meta(&Bytes::from(truncated)).is_err());
+    }
+
+    #[test]
+    fn bind_meta_explicit_sections_crosslang() {
+        // Same bytes as the edge cross-language test.
+        // Flags decide the parse. A short section fails closed.
+        let anon: &[u8] = &[0, 6, b't', b'm', b'0', b'7', b'-', b'a', 1, 0, 60];
+        let req = decode_bind_meta(anon).expect("anonymous decodes");
+        assert_eq!(req.client_id, "tm07-a");
+        assert!(req.username.is_none());
+        assert!(req.peerhost.is_none());
+        assert!(req.cert_cn.is_none());
+        // Credentialed bind with flags (clean plus creds = 9).
+        let creds: &[u8] = &[
+            0, 6, b't', b'm', b'0', b'7', b'-', b'b', 9, 0, 60, 0, 5, b'a', b'l', b'i', b'c', b'e',
+            0, 2, b'p', b'w',
+        ];
+        let req = decode_bind_meta(creds).expect("credentialed decodes");
+        assert_eq!(req.client_id, "tm07-b");
+        assert_eq!(req.username.as_deref(), Some("alice"));
+        assert_eq!(req.password, Some(b"pw".to_vec()));
+        assert!(req.peerhost.is_none());
+        // Same bytes without flags decode to the same fields.
+        let mut legacy = creds.to_vec();
+        legacy[8] = 1;
+        let old = decode_bind_meta(&legacy).expect("legacy credentialed decodes");
+        assert_eq!(old.username, req.username);
+        assert_eq!(old.password, req.password);
+        // Peer bind with flags (peer only = 16, clean is false).
+        let peer: &[u8] = &[
+            0, 6, b't', b'm', b'0', b'7', b'-', b'c', 16, 0, 30, 0, 9, b'1', b'2', b'7', b'.',
+            b'0', b'.', b'0', b'.', b'1',
+        ];
+        let req = decode_bind_meta(peer).expect("peer decodes");
+        assert_eq!(req.client_id, "tm07-c");
+        assert!(req.username.is_none());
+        assert_eq!(req.peerhost.as_deref(), Some("127.0.0.1"));
+        // Same peer bytes without flags decode to the same peer.
+        let mut legacy_peer = peer.to_vec();
+        legacy_peer[8] = 0;
+        let old = decode_bind_meta(&legacy_peer).expect("legacy peer decodes");
+        assert_eq!(old.peerhost, req.peerhost);
+        // Certificate bind with flags (clean plus all sections = 57).
+        let cert: &[u8] = &[
+            0, 6, b't', b'm', b'0', b'7', b'-', b'd', 57, 0, 60, 0, 3, b'b', b'o', b'b', 0, 6,
+            b's', b'e', b'c', b'r', b'e', b't', 0, 10, b'1', b'9', b'2', b'.', b'0', b'.', b'2',
+            b'.', b'1', b'0', 0, 9, 0, 3, b'c', b'n', b'1', 0, 0, 0, 0,
+        ];
+        let req = decode_bind_meta(cert).expect("certificate decodes");
+        assert_eq!(req.client_id, "tm07-d");
+        assert_eq!(req.username.as_deref(), Some("bob"));
+        assert_eq!(req.peerhost.as_deref(), Some("192.0.2.10"));
+        assert_eq!(req.cert_cn.as_deref(), Some("cn1"));
+        // Same certificate bytes without flags decode to the same fields.
+        let mut legacy_cert = cert.to_vec();
+        legacy_cert[8] = 1;
+        let old = decode_bind_meta(&legacy_cert).expect("legacy certificate decodes");
+        assert_eq!(old.username, req.username);
+        assert_eq!(old.peerhost, req.peerhost);
+        assert_eq!(old.cert_cn, req.cert_cn);
+        // The flagged encoder mirror sets the same flag bits.
+        let mirrored = mark_bind_sections_flagged(
+            encode_bind_meta_creds("tm07-b", true, 60, "alice", b"pw").to_vec(),
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(&mirrored[..], creds);
+        // A short section fails with the documented error.
+        let mut short = creds.to_vec();
+        short.pop();
+        assert!(decode_bind_meta(&short).is_err());
+        let mut short_cert = cert.to_vec();
+        short_cert.pop();
+        assert!(decode_bind_meta(&short_cert).is_err());
+    }
+
+    /// Build one flagged bind (test mirror of the edge flag patch).
+    /// Sets the section bits on the same bytes the edge sends.
+    fn encode_bind_meta_flagged(base: Bytes, creds: bool, peer: bool, cert: bool) -> Bytes {
+        mark_bind_sections_flagged(base.to_vec(), creds, peer, cert, false)
+    }
+
+    /// Mirror of the edge listener section (`encode_listener_bin`):
+    /// append `ListenerLen:16be | Listener` to an encoded bind.
+    /// Same bytes the edge sends, so the test drives the production
+    /// bind entry.
+    fn encode_bind_meta_listener(base: Bytes, listener: &str) -> Bytes {
+        let mut meta = base.to_vec();
+        meta.extend_from_slice(&(listener.len() as u16).to_be_bytes());
+        meta.extend_from_slice(listener.as_bytes());
+        Bytes::from(meta)
+    }
+
+    /// Build one flagged bind with a listener section.
+    fn encode_bind_meta_flagged_listener(base: Bytes, listener: &str) -> Bytes {
+        let with_section = encode_bind_meta_listener(base, listener);
+        mark_bind_sections_flagged(with_section.to_vec(), false, false, false, true)
+    }
+
+    #[tokio::test]
+    async fn tm07_flagged_two_tenants_isolated_through_broker() {
+        // Two tenants connect with flagged binds through `apply_bind`
+        // (the production entry the edge drives at connect). Each
+        // tenant publishes a random value. Delivery stays in-tenant.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${clientid}")])
+            .expect("tenant rules store");
+        for (tenant, user, pw) in [
+            ("t-tm07-a", "alice", b"pw-a".as_slice()),
+            ("t-tm07-b", "bob", b"pw-b".as_slice()),
+        ] {
+            shared
+                .auth
+                .add_user_in_tenant(tenant, user, pw)
+                .expect("tenant user stores");
+            for action in [AclAction::Publish, AclAction::Subscribe] {
+                shared
+                    .auth
+                    .add_rule_in_tenant(tenant, AclRule::new("*", action, "tm07/#", true))
+                    .expect("tenant rule stores");
+            }
+        }
+        // Flagged credentialed binds with a peer section (bits set).
+        let base_a = encode_bind_meta_peer(
+            encode_bind_meta_creds("tm07-a", true, 60, "alice", b"pw-a"),
+            "127.0.0.1",
+        );
+        let meta_a = encode_bind_meta_flagged(base_a, true, true, false);
+        let base_b = encode_bind_meta_peer(
+            encode_bind_meta_creds("tm07-b", true, 60, "bob", b"pw-b"),
+            "127.0.0.1",
+        );
+        let meta_b = encode_bind_meta_flagged(base_b, true, true, false);
+        for (conn, meta) in [(401u64, meta_a), (402u64, meta_b)] {
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        for (conn, client) in [(401u64, "tm07-a"), (402u64, "tm07-b")] {
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("tm07/data", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+        }
+        // Random value the broker cannot know (nanos plus process id).
+        let secret = format!(
+            "tm07-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            std::process::id()
+        );
+        let (meta, payload) = encode_publish_meta("tm07/data", 0, 0, false, secret.as_bytes());
+        let (_, deliveries) = apply_publish(&publish_frame(401, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "same-tenant delivery works");
+        assert_eq!(deliveries[0].0, 401);
+        let (meta_b, payload_b) = encode_publish_meta("tm07/data", 0, 0, false, secret.as_bytes());
+        let (_, deliveries_b) =
+            apply_publish(&publish_frame(402, 2, meta_b, payload_b), &shared).await;
+        assert_eq!(deliveries_b.len(), 1, "other tenant self-delivers");
+        assert_eq!(deliveries_b[0].0, 402);
+        assert_ne!(
+            deliveries[0].0, deliveries_b[0].0,
+            "no cross-tenant delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn tm07_flagged_default_tenant_unchanged() {
+        // Default tenant still connects, publishes and delivers.
+        // The bind carries the flagged peer section (new bind path).
+        use broker_session::tenant::DEFAULT_TENANT_ID;
+        let shared = test_shared();
+        assert!(shared.tenant_registry.is_empty());
+        let base = encode_bind_meta_peer(encode_bind_meta("tm07-def", true, 60), "127.0.0.1");
+        let meta = encode_bind_meta_flagged(base, false, true, false);
+        let reply = apply_bind(&bind_frame(403, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let tenant = shared
+            .sessions
+            .get("tm07-def")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, DEFAULT_TENANT_ID);
+        let sub = subscribe_frame(
+            403,
+            1,
+            encode_subscribe_meta(1, "tm07-def", &[("tm07/def", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (meta, payload) = encode_publish_meta("tm07/def", 0, 0, false, b"ping");
+        let (_, deliveries) = apply_publish(&publish_frame(403, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0, 403);
+    }
+
+    #[tokio::test]
+    async fn tm08_listener_name_drives_tenant_through_bind() {
+        // Production entry is bind bytes, as the spec lists. The edge
+        // sends the same bytes with the same flag. A bind with a
+        // listener name lands in the rule for that listener. A bind
+        // without a name keeps the default scope.
+        use broker_session::tenant::{TenantRule, DEFAULT_TENANT_ID};
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![
+                TenantRule::new("tls", "tenant", "t-tls"),
+                TenantRule::new("tcp", "tenant", "t-tcp"),
+            ])
+            .expect("scoped rules store");
+        let tls_meta =
+            encode_bind_meta_flagged_listener(encode_bind_meta("tm08-tls", true, 60), "tls");
+        let reply = apply_bind(&bind_frame(501, 1, tls_meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let tenant = shared
+            .sessions
+            .get_in_tenant("t-tls", "tm08-tls")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, "t-tls");
+        let plain_meta = encode_bind_meta("tm08-plain", true, 60);
+        let reply = apply_bind(&bind_frame(502, 1, plain_meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let tenant = shared
+            .sessions
+            .get("tm08-plain")
+            .expect("session")
+            .tenant_id
+            .read()
+            .clone();
+        assert_eq!(tenant, DEFAULT_TENANT_ID);
+    }
+
+    #[tokio::test]
+    async fn tm08_two_listeners_isolated_through_broker() {
+        // Production entry is bind bytes, as the spec lists. Two
+        // listeners hold two tenants apart. Each client uses a random
+        // value the broker cannot know. Delivery stays in-tenant.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![
+                TenantRule::new("tls", "tenant", "t-lis-a"),
+                TenantRule::new("tcp", "tenant", "t-lis-b"),
+            ])
+            .expect("scoped rules store");
+        let meta_a = encode_bind_meta_flagged_listener(encode_bind_meta("tm08-a", true, 60), "tls");
+        let meta_b = encode_bind_meta_flagged_listener(encode_bind_meta("tm08-b", true, 60), "tcp");
+        for (conn, meta) in [(511u64, meta_a), (512u64, meta_b)] {
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        for (conn, client) in [(511u64, "tm08-a"), (512u64, "tm08-b")] {
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("tm08/data", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            reply.expect("subscribe replies");
+        }
+        let secret = format!(
+            "tm08-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            std::process::id()
+        );
+        let (meta, payload) = encode_publish_meta("tm08/data", 0, 0, false, secret.as_bytes());
+        let (_, deliveries) = apply_publish(&publish_frame(511, 2, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "same-tenant delivery works");
+        assert_eq!(deliveries[0].0, 511);
+        let (meta_b, payload_b) = encode_publish_meta("tm08/data", 0, 0, false, secret.as_bytes());
+        let (_, deliveries_b) =
+            apply_publish(&publish_frame(512, 2, meta_b, payload_b), &shared).await;
+        assert_eq!(deliveries_b.len(), 1, "other tenant self-delivers");
+        assert_ne!(
+            deliveries[0].0, deliveries_b[0].0,
+            "no cross-tenant delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn tm08_client_cert_check_through_bind() {
+        // Production entry is bind bytes, as the spec lists. The edge
+        // sends the same bytes. The TLS handshake supplies the fields.
+        // Verification off lets a bind without a certificate through.
+        // Verification on refuses it, counts and logs. A bind with a
+        // certificate passes. All through `apply_bind` with bind bytes.
+        let mut shared = test_shared();
+        let base = encode_bind_meta("tm08-nocert", true, 60);
+        let flagged = mark_bind_sections_flagged(base.to_vec(), false, false, false, false);
+        let reply = apply_bind(&bind_frame(521, 1, flagged), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "no verification means no certificate is fine");
+        shared.tls_verify_client_cert = true;
+        let before = shared.metrics.auth_failures();
+        let base = encode_bind_meta("tm08-deny", true, 60);
+        let with_listener = encode_bind_meta_listener(base, "tls");
+        let flagged = mark_bind_sections_flagged(with_listener.to_vec(), false, false, false, true);
+        let reply = apply_bind(&bind_frame(522, 1, flagged), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x87, "missing certificate is refused");
+        assert_eq!(
+            shared.metrics.auth_failures(),
+            before + 1,
+            "denial is counted"
+        );
+        assert!(
+            shared.sessions.get("tm08-deny").is_none(),
+            "no session is made"
+        );
+        let base = encode_bind_meta_cert(
+            encode_bind_meta("tm08-cert", true, 60),
+            Some("cn-1"),
+            None,
+            &[],
+        );
+        let with_listener = encode_bind_meta_listener(base, "tls");
+        let flagged = mark_bind_sections_flagged(with_listener.to_vec(), false, false, true, true);
+        let reply = apply_bind(&bind_frame(523, 1, flagged), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "a certificate passes verification");
     }
 
     #[tokio::test]
@@ -20169,6 +21459,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tm04_rule_in_tenant_fires_only_for_own_tenant_through_broker() {
+        // TM-04 through the real broker path (bind, subscribe,
+        // publish, rule dispatch, sink — never store-only). Two
+        // tenants share the username `sam` with separate passwords.
+        // One rule of tenant A republishes. A publish with a random
+        // value in A fires the rule and the output carries tenant A
+        // to the subscriber set of A only. A publish in B fires
+        // nothing and outputs nothing.
+        use broker_session::tenant::TenantRule;
+        let mut shared = test_shared();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${clientid}")])
+            .expect("tenant rules store");
+        for (tenant, password) in [
+            ("t-tm04-a", b"pw-for-a".as_slice()),
+            ("t-tm04-b", b"pw-for-b".as_slice()),
+        ] {
+            shared
+                .auth
+                .add_user_in_tenant(tenant, "sam", password)
+                .expect("tenant user stores");
+            for action in [
+                broker_auth::AclAction::Publish,
+                broker_auth::AclAction::Subscribe,
+            ] {
+                shared
+                    .auth
+                    .add_rule_in_tenant(
+                        tenant,
+                        broker_auth::AclRule::new("*", action, "tm04/#", true),
+                    )
+                    .expect("tenant rule stores");
+            }
+        }
+        for (conn, client, pw) in [
+            (401u64, "tm04-a", b"pw-for-a".as_slice()),
+            (402u64, "tm04-b", b"pw-for-b".as_slice()),
+        ] {
+            let meta = encode_bind_meta_creds(client, true, 60, "sam", pw);
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0, "{client} connects with its own password");
+        }
+        // One rule of tenant A: match `tm04/in`, republish `tm04/out`.
+        let rule = shared
+            .engine
+            .create_rule_in_tenant(
+                "t-tm04-a".to_string(),
+                "tm04-a-rule".to_string(),
+                broker_protocol::TopicFilter::new("tm04/in").expect("filter parses"),
+                None,
+                true,
+                vec![broker_rules::RuleAction::Republish {
+                    topic: broker_protocol::Topic::new("tm04/out").expect("topic parses"),
+                    qos: broker_protocol::QoS::AtMostOnce,
+                }],
+            )
+            .expect("rule creates");
+        assert_eq!(rule.tenant, "t-tm04-a");
+        // Both tenants subscribe to the output topic. Both grants land.
+        for (conn, client) in [(401u64, "tm04-a"), (402u64, "tm04-b")] {
+            let sub = subscribe_frame(
+                conn,
+                1,
+                encode_subscribe_meta(1, client, &[("tm04/out", 0)]),
+            );
+            let (reply, _) = apply_subscribe(&sub, &shared).await;
+            let reply = reply.expect("subscribe replies");
+            assert_eq!(reply.metadata[2], 0, "{client} subscribe is granted");
+        }
+        // Tee probe: record the output tenant, then run the real
+        // fan-out unchanged.
+        #[derive(Default)]
+        struct TeeSink {
+            inner: std::sync::Mutex<Option<std::sync::Arc<dyn BrokerSink>>>,
+            recorded: std::sync::Mutex<Vec<(String, String, bytes::Bytes)>>,
+        }
+        #[async_trait::async_trait]
+        impl BrokerSink for TeeSink {
+            async fn publish(
+                &self,
+                topic: Topic,
+                payload: Bytes,
+                qos: QoS,
+                retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                self.recorded.lock().unwrap().push((
+                    "default".to_string(),
+                    topic.as_str().to_string(),
+                    payload.clone(),
+                ));
+                let inner = self.inner.lock().unwrap().clone();
+                if let Some(inner) = inner {
+                    inner.publish(topic, payload, qos, retain).await?;
+                }
+                Ok(())
+            }
+            async fn publish_in_tenant(
+                &self,
+                tenant: &str,
+                topic: Topic,
+                payload: Bytes,
+                qos: QoS,
+                retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                self.recorded.lock().unwrap().push((
+                    tenant.to_string(),
+                    topic.as_str().to_string(),
+                    payload.clone(),
+                ));
+                let inner = self.inner.lock().unwrap().clone();
+                if let Some(inner) = inner {
+                    inner
+                        .publish_in_tenant(tenant, topic, payload, qos, retain)
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+        let tee = std::sync::Arc::new(TeeSink::default());
+        *tee.inner.lock().unwrap() = Some(shared.sink.clone());
+        let tee_obj: std::sync::Arc<dyn BrokerSink> = tee.clone();
+        shared.sink = tee_obj;
+        // Random values the broker cannot know.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|span| span.as_nanos())
+            .unwrap_or(0);
+        let secret_a = format!("tm04-secret-a-{nanos}");
+        let secret_b = format!("tm04-secret-b-{nanos}");
+        // Publish in A: the rule fires once.
+        let (meta, payload) = encode_publish_meta("tm04/in", 0, 0, false, secret_a.as_bytes());
+        let (_, deliveries) = apply_publish(&publish_frame(401, 2, meta, payload), &shared).await;
+        assert!(deliveries.is_empty(), "no direct subscriber on tm04/in");
+        let recorded = tee.recorded.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "one rule output for the A publish");
+        assert_eq!(recorded[0].0, "t-tm04-a", "output stays in tenant A");
+        assert_eq!(recorded[0].1, "tm04/out");
+        assert_eq!(recorded[0].2, bytes::Bytes::from(secret_a.clone()));
+        // The output tenant holds only the A subscriber.
+        let out_topic = broker_protocol::Topic::new("tm04/out").expect("topic parses");
+        let (matched_a, _) = shared
+            .router
+            .matches_in_tenant_counted(&out_topic, None, "t-tm04-a");
+        assert!(matched_a.iter().any(|s| s.client_id.as_ref() == "tm04-a"));
+        assert!(!matched_a.iter().any(|s| s.client_id.as_ref() == "tm04-b"));
+        let (matched_b, _) = shared
+            .router
+            .matches_in_tenant_counted(&out_topic, None, "t-tm04-b");
+        assert!(matched_b.iter().any(|s| s.client_id.as_ref() == "tm04-b"));
+        assert!(!matched_b.iter().any(|s| s.client_id.as_ref() == "tm04-a"));
+        // Publish in B: no rule of B exists, so nothing outputs.
+        let (meta, payload) = encode_publish_meta("tm04/in", 0, 0, false, secret_b.as_bytes());
+        let (_, deliveries) = apply_publish(&publish_frame(402, 3, meta, payload), &shared).await;
+        assert!(deliveries.is_empty(), "no direct subscriber on tm04/in");
+        assert_eq!(
+            tee.recorded.lock().unwrap().len(),
+            1,
+            "the B publish outputs nothing"
+        );
+        // Counters show one match and one pass, both from A.
+        let stored = shared.engine.get_rule(&rule.id).expect("rule stays");
+        assert_eq!(
+            stored
+                .matched_cnt
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stored.passed_cnt.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn mt06_auth_default_tenant_keeps_working_through_broker() {
         // MT-06: the pre-change username/password and ACL rows keep
         // working unchanged through the real broker path while no tenant
@@ -20454,6 +21925,215 @@ mod tests {
         }
         assert_eq!(session_a.offline_len(), 0);
         assert_eq!(session_b.offline_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tm06_tenant_at_connection_limit_refuses_new_connection() {
+        // Bind through the kernel. Tenant A allows one live connection.
+        // The second CONNECT in A fails with the documented code.
+        // Tenant B still connects. The refusal is counted and logged.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${username}")])
+            .expect("tenant rules store");
+        shared.namespaces.create("t-alpha").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "t-alpha",
+                serde_json::json!({"limits": {"max_connections": 1}}),
+            )
+            .expect("limit stores");
+        for (conn, client) in [(501u64, "tm06-a1")] {
+            let meta = encode_bind_meta_creds(client, true, 60, "alpha", b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        let meta = encode_bind_meta_creds("tm06-a2", true, 60, "alpha", b"pw");
+        let reply = apply_bind(&bind_frame(502, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8B, "full tenant refuses with quota code");
+        assert_eq!(shared.metrics.tenant_conn_refused(), 1);
+        assert_eq!(shared.tenant_limits.conn_refused(), 1);
+        let meta = encode_bind_meta_creds("tm06-b1", true, 60, "beta", b"pw");
+        let reply = apply_bind(&bind_frame(503, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "other tenant still connects");
+    }
+
+    #[tokio::test]
+    async fn tm06_tenant_at_session_limit_refuses_new_session() {
+        // Bind through the kernel. Tenant A allows one session.
+        // A second client id in A fails with the documented code.
+        // Tenant B still creates sessions.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${username}")])
+            .expect("tenant rules store");
+        shared.namespaces.create("t-alpha").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "t-alpha",
+                serde_json::json!({"limits": {"max_sessions": 1}}),
+            )
+            .expect("limit stores");
+        let meta = encode_bind_meta_creds("tm06-s1", true, 60, "alpha", b"pw");
+        let reply = apply_bind(&bind_frame(511, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let meta = encode_bind_meta_creds("tm06-s2", true, 60, "alpha", b"pw");
+        let reply = apply_bind(&bind_frame(512, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8B, "full tenant refuses with quota code");
+        assert_eq!(shared.metrics.tenant_sess_refused(), 1);
+        let meta = encode_bind_meta_creds("tm06-sb1", true, 60, "beta", b"pw");
+        let reply = apply_bind(&bind_frame(513, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0, "other tenant still creates sessions");
+    }
+
+    #[tokio::test]
+    async fn tm06_tenant_at_retained_limit_drops_new_topic() {
+        // Publish through the kernel. Tenant A allows one retained topic.
+        // A second retained topic drops but delivery still works.
+        // Tenant B still stores retained messages.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${username}")])
+            .expect("tenant rules store");
+        shared.namespaces.create("t-alpha").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "t-alpha",
+                serde_json::json!({"limits": {"max_retained": 1}}),
+            )
+            .expect("limit stores");
+        shared.retained.set_retained_per_tenant_cap("t-alpha", 1);
+        for (conn, client, user) in [(521u64, "tm06-ra", "alpha"), (522u64, "tm06-rb", "beta")] {
+            let meta = encode_bind_meta_creds(client, true, 60, user, b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0);
+        }
+        let (meta, payload) = encode_publish_meta("tm06/r1", 0, 0, true, b"keep-a");
+        let _ = apply_publish(&publish_frame(521, 2, meta, payload), &shared).await;
+        let sub = subscribe_frame(
+            521,
+            1,
+            encode_subscribe_meta(1, "tm06-ra", &[("tm06/r2", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (meta, payload) = encode_publish_meta("tm06/r2", 0, 0, true, b"drop-a");
+        let (_, deliveries) = apply_publish(&publish_frame(521, 3, meta, payload), &shared).await;
+        assert_eq!(deliveries.len(), 1, "delivery still works at the limit");
+        let stored = shared
+            .retained
+            .get_retained_in_tenant(&broker_protocol::Topic::new("tm06/r2").unwrap(), "t-alpha")
+            .await
+            .expect("retained reads");
+        assert!(stored.is_none(), "new topic drops at the limit");
+        assert_eq!(shared.metrics.tenant_retained_dropped(), 1);
+        let (meta, payload) = encode_publish_meta("tm06/r2", 0, 0, true, b"keep-b");
+        let _ = apply_publish(&publish_frame(522, 2, meta, payload), &shared).await;
+        let stored = shared
+            .retained
+            .get_retained_in_tenant(&broker_protocol::Topic::new("tm06/r2").unwrap(), "t-beta")
+            .await
+            .expect("retained reads");
+        assert!(stored.is_some(), "other tenant still stores");
+    }
+
+    #[tokio::test]
+    async fn tm06_limits_apply_from_file_and_env_and_api() {
+        // File and env entries drive the defaults. The API entry
+        // drives the per-tenant override. Sockets observe the result.
+        let dir = std::env::temp_dir().join(format!(
+            "tm06-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            dir.join("indra.toml"),
+            "[quotas]\nmax_connections_per_tenant = 7\nmax_sessions_per_tenant = 8\nmax_retained_per_tenant = 9\n",
+        )
+        .expect("write indra.toml");
+        let env = vec![(
+            "INDRA_QUOTAS__MAX_SESSIONS_PER_TENANT".to_string(),
+            "8".to_string(),
+        )];
+        let layered = broker_config::layers::load_layered_with_env(
+            &dir,
+            &env,
+            &broker_config::layers::CliOverrides::default(),
+        )
+        .expect("layers load");
+        assert_eq!(layered.config().quotas.max_connections_per_tenant, 7);
+        assert_eq!(layered.config().quotas.max_sessions_per_tenant, 8);
+        assert_eq!(layered.config().quotas.max_retained_per_tenant, 9);
+        let shared = test_shared();
+        apply_tenant_limit_defaults(&shared, layered.config());
+        assert_eq!(shared.tenant_limits.defaults().max_connections, 7);
+        assert_eq!(shared.tenant_limits.defaults().max_sessions, 8);
+        assert_eq!(shared.tenant_limits.defaults().max_retained, 9);
+        shared.namespaces.create("t-api").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "t-api",
+                serde_json::json!({"limits": {"max_connections": 2}}),
+            )
+            .expect("limit stores");
+        let effective = effective_tenant_limits(&shared, "t-api").expect("limits resolve");
+        assert_eq!(effective.max_connections, 2);
+        assert_eq!(effective.max_sessions, 8);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tm06_unreachable_limit_store_denies_new_use() {
+        // Fail closed: an unreachable store denies new connections.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "t-${username}")])
+            .expect("tenant rules store");
+        shared.tenant_limits.set_unreachable(true);
+        let meta = encode_bind_meta_creds("tm06-u1", true, 60, "alpha", b"pw");
+        let reply = apply_bind(&bind_frame(531, 1, meta), &shared)
+            .await
+            .expect("bind replies");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x8B, "unreachable store denies");
+        shared.tenant_limits.set_unreachable(false);
     }
 
     #[tokio::test]

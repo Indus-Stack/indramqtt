@@ -428,6 +428,11 @@
               "description": "Bind address for the secure TLS MQTT listener.",
               "type": "string"
             },
+            "cacertfile": {
+              "default": "",
+              "description": "CA file for client certificate checks of the TLS listener.",
+              "type": "string"
+            },
             "cert_file": {
               "default": "",
               "description": "Path to the PEM server certificate for the TLS listener.",
@@ -438,6 +443,11 @@
               "description": "Whether the secure TLS MQTT listener accepts connections.",
               "type": "boolean"
             },
+            "fail_if_no_peer_cert": {
+              "default": false,
+              "description": "Whether the TLS listener refuses a handshake without a certificate.",
+              "type": "boolean"
+            },
             "key_file": {
               "default": "",
               "description": "Path to the PEM private key for the TLS listener.",
@@ -446,6 +456,40 @@
             "native": {
               "default": false,
               "description": "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
+              "type": "boolean"
+            },
+            "peer_cert_as_clientid": {
+              "default": "disabled",
+              "description": "Source for the bind client identifier from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "peer_cert_as_username": {
+              "default": "disabled",
+              "description": "Source for the bind username from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "verify": {
+              "default": "verify_none",
+              "description": "Client certificate chain check mode of the TLS listener.",
+              "enum": [
+                "verify_none",
+                "verify_peer"
+              ],
+              "type": "string"
+            },
+            "verify_client_cert": {
+              "default": false,
+              "description": "Whether the TLS listener requests and verifies a client certificate.",
               "type": "boolean"
             }
           },
@@ -467,6 +511,11 @@
               "default": "/mqtt",
               "description": "HTTP path serving MQTT-over-WebSocket traffic.",
               "type": "string"
+            },
+            "native": {
+              "default": false,
+              "description": "Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them.",
+              "type": "boolean"
             }
           },
           "type": "object"
@@ -493,10 +542,20 @@
               "description": "Path to the PEM private key for the secure WebSocket listener.",
               "type": "string"
             },
+            "native": {
+              "default": false,
+              "description": "Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them.",
+              "type": "boolean"
+            },
             "path": {
               "default": "/mqtt",
               "description": "HTTP path serving secure WebSocket traffic.",
               "type": "string"
+            },
+            "verify_client_cert": {
+              "default": false,
+              "description": "Whether the secure WebSocket listener requests and verifies a client certificate.",
+              "type": "boolean"
             }
           },
           "type": "object"
@@ -691,6 +750,27 @@
           "default": 50000,
           "description": "Default token-bucket publish rate limit in messages per second (0 = unlimited).",
           "maximum": 10000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_connections_per_tenant": {
+          "default": 10000,
+          "description": "Default max live connections per tenant (0 = unlimited).",
+          "maximum": 1000000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_retained_per_tenant": {
+          "default": 10000,
+          "description": "Default max retained topics per tenant (0 = unlimited).",
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_sessions_per_tenant": {
+          "default": 10000,
+          "description": "Default max sessions per tenant (0 = unlimited).",
+          "maximum": 100000,
           "minimum": 0,
           "type": "integer"
         }

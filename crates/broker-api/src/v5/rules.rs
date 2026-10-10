@@ -81,6 +81,7 @@ const MAX_RULE_ID_LEN: usize = broker_config::MAX_RULE_ID_LEN;
 /// Projection of the stored [`broker_rules::Rule`] for `/api/v5/rules`.
 /// Only real engine state: stored actions verbatim (empty stays empty),
 /// no invented `description`/`created_at`, no connector-id coercion.
+/// `tenant` names the owning tenant (`default` for pre-tenancy rules).
 fn rule_to_v5(rule: &broker_rules::Rule) -> serde_json::Value {
     let topic = rule.topic_filter.as_str().to_string();
     let sql = rule
@@ -91,11 +92,48 @@ fn rule_to_v5(rule: &broker_rules::Rule) -> serde_json::Value {
     serde_json::json!({
         "id": rule.id,
         "name": rule.name,
+        "tenant": rule.tenant,
         "sql": sql,
         "from": [topic],
         "enable": rule.enabled,
         "actions": actions,
     })
+}
+
+/// Resolve the rule tenant from a v5 body: absent or blank rides as
+/// the default tenant. A present but non-string tenant fails with
+/// 400. A malformed id fails with 400. An unknown tenant (no managed
+/// namespace) fails with 400 and stores nothing.
+fn resolve_rule_tenant(
+    state: &ApiState,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, Box<Response>> {
+    let raw = match obj.get("tenant") {
+        None => "",
+        Some(value) => {
+            let Some(text) = value.as_str() else {
+                return Err(Box::new(
+                    ApiError::BadRequest("field `tenant` must be a string".to_string())
+                        .into_response(),
+                ));
+            };
+            text
+        }
+    };
+    let tenant = broker_config::canonical_rule_tenant(raw);
+    if !broker_config::is_valid_rule_tenant(&tenant) {
+        return Err(Box::new(
+            ApiError::BadRequest(format!("tenant {tenant:?} is not valid (field `tenant`)"))
+                .into_response(),
+        ));
+    }
+    if !state.namespaces.contains(&tenant) {
+        return Err(Box::new(
+            ApiError::BadRequest(format!("unknown tenant {tenant:?} (field `tenant`)"))
+                .into_response(),
+        ));
+    }
+    Ok(tenant)
 }
 
 pub async fn list_rules(State(state): State<ApiState>, params: PageParams) -> Response {
@@ -129,7 +167,9 @@ fn rule_persist_error(error: broker_rules::RuleEngineError) -> Response {
 /// bodies rejected with the documented error shape); a duplicate id is
 /// rejected cleanly, never overwritten. An explicit `id` is stored
 /// verbatim so duplicates are detectable; without one the engine assigns
-/// `rule-<n>`. A `ForwardConnector` target naming no known action is
+/// `rule-<n>`. A `tenant` field selects the owning tenant (absent
+/// means the default tenant); an unknown tenant is rejected with 400.
+/// A `ForwardConnector` target naming no known action is
 /// rejected (the W3-02 action linkage). Management-plane only; publish
 /// and deliver never touch this map (dispatch reads a snapshot).
 pub async fn create_rule(
@@ -180,6 +220,12 @@ pub async fn create_rule(
         return ApiError::BadRequest("missing required field: sql".to_string()).into_response();
     };
     let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    // Tenant scope first: an unknown tenant fails with 400 before
+    // any other store check, and stores nothing.
+    let tenant = match resolve_rule_tenant(&state, obj) {
+        Ok(tenant) => tenant,
+        Err(response) => return *response,
+    };
     let raw_actions: Vec<serde_json::Value> = match obj.get("actions") {
         None => Vec::new(),
         Some(value) => match value.as_array() {
@@ -289,14 +335,23 @@ pub async fn create_rule(
     }
 
     let rule = match explicit_id {
-        Some(id) => {
-            state
-                .engine
-                .create_rule_with_id(id, name, topic_filter, Some(sql), enable, actions)
-        }
-        None => state
-            .engine
-            .create_rule(name, topic_filter, Some(sql), enable, actions),
+        Some(id) => state.engine.create_rule_with_id_in_tenant(
+            id,
+            tenant,
+            name,
+            topic_filter,
+            Some(sql),
+            enable,
+            actions,
+        ),
+        None => state.engine.create_rule_in_tenant(
+            tenant,
+            name,
+            topic_filter,
+            Some(sql),
+            enable,
+            actions,
+        ),
     };
 
     match rule {
@@ -316,7 +371,7 @@ pub async fn create_rule(
 /// `GET /api/v5/rules/:id`: read one rule (C06-21).
 ///
 /// A known id returns the full documented rule fields (`id`, `name`,
-/// `sql`, `from`, `enable`, `actions`) from live engine state; an unknown
+/// `tenant`, `sql`, `from`, `enable`, `actions`) from live engine state; an unknown
 /// id returns 404 with the documented error code, not an empty body. The
 /// pair is not paged; unknown query parameters are ignored (the ignored
 /// query sink below). Management-plane only: one short read lock cloning
@@ -342,6 +397,9 @@ pub async fn get_rule(
 
 /// `PUT /api/v5/rules/:id`: validated full replace of one rule (C06-22).
 ///
+/// A `tenant` field moves the rule to that tenant. Absent keeps the
+/// stored tenant. An unknown tenant fails with 400 and keeps the old
+/// rule.
 /// The body gets the same compilation as create: it must be a JSON object
 /// carrying the full rule (`sql` required, `actions` as string ids or
 /// `{id,name}` objects validated against the W3-02 action directory,
@@ -436,7 +494,8 @@ pub async fn update_rule(
     let has_full_keys = obj.contains_key("sql")
         || obj.contains_key("from")
         || obj.contains_key("actions")
-        || obj.contains_key("name");
+        || obj.contains_key("name")
+        || obj.contains_key("tenant");
     if !has_full_keys {
         // Legacy enable-only shape (pre-W3-14): apply only the flag.
         if let Some(enable) = obj.get("enable").and_then(|v| v.as_bool()) {
@@ -554,10 +613,42 @@ pub async fn update_rule(
                 .into_response();
             }
         }
-        match state
-            .engine
-            .replace_rule(&id, name, topic_filter, Some(sql), enable, actions)
-        {
+        // Tenant scope: a body tenant moves the rule. Absent keeps
+        // the stored tenant. A present but non-string tenant fails
+        // with 400. An unknown tenant fails with 400 and keeps the
+        // old rule.
+        let tenant = match obj.get("tenant") {
+            None => existing.tenant.clone(),
+            Some(value) => {
+                let Some(raw) = value.as_str() else {
+                    return ApiError::BadRequest("field `tenant` must be a string".to_string())
+                        .into_response();
+                };
+                let tenant = broker_config::canonical_rule_tenant(raw);
+                if !broker_config::is_valid_rule_tenant(&tenant) {
+                    return ApiError::BadRequest(format!(
+                        "tenant {tenant:?} is not valid (field `tenant`)"
+                    ))
+                    .into_response();
+                }
+                if !state.namespaces.contains(&tenant) {
+                    return ApiError::BadRequest(format!(
+                        "unknown tenant {tenant:?} (field `tenant`)"
+                    ))
+                    .into_response();
+                }
+                tenant
+            }
+        };
+        match state.engine.replace_rule_in_tenant(
+            &id,
+            tenant,
+            name,
+            topic_filter,
+            Some(sql),
+            enable,
+            actions,
+        ) {
             Ok(Some(r)) => (StatusCode::OK, Json(rule_to_v5(&r))).into_response(),
             Ok(None) => (
                 StatusCode::NOT_FOUND,
@@ -1387,9 +1478,7 @@ fn connector_store_doc(entry: &broker_config::ConnectorEntry) -> serde_json::Val
 /// catalogue must stay small and bounded; 512 covers the documented
 /// connector catalogue with headroom while keeping per-request clones
 /// cheap.
-// TODO(parity): is 512 the documented connector cap? The rulebook does not
-// decide the exact bound; 512 is the conservative choice until the
-// conformance checker pins it.
+// Bound of this broker: the reference specification documents no maximum.
 pub const MAX_CONNECTORS: usize = 512;
 /// Longest accepted connector `id`. Reason: bounds map-key memory per
 /// entry so one create cannot balloon the store.
@@ -1564,93 +1653,136 @@ pub async fn get_connector(
 
 /// Cargo feature gating a connector kind, or `None` when the kind is
 /// always compiled in. X1-09 gates the first half (cloud-IoT +
-/// cloud-store): `s3` lives in `broker-connectors`, the rest in
-/// `broker-connectors-enterprise`. A disabled kind is absent from the
+/// cloud-store) and X1-10 gates the rest: `kafka`, `rabbitmq`,
+/// `clickhouse` and `elasticsearch` live in `broker-connectors`,
+/// `cassandra`, `confluent`, `couchbase`, `mongodb`, `gcp_pubsub` and
+/// `kinesis` in `broker-connectors-enterprise`. A disabled kind is absent from the
 /// build and the binary.
+struct ConnectorGate {
+    /// Each alias that selects this kind.
+    kinds: &'static [&'static str],
+    /// Cargo feature that compiles the kind in.
+    feature: &'static str,
+    /// True when the feature is enabled in this build.
+    enabled: bool,
+}
+
+/// One row per gated kind. This table is the single source: the lookup
+/// below and the compiled-in list read from it.
+static CONNECTOR_GATES: &[ConnectorGate] = &[
+    ConnectorGate {
+        kinds: &["kafka"],
+        feature: "kafka",
+        enabled: cfg!(feature = "kafka"),
+    },
+    ConnectorGate {
+        kinds: &["rabbitmq", "rabbit", "amqp"],
+        feature: "rabbitmq",
+        enabled: cfg!(feature = "rabbitmq"),
+    },
+    ConnectorGate {
+        kinds: &["clickhouse", "ch"],
+        feature: "clickhouse",
+        enabled: cfg!(feature = "clickhouse"),
+    },
+    ConnectorGate {
+        kinds: &["elasticsearch", "elastic", "es", "opensearch"],
+        feature: "elasticsearch",
+        enabled: cfg!(feature = "elasticsearch"),
+    },
+    ConnectorGate {
+        kinds: &["cassandra", "scylla", "scylladb", "cql"],
+        feature: "cassandra",
+        enabled: cfg!(feature = "cassandra"),
+    },
+    ConnectorGate {
+        kinds: &["confluent", "confluent_kafka", "confluent_cloud"],
+        feature: "confluent",
+        enabled: cfg!(feature = "confluent"),
+    },
+    ConnectorGate {
+        kinds: &["couchbase", "couch", "cb"],
+        feature: "couchbase",
+        enabled: cfg!(feature = "couchbase"),
+    },
+    ConnectorGate {
+        kinds: &["mongodb", "mongo", "documentdb"],
+        feature: "mongodb",
+        enabled: cfg!(feature = "mongodb"),
+    },
+    ConnectorGate {
+        kinds: &["gcp_pubsub", "gcp", "pubsub"],
+        feature: "gcp_pubsub",
+        enabled: cfg!(feature = "gcp_pubsub"),
+    },
+    ConnectorGate {
+        kinds: &["kinesis", "aws_kinesis"],
+        feature: "kinesis",
+        enabled: cfg!(feature = "kinesis"),
+    },
+    ConnectorGate {
+        kinds: &["s3", "minio"],
+        feature: "s3",
+        enabled: cfg!(feature = "s3"),
+    },
+    ConnectorGate {
+        kinds: &["dynamodb", "dynamo", "ddb"],
+        feature: "dynamodb",
+        enabled: cfg!(feature = "dynamodb"),
+    },
+    ConnectorGate {
+        kinds: &["bigquery", "bq", "gbq"],
+        feature: "bigquery",
+        enabled: cfg!(feature = "bigquery"),
+    },
+    ConnectorGate {
+        kinds: &["aws_iot", "aws_iot_core"],
+        feature: "aws_iot",
+        enabled: cfg!(feature = "aws_iot"),
+    },
+    ConnectorGate {
+        kinds: &["azure_blob", "azure_blob_storage", "azureblob", "azblob"],
+        feature: "azure_blob",
+        enabled: cfg!(feature = "azure_blob"),
+    },
+    ConnectorGate {
+        kinds: &["azure_eventhubs", "azure_event_hubs", "azure", "eventhubs"],
+        feature: "azure_eventhubs",
+        enabled: cfg!(feature = "azure_eventhubs"),
+    },
+    ConnectorGate {
+        kinds: &["azure_iot", "azure_iot_hub", "azure_iothub", "iothub"],
+        feature: "azure_iot",
+        enabled: cfg!(feature = "azure_iot"),
+    },
+    ConnectorGate {
+        kinds: &["gcp_iot", "gcp_iot_core", "cloud_iot"],
+        feature: "gcp_iot",
+        enabled: cfg!(feature = "gcp_iot"),
+    },
+];
+
 pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str> {
-    match conn_type {
-        "s3" | "minio" => {
-            #[cfg(feature = "s3")]
-            {
+    CONNECTOR_GATES
+        .iter()
+        .find(|gate| gate.kinds.contains(&conn_type))
+        .and_then(|gate| {
+            if gate.enabled {
                 None
+            } else {
+                Some(gate.feature)
             }
-            #[cfg(not(feature = "s3"))]
-            {
-                Some("s3")
-            }
-        }
-        "dynamodb" | "dynamo" | "ddb" => {
-            #[cfg(feature = "dynamodb")]
-            {
-                None
-            }
-            #[cfg(not(feature = "dynamodb"))]
-            {
-                Some("dynamodb")
-            }
-        }
-        "bigquery" | "bq" | "gbq" => {
-            #[cfg(feature = "bigquery")]
-            {
-                None
-            }
-            #[cfg(not(feature = "bigquery"))]
-            {
-                Some("bigquery")
-            }
-        }
-        "aws_iot" | "aws_iot_core" => {
-            #[cfg(feature = "aws_iot")]
-            {
-                None
-            }
-            #[cfg(not(feature = "aws_iot"))]
-            {
-                Some("aws_iot")
-            }
-        }
-        "azure_blob" | "azure_blob_storage" | "azureblob" | "azblob" => {
-            #[cfg(feature = "azure_blob")]
-            {
-                None
-            }
-            #[cfg(not(feature = "azure_blob"))]
-            {
-                Some("azure_blob")
-            }
-        }
-        "azure_eventhubs" | "azure_event_hubs" | "azure" | "eventhubs" => {
-            #[cfg(feature = "azure_eventhubs")]
-            {
-                None
-            }
-            #[cfg(not(feature = "azure_eventhubs"))]
-            {
-                Some("azure_eventhubs")
-            }
-        }
-        "azure_iot" | "azure_iot_hub" | "azure_iothub" | "iothub" => {
-            #[cfg(feature = "azure_iot")]
-            {
-                None
-            }
-            #[cfg(not(feature = "azure_iot"))]
-            {
-                Some("azure_iot")
-            }
-        }
-        "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
-            #[cfg(feature = "gcp_iot")]
-            {
-                None
-            }
-            #[cfg(not(feature = "gcp_iot"))]
-            {
-                Some("gcp_iot")
-            }
-        }
-        _ => None,
-    }
+        })
+}
+
+/// Features compiled into this build, from the same table.
+#[cfg(test)]
+pub(crate) fn compiled_connector_features() -> Vec<&'static str> {
+    CONNECTOR_GATES
+        .iter()
+        .filter(|gate| gate.enabled)
+        .map(|gate| gate.feature)
+        .collect()
 }
 
 /// Map a documented type name to the runtime kind that executes it.
@@ -1695,6 +1827,15 @@ pub(crate) async fn try_register_live_sink(
     }
     register_live_sink(engine, runtime, name, body).await;
     Ok(())
+}
+
+/// Closed fallback for a kind whose vendor SDK is not compiled in.
+/// Fails closed without registering anything and names the missing feature.
+#[allow(dead_code)]
+fn refuse_disabled_kind(conn_type: &str, feature: &str) {
+    tracing::warn!(
+        "connector kind `{conn_type}` needs missing feature `{feature}`; registration refused"
+    );
 }
 
 pub(crate) async fn register_live_sink(
@@ -1866,6 +2007,7 @@ pub(crate) async fn register_live_sink(
             engine.connectors().register(name, sink.clone());
             engine.connectors().register(format!("http:{}", name), sink);
         }
+        #[cfg(feature = "kafka")]
         "kafka" => {
             let servers = body
                 .get("bootstrap_hosts")
@@ -1895,6 +2037,10 @@ pub(crate) async fn register_live_sink(
                         .register(format!("kafka:{}", name), sink);
                 }
             }
+        }
+        #[cfg(not(feature = "kafka"))]
+        "kafka" => {
+            refuse_disabled_kind(conn_type, "kafka");
         }
         "pgsql" => {
             let server = body
@@ -1975,6 +2121,7 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(feature = "rabbitmq")]
         "rabbitmq" => {
             let endpoint = body
                 .get("server")
@@ -2014,6 +2161,11 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(not(feature = "rabbitmq"))]
+        "rabbitmq" => {
+            refuse_disabled_kind(conn_type, "rabbitmq");
+        }
+        #[cfg(feature = "clickhouse")]
         "clickhouse" => {
             let url = body
                 .get("url")
@@ -2071,6 +2223,10 @@ pub(crate) async fn register_live_sink(
                         .register(format!("clickhouse:{}", name), sink);
                 }
             }
+        }
+        #[cfg(not(feature = "clickhouse"))]
+        "clickhouse" => {
+            refuse_disabled_kind(conn_type, "clickhouse");
         }
         "mqtt_bridge" | "bridge" => {
             let server = body
@@ -2170,6 +2326,7 @@ pub(crate) async fn register_live_sink(
                     .register(format!("influxdb:{}", name), sink);
             }
         }
+        #[cfg(feature = "mongodb")]
         "mongodb" | "mongo" => {
             let server = body
                 .get("server")
@@ -2226,6 +2383,11 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(not(feature = "mongodb"))]
+        "mongodb" | "mongo" => {
+            refuse_disabled_kind(conn_type, "mongodb");
+        }
+        #[cfg(feature = "cassandra")]
         "cassandra" | "scylla" | "scylladb" => {
             let server = body
                 .get("server")
@@ -2295,6 +2457,10 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(not(feature = "cassandra"))]
+        "cassandra" | "scylla" | "scylladb" => {
+            refuse_disabled_kind(conn_type, "cassandra");
+        }
         "cockroachdb" | "cockroach" => {
             let conn_str = body
                 .get("connection_string")
@@ -2334,6 +2500,7 @@ pub(crate) async fn register_live_sink(
                     .register(format!("cockroach:{}", name), sink);
             }
         }
+        #[cfg(feature = "couchbase")]
         "couchbase" => {
             let server = body
                 .get("server")
@@ -2409,6 +2576,10 @@ pub(crate) async fn register_live_sink(
                         .register(format!("couchbase:{}", name), sink);
                 }
             }
+        }
+        #[cfg(not(feature = "couchbase"))]
+        "couchbase" => {
+            refuse_disabled_kind(conn_type, "couchbase");
         }
         "mssql" | "sqlserver" => {
             let server = body
@@ -2991,6 +3162,7 @@ pub(crate) async fn register_live_sink(
                     .register(format!("datalayers:{}", name), sink);
             }
         }
+        #[cfg(feature = "elasticsearch")]
         "elasticsearch" | "opensearch" => {
             let server = body
                 .get("endpoint")
@@ -3053,6 +3225,10 @@ pub(crate) async fn register_live_sink(
                         .register(format!("opensearch:{}", name), sink);
                 }
             }
+        }
+        #[cfg(not(feature = "elasticsearch"))]
+        "elasticsearch" | "opensearch" => {
+            refuse_disabled_kind(conn_type, "elasticsearch");
         }
         "pulsar" => {
             let server = body
@@ -3190,6 +3366,7 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(feature = "confluent")]
         "confluent" => {
             let server = body
                 .get("bootstrap_servers")
@@ -3261,6 +3438,10 @@ pub(crate) async fn register_live_sink(
                         .register(format!("confluent:{}", name), sink);
                 }
             }
+        }
+        #[cfg(not(feature = "confluent"))]
+        "confluent" => {
+            refuse_disabled_kind(conn_type, "confluent");
         }
         "disk_log" | "disk" | "disklog" => {
             let dir = body
@@ -3433,12 +3614,6 @@ pub(crate) async fn register_live_sink(
                     .register(format!("sparkplug:{}", name), sink);
             }
         }
-        #[cfg(not(feature = "s3"))]
-        "s3" | "minio" => {
-            // Feature off: fail closed with no sink. The checked
-            // wrapper already returns the naming error. Boot replay
-            // keeps the entry persist-only.
-        }
         #[cfg(feature = "s3")]
         "s3" | "minio" => {
             let endpoint = body
@@ -3499,6 +3674,10 @@ pub(crate) async fn register_live_sink(
                         .register(format!("minio:{}", name), sink);
                 }
             }
+        }
+        #[cfg(not(feature = "s3"))]
+        "s3" | "minio" => {
+            refuse_disabled_kind(conn_type, "s3");
         }
         "s3_tables" | "s3tables" => {
             let arn = body
@@ -3577,6 +3756,7 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(feature = "kinesis")]
         "kinesis" | "aws_kinesis" => {
             let stream = body
                 .get("stream_name")
@@ -3637,6 +3817,10 @@ pub(crate) async fn register_live_sink(
                         .register(format!("kinesis:{}", name), sink);
                 }
             }
+        }
+        #[cfg(not(feature = "kinesis"))]
+        "kinesis" | "aws_kinesis" => {
+            refuse_disabled_kind(conn_type, "kinesis");
         }
         #[cfg(not(feature = "dynamodb"))]
         "dynamodb" | "dynamo" | "ddb" => {
@@ -4311,6 +4495,7 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(feature = "gcp_pubsub")]
         "gcp_pubsub" | "pubsub" => {
             let project_id = body
                 .get("project_id")
@@ -4365,9 +4550,13 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(not(feature = "gcp_pubsub"))]
+        "gcp_pubsub" | "pubsub" => {
+            refuse_disabled_kind(conn_type, "gcp_pubsub");
+        }
         #[cfg(not(feature = "bigquery"))]
         "bigquery" | "bq" | "gbq" => {
-            // Feature disabled (X1-09): fail closed with no sink; the
+            // Feature disabled: fail closed with no sink; the
             // checked wrapper names the missing feature.
         }
         #[cfg(feature = "bigquery")]
@@ -4471,7 +4660,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "gcp_iot"))]
         "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
-            // Feature disabled (X1-09): fail closed with no sink; the
+            // Feature disabled: fail closed with no sink; the
             // checked wrapper names the missing feature.
         }
         #[cfg(feature = "gcp_iot")]
@@ -6218,6 +6407,35 @@ mod connector_feature_tests {
         );
     }
 
+    /// The compiled-in list comes from the same table as the lookup.
+    /// Each entry tracks its own feature, so no second list exists.
+    /// The test fails if the lookup ever disagrees with the table or
+    /// if two rows claim one alias.
+    #[tokio::test]
+    async fn test_compiled_features_match_table() {
+        let compiled = compiled_connector_features();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for gate in CONNECTOR_GATES {
+            assert_eq!(
+                compiled.contains(&gate.feature),
+                gate.enabled,
+                "feature `{}` must track its table row",
+                gate.feature
+            );
+            for kind in gate.kinds {
+                assert!(
+                    seen.insert(kind),
+                    "alias `{kind}` must appear in one table row only"
+                );
+                assert_eq!(
+                    disabled_connector_feature(kind).is_some(),
+                    !gate.enabled,
+                    "kind `{kind}` must track its table row"
+                );
+            }
+        }
+    }
+
     #[cfg(not(feature = "s3"))]
     #[tokio::test]
     async fn test_disabled_s3_names_feature() {
@@ -6271,6 +6489,73 @@ mod connector_feature_tests {
     async fn test_disabled_gcp_iot_names_feature() {
         expect_disabled("gcp_iot", "gcp_iot").await;
         expect_disabled("gcp_iot_core", "gcp_iot").await;
+    }
+
+    #[cfg(not(feature = "kafka"))]
+    #[tokio::test]
+    async fn test_disabled_kafka_names_feature() {
+        expect_disabled("kafka", "kafka").await;
+    }
+
+    #[cfg(not(feature = "rabbitmq"))]
+    #[tokio::test]
+    async fn test_disabled_rabbitmq_names_feature() {
+        expect_disabled("rabbitmq", "rabbitmq").await;
+        expect_disabled("amqp", "rabbitmq").await;
+    }
+
+    #[cfg(not(feature = "clickhouse"))]
+    #[tokio::test]
+    async fn test_disabled_clickhouse_names_feature() {
+        expect_disabled("clickhouse", "clickhouse").await;
+        expect_disabled("ch", "clickhouse").await;
+    }
+
+    #[cfg(not(feature = "elasticsearch"))]
+    #[tokio::test]
+    async fn test_disabled_elasticsearch_names_feature() {
+        expect_disabled("elasticsearch", "elasticsearch").await;
+        expect_disabled("opensearch", "elasticsearch").await;
+    }
+
+    #[cfg(not(feature = "cassandra"))]
+    #[tokio::test]
+    async fn test_disabled_cassandra_names_feature() {
+        expect_disabled("cassandra", "cassandra").await;
+        expect_disabled("scylla", "cassandra").await;
+    }
+
+    #[cfg(not(feature = "confluent"))]
+    #[tokio::test]
+    async fn test_disabled_confluent_names_feature() {
+        expect_disabled("confluent", "confluent").await;
+    }
+
+    #[cfg(not(feature = "couchbase"))]
+    #[tokio::test]
+    async fn test_disabled_couchbase_names_feature() {
+        expect_disabled("couchbase", "couchbase").await;
+    }
+
+    #[cfg(not(feature = "mongodb"))]
+    #[tokio::test]
+    async fn test_disabled_mongodb_names_feature() {
+        expect_disabled("mongodb", "mongodb").await;
+        expect_disabled("mongo", "mongodb").await;
+    }
+
+    #[cfg(not(feature = "gcp_pubsub"))]
+    #[tokio::test]
+    async fn test_disabled_gcp_pubsub_names_feature() {
+        expect_disabled("gcp_pubsub", "gcp_pubsub").await;
+        expect_disabled("pubsub", "gcp_pubsub").await;
+    }
+
+    #[cfg(not(feature = "kinesis"))]
+    #[tokio::test]
+    async fn test_disabled_kinesis_names_feature() {
+        expect_disabled("kinesis", "kinesis").await;
+        expect_disabled("aws_kinesis", "kinesis").await;
     }
 
     /// Enabled evidence (dynamodb): a rule registered with the connector
