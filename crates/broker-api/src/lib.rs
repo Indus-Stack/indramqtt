@@ -6198,6 +6198,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rules_builtin_functions_round_trip_in_documented_shape() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // The example of the specification: a republish and a console.
+        let body = json!({
+            "name": "builtin-fn",
+            "sql": "SELECT * FROM \"test/topic\" WHERE payload.x = 1",
+            "actions": [
+                {"function": "republish", "args": {"topic": "t/1", "payload": "${payload}"}},
+                {"function": "console"}
+            ]
+        });
+        let (status, created) = server.post_auth("/api/v5/rules", body, &token).await;
+        assert_eq!(status, 201, "create answered {created}");
+        let actions = created["actions"].as_array().expect("actions list");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0]["function"], json!("republish"));
+        assert_eq!(actions[0]["args"]["topic"], json!("t/1"));
+        assert_eq!(actions[0]["args"]["payload"], json!("${payload}"));
+        // Defaults are filled in, as the specification documents them.
+        assert_eq!(actions[0]["args"]["qos"], json!("${qos}"));
+        assert_eq!(actions[0]["args"]["retain"], json!("${retain}"));
+        assert_eq!(actions[0]["args"]["direct_dispatch"], json!(false));
+        assert_eq!(actions[1], json!({"function": "console"}));
+
+        // The read route returns the same items.
+        let rule_id = created["id"].as_str().expect("rule id").to_string();
+        let (status, fetched) = server
+            .get_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["actions"], created["actions"]);
+
+        // A full update replaces them; fixed QoS and retain keep their types.
+        let (status, updated) = server
+            .put_auth(
+                &format!("/api/v5/rules/{rule_id}"),
+                json!({
+                    "sql": "SELECT * FROM \"test/topic\"",
+                    "actions": [{"function": "republish",
+                                 "args": {"topic": "out/${topic}", "qos": 1, "retain": true}}]
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "update answered {updated}");
+        assert_eq!(updated["actions"][0]["args"]["qos"], json!(1));
+        assert_eq!(updated["actions"][0]["args"]["retain"], json!(true));
+        assert_eq!(
+            updated["actions"][0]["args"]["topic"],
+            json!("out/${topic}")
+        );
+    }
+
+    #[tokio::test]
+    async fn rules_builtin_functions_refuse_what_the_broker_cannot_do() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let sql = "SELECT * FROM \"t/#\"";
+
+        // A user function needs user code, which this broker cannot load.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"name": "user-fn", "sql": sql,
+                       "actions": [{"function": "my_module:my_function", "args": {}}]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not available in this broker"),
+            "message was {body}"
+        );
+
+        // Arguments that break the documented types or ranges.
+        for (name, args) in [
+            ("no-topic", json!({})),
+            ("wildcard", json!({"topic": "a/#"})),
+            ("bad-qos", json!({"topic": "a", "qos": 3})),
+            ("bad-retain", json!({"topic": "a", "retain": "sometimes"})),
+            ("open-template", json!({"topic": "a/${b"})),
+            ("unknown-arg", json!({"topic": "a", "color": "red"})),
+            (
+                "content-type",
+                json!({"topic": "a", "mqtt_properties": {"Content-Type": "text/plain"}}),
+            ),
+        ] {
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/rules",
+                    json!({"name": name, "sql": sql,
+                           "actions": [{"function": "republish", "args": args}]}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{name} answered {body}");
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+        // Nothing was stored.
+        let (_, list) = server.get_auth("/api/v5/rules", &token).await;
+        assert_eq!(list["data"].as_array().map(Vec::len), Some(0));
+
+        // The empty forms that the management console sends are accepted.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"name": "console-defaults", "sql": sql,
+                       "actions": [{"function": "republish",
+                                    "args": {"topic": "a", "qos": 0, "retain": false,
+                                             "payload": "${payload}", "mqtt_properties": {},
+                                             "user_properties": "", "direct_dispatch": false}}]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "console defaults answered {body}");
+    }
+
+    #[tokio::test]
     async fn rules_create_rejects_bad_filter() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;

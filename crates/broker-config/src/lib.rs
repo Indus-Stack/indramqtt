@@ -714,6 +714,86 @@ pub enum RuleActionEntry {
         /// Connector id; must be non-empty.
         connector_id: String,
     },
+    /// The built-in `republish` function of the reference API: topic,
+    /// payload, QoS and retain flag are fixed values or templates.
+    #[serde(rename = "republish_function")]
+    RepublishFunction {
+        /// The arguments as the API documents them, defaults filled in.
+        args: RepublishArgs,
+    },
+    /// The built-in `console` function of the reference API: write the
+    /// rule result to the log.
+    Console,
+}
+
+/// Arguments of the built-in `republish` rule function, in the form the
+/// reference API documents them. A value that holds `${...}` is a template
+/// that the rule engine renders for each result row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepublishArgs {
+    /// Target topic; a template.
+    pub topic: String,
+    /// Payload; a template. The default is `${payload}`.
+    #[serde(default = "default_republish_payload")]
+    pub payload: String,
+    /// QoS: a number from 0 to 2 or a template. The default is `${qos}`.
+    #[serde(default = "default_republish_qos")]
+    pub qos: RepublishQos,
+    /// Retain flag: a boolean or a template. The default is `${retain}`.
+    #[serde(default = "default_republish_retain")]
+    pub retain: RepublishFlag,
+    /// MQTT properties to set. Keys are the property names of the
+    /// reference API; values are templates.
+    #[serde(default)]
+    pub mqtt_properties: BTreeMap<String, String>,
+    /// A single `${...}` reference to a map of user properties. An empty
+    /// string means none. The default is `${user_properties}`.
+    #[serde(default = "default_republish_user_properties")]
+    pub user_properties: String,
+    /// When true the message goes straight to the subscribers and is not
+    /// retained. The default is false.
+    #[serde(default = "default_republish_direct_dispatch")]
+    pub direct_dispatch: RepublishFlag,
+}
+
+/// QoS of a republish: a fixed number or a template.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RepublishQos {
+    /// Fixed QoS, 0 to 2.
+    Fixed(u8),
+    /// Template that gives the QoS as text.
+    Template(String),
+}
+
+/// A flag of a republish: a fixed boolean or a template.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RepublishFlag {
+    /// Fixed value.
+    Fixed(bool),
+    /// Template that gives `true` or `false` as text.
+    Template(String),
+}
+
+fn default_republish_payload() -> String {
+    "${payload}".to_string()
+}
+
+fn default_republish_qos() -> RepublishQos {
+    RepublishQos::Template("${qos}".to_string())
+}
+
+fn default_republish_retain() -> RepublishFlag {
+    RepublishFlag::Template("${retain}".to_string())
+}
+
+fn default_republish_user_properties() -> String {
+    "${user_properties}".to_string()
+}
+
+fn default_republish_direct_dispatch() -> RepublishFlag {
+    RepublishFlag::Fixed(false)
 }
 
 /// Serde default for a missing rule enable flag: historical entries
@@ -856,7 +936,21 @@ impl RulesConf {
                             )));
                         }
                     }
-                    RuleActionEntry::Log => {}
+                    RuleActionEntry::Log | RuleActionEntry::Console => {}
+                    RuleActionEntry::RepublishFunction { args } => {
+                        if args.topic.trim().is_empty() {
+                            return Err(ConfigError::Invalid(format!(
+                                "rules.rules[{index}].actions[{action_index}].args.topic must not be empty (field `topic`)"
+                            )));
+                        }
+                        if let RepublishQos::Fixed(qos) = &args.qos {
+                            if *qos > 2 {
+                                return Err(ConfigError::Invalid(format!(
+                                    "rules.rules[{index}].actions[{action_index}].args.qos {qos} is out of range (field `qos`)"
+                                )));
+                            }
+                        }
+                    }
                     RuleActionEntry::ForwardConnector { connector_id } => {
                         if connector_id.trim().is_empty() {
                             return Err(ConfigError::Invalid(format!(
@@ -4257,6 +4351,50 @@ mod tests {
             text.contains("rule-1"),
             "error must name the key, got: {text}"
         );
+    }
+
+    #[test]
+    fn builtin_function_actions_survive_the_toml_state_file() {
+        let mut properties = BTreeMap::new();
+        properties.insert("Message-Expiry-Interval".to_string(), "60".to_string());
+        let rule = RuleEntry {
+            id: "rule-fn".to_string(),
+            name: "rule-fn".to_string(),
+            tenant: "default".to_string(),
+            topic_filter: "a/#".to_string(),
+            sql_query: Some("SELECT * FROM 'a/#'".to_string()),
+            enabled: true,
+            actions: vec![
+                RuleActionEntry::RepublishFunction {
+                    args: RepublishArgs {
+                        topic: "out/${dev}".to_string(),
+                        payload: "v=${v}".to_string(),
+                        qos: RepublishQos::Fixed(1),
+                        retain: RepublishFlag::Template("${retain}".to_string()),
+                        mqtt_properties: properties,
+                        user_properties: "${user_properties}".to_string(),
+                        direct_dispatch: RepublishFlag::Fixed(true),
+                    },
+                },
+                RuleActionEntry::RepublishFunction {
+                    args: RepublishArgs {
+                        topic: "out".to_string(),
+                        payload: "${payload}".to_string(),
+                        qos: RepublishQos::Template("${qos}".to_string()),
+                        retain: RepublishFlag::Fixed(false),
+                        mqtt_properties: BTreeMap::new(),
+                        user_properties: String::new(),
+                        direct_dispatch: RepublishFlag::Template("false".to_string()),
+                    },
+                },
+                RuleActionEntry::Console,
+            ],
+        };
+        let conf = RulesConf { rules: vec![rule] };
+        conf.validate().expect("rules validate");
+        let text = toml::to_string(&conf).expect("serialise rules");
+        let back: RulesConf = toml::from_str(&text).expect("parse rules");
+        assert_eq!(back, conf, "state file text was: {text}");
     }
 
     #[test]

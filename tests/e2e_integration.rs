@@ -4387,3 +4387,575 @@ async fn tm09_tenant_client_reads_through_sockets_and_api() {
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_dir_all(&config_dir);
 }
+
+/// Built-in rule actions of the reference API, through real sockets and
+/// the real management API.
+///
+/// The kernel boots from `indra.toml` with its own MQTT listener, so no
+/// edge is needed. Each rule is created with `POST /api/v5/rules`. Real
+/// MQTT clients publish, and other clients receive on the republish
+/// topic. Every value is random, so the broker cannot know it.
+#[tokio::test]
+async fn rule_builtin_actions_republish_and_console_through_the_broker() {
+    use tokio::io::AsyncWriteExt;
+
+    const STEP: std::time::Duration = SHARD_E2E_STEP;
+    const QUIET: std::time::Duration = std::time::Duration::from_millis(1500);
+    let tag = format!(
+        "rb-actions-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}"));
+    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+    let kernel_log = std::env::temp_dir().join(format!("indramqtt-{tag}.log"));
+    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+
+    let bl_port = shard_ephemeral_port();
+    let mqtt_port = shard_ephemeral_port();
+    let api_port = shard_ephemeral_port();
+    std::fs::write(
+        config_dir.join("indra.toml"),
+        format!(
+            "[node]\n\
+             id = \"rb-e2e\"\n\
+             data_dir = \"{}\"\n\
+             brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
+             \n\
+             [listeners.tcp]\n\
+             bind = \"127.0.0.1:{mqtt_port}\"\n\
+             native = true\n\
+             \n\
+             [listeners.api]\n\
+             bind = \"127.0.0.1:{api_port}\"\n\
+             \n\
+             [logging]\n\
+             level = \"info\"\n\
+             \n\
+             [[tenants.rules]]\n\
+             expression = \"t-${{username}}\"\n",
+            scratch.display(),
+        ),
+    )
+    .expect("write indra.toml");
+
+    let api_key = "rb-e2e-test-key-0001";
+    let log_file = std::fs::File::create(&kernel_log).expect("create kernel log");
+    let mut child = tokio::process::Command::new(shard_kernel_binary())
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .arg("--allow-anonymous")
+        .env("INDRA_API_KEYS", api_key)
+        .env("NO_COLOR", "1")
+        .stdout(log_file.try_clone().expect("clone log handle"))
+        .stderr(log_file)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real kernel");
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{api_port}");
+    let deadline = std::time::Instant::now() + SHARD_E2E_BOOT;
+    loop {
+        let up = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            http.get(format!("{base}/healthz")).send(),
+        )
+        .await;
+        if let Ok(Ok(res)) = up {
+            if let Ok(text) = res.text().await {
+                if text == "OK"
+                    && tokio::net::TcpStream::connect(("127.0.0.1", mqtt_port))
+                        .await
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            panic!("rule actions kernel never opened API {api_port} and MQTT {mqtt_port}");
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("rule actions kernel exited during boot: {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    async fn api(
+        http: &reqwest::Client,
+        base: &str,
+        key: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        let mut request = http
+            .request(method, format!("{base}{path}"))
+            .bearer_auth(key);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let res = tokio::time::timeout(STEP, request.send())
+            .await
+            .expect("API in time")
+            .expect("API send");
+        let status = res.status().as_u16();
+        let text = res.text().await.expect("API body");
+        let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+    async fn dial(port: u16) -> tokio::net::TcpStream {
+        tokio::time::timeout(STEP, tokio::net::TcpStream::connect(("127.0.0.1", port)))
+            .await
+            .expect("dial in time")
+            .expect("dial")
+    }
+    async fn connect(port: u16, client_id: &str, username: Option<&str>) -> tokio::net::TcpStream {
+        let mut sock = dial(port).await;
+        let creds = username.map(|name| (name, &b"pw"[..]));
+        tokio::time::timeout(
+            STEP,
+            sock.write_all(&sy02_connect311(client_id, true, 60, creds)),
+        )
+        .await
+        .expect("CONNECT in time")
+        .expect("CONNECT send");
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut sock))
+            .await
+            .expect("CONNACK in time")
+            .expect("CONNACK");
+        assert_eq!(head, 0x20, "kernel answers {client_id} with CONNACK");
+        assert_eq!(body, vec![0x00, 0x00], "CONNECT of {client_id} is accepted");
+        sock
+    }
+    async fn subscribe(sock: &mut tokio::net::TcpStream, filter: &str, qos: u8) {
+        tokio::time::timeout(STEP, sock.write_all(&sy02_subscribe(1, &[(filter, qos)])))
+            .await
+            .expect("SUBSCRIBE in time")
+            .expect("SUBSCRIBE send");
+        let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
+            .await
+            .expect("SUBACK in time")
+            .expect("SUBACK");
+        assert_eq!(head & 0xF0, 0x90, "kernel answers with SUBACK");
+        assert_eq!(body, vec![0x00, 0x01, qos], "subscribe to {filter} granted");
+    }
+    async fn publish(sock: &mut tokio::net::TcpStream, topic: &str, qos: u8, payload: &[u8]) {
+        tokio::time::timeout(
+            STEP,
+            sock.write_all(&sy02_publish311(topic, 7, qos, false, payload)),
+        )
+        .await
+        .expect("publish in time")
+        .expect("publish send");
+        if qos > 0 {
+            let (head, _) = tokio::time::timeout(STEP, read_mqtt_packet(sock))
+                .await
+                .expect("PUBACK in time")
+                .expect("PUBACK");
+            assert_eq!(head, 0x40, "publisher sees PUBACK");
+        }
+    }
+    /// The next PUBLISH on the socket, or `None` when nothing comes in
+    /// the given time.
+    async fn next_publish(
+        sock: &mut tokio::net::TcpStream,
+        wait: std::time::Duration,
+    ) -> Option<Sy02Publish> {
+        let (head, body) = tokio::time::timeout(wait, read_mqtt_packet(sock))
+            .await
+            .ok()?
+            .expect("downlink");
+        assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+        Some(sy02_parse_publish_classic(head, &body))
+    }
+    let nonce = || format!("{:016x}", rand::random::<u64>());
+
+    // Two tenants own rules; clients with these usernames land there.
+    for ns in ["t-rb-a", "t-rb-b"] {
+        let (status, body) = api(
+            &http,
+            &base,
+            api_key,
+            reqwest::Method::POST,
+            &format!("/api/v5/mt/ns/{ns}"),
+            None,
+        )
+        .await;
+        assert!(status < 300, "namespace {ns} answered {status}: {body}");
+    }
+    let make_rule = |name: &str, sql: &str, actions: serde_json::Value| serde_json::json!({"id": name, "name": name, "sql": sql, "actions": actions});
+
+    // 1. A fixed topic and the default `${payload}`. The republish topic
+    // matches the filter of the rule itself: a loop would deliver more
+    // than one copy.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-fixed",
+            "SELECT * FROM \"rb/one/#\"",
+            serde_json::json!([
+                {"function": "republish", "args": {"topic": "rb/one/out", "payload": "${payload}"}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    assert_eq!(body["actions"][0]["function"], "republish");
+    let mut sub_one = connect(mqtt_port, "rb-sub-one", None).await;
+    subscribe(&mut sub_one, "rb/one/out", 0).await;
+    let mut pubr = connect(mqtt_port, "rb-pub", None).await;
+    let value = nonce();
+    let message = format!("{{\"v\":\"{value}\"}}");
+    publish(&mut pubr, "rb/one/in", 0, message.as_bytes()).await;
+    let got = next_publish(&mut sub_one, STEP).await.expect("republish");
+    assert_eq!(got.topic, "rb/one/out");
+    assert_eq!(got.payload, message.as_bytes());
+    assert!(
+        next_publish(&mut sub_one, QUIET).await.is_none(),
+        "one input gives one output: a republish does not start its own rule again"
+    );
+
+    // 2. A payload template with selected fields and a topic template.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-template",
+            "SELECT temp, dev FROM \"rb/two/+\"",
+            serde_json::json!([
+                {"function": "republish",
+                 "args": {"topic": "rb/two/out/${dev}", "payload": "temp=${temp};dev=${dev}"}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut sub_two = connect(mqtt_port, "rb-sub-two", None).await;
+    subscribe(&mut sub_two, "rb/two/out/#", 0).await;
+    let dev = nonce();
+    let temp = rand::random::<u32>();
+    let message = format!("{{\"temp\":{temp},\"dev\":\"{dev}\",\"noise\":\"x\"}}");
+    publish(&mut pubr, "rb/two/in", 0, message.as_bytes()).await;
+    let got = next_publish(&mut sub_two, STEP).await.expect("template");
+    assert_eq!(got.topic, format!("rb/two/out/{dev}"));
+    assert_eq!(got.payload, format!("temp={temp};dev={dev}").as_bytes());
+
+    // 3. A WHERE clause filters.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-where",
+            "SELECT * FROM \"rb/three\" WHERE n > 5",
+            serde_json::json!([{"function": "republish", "args": {"topic": "rb/three/out"}}]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut sub_three = connect(mqtt_port, "rb-sub-three", None).await;
+    subscribe(&mut sub_three, "rb/three/out", 0).await;
+    publish(&mut pubr, "rb/three", 0, br#"{"n":1,"w":"low"}"#).await;
+    assert!(
+        next_publish(&mut sub_three, QUIET).await.is_none(),
+        "WHERE n > 5 drops n = 1"
+    );
+    let high = format!("{{\"n\":9,\"w\":\"{}\"}}", nonce());
+    publish(&mut pubr, "rb/three", 0, high.as_bytes()).await;
+    let got = next_publish(&mut sub_three, STEP).await.expect("where");
+    assert_eq!(got.payload, high.as_bytes());
+
+    // 4. QoS: the default follows the input message, a number is fixed,
+    // and a template reads a field.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-qos",
+            "SELECT * FROM \"rb/four\"",
+            serde_json::json!([
+                {"function": "republish", "args": {"topic": "rb/four/follow"}},
+                {"function": "republish", "args": {"topic": "rb/four/fixed", "qos": 1}},
+                {"function": "republish", "args": {"topic": "rb/four/field", "qos": "${lvl}"}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut sub_four = connect(mqtt_port, "rb-sub-four", None).await;
+    subscribe(&mut sub_four, "rb/four/+", 2).await;
+    for (input_qos, expect) in [(1u8, [1u8, 1, 2]), (0u8, [0u8, 1, 2])] {
+        let message = format!("{{\"lvl\":2,\"id\":\"{}\"}}", nonce());
+        publish(&mut pubr, "rb/four", input_qos, message.as_bytes()).await;
+        let mut seen = std::collections::HashMap::new();
+        for _ in 0..3 {
+            let got = next_publish(&mut sub_four, STEP).await.expect("qos output");
+            if got.qos == 1 {
+                tokio::time::timeout(STEP, sub_four.write_all(&sy02_puback(got.packet_id)))
+                    .await
+                    .expect("PUBACK in time")
+                    .expect("PUBACK send");
+            }
+            seen.insert(got.topic.clone(), got.qos);
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "three outputs for input QoS {input_qos}: {seen:?}"
+        );
+        assert_eq!(
+            seen["rb/four/follow"], expect[0],
+            "follows input QoS {input_qos}"
+        );
+        assert_eq!(seen["rb/four/fixed"], expect[1], "fixed QoS 1");
+        assert_eq!(seen["rb/four/field"], expect[2], "QoS from the field `lvl`");
+    }
+
+    // 5. A retained republish is kept for later subscribers.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-retain",
+            "SELECT * FROM \"rb/five\"",
+            serde_json::json!([
+                {"function": "republish", "args": {"topic": "rb/five/kept", "retain": true}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let kept = format!("{{\"keep\":\"{}\"}}", nonce());
+    publish(&mut pubr, "rb/five", 0, kept.as_bytes()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut late = connect(mqtt_port, "rb-late", None).await;
+    subscribe(&mut late, "rb/five/kept", 0).await;
+    let got = next_publish(&mut late, STEP)
+        .await
+        .expect("retained replay");
+    assert_eq!(got.payload, kept.as_bytes());
+    assert!(got.retain, "the replay carries the retain flag");
+
+    // 6. A rule of tenant A republishes inside tenant A only.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(serde_json::json!({
+            "name": "rb-tenant-a",
+            "tenant": "t-rb-a",
+            "sql": "SELECT * FROM \"rb/six\"",
+            "actions": [{"function": "republish", "args": {"topic": "rb/six/out"}}]
+        })),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut a_sub = connect(mqtt_port, "rb-a-sub", Some("rb-a")).await;
+    let mut a_pub = connect(mqtt_port, "rb-a-pub", Some("rb-a")).await;
+    let mut b_sub = connect(mqtt_port, "rb-b-sub", Some("rb-b")).await;
+    let mut b_pub = connect(mqtt_port, "rb-b-pub", Some("rb-b")).await;
+    let mut default_sub = connect(mqtt_port, "rb-d-sub", None).await;
+    for sock in [&mut a_sub, &mut b_sub, &mut default_sub] {
+        subscribe(sock, "rb/six/out", 0).await;
+    }
+    let secret = nonce();
+    let message = format!("{{\"s\":\"{secret}\"}}");
+    publish(&mut a_pub, "rb/six", 0, message.as_bytes()).await;
+    let got = next_publish(&mut a_sub, STEP)
+        .await
+        .expect("tenant A output");
+    assert_eq!(got.payload, message.as_bytes());
+    assert!(
+        next_publish(&mut b_sub, QUIET).await.is_none(),
+        "tenant B holds none of the output of a rule of tenant A"
+    );
+    assert!(
+        next_publish(&mut default_sub, std::time::Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the default tenant holds none of the output of a rule of tenant A"
+    );
+    // A publish of tenant B on the same topic does not fire the rule.
+    publish(&mut b_pub, "rb/six", 0, message.as_bytes()).await;
+    assert!(
+        next_publish(&mut a_sub, QUIET).await.is_none(),
+        "a publish of tenant B does not fire a rule of tenant A"
+    );
+    assert!(
+        next_publish(&mut b_sub, std::time::Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a publish of tenant B gives no output in tenant B"
+    );
+
+    // 7. MQTT 5 properties: user properties from a result field and the
+    // message expiry from the arguments.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-props",
+            "SELECT * FROM \"rb/seven\"",
+            serde_json::json!([
+                {"function": "republish",
+                 "args": {"topic": "rb/seven/out", "user_properties": "${props}",
+                          "mqtt_properties": {"Message-Expiry-Interval": "120"}}}
+            ]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let mut v5_sub = dial(mqtt_port).await;
+    tokio::time::timeout(
+        STEP,
+        v5_sub.write_all(&sy02_connect5("rb-v5-sub", true, 60, None, None, 0)),
+    )
+    .await
+    .expect("CONNECT in time")
+    .expect("CONNECT send");
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut v5_sub))
+        .await
+        .expect("CONNACK in time")
+        .expect("CONNACK");
+    assert_eq!(head, 0x20);
+    assert_eq!(body[1], 0, "v5 CONNECT accepted");
+    tokio::time::timeout(
+        STEP,
+        v5_sub.write_all(&sy02_subscribe_v5(1, &[("rb/seven/out", 0)], 0)),
+    )
+    .await
+    .expect("SUBSCRIBE in time")
+    .expect("SUBSCRIBE send");
+    let (head, _) = tokio::time::timeout(STEP, read_mqtt_packet(&mut v5_sub))
+        .await
+        .expect("SUBACK in time")
+        .expect("SUBACK");
+    assert_eq!(head & 0xF0, 0x90);
+    let prop_value = nonce();
+    let message = format!("{{\"props\":{{\"trace\":\"{prop_value}\"}},\"body\":1}}");
+    publish(&mut pubr, "rb/seven", 0, message.as_bytes()).await;
+    let (head, body) = tokio::time::timeout(STEP, read_mqtt_packet(&mut v5_sub))
+        .await
+        .expect("v5 downlink in time")
+        .expect("v5 downlink");
+    let parsed = sy02_parse_publish_v5(head, &body);
+    assert_eq!(parsed.topic, "rb/seven/out");
+    assert_eq!(parsed.expiry, 120);
+    assert_eq!(parsed.users, vec![("trace".to_string(), prop_value)]);
+
+    // 8. The console function writes the result to the log, on one line,
+    // with a size limit.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-console",
+            "SELECT * FROM \"rb/eight\"",
+            serde_json::json!([{"function": "console"}]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "create answered {body}");
+    let seen_value = nonce();
+    publish(
+        &mut pubr,
+        "rb/eight",
+        0,
+        format!("{{\"seen\":\"{seen_value}\"}}").as_bytes(),
+    )
+    .await;
+    let big_mark = nonce();
+    let big = format!(
+        "{{\"mark\":\"{big_mark}\",\"pad\":\"{}\"}}",
+        "x".repeat(4000)
+    );
+    publish(&mut pubr, "rb/eight", 0, big.as_bytes()).await;
+    let mut console_lines = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let text = std::fs::read_to_string(&kernel_log).unwrap_or_default();
+        console_lines = text
+            .lines()
+            .filter(|line| line.contains("rule console"))
+            .map(str::to_string)
+            .collect();
+        if console_lines.iter().any(|l| l.contains(&seen_value))
+            && console_lines.iter().any(|l| l.contains(&big_mark))
+        {
+            break;
+        }
+    }
+    assert!(
+        console_lines.iter().any(|l| l.contains(&seen_value)),
+        "the console line holds the result: {console_lines:?}"
+    );
+    let big_line = console_lines
+        .iter()
+        .find(|l| l.contains(&big_mark))
+        .expect("console line of the big result");
+    assert!(
+        !big_line.contains(&"x".repeat(2000)),
+        "the console line is cut at the size limit"
+    );
+    assert!(big_line.contains("..."), "a cut line ends with dots");
+
+    // 9. A user function is refused with 400 and nothing is stored.
+    let (status, body) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        Some(make_rule(
+            "rb-user-fn",
+            "SELECT * FROM \"rb/nine\"",
+            serde_json::json!([{"function": "my_module:my_function", "args": {}}]),
+        )),
+    )
+    .await;
+    assert_eq!(status, 400, "user function answered {body}");
+    assert_eq!(body["code"], "BAD_REQUEST");
+    let (status, _) = api(
+        &http,
+        &base,
+        api_key,
+        reqwest::Method::GET,
+        "/api/v5/rules/rb-user-fn",
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "the refused rule was not stored");
+
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&config_dir);
+    let _ = std::fs::remove_file(&kernel_log);
+}

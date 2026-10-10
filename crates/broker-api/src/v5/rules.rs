@@ -88,7 +88,13 @@ fn rule_to_v5(rule: &broker_rules::Rule) -> serde_json::Value {
         .sql_query
         .clone()
         .unwrap_or_else(|| format!("SELECT * FROM \"{topic}\""));
-    let actions = serde_json::to_value(&rule.actions).unwrap_or_else(|_| serde_json::json!([]));
+    // The documented shape: a string for a stored action, an object with
+    // `function` for the built-in functions.
+    let actions: Vec<serde_json::Value> = rule
+        .actions
+        .iter()
+        .map(broker_rules::action_to_api_json)
+        .collect();
     serde_json::json!({
         "id": rule.id,
         "name": rule.name,
@@ -163,13 +169,90 @@ fn rule_persist_error(error: broker_rules::RuleEngineError) -> Response {
         .into_response()
 }
 
+/// Read the `actions` list of a rule body. An item is one of:
+///
+/// - a string: the id of a stored action (checked against the action
+///   directory);
+/// - an object with `function` `republish` or `console`: a built-in
+///   function with the arguments the reference API documents;
+/// - an object with `function` in the `module:function` form: a user
+///   function. This broker cannot load user code, so it answers 400;
+/// - an object with `id` or `name` and no `function`: the older form of a
+///   stored action, kept for existing callers.
+///
+/// A refusal is a 400 that names the field. Management plane only.
+fn parse_rule_actions(
+    state: &ApiState,
+    raw_actions: &[serde_json::Value],
+) -> Result<Vec<broker_rules::RuleAction>, Box<Response>> {
+    let bad = |message: String| Box::new(ApiError::BadRequest(message).into_response());
+    let mut actions = Vec::with_capacity(raw_actions.len());
+    for item in raw_actions {
+        if let Some(id_str) = item.as_str() {
+            // Rule-to-action linkage (W3-02): a forward target naming no
+            // known action is rejected instead of going live and failing
+            // at fire time.
+            let Some(found) = state.actions.get_any(id_str) else {
+                return Err(bad(format!("unknown action {id_str:?} (field `actions`)")));
+            };
+            actions.push(broker_rules::RuleAction::ForwardConnector {
+                connector_id: found.id.clone(),
+            });
+            continue;
+        }
+        let Some(object) = item.as_object() else {
+            return Err(bad(
+                "unsupported action entry: expected a string id or an object (field `actions`)"
+                    .to_string(),
+            ));
+        };
+        if let Some(function) = object.get("function") {
+            let Some(function) = function.as_str() else {
+                return Err(bad(
+                    "field `function` of an action must be a string (field `actions`)".to_string(),
+                ));
+            };
+            match broker_rules::parse_function_action(function, object.get("args")) {
+                Ok(action) => actions.push(action),
+                Err(broker_rules::FunctionActionError::Unavailable(message))
+                | Err(broker_rules::FunctionActionError::Invalid(message)) => {
+                    return Err(bad(format!("{message} (field `actions`)")));
+                }
+            }
+            continue;
+        }
+        let Some(conn_id) = object
+            .get("id")
+            .or_else(|| object.get("name"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            // Fail closed: an object without an addressable target is
+            // rejected, never silently dropped while the call answers 2xx.
+            return Err(bad(
+                "action entry object must carry a `function`, an `id` or a `name` (field `actions`)"
+                    .to_string(),
+            ));
+        };
+        let Some(found) = state.actions.get_any(conn_id) else {
+            return Err(bad(format!("unknown action {conn_id:?} (field `actions`)")));
+        };
+        actions.push(broker_rules::RuleAction::ForwardConnector {
+            connector_id: found.id.clone(),
+        });
+    }
+    Ok(actions)
+}
+
 /// `POST /api/v5/rules`: compile the rule before storing (malformed
 /// bodies rejected with the documented error shape); a duplicate id is
 /// rejected cleanly, never overwritten. An explicit `id` is stored
 /// verbatim so duplicates are detectable; without one the engine assigns
 /// `rule-<n>`. A `tenant` field selects the owning tenant (absent
 /// means the default tenant); an unknown tenant is rejected with 400.
-/// A `ForwardConnector` target naming no known action is
+/// The `actions` list follows [`parse_rule_actions`]. A
+/// `ForwardConnector` target naming no known action is
 /// rejected (the W3-02 action linkage). Management-plane only; publish
 /// and deliver never touch this map (dispatch reads a snapshot).
 pub async fn create_rule(
@@ -264,55 +347,10 @@ pub async fn create_rule(
         }
     };
 
-    let mut actions = Vec::new();
-    for a in &raw_actions {
-        if let Some(id_str) = a.as_str() {
-            // Rule-to-action linkage (W3-02): a forward target naming no
-            // known action is rejected instead of going live and failing
-            // at fire time.
-            let Some(found) = state.actions.get_any(id_str) else {
-                return ApiError::BadRequest(format!(
-                    "unknown action {id_str:?} (field `actions`)"
-                ))
-                .into_response();
-            };
-            actions.push(broker_rules::RuleAction::ForwardConnector {
-                connector_id: found.id.clone(),
-            });
-        } else if let Some(obj) = a.as_object() {
-            let Some(conn_id) = obj
-                .get("id")
-                .or_else(|| obj.get("name"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
-                // Fail closed (UNKNOWN rule): an object without an
-                // addressable forward target is rejected, never silently
-                // dropped while create still answers 201.
-                return ApiError::BadRequest(
-                    "action entry object must carry an `id` or `name` (field `actions`)"
-                        .to_string(),
-                )
-                .into_response();
-            };
-            let Some(found) = state.actions.get_any(conn_id) else {
-                return ApiError::BadRequest(format!(
-                    "unknown action {conn_id:?} (field `actions`)"
-                ))
-                .into_response();
-            };
-            actions.push(broker_rules::RuleAction::ForwardConnector {
-                connector_id: found.id.clone(),
-            });
-        } else {
-            return ApiError::BadRequest(
-                "unsupported action entry: expected a string id or an object (field `actions`)"
-                    .to_string(),
-            )
-            .into_response();
-        }
-    }
+    let actions = match parse_rule_actions(&state, &raw_actions) {
+        Ok(actions) => actions,
+        Err(response) => return *response,
+    };
 
     // Rule-cap bound (management-plane, fail closed): the engine re-checks
     // the same bound after SQL compilation, but this early reject wires the
@@ -401,8 +439,9 @@ pub async fn get_rule(
 /// stored tenant. An unknown tenant fails with 400 and keeps the old
 /// rule.
 /// The body gets the same compilation as create: it must be a JSON object
-/// carrying the full rule (`sql` required, `actions` as string ids or
-/// `{id,name}` objects validated against the W3-02 action directory,
+/// carrying the full rule (`sql` required, `actions` as read by
+/// [`parse_rule_actions`]: stored-action ids validated against the W3-02
+/// action directory, or the built-in `republish` and `console` functions,
 /// `enable` as a bool, `name` free-form). The SQL is recompiled before
 /// anything is stored: a malformed body is rejected with the documented
 /// error shape and the old rule is kept. An unknown path id returns 404
@@ -570,49 +609,10 @@ pub async fn update_rule(
                 return ApiError::BadRequest(format!("invalid topic filter: {e}")).into_response();
             }
         };
-        let mut actions = Vec::new();
-        for a in &raw_actions {
-            if let Some(id_str) = a.as_str() {
-                let Some(found) = state.actions.get_any(id_str) else {
-                    return ApiError::BadRequest(format!(
-                        "unknown action {id_str:?} (field `actions`)"
-                    ))
-                    .into_response();
-                };
-                actions.push(broker_rules::RuleAction::ForwardConnector {
-                    connector_id: found.id.clone(),
-                });
-            } else if let Some(action_obj) = a.as_object() {
-                let Some(conn_id) = action_obj
-                    .get("id")
-                    .or_else(|| action_obj.get("name"))
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                else {
-                    return ApiError::BadRequest(
-                        "action entry object must carry an `id` or `name` (field `actions`)"
-                            .to_string(),
-                    )
-                    .into_response();
-                };
-                let Some(found) = state.actions.get_any(conn_id) else {
-                    return ApiError::BadRequest(format!(
-                        "unknown action {conn_id:?} (field `actions`)"
-                    ))
-                    .into_response();
-                };
-                actions.push(broker_rules::RuleAction::ForwardConnector {
-                    connector_id: found.id.clone(),
-                });
-            } else {
-                return ApiError::BadRequest(
-                    "unsupported action entry: expected a string id or an object (field `actions`)"
-                        .to_string(),
-                )
-                .into_response();
-            }
-        }
+        let actions = match parse_rule_actions(&state, &raw_actions) {
+            Ok(actions) => actions,
+            Err(response) => return *response,
+        };
         // Tenant scope: a body tenant moves the rule. Absent keeps
         // the stored tenant. A present but non-string tenant fails
         // with 400. An unknown tenant fails with 400 and keeps the

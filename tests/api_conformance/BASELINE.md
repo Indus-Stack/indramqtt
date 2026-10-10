@@ -408,3 +408,13 @@ is not changed.
   scrape routes stay behind credentials either way: opening them would
   fail open, and the rulebook fails closed. The management console
    reads and writes the flag through the settings form.
+- `POST /rules` and `PUT /rules/{id}`, request body. The specification
+  documents no `id` field in the request schema (`rule_creation`). The management console sends `id` when it
+  creates a rule (`createRules` in the copy dialog sends
+  `{ sql, enable, description, actions, id }`), so the broker accepts `id`
+  and keeps `name` as the fallback. The cases that create a rule send `id`
+  for this reason, because a case needs a known id to clean up.
+- `POST /rules`, `PUT /rules/{id}`, response, field `actions`. The specification declares
+  `oneOf` for each item, but a `republish` or `console` item also matches the
+  schema `user_provided_function` (a string `function` and an object `args`).
+  The checker reports this overlap as a warning, not as an error.

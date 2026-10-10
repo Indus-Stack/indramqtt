@@ -359,6 +359,24 @@ pub async fn test_stored_rule(
     if !value.is_object() {
         return bad_request("rule test body must be a JSON object".to_string());
     }
+    // The documented flag defaults to true: stop each action after its
+    // template is rendered. This probe never runs an action, so `false`
+    // is refused instead of being accepted and ignored.
+    match value.get("stop_action_after_template_rendering") {
+        None | Some(serde_json::Value::Bool(true)) => {}
+        Some(serde_json::Value::Bool(false)) => {
+            return bad_request(
+                "running the actions of a rule from a test is not available in this broker \
+                 (field `stop_action_after_template_rendering`)"
+                    .to_string(),
+            );
+        }
+        Some(_) => {
+            return bad_request(
+                "field `stop_action_after_template_rendering` must be a boolean".to_string(),
+            );
+        }
+    }
     let Some(topic) = extract_topic(&value) else {
         return missing_field("topic");
     };
@@ -596,6 +614,37 @@ mod tests {
             )
             .expect("rule creates");
         state
+    }
+
+    /// The probe never runs an action. The default (stop after the
+    /// template) and an explicit `true` are served; `false` is refused.
+    #[tokio::test]
+    async fn stored_probe_refuses_to_run_actions() {
+        let state = stored_state();
+        for (flag, expected) in [
+            (None, StatusCode::OK),
+            (Some(serde_json::json!(true)), StatusCode::OK),
+            (Some(serde_json::json!(false)), StatusCode::BAD_REQUEST),
+            (Some(serde_json::json!("no")), StatusCode::BAD_REQUEST),
+        ] {
+            let mut body = serde_json::json!({
+                "context": {"topic": "sensors/kitchen", "payload": "{\"temperature\":150.0}"},
+            });
+            if let Some(flag) = flag {
+                body["stop_action_after_template_rendering"] = flag;
+            }
+            let (status, _) = response_parts(
+                test_stored_rule(
+                    State(state.clone()),
+                    Path("w316-rule".to_string()),
+                    Query(HashMap::new()),
+                    body_of(body),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, expected);
+        }
     }
 
     /// Per-rule probe bound to the stored rule: match reports projected

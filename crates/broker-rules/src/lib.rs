@@ -22,6 +22,9 @@ pub mod engine_config;
 /// Rule-event producer registry behind `GET /rule_events` (W3-11, C06-16):
 /// the single catalogue of event types the kernel actually produces.
 pub mod events;
+/// Built-in rule functions of the reference API (`republish`, `console`):
+/// parser, validator, read-route projection and the template renderer.
+pub mod functions;
 /// Bounded on-disk spill buffer behind [`BackpressurePolicy::SpillToDisk`].
 pub mod spill;
 /// Standard rule SQL dialect front end: parser plus lowering onto the
@@ -41,6 +44,13 @@ pub mod runtime;
 /// The streaming-SQL function catalog (name, category, aggregate flag,
 /// arity, example) served to the dashboard SQL studio.
 pub use rekuiper_sql::{builtin_function_metadata, FunctionMeta};
+
+pub use functions::{
+    action_to_api_json, console_text, parse_function_action, render_republish,
+    republish_args_from_json, validate_republish_args, FunctionActionError, InputMessage,
+    RepublishMessage, RepublishProperties, CONSOLE_LINE_LIMIT, MAX_REPUBLISH_PROPERTY_LEN,
+    MAX_REPUBLISH_USER_PROPERTIES,
+};
 
 pub use engine_config::{EngineConfigStore, EngineConfigSubscriber, EngineConfigUpdateError};
 use spill::SpillLog;
@@ -587,6 +597,25 @@ pub trait BrokerSink: Send + Sync {
     ) -> Result<(), RuleEngineError> {
         let _ = tenant;
         self.publish(topic, payload, qos, retain).await
+    }
+    /// Publish one message that a `republish` function rendered, inside
+    /// one tenant. The message may carry MQTT v5 properties. The default
+    /// impl drops the properties and calls
+    /// [`BrokerSink::publish_in_tenant`]; a sink that can carry them
+    /// overrides this.
+    async fn publish_message_in_tenant(
+        &self,
+        tenant: &str,
+        message: RepublishMessage,
+    ) -> Result<(), RuleEngineError> {
+        self.publish_in_tenant(
+            tenant,
+            message.topic,
+            message.payload,
+            message.qos,
+            message.retain,
+        )
+        .await
     }
 }
 
@@ -1295,6 +1324,14 @@ pub enum RuleAction {
     /// Forward the (possibly transformed) payload to a registered
     /// external connector (e.g. an HTTP webhook) by id.
     ForwardConnector { connector_id: String },
+    /// The built-in `republish` function of the reference API. Topic,
+    /// payload, QoS and retain flag are fixed values or templates that
+    /// the engine renders for each result row, see [`functions`].
+    RepublishFn { args: broker_config::RepublishArgs },
+    /// The built-in `console` function of the reference API: write the
+    /// result row to the log at info level, on one line, with a size
+    /// limit.
+    Console,
 }
 
 /// Serde helper: [`QoS`] as its MQTT wire number (0/1/2).
@@ -1595,6 +1632,7 @@ impl runtime::RuleOutputSink for BrokerRuleSink {
             &self.flush_ctx.forward_throttle,
             &disabled,
             &action_metrics,
+            false,
         )
         .await;
         self.task_counters.inc_sink_out(1);
@@ -2049,6 +2087,7 @@ impl RuleEngine {
             &self.forward_throttle,
             &disabled,
             &action_metrics,
+            false,
         )
         .await;
     }
@@ -2478,6 +2517,10 @@ impl RuleEngine {
                     connector_id: connector_id.clone(),
                 }
             }
+            RuleAction::RepublishFn { args } => {
+                broker_config::RuleActionEntry::RepublishFunction { args: args.clone() }
+            }
+            RuleAction::Console => broker_config::RuleActionEntry::Console,
         }
     }
 
@@ -2502,6 +2545,15 @@ impl RuleEngine {
                 Ok(RuleAction::Republish { topic, qos })
             }
             broker_config::RuleActionEntry::Log => Ok(RuleAction::Log),
+            broker_config::RuleActionEntry::Console => Ok(RuleAction::Console),
+            broker_config::RuleActionEntry::RepublishFunction { args } => {
+                validate_republish_args(args).map_err(|e| {
+                    RuleEngineError::InvalidRule(format!(
+                        "invalid republish function for {rule_id}: {e}"
+                    ))
+                })?;
+                Ok(RuleAction::RepublishFn { args: args.clone() })
+            }
             broker_config::RuleActionEntry::ForwardConnector { connector_id } => {
                 if connector_id.trim().is_empty() {
                     return Err(RuleEngineError::InvalidRule(format!(
@@ -3778,6 +3830,22 @@ impl RuleEngine {
         qos: QoS,
         broker_sink: &Arc<dyn BrokerSink>,
     ) -> usize {
+        self.dispatch_ingress_message(tenant, topic, payload, qos, false, broker_sink)
+            .await
+    }
+
+    /// [`RuleEngine::dispatch_ingress_in_tenant`] for a caller that
+    /// knows the retain flag of the input message. The flag is the
+    /// value of `${retain}` in a `republish` function.
+    pub async fn dispatch_ingress_message(
+        &self,
+        tenant: &str,
+        topic: &Topic,
+        payload: &Bytes,
+        qos: QoS,
+        retain: bool,
+        broker_sink: &Arc<dyn BrokerSink>,
+    ) -> usize {
         // W3-10: skip system topics while the flag holds. Test the
         // topic first so plain traffic pays no settings load.
         if is_system_topic(topic) && self.engine_config_snapshot().ignore_sys_message {
@@ -3884,6 +3952,7 @@ impl RuleEngine {
                     &self.forward_throttle,
                     &disabled,
                     &action_metrics,
+                    retain,
                 )
                 .await;
             }
@@ -3997,6 +4066,7 @@ impl RuleEngine {
                             &self.forward_throttle,
                             disabled,
                             action_metrics,
+                            false,
                         )
                         .await;
                     }
@@ -4079,9 +4149,55 @@ async fn run_actions_in_tenant(
     throttle: &parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>,
     disabled: &HashSet<String>,
     action_metrics: &HashMap<String, Arc<ActionMetrics>>,
+    input_retain: bool,
 ) {
     for action in actions {
         match action {
+            RuleAction::RepublishFn { args } => {
+                counters.total.fetch_add(1, Ordering::Relaxed);
+                // The input message names `${topic}`, `${qos}` and
+                // `${retain}`. A republish never starts a rule again:
+                // the sink fans out to subscribers and does not call
+                // `dispatch_ingress`.
+                let input = functions::InputMessage {
+                    topic,
+                    qos: qos_cap,
+                    retain: input_retain,
+                };
+                let outcome = match functions::render_republish(args, &payload, input) {
+                    Ok(message) => match broker_sink {
+                        Some(sink) => sink
+                            .publish_message_in_tenant(tenant, message)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        None => Err("no broker sink configured".to_string()),
+                    },
+                    Err(e) => Err(e),
+                };
+                match outcome {
+                    Ok(()) => {
+                        counters.success.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        counters.failed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            rule_id = %rule_id,
+                            error = %e,
+                            "Rule republish function failed; continuing with remaining actions"
+                        );
+                    }
+                }
+            }
+            RuleAction::Console => {
+                counters.total.fetch_add(1, Ordering::Relaxed);
+                counters.success.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    rule_id = %rule_id,
+                    topic = %topic,
+                    result = %functions::console_text(&payload),
+                    "rule console"
+                );
+            }
             RuleAction::Republish {
                 topic: dst,
                 qos: action_qos,

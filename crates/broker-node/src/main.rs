@@ -3649,6 +3649,8 @@ struct Shared {
     engine: Arc<RuleEngine>,
     sink: Arc<dyn BrokerSink>,
     retained: Arc<dyn RetainedStore>,
+    /// Retained writer shared by the ingress pipeline and the rule sink.
+    retain_writer: RetainWriter,
     /// Retained-delivery settings for W1-28: shared with the management
     /// API so kernel ingress and management publishes enforce the same
     /// configurable limits. One Arc clone at boot; reads take a short
@@ -4053,12 +4055,23 @@ impl Shared {
         // NO MQTT LOOPBACK: rule republishes route straight into the local
         // router/mailboxes through this in-memory sink. The same sink
         // serves window-flush republish actions (INDRA-213).
+        let retained: Arc<dyn RetainedStore> = Arc::new(MemoryStore::new());
+        let retainer_config = Arc::new(broker_api::v5::retainer::RetainerConfigStore::new());
+        let tenant_limits = Arc::new(broker_session::tenant_limits::TenantLimitStore::default());
+        let retain_writer = RetainWriter {
+            retained: retained.clone(),
+            config: retainer_config.clone(),
+            stats: stats.clone(),
+            metrics: metrics.clone(),
+            tenant_limits: tenant_limits.clone(),
+        };
         let sink: Arc<dyn BrokerSink> = Arc::new(InMemoryBrokerSink {
             router: router.clone(),
             sessions: sessions.clone(),
             conns: conns.clone(),
             metrics: metrics.clone(),
             engine: engine.clone(),
+            retain_writer: retain_writer.clone(),
         });
         engine.set_broker_sink(sink.clone());
 
@@ -4127,8 +4140,9 @@ impl Shared {
             conns,
             engine,
             sink,
-            retained: Arc::new(MemoryStore::new()),
-            retainer_config: Arc::new(broker_api::v5::retainer::RetainerConfigStore::new()),
+            retained,
+            retain_writer,
+            retainer_config,
             auto_subscribe: Arc::new(broker_api::v5::auto_subscribe::AutoSubscribeStore::new()),
             bans: Arc::new(broker_api::v5::banned::BanStore::new()),
             licence: Arc::new(broker_api::licence::LicenceStore::new()),
@@ -4184,7 +4198,7 @@ impl Shared {
             api_listeners: Arc::new(std::sync::RwLock::new(None)),
             listener_store: Arc::new(broker_api::v5::listeners::ListenerStore::new()),
             api_startup_config: Arc::new(std::sync::RwLock::new(None)),
-            tenant_limits: Arc::new(broker_session::tenant_limits::TenantLimitStore::default()),
+            tenant_limits,
             tls_verify_client_cert: false,
             wss_verify_client_cert: false,
             tls_verify_peer: false,
@@ -4971,6 +4985,118 @@ fn apply_tenant_limit_defaults(shared: &Shared, cfg: &broker_config::schema::Bro
         .set_default_retained_per_tenant_cap(defaults.max_retained as usize);
 }
 
+/// Writes retained messages: store, clear and the limits that guard them.
+/// The ingress pipeline and the rule republish sink share it, so a
+/// retained message obeys the same payload size, message count and tenant
+/// bounds whichever way it arrives. One `Arc` clone per field; it holds
+/// no lock of its own.
+#[derive(Clone)]
+struct RetainWriter {
+    retained: Arc<dyn RetainedStore>,
+    config: Arc<broker_api::v5::retainer::RetainerConfigStore>,
+    stats: Arc<StatsStore>,
+    metrics: Arc<Metrics>,
+    tenant_limits: Arc<broker_session::tenant_limits::TenantLimitStore>,
+}
+
+impl RetainWriter {
+    /// Recount retained topics into the stats store.
+    async fn sync_stat(&self) {
+        match self.retained.count_retained().await {
+            Ok(count) => self.stats.set_retained(count as u64),
+            Err(e) => warn!("Retained recount failed: {}", e),
+        }
+    }
+
+    /// Store the message as retained state of `tenant`, or clear the
+    /// topic when the payload is empty. Oversized payloads are delivered
+    /// but not stored, and new topics past the configured count are
+    /// dropped while replacements still land. The hard cap in
+    /// `broker_storage::MAX_RETAINED_MESSAGES` always applies inside the
+    /// store. Retained state never crosses tenants.
+    async fn apply(&self, topic: &Topic, qos: QoS, payload: &Bytes, tenant: &str) {
+        if payload.is_empty() {
+            if let Err(e) = self.retained.clear_retained_in_tenant(topic, tenant).await {
+                warn!("Retained clear failed for {}: {}", topic.as_str(), e);
+            } else {
+                self.sync_stat().await;
+            }
+        } else {
+            let cfg = self.config.get();
+            let max_bytes =
+                broker_api::v5::retainer::parse_bytesize_to_bytes(&cfg.max_payload_size)
+                    .unwrap_or(1_048_576);
+            let mut drop_new = false;
+            let mut tenant_limited = false;
+            if (payload.len() as u64) > max_bytes {
+                drop_new = true;
+            } else {
+                let cap = cfg.backend.max_retained_messages;
+                if cap > 0 {
+                    let already = self
+                        .retained
+                        .get_retained_in_tenant(topic, tenant)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if !already && self.stats.retained() >= cap {
+                        drop_new = true;
+                    }
+                }
+                // TM-06: per-tenant retained bound lives in the store.
+                // The store checks the cap inside its write lock.
+                // Caps sync off path at boot and on API writes.
+                // This path takes no new lock. It reads one atomic
+                // for the unreachable flag. It counts and logs each
+                // refusal.
+                if !drop_new && self.tenant_limits.is_unreachable() {
+                    drop_new = true;
+                    tenant_limited = true;
+                    self.tenant_limits.count_store_denied();
+                }
+            }
+            if tenant_limited {
+                self.metrics.inc_tenant_retained_dropped();
+                self.tenant_limits.count_retained_dropped();
+                tracing::warn!(
+                    tenant = %tenant,
+                    topic = %topic.as_str(),
+                    "tenant retained limit reached: dropping new retained topic"
+                );
+            }
+            if drop_new {
+                // Delivered but not stored, matching the management path.
+            } else {
+                match self
+                    .retained
+                    .set_retained_in_tenant_checked(topic.clone(), qos, payload.clone(), tenant)
+                    .await
+                {
+                    Ok(broker_storage::RetainedWriteOutcome::Stored) => {
+                        self.sync_stat().await;
+                    }
+                    Ok(broker_storage::RetainedWriteOutcome::DroppedPerTenantLimit) => {
+                        self.metrics.inc_tenant_retained_dropped();
+                        self.tenant_limits.count_retained_dropped();
+                        tracing::warn!(
+                            tenant = %tenant,
+                            topic = %topic.as_str(),
+                            "tenant retained limit reached: dropping new retained topic"
+                        );
+                    }
+                    Ok(broker_storage::RetainedWriteOutcome::DroppedGlobalLimit) => {
+                        // Delivered but not stored at the global cap.
+                    }
+                    Err(e) => {
+                        warn!("Retained store failed for {}: {}", topic.as_str(), e);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// [`BrokerSink`] that forwards rule output directly to local router
 /// subscribers. Pure in-memory fan-out: no sockets, no MQTT loopback.
 struct InMemoryBrokerSink {
@@ -4979,6 +5105,7 @@ struct InMemoryBrokerSink {
     conns: Arc<ConnTable>,
     metrics: Arc<Metrics>,
     engine: Arc<RuleEngine>,
+    retain_writer: RetainWriter,
 }
 
 #[async_trait]
@@ -5009,11 +5136,70 @@ impl BrokerSink for InMemoryBrokerSink {
         qos: QoS,
         retain: bool,
     ) -> Result<(), broker_rules::RuleEngineError> {
+        self.fan_out(
+            tenant,
+            topic,
+            payload,
+            qos,
+            retain,
+            &PublishV5Props::default(),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Publish one message that a `republish` function rendered. The
+    /// MQTT v5 properties ride to version-5 subscribers.
+    async fn publish_message_in_tenant(
+        &self,
+        tenant: &str,
+        message: broker_rules::RepublishMessage,
+    ) -> Result<(), broker_rules::RuleEngineError> {
+        let props = PublishV5Props {
+            format: message.properties.payload_format,
+            expiry: message.properties.message_expiry,
+            users: message
+                .properties
+                .user_properties
+                .into_iter()
+                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
+                .collect(),
+        };
+        self.fan_out(
+            tenant,
+            message.topic,
+            message.payload,
+            message.qos,
+            message.retain,
+            &props,
+        )
+        .await;
+        Ok(())
+    }
+}
+
+impl InMemoryBrokerSink {
+    /// Store the message as retained state when it carries the retain
+    /// flag, then fan it out to the subscribers of `tenant`.
+    async fn fan_out(
+        &self,
+        tenant: &str,
+        topic: Topic,
+        payload: Bytes,
+        qos: QoS,
+        retain: bool,
+        props: &PublishV5Props,
+    ) {
+        if retain {
+            self.retain_writer
+                .apply(&topic, qos, &payload, tenant)
+                .await;
+        }
         // Rule output must not fire delivery events. It routes here,
         // not through ingress. A delivery event here requeues and
         // retriggers the same rule. The drain loop then emits 64
         // copies for one delivery.
-        let deliveries = build_downlink_frames(
+        let deliveries = build_downlink_frames_with_publisher_and_props(
             &self.router,
             &self.sessions,
             &self.metrics,
@@ -5021,7 +5207,9 @@ impl BrokerSink for InMemoryBrokerSink {
             qos,
             retain,
             &payload,
+            None,
             tenant,
+            props,
             None,
         );
         // Only frames that reached a live mailbox count as
@@ -5051,7 +5239,6 @@ impl BrokerSink for InMemoryBrokerSink {
         self.metrics.inc_publish_sent_by(enqueued);
         self.metrics.inc_delivered_by(enqueued);
         self.metrics.inc_bytes_sent_by(enqueued_bytes);
-        Ok(())
     }
 }
 
@@ -5464,10 +5651,7 @@ fn count_subscription_stats(sessions: &SessionManager, stats: &StatsStore) {
 /// drifting the way check-then-act deltas would. Single-tenant installs
 /// observe the same count as the old `#`-match read.
 async fn sync_retained_stat(shared: &Shared) {
-    match shared.retained.count_retained().await {
-        Ok(count) => shared.stats.set_retained(count as u64),
-        Err(e) => warn!("Retained recount failed: {}", e),
-    }
+    shared.retain_writer.sync_stat().await;
 }
 
 /// Current Unix time in seconds for monitor points. Zero on clock failure
@@ -7759,95 +7943,13 @@ async fn ingress_pipeline_with_publisher_and_props(
     // inside the store. Retained-only work; non-retained fan-out and
     // fan-in never take the config lock. Scoped to the publisher's
     // tenant: retained state never crosses tenants.
+    // The writer holds the retained store and the limits it needs, so a
+    // rule republish with the retain flag takes the same path.
     if retain {
-        if payload.is_empty() {
-            if let Err(e) = shared
-                .retained
-                .clear_retained_in_tenant(topic, publisher_tenant)
-                .await
-            {
-                warn!("Retained clear failed for {}: {}", topic.as_str(), e);
-            } else {
-                sync_retained_stat(shared).await;
-            }
-        } else {
-            let cfg = shared.retainer_config.get();
-            let max_bytes =
-                broker_api::v5::retainer::parse_bytesize_to_bytes(&cfg.max_payload_size)
-                    .unwrap_or(1_048_576);
-            let mut drop_new = false;
-            let mut tenant_limited = false;
-            if (payload.len() as u64) > max_bytes {
-                drop_new = true;
-            } else {
-                let cap = cfg.backend.max_retained_messages;
-                if cap > 0 {
-                    let already = shared
-                        .retained
-                        .get_retained_in_tenant(topic, publisher_tenant)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some();
-                    if !already && shared.stats.retained() >= cap {
-                        drop_new = true;
-                    }
-                }
-                // TM-06: per-tenant retained bound lives in the store.
-                // The store checks the cap inside its write lock.
-                // Caps sync off path at boot and on API writes.
-                // This path takes no new lock. It reads one atomic
-                // for the unreachable flag. It counts and logs each
-                // refusal.
-                if !drop_new && shared.tenant_limits.is_unreachable() {
-                    drop_new = true;
-                    tenant_limited = true;
-                    shared.tenant_limits.count_store_denied();
-                }
-            }
-            if tenant_limited {
-                shared.metrics.inc_tenant_retained_dropped();
-                shared.tenant_limits.count_retained_dropped();
-                tracing::warn!(
-                    tenant = %publisher_tenant,
-                    topic = %topic.as_str(),
-                    "tenant retained limit reached: dropping new retained topic"
-                );
-            }
-            if drop_new {
-                // Delivered but not stored, matching the management path.
-            } else {
-                match shared
-                    .retained
-                    .set_retained_in_tenant_checked(
-                        topic.clone(),
-                        qos,
-                        payload.clone(),
-                        publisher_tenant,
-                    )
-                    .await
-                {
-                    Ok(broker_storage::RetainedWriteOutcome::Stored) => {
-                        sync_retained_stat(shared).await;
-                    }
-                    Ok(broker_storage::RetainedWriteOutcome::DroppedPerTenantLimit) => {
-                        shared.metrics.inc_tenant_retained_dropped();
-                        shared.tenant_limits.count_retained_dropped();
-                        tracing::warn!(
-                            tenant = %publisher_tenant,
-                            topic = %topic.as_str(),
-                            "tenant retained limit reached: dropping new retained topic"
-                        );
-                    }
-                    Ok(broker_storage::RetainedWriteOutcome::DroppedGlobalLimit) => {
-                        // Delivered but not stored at the global cap.
-                    }
-                    Err(e) => {
-                        warn!("Retained store failed for {}: {}", topic.as_str(), e);
-                    }
-                }
-            }
-        }
+        shared
+            .retain_writer
+            .apply(topic, qos, payload, publisher_tenant)
+            .await;
     }
 
     // Rules execute at ingress on this node, before local fan-out.
@@ -7859,7 +7961,7 @@ async fn ingress_pipeline_with_publisher_and_props(
     // setup runs as before.
     let rules_fired = shared
         .engine
-        .dispatch_ingress_in_tenant(publisher_tenant, topic, payload, qos, &shared.sink)
+        .dispatch_ingress_message(publisher_tenant, topic, payload, qos, retain, &shared.sink)
         .await;
     shared.metrics.inc_rules_executed_by(rules_fired as u64);
 

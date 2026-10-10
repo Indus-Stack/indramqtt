@@ -460,6 +460,79 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 4e. A built-in rule action works through the production path ---
+# A rule is created with the management API. It republishes with the
+# built-in `republish` function: the topic is fixed and the payload is a
+# template that reads a field of the result. A real MQTT client publishes
+# a random value and another client receives it on the republish topic.
+# A user function in the same list is refused with 400.
+python3 - "$API_PORT" "$MQTT_PORT" "$API_KEY_GOOD" <<'PY'
+import json, os, socket, struct, sys, urllib.request, urllib.error
+api_port, mqtt_port, key = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+def api(method, path, body=None):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}/api/v5{path}", data=data, method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+
+def field(data):
+    return struct.pack(">H", len(data)) + data
+
+def client(client_id):
+    sock = socket.create_connection(("127.0.0.1", mqtt_port), timeout=5)
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return sock, sock.recv(4) == b"\x20\x02\x00\x00"
+
+status, _ = api("POST", "/rules", {
+    "id": "smoke-republish",
+    "sql": 'SELECT v FROM "smoke/rule/in"',
+    "actions": [{"function": "republish",
+                 "args": {"topic": "smoke/rule/out", "payload": "got=${v}"}}],
+})
+report("a rule with the republish function is created through the API", status == 201)
+status, body = api("POST", "/rules", {
+    "id": "smoke-user-fn",
+    "sql": 'SELECT * FROM "smoke/rule/never"',
+    "actions": [{"function": "some_module:some_function", "args": {}}],
+})
+report("a rule with a user function is refused with 400", status == 400)
+
+sub, sub_ok = client(b"smoke-rule-sub")
+topic_out = b"smoke/rule/out"
+sub.sendall(packet(0x82, b"\x00\x01" + field(topic_out) + b"\x00"))
+suback = sub.recv(5)
+pub, pub_ok = client(b"smoke-rule-pub")
+value = os.urandom(8).hex().encode()
+pub.sendall(packet(0x30, field(b"smoke/rule/in") + b'{"v":"' + value + b'"}'))
+sub.settimeout(5)
+try:
+    delivered = sub.recv(200)
+except OSError:
+    delivered = b""
+report("the republish rule delivers a random value to a subscriber of the republish topic",
+       sub_ok and pub_ok and suback[:1] == b"\x90"
+       and delivered.endswith(b"got=" + value))
+api("DELETE", "/rules/smoke-republish")
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 # --- 4a. Unsubscribe on the kernel listener keeps the connection ---
 # Run this check only when the kernel owns the MQTT listener.
 # A client subscribes, gets a message, unsubscribes, gets UNSUBACK,

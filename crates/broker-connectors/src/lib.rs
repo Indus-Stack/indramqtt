@@ -565,45 +565,49 @@ impl BackoffState {
 /// else is a dispatch error, so typos fail loudly at buffer time
 /// instead of silently producing wrong object names.
 pub fn render_template(template: &str, vars: &[(&str, String)]) -> Result<String> {
+    render_template_with(template, |name| {
+        vars.iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.clone())
+    })
+}
+
+/// The scanner behind [`render_template`]. Every `${name}` must close and
+/// must not be empty. `lookup` gives the text for one name; `None` is a
+/// dispatch error that names the variable. Callers with their own variable
+/// source (for example the fields of a rule result) pass a closure and
+/// get the same syntax rules and the same error text.
+pub fn render_template_with<F>(template: &str, mut lookup: F) -> Result<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let mut out = String::with_capacity(template.len() + 32);
-    let bytes = template.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            let start = i + 2;
-            let mut end = start;
-            while end < bytes.len() && bytes[end] != b'}' {
-                end += 1;
-            }
-            if end >= bytes.len() {
-                return Err(ConnectorError::Dispatch(format!(
-                    "unclosed template variable in {template:?}"
-                )));
-            }
-            let name = &template[start..end];
-            if name.is_empty() {
-                return Err(ConnectorError::Dispatch(format!(
-                    "empty template variable in {template:?}"
-                )));
-            }
-            let value = vars
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| value.clone());
-            match value {
-                Some(value) => out.push_str(&value),
-                None => {
-                    return Err(ConnectorError::Dispatch(format!(
-                        "unknown template variable {name:?} in {template:?}"
-                    )))
-                }
-            }
-            i = end + 1;
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
+    let mut rest = template;
+    while let Some(pos) = rest.find("${") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(ConnectorError::Dispatch(format!(
+                "unclosed template variable in {template:?}"
+            )));
+        };
+        let name = &after[..end];
+        if name.is_empty() {
+            return Err(ConnectorError::Dispatch(format!(
+                "empty template variable in {template:?}"
+            )));
         }
+        match lookup(name) {
+            Some(value) => out.push_str(&value),
+            None => {
+                return Err(ConnectorError::Dispatch(format!(
+                    "unknown template variable {name:?} in {template:?}"
+                )))
+            }
+        }
+        rest = &after[end + 1..];
     }
+    out.push_str(rest);
     Ok(out)
 }
 
@@ -1207,6 +1211,17 @@ mod tests {
         assert!(render_template("a/${topic", &vars).is_err());
         assert!(render_template("a/${}", &vars).is_err());
         assert!(render_template("price: $5", &vars).is_ok());
+    }
+
+    #[test]
+    fn test_render_template_with_keeps_multibyte_text() {
+        let out = render_template_with("caf\u{e9}/${a}/\u{4e2d}", |name| {
+            (name == "a").then(|| "x".to_string())
+        })
+        .unwrap();
+        assert_eq!(out, "caf\u{e9}/x/\u{4e2d}");
+        let err = render_template_with("${gone}", |_| None).unwrap_err();
+        assert!(err.to_string().contains("unknown template variable"));
     }
 
     #[test]
