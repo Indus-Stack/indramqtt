@@ -19119,6 +19119,48 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn client_detail_reads_mqtt_connected_session() {
+        // Detail read finds a kernel-bind session and a console
+        // session. Unknown ids still answer 404.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Kernel-bind session: same calls as the edge bind path
+        // (create in tenant, pin the connection, record keepalive).
+        let (bind_session, _, _) = state.sessions.get_or_create_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "ap03-bind-1",
+            true,
+            4,
+            0,
+            100,
+            65536,
+        );
+        state.sessions.bind_session(&bind_session, 9101);
+        *bind_session.keepalive_secs.write() = 60;
+        let (status, body) = server.get_auth("/api/v5/clients/ap03-bind-1", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], json!("ap03-bind-1"));
+        assert_eq!(body["connected"], json!(true));
+        // Console session over the live socket.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("ap03-ws-1", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        let (status, body) = server.get_auth("/api/v5/clients/ap03-ws-1", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], json!("ap03-ws-1"));
+        assert_eq!(body["connected"], json!(true));
+        let (status, body) = server
+            .get_auth("/api/v5/clients/ap03-ws-missing", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+    }
+
+    #[tokio::test]
     async fn client_keepalive_write_returns_detail_shape() {
         // Hidden keepalive route: takes `interval`, answers the full
         // detail shape with the new value applied to live state.

@@ -418,3 +418,4 @@ is not changed.
   `oneOf` for each item, but a `republish` or `console` item also matches the
   schema `user_provided_function` (a string `function` and an object `args`).
   The checker reports this overlap as a warning, not as an error.
+- `GET /clients/{clientid}/authorization/cache`, response 200. The specification declares one object with `access`, `result`, `topic` and `updated_time`. One session holds many decisions, one per topic and access type. The broker returns a bare array with one object per decision, oldest first. An empty cache returns an empty array. The checker reports a type error for this row.
