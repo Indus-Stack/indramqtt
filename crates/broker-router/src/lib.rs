@@ -3905,4 +3905,18 @@ impl ConnTable {
         }
         false
     }
+
+    /// Snapshot of every registered connection id.
+    ///
+    /// Locks one bucket at a time. Shutdown path only. The publish
+    /// and deliver paths never call this.
+    pub fn connection_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for shard in &self.shards {
+            for id in shard.lock().keys() {
+                ids.push(*id);
+            }
+        }
+        ids
+    }
 }

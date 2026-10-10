@@ -279,6 +279,24 @@ impl ListenerStore {
         *self.controller.write().unwrap_or_else(|p| p.into_inner()) = Some(controller);
     }
 
+    /// Stop every listener socket. Marks each row stopped.
+    ///
+    /// Reads one snapshot, then stops one row at a time. Shutdown
+    /// path only. Publish and deliver never call this.
+    pub fn stop_all(&self) {
+        let control = self.controller();
+        let ids: Vec<String> = self.list().iter().map(|row| row.id.clone()).collect();
+        for id in &ids {
+            if let Some(control) = control.as_ref() {
+                control.stop_listener(id);
+            }
+            if let Some(mut row) = self.get(id) {
+                row.running = false;
+                self.update(row);
+            }
+        }
+    }
+
     /// Fetch the installed control, if any.
     fn controller(&self) -> Option<Arc<dyn ListenerController>> {
         self.controller

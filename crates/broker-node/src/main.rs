@@ -556,6 +556,14 @@ const V5_RC_PROTOCOL_ERROR: u8 = 0x82;
 /// binds carry the documented quota code below with a reason string.
 const V5_RC_CONNECT_QUOTA: u8 = 0x97;
 
+/// DISCONNECT reason for the orderly stop.
+/// Reason: MQTT 5 code 0x8B means Server shutting down.
+const SHUTDOWN_DISCONNECT_RC: u8 = 0x8B;
+
+/// Longest wait for clients to close during the stop.
+/// Reason: the removal plan bounds the orderly stop at ten seconds.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Server-side reason string for one CONNACK return code (X1-02).
 /// Our own wording, written for this broker (never copied): success
 /// and identifier-rejected omit the property (`None`) to keep the
@@ -10443,6 +10451,76 @@ fn decode_unbind_reason(meta: &[u8]) -> Option<u8> {
     decode_unbind_meta_full(meta).and_then(|(_, reason)| reason)
 }
 
+/// Waits for the stop signal. Returns on SIGTERM or SIGINT.
+#[cfg(unix)]
+async fn wait_for_shutdown() {
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+    match (terminate, interrupt) {
+        (Ok(mut terminate), Ok(mut interrupt)) => {
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
+            }
+        }
+        (Ok(mut terminate), Err(_)) => {
+            let _ = terminate.recv().await;
+        }
+        (Err(_), Ok(mut interrupt)) => {
+            let _ = interrupt.recv().await;
+        }
+        (Err(_), Err(_)) => {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Waits for the stop signal. Returns on Ctrl-C.
+#[cfg(not(unix))]
+async fn wait_for_shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Stops the broker in order. Stops new accepts, closes clients, flushes state.
+///
+/// Sends `ConnClose` with reason 0x8B to every registered connection.
+/// Version-5 clients get DISCONNECT 0x8B first. Version-4 clients get
+/// a plain close. The close is clean, thus no will fires. Waits up to
+/// [`SHUTDOWN_GRACE`] for the session count to reach zero, then syncs
+/// the offline store directory (appends already fsync per write).
+async fn shutdown(shared: &Shared) {
+    // Stop new accepts first. Running tasks keep their sockets.
+    shared.listener_store.stop_all();
+    // Ask every live connection to close through the delivery table.
+    for conn_id in shared.conns.connection_ids() {
+        if let Ok(frame) = BrokerFrame::new(
+            OpCode::ConnClose,
+            conn_id,
+            0,
+            Bytes::from(vec![SHUTDOWN_DISCONNECT_RC]),
+            Bytes::new(),
+        ) {
+            let _ = shared.conns.route(conn_id, frame);
+        }
+    }
+    // Wait for the clients to leave, at most the grace period.
+    let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+    while shared.sessions.connected_count() != 0 {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Flush durable state. Each append already flushes and fsyncs, so
+    // only the directory entry still needs a sync for renames.
+    if let Some(store) = shared.sessions.offline_store() {
+        if let Ok(dir) = std::fs::File::open(store.dir()) {
+            let _ = dir.sync_all();
+        }
+    }
+    info!("Kernel stopped orderly");
+}
+
 async fn serve_brokerlink(bind: &str, shared: Shared) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind).await?;
     info!("BrokerLink IPC listening on {}", bind);
@@ -11537,7 +11615,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         record.running = true;
         shared.listener_store.update(record);
     }
-    serve_brokerlink(&args.brokerlink_bind, shared).await
+    // Run until the edge link ends or a stop signal arrives. The signal
+    // path leaves the edge link unchanged and stops the kernel in order.
+    tokio::select! {
+        result = serve_brokerlink(&args.brokerlink_bind, shared.clone()) => {
+            result?;
+        }
+        () = wait_for_shutdown() => {
+            shutdown(&shared).await;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -11613,6 +11701,214 @@ mod tests {
         let args = resolve_boot(&dir, &["--node-id", "indra-node-1"]);
         assert_eq!(args.node_id, "indra-node-1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Orderly stop closes sockets, tells v5 clients why, keeps wills.
+    ///
+    /// Goes through the broker: three sockets on a kernel listener, then
+    /// `shutdown`. v5 sees DISCONNECT 0x8B. v4 sees a plain close. The
+    /// will watcher sees no publish. New accepts are refused.
+    #[tokio::test]
+    async fn orderly_stop_closes_native_connections_without_will() {
+        // Encode one remaining length as MQTT varint bytes.
+        fn remaining_len(mut len: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let mut byte = (len % 128) as u8;
+                len /= 128;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    break;
+                }
+            }
+            out
+        }
+        // Build one 3.1.1 CONNECT packet.
+        fn connect_v4(client_id: &str) -> Vec<u8> {
+            let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id.as_bytes());
+            let mut packet = vec![0x10];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        // Build one v5 CONNECT packet with a will.
+        fn connect_v5_will(client_id: &str, topic: &str, payload: &[u8]) -> Vec<u8> {
+            let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x06, 0x00, 0x3C];
+            body.push(0x00);
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id.as_bytes());
+            body.push(0x00);
+            body.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            body.extend_from_slice(topic.as_bytes());
+            body.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            body.extend_from_slice(payload);
+            let mut packet = vec![0x10];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        // Build one 3.1.1 SUBSCRIBE packet for one filter.
+        fn subscribe_once(packet_id: u16, filter: &str) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            body.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+            body.extend_from_slice(filter.as_bytes());
+            body.push(0x00);
+            let mut packet = vec![0x82];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        // Read one full MQTT packet from a socket.
+        async fn read_packet(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+            use tokio::io::AsyncReadExt as _;
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).await?;
+            let mut packet = vec![first[0]];
+            let mut multiplier = 1usize;
+            let mut remaining = 0usize;
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                packet.push(byte[0]);
+                remaining += ((byte[0] & 0x7F) as usize) * multiplier;
+                multiplier *= 128;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+                if multiplier > 128 * 128 * 128 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "length runs away",
+                    ));
+                }
+            }
+            if remaining > 0 {
+                let mut body = vec![0u8; remaining];
+                stream.read_exact(&mut body).await?;
+                packet.extend_from_slice(&body);
+            }
+            Ok(packet)
+        }
+        // Read one packet, at most five seconds.
+        async fn read_soon(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(stream))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "no packet in time")
+                })?
+        }
+
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        // One free loopback port for the test listener.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        // Boot one kernel-owned TCP row on that port.
+        let mut listeners = broker_config::schema::ListenersConf::default();
+        listeners.tcp.enabled = true;
+        listeners.tcp.bind = format!("127.0.0.1:{port}");
+        listeners.tcp.native = true;
+        listeners.tls.enabled = false;
+        listeners.ws.enabled = false;
+        listeners.wss.enabled = false;
+        shared.listener_store.reset_from_config(&listeners);
+        let control = std::sync::Arc::new(super::native::NativeListenerController::new(
+            shared.clone(),
+            listeners,
+        ));
+        shared.listener_store.set_controller(control.clone());
+        let row = shared
+            .listener_store
+            .get("tcp:default")
+            .expect("tcp row exists");
+        broker_api::v5::listeners::ListenerController::start_listener(&*control, &row)
+            .expect("listener starts");
+        let mut running = row;
+        running.running = true;
+        shared.listener_store.update(running);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // A watcher waits on the will topic.
+        let mut watcher = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("watcher dials");
+        watcher
+            .write_all(&connect_v4("shutdown-watcher"))
+            .await
+            .expect("watcher CONNECT sends");
+        assert_eq!(
+            read_soon(&mut watcher)
+                .await
+                .expect("watcher CONNACK arrives"),
+            vec![0x20, 0x02, 0x00, 0x00]
+        );
+        watcher
+            .write_all(&subscribe_once(1, "shutdown/will"))
+            .await
+            .expect("watcher SUBSCRIBE sends");
+        let suback = read_soon(&mut watcher)
+            .await
+            .expect("watcher SUBACK arrives");
+        assert_eq!(suback[0], 0x90);
+        assert_eq!(suback[suback.len() - 1], 0x00);
+        // A v5 client with a will connects.
+        let mut fifth = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("v5 dials");
+        fifth
+            .write_all(&connect_v5_will("shutdown-v5", "shutdown/will", b"bye"))
+            .await
+            .expect("v5 CONNECT sends");
+        let connack = read_soon(&mut fifth).await.expect("v5 CONNACK arrives");
+        assert_eq!(connack[0], 0x20);
+        let mut at = 1usize;
+        while connack[at] & 0x80 != 0 {
+            at += 1;
+        }
+        let body = &connack[at + 1..];
+        assert!(body.len() >= 2 && body[1] == 0, "v5 CONNACK accepts");
+        // A plain v4 client connects.
+        let mut fourth = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("v4 dials");
+        fourth
+            .write_all(&connect_v4("shutdown-v4"))
+            .await
+            .expect("v4 CONNECT sends");
+        assert_eq!(
+            read_soon(&mut fourth).await.expect("v4 CONNACK arrives"),
+            vec![0x20, 0x02, 0x00, 0x00]
+        );
+        assert_eq!(shared.sessions.connected_count(), 3);
+        // Stop the broker in order.
+        shutdown(&shared).await;
+        // v5 sees DISCONNECT 0x8B, then the close.
+        assert_eq!(
+            read_soon(&mut fifth).await.expect("v5 DISCONNECT arrives"),
+            vec![0xE0, 0x01, 0x8B]
+        );
+        assert!(read_soon(&mut fifth).await.is_err(), "v5 socket closes");
+        // v4 sees a plain close with no packet.
+        assert!(read_soon(&mut fourth).await.is_err(), "v4 socket closes");
+        // The will never arrives: the close is clean.
+        if let Ok(Ok(packet)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_packet(&mut watcher)).await
+        {
+            assert_ne!(packet[0], 0x30, "no will publish arrives");
+        }
+        // The count is zero and new accepts are refused.
+        assert_eq!(shared.sessions.connected_count(), 0);
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "accepts stop"
+        );
     }
 
     #[test]
