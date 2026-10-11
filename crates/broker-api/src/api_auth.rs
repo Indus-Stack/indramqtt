@@ -325,16 +325,22 @@ pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next:
         return forbidden();
     }
 
+    let audited = matches!(method.as_str(), "POST" | "PUT" | "DELETE");
     let mut req = req;
     req.extensions_mut().insert(info.clone());
     let started = std::time::Instant::now();
     let response = next.run(req).await;
     // Management audit (W2-28): one fire-and-forget entry per
-    // authenticated management request, recorded after the response so
-    // the audited request never waits on the ring. Management-plane
-    // only; publish and deliver never pass through here. The peer
-    // address is not available in this layer without connection info,
-    // so the record carries no address and the render omits `source_ip`.
+    // authenticated management write, recorded after the response so
+    // the audited request never waits on the ring. Reads make no
+    // record: the documented audit methods are post, put and delete.
+    // Management-plane only; publish and deliver never pass through
+    // here. The peer address is not available in this layer without
+    // connection info, so the record carries no address and the render
+    // omits `source_ip`.
+    if !audited {
+        return response;
+    }
     let status = response.status().as_u16();
     state.audit.record(crate::v5::audit::AuditRecordInput {
         created_at_us: crate::v5::audit::now_micros(),

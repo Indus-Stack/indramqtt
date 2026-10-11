@@ -157,9 +157,12 @@ impl TraceSession {
             "formatter".to_string(),
             serde_json::Value::String(self.formatter.clone()),
         );
+        // The documented shape is a list with one row per node.
+        // This broker runs one node, so the list holds one row.
+        // The row carries the true node name and the true byte count.
         obj.insert(
             "log_size".to_string(),
-            serde_json::json!({ (local_node_name()): log_size }),
+            serde_json::json!([{ "node": local_node_name(), "size": log_size }]),
         );
         serde_json::Value::Object(obj)
     }
@@ -1232,7 +1235,7 @@ mod tests {
             assert_eq!(created[field], serde_json::json!(filter));
             assert!(created["start_at"].is_string());
             assert!(created["end_at"].is_string());
-            assert!(created["log_size"].is_object());
+            assert!(created["log_size"].is_array());
         }
     }
 
@@ -1527,9 +1530,13 @@ mod tests {
             response_parts(create_trace(State(state.clone()), valid_body("trace-size")).await)
                 .await;
         assert_eq!(status, StatusCode::OK);
-        let initial = created["log_size"][local_node_name()]
+        let initial = created["log_size"][0]["size"]
             .as_u64()
             .expect("log_size renders a byte count");
+        assert_eq!(
+            created["log_size"][0]["node"],
+            serde_json::json!(local_node_name())
+        );
         assert_eq!(
             initial, 0,
             "fresh sessions start empty (no synthesised header)"
@@ -1540,7 +1547,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let items = listed.as_array().expect("list is an array");
         assert_eq!(items.len(), 1);
-        let reported = items[0]["log_size"][local_node_name()]
+        let reported = items[0]["log_size"][0]["size"]
             .as_u64()
             .expect("list renders a byte count");
         assert_eq!(reported, state.traces.log_len("trace-size") as u64);

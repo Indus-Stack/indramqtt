@@ -1289,28 +1289,7 @@ async fn apply_bind_request_inner(
                 &format!("banned CONNECT refused for '{}'", req.client_id),
                 serde_json::json!({"clientid": req.client_id}),
             );
-            // CONNECT drives the audit ring.
-            // Record the refusal with measured values only.
-            // CONNECT is rare, so the write stays off the hot path.
-            shared
-                .audit
-                .record(broker_api::v5::audit::AuditRecordInput {
-                    created_at_us: broker_api::v5::audit::now_micros(),
-                    node: shared.node_id.clone(),
-                    from: broker_api::v5::audit::AUDIT_FROM_MQTT.to_string(),
-                    source: req
-                        .username
-                        .clone()
-                        .unwrap_or_else(|| req.client_id.clone()),
-                    source_ip: req.peerhost.clone().unwrap_or_default(),
-                    operation_id: "/mqtt/connect".to_string(),
-                    operation_type: broker_api::v5::audit::operation_type_for_path("/mqtt/connect"),
-                    operation_result: broker_api::v5::audit::outcome_for_status(403).to_string(),
-                    http_method: "connect".to_string(),
-                    http_status_code: 403,
-                    duration_ms: 0,
-                    tenant: tenant_for_ban.clone(),
-                });
+            // No audit record here. The log holds only post, put and delete.
             return Some(refusal_for_req(frame, &req, 0x8A, alias_max));
         }
         // TM-08: client-certificate check. Runs on connect only, never
@@ -2036,29 +2015,7 @@ async fn apply_bind_request_inner(
             session.set_tenant_id(tenant_for_bind.clone());
             shared.sessions.bind_session(&session, frame.header.conn_id);
             *session.keepalive_secs.write() = req.keepalive_secs;
-            // CONNECT drives the audit ring.
-            // Record the success with measured values only, in the
-            // bind's own tenant. CONNECT is rare, so the write stays
-            // off the hot path.
-            shared
-                .audit
-                .record(broker_api::v5::audit::AuditRecordInput {
-                    created_at_us: broker_api::v5::audit::now_micros(),
-                    node: shared.node_id.clone(),
-                    from: broker_api::v5::audit::AUDIT_FROM_MQTT.to_string(),
-                    source: req
-                        .username
-                        .clone()
-                        .unwrap_or_else(|| req.client_id.clone()),
-                    source_ip: req.peerhost.clone().unwrap_or_default(),
-                    operation_id: "/mqtt/connect".to_string(),
-                    operation_type: broker_api::v5::audit::operation_type_for_path("/mqtt/connect"),
-                    operation_result: broker_api::v5::audit::outcome_for_status(200).to_string(),
-                    http_method: "connect".to_string(),
-                    http_status_code: 200,
-                    duration_ms: 0,
-                    tenant: tenant_for_bind.clone(),
-                });
+            // No audit record here. The log holds only post, put and delete.
             // B4-05: a new connection renegotiates aliases. The inbound
             // bound is the manager default (advertised below in CONNACK);
             // the outbound bound is the client's CONNECT maximum (0 when

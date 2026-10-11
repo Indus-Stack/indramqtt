@@ -168,8 +168,9 @@ is not changed.
   console reads one object with `data` and `meta`:
   `queryAuditLogs` in the API module of the console returns
   `ListDataWithPagination<AuditLogItem>`, and the audit page reads
-  `res.data`. The broker returns one object with `data` and `meta`, so the
-  checker reports a type error for this row.
+  `res.data`. The broker returns the documented array with one page
+  object, so the checker accepts the shape. The console page keeps its
+  own reader.
 - `GET /rule_events`, response 200. The specification declares one object
   (the schema of one event). The management console reads an array of
   events: `const events: RuleEvent[] = await http.get('/rule_events')` in
@@ -254,10 +255,10 @@ is not changed.
   evaluation order gates the next verdict.
 - `POST /trace`, `PUT /trace/{name}/stop` and `GET /trace`, response 200,
   field `log_size`. The specification declares an array of objects. The
-  management console reads an object keyed by node name. Its trace type
-  declares `log_size` as a map from node name to byte count. Its trace
-  table sums the values of that object. The broker returns one object
-  keyed by node name, so the checker reports a type error for these rows.
+  broker returns that array with one row per node. The generated console
+  types read the same array. One hand-written console type reads an object
+  keyed by node name instead. That type is stale. The broker follows the
+  specification.
 - `GET /data/files/{filename}`, response 200. The specification declares
   a JSON string with the single value `binary`. The management console
   reads a file body. Its backup download call requests the path with a

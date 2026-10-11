@@ -13593,7 +13593,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 200);
-        assert!(created["log_size"].is_object());
+        assert!(created["log_size"].is_array());
         let (status, detail) = server
             .get_auth("/api/v5/trace/http-trace-1/log_detail", &token)
             .await;
@@ -13607,7 +13607,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         assert_eq!(stopped["status"], json!("stopped"));
-        assert!(stopped["log_size"].is_object());
+        assert!(stopped["log_size"].is_array());
         let (status, _) = server
             .get_auth("/api/v5/trace/http-trace-1/log_detail", &token)
             .await;
@@ -16998,6 +16998,20 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn configs_dashboard_reports_default_password() {
+        // AP2-05 failing test: `GET /configs/dashboard` carries the
+        // documented `default_password`. Before: the root read as `{}`.
+        // Broker-through: the read goes through the served management
+        // API on `ApiState`. The value is the true initial admin
+        // password, never a stand-in.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server.get_auth("/api/v5/configs/dashboard", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["default_password"], json!("public"));
+    }
+
+    #[tokio::test]
     async fn mqtt_group_delayed_rewrite_topicmetrics_over_http() {
         // AP-04 failing test: the `/mqtt` group answers the documented
         // shapes through the served management API. Before: delayed
@@ -19560,6 +19574,34 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .delete_auth("/api/v5/api_key/w228-audit-b", &token)
             .await;
         assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn audit_log_ignores_reads() {
+        // AP2-05 failing test: a read through the API makes no audit
+        // record. GET /clients then GET /audit shows no entry for the
+        // read. Before: it had one.
+        // Broker-through: both steps go through the served management
+        // API on `ApiState`, not only through the store. The entries
+        // are recorded by the management auth middleware
+        // (`crates/broker-api/src/api_auth.rs`, `require_api_auth`).
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server.get_auth("/api/v5/clients", &token).await;
+        assert_eq!(status, 200);
+        let (status, body) = server.get_auth("/api/v5/audit", &token).await;
+        assert_eq!(status, 200);
+        let data = body[0]["data"].as_array().expect("data is a list");
+        assert!(
+            data.iter()
+                .all(|entry| entry["operation_id"] != json!("/api/v5/clients")),
+            "reads leave no audit record: {body:?}"
+        );
+        assert!(
+            data.iter()
+                .all(|entry| entry["http_method"] != json!("get")),
+            "audit holds only documented methods: {body:?}"
+        );
     }
 
     #[tokio::test]

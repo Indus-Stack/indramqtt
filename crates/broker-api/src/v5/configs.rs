@@ -94,13 +94,15 @@ fn global_zone_view(state: &ApiState) -> serde_json::Value {
 }
 
 /// Render one static root. `global_zone` reads live state; `alarm`
-/// reports its true cap; every other routed root has no broker setting
-/// and reads as an empty object.
+/// reports its true cap; `dashboard` reports the true initial admin
+/// password (`public`, the value that seeds the admin record); every
+/// other routed root has no broker setting and reads as an empty object.
 fn root_body(state: &ApiState, root: &str) -> Option<serde_json::Value> {
     match root {
         "global_zone" => Some(global_zone_view(state)),
         "alarm" => Some(serde_json::json!({"size_limit": MAX_ALARMS})),
-        "broker" | "log" | "sysmon" | "sys_topics" | "dashboard" => Some(serde_json::json!({})),
+        "dashboard" => Some(serde_json::json!({"default_password": "public"})),
+        "broker" | "log" | "sysmon" | "sys_topics" => Some(serde_json::json!({})),
         _ => None,
     }
 }
