@@ -307,6 +307,8 @@ pub const KNOWN_AUTHN_BACKENDS: &[&str] = &[
     "scram",
     "ldap",
     "file",
+    "kerberos",
+    "cinfo",
 ];
 
 /// Returns true for an authenticator backend the kernel can store.
@@ -316,7 +318,7 @@ pub fn is_known_authn_backend(backend: &str) -> bool {
 }
 
 /// Credential mechanisms the authenticator chain addresses.
-pub const KNOWN_AUTHN_MECHANISMS: &[&str] = &["password_based", "jwt", "scram"];
+pub const KNOWN_AUTHN_MECHANISMS: &[&str] = &["password_based", "jwt", "scram", "cinfo", "gssapi"];
 
 /// Returns true for an authenticator mechanism the kernel can store.
 #[must_use]

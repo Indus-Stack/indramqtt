@@ -214,10 +214,28 @@ is not changed.
 - `GET /authentication/{id}/status`, response 200. The specification schema
   types `node_error`, `node_metrics`, `node_resource_metrics` and
   `node_status` as single objects. The specification example answers one
-  array per field with one object per node, and the management console
-  reads arrays (`node_status: Array<{node, status}>`,
-  `node_metrics: Array<...>`). The broker returns one row per node in each
-  array, so the checker reports a type error for this row.
+  array per field with one object per node. The broker follows the
+  documented object shape: one object per field for the local node, with
+  live counters inside `node_metrics` and `node_resource_metrics` and
+  only the node name inside `node_error` (the broker tracks no per-node
+  error text). `status` and `node_status` stay omitted: the broker runs
+  no backend health probe. The management console reads arrays
+  (`node_status: Array<{node, status}>`,
+  `node_metrics: Array<...>`), so it renders empty rows for this route
+  until its reader accepts the documented shape.
+- `POST /authentication`, `GET /authentication/{id}` and
+  `GET /authentication`, `mongodb` variants. The specification example
+  for `password_based:mongodb` carries no `mongo_type`, but every
+  `authn.mongo_*` schema requires it. The management console always
+  sends `mongo_type` (`single`, `sharded` or `rs`). The broker stores
+  and reports the fields it receives, so the specification example on
+  its own matches no variant. The conformance cases use the console
+  form with `mongo_type`.
+- `POST /authentication`, `jwt` and `cinfo` variants. The documented
+  shapes carry no `backend`. The broker defaults a missing backend to
+  the mechanism name and reports it back as an extra field, which the
+  checker accepts. The management console sends the same backend-free
+  form.
 - `POST /sso/mfa/setup_info`, response 401. The specification documents
   401 `UNAUTHORIZED` for an invalid or expired token. The management console
   sends `backend`, `setup_token` and `username` and reads `secret` plus

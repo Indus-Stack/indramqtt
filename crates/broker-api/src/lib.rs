@@ -9814,17 +9814,18 @@ mod tests {
         assert_eq!(body["metrics"]["failed"], json!(0));
         assert_eq!(body["metrics"]["total"], json!(0));
         assert!(body["metrics"]["nomatch"].is_number());
-        assert!(body["node_metrics"].is_array());
-        assert!(body["node_resource_metrics"].is_array());
+        assert!(body["node_metrics"].is_object());
+        assert!(body["node_resource_metrics"].is_object());
+        assert!(body["node_error"].is_object());
         assert_eq!(
-            body["node_metrics"][0]["metrics"]["total"],
+            body["node_metrics"]["metrics"]["total"],
             body["metrics"]["total"]
         );
         assert_eq!(
-            body["node_resource_metrics"][0]["metrics"]["matched"],
+            body["node_resource_metrics"]["metrics"]["matched"],
             body["metrics"]["total"]
         );
-        assert_eq!(body["node_error"], json!([]));
+        assert!(body["node_error"]["node"].is_string());
 
         // Create a user through the broker, then CONNECT through the
         // broker: success moves the live counters.

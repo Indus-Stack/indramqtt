@@ -51,6 +51,10 @@ pub async fn list_authn_chain(State(state): State<ApiState>) -> Response {
 /// entry with 200, as the reference API documents. Malformed bodies fail with `BAD_REQUEST`; an existing
 /// `id` fails with `ALREADY_EXISTS` instead of being overwritten; a full
 /// chain fails with `BAD_REQUEST`.
+// TODO(parity): does the documented API reject a write that matches no
+// variant (a `mysql` entry without `query`, a `redis` entry without
+// `cmd`)? The current choice stores it leniently, so older minimal
+// bodies keep working, until the checker pins the rejection set.
 pub async fn create_authn_chain(State(state): State<ApiState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -352,12 +356,15 @@ fn render_entry(entry: &AuthnEntry) -> serde_json::Value {
 
 /// Validate a create body into a chain entry.
 ///
-/// Required: `mechanism` and `backend` (both non-empty, both naming a
-/// known value). Optional: `id` (defaults to `{mechanism}:{backend}`; a
-/// colon-form id must start with its mechanism) and `enable` (defaults
-/// to true). Backend config rides either as a nested `config` object or
-/// as extra top-level fields besides the four known ones; both forms
-/// store the same object and read back under `config`.
+/// Required: `mechanism` (non-empty, naming a known value). `backend` is
+/// required except for `jwt` and `cinfo`: the documented shapes carry no
+/// backend, so a missing backend defaults to the mechanism name and reads
+/// back as an extra field. Optional: `id` (defaults to
+/// `{mechanism}:{backend}`; a colon-form id must start with its mechanism)
+/// and `enable` (defaults to true). Backend config rides either as a
+/// nested `config` object or as extra top-level fields besides the four
+/// known ones; both forms store the same object and read back under
+/// `config`.
 fn parse_chain_request(value: &serde_json::Value) -> Result<AuthnEntry, String> {
     let obj = value
         .as_object()
@@ -372,16 +379,24 @@ fn parse_chain_request(value: &serde_json::Value) -> Result<AuthnEntry, String> 
     if !broker_config::is_known_authn_mechanism(mechanism) {
         return Err(format!("field `mechanism` {mechanism:?} is unknown"));
     }
-    let backend = obj
-        .get("backend")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "field `backend` is required".to_string())?;
-    if backend.trim().is_empty() {
-        return Err("field `backend` must not be empty".to_string());
-    }
-    if !broker_config::is_known_authn_backend(backend) {
-        return Err(format!("field `backend` {backend:?} is unknown"));
-    }
+    let backend = match obj.get("backend") {
+        Some(value) if !value.is_null() => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| "field `backend` must be a string".to_string())?;
+            if raw.trim().is_empty() {
+                return Err("field `backend` must not be empty".to_string());
+            }
+            if !broker_config::is_known_authn_backend(raw) {
+                return Err(format!("field `backend` {raw:?} is unknown"));
+            }
+            raw.to_string()
+        }
+        _ if mechanism == "jwt" || mechanism == "cinfo" => mechanism.to_string(),
+        _ => {
+            return Err("field `backend` is required".to_string());
+        }
+    };
     let id = match obj.get("id") {
         None | Some(serde_json::Value::Null) => format!("{mechanism}:{backend}"),
         Some(v) => {
@@ -663,5 +678,138 @@ mod tests {
             .map(|e| e.id.clone())
             .collect();
         assert_eq!(ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_round_trips_each_documented_variant() {
+        // Each documented variant keeps its required fields through the
+        // write and the read. The stored row reports them flat at the
+        // top level, so the answer matches the documented variant.
+        // Before: `jwt` and `cinfo` failed with 400, as the handler
+        // required a backend the documented shapes do not carry.
+        let state = standalone_state();
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!({
+                "mechanism": "jwt",
+                "algorithm": "hmac-based",
+                "secret": "mysecret",
+                "secret_base64_encoded": false,
+                "use_jwks": false,
+                "verify_claims": {"username": "${username}"},
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "built_in_database",
+                "password_hash_algorithm": {"name": "sha256", "salt_position": "suffix"},
+                "user_id_type": "username",
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "http",
+                "method": "post",
+                "url": "http://127.0.0.1:18083",
+                "headers": {"content-type": "application/json"},
+                "body": {"username": "${username}", "password": "${password}"},
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "redis",
+                "redis_type": "single",
+                "server": "127.0.0.1:6379",
+                "cmd": "HMGET ${username} password_hash salt",
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "mongodb",
+                "mongo_type": "single",
+                "server": "127.0.0.1:27017",
+                "database": "example",
+                "collection": "users",
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "ldap",
+                "server": "127.0.0.1:389",
+                "base_dn": "ou=users,dc=example,dc=org",
+                "username": "cn=reader",
+            }),
+            serde_json::json!({
+                "mechanism": "password_based",
+                "backend": "mysql",
+                "server": "127.0.0.1:3306",
+                "database": "mqtt",
+                "query": "SELECT password_hash FROM users WHERE username = ${username} LIMIT 1",
+            }),
+            serde_json::json!({
+                "mechanism": "cinfo",
+                "checks": [],
+            }),
+        ];
+        // The chain holds at most eight entries. The remaining documented
+        // shapes (`gssapi` on `kerberos`, `scram` on `http`) round-trip
+        // through their own state in the test below.
+        assert_eq!(cases.len(), 8);
+        for sent in &cases {
+            let raw = serde_json::to_vec(sent).expect("case serialises");
+            let (status, stored, _) =
+                parts(create_authn_chain(State(state.clone()), Bytes::from(raw)).await).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(stored["mechanism"], sent["mechanism"]);
+            for (key, want) in sent.as_object().expect("case is an object") {
+                assert_eq!(&stored[key], want, "variant field {key} round-trips",);
+            }
+        }
+        // The backend-free shapes default the backend to the mechanism.
+        // The read keeps the default as an extra field.
+        let rows = state.authn_chain.list();
+        let jwt = rows
+            .iter()
+            .find(|entry| entry.mechanism == "jwt")
+            .expect("jwt stored");
+        assert_eq!(jwt.backend, "jwt");
+        let cinfo = rows
+            .iter()
+            .find(|entry| entry.mechanism == "cinfo")
+            .expect("cinfo stored");
+        assert_eq!(cinfo.backend, "cinfo");
+        assert_eq!(rows.len(), cases.len());
+    }
+
+    #[tokio::test]
+    async fn create_round_trips_scram_and_kerberos_variants() {
+        // The `scram` and `gssapi` shapes keep their discriminator
+        // fields. They run on their own state, as the chain holds at
+        // most eight entries.
+        let state = standalone_state();
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!({
+                "mechanism": "scram",
+                "backend": "built_in_database",
+                "algorithm": "sha256",
+                "iteration_count": 4096,
+            }),
+            serde_json::json!({
+                "mechanism": "scram",
+                "backend": "http",
+                "method": "post",
+                "url": "http://127.0.0.1:18083/scram",
+            }),
+            serde_json::json!({
+                "mechanism": "gssapi",
+                "backend": "kerberos",
+                "principal": "mqtt@EXAMPLE.ORG",
+            }),
+        ];
+        for sent in &cases {
+            let raw = serde_json::to_vec(sent).expect("case serialises");
+            let (status, stored, _) =
+                parts(create_authn_chain(State(state.clone()), Bytes::from(raw)).await).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(stored["mechanism"], sent["mechanism"]);
+            for (key, want) in sent.as_object().expect("case is an object") {
+                assert_eq!(&stored[key], want, "variant field {key} round-trips",);
+            }
+        }
+        assert_eq!(state.authn_chain.list().len(), cases.len());
     }
 }

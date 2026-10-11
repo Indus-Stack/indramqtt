@@ -3927,6 +3927,69 @@ mod sso_token_exchange_tests {
             get_sso_backend(State(state.clone()), Path("w239-missing".to_string())).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn put_then_get_round_trips_each_documented_variant() {
+        // Each documented backend keeps its required fields through the
+        // write and the read. The row reports them flat at the top
+        // level, so the answer matches the documented variant.
+        let state = standalone_state();
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "ldap",
+                serde_json::json!({
+                    "backend": "ldap",
+                    "enable": true,
+                    "server": "127.0.0.1:389",
+                    "base_dn": "dc=example,dc=com",
+                    "username": "cn=reader",
+                }),
+            ),
+            (
+                "oidc",
+                serde_json::json!({
+                    "backend": "oidc",
+                    "enable": true,
+                    "clientid": "conf-oidc-client",
+                    "issuer": "https://idp.example.invalid",
+                    "secret": "conf-oidc-secret",
+                }),
+            ),
+            (
+                "saml",
+                serde_json::json!({
+                    "backend": "saml",
+                    "enable": false,
+                    "dashboard_addr": "https://127.0.0.1:18083",
+                    "idp_metadata_url": "https://idp.example.invalid",
+                }),
+            ),
+        ];
+        for (name, sent) in &cases {
+            let (status, stored) = parts(
+                put_sso_backend(
+                    State(state.clone()),
+                    Path(name.to_string()),
+                    body(sent.clone()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            for (key, want) in sent.as_object().expect("case is an object") {
+                if key == "secret" {
+                    // Secrets never render. The read carries the marker.
+                    assert_eq!(stored[key], serde_json::json!(REDACTED_SECRET));
+                    continue;
+                }
+                assert_eq!(&stored[key], want, "variant field {key} round-trips");
+            }
+            let (status, read) =
+                parts(get_sso_backend(State(state.clone()), Path(name.to_string())).await).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(read, stored);
+        }
+    }
 }
 
 #[cfg(test)]
