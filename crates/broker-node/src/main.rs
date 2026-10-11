@@ -4785,32 +4785,13 @@ fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, C
             }
             Ok(())
         };
-    // A listener with `native = true` belongs to the kernel. The edge
-    // must not bind the same address.
-    listener(
-        "mqtt",
-        "listeners.tcp.bind",
-        listeners.tcp.enabled && !listeners.tcp.native,
-        &listeners.tcp.bind,
-    )?;
-    listener(
-        "tls",
-        "listeners.tls.bind",
-        listeners.tls.enabled && !listeners.tls.native,
-        &listeners.tls.bind,
-    )?;
-    listener(
-        "ws",
-        "listeners.ws.bind",
-        listeners.ws.enabled && !listeners.ws.native,
-        &listeners.ws.bind,
-    )?;
-    listener(
-        "wss",
-        "listeners.wss.bind",
-        listeners.wss.enabled && !listeners.wss.native,
-        &listeners.wss.bind,
-    )?;
+    // The kernel serves every enabled listener. The edge must bind no
+    // address, so a stale entrypoint that still starts it opens no
+    // socket. `native` is deprecated and ignored.
+    listener("mqtt", "listeners.tcp.bind", false, &listeners.tcp.bind)?;
+    listener("tls", "listeners.tls.bind", false, &listeners.tls.bind)?;
+    listener("ws", "listeners.ws.bind", false, &listeners.ws.bind)?;
+    listener("wss", "listeners.wss.bind", false, &listeners.wss.bind)?;
     put("ws_path", quoted(&listeners.ws.path));
     put("wss_path", quoted(&listeners.wss.path));
     for (key, value) in [
@@ -10915,6 +10896,42 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     broker_api::serve(listener, state).await
 }
 
+/// Collect the deprecation warnings for the removed edge settings.
+///
+/// Read the provenance of the layered startup configuration. Return one
+/// message per deprecated setting that a layer sets. The caller logs
+/// each message. A test sets the values through a file and checks
+/// the returned messages.
+fn deprecated_startup_warnings(layered: &LayeredConfig) -> Vec<String> {
+    let cfg = layered.config();
+    let mut out = Vec::new();
+    for (path, native) in [
+        ("listeners.tcp.native", cfg.listeners.tcp.native),
+        ("listeners.tls.native", cfg.listeners.tls.native),
+        ("listeners.ws.native", cfg.listeners.ws.native),
+        ("listeners.wss.native", cfg.listeners.wss.native),
+    ] {
+        if layered.provenance().contains_key(path) {
+            if native {
+                out.push(format!(
+                    "setting `{path}` is deprecated and ignored: the kernel always serves this listener"
+                ));
+            } else {
+                out.push(format!(
+                    "setting `{path}` is deprecated: the edge was removed; this listener is served by the kernel"
+                ));
+            }
+        }
+    }
+    if layered.provenance().contains_key("node.brokerlink_bind") {
+        out.push(
+            "setting `node.brokerlink_bind` is deprecated: it remains until a later release removes it"
+                .to_string(),
+        );
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = <Args as clap::CommandFactory>::command().get_matches();
@@ -10963,6 +10980,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `logging.level` applies. If the configuration has an error, `main`
     // returns the error and the runtime prints it on stderr.
     broker_observability::init_tracing_with_level(&cfg.logging.level);
+
+    // Deprecated settings stay valid for one release. The kernel serves
+    // every enabled listener. `native` has no effect. A value of
+    // `native = false` requests the removed edge, so it warns more
+    // loudly. `node.brokerlink_bind` remains until a later release.
+    for warning in deprecated_startup_warnings(&layered) {
+        warn!("{warning}");
+    }
 
     info!(
         "Starting IndraMQTT Kernel v{} on {}",
@@ -11035,7 +11060,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the store empty, so every handshake fails closed. A bad file
     // fails boot loudly, never with an empty store.
     if cfg.listeners.tls.enabled
-        && cfg.listeners.tls.native
         && cfg.listeners.tls.psk_enabled
         && !cfg.listeners.tls.psk_keys_file.trim().is_empty()
     {
@@ -11786,12 +11810,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // The listeners that the kernel owns (`listeners.*.native = true`).
-    // A listener that cannot start stops the kernel: a broker that runs
-    // without a configured listener looks healthy and accepts no client.
-    // The directory seeds from the boot configuration and carries the
-    // socket control, so the v5 start, stop and restart routes drive the
-    // same sockets the boot binds here.
+    // The kernel serves every enabled listener. A listener that cannot
+    // start stops the kernel: a broker that runs without a configured
+    // listener looks healthy and accepts no client. The directory seeds
+    // from the boot configuration and carries the socket control, so
+    // the v5 start, stop and restart routes drive the same sockets the
+    // boot binds here.
     shared.listener_store.reset_from_config(&cfg.listeners);
     let control: Arc<native::NativeListenerController> = Arc::new(
         native::NativeListenerController::new(shared.clone(), cfg.listeners.clone()),
@@ -11801,7 +11825,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(mut record) = shared.listener_store.get(id) else {
             continue;
         };
-        if !record.enable || !record.kernel_owned {
+        if !record.enable {
             continue;
         }
         let bind = record.bind.clone();
@@ -12005,11 +12029,11 @@ mod tests {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
         let port = probe.local_addr().expect("probe addr").port();
         drop(probe);
-        // Boot one kernel-owned TCP row on that port.
+        // Boot one kernel-owned TCP row on that port. No `native` key:
+        // the kernel serves the row by default.
         let mut listeners = broker_config::schema::ListenersConf::default();
         listeners.tcp.enabled = true;
         listeners.tcp.bind = format!("127.0.0.1:{port}");
-        listeners.tcp.native = true;
         listeners.tls.enabled = false;
         listeners.ws.enabled = false;
         listeners.wss.enabled = false;
@@ -12192,7 +12216,7 @@ mod tests {
                 .find(|chunk| chunk[0] == "-indra_edge" && chunk[1] == key)
                 .map(|chunk| chunk[2].clone())
         };
-        assert_eq!(triple(&defaults, "mqtt_enabled").as_deref(), Some("true"));
+        assert_eq!(triple(&defaults, "mqtt_enabled").as_deref(), Some("false"));
         assert_eq!(triple(&defaults, "mqtt_port").as_deref(), Some("1883"));
         // All the interfaces is the default of the edge. No address is given.
         assert_eq!(triple(&defaults, "mqtt_ip"), None);
@@ -12224,13 +12248,14 @@ mod tests {
         assert_eq!(triple(&changed, "mqtt_enabled").as_deref(), Some("false"));
         assert_eq!(triple(&changed, "mqtt_port").as_deref(), Some("11883"));
         assert_eq!(triple(&changed, "mqtt_ip").as_deref(), Some("\"10.0.0.5\""));
-        assert_eq!(triple(&changed, "wss_enabled").as_deref(), Some("true"));
+        assert_eq!(triple(&changed, "wss_enabled").as_deref(), Some("false"));
         assert_eq!(
             triple(&changed, "wss_certfile").as_deref(),
             Some("\"/etc/indramqtt/tls/cert.pem\"")
         );
-        // A native secure WebSocket listener belongs to the kernel.
-        // The edge stands down, so the two never bind one port.
+        // The kernel serves every enabled listener. The edge opens no
+        // socket, so the two never bind one port. `native` is deprecated
+        // and ignored.
         cfg.listeners.wss.native = true;
         let native = edge_args(&cfg).expect("native config resolves");
         assert_eq!(triple(&native, "wss_enabled").as_deref(), Some("false"));
@@ -12252,6 +12277,57 @@ mod tests {
         cfg.listeners.ws.bind = "localhost:8083".to_string();
         let err = edge_args(&cfg).expect_err("host names are refused");
         assert!(err.to_string().contains("listeners.ws.bind"), "got: {err}");
+    }
+
+    #[test]
+    fn deprecated_edge_settings_warn_at_startup() {
+        // The production entry is the file. The broker warns per
+        // deprecated setting that a layer sets.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(
+            dir.join("indra.toml"),
+            "[listeners.tcp]\nnative = true\n[listeners.tls]\nnative = false\n[node]\nbrokerlink_bind = \"127.0.0.1:18883\"\n",
+        )
+        .expect("write indra.toml");
+        let layered = broker_config::layers::load_layered_with_env(
+            &dir,
+            &[],
+            &broker_config::layers::CliOverrides::default(),
+        )
+        .expect("layers load");
+        let warnings = deprecated_startup_warnings(&layered);
+        assert_eq!(warnings.len(), 3, "got: {warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("listeners.tcp.native")
+                && w.contains("deprecated and ignored")),
+            "got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("listeners.tls.native") && w.contains("the edge was removed")),
+            "got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("node.brokerlink_bind") && w.contains("deprecated")),
+            "got: {warnings:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Defaults set no deprecated setting. The broker stays quiet.
+        let clean = unique_data_dir();
+        std::fs::create_dir_all(&clean).expect("create config dir");
+        let layered = broker_config::layers::load_layered_with_env(
+            &clean,
+            &[],
+            &broker_config::layers::CliOverrides::default(),
+        )
+        .expect("layers load");
+        assert!(deprecated_startup_warnings(&layered).is_empty());
+        std::fs::remove_dir_all(&clean).ok();
     }
 
     #[test]

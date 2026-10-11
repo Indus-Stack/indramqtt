@@ -20,12 +20,12 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `listeners.tcp.bind` | string | `0.0.0.0:1883` | string | Bind address for the plaintext MQTT listener. |
 | `listeners.tcp.max_connections` | integer | `1000000` | 1..=10000000 | Maximum concurrent connections on the plaintext MQTT listener. |
 | `listeners.tcp.backlog` | integer | `1024` | 1..=65536 | Listener accept backlog for the plaintext MQTT listener. |
-| `listeners.tcp.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them. |
+| `listeners.tcp.native` | boolean | `false` | boolean | Deprecated. Ignored. The kernel always serves this listener. |
 | `listeners.tls.enabled` | boolean | `false` | boolean | Whether the secure TLS MQTT listener accepts connections. |
 | `listeners.tls.bind` | string | `0.0.0.0:8883` | string | Bind address for the secure TLS MQTT listener. |
 | `listeners.tls.cert_file` | string | `` | string | Path to the PEM server certificate for the TLS listener. |
 | `listeners.tls.key_file` | string | `` | string | Path to the PEM private key for the TLS listener. |
-| `listeners.tls.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them. |
+| `listeners.tls.native` | boolean | `false` | boolean | Deprecated. Ignored. The kernel always serves this listener. |
 | `listeners.tls.verify_client_cert` | boolean | `false` | boolean | Whether the TLS listener requests and verifies a client certificate. |
 | `listeners.tls.verify` | string | `verify_none` | ["verify_none","verify_peer"] | Client certificate chain check mode of the TLS listener. |
 | `listeners.tls.cacertfile` | string | `` | string | CA file for client certificate checks of the TLS listener. |
@@ -35,13 +35,13 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `listeners.ws.enabled` | boolean | `true` | boolean | Whether the MQTT-over-WebSocket listener accepts connections. |
 | `listeners.ws.bind` | string | `0.0.0.0:8083` | string | Bind address for the MQTT-over-WebSocket listener. |
 | `listeners.ws.path` | string | `/mqtt` | string | HTTP path serving MQTT-over-WebSocket traffic. |
-| `listeners.ws.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them. |
+| `listeners.ws.native` | boolean | `false` | boolean | Deprecated. Ignored. The kernel always serves this listener. |
 | `listeners.wss.enabled` | boolean | `false` | boolean | Whether the secure WebSocket listener accepts connections. |
 | `listeners.wss.bind` | string | `0.0.0.0:8084` | string | Bind address for the secure WebSocket listener. |
 | `listeners.wss.path` | string | `/mqtt` | string | HTTP path serving secure WebSocket traffic. |
 | `listeners.wss.cert_file` | string | `` | string | Path to the PEM server certificate for the secure WebSocket listener. |
 | `listeners.wss.key_file` | string | `` | string | Path to the PEM private key for the secure WebSocket listener. |
-| `listeners.wss.native` | boolean | `false` | boolean | Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them. |
+| `listeners.wss.native` | boolean | `false` | boolean | Deprecated. Ignored. The kernel always serves this listener. |
 | `listeners.wss.verify_client_cert` | boolean | `false` | boolean | Whether the secure WebSocket listener requests and verifies a client certificate. |
 | `listeners.wss.verify` | string | `verify_none` | ["verify_none","verify_peer"] | Client certificate chain check mode of the secure WebSocket listener. |
 | `listeners.wss.cacertfile` | string | `` | string | CA file for client certificate checks of the secure WebSocket listener. |

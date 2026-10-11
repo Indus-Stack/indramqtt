@@ -102,7 +102,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 setting_type: "bool",
                 default: "false",
                 range: "true | false",
-                doc: "Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them.",
+                doc: "Deprecated. Ignored. The kernel always serves this listener.",
             },
             FieldDoc {
                 path: "listeners.tls.enabled",
@@ -137,21 +137,21 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 setting_type: "bool",
                 default: "false",
                 range: "true | false",
-                doc: "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.",
+                doc: "Deprecated. Ignored. The kernel always serves this listener.",
             },
             FieldDoc {
                 path: "listeners.tls.psk_enabled",
                 setting_type: "bool",
                 default: "false",
                 range: "true | false",
-                doc: "Whether the kernel TLS listener accepts pre-shared-key handshakes. Takes effect with native enabled.",
+                doc: "Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.",
             },
             FieldDoc {
                 path: "listeners.tls.psk_keys_file",
                 setting_type: "path string",
                 default: "\"\"",
                 range: "file path; empty means no identities",
-                doc: "Path to the PSK identity file of the kernel TLS listener. Takes effect with native and PSK enabled.",
+                doc: "Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.",
             },
             FieldDoc {
                 path: "listeners.tls.verify_client_cert",
@@ -221,7 +221,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 setting_type: "bool",
                 default: "false",
                 range: "true | false",
-                doc: "Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them.",
+                doc: "Deprecated. Ignored. The kernel always serves this listener.",
             },
             FieldDoc {
                 path: "listeners.wss.enabled",
@@ -305,7 +305,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 setting_type: "bool",
                 default: "false",
                 range: "true | false",
-                doc: "Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them.",
+                doc: "Deprecated. Ignored. The kernel always serves this listener.",
             },
             FieldDoc {
                 path: "listeners.api.enabled",
@@ -940,7 +940,7 @@ pub struct TcpListenerConf {
     /// Listener accept backlog for the plaintext MQTT listener.
     #[serde(default = "default_tcp_backlog")]
     pub backlog: u32,
-    /// Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them.
+    /// Deprecated. Ignored. The kernel always serves this listener.
     #[serde(default = "default_false")]
     pub native: bool,
 }
@@ -1008,18 +1008,17 @@ pub struct TlsListenerConf {
     /// Path to the PEM private key for the TLS listener.
     #[serde(default)]
     pub key_file: String,
-    /// Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them.
+    /// Deprecated. Ignored. The kernel always serves this listener.
     #[serde(default = "default_false")]
     pub native: bool,
     /// Whether the kernel TLS listener accepts pre-shared-key handshakes.
-    /// Takes effect with native enabled. Off by default keeps
-    /// certificate handshakes unchanged. On serves PSK suites from the
-    /// identity store with no certificate.
+    /// Off by default keeps certificate handshakes unchanged. On serves
+    /// PSK suites from the identity store with no certificate.
     #[serde(default = "default_false")]
     pub psk_enabled: bool,
     /// Path to the PSK identity file of the kernel TLS listener.
-    /// Takes effect with native and PSK enabled. Empty keeps the
-    /// store empty, so every handshake fails closed.
+    /// Use it only when PSK is on. Empty keeps the store empty,
+    /// so every handshake fails closed.
     #[serde(default)]
     pub psk_keys_file: String,
     /// Whether the TLS listener requests and verifies a client certificate.
@@ -1086,22 +1085,22 @@ impl TlsListenerConf {
     /// Validates the TLS listener.
     pub fn validate(&self) -> Result<(), ConfigError> {
         check_bind("listeners.tls.bind", &self.bind, false)?;
-        // A native PSK-only listener carries no certificate. The pure
-        // PSK form needs no certificate files. Other forms still do.
-        let needs_cert = self.enabled && !(self.psk_enabled && self.native);
+        // A PSK-only listener carries no certificate. The pure PSK form
+        // needs no certificate files. Other forms still do.
+        let needs_cert = self.enabled && !self.psk_enabled;
         if needs_cert {
             if self.cert_file.trim().is_empty() {
                 return Err(invalid(
                     "listeners.tls.cert_file",
                     &self.cert_file,
-                    "is required when TLS is enabled without native PSK",
+                    "is required when TLS is enabled without PSK",
                 ));
             }
             if self.key_file.trim().is_empty() {
                 return Err(invalid(
                     "listeners.tls.key_file",
                     &self.key_file,
-                    "is required when TLS is enabled without native PSK",
+                    "is required when TLS is enabled without PSK",
                 ));
             }
         }
@@ -1188,7 +1187,7 @@ pub struct WsListenerConf {
     /// HTTP path serving MQTT-over-WebSocket traffic.
     #[serde(default = "default_ws_path")]
     pub path: String,
-    /// Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them.
+    /// Deprecated. Ignored. The kernel always serves this listener.
     #[serde(default = "default_false")]
     pub native: bool,
 }
@@ -1246,7 +1245,7 @@ pub struct WssListenerConf {
     /// Path to the PEM private key for the secure WebSocket listener.
     #[serde(default)]
     pub key_file: String,
-    /// Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them.
+    /// Deprecated. Ignored. The kernel always serves this listener.
     #[serde(default = "default_false")]
     pub native: bool,
     /// Whether the secure WebSocket listener requests and verifies a client certificate.
@@ -2967,7 +2966,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     65_536,
                     "Listener accept backlog for the plaintext MQTT listener.",
                 ),
-                bool_field("tcp.native", false, "Whether the kernel accepts the clients of the plaintext MQTT listener itself. When false, the edge accepts them."),
+                bool_field("tcp.native", false, "Deprecated. Ignored. The kernel always serves this listener."),
                 bool_field(
                     "tls.enabled",
                     false,
@@ -2988,16 +2987,16 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "",
                     "Path to the PEM private key for the TLS listener.",
                 ),
-                bool_field("tls.native", false, "Whether the kernel accepts the clients of the TLS MQTT listener itself. When false, the edge accepts them."),
+                bool_field("tls.native", false, "Deprecated. Ignored. The kernel always serves this listener."),
                 bool_field(
                     "tls.psk_enabled",
                     false,
-                    "Whether the kernel TLS listener accepts pre-shared-key handshakes. Takes effect with native enabled.",
+                    "Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.",
                 ),
                 str_field(
                     "tls.psk_keys_file",
                     "",
-                    "Path to the PSK identity file of the kernel TLS listener. Takes effect with native and PSK enabled.",
+                    "Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.",
                 ),
                 bool_field(
                     "tls.verify_client_cert",
@@ -3047,7 +3046,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "/mqtt",
                     "HTTP path serving MQTT-over-WebSocket traffic.",
                 ),
-                bool_field("ws.native", false, "Whether the kernel accepts the clients of the MQTT-over-WebSocket listener itself. When false, the edge accepts them."),
+                bool_field("ws.native", false, "Deprecated. Ignored. The kernel always serves this listener."),
                 bool_field(
                     "wss.enabled",
                     false,
@@ -3073,7 +3072,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "",
                     "Path to the PEM private key for the secure WebSocket listener.",
                 ),
-                bool_field("wss.native", false, "Whether the kernel accepts the clients of the secure WebSocket listener itself. When false, the edge accepts them."),
+                bool_field("wss.native", false, "Deprecated. Ignored. The kernel always serves this listener."),
                 bool_field(
                     "wss.verify_client_cert",
                     false,
@@ -4120,10 +4119,9 @@ mod tests {
             BrokerConfig::parse_toml("[listeners.tls]\npsk_keys_file = \"/etc/indra/psk.txt\"\n")
                 .expect("keys file parses");
         assert_eq!(parsed.listeners.tls.psk_keys_file, "/etc/indra/psk.txt");
-        // A native PSK-only listener needs no certificate files.
+        // A PSK-only listener needs no certificate files.
         let mut psk = BrokerConfig::default();
         psk.listeners.tls.enabled = true;
-        psk.listeners.tls.native = true;
         psk.listeners.tls.psk_enabled = true;
         psk.validate().expect("psk needs no certificate");
         // A certificate listener still needs them.

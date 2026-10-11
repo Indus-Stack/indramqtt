@@ -91,51 +91,46 @@ flag sets a setting, the kernel uses the default of the flag.
 `logging.level`. `RUST_LOG` is a developer filter
 (`RUST_LOG=broker_router=trace`) and has no schema home.
 
-The edge is a separate process. It holds the MQTT, TLS and WebSocket
-sockets. Set a listener in `indra.toml` only:
+The kernel serves every enabled listener. It binds the MQTT, TLS and
+WebSocket sockets itself. Set a listener in `indra.toml` only:
 
-1. `indramqtt --print-edge-args` prints the start arguments of the edge,
-   one argument on each line. It reads the resolved `listeners.*` and
-   `node.brokerlink_bind` settings.
-2. The container image starts the edge with these arguments.
+1. `indramqtt --check-config` loads the layered configuration. It prints
+   `ok` and exits 0 for a valid directory. It prints the error and
+   exits 2 for an invalid directory.
+2. The container image starts only the kernel. It starts no edge process.
 
-A listener bind must be an IP address and a port. The broker accepts
-and reports `listeners.tcp.max_connections` and `listeners.tcp.backlog`,
-but the edge does not apply them at this time. A listener of the kernel
-(`native = true`) applies the two settings.
+A listener bind must be an IP address and a port. The broker applies
+`listeners.tcp.max_connections` and `listeners.tcp.backlog` at each
+bind. Each kernel WebSocket listener uses the limit of the plaintext
+listener.
 
 ## Which process owns an MQTT listener
 
-By default the edge process accepts the MQTT clients and sends their
-packets to the kernel. With `native = true`, the kernel accepts the
-clients of that listener itself:
+The kernel accepts the MQTT clients of every enabled listener. The
+four `native` settings (`listeners.tcp.native`,
+`listeners.tls.native`, `listeners.ws.native`,
+`listeners.wss.native`) are deprecated and ignored: files and
+`INDRA_*` variables that set them still load, and the kernel logs a
+warning for each one that a layer sets. A value of `native = false`
+requests the removed edge, so its warning is stronger. Do not set
+`native` in new files:
 
 ```toml
 [listeners.tcp]
 bind = "0.0.0.0:1883"
-native = true
 
 [listeners.tls]
 enabled = true
-native = true
 cert_file = "/etc/indramqtt/server.pem"
 key_file = "/etc/indramqtt/server.key"
 
-[listeners.ws]
-native = true
-
 [listeners.wss]
 enabled = true
-native = true
 cert_file = "/etc/indramqtt/server.pem"
 key_file = "/etc/indramqtt/server.key"
 ```
 
-The edge does not open a listener that has `native = true`. The
-kernel listener does not support PSK and client certificates
-yet. If a kernel listener cannot start, the kernel stops with an
-error. Each kernel WebSocket listener uses the limit of the plaintext
-listener.
+If a kernel listener cannot start, the kernel stops with an error.
 
 ## Flags: one more layer, then the schema
 
@@ -146,7 +141,7 @@ with no schema home: it locates the files, so it cannot come from them.
 | Flag | Schema home |
 |---|---|
 | `-b`, `--bind` | `listeners.tcp.bind` |
-| `--brokerlink-bind` | `node.brokerlink_bind` |
+| `--brokerlink-bind` | `node.brokerlink_bind` (deprecated) |
 | `--api-bind` | `listeners.api.bind` |
 | `--data-dir` | `node.data_dir` |
 | `--node-id` | `node.id` |

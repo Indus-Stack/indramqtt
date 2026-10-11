@@ -1,45 +1,35 @@
 #!/usr/bin/env bash
 # Boot test for a built broker.
 #
-# This script starts the kernel and the edge as an operator does: from an
+# This script starts the kernel as an operator does: from an
 # indra.toml file and INDRA_* variables. It then examines the behaviour
 # through the sockets. It does not use internal functions.
 #
 # Usage:
-#   tools/boot_smoke.sh <dir with indramqtt and indra> <edge ebin dir>
+#   tools/boot_smoke.sh <dir with indramqtt and indra>
 #
-# Build the inputs first:
+# Build the input first:
 #   cargo build -p broker-node --bins
-#   (cd beam && mkdir -p ebin && erlc -o ebin src/*.erl \
-#      && cp src/indra_edge.app.src ebin/indra_edge.app)
 #
 # The script exits with 0 if all the checks are satisfactory. It prints
 # one line for each check.
 set -u
 
 BIN_DIR=${1:?give the directory that contains indramqtt and indra}
-EBIN=${2:?give the ebin directory of the edge}
-# The script starts the edge from a different directory. Thus it needs
-# absolute paths.
 BIN_DIR=$(cd "$BIN_DIR" 2>/dev/null && pwd) || { echo "FAIL: $1 is not a directory"; exit 2; }
-EBIN=$(cd "$EBIN" 2>/dev/null && pwd) || { echo "FAIL: $2 is not a directory"; exit 2; }
 KERNEL=$BIN_DIR/indramqtt
 CTL=$BIN_DIR/indra
 
 for tool in "$KERNEL" "$CTL"; do
     [ -x "$tool" ] || { echo "FAIL: $tool is not an executable file"; exit 2; }
 done
-[ -f "$EBIN/indra_edge_sup.beam" ] || { echo "FAIL: $EBIN does not contain the edge"; exit 2; }
-command -v erl >/dev/null || { echo "FAIL: erl is not in PATH"; exit 2; }
 command -v python3 >/dev/null || { echo "FAIL: python3 is not in PATH"; exit 2; }
 
 ROOT=$(mktemp -d)
 KERNEL_PID=
-EDGE_PID=
 failures=0
 
 cleanup() {
-    [ -n "$EDGE_PID" ] && kill "$EDGE_PID" 2>/dev/null
     [ -n "$KERNEL_PID" ] && kill "$KERNEL_PID" 2>/dev/null
     wait 2>/dev/null
     rm -rf "$ROOT"
@@ -74,9 +64,9 @@ WSS_KEY="$TREE_DIR/crates/broker-connectors-enterprise/testdata/server-key.pem"
 WSS_CA="$TREE_DIR/crates/broker-connectors-enterprise/testdata/ca-cert.pem"
 
 API_KEY_GOOD=boot-smoke-key-0001
-# With SMOKE_NATIVE=1 the kernel owns the plaintext MQTT listener
-# (listeners.tcp.native = true). Without it the edge owns the listener.
-# The MQTT checks are the same for the two modes.
+# The kernel serves every enabled listener. `native` is deprecated and
+# ignored, so the config sets no `native` key. SMOKE_NATIVE still gates
+# the checks that need the secure WebSocket listener below.
 if [ "${SMOKE_NATIVE:-0}" = 1 ]; then NATIVE=true; else NATIVE=false; fi
 mkdir -p "$ROOT/cfg" "$ROOT/data"
 cat > "$ROOT/cfg/indra.toml" <<EOF
@@ -87,12 +77,10 @@ brokerlink_bind = "127.0.0.1:$LINK_PORT"
 
 [listeners.tcp]
 bind = "127.0.0.1:$MQTT_PORT"
-native = $NATIVE
 
 [listeners.ws]
 bind = "127.0.0.1:$WS_PORT"
 path = "/smoke"
-native = $NATIVE
 
 [listeners.api]
 bind = "127.0.0.1:$API_PORT"
@@ -134,7 +122,7 @@ listener = "wss"
 expression = "t-ws-\${username}"
 EOF
 
-# With SMOKE_NATIVE=1 the kernel also owns the secure WebSocket
+# With SMOKE_NATIVE=1 the config also enables the secure WebSocket
 # listener. The test certificate is the one of the kernel TLS tests.
 if [ "$NATIVE" = true ]; then
 for cert in "$WSS_CERT" "$WSS_KEY" "$WSS_CA"; do
@@ -147,7 +135,6 @@ path = "/smoke"
 cert_file = "$WSS_CERT"
 key_file = "$WSS_KEY"
 enabled = true
-native = true
 EOF
 fi
 
@@ -216,19 +203,15 @@ os.makedirs(f"{root}/all", exist_ok=True)
 open(f"{root}/all/indra.toml", "w").write("\n".join(lines))
 print(sum(1 for line in lines if " = " in line))
 PY
-"$KERNEL" --config-dir "$ROOT/all" --print-edge-args > "$ROOT/all.log" 2>&1
+"$KERNEL" --config-dir "$ROOT/all" --check-config > "$ROOT/all.log" 2>&1
 all_status=$?
 [ "$all_status" = 0 ] || head -3 "$ROOT/all.log"
 check "indra.toml accepts each setting in schemas/config-schema.json" "$all_status"
 
-# --- 4. The edge gets its listeners from the resolved configuration ---
-mapfile -t EDGE_ARGS < <("$KERNEL" --config-dir "$ROOT/cfg" --print-edge-args)
-[ "${#EDGE_ARGS[@]}" -gt 0 ]
-check "the kernel prints the edge arguments" $?
-(cd "$ROOT" && exec erl -noshell -noinput -pa "$EBIN" "${EDGE_ARGS[@]}" \
-    -eval '{ok, _} = application:ensure_all_started(indra_edge), timer:sleep(infinity).' \
-    > "$ROOT/edge.log" 2>&1) &
-EDGE_PID=$!
+# --- 4. The kernel serves the listeners from the file ---
+# The kernel already serves. This step starts no extra process.
+"$KERNEL" --config-dir "$ROOT/cfg" --check-config > "$ROOT/cfg.log" 2>&1
+check "the kernel validates the boot configuration" $?
 
 python3 - "$MQTT_PORT" "$WS_PORT" <<'PY'
 import base64, os, socket, struct, sys, time
@@ -240,7 +223,7 @@ def wait_port(port):
             return socket.create_connection(("127.0.0.1", port), timeout=2)
         except OSError:
             time.sleep(0.1)
-    raise SystemExit(f"FAIL the edge does not listen on port {port} from indra.toml")
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port} from indra.toml")
 
 def packet(kind, body):
     return bytes([kind, len(body)]) + body
@@ -283,7 +266,7 @@ try:
     delivered = sub.recv(100)
 except OSError:
     delivered = b""
-report("a publish goes to a subscriber through the edge and the kernel",
+report("a publish goes to a subscriber through the kernel listener",
        suback[:1] == b"\x90" and delivered.endswith(b"smoke-ok"))
 
 # MQTT 5 delivery. Each MQTT 5 PUBLISH has a property length, also when
@@ -534,7 +517,7 @@ PY
 [ $? = 0 ] || failures=$((failures + 1))
 
 # --- 4a. Unsubscribe on the kernel listener keeps the connection ---
-# Run this check only when the kernel owns the MQTT listener.
+# Run this check in the SMOKE_NATIVE mode for now.
 # A client subscribes, gets a message, unsubscribes, gets UNSUBACK,
 # and gets no more messages. Covers MQTT 3.1.1 and MQTT 5.
 if [ "${SMOKE_NATIVE:-0}" = 1 ]; then
@@ -611,7 +594,7 @@ PY
 fi
 
 # --- 4a2. WebSocket on the kernel listener carries MQTT ---
-# Run this check only when the kernel owns the listeners. A WebSocket
+# Run this check in the SMOKE_NATIVE mode for now. A WebSocket
 # client connects with the mqtt subprotocol, subscribes, and exchanges
 # a publish with a TCP client in both directions. A wrong path fails.
 if [ "${SMOKE_NATIVE:-0}" = 1 ]; then
@@ -736,7 +719,7 @@ PY
 fi
 
 # --- 4a3. Secure WebSocket on the kernel listener carries MQTT ---
-# Run this check only when the kernel owns the listeners. A TLS
+# Run this check in the SMOKE_NATIVE mode for now. A TLS
 # client makes the WebSocket upgrade with the mqtt subprotocol and
 # exchanges a publish with a TCP client in both directions. A client
 # without TLS gets no upgrade. A wrong path fails.
@@ -904,7 +887,7 @@ def wait_port(port):
             return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
         except OSError:
             time.sleep(0.1)
-    raise SystemExit("FAIL the edge does not listen")
+    raise SystemExit("FAIL the kernel listener does not listen")
 def mqtt_connect(sock, client_id, username):
     body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(b"pw")
     sock.sendall(packet(0x10, body))
@@ -988,7 +971,7 @@ def wait_port(port):
             return socket.create_connection(("127.0.0.1", int(port)), timeout=2)
         except OSError:
             time.sleep(0.1)
-    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
 def mqtt_connect(sock, client_id, username=None):
     if username is None:
         body = b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)
@@ -1009,7 +992,7 @@ def wait_port2(port):
             return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
         except OSError:
             time.sleep(0.1)
-    raise SystemExit("FAIL the edge does not listen")
+    raise SystemExit("FAIL the kernel listener does not listen")
 def connect(client_id, username=None):
     sock = wait_port2(mqtt_port)
     return sock, mqtt_connect(sock, client_id, username)
@@ -1079,8 +1062,8 @@ print("per-tenant user and ACLs are stored")
 PY
 check "a per-tenant user with a random password is stored through the API" $?
 
-# Restart the kernel and the edge on the same data directory.
-kill "$KERNEL_PID" "$EDGE_PID" 2>/dev/null
+# Restart the kernel on the same data directory.
+kill "$KERNEL_PID" 2>/dev/null
 wait 2>/dev/null
 sleep 0.5
 INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
@@ -1099,10 +1082,6 @@ PY
 done
 [ "$healthz" = OK ]
 check "the kernel restarts on the same data directory" $?
-(cd "$ROOT" && exec erl -noshell -noinput -pa "$EBIN" "${EDGE_ARGS[@]}" \
-    -eval '{ok, _} = application:ensure_all_started(indra_edge), timer:sleep(infinity).' \
-    > "$ROOT/edge2.log" 2>&1) &
-EDGE_PID=$!
 
 python3 - "$MQTT_PORT" "$KEEP_USER" "$KEEP_PASS" "$KEEP_TOPIC" <<'PY'
 import socket, struct, sys, time
@@ -1122,7 +1101,7 @@ def wait_port(port):
             return socket.create_connection(("127.0.0.1", port), timeout=2)
         except OSError:
             time.sleep(0.1)
-    raise SystemExit(f"FAIL the edge does not listen on port {port} after the restart")
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port} after the restart")
 def connect(client_id, username, password):
     sock = wait_port(mqtt_port)
     body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
@@ -1216,7 +1195,7 @@ def wait_port(port):
             return socket.create_connection(("127.0.0.1", port), timeout=2)
         except OSError:
             time.sleep(0.1)
-    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
 def connect(client_id, username, password):
     sock = wait_port(mqtt_port)
     body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
@@ -1310,7 +1289,7 @@ def wait_port(port):
         except OSError:
             import time
             time.sleep(0.1)
-    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
 def connect(client_id, username, password):
     sock = wait_port(mqtt_port)
     body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
@@ -1423,7 +1402,7 @@ def wait_port(port):
         except OSError:
             import time
             time.sleep(0.1)
-    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
 def connect(client_id, username, password):
     sock = wait_port(mqtt_port)
     body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
@@ -1532,7 +1511,7 @@ def wait_port(port):
         except OSError:
             import time
             time.sleep(0.1)
-    raise SystemExit(f"FAIL the edge does not listen on port {port}")
+    raise SystemExit(f"FAIL the kernel listener does not listen on port {port}")
 def connect(client_id, username, password):
     sock = wait_port(mqtt_port)
     body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
@@ -1651,7 +1630,7 @@ def wait_port(port):
             return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
         except OSError:
             time.sleep(0.1)
-    raise SystemExit("FAIL the edge does not listen")
+    raise SystemExit("FAIL the kernel listener does not listen")
 def mqtt_connect(sock, client_id, username, password):
     body = b"\x00\x04MQTT\x04\xc2\x00\x3c" + field(client_id) + field(username) + field(password)
     sock.sendall(packet(0x10, body))
@@ -1692,5 +1671,4 @@ if [ "$failures" = 0 ]; then
 fi
 echo "boot smoke: $failures check(s) failed"
 echo "--- kernel log"; tail -15 "$ROOT/kernel.log"
-echo "--- edge log"; tail -15 "$ROOT/edge.log" 2>/dev/null
 exit 1

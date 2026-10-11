@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Login error code**: an incorrect user name or password gets the code `BAD_USERNAME_OR_PWD`. Before this change the code was `NAME_PWD_ERROR`.
 
 ### Changed
+- **MQTT listeners of the kernel**: the kernel serves every enabled MQTT listener. The four `native` settings are deprecated and ignored. Files and variables that set them still load, and the kernel logs a warning for each one that a layer sets. A value of `native = false` requests the removed edge, so its warning is stronger. A stale entrypoint that still starts the edge opens no client socket.
 - **Licence**: all the code in this repository is now under MIT OR Apache-2.0. The enterprise licence file and the licensing guide are removed. The crates `broker-cluster`, `broker-connectors-enterprise` and `broker-rules-enterprise` use the licence of the workspace. The licence functions in the code (trial period, licence key, tier names) stay for now. They are removed step by step before the stable release.
 - **README**: the README is written again in Simplified Technical English. It has the roadmap to the stable release.
 - **Direction**: the Erlang edge will be deprecated. The MQTT listener of the kernel will get the functions of the edge and then become the default. A later release removes the edge.

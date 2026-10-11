@@ -9,8 +9,9 @@
 //!
 //! Each test that needs a broker boots one real kernel with
 //! [`spawn_kernel`]. The helper writes a config dir with ephemeral ports
-//! for the TCP, WebSocket and API listeners (`native = true`), waits for
-//! `/healthz` and the MQTT port, and stops the child on drop.
+//! for the TCP, WebSocket and API listeners, waits for `/healthz` and
+//! the MQTT port, and stops the child on drop. The kernel serves every
+//! enabled listener, so the configs set no `native` key.
 
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{Router, Subscription};
@@ -57,11 +58,11 @@ fn ephemeral_port() -> u16 {
 /// Boots one real kernel with the kernel listener on ephemeral ports.
 ///
 /// `extra_toml` appends to `indra.toml` (tenant rules, session limits).
-/// TCP, WebSocket and API get explicit loopback ports with `native = true`.
-/// TLS and secure WebSocket stay disabled. The link bind gets an explicit
-/// loopback port so parallel tests never share the default port. The call
-/// waits for `/healthz` plus the MQTT and WebSocket ports. The child dies
-/// with the test (`kill_on_drop`).
+/// TCP, WebSocket and API get explicit loopback ports. TLS and secure
+/// WebSocket stay disabled. The link bind gets an explicit loopback port
+/// so parallel tests never share the default port. The call waits for
+/// `/healthz` plus the MQTT and WebSocket ports. The child dies with the
+/// test (`kill_on_drop`).
 async fn spawn_kernel(extra_toml: &str) -> Kernel {
     let tag = format!(
         "p6-{}-{}",
@@ -87,26 +88,24 @@ async fn spawn_kernel(extra_toml: &str) -> Kernel {
              brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
              \n\
              [listeners.tcp]\n\
-             bind = \"127.0.0.1:{mqtt_port}\"\n\
-             native = true\n\
-             \n\
-             [listeners.tls]\n\
-             enabled = false\n\
-             \n\
-             [listeners.ws]\n\
-             bind = \"127.0.0.1:{ws_port}\"\n\
-             native = true\n\
-             \n\
-             [listeners.wss]\n\
-             enabled = false\n\
-             \n\
-             [listeners.api]\n\
-             bind = \"127.0.0.1:{api_port}\"\n\
-             \n\
-             [logging]\n\
-             level = \"warn\"\n\
-             \n\
-             {extra_toml}",
+              bind = \"127.0.0.1:{mqtt_port}\"\n\
+              \n\
+              [listeners.tls]\n\
+              enabled = false\n\
+              \n\
+              [listeners.ws]\n\
+              bind = \"127.0.0.1:{ws_port}\"\n\
+              \n\
+              [listeners.wss]\n\
+              enabled = false\n\
+              \n\
+              [listeners.api]\n\
+              bind = \"127.0.0.1:{api_port}\"\n\
+              \n\
+              [logging]\n\
+              level = \"warn\"\n\
+              \n\
+              {extra_toml}",
             scratch.display(),
         ),
     )
@@ -2568,26 +2567,25 @@ async fn tm09_tenant_client_reads_through_sockets_and_api() {
              brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
              \n\
              [listeners.tcp]\n\
-             bind = \"127.0.0.1:{mqtt_port}\"\n\
-             native = true\n\
-             \n\
-             [listeners.tls]\n\
-             enabled = false\n\
-             \n\
-             [listeners.ws]\n\
-             enabled = false\n\
-             \n\
-             [listeners.wss]\n\
-             enabled = false\n\
-             \n\
-             [listeners.api]\n\
-             bind = \"127.0.0.1:{api_port}\"\n\
-             \n\
-             [logging]\n\
-             level = \"warn\"\n\
-             \n\
-             [[tenants.rules]]\n\
-             expression = \"t-${{username}}\"\n",
+              bind = \"127.0.0.1:{mqtt_port}\"\n\
+              \n\
+              [listeners.tls]\n\
+              enabled = false\n\
+              \n\
+              [listeners.ws]\n\
+              enabled = false\n\
+              \n\
+              [listeners.wss]\n\
+              enabled = false\n\
+              \n\
+              [listeners.api]\n\
+              bind = \"127.0.0.1:{api_port}\"\n\
+              \n\
+              [logging]\n\
+              level = \"warn\"\n\
+              \n\
+              [[tenants.rules]]\n\
+              expression = \"t-${{username}}\"\n",
             scratch.display(),
         ),
     )
@@ -2875,26 +2873,25 @@ async fn rule_builtin_actions_republish_and_console_through_the_broker() {
              brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
              \n\
              [listeners.tcp]\n\
-             bind = \"127.0.0.1:{mqtt_port}\"\n\
-             native = true\n\
-             \n\
-             [listeners.tls]\n\
-             enabled = false\n\
-             \n\
-             [listeners.ws]\n\
-             enabled = false\n\
-             \n\
-             [listeners.wss]\n\
-             enabled = false\n\
-             \n\
-             [listeners.api]\n\
-             bind = \"127.0.0.1:{api_port}\"\n\
-             \n\
-             [logging]\n\
-             level = \"info\"\n\
-             \n\
-             [[tenants.rules]]\n\
-             expression = \"t-${{username}}\"\n",
+              bind = \"127.0.0.1:{mqtt_port}\"\n\
+              \n\
+              [listeners.tls]\n\
+              enabled = false\n\
+              \n\
+              [listeners.ws]\n\
+              enabled = false\n\
+              \n\
+              [listeners.wss]\n\
+              enabled = false\n\
+              \n\
+              [listeners.api]\n\
+              bind = \"127.0.0.1:{api_port}\"\n\
+              \n\
+              [logging]\n\
+              level = \"info\"\n\
+              \n\
+              [[tenants.rules]]\n\
+              expression = \"t-${{username}}\"\n",
             scratch.display(),
         ),
     )

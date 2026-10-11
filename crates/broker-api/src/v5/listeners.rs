@@ -8,11 +8,11 @@
 //!
 //! Rows report the stored configuration plus live state. `running` is
 //! always present: true only while the kernel holds the socket open.
-//! `current_connections` is the live per-listener count on kernel rows
-//! and zero on edge rows. The kernel holds no socket for an edge row,
-//! so it reports `running: false` and a zero count for it. Unsupported
-//! write fields answer 400 `BAD_REQUEST`: the broker never stores a
-//! value it does not apply or echo.
+//! `current_connections` is the live per-listener count on built-in rows
+//! and zero on created rows. The kernel holds no socket for a created
+//! row, so it reports `running: false` and a zero count for it.
+//! Unsupported write fields answer 400 `BAD_REQUEST`: the broker never
+//! stores a value it does not apply or echo.
 //!
 //! Store bounds (stated here and enforced below):
 //! - at most 32 listener records; creates past the bound fail closed.
@@ -65,12 +65,10 @@ pub enum ListenerMaxConnections {
 
 /// One listener row: stored configuration plus live state.
 ///
-/// `kernel_owned` is true only for the listeners the kernel binds
-/// itself (`listeners.tcp.native`, `listeners.tls.native`,
-/// `listeners.ws.native`, `listeners.wss.native`).
-/// Every other row belongs to the edge, and lifecycle calls on it fail
-/// closed with 400. `running` is true only while the kernel holds the
-/// socket open.
+/// `kernel_owned` is true for the four built-in listeners the kernel
+/// serves. Rows created through the API are stored only, and lifecycle
+/// calls on them fail closed with 400. `running` is true only while
+/// the kernel holds the socket open.
 #[derive(Debug, Clone)]
 pub struct ListenerRecord {
     /// Row id in the `{type}:{name}` form.
@@ -85,7 +83,8 @@ pub struct ListenerRecord {
     pub enable: bool,
     /// Whether the kernel holds the socket open now.
     pub running: bool,
-    /// Whether the kernel (not the edge) owns the socket.
+    /// Whether the kernel serves the socket now. True for built-in
+    /// rows, false for rows created through the API.
     pub kernel_owned: bool,
     /// Configured connection limit, when the configuration sets one.
     pub max_connections: Option<ListenerMaxConnections>,
@@ -184,7 +183,7 @@ impl ListenerStore {
                 bind: conf.tcp.bind.clone(),
                 enable: conf.tcp.enabled,
                 running: false,
-                kernel_owned: conf.tcp.native,
+                kernel_owned: true,
                 max_connections: Some(ListenerMaxConnections::Finite(conf.tcp.max_connections)),
                 acceptors: None,
                 backlog: conf.tcp.backlog,
@@ -206,7 +205,7 @@ impl ListenerStore {
                 bind: conf.tls.bind.clone(),
                 enable: conf.tls.enabled,
                 running: false,
-                kernel_owned: conf.tls.native,
+                kernel_owned: true,
                 max_connections: Some(ListenerMaxConnections::Finite(conf.tcp.max_connections)),
                 acceptors: None,
                 backlog: conf.tcp.backlog,
@@ -228,12 +227,9 @@ impl ListenerStore {
                 bind: conf.ws.bind.clone(),
                 enable: conf.ws.enabled,
                 running: false,
-                kernel_owned: conf.ws.native,
+                kernel_owned: true,
                 // A kernel row uses the limit of the plaintext listener.
-                max_connections: conf
-                    .ws
-                    .native
-                    .then_some(ListenerMaxConnections::Finite(conf.tcp.max_connections)),
+                max_connections: Some(ListenerMaxConnections::Finite(conf.tcp.max_connections)),
                 acceptors: None,
                 backlog: 0,
                 cert_file: String::new(),
@@ -254,12 +250,9 @@ impl ListenerStore {
                 bind: conf.wss.bind.clone(),
                 enable: conf.wss.enabled,
                 running: false,
-                kernel_owned: conf.wss.native,
+                kernel_owned: true,
                 // A kernel row uses the limit of the plaintext listener.
-                max_connections: conf
-                    .wss
-                    .native
-                    .then_some(ListenerMaxConnections::Finite(conf.tcp.max_connections)),
+                max_connections: Some(ListenerMaxConnections::Finite(conf.tcp.max_connections)),
                 acceptors: None,
                 backlog: 0,
                 cert_file: String::new(),
@@ -737,8 +730,8 @@ fn read_ssl_options(body: &serde_json::Value) -> SslOptionsRead {
     Ok((Some(options.clone()), cert, key_file))
 }
 
-/// Read the `websocket` options of a create or update body. The edge
-/// serves WebSocket rows and the kernel applies none of these keys:
+/// Read the `websocket` options of a create or update body. Created
+/// rows stay stored only and the kernel applies none of these keys:
 /// every key must carry its documented default.
 fn read_websocket(body: &serde_json::Value) -> Result<Option<serde_json::Value>, Box<Response>> {
     let Some(options) = body.get("websocket") else {
@@ -817,8 +810,9 @@ fn resolved_bind(bind: &str) -> (String, &'static str) {
     }
 }
 
-/// Live connection count of `record`. Kernel rows ask the installed
-/// control; edge rows report zero: the kernel holds no socket for them.
+/// Live connection count of `record`. Built-in rows ask the installed
+/// control; created rows report zero: the kernel holds no socket for
+/// them.
 fn current_count(store: &ListenerStore, record: &ListenerRecord) -> u64 {
     if !record.kernel_owned {
         return 0;
@@ -1057,7 +1051,8 @@ fn create_fields(
 }
 
 /// Store one validated create and answer its detail. Created rows
-/// belong to the edge: the kernel cannot bind them now.
+/// stay stored only: the kernel cannot bind them. To serve a listener,
+/// set it in `indra.toml`.
 fn store_created(store: &ListenerStore, id: &str, fields: CreateFields) -> Response {
     let record = ListenerRecord {
         id: id.to_string(),
@@ -1351,8 +1346,8 @@ pub async fn delete_listener(State(state): State<ApiState>, Path(id): Path<Strin
 }
 
 /// Fetch the kernel-owned record for a lifecycle call. Unknown ids
-/// answer 400 with `BAD_LISTENER_ID`; edge-owned rows answer 400 with
-/// `BAD_REQUEST` and name the edge as the owner.
+/// answer 400 with `BAD_LISTENER_ID`; created rows answer 400 with
+/// `BAD_REQUEST` and name the file configuration as their home.
 fn lifecycle_record(store: &ListenerStore, id: &str) -> Result<ListenerRecord, Box<Response>> {
     let Some(record) = store.get(id) else {
         return Err(Box::new(bad_listener_id_400(format!(
@@ -1362,7 +1357,7 @@ fn lifecycle_record(store: &ListenerStore, id: &str) -> Result<ListenerRecord, B
     if !record.kernel_owned {
         return Err(Box::new(
             ApiError::BadRequest(format!(
-                "listener {id:?} is owned by the edge: this broker cannot change it"
+                "listener {id:?} is stored only: a listener created through the API cannot be started; set it in indra.toml"
             ))
             .into_response(),
         ));
@@ -1763,9 +1758,9 @@ mod tests {
         assert_eq!(by_id("ssl:default")["enable"], serde_json::json!(false));
         assert_eq!(by_id("ws:default")["enable"], serde_json::json!(true));
         assert_eq!(by_id("wss:default")["enable"], serde_json::json!(false));
-        // Documented live state: `running` is always present, edge rows
-        // report a zero count, and each row carries status and one node
-        // entry. Nothing runs without the socket control, so no row
+        // Documented live state: `running` is always present, created
+        // rows report a zero count, and each row carries status and one
+        // node entry. Nothing runs without the socket control, so no row
         // claims a number.
         for row in rows {
             assert_eq!(row["running"], serde_json::json!(false));
@@ -1957,15 +1952,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_on_edge_listener_answers_400() {
+    async fn builtin_rows_are_kernel_owned_with_limits() {
+        let store = ListenerStore::from_config(&broker_config::schema::ListenersConf::default());
+        // The kernel serves every built-in listener. Each row carries a
+        // limit, so no row reports a missing limit.
+        for id in ["tcp:default", "ssl:default", "ws:default", "wss:default"] {
+            let row = store.get(id).expect("built-in row exists");
+            assert!(row.kernel_owned, "{id} is served by the kernel");
+            assert!(
+                matches!(row.max_connections, Some(ListenerMaxConnections::Finite(_))),
+                "{id} carries a limit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_on_created_listener_answers_400() {
         let state = standalone_state();
         let server = HttpServer::start(state).await;
-        // The default rows belong to the edge: lifecycle calls fail.
+        // Rows created through the API stay stored only.
+        let (status, created) = server
+            .call(
+                "POST",
+                "/listeners",
+                Some(serde_json::json!({
+                    "name": "stored",
+                    "type": "tcp",
+                    "bind": "127.0.0.1:11887",
+                })),
+            )
+            .await;
+        assert_eq!(status, 200, "create answers 200: {created}");
+        // Lifecycle calls on the stored row fail with the file path.
         for action in ["start", "stop", "restart"] {
-            let path = format!("/listeners/tcp:default/{action}");
+            let path = format!("/listeners/tcp:stored/{action}");
             let (status, body) = server.call("POST", &path, None).await;
-            assert_eq!(status, 400, "{action} on edge row fails: {body}");
+            assert_eq!(status, 400, "{action} on stored row fails: {body}");
             assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("set it in indra.toml")),
+                "{action} names the file: {body}"
+            );
         }
         // Unknown ids fail with the documented listener code.
         for action in ["start", "stop", "restart"] {
@@ -2331,8 +2360,8 @@ mod tests {
         let server = HttpServer::start(state).await;
         let (status, groups) = server.call("GET", "/listeners_status", None).await;
         assert_eq!(status, 200);
-        // Every group carries status and one node entry, even for rows
-        // the edge owns.
+        // Every group carries status and one node entry, even for
+        // stored rows the kernel never serves.
         for group in groups.as_array().expect("groups is an array") {
             assert!(
                 group["enable"].is_boolean(),
