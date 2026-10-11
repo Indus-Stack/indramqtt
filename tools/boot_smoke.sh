@@ -16,6 +16,8 @@
 set -u
 
 BIN_DIR=${1:?give the directory that contains indramqtt and indra}
+# The script starts the kernel from a different directory. Thus it needs
+# absolute paths.
 BIN_DIR=$(cd "$BIN_DIR" 2>/dev/null && pwd) || { echo "FAIL: $1 is not a directory"; exit 2; }
 KERNEL=$BIN_DIR/indramqtt
 CTL=$BIN_DIR/indra
@@ -42,7 +44,7 @@ check() { if [ "$2" = 0 ]; then pass "$1"; else fail "$1"; fi; }
 
 # Get free ports. The checks use these ports and not the defaults. Thus
 # a check is satisfactory only if the broker reads the port from the file.
-read -r API_PORT LINK_PORT MQTT_PORT WS_PORT WSS_PORT <<EOF
+read -r API_PORT MQTT_PORT TLS_PORT WS_PORT WSS_PORT <<EOF
 $(python3 - <<'PY'
 import socket
 socks = [socket.socket() for _ in range(5)]
@@ -65,18 +67,22 @@ WSS_CA="$TREE_DIR/crates/broker-connectors-enterprise/testdata/ca-cert.pem"
 
 API_KEY_GOOD=boot-smoke-key-0001
 # The kernel serves every enabled listener. `native` is deprecated and
-# ignored, so the config sets no `native` key. SMOKE_NATIVE still gates
-# the checks that need the secure WebSocket listener below.
-if [ "${SMOKE_NATIVE:-0}" = 1 ]; then NATIVE=true; else NATIVE=false; fi
+# ignored, so the config sets no `native` key. The MQTT checks run in
+# one mode against the kernel listener in each run.
 mkdir -p "$ROOT/cfg" "$ROOT/data"
 cat > "$ROOT/cfg/indra.toml" <<EOF
 [node]
 id = "boot-smoke"
 data_dir = "$ROOT/data"
-brokerlink_bind = "127.0.0.1:$LINK_PORT"
 
 [listeners.tcp]
 bind = "127.0.0.1:$MQTT_PORT"
+
+[listeners.tls]
+bind = "127.0.0.1:$TLS_PORT"
+cert_file = "$WSS_CERT"
+key_file = "$WSS_KEY"
+enabled = true
 
 [listeners.ws]
 bind = "127.0.0.1:$WS_PORT"
@@ -102,7 +108,7 @@ interval = "31s"
 [[tenants.rules]]
 expression = "t-\${username}"
 
-# Listener-scoped rules. The default rule is first, so edge
+# Listener-scoped rules. The default rule is first, so TCP
 # clients keep the default scope. Scoped rules stay to prove
 # scoping at connect does not break delivery.
 [[tenants.rules]]
@@ -122,9 +128,8 @@ listener = "wss"
 expression = "t-ws-\${username}"
 EOF
 
-# With SMOKE_NATIVE=1 the config also enables the secure WebSocket
-# listener. The test certificate is the one of the kernel TLS tests.
-if [ "$NATIVE" = true ]; then
+# The secure WebSocket listener is always enabled. The test certificate
+# is the one of the kernel TLS tests.
 for cert in "$WSS_CERT" "$WSS_KEY" "$WSS_CA"; do
     [ -f "$cert" ] || { echo "FAIL: test certificate $cert is missing"; exit 2; }
 done
@@ -136,7 +141,6 @@ cert_file = "$WSS_CERT"
 key_file = "$WSS_KEY"
 enabled = true
 EOF
-fi
 
 # --- 1. The kernel starts from the file and the credential variables ---
 INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
@@ -208,7 +212,7 @@ all_status=$?
 [ "$all_status" = 0 ] || head -3 "$ROOT/all.log"
 check "indra.toml accepts each setting in schemas/config-schema.json" "$all_status"
 
-# --- 4. The kernel serves the listeners from the file ---
+# --- 4. The kernel serves the listeners from the resolved configuration ---
 # The kernel already serves. This step starts no extra process.
 "$KERNEL" --config-dir "$ROOT/cfg" --check-config > "$ROOT/cfg.log" 2>&1
 check "the kernel validates the boot configuration" $?
@@ -517,10 +521,8 @@ PY
 [ $? = 0 ] || failures=$((failures + 1))
 
 # --- 4a. Unsubscribe on the kernel listener keeps the connection ---
-# Run this check in the SMOKE_NATIVE mode for now.
 # A client subscribes, gets a message, unsubscribes, gets UNSUBACK,
-# and gets no more messages. Covers MQTT 3.1.1 and MQTT 5.
-if [ "${SMOKE_NATIVE:-0}" = 1 ]; then
+# and gets no more messages. It covers MQTT 3.1.1 and MQTT 5.
 python3 - "$MQTT_PORT" <<'PY'
 import socket, struct, sys, time
 mqtt_port = sys.argv[1]
@@ -591,13 +593,11 @@ report("an MQTT 5 unsubscribe stops delivery and answers success",
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
-fi
 
 # --- 4a2. WebSocket on the kernel listener carries MQTT ---
-# Run this check in the SMOKE_NATIVE mode for now. A WebSocket
-# client connects with the mqtt subprotocol, subscribes, and exchanges
-# a publish with a TCP client in both directions. A wrong path fails.
-if [ "${SMOKE_NATIVE:-0}" = 1 ]; then
+# A WebSocket client and a TCP client connect, subscribe,
+# and exchange a publish in both directions.
+# A wrong path fails.
 python3 - "$MQTT_PORT" "$WS_PORT" <<'PY'
 import base64, os, socket, struct, sys, time
 mqtt_port, ws_port = int(sys.argv[1]), int(sys.argv[2])
@@ -698,16 +698,34 @@ ready = ws_ok and tcp_ok
 if ready:
     ws_send(ws, packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
     ready = ws_recv(ws, 5)[:1] == b"\x90"
+    tcp.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and tcp.recv(5)[:1] == b"\x90"
 if ready:
     tcp.sendall(packet(0x30, field(topic) + secret_tcp))
     report("a TCP publish reaches a WebSocket subscriber through the kernel",
            ws_recv(ws, 5).endswith(secret_tcp))
-    ws_send(ws, packet(0x30, field(topic) + secret_ws))
+    # The TCP client subscribes too, so it first gets its own publish.
+    # Drain that echo, then wait for the WebSocket publish.
     tcp.settimeout(5)
     try:
-        got = tcp.recv(100)
+        tcp.recv(100)
     except OSError:
-        got = b""
+        pass
+    ws_send(ws, packet(0x30, field(topic) + secret_ws))
+    got = b""
+    deadline = time.time() + 5
+    while time.time() < deadline and secret_ws not in got:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        tcp.settimeout(remaining)
+        try:
+            chunk = tcp.recv(100)
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
     report("a WebSocket publish reaches a TCP subscriber through the kernel",
            got.endswith(secret_ws))
 else:
@@ -716,14 +734,11 @@ else:
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
-fi
 
 # --- 4a3. Secure WebSocket on the kernel listener carries MQTT ---
-# Run this check in the SMOKE_NATIVE mode for now. A TLS
-# client makes the WebSocket upgrade with the mqtt subprotocol and
-# exchanges a publish with a TCP client in both directions. A client
-# without TLS gets no upgrade. A wrong path fails.
-if [ "${SMOKE_NATIVE:-0}" = 1 ]; then
+# A TLS client and a TCP client connect, subscribe,
+# and exchange a publish in both directions.
+# A client without TLS gets no upgrade. A wrong path fails.
 python3 - "$MQTT_PORT" "$WSS_PORT" "$WSS_CA" <<'PY'
 import base64, os, socket, ssl, struct, sys, time
 mqtt_port, wss_port, ca = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
@@ -841,16 +856,34 @@ ready = wss_ok and tcp_ok
 if ready:
     ws_send(wss, packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
     ready = ws_recv(wss, 5)[:1] == b"\x90"
+    tcp.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = ready and tcp.recv(5)[:1] == b"\x90"
 if ready:
     tcp.sendall(packet(0x30, field(topic) + secret_tcp))
     report("a TCP publish reaches a secure WebSocket subscriber through the kernel",
            ws_recv(wss, 5).endswith(secret_tcp))
-    ws_send(wss, packet(0x30, field(topic) + secret_wss))
+    # The TCP client subscribes too, so it first gets its own publish.
+    # Drain that echo, then wait for the secure WebSocket publish.
     tcp.settimeout(5)
     try:
-        got = tcp.recv(100)
+        tcp.recv(100)
     except OSError:
-        got = b""
+        pass
+    ws_send(wss, packet(0x30, field(topic) + secret_wss))
+    got = b""
+    deadline = time.time() + 5
+    while time.time() < deadline and secret_wss not in got:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        tcp.settimeout(remaining)
+        try:
+            chunk = tcp.recv(100)
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
     report("a secure WebSocket publish reaches a TCP subscriber through the kernel",
            got.endswith(secret_wss))
 else:
@@ -859,7 +892,104 @@ else:
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
-fi
+
+# --- 4a4. TLS on the kernel listener carries MQTT ---
+# A TLS client and a TCP client connect, subscribe,
+# and exchange a publish in both directions.
+# The TLS client uses the test certificate of the kernel TLS tests.
+# A client without TLS gets no MQTT handshake.
+python3 - "$MQTT_PORT" "$TLS_PORT" "$WSS_CA" <<'PY'
+import os, socket, ssl, struct, sys, time
+mqtt_port, tls_port, ca = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def tls_dial(port):
+    raw = wait_port(port)
+    ctx = ssl.create_default_context(cafile=ca)
+    ctx.check_hostname = False
+    return ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+def mqtt_connect(sock, client_id):
+    sock.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(client_id)))
+    return sock.recv(4) == b"\x20\x02\x00\x00"
+def receive(sock, seconds):
+    sock.settimeout(seconds)
+    try:
+        return sock.recv(200)
+    except OSError:
+        return b""
+tls = tls_dial(tls_port)
+report("the kernel TLS listener accepts a handshake with the test certificate",
+       mqtt_connect(tls, b"smoke-tls-sub"))
+topic = b"smoke/tls/check"
+secret_tcp = os.urandom(6).hex().encode()
+secret_tls = os.urandom(6).hex().encode()
+tls.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+ready = tls.recv(5)[:1] == b"\x90"
+tcp = wait_port(mqtt_port)
+tcp.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-tls-tcp")))
+tcp_ok = tcp.recv(4) == b"\x20\x02\x00\x00"
+ready = ready and tcp_ok
+if ready:
+    tcp.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+    ready = tcp.recv(5)[:1] == b"\x90"
+if ready:
+    tcp.sendall(packet(0x30, field(topic) + secret_tcp))
+    report("a TCP publish reaches a TLS subscriber through the kernel",
+           receive(tls, 5).endswith(secret_tcp))
+    # The TCP client subscribes too, so it first gets its own publish.
+    # Drain that echo, then wait for the TLS publish.
+    tcp.settimeout(5)
+    try:
+        tcp.recv(100)
+    except OSError:
+        pass
+    tls.sendall(packet(0x30, field(topic) + secret_tls))
+    got = b""
+    deadline = time.time() + 5
+    while time.time() < deadline and secret_tls not in got:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        tcp.settimeout(remaining)
+        try:
+            chunk = tcp.recv(100)
+        except OSError:
+            break
+        if not chunk:
+            break
+        got += chunk
+    report("a TLS publish reaches a TCP subscriber through the kernel",
+           got.endswith(secret_tls))
+else:
+    report("a TCP publish reaches a TLS subscriber through the kernel", False)
+    report("a TLS publish reaches a TCP subscriber through the kernel", False)
+plain = socket.create_connection(("127.0.0.1", tls_port), timeout=5)
+plain.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-tls-plain")))
+plain.settimeout(5)
+try:
+    plain_reply = plain.recv(4)
+except OSError:
+    plain_reply = b""
+report("a client without TLS gets no MQTT handshake",
+       plain_reply != b"\x20\x02\x00\x00")
+plain.close()
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
 
 # --- 4b. Tenant filters on the client list keep tenants apart ---
 # Run this check before the first user exists. The broker stays open.
@@ -949,7 +1079,7 @@ PY
 # --- 10. Explicit bind sections keep tenants apart ---
 # Run this check before the first user exists. The broker stays open.
 # Unknown users connect. The check proves isolation on the new path.
-# Each connect uses the new bind path. The edge sets the section
+# Each connect uses the new bind path. The kernel sets the section
 # flags. Each publish uses a random value. Delivery stays in-tenant.
 # The default tenant still delivers as before.
 python3 - "$MQTT_PORT" <<'PY'
@@ -1545,7 +1675,7 @@ PY
 
 # --- 11. Listener scope and client certificate defaults through the socket ---
 # The broker starts from indra.toml with listener-scoped tenant rules.
-# The default rule is first, so edge clients use the per-username
+# The default rule is first, so TCP clients use the per-username
 # rule. Each tenant gets one user with a random password the broker
 # cannot know, plus publish and subscribe rules. Real clients connect
 # in each tenant. A publish in one tenant reaches its own subscriber
