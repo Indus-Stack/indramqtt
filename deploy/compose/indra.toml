@@ -21,9 +21,6 @@ id = "indra-node-1"
 # compose data volume, so state survives container restarts.
 data_dir = "/var/lib/indramqtt/data"
 
-# BrokerLink IPC listen address for the edge (container loopback).
-brokerlink_bind = "127.0.0.1:18883"
-
 [listeners.tcp]
 # Standard plaintext MQTT listener (mapped to host port 1883).
 enabled = true

@@ -1,9 +1,9 @@
 # Keep the build context to what the image builds: the Rust workspace
-# (Cargo manifests, the Protobuf contract, all crates), the Erlang edge
-# sources, and the image files themselves. Everything else only costs
-# upload time and risks stale bytes in the build cache.
+# (Cargo manifests, the Protobuf contract, all crates) and the image
+# files themselves. Everything else only costs upload time and risks
+# stale bytes in the build cache.
 #
-# Never ignore: Dockerfile, beam/src, proto, crates, Cargo.toml, Cargo.lock.
+# Never ignore: Dockerfile, proto, crates, Cargo.toml, Cargo.lock.
 
 # Rust build artefacts (never build inside the tree; the builder stage
 # compiles inside the container only).
@@ -13,9 +13,8 @@
 /.git/
 .github/
 
-# Compiled edge artefacts (the image compiles the edge from beam/src).
-beam/_build/
-beam/ebin/
+# The image uses no file from beam/.
+beam/
 
 # Frontend workspace (not part of the image).
 dashboard/node_modules/

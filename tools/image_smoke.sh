@@ -18,8 +18,8 @@ check() { if [ "$2" = 0 ]; then echo "ok   $1"; else echo "FAIL $1"; failures=$(
 [ "$(docker exec "$CONTAINER" id -un)" != root ]
 check "the broker does not run as root" $?
 
-docker exec "$CONTAINER" sh -c 'ps -eo args | grep -q "[b]eam"'
-check "the edge runs in the container" $?
+docker exec "$CONTAINER" sh -c '! ps -eo args | grep -q "[b]eam"'
+check "no Erlang process runs in the container" $?
 
 # The compose file sets INDRA_LOGGING__LEVEL=debug. The file sets info.
 [ "$(docker logs "$CONTAINER" 2>&1 | grep -c DEBUG)" -gt 0 ]
