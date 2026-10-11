@@ -54,6 +54,7 @@
                        | {certfile, file:filename()}
                        | {keyfile, file:filename()}
                        | {verify_client_cert, boolean()}
+                       | {cacertfile, file:filename()}
                        | {path, string() | binary()}
                        | {handshake_timeout_ms, pos_integer()}
                        | {max_frame_bytes, pos_integer()}
@@ -62,16 +63,17 @@
 
 %% @private SSL verify options for client certificates (TM-08).
 %% Off requests no certificate. On requests one and checks its chain
-%% against system roots. Missing passes the handshake and fails at the
-%% bind. A bad chain fails the handshake.
-wss_verify_opts(true) ->
-    Cacerts = case catch public_key:cacerts_get() of
-        Certs when is_list(Certs) -> [{cacerts, Certs}];
-        _ -> []
-    end,
-    [{verify, verify_peer}, {fail_if_no_peer_cert, false} | Cacerts];
-wss_verify_opts(_) ->
-    [].
+%% against the CA file of the operator. No default set of public
+%% authorities applies: without a CA file the listener does not start.
+%% Missing passes the handshake and fails at the bind. A bad chain fails
+%% the handshake.
+wss_verify_opts(true, undefined) ->
+    {error, {missing_option, cacertfile}};
+wss_verify_opts(true, CaFile) ->
+    {ok, [{verify, verify_peer}, {fail_if_no_peer_cert, false},
+          {cacertfile, CaFile}]};
+wss_verify_opts(_, _) ->
+    {ok, []}.
 
 %%====================================================================
 %% API
@@ -157,8 +159,14 @@ init(Opts) ->
                     %% verification follows the verify flag. Material is
                     %% read once here; rotation needs a restart.
                     Verify = proplists:get_value(verify_client_cert, Opts, false),
-                    ssl:listen(Port, [{certfile, Cert}, {keyfile, Key} |
-                                      wss_verify_opts(Verify)] ++ SockOpts)
+                    case wss_verify_opts(Verify,
+                                         proplists:get_value(cacertfile, Opts, undefined)) of
+                        {ok, VerifyOpts} ->
+                            ssl:listen(Port, [{certfile, Cert}, {keyfile, Key} |
+                                              VerifyOpts] ++ SockOpts);
+                        {error, _} = VerifyError ->
+                            VerifyError
+                    end
             end;
         _ ->
             gen_tcp:listen(Port, SockOpts)

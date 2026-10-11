@@ -171,7 +171,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 path: "listeners.tls.cacertfile",
                 setting_type: "path string",
                 default: "\"\"",
-                range: "PEM file path; empty uses system roots",
+                range: "PEM file path; required when client verification is on",
                 doc: "CA file for client certificate checks of the TLS listener.",
             },
             FieldDoc {
@@ -276,7 +276,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 path: "listeners.wss.cacertfile",
                 setting_type: "path string",
                 default: "\"\"",
-                range: "PEM file path; empty uses system roots",
+                range: "PEM file path; required when client verification is on",
                 doc: "CA file for client certificate checks of the secure WebSocket listener.",
             },
             FieldDoc {
@@ -1111,6 +1111,7 @@ impl TlsListenerConf {
             &self.peer_cert_as_clientid,
             self.fail_if_no_peer_cert,
             self.verify_client_cert,
+            &self.cacertfile,
         )?;
         Ok(())
     }
@@ -1130,6 +1131,7 @@ fn validate_client_cert_opts(
     as_clientid: &str,
     fail_if_no_peer_cert: bool,
     legacy_verify: bool,
+    cacertfile: &str,
 ) -> Result<(), ConfigError> {
     if verify != "verify_none" && verify != "verify_peer" {
         return Err(invalid(
@@ -1158,6 +1160,15 @@ fn validate_client_cert_opts(
         }
     }
     let verify_on = verify == "verify_peer" || legacy_verify;
+    // The trust anchors for client certificates come from the operator
+    // only. No default set of public authorities applies.
+    if verify_on && cacertfile.trim().is_empty() {
+        return Err(invalid(
+            &format!("{prefix}.cacertfile"),
+            cacertfile,
+            "is required when client certificate verification is on",
+        ));
+    }
     if fail_if_no_peer_cert && !verify_on {
         return Err(invalid(
             &format!("{prefix}.fail_if_no_peer_cert"),
@@ -1327,6 +1338,7 @@ impl WssListenerConf {
             &self.peer_cert_as_clientid,
             self.fail_if_no_peer_cert,
             self.verify_client_cert,
+            &self.cacertfile,
         )?;
         Ok(())
     }
@@ -3939,6 +3951,33 @@ mod tests {
         BrokerConfig::default()
             .validate()
             .expect("schema defaults must validate");
+    }
+
+    #[test]
+    fn schema_refuses_client_verification_without_ca_file() {
+        for (verify, legacy) in [("verify_peer", false), ("verify_none", true)] {
+            let mut config = BrokerConfig::default();
+            config.listeners.tls.verify = verify.to_string();
+            config.listeners.tls.verify_client_cert = legacy;
+            let text = config
+                .validate()
+                .expect_err("tls verification without a CA file must fail")
+                .to_string();
+            assert!(text.contains("listeners.tls.cacertfile"), "got: {text}");
+
+            let mut config = BrokerConfig::default();
+            config.listeners.wss.verify = verify.to_string();
+            config.listeners.wss.verify_client_cert = legacy;
+            let text = config
+                .validate()
+                .expect_err("wss verification without a CA file must fail")
+                .to_string();
+            assert!(text.contains("listeners.wss.cacertfile"), "got: {text}");
+        }
+        let mut config = BrokerConfig::default();
+        config.listeners.tls.verify = "verify_peer".to_string();
+        config.listeners.tls.cacertfile = "/etc/indramqtt/ca.pem".to_string();
+        config.validate().expect("a CA file makes it valid");
     }
 
     #[test]

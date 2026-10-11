@@ -48,6 +48,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Unstable
 - **Single sign-on**: the login endpoints of single sign-on answer the error that the reference API documents: 404 `BACKEND_NOT_FOUND` for `POST /sso/login/{backend}` and `POST /sso/saml/acs`, and 400 `BAD_REQUEST` for `GET /sso/oidc/callback` and `POST /sso/token_exchange`. The message says that single sign-on is not available in this release. The flows did not connect to an identity provider. The endpoints that store a backend stay.
 
+### Security
+- **Client certificate roots**: a listener with client certificate verification on (`verify = "verify_peer"` or `verify_client_cert = true`) needs `cacertfile`. The configuration check refuses an empty value, and a secure listener does not start without a CA file. The broker no longer uses a built-in set of public authorities for client certificates.
+- **Publish without a session**: a PUBLISH from a connection with no bound session is not routed, and the broker closes that connection. After a denial with `deny_action = disconnect`, the broker does not handle the packets that the connection still holds in its read buffer.
+- **Delayed publish**: a publish to `$delayed/<seconds>/<topic>` is checked against the access rules, the database rules and the webhook with the target topic, also with the retain flag.
+- **Gateway publish**: a CoAP publish is checked against the access rules, the database rules and the webhook in the default tenant, and a denied publish stores nothing and answers 4.01.
+
 ### Fixed
 - **Messages that did not arrive in a large fan-out**: the kernel wrote one batch for each wake of a link and then waited. A publish to more subscribers than one batch holds left messages in the queues, and the kernel counted them as delivered. The kernel now writes until the queues are empty.
 

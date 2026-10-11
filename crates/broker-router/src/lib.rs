@@ -3503,6 +3503,10 @@ struct ConnSlot {
     /// manually) means no directed wakeup; the global
     /// [`ConnTable::qos0_notify`] still fires.
     waker: RwLock<Option<Arc<Notify>>>,
+    /// Set when a close of this connection was ordered with
+    /// [`ConnTable::order_close`]. The owning transport reads it with one
+    /// atomic load, so it stops handling input that is already buffered.
+    closing: Arc<AtomicBool>,
 }
 
 impl ConnTable {
@@ -3530,6 +3534,7 @@ impl ConnTable {
                 client: RwLock::new(None),
                 tenant: RwLock::new(None),
                 waker: RwLock::new(None),
+                closing: Arc::new(AtomicBool::new(false)),
             },
         );
     }
@@ -3636,6 +3641,29 @@ impl ConnTable {
         if let Some(slot) = shard.get(&conn_id) {
             *slot.waker.write() = Some(waker.clone());
         }
+    }
+
+    /// The flag that [`ConnTable::order_close`] sets for `conn_id`. A
+    /// transport takes it once after the bind and reads it for each
+    /// inbound packet. Unknown connections have no flag.
+    pub fn closing_flag(&self, conn_id: u64) -> Option<Arc<AtomicBool>> {
+        let shard = self.shard(conn_id).lock();
+        shard.get(&conn_id).map(|slot| slot.closing.clone())
+    }
+
+    /// Orders the close of `conn_id`: sets its closing flag, then routes
+    /// `frame` (the `ConnClose` frame) like [`ConnTable::route`]. The
+    /// flag is set first, so no packet that the connection still holds
+    /// in its read buffer is handled after the order. Used on denial
+    /// events only, never for an allowed message.
+    pub fn order_close(&self, conn_id: u64, frame: BrokerFrame) -> bool {
+        {
+            let shard = self.shard(conn_id).lock();
+            if let Some(slot) = shard.get(&conn_id) {
+                slot.closing.store(true, Ordering::Release);
+            }
+        }
+        self.route(conn_id, frame)
     }
 
     /// Configured QoS 0 backlog bound (floored at 1 on write).

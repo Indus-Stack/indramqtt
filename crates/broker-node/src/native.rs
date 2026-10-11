@@ -343,7 +343,7 @@ pub(super) struct TlsClientAuth {
     pub verify_peer: bool,
     /// True when the legacy switch requests a chain check.
     pub legacy_verify: bool,
-    /// CA file for the chain check. Empty selects the system roots.
+    /// CA file for the chain check. Required when a check is on.
     pub cacertfile: String,
     /// True when a missing certificate fails the handshake.
     pub fail_if_no_peer_cert: bool,
@@ -363,17 +363,15 @@ impl TlsClientAuth {
 }
 
 /// Loads the trust roots for client certificate checks.
-/// An empty path selects the bundled system roots.
-/// A set path must name a PEM file with at least one certificate.
-/// A missing file, an unreadable file and an empty file return an
-/// error. The caller fails the listener start on an error.
+/// The path must name a PEM file with at least one certificate.
+/// An empty path, a missing file, an unreadable file and an empty
+/// file return an error. No default set of public authorities
+/// applies. The caller fails the listener start on an error.
 fn load_client_roots(
     cacertfile: &str,
 ) -> Result<rustls::RootCertStore, Box<dyn std::error::Error + Send + Sync>> {
     if cacertfile.trim().is_empty() {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        return Ok(roots);
+        return Err("client certificate verification needs a CA file (cacertfile)".into());
     }
     let file = std::fs::File::open(cacertfile)?;
     let mut reader = std::io::BufReader::new(file);
@@ -1632,6 +1630,10 @@ struct Conn {
     connected: bool,
     keepalive: Option<Duration>,
     peer: String,
+    /// Set by the kernel when it orders the close of this connection (a
+    /// denial with `deny_action = disconnect`). Packets that are already
+    /// in the read buffer are not handled after that.
+    closing: Option<Arc<AtomicBool>>,
 }
 
 impl Conn {
@@ -1893,6 +1895,7 @@ where
         connected: false,
         keepalive: None,
         peer,
+        closing: None,
     };
     let mut last_packet = Instant::now();
 
@@ -2062,6 +2065,16 @@ async fn drain_inbound(
     peer_cert: &PeerCert,
 ) -> Result<Option<Stop>, WireError> {
     loop {
+        // One atomic load for each packet, no lock. After a close order the
+        // rest of the buffer is not handled: the task writes the close
+        // packet and ends.
+        if conn
+            .closing
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Ok(None);
+        }
         let Some(header) = wire::fixed_header(inbuf)? else {
             return Ok(None);
         };
@@ -2134,6 +2147,7 @@ async fn drain_inbound(
                 }
                 if sink.accepted.load(Ordering::Relaxed) {
                     conn.connected = true;
+                    conn.closing = shared.conns.closing_flag(conn.conn_id);
                 } else {
                     // Refused: the CONNACK with the reason is in the sink.
                     return Ok(Some(Stop::Clean));
@@ -2657,7 +2671,7 @@ mod tests {
     /// Server config loads with and without client verification.
     /// The fixture is the test server certificate and key.
     /// Verification on requests a client certificate.
-    /// An empty CA path selects the bundled system roots.
+    /// A set CA file loads. An empty CA path returns an error.
     /// A missing CA file returns an error.
     #[test]
     fn tls_config_loads_with_and_without_verify() {
@@ -2671,6 +2685,7 @@ mod tests {
         assert!(super::load_tls_config(&cert, &key, &off).is_ok());
         let on = TlsClientAuth {
             verify_peer: true,
+            cacertfile: format!("{base}/ca-cert.pem"),
             ..TlsClientAuth::default()
         };
         assert!(super::load_tls_config(&cert, &key, &on).is_ok());
@@ -4583,5 +4598,236 @@ mod tests {
             .expect("socket stays open");
         assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "file identity connects");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // Security tests: client certificate roots, publish after a denial
+    // with disconnect, and delayed publish authorization.
+
+    /// Client certificate verification needs a CA file. An empty path
+    /// does not select any default set of public authorities.
+    #[test]
+    fn client_verification_without_ca_file_is_refused() {
+        let cert = k1_05_file("server-cert.pem");
+        let key = k1_05_file("server-key.pem");
+        for (verify_peer, legacy_verify) in [(true, false), (false, true)] {
+            let policy = super::TlsClientAuth {
+                verify_peer,
+                legacy_verify,
+                cacertfile: String::new(),
+                fail_if_no_peer_cert: false,
+            };
+            let result = super::load_tls_config(&cert, &key, &policy);
+            assert!(
+                result.is_err(),
+                "verification with no CA file must not load"
+            );
+        }
+        let with_ca = k1_05_policy(false);
+        assert!(super::load_tls_config(&cert, &key, &with_ca).is_ok());
+    }
+
+    /// The listener controller refuses to start a secure listener with
+    /// client verification on and no CA file, for TLS and for secure
+    /// WebSocket.
+    #[tokio::test]
+    async fn controller_does_not_start_secure_listener_without_ca_file() {
+        use broker_api::v5::listeners::{ListenerController as _, ListenerRecord};
+        let record = |kind: &str| ListenerRecord {
+            id: format!("{kind}:default"),
+            name: "default".to_string(),
+            kind: kind.to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            enable: true,
+            running: false,
+            kernel_owned: true,
+            max_connections: None,
+            acceptors: None,
+            backlog: 0,
+            cert_file: k1_05_file("server-cert.pem"),
+            key_file: k1_05_file("server-key.pem"),
+            zone: "default".to_string(),
+            mountpoint: String::new(),
+            tcp_options: None,
+            ssl_options: None,
+            websocket: None,
+        };
+        let mut conf = broker_config::schema::ListenersConf::default();
+        conf.tls.verify = "verify_peer".to_string();
+        conf.wss.cert_file = k1_05_file("server-cert.pem");
+        conf.wss.key_file = k1_05_file("server-key.pem");
+        conf.wss.verify_client_cert = true;
+        let control = NativeListenerController::new(Shared::new(), conf);
+        for kind in ["ssl", "wss"] {
+            let refused = control.start_listener(&record(kind));
+            assert!(refused.is_err(), "{kind} must not start without a CA file");
+            assert!(
+                refused
+                    .expect_err("refused")
+                    .to_lowercase()
+                    .contains("ca file"),
+                "the error names the CA file"
+            );
+        }
+    }
+
+    /// Rules for the authorization tests: publish to `secret/#` is
+    /// denied and everything else is allowed.
+    fn acl_deny_secret(shared: &Shared, deny_action: &str) {
+        shared
+            .auth
+            .add_rule(broker_auth::AclRule::new(
+                "*",
+                broker_auth::AclAction::Publish,
+                "secret/#",
+                false,
+            ))
+            .expect("rule adds");
+        shared
+            .auth
+            .add_rule(broker_auth::AclRule::new(
+                "*",
+                broker_auth::AclAction::All,
+                "#",
+                true,
+            ))
+            .expect("rule adds");
+        shared
+            .authz_settings
+            .replace(broker_config::AuthzSettingsConf {
+                no_match: "deny".to_string(),
+                deny_action: deny_action.to_string(),
+                ..broker_config::AuthzSettingsConf::default()
+            })
+            .expect("settings replace");
+    }
+
+    /// Opens a TCP client, sends CONNECT and reads the CONNACK.
+    async fn tcp_test_client(port: u16, client_id: &str) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt as _;
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        stream
+            .write_all(&ws_test_connect(client_id))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut stream).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "CONNACK accepts"
+        );
+        stream
+    }
+
+    /// Subscribes a TCP client to the filters and reads the SUBACKs.
+    async fn tcp_test_subscribe(stream: &mut tokio::net::TcpStream, filters: &[&str]) {
+        use tokio::io::AsyncWriteExt as _;
+        for (index, filter) in filters.iter().enumerate() {
+            stream
+                .write_all(&ws_test_subscribe(index as u16 + 1, filter))
+                .await
+                .expect("SUBSCRIBE sends");
+            assert_eq!(tcp_test_recv(stream).await[0], 0x90, "SUBACK answers");
+        }
+    }
+
+    /// With `deny_action = disconnect` the first denied PUBLISH ends the
+    /// connection. The PUBLISH packets that follow it in the same read
+    /// buffer are not routed.
+    #[tokio::test]
+    async fn denied_publish_with_disconnect_stops_the_rest_of_the_buffer() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        acl_deny_secret(&shared, "disconnect");
+        let (tcp_port, _ws_port) = ws_test_listeners(shared).await;
+
+        let mut subscriber = tcp_test_client(tcp_port, "sec-h2-sub").await;
+        tcp_test_subscribe(&mut subscriber, &["secret/x", "open/x"]).await;
+        let mut offender = tcp_test_client(tcp_port, "sec-h2-bad").await;
+
+        // One write: the denied PUBLISH, then more PUBLISH packets.
+        let mut burst = ws_test_publish("secret/x", b"first");
+        for index in 0..20 {
+            burst.extend(ws_test_publish(
+                "secret/x",
+                format!("later-{index}").as_bytes(),
+            ));
+        }
+        offender.write_all(&burst).await.expect("burst sends");
+
+        let leaked =
+            tokio::time::timeout(Duration::from_millis(800), tcp_test_recv(&mut subscriber)).await;
+        assert!(
+            leaked.is_err(),
+            "no packet of the offender reaches a subscriber"
+        );
+
+        // The connection of the offender ends.
+        let mut scratch = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match offender.read(&mut scratch).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the denied connection is closed");
+
+        // The path still works for a client that is allowed.
+        let mut good = tcp_test_client(tcp_port, "sec-h2-good").await;
+        good.write_all(&ws_test_publish("open/x", b"fine"))
+            .await
+            .expect("PUBLISH sends");
+        let delivered = tcp_test_recv(&mut subscriber).await;
+        assert!(delivered.ends_with(b"fine"), "an allowed publish arrives");
+    }
+
+    /// A delayed publish is checked on its inner topic, also with the
+    /// retain flag. An inner topic that the rules allow is delivered
+    /// after the delay.
+    #[tokio::test]
+    async fn delayed_publish_is_authorized_on_the_inner_topic() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        acl_deny_secret(&shared, "ignore");
+        shared.spawn_delayed_driver();
+        let (tcp_port, _ws_port) = ws_test_listeners(shared).await;
+
+        let mut subscriber = tcp_test_client(tcp_port, "sec-h3-sub").await;
+        tcp_test_subscribe(&mut subscriber, &["secret/#", "open/#"]).await;
+        let mut publisher = tcp_test_client(tcp_port, "sec-h3-pub").await;
+
+        let mut retained = ws_test_publish("$delayed/1/secret/kept", b"hidden-kept");
+        retained[0] = 0x31;
+        publisher.write_all(&retained).await.expect("PUBLISH sends");
+        publisher
+            .write_all(&ws_test_publish("$delayed/1/secret/x", b"hidden"))
+            .await
+            .expect("PUBLISH sends");
+        publisher
+            .write_all(&ws_test_publish("$delayed/1/open/x", b"shown"))
+            .await
+            .expect("PUBLISH sends");
+
+        // The only packet is the allowed one, after the delay.
+        let first = tokio::time::timeout(Duration::from_secs(6), tcp_test_recv(&mut subscriber))
+            .await
+            .expect("the allowed delayed publish arrives");
+        assert!(first.ends_with(b"shown"), "first packet is the allowed one");
+        let more =
+            tokio::time::timeout(Duration::from_millis(1500), tcp_test_recv(&mut subscriber)).await;
+        assert!(more.is_err(), "the denied inner topic is not delivered");
+
+        // The denied retained message was not stored.
+        let mut late = tcp_test_client(tcp_port, "sec-h3-late").await;
+        late.write_all(&ws_test_subscribe(1, "secret/#"))
+            .await
+            .expect("SUBSCRIBE sends");
+        assert_eq!(tcp_test_recv(&mut late).await[0], 0x90);
+        let stored =
+            tokio::time::timeout(Duration::from_millis(800), tcp_test_recv(&mut late)).await;
+        assert!(stored.is_err(), "no retained message under secret/");
     }
 }

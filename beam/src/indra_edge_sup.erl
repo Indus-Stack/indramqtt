@@ -56,6 +56,7 @@ init([]) ->
     TlsCert = application:get_env(indra_edge, tls_certfile, undefined),
     TlsKey = application:get_env(indra_edge, tls_keyfile, undefined),
     TlsVerify = application:get_env(indra_edge, tls_verify_client_cert, false),
+    TlsCa = application:get_env(indra_edge, tls_cacertfile, undefined),
     WsEnabled = application:get_env(indra_edge, ws_enabled, true),
     WsPort = application:get_env(indra_edge, ws_port, 8083),
     WsPath = application:get_env(indra_edge, ws_path, "/mqtt"),
@@ -71,6 +72,7 @@ init([]) ->
     WssCert = application:get_env(indra_edge, wss_certfile, undefined),
     WssKey = application:get_env(indra_edge, wss_keyfile, undefined),
     WssVerify = application:get_env(indra_edge, wss_verify_client_cert, false),
+    WssCa = application:get_env(indra_edge, wss_cacertfile, undefined),
     KernelHost = application:get_env(indra_edge, kernel_host, "127.0.0.1"),
     KernelPort = application:get_env(indra_edge, kernel_port, 18883),
     LinkOpts = [{transport, tcp},
@@ -87,10 +89,10 @@ init([]) ->
                     modules => [indra_conn_registry]}] ++
                  BrokerSpecs ++
                  mqtt_child_spec(MqttEnabled, MqttPort, MqttIp) ++
-                 tls_child_spec(TlsEnabled, TlsPort, TlsIp, TlsCert, TlsKey, TlsVerify) ++
+                 tls_child_spec(TlsEnabled, TlsPort, TlsIp, TlsCert, TlsKey, TlsVerify, TlsCa) ++
                  ws_child_spec(WsEnabled, WsPort, WsPath, WsIp) ++
                  wss_child_spec(WssEnabled, WssPort, WssPath, WssCert, WssKey, WssIp,
-                                WssVerify),
+                                WssVerify, WssCa),
     {ok, {SupFlags, ChildSpecs}}.
 
 %% @private The bind address option of a listener. If the address is
@@ -124,12 +126,13 @@ mqtt_child_spec(_, Port, Ip) ->
 %% `tls_enabled' is true. If the certificate or the key is absent, the
 %% child and the start fail. The listener does not use plaintext.
 %% When verify is true the listener requests a client certificate.
-tls_child_spec(false, _Port, _Ip, _Cert, _Key, _Verify) ->
+tls_child_spec(false, _Port, _Ip, _Cert, _Key, _Verify, _Ca) ->
     [];
-tls_child_spec(_, Port, Ip, Cert, Key, Verify) ->
+tls_child_spec(_, Port, Ip, Cert, Key, Verify, Ca) ->
     Material = [{certfile, Cert} || Cert =/= undefined] ++
                [{keyfile, Key} || Key =/= undefined] ++
-               [{verify_client_cert, Verify} || Verify =:= true],
+               [{verify_client_cert, Verify} || Verify =:= true] ++
+               [{cacertfile, Ca} || Ca =/= undefined],
     [#{id => indra_tls_listener,
        start => {?MODULE, start_listener,
                  [[{transport, ssl}, {port, Port}] ++ Material ++ ip_opt(Ip)]},
@@ -159,12 +162,13 @@ ws_child_spec(_, Port, Path, Ip) ->
 %% needs a restart: neither this listener nor the TCP/TLS listener
 %% reloads material in place. The M1-03 schema owns the final names.
 %% When verify is true the listener requests a client certificate.
-wss_child_spec(false, _Port, _Path, _Cert, _Key, _Ip, _Verify) ->
+wss_child_spec(false, _Port, _Path, _Cert, _Key, _Ip, _Verify, _Ca) ->
     [];
-wss_child_spec(_, Port, Path, Cert, Key, Ip, Verify) ->
+wss_child_spec(_, Port, Path, Cert, Key, Ip, Verify, Ca) ->
     Material = [{certfile, Cert} || Cert =/= undefined] ++
                [{keyfile, Key} || Key =/= undefined] ++
-               [{verify_client_cert, Verify} || Verify =:= true],
+               [{verify_client_cert, Verify} || Verify =:= true] ++
+               [{cacertfile, Ca} || Ca =/= undefined],
     [#{id => indra_wss_listener,
        start => {?MODULE, start_wss_listener,
                  [[{transport, ssl}, {port, Port}, {path, Path}] ++

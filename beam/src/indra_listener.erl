@@ -87,20 +87,22 @@
                     | {psk_keys, [{binary(), binary()}]}
                     | {psk_hint, binary() | string()}
                     | {verify_client_cert, boolean()}
+                    | {cacertfile, file:filename()}
                     | {conn, [tuple()]}.
 
 %% @private SSL verify options for client certificates (TM-08).
 %% Off requests no certificate. On requests one and checks its chain
-%% against system roots. Missing passes the handshake and fails at the
-%% bind. A bad chain fails the handshake.
-verify_ssl_opts(true) ->
-    Cacerts = case catch public_key:cacerts_get() of
-        Certs when is_list(Certs) -> [{cacerts, Certs}];
-        _ -> []
-    end,
-    [{verify, verify_peer}, {fail_if_no_peer_cert, false} | Cacerts];
-verify_ssl_opts(_) ->
-    [].
+%% against the CA file of the operator. No default set of public
+%% authorities applies: without a CA file the listener does not start.
+%% Missing passes the handshake and fails at the bind. A bad chain fails
+%% the handshake.
+verify_ssl_opts(true, undefined) ->
+    {error, {missing_option, cacertfile}};
+verify_ssl_opts(true, CaFile) ->
+    {ok, [{verify, verify_peer}, {fail_if_no_peer_cert, false},
+          {cacertfile, CaFile}]};
+verify_ssl_opts(_, _) ->
+    {ok, []}.
 
 %%====================================================================
 %% API
@@ -278,7 +280,13 @@ build_ssl_opts(Opts, SockOpts) ->
             case {Cert, Key} of
                 {undefined, _} -> {error, {missing_option, certfile}};
                 {_, undefined} -> {error, {missing_option, keyfile}};
-                {_, _} -> {ok, [{certfile, Cert}, {keyfile, Key} | verify_ssl_opts(Verify)] ++ SockOpts, undefined}
+                {_, _} ->
+                    case verify_ssl_opts(Verify, proplists:get_value(cacertfile, Opts, undefined)) of
+                        {ok, VerifyOpts} ->
+                            {ok, [{certfile, Cert}, {keyfile, Key} | VerifyOpts] ++ SockOpts, undefined};
+                        {error, _} = VerifyError ->
+                            VerifyError
+                    end
             end;
         _ ->
             case validate_psk_keys(PskKeys) of

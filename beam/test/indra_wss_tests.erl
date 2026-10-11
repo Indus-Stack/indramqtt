@@ -56,6 +56,23 @@ wss_missing_keyfile_rejected_test() ->
         process_flag(trap_exit, false)
     end.
 
+wss_verify_without_cacertfile_rejected_test() ->
+    {Cert, Key} = test_certs(),
+    process_flag(trap_exit, true),
+    try
+        %% Client verification on and no CA file: the listener does not
+        %% start. No default set of public authorities applies.
+        ?assertMatch({error, _},
+                     indra_ws_listener:start_link([{transport, ssl},
+                                                  {port, 0},
+                                                  {certfile, Cert},
+                                                  {keyfile, Key},
+                                                  {verify_client_cert, true}])),
+        receive {'EXIT', _, _} -> ok after 1000 -> ok end
+    after
+        process_flag(trap_exit, false)
+    end.
+
 %%====================================================================
 %% Handshake over TLS
 %%====================================================================

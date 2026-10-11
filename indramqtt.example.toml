@@ -40,7 +40,7 @@ key_file = "/etc/indramqtt/certs/server.key"
 verify_client_cert = false
 # Client certificate chain check mode: verify_none or verify_peer.
 verify = "verify_none"
-# CA file for client certificate checks. Empty uses system roots.
+# CA file for client certificate checks. Required when verification is on.
 cacertfile = ""
 # Refuse a handshake without a certificate. Needs verification on.
 fail_if_no_peer_cert = false
@@ -67,7 +67,7 @@ key_file = ""
 verify_client_cert = false
 # Client certificate chain check mode: verify_none or verify_peer.
 verify = "verify_none"
-# CA file for client certificate checks. Empty uses system roots.
+# CA file for client certificate checks. Required when verification is on.
 cacertfile = ""
 # Refuse a handshake without a certificate. Needs verification on.
 fail_if_no_peer_cert = false
