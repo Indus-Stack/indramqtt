@@ -270,8 +270,9 @@ class TestDockerRunChecked(unittest.TestCase):
         self.assertIn("+S", joined)
         self.assertIn("+sbwt none", joined)
 
-    def test_broker_image_is_slim(self):
-        self.assertEqual(suite.BROKER_IMAGE, "debian:bookworm-slim")
+    def test_broker_image_is_bench_base(self):
+        self.assertEqual(suite.BROKER_IMAGE, "indra-bench-base")
+        self.assertEqual(suite.BROKER_IMAGE_BASE, "debian:bookworm-slim")
 
 
 class TestStepGuards(unittest.TestCase):
@@ -348,7 +349,7 @@ class TestStepGuards(unittest.TestCase):
         args = mock.Mock(bench_bin="/bin/gen", bench_image="img:1")
         order = []
         with mock.patch.object(suite, "start_generator",
-                               side_effect=lambda n, c, cmds, img: order.append(n) or "cid-" + n):
+                               side_effect=lambda n, c, cmds, img, mem=None: order.append(n) or "cid-" + n):
             with mock.patch.object(suite.time, "sleep", return_value=None):
                 with mock.patch.object(suite, "wait_for_subscriptions", return_value=True) as wf:
                     with mock.patch.object(suite, "sh", return_value="cid-bs-sub-1"):
@@ -477,6 +478,269 @@ class TestScriptsAndLoadgen(unittest.TestCase):
         text = self._read("build-probe.sh")
         self.assertNotIn("12-17", text)
         self.assertIn("rust:1.96-bookworm", text)
+
+
+class TestMemoryLimits(unittest.TestCase):
+    """Check host limit, broker share and generator budget."""
+
+    def test_reads_cgroup_limit(self):
+        with mock.patch.object(suite, "read_file", return_value="12884901888\n"):
+            self.assertEqual(suite.read_host_memory_limit_bytes(), 12884901888)
+
+    def test_max_falls_back_to_memtotal(self):
+        def fake(path):
+            if path == suite.HOST_MEMORY_MAX_PATH:
+                return "max\n"
+            return "MemTotal:       25165824 kB\n"
+        with mock.patch.object(suite, "read_file", side_effect=fake):
+            self.assertEqual(suite.read_host_memory_limit_bytes(), 25165824 * 1024)
+
+    def test_broker_share(self):
+        gib = 1024 ** 3
+        self.assertEqual(suite.broker_memory_limit_bytes(12 * gib), 6 * gib)
+        self.assertEqual(suite.broker_memory_limit_bytes(24 * gib), 8 * gib)
+
+    def test_format_docker_mem(self):
+        self.assertEqual(suite.format_docker_mem(6 * 1024 ** 3), "6144m")
+
+    def test_generator_budget_fits(self):
+        gib = 1024 ** 3
+        host = 12 * gib
+        broker = suite.broker_memory_limit_bytes(host)
+        per = suite.generator_memory_limit_bytes(host, broker, 21)
+        self.assertGreater(per, 0)
+        total = broker + 21 * per + suite.PROBE_RESERVE_BYTES
+        self.assertLessEqual(total, int(host * 0.85))
+
+    def test_broker_start_sets_limits(self):
+        seen = {}
+
+        def fake_docker(*args):
+            seen["args"] = list(args)
+            return "ok"
+
+        with mock.patch.object(suite, "read_file", return_value="12884901888\n"):
+            broker = suite.Broker("/bin/x", "/tmp", 28083, False, 0)
+
+            def fake_sh(*args):
+                if "{{.State.Pid}}" in " ".join(args):
+                    return "1234"
+                return "cid123"
+
+            with mock.patch.object(suite, "docker_run", side_effect=fake_docker):
+                with mock.patch.object(suite, "sh", side_effect=fake_sh):
+                    with mock.patch.object(suite.time, "sleep", return_value=None):
+                        with mock.patch.object(suite.Broker, "api", return_value={}):
+                            with mock.patch.object(suite.urllib.request, "urlopen") as url:
+                                url.return_value.__enter__.return_value = mock.Mock()
+                                broker.start()
+        flat = " ".join(seen["args"])
+        self.assertIn("--memory=6144m", flat)
+        self.assertIn("--memory-swap=6144m", flat)
+        self.assertEqual(broker.memory_limit_str, "6144m")
+
+    def test_generator_flags(self):
+        seen = {}
+
+        def fake_docker(*args):
+            seen["args"] = list(args)
+            return "ok"
+
+        with mock.patch.object(suite, "docker_run", side_effect=fake_docker):
+            with mock.patch.object(suite, "sh", return_value="cid"):
+                suite.start_generator("bs-t", "0-3", ["loadgen sub"], "img:1",
+                                      512 * suite.MIB)
+        flat = " ".join(seen["args"])
+        self.assertIn("--memory=512m", flat)
+        self.assertIn("--memory-swap=512m", flat)
+
+
+class TestHostMemoryGuard(unittest.TestCase):
+    """Check sampler guard, error row and peaks."""
+
+    def test_hit_above_90pct(self):
+        sam = suite.Sampler(None, {}, host_limit=1000)
+        sam.check_host_memory({"host_mem": 950, "mem": 100, "gen_mem": {"pub": 50}})
+        self.assertTrue(sam.host_hit)
+        self.assertEqual(sam.container_mem["pub"], 50)
+
+    def test_no_hit_below(self):
+        sam = suite.Sampler(None, {}, host_limit=1000)
+        sam.check_host_memory({"host_mem": 800, "mem": 100, "gen_mem": {}})
+        self.assertFalse(sam.host_hit)
+
+    def test_no_hit_unknown(self):
+        sam = suite.Sampler(None, {}, host_limit=1000)
+        sam.check_host_memory({"host_mem": None, "mem": 0, "gen_mem": {}})
+        self.assertFalse(sam.host_hit)
+
+    def test_sleep_guarded_host_memory(self):
+        sam = suite.Sampler(None, {}, host_limit=1000)
+        sam.host_hit = True
+        with mock.patch.object(suite.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 0.0]):
+            self.assertEqual(suite.sleep_guarded(5, 9000.0, sam), "host memory")
+
+    def test_error_row_carries_mem(self):
+        sam = mock.Mock(broker_peak=100 * 1048576, host_peak=900,
+                        gen_peaks={"pub": 50 * 1048576},
+                        container_mem={"broker": 100 * 1048576})
+        broker = mock.Mock(memory_limit_str="6144m")
+        sc = suite.SCENARIOS["s1-qos1"]
+        step = {"label": "r1", "payload": 128, "offered": 100}
+        row = suite.make_error_row(sc, step, 40, 10, "host memory",
+                                   broker=broker, sampler=sam, oom=["bs-pub"])
+        self.assertEqual(row["error"], "host memory")
+        self.assertEqual(row["oom"], ["bs-pub"])
+        self.assertEqual(row["broker_memory"], "6144m")
+        self.assertEqual(row["broker_peak_mib"], 100.0)
+        self.assertIn("pub", row["gen_peaks_mib"])
+        self.assertIn("broker", row["container_mem_mib"])
+
+    def test_gen_peak_mib(self):
+        rows = [{"gen_mem": {"pub": 100 * 1048576}},
+                {"gen_mem": {"pub": 150 * 1048576, "sub": 10 * 1048576}}]
+        peaks = suite.gen_peak_mib(rows)
+        self.assertEqual(peaks["pub"], 150.0)
+        self.assertEqual(peaks["sub"], 10.0)
+
+
+class TestStepAlarm(unittest.TestCase):
+    """Check alarm arm, handler and one-call kill."""
+
+    def tearDown(self):
+        suite._ALARM_FIRED = False
+        try:
+            suite.disarm_step_alarm()
+        except Exception:
+            pass
+
+    def test_kill_once(self):
+        calls = []
+
+        def fake_shq(*args):
+            calls.append(list(args))
+            return FakeCompleted()
+
+        with mock.patch.object(suite, "list_temp_containers", return_value=["a", "b"]):
+            with mock.patch.object(suite, "shq", side_effect=fake_shq):
+                ids = suite.kill_label_containers_once()
+        self.assertEqual(ids, ["a", "b"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["docker", "kill"])
+        self.assertIn("a", calls[0])
+        self.assertIn("b", calls[0])
+
+    def test_kill_empty_skips(self):
+        with mock.patch.object(suite, "list_temp_containers", return_value=[]):
+            with mock.patch.object(suite, "shq") as shq:
+                suite.kill_label_containers_once()
+        shq.assert_not_called()
+
+    def test_arm_sets_alarm(self):
+        with mock.patch.object(signal, "signal") as sig:
+            with mock.patch.object(signal, "alarm") as alarm:
+                suite.arm_step_alarm(160)
+        alarm.assert_called_once_with(160)
+        nums = [c[0][0] for c in sig.call_args_list]
+        self.assertIn(signal.SIGALRM, nums)
+
+    def test_handler_kills_once_and_flags(self):
+        with mock.patch.object(suite, "kill_label_containers_once") as kill:
+            suite._step_alarm_handler(signal.SIGALRM, None)
+        kill.assert_called_once()
+        self.assertTrue(suite._ALARM_FIRED)
+
+
+class TestOomReport(unittest.TestCase):
+    """Check OOM flags and verdict mapping."""
+
+    def test_container_oom_true(self):
+        with mock.patch.object(suite, "sh", return_value="true\n"):
+            self.assertTrue(suite.container_oom_killed("bs-pub"))
+        with mock.patch.object(suite, "sh", return_value="false\n"):
+            self.assertFalse(suite.container_oom_killed("bs-pub"))
+
+    def test_collect_oom(self):
+        with mock.patch.object(suite, "container_oom_killed",
+                               side_effect=lambda n: n == "bs-pub"):
+            self.assertEqual(suite.collect_oom(["bs-broker", "bs-pub"]), ["bs-pub"])
+
+    def test_broker_oom_fails(self):
+        row = {"delivery_ratio": 1.0, "broker_alive": True, "broker_oom": True,
+               "generator_limited": False, "mem_first_mib": 100.0,
+               "mem_mib": 102.0, "drain_secs": 2.0}
+        self.assertTrue(suite.is_failing(row))
+        _, failed = suite.evaluate_step(row)
+        self.assertIn("broker-oom", failed)
+
+    def test_generator_flag_fails(self):
+        row = {"delivery_ratio": 1.0, "broker_alive": True,
+               "generator_limited": True, "mem_first_mib": 100.0,
+               "mem_mib": 102.0, "drain_secs": 2.0}
+        _, failed = suite.evaluate_step(row)
+        self.assertIn("generator-limited", failed)
+
+
+class TestBenchBaseImage(unittest.TestCase):
+    """Check broker base image and its build."""
+
+    def test_dockerfile(self):
+        with open(os.path.join(HERE, "Dockerfile")) as f:
+            text = f.read()
+        self.assertIn("debian:bookworm-slim", text)
+        for pkg in ("libssl3", "zlib1g", "libzstd1", "ca-certificates"):
+            self.assertIn(pkg, text)
+
+    def test_run_all_builds_base(self):
+        with open(os.path.join(HERE, "run_all.sh")) as f:
+            text = f.read()
+        self.assertIn("indra-bench-base", text)
+        self.assertIn("Dockerfile", text)
+        self.assertIn("docker build", text)
+
+
+class TestFanRatesAndStop(unittest.TestCase):
+    """Check low start rates and stop on error."""
+
+    def test_fanin_starts_low(self):
+        rates = suite.FanIn().default_rates
+        self.assertEqual(rates[0], 2000)
+        self.assertEqual(sorted(rates), rates)
+        self.assertGreater(rates[-1], rates[0])
+
+    def test_fanout_starts_low(self):
+        rates = suite.FanOut().default_rates
+        self.assertEqual(rates[0], 2000)
+        self.assertEqual(sorted(rates), rates)
+        self.assertGreater(rates[-1], rates[0])
+
+    def test_error_stops_scenario(self):
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as out:
+            args = mock.Mock(scenario="s3-fanin", rates="2000,4000", out=out,
+                             binary="/bin/x", step_secs=40, warm=10, sub_wait=0,
+                             api_port=28083, syscount=False, profile=0,
+                             bench_image="img", bench_bin="/bin/gen")
+            broker = mock.Mock(name="broker")
+            broker.name = "bs-broker"
+            broker.start.return_value = None
+            broker.alive.return_value = True
+            row = {"error": "host memory", "verdict": "fail"}
+            with mock.patch.object(suite, "refresh_cpus", return_value={}):
+                with mock.patch.object(suite, "Broker", return_value=broker):
+                    with mock.patch.object(suite, "sh", return_value=""):
+                        with mock.patch.object(suite, "collect_env", return_value={}):
+                            with mock.patch.object(suite, "start_subscribers",
+                                                   return_value=("bs-sub", "cid", ["bs-sub"])):
+                                with mock.patch.object(suite.time, "sleep", return_value=None):
+                                    with mock.patch.object(suite, "shq",
+                                                           return_value=FakeCompleted()):
+                                        with mock.patch.object(suite, "run_step",
+                                                               return_value=row) as rs:
+                                            with mock.patch.object(suite, "write_outputs"):
+                                                rows = suite.run_scenario(args)
+            self.assertEqual(rs.call_count, 1)
+            self.assertEqual(len(rows), 1)
 
 
 if __name__ == "__main__":

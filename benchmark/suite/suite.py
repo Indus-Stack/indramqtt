@@ -33,7 +33,8 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LABEL = "purpose=benchmark-temp"
-BROKER_IMAGE = "debian:bookworm-slim"
+BROKER_IMAGE_BASE = "debian:bookworm-slim"
+BROKER_IMAGE = "indra-bench-base"
 GEN_RUNTIME_BASE = "+sbwt none +sbwtdcpu none +sbwtdio none"
 ADMIN_PW = "Adm1n-test-pass!"
 API = "http://127.0.0.1:%d/api/v5"
@@ -42,6 +43,15 @@ MIN_PERMITTED_CORES = 10
 EFFECTIVE_CPUSET_PATH = "/sys/fs/cgroup/cpuset.cpus.effective"
 LOADAVG_PATH = "/proc/loadavg"
 BROKER_CORES = 4
+GIB = 1024 ** 3
+MIB = 1024 ** 2
+HOST_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
+HOST_MEMORY_CURRENT_PATH = "/sys/fs/cgroup/memory.current"
+MEMINFO_PATH = "/proc/meminfo"
+BROKER_MEMORY_CAP_BYTES = 8 * GIB
+MEMORY_BUDGET_RATIO = 0.85
+HOST_MEMORY_GUARD_RATIO = 0.90
+PROBE_RESERVE_BYTES = 512 * MIB
 
 
 def read_file(path):
@@ -162,6 +172,105 @@ def is_overloaded(load1, num_cores):
     return load1 > 3.0 * num_cores
 
 
+def read_memtotal_bytes():
+    """Read MemTotal from meminfo. Return None when unknown."""
+    try:
+        text = read_file(MEMINFO_PATH)
+    except Exception:
+        return None
+    m = re.search(r"MemTotal:\s*(\d+)\s*kB", text or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1)) * 1024
+    except ValueError:
+        return None
+
+
+def read_host_memory_limit_bytes():
+    """Read host limit from cgroup. Fall back to MemTotal."""
+    try:
+        text = (read_file(HOST_MEMORY_MAX_PATH) or "").strip()
+    except Exception:
+        text = ""
+    if text and text != "max":
+        try:
+            value = int(text)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    total = read_memtotal_bytes()
+    if total:
+        return total
+    return BROKER_MEMORY_CAP_BYTES
+
+
+def read_memory_bytes(path):
+    """Read one memory.current file. Return None when unknown."""
+    try:
+        text = (read_file(path) or "").strip()
+    except Exception:
+        return None
+    if not text or text == "max":
+        return None
+    try:
+        value = int(text.split()[0])
+    except (ValueError, IndexError):
+        return None
+    return value if value >= 0 else None
+
+
+def broker_memory_limit_bytes(host_limit_bytes):
+    """Give broker min(8 GiB, 50 pct of host). Cap guards small hosts."""
+    try:
+        host = int(host_limit_bytes)
+    except (TypeError, ValueError):
+        host = BROKER_MEMORY_CAP_BYTES
+    if host <= 0:
+        host = BROKER_MEMORY_CAP_BYTES
+    return min(BROKER_MEMORY_CAP_BYTES, host // 2)
+
+
+def format_docker_mem(limit_bytes):
+    """Format bytes as docker memory like 4096m. Clamp to 6m."""
+    try:
+        value = int(limit_bytes)
+    except (TypeError, ValueError):
+        value = BROKER_MEMORY_CAP_BYTES
+    value = max(6 * MIB, value)
+    return "%dm" % (value // MIB)
+
+
+def generator_memory_limit_bytes(host_limit_bytes, broker_limit_bytes, num_generators,
+                                 probe_reserve_bytes=PROBE_RESERVE_BYTES):
+    """Share 85 pct of host minus broker and probe. Return per-generator bytes."""
+    try:
+        count = int(num_generators)
+    except (TypeError, ValueError):
+        count = 1
+    if count <= 0:
+        return 0
+    try:
+        host = int(host_limit_bytes)
+    except (TypeError, ValueError):
+        host = BROKER_MEMORY_CAP_BYTES
+    try:
+        broker = int(broker_limit_bytes)
+    except (TypeError, ValueError):
+        broker = broker_memory_limit_bytes(host)
+    try:
+        reserve = int(probe_reserve_bytes)
+    except (TypeError, ValueError):
+        reserve = 0
+    # Budget keeps all limits within 85 pct of host. Probe runs on host.
+    # TODO(parity): probe runs as host process, so it has no docker limit. Which cap fits it?
+    budget = int(host * MEMORY_BUDGET_RATIO) - broker - reserve
+    if budget <= 0:
+        return 0
+    return budget // count
+
+
 def ncpus(spec):
     """Count cores in a spec like "4-9,21-24"."""
     if not spec:
@@ -203,6 +312,69 @@ def list_temp_containers():
     if r.returncode != 0:
         return []
     return [x for x in r.stdout.split() if x]
+
+
+def kill_label_containers_once():
+    """Kill all label containers in one docker call. Return ids."""
+    ids = list_temp_containers()
+    if ids:
+        shq("docker", "kill", *ids)
+    return ids
+
+
+_ALARM_FIRED = False
+
+
+def _step_alarm_handler(signum, _frame):
+    """Kill label containers on SIGALRM. Set flag for error row."""
+    global _ALARM_FIRED
+    _ALARM_FIRED = True
+    try:
+        kill_label_containers_once()
+    except Exception:
+        pass
+
+
+def arm_step_alarm(timeout_secs):
+    """Arm a SIGALRM for the step. Skip when signals are absent."""
+    global _ALARM_FIRED
+    _ALARM_FIRED = False
+    try:
+        import signal as _signal
+        _signal.signal(_signal.SIGALRM, _step_alarm_handler)
+        _signal.alarm(int(timeout_secs))
+    except Exception:
+        pass
+
+
+def disarm_step_alarm():
+    """Clear the step alarm. Ignore errors."""
+    try:
+        import signal as _signal
+        _signal.alarm(0)
+    except Exception:
+        pass
+
+
+def container_oom_killed(name):
+    """Check OOMKilled flag of one container. Return True when killed."""
+    try:
+        out = sh("docker", "inspect", "-f", "{{.State.OOMKilled}}", name)
+    except Exception:
+        return False
+    return "true" in (out or "").lower()
+
+
+def collect_oom(names):
+    """List names with OOMKilled set. Ignore lookup errors."""
+    hit = []
+    for name in names or []:
+        try:
+            if container_oom_killed(name):
+                hit.append(name)
+        except Exception:
+            pass
+    return hit
 
 
 def cleanup_temp_containers():
@@ -381,7 +553,8 @@ class FanIn(Scenario):
         self.name = "s3-fanin"
         self.desc = ("Fan-in: 2000 publishers, 100 subscribers in 20 shared groups of 5, "
                      "each group reads 100 publishers, QoS 1, 128 B")
-        self.default_rates = [10000, 20000, 30000, 40000, 60000, 80000]
+        # Start at 2000 msg/s. Rise to find the limit without OOM.
+        self.default_rates = [2000, 5000, 10000, 20000, 40000, 60000]
 
     def make_step(self, rate):
         total_pubs = self.groups * self.pubs_per_group
@@ -418,7 +591,9 @@ class FanOut(Scenario):
     def __init__(self):
         self.name = "s3-fanout"
         self.desc = "Fan-out: 10 publishers, 2000 subscribers, 200 per topic, QoS 1, 128 B"
-        self.default_rates = [250, 500, 750, 1000, 1500, 2000]
+        # Start at 2000 msg/s inbound. Rise to find the limit without OOM.
+        # TODO(parity): which upper rates fit fan-out with factor 200? Keep rise small for now.
+        self.default_rates = [2000, 4000, 8000]
 
     def make_step(self, rate):
         iv = rate_to_interval(rate, self.topics)
@@ -490,6 +665,8 @@ def is_failing(row):
     """A step fails on low delivery or a stopped broker."""
     if not row.get("broker_alive", True):
         return True
+    if row.get("broker_oom"):
+        return True
     return (row.get("delivery_ratio") or 0.0) < DELIVERY_FAIL_BELOW
 
 
@@ -500,6 +677,8 @@ def evaluate_step(row):
         failed.append("delivery-below-90pct")
     if not row.get("broker_alive", True):
         failed.append("broker-not-alive")
+    if row.get("broker_oom"):
+        failed.append("broker-oom")
     if row.get("generator_limited"):
         failed.append("generator-limited")
     mem = memory_flat(row.get("mem_first_mib"), row.get("mem_mib"))
@@ -549,7 +728,15 @@ def collect_env(binary):
     except Exception:
         info["kernel"] = "unknown"
     info["broker_cores"] = BROKER_CORES
-    info["broker_memory"] = "8g"
+    try:
+        host_limit = read_host_memory_limit_bytes()
+    except Exception:
+        host_limit = BROKER_MEMORY_CAP_BYTES
+    info["host_memory_limit_bytes"] = host_limit
+    try:
+        info["broker_memory"] = format_docker_mem(broker_memory_limit_bytes(host_limit))
+    except Exception:
+        info["broker_memory"] = "8g"
     try:
         h = subprocess.run(["sha256sum", binary], capture_output=True, text=True, timeout=30)
         info["build_sha256"] = h.stdout.split()[0] if h.stdout else "unknown"
@@ -630,6 +817,8 @@ class Broker:
         self.cid = None
         self.pid = None
         self.cg = None
+        self.memory_limit_bytes = broker_memory_limit_bytes(read_host_memory_limit_bytes())
+        self.memory_limit_str = format_docker_mem(self.memory_limit_bytes)
 
     def api(self, method, path, body=None, retry_login=True):
         req = urllib.request.Request((API % self.api_port) + path, method=method,
@@ -657,6 +846,13 @@ class Broker:
         sh("docker", "rm", "-f", self.name)
         self.syscount_file = os.path.join(self.run_dir, "syscount.bin")
         self.prof_prefix = os.path.join(self.run_dir, "prof")
+        try:
+            host_limit = read_host_memory_limit_bytes()
+        except Exception:
+            host_limit = BROKER_MEMORY_CAP_BYTES
+        self.memory_limit_bytes = broker_memory_limit_bytes(host_limit)
+        self.memory_limit_str = format_docker_mem(self.memory_limit_bytes)
+        mem = self.memory_limit_str
         env = ["-e", "INDRA_LISTENERS__TCP__NATIVE=true", "-e", "INDRA_LISTENERS__TCP__BIND=0.0.0.0:1883",
                "-e", "INDRA_AUTH__ALLOW_ANONYMOUS=true"]
         mounts = ["-v", "%s:/usr/local/bin/indramqtt:ro" % self.binary, "-v", "%s:/run/bs" % self.run_dir]
@@ -667,7 +863,8 @@ class Broker:
         if self.prof:
             env += ["-e", "DIAG_PROF_OUT=/run/bs/prof", "-e", "DIAG_PROF_HZ=%d" % self.prof]
         docker_run("docker", "run", "-d", "--label", LABEL, "--name", self.name, "--network", "host",
-                   "--cpus=%d" % BROKER_CORES, "--cpuset-cpus=" + CPUS["broker"], "--memory=8g", "--memory-swap=8g",
+                   "--cpus=%d" % BROKER_CORES, "--cpuset-cpus=" + CPUS["broker"],
+                   "--memory=" + mem, "--memory-swap=" + mem,
                    "--ulimit", "nofile=524288:524288", *env, *mounts, BROKER_IMAGE, "sh", "-c",
                    "mkdir -p /tmp/d && exec /usr/local/bin/indramqtt --api-bind 127.0.0.1:%d --data-dir /tmp/d" % self.api_port)
         ok = False
@@ -716,16 +913,40 @@ def snapshot(broker, gens):
     s = {"t": time.monotonic(), "wall": time.time()}
     s["api"] = broker.counters()
     s["cpu"] = cpu_stat(broker.cg)
-    s["mem"] = int(read_file(broker.cg + "/memory.current").strip() or 0)
+    try:
+        s["mem"] = int(read_file(broker.cg + "/memory.current").strip() or 0)
+    except (OSError, ValueError, AttributeError):
+        s["mem"] = 0
+    s["host_mem"] = read_memory_bytes(HOST_MEMORY_CURRENT_PATH)
     s["io"] = proc_io(broker.pid)
     s["ctxt"] = proc_ctxt(broker.pid)
     s["sc"] = syscount_read(broker.syscount_file) if broker.use_syscount else None
     s["gen"] = {n: cpu_stat(cg).get("usage_usec", 0) for n, cg in gens.items()}
+    gm = {}
+    for n, cg in gens.items():
+        v = read_memory_bytes(cg + "/memory.current")
+        if v is not None:
+            gm[n] = v
+    s["gen_mem"] = gm
     return s
 
 
+def gen_peak_mib(rows, window=True):
+    """Return peak generator memory in MiB per name. Read rows only."""
+    peaks = {}
+    for r in rows or []:
+        for n, v in (r.get("gen_mem") or {}).items():
+            try:
+                mib = v / 1048576
+            except TypeError:
+                continue
+            if mib > peaks.get(n, 0.0):
+                peaks[n] = round(mib, 1)
+    return peaks
+
+
 class Sampler(threading.Thread):
-    def __init__(self, broker, gens, every=5.0, permitted_cores=0):
+    def __init__(self, broker, gens, every=5.0, permitted_cores=0, host_limit=None):
         super().__init__(daemon=True)
         self.broker, self.gens, self.every = broker, gens, every
         self.rows = []
@@ -734,6 +955,13 @@ class Sampler(threading.Thread):
         self.overload_secs = 0.0
         self.overloaded = False
         self.load1 = None
+        self.host_limit = host_limit
+        self.host_hit = False
+        self.host_mem = None
+        self.container_mem = {}
+        self.host_peak = 0
+        self.broker_peak = 0
+        self.gen_peaks = {}
 
     def note_load(self, load1):
         """Track overload time. Set the flag after 30 s."""
@@ -745,17 +973,67 @@ class Sampler(threading.Thread):
         if self.overload_secs >= 30.0:
             self.overloaded = True
 
+    def host_limit_bytes(self):
+        """Return cached host limit. Read it once."""
+        if self.host_limit:
+            return self.host_limit
+        try:
+            self.host_limit = read_host_memory_limit_bytes()
+        except Exception:
+            self.host_limit = BROKER_MEMORY_CAP_BYTES
+        return self.host_limit
+
+    def check_host_memory(self, row):
+        """Guard host memory each sample. Set hit above 90 pct."""
+        try:
+            limit = self.host_limit_bytes()
+        except Exception:
+            return
+        if not limit:
+            return
+        host = row.get("host_mem")
+        try:
+            host = int(host) if host is not None else None
+        except (TypeError, ValueError):
+            host = None
+        if host is None:
+            return
+        if host > self.host_peak:
+            self.host_peak = host
+        broker_mem = row.get("mem") or 0
+        if broker_mem > self.broker_peak:
+            self.broker_peak = broker_mem
+        for n, v in (row.get("gen_mem") or {}).items():
+            if v > self.gen_peaks.get(n, 0):
+                self.gen_peaks[n] = v
+        if host > HOST_MEMORY_GUARD_RATIO * limit:
+            self.host_hit = True
+            self.host_mem = host
+            snap = {}
+            try:
+                snap["broker"] = int(broker_mem)
+            except (TypeError, ValueError):
+                pass
+            for n, v in (row.get("gen_mem") or {}).items():
+                snap[n] = v
+            self.container_mem = snap
+
     def run(self):
         while not self.halt:
             t = time.monotonic()
             try:
-                self.rows.append(snapshot(self.broker, self.gens))
+                row = snapshot(self.broker, self.gens)
+                self.rows.append(row)
+                self.check_host_memory(row)
             except Exception as e:
                 print("sampler:", e, file=sys.stderr)
             try:
                 self.note_load(read_load1())
             except Exception as e:
                 print("sampler:", e, file=sys.stderr)
+            if self.host_hit:
+                print("sampler: host memory", file=sys.stderr)
+                break
             if self.overloaded:
                 print("sampler: host overload", file=sys.stderr)
                 break
@@ -766,12 +1044,24 @@ def dropped_total(c):
     return sum(v for k, v in c.items() if "dropped" in k or "shed" in k)
 
 
-def start_generator(name, cpus, commands, bench_image):
+def start_generator(name, cpus, commands, bench_image, memory_bytes=None):
+    """Start one generator container with a memory bound. Set swap equal."""
     sh("docker", "rm", "-f", name)
     script = "\n".join(c + " &" for c in commands) + "\nwait\n"
     flags = gen_runtime_flags(cpus, len(commands))
+    if memory_bytes is None:
+        try:
+            host = read_host_memory_limit_bytes()
+            broker = broker_memory_limit_bytes(host)
+            memory_bytes = generator_memory_limit_bytes(host, broker, 1)
+        except Exception:
+            memory_bytes = 0
+    mem_args = []
+    if memory_bytes:
+        mem_str = format_docker_mem(memory_bytes)
+        mem_args = ["--memory=" + mem_str, "--memory-swap=" + mem_str]
     docker_run("docker", "run", "-d", "--label", LABEL, "--name", name, "--network", "host",
-               "--cpuset-cpus=" + cpus, "--ulimit", "nofile=524288:524288",
+               "--cpuset-cpus=" + cpus, *mem_args, "--ulimit", "nofile=524288:524288",
                "-e", "ERL_AFLAGS=" + flags, "--entrypoint", "sh", bench_image, "-c", script)
     cid = sh("docker", "inspect", "-f", "{{.Id}}", name).strip()
     return cid
@@ -875,9 +1165,21 @@ def permitted_core_count():
         return 0
 
 
-def make_error_row(sc, step, secs, warm, message):
+def broker_memory_str(broker):
+    """Return broker limit string. Fall back to 8g."""
+    try:
+        if getattr(broker, "memory_limit_str", None):
+            return broker.memory_limit_str
+        host = read_host_memory_limit_bytes()
+        return format_docker_mem(broker_memory_limit_bytes(host))
+    except Exception:
+        return "8g"
+
+
+def make_error_row(sc, step, secs, warm, message, broker=None, sampler=None,
+                   oom=None, container_mem=None):
     """Make a result row for a stopped step."""
-    return {
+    row = {
         "scenario": sc.name, "step": step["label"], "payload": step["payload"],
         "offered": step["offered"], "step_secs": secs, "warm_secs": warm,
         "window_secs": 0.0, "in_rate": 0, "out_rate": 0,
@@ -885,20 +1187,63 @@ def make_error_row(sc, step, secs, warm, message):
         "cpu_pct_of_4": 0.0, "broker_alive": False,
         "generator_limited": False, "drain_secs": 0.0,
         "verdict": "fail", "failed": [message], "error": message,
+        "broker_memory": broker_memory_str(broker) if broker is not None else "8g",
+        "oom": list(oom or []),
     }
+    if sampler is not None:
+        try:
+            row["broker_peak_mib"] = round(getattr(sampler, "broker_peak", 0) / 1048576, 1)
+        except TypeError:
+            row["broker_peak_mib"] = 0.0
+        peaks = {}
+        try:
+            for n, v in (getattr(sampler, "gen_peaks", {}) or {}).items():
+                peaks[n] = round(v / 1048576, 1)
+        except TypeError:
+            pass
+        row["gen_peaks_mib"] = peaks
+        try:
+            row["host_peak_mib"] = round(getattr(sampler, "host_peak", 0) / 1048576, 1)
+        except TypeError:
+            row["host_peak_mib"] = 0.0
+    if container_mem is not None:
+        mib = {}
+        for n, v in (container_mem or {}).items():
+            try:
+                mib[n] = round(v / 1048576, 1)
+            except TypeError:
+                pass
+        row["container_mem_mib"] = mib
+    elif sampler is not None and getattr(sampler, "container_mem", None):
+        mib = {}
+        for n, v in (sampler.container_mem or {}).items():
+            try:
+                mib[n] = round(v / 1048576, 1)
+            except TypeError:
+                pass
+        row["container_mem_mib"] = mib
+    return row
 
 
 def sleep_guarded(total, deadline, sampler, poll=1.0):
-    """Sleep in chunks. Return "step timeout" or "host overload"."""
+    """Sleep in chunks. Return timeout, overload or memory string."""
     end = time.monotonic() + total
     while time.monotonic() < end:
+        if _ALARM_FIRED:
+            return "step timeout"
         if time.monotonic() > deadline:
             return "step timeout"
+        if sampler is not None and getattr(sampler, "host_hit", False):
+            return "host memory"
         if sampler is not None and getattr(sampler, "overloaded", False):
             return "host overload"
         time.sleep(min(poll, max(0.0, end - time.monotonic())))
+    if _ALARM_FIRED:
+        return "step timeout"
     if time.monotonic() > deadline:
         return "step timeout"
+    if sampler is not None and getattr(sampler, "host_hit", False):
+        return "host memory"
     if sampler is not None and getattr(sampler, "overloaded", False):
         return "host overload"
     return None
@@ -907,6 +1252,10 @@ def sleep_guarded(total, deadline, sampler, poll=1.0):
 def abort_step(args, sc, broker, step, sub_names, pub_name, sampler, probe, message):
     """Kill step processes and make an error row."""
     try:
+        disarm_step_alarm()
+    except Exception:
+        pass
+    try:
         if sampler is not None:
             sampler.halt = True
         if probe is not None:
@@ -914,11 +1263,27 @@ def abort_step(args, sc, broker, step, sub_names, pub_name, sampler, probe, mess
                 probe.kill()
             except Exception:
                 pass
+        try:
+            kill_label_containers_once()
+        except Exception:
+            pass
         shq("docker", "rm", "-f", pub_name, *sub_names)
         shq("docker", "rm", "-f", broker.name)
     finally:
         pass
-    return make_error_row(sc, step, args.step_secs, args.warm, message)
+    oom = []
+    try:
+        oom = collect_oom([broker.name, pub_name] + list(sub_names or []))
+    except Exception:
+        pass
+    mem = None
+    try:
+        if sampler is not None and getattr(sampler, "container_mem", None):
+            mem = dict(sampler.container_mem)
+    except Exception:
+        mem = None
+    return make_error_row(sc, step, args.step_secs, args.warm, message,
+                          broker=broker, sampler=sampler, oom=oom, container_mem=mem)
 
 
 def fanin_expected_subs(sc):
@@ -929,14 +1294,34 @@ def fanin_expected_subs(sc):
         return 0
 
 
+def generator_share_for_step(broker, total_containers):
+    """Share generator budget for one step. Return bytes per container."""
+    try:
+        host = read_host_memory_limit_bytes()
+    except Exception:
+        host = BROKER_MEMORY_CAP_BYTES
+    try:
+        broker_limit = int(getattr(broker, "memory_limit_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        broker_limit = 0
+    if not broker_limit:
+        broker_limit = broker_memory_limit_bytes(host)
+    try:
+        return generator_memory_limit_bytes(host, broker_limit, total_containers)
+    except Exception:
+        return 0
+
+
 def start_subscribers(args, sc, broker):
     """Start subscriber generators. Return names and main cid."""
     cmds = sc.sub_commands(args.bench_bin)
     if isinstance(sc, FanIn):
+        total = len(cmds) + 1
+        share = generator_share_for_step(broker, total)
         names = []
         for k, cmd in enumerate(cmds, 1):
             name = "bs-sub-%d" % k
-            start_generator(name, CPUS["sub"], [cmd], args.bench_image)
+            start_generator(name, CPUS["sub"], [cmd], args.bench_image, share)
             names.append(name)
             time.sleep(2.0)
         expected = fanin_expected_subs(sc)
@@ -945,7 +1330,8 @@ def start_subscribers(args, sc, broker):
         cid = sh("docker", "inspect", "-f", "{{.Id}}", names[0]).strip() if names else ""
         return names[0], cid, names
     name = "bs-sub"
-    cid = start_generator(name, CPUS["sub"], cmds, args.bench_image)
+    share = generator_share_for_step(broker, 2)
+    cid = start_generator(name, CPUS["sub"], cmds, args.bench_image, share)
     return name, cid, [name]
 
 
@@ -956,7 +1342,12 @@ def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos, sub_names=Non
     subs = list(sub_names) if sub_names else [sub_name]
     gens = {"pub": None, "sub": cgroup_dir_of_container(sub_cid)}
     deadline = time.monotonic() + step_timeout_secs(secs)
-    pub_cid = start_generator(pub_name, CPUS["pub"], sc.pub_commands(step, args.bench_bin), args.bench_image)
+    arm_step_alarm(step_timeout_secs(secs))
+    sam = None
+    probe = None
+    share = generator_share_for_step(broker, len(subs) + 1)
+    pub_cid = start_generator(pub_name, CPUS["pub"], sc.pub_commands(step, args.bench_bin),
+                              args.bench_image, share)
     gens["pub"] = cgroup_dir_of_container(pub_cid)
     probe = run_probe(args, secs, warm, probe_qos, probe_id)
     sam = Sampler(broker, gens, every=args.sample_every,
@@ -975,10 +1366,13 @@ def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos, sub_names=Non
         sam.halt = True
         return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, hit)
     s_b = snapshot(broker, gens)
+    if getattr(sam, "host_hit", False):
+        sam.halt = True
+        return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "host memory")
     if getattr(sam, "overloaded", False):
         sam.halt = True
         return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "host overload")
-    if time.monotonic() > deadline:
+    if _ALARM_FIRED or time.monotonic() > deadline:
         sam.halt = True
         return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "step timeout")
     if args.profile and not args.no_prof_window:
@@ -988,9 +1382,12 @@ def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos, sub_names=Non
     prev = broker.counters().get("messages.delivered", 0)
     for _ in range(30):
         time.sleep(1.0)
-        if time.monotonic() > deadline:
+        if _ALARM_FIRED or time.monotonic() > deadline:
             sam.halt = True
             return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "step timeout")
+        if getattr(sam, "host_hit", False):
+            sam.halt = True
+            return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "host memory")
         if getattr(sam, "overloaded", False):
             sam.halt = True
             return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "host overload")
@@ -1035,8 +1432,20 @@ def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos, sub_names=Non
                 best = max(best, (y["gen"].get(key, 0) - x["gen"].get(key, 0)) / 1e6 / dt / cap)
         return best
     gen_pub_peak, gen_sub_peak = peak("pub", pubcap), peak("sub", subcap)
+    oom_names = []
+    try:
+        oom_names = collect_oom([broker.name, pub_name] + list(subs))
+    except Exception:
+        oom_names = []
+    gen_oom = [n for n in oom_names if n != broker.name]
+    broker_oom = broker.name in oom_names
     gen_limited = (pubcpu / pubcap >= 0.90 or subcpu / subcap >= 0.90 or gen_pub_peak >= 0.97
-                   or gen_sub_peak >= 0.97)
+                   or gen_sub_peak >= 0.97 or bool(gen_oom))
+    window_rows = [r for r in sam.rows if s_a["t"] <= r["t"] <= s_b["t"]]
+    broker_peak_mib = round(max(mems) / 1048576, 1)
+    gen_peaks = gen_peak_mib(window_rows)
+    host_vals = [r.get("host_mem") for r in window_rows if r.get("host_mem") is not None]
+    host_peak_mib = round(max(host_vals) / 1048576, 1) if host_vals else 0.0
 
     row = {
         "scenario": sc.name, "step": step["label"], "payload": step["payload"],
@@ -1062,6 +1471,10 @@ def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos, sub_names=Non
         "gen_pub_peak_pct": round(gen_pub_peak * 100, 1), "gen_sub_peak_pct": round(gen_sub_peak * 100, 1),
         "generator_limited": gen_limited,
         "drain_secs": round(drain, 1), "broker_alive": broker.alive(),
+        "broker_memory": broker_memory_str(broker),
+        "broker_peak_mib": broker_peak_mib, "gen_peaks_mib": gen_peaks,
+        "host_peak_mib": host_peak_mib,
+        "oom": oom_names, "broker_oom": broker_oom,
     }
     if pres and "error" not in pres:
         for k in ("count", "lost", "p50_us", "p90_us", "p99_us", "p999_us", "max_us"):
@@ -1086,6 +1499,7 @@ def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos, sub_names=Non
     verdict, failed = evaluate_step(row)
     row["verdict"] = verdict
     row["failed"] = failed
+    disarm_step_alarm()
     return row
 
 
@@ -1115,7 +1529,8 @@ def run_scenario(args):
         sub_name, sub_cid, sub_names = start_subscribers(args, sc, broker)
         if sub_name is None:
             step = sc.make_step(rates[0]) if rates else {"label": "init", "payload": 128, "offered": 0}
-            row = make_error_row(sc, step, args.step_secs, args.warm, "subscribers not connected")
+            row = make_error_row(sc, step, args.step_secs, args.warm, "subscribers not connected",
+                                 broker=broker)
             rows.append(row)
             with open(jsonl, "a") as f:
                 f.write(json.dumps(row) + "\n")
@@ -1139,8 +1554,8 @@ def run_scenario(args):
             with open(jsonl, "a") as f:
                 f.write(json.dumps(row) + "\n")
             print(json.dumps(row), flush=True)
-            if row.get("error") in ("step timeout", "host overload"):
-                print("guard stopped the step; stop scenario", flush=True)
+            if row.get("error"):
+                print("error stopped the step; stop scenario", flush=True)
                 try:
                     broker.start()
                 except Exception as e:

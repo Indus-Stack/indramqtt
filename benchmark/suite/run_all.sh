@@ -18,6 +18,10 @@ test -d "$SRC" || { echo "Source directory $SRC is absent." >&2; exit 1; }
 
 mkdir -p "$OUT/bin"
 echo "Build binary from $SRC ($COMMIT_LABEL)."
+if ! docker image inspect indra-bench-base >/dev/null 2>&1; then
+  echo "Build base image indra-bench-base."
+  docker build -t indra-bench-base -f "$D/Dockerfile" "$D"
+fi
 if [ ! -x "$D/bin/latency-probe" ]; then
   echo "Probe binary is absent. Build it."
   bash "$D/build-probe.sh"
