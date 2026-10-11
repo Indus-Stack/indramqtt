@@ -437,7 +437,9 @@ is not changed.
   creates a rule (`createRules` in the copy dialog sends
   `{ sql, enable, description, actions, id }`), so the broker accepts `id`
   and keeps `name` as the fallback. The cases that create a rule send `id`
-  for this reason, because a case needs a known id to clean up.
+  for this reason, because a case needs a known id to clean up. A create
+  with neither `id` nor `name` gets an assigned id of 8 lowercase hex
+  chars, the form the documented example shows.
 - `POST /rules`, `PUT /rules/{id}`, response, field `actions`. The specification declares
   `oneOf` for each item, but a `republish` or `console` item also matches the
   schema `user_provided_function` (a string `function` and an object `args`).

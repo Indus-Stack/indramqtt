@@ -96,6 +96,19 @@ fn missing_field(field: &str) -> Response {
     bad_request(format!("missing required field: {field}"))
 }
 
+/// Answer 412 with the documented `NOT_MATCH` code. The rule parses
+/// but the sample does not match it.
+fn no_match() -> Response {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(serde_json::json!({
+            "code": "NOT_MATCH",
+            "message": "Rule does not match the sample.",
+        })),
+    )
+        .into_response()
+}
+
 fn as_non_empty_str(value: Option<&serde_json::Value>) -> Option<String> {
     value
         .and_then(|v| v.as_str())
@@ -206,8 +219,9 @@ fn extract_payload(body: &serde_json::Value) -> Option<serde_json::Value> {
 ///
 /// Parses the bounded body, evaluates the rule SQL plus optional filter
 /// over the sample through [`broker_rules::try_evaluate`], and answers
-/// 200 with `{matched, projected, output}` (`output` mirrors `projected`
-/// for shape compatibility; both are `null` on no-match). Malformed rule
+/// 200 with `{matched, projected, output}` on a match (`output` mirrors
+/// `projected` for shape compatibility). A sample that does not match
+/// answers 412 with the documented `NOT_MATCH` code. Malformed rule
 /// bodies, topics, filters and samples are 400 with the documented
 /// `{code, message}` shape. Nothing is stored, published or fired, and
 /// nothing is cached: every request re-parses and re-evaluates.
@@ -271,6 +285,9 @@ pub async fn test_rule_offline(body: Bytes) -> Response {
                 .into_response();
         }
     };
+    if !matched {
+        return no_match();
+    }
     {
         let output = projected.clone().unwrap_or(serde_json::Value::Null);
         (
@@ -294,9 +311,10 @@ pub async fn test_rule_offline(body: Bytes) -> Response {
 /// [`broker_rules::try_evaluate`] front end, reusing the stored SQL and the
 /// stored topic filter. A sample `sql` field, when present, is ignored: the
 /// probe is bound to the stored compiled rule, never to a caller-supplied
-/// program. Reports 200 with `{matched, projected, output}` (`output`
-/// mirrors `projected` for shape compatibility; both are `null` on
-/// no-match). An unknown id returns 404 with the documented `{code,
+/// program. A match reports 200 with `{matched, projected, output}`
+/// (`output` mirrors `projected` for shape compatibility). A sample that
+/// does not match answers 412 with the documented `NOT_MATCH` code.
+/// An unknown id returns 404 with the documented `{code,
 /// message}` shape, not an empty body; malformed samples are rejected with
 /// 400 and the documented error shape. Nothing is stored, published, fired
 /// or retained: the probe runs with `dry_run` set, writes to no store and
@@ -416,6 +434,9 @@ pub async fn test_stored_rule(
                 .into_response();
         }
     };
+    if !matched {
+        return no_match();
+    }
     {
         let output = projected.clone().unwrap_or(serde_json::Value::Null);
         (
@@ -478,7 +499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_matching_sample_reports_no_match() {
+    async fn non_matching_sample_answers_not_match() {
         let (status, body) = response_parts(
             test_rule_offline(body_of(serde_json::json!({
                 "sql": "SELECT * FROM \"sensors/+\" WHERE temperature > 100.0",
@@ -488,10 +509,9 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["matched"], serde_json::json!(false));
-        assert!(body["projected"].is_null());
-        assert!(body["output"].is_null());
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["code"], serde_json::json!("NOT_MATCH"));
+        assert!(body["message"].is_string());
     }
 
     #[tokio::test]
@@ -648,7 +668,7 @@ mod tests {
     }
 
     /// Per-rule probe bound to the stored rule: match reports projected
-    /// output, no-match reports no-match, and the stored rule survives.
+    /// output, no-match answers 412, and the stored rule survives.
     #[tokio::test]
     async fn stored_probe_reports_match_and_no_match() {
         let state = stored_state();
@@ -683,10 +703,9 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["matched"], serde_json::json!(false));
-        assert!(body["projected"].is_null());
-        assert!(body["output"].is_null());
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["code"], serde_json::json!("NOT_MATCH"));
+        assert!(body["message"].is_string());
         assert!(state.engine.get_rule("w316-rule").is_some());
     }
 

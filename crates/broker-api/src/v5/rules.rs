@@ -74,6 +74,20 @@ pub const MAX_RULES: usize = broker_config::MAX_RULES;
 /// entry so one create cannot balloon the store.
 const MAX_RULE_ID_LEN: usize = broker_config::MAX_RULE_ID_LEN;
 
+/// Length of a generated rule id in hex chars. Reason: the documented
+/// example shows an 8-char id, so a create without one assigns 8 chars.
+const GENERATED_RULE_ID_LEN: usize = 8;
+
+/// Assign a rule id for a create without one. Returns 8 lowercase hex
+/// chars from secure random. A collision fails as a duplicate, never
+/// as an overwrite.
+fn generate_rule_id() -> String {
+    let value: u32 = rand::random();
+    let id = format!("{value:08x}");
+    debug_assert_eq!(id.len(), GENERATED_RULE_ID_LEN);
+    id
+}
+
 // ---------------------------------------------------------------------------
 // Streaming Rules
 // ---------------------------------------------------------------------------
@@ -247,9 +261,12 @@ fn parse_rule_actions(
 
 /// `POST /api/v5/rules`: compile the rule before storing (malformed
 /// bodies rejected with the documented error shape); a duplicate id is
-/// rejected cleanly, never overwritten. An explicit `id` is stored
-/// verbatim so duplicates are detectable; without one the engine assigns
-/// `rule-<n>`. A `tenant` field selects the owning tenant (absent
+/// rejected cleanly, never overwritten. The documented request needs
+/// only `sql`: an explicit `id` is stored verbatim so duplicates are
+/// detectable, `name` falls back as the id for older callers, and
+/// neither present means the broker assigns an 8-char hex id and
+/// returns it so `GET /rules/{id}` finds the rule. A `tenant` field
+/// selects the owning tenant (absent
 /// means the default tenant); an unknown tenant is rejected with 400.
 /// The `actions` list follows [`parse_rule_actions`]. A
 /// `ForwardConnector` target naming no known action is
@@ -263,36 +280,46 @@ pub async fn create_rule(
         return ApiError::BadRequest("request body must be a JSON object".to_string())
             .into_response();
     };
-    // Explicit `id` wins, `name` falls back (mirrors the action create).
-    let raw_id = obj
+    // A present `id` must be a non-empty string. An empty id fails
+    // with 400. An absent id falls back to `name`, then to a
+    // generated id.
+    if let Some(id_value) = obj.get("id") {
+        let Some(text) = id_value.as_str() else {
+            return ApiError::BadRequest("field `id` must be a string".to_string()).into_response();
+        };
+        if text.trim().is_empty() {
+            return ApiError::BadRequest("field `id` must not be empty".to_string())
+                .into_response();
+        }
+    }
+    // Explicit `id` wins, `name` falls back (mirrors the action create),
+    // and a generated id covers neither present.
+    let rule_id = obj
         .get("id")
         .or_else(|| obj.get("name"))
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if raw_id.is_empty() {
-        return ApiError::BadRequest("rule id or name is required".to_string()).into_response();
-    }
-    if raw_id.len() > MAX_RULE_ID_LEN {
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(generate_rule_id);
+    if rule_id.len() > MAX_RULE_ID_LEN {
         return ApiError::BadRequest(format!(
             "rule id holds {} chars, at most {MAX_RULE_ID_LEN} (field `id`)",
-            raw_id.len()
+            rule_id.len()
         ))
         .into_response();
     }
-    let explicit_id = obj
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
     let name = obj
         .get("name")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| raw_id.to_string());
+        .unwrap_or_else(|| rule_id.clone());
+    // TODO(parity): does a create without `name` default the name to
+    // the id or to ""? The spec gives `name` a "" default, but this
+    // route has always echoed the id. The current choice keeps the id
+    // until the checker pins it.
     let Some(sql) = obj
         .get("sql")
         .and_then(|v| v.as_str())
@@ -361,9 +388,7 @@ pub async fn create_rule(
     // a 400 either way.
     {
         let live = state.engine.rule_count();
-        let is_duplicate = explicit_id
-            .as_ref()
-            .is_some_and(|id| state.engine.get_rule(id).is_some());
+        let is_duplicate = state.engine.get_rule(&rule_id).is_some();
         if !is_duplicate && live >= MAX_RULES {
             return ApiError::BadRequest(format!(
                 "rule store holds {live} entries, at most {MAX_RULES}"
@@ -372,25 +397,15 @@ pub async fn create_rule(
         }
     }
 
-    let rule = match explicit_id {
-        Some(id) => state.engine.create_rule_with_id_in_tenant(
-            id,
-            tenant,
-            name,
-            topic_filter,
-            Some(sql),
-            enable,
-            actions,
-        ),
-        None => state.engine.create_rule_in_tenant(
-            tenant,
-            name,
-            topic_filter,
-            Some(sql),
-            enable,
-            actions,
-        ),
-    };
+    let rule = state.engine.create_rule_with_id_in_tenant(
+        rule_id,
+        tenant,
+        name,
+        topic_filter,
+        Some(sql),
+        enable,
+        actions,
+    );
 
     match rule {
         Ok(r) => (StatusCode::CREATED, Json(rule_to_v5(&r))).into_response(),

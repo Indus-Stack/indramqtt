@@ -6385,14 +6385,32 @@ mod tests {
         assert_eq!(status, 400);
         assert_eq!(body["code"], json!("BAD_REQUEST"));
 
-        let (status, _) = server
+        // A create with only `sql` succeeds: the broker assigns an id
+        // and `GET /rules/{id}` finds the rule.
+        let (status, created) = server
             .post_auth(
                 "/api/v5/rules",
                 json!({"sql": "SELECT * FROM \"t/#\"", "actions": []}),
                 &token,
             )
             .await;
-        assert_eq!(status, 400);
+        assert_eq!(status, 201, "sql-only create answered {created}");
+        let id = created["id"].as_str().expect("created rule has id");
+        assert_eq!(id.len(), 8, "assigned id has 8 chars, got {id:?}");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "assigned id is hex, got {id:?}"
+        );
+        let (status, fetched) = server
+            .get_auth(&format!("/api/v5/rules/{id}"), &token)
+            .await;
+        assert_eq!(status, 200, "assigned id reads back");
+        assert_eq!(fetched["id"], json!(id));
+        assert_eq!(fetched["sql"], json!("SELECT * FROM \"t/#\""));
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{id}"), &token)
+            .await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]
@@ -15721,7 +15739,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["matched"], json!(true));
         assert_eq!(body["projected"], json!({"temperature": 72.5}));
 
-        // Non-matching sample reports no-match.
+        // Non-matching sample answers 412 with the documented code.
         let (status, body) = server
             .post_auth(
                 "/api/v5/rule_test",
@@ -15733,8 +15751,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["matched"], json!(false));
+        assert_eq!(status, 412);
+        assert_eq!(body["code"], json!("NOT_MATCH"));
 
         // Malformed rule bodies are rejected with the documented shape.
         let (status, body) = server
@@ -15826,7 +15844,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["projected"], json!({"temperature": 150.0}));
         assert_eq!(body["output"], body["projected"]);
 
-        // Non-matching sample reports no-match.
+        // Non-matching sample answers 412 with the documented code.
         let (status, body) = server
             .post_auth(
                 "/api/v5/rules/w3-16-rule/test",
@@ -15837,9 +15855,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["matched"], json!(false));
-        assert!(body["projected"].is_null());
+        assert_eq!(status, 412);
+        assert_eq!(body["code"], json!("NOT_MATCH"));
 
         // Malformed samples are rejected with the documented shape.
         let (status, body) = server
