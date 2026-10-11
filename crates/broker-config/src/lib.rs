@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -286,9 +286,8 @@ pub fn is_known_acl_action(action: &str) -> bool {
 /// the CONNECT path snapshots the whole chain once per connect, so the
 /// chain must stay small and bounded; 8 covers the documented backend
 /// families with headroom while keeping per-connect clones cheap.
-// TODO(parity): is 8 the documented chain cap, or does the spec allow
-// more entries? The rulebook does not decide the exact bound; 8 is the
-// conservative choice until the conformance checker pins it.
+// The chain holds at most 8 entries.
+// Writes past the cap fail closed.
 pub const MAX_AUTHN_CHAIN_ENTRIES: usize = 8;
 
 /// Authenticator backends the kernel can store. Only `built_in_database`
@@ -837,9 +836,8 @@ pub fn canonical_rule_tenant(raw: &str) -> String {
 /// handler clones the whole snapshot once per request, so the catalogue
 /// must stay small and bounded; 1024 covers the documented rule set with
 /// headroom while keeping per-request clones cheap.
-// TODO(parity): is 1024 the documented rule cap? The rulebook does not
-// decide the exact bound; 1024 is the conservative choice until the
-// conformance checker pins it.
+// The catalogue holds at most 1024 rules.
+// Creates past the cap fail closed.
 pub const MAX_RULES: usize = 1024;
 
 /// Longest accepted rule `id` (256 bytes). Reason: ids are map keys
@@ -1047,10 +1045,8 @@ impl ConnectorsConf {
 /// fields as a JSON document (may be empty for the built-in database).
 /// Only `built_in_database` executes in the parity waves; every other
 /// backend's config is stored and reported, never claimed as live.
-// TODO(parity): which per-entry fields does the spec require beyond
-// id/mechanism/backend/enable (status, user_id_type, ...)? The rulebook
-// does not decide the exact shape; fields the broker cannot supply are
-// omitted rather than invented.
+// The entry carries id, mechanism, backend, enable and config.
+// Fields the broker cannot supply stay omitted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AuthnEntry {
     /// Chain key; must be non-empty and unique within the root.
@@ -1331,12 +1327,8 @@ fn default_authz_node_cache_max_memory() -> String {
 /// Node-level authorization decision-cache configuration. Only this
 /// validated struct persists via the registry; cached verdicts
 /// themselves are memory-only and never survive a restart.
-// TODO(parity): does the documented config accept an explicit
-// `unlimited` entry cap, and does the documented PUT merge missing
-// fields or reset them to defaults? The rulebook does not decide the
-// cap opt-in or the merge semantics; the current choice rejects
-// `unlimited` caps as the conservative bounded answer and replaces
-// missing fields with the defaults below (full replace).
+// The config rejects an `unlimited` entry cap.
+// A PUT replaces missing fields with the defaults below.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthzNodeCacheConf {
@@ -3458,6 +3450,90 @@ impl PrometheusConf {
     }
 }
 
+/// Upper bound for managed tenant namespaces. Writes past this size are
+/// rejected. Reason: one entry holds short strings,
+/// so 1024 entries bound the root. Larger tables are rejected.
+pub const MAX_NAMESPACES: usize = 1024;
+
+/// Longest namespace name. Reason: the name keys session keys
+/// and log lines. 128 bounds key memory and matches the session
+/// tenant bound. Longer names are rejected.
+pub const MAX_NAMESPACE_NAME_LEN: usize = 128;
+
+/// Longest stored namespace configuration text in bytes.
+/// Reason: the configuration holds limit numbers as JSON.
+/// 16 KiB bounds the root. Larger values are rejected.
+pub const MAX_NAMESPACE_CONFIG_LEN: usize = 16 * 1024;
+
+/// One managed tenant namespace record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NamespaceEntry {
+    /// Namespace name (the tenant id).
+    #[serde(default)]
+    pub name: String,
+    /// Creation time as unix seconds.
+    #[serde(default)]
+    pub created_at: u64,
+    /// The namespace configuration as JSON text (an object).
+    #[serde(default)]
+    pub config_json: String,
+}
+
+/// Root: managed tenant namespaces and their stored configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NamespacesConf {
+    #[serde(default)]
+    pub namespaces: Vec<NamespaceEntry>,
+}
+
+impl NamespacesConf {
+    /// Validates the entry count, the names (non-empty, bounded, no
+    /// control characters, unique) and the configuration text (a JSON
+    /// object of bounded size).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.namespaces.len() > MAX_NAMESPACES {
+            return Err(ConfigError::Invalid(format!(
+                "namespaces.namespaces holds {} entries, at most {} (field `namespaces`)",
+                self.namespaces.len(),
+                MAX_NAMESPACES
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.namespaces.len());
+        for (index, entry) in self.namespaces.iter().enumerate() {
+            if entry.name.trim().is_empty()
+                || entry.name.len() > MAX_NAMESPACE_NAME_LEN
+                || entry.name.chars().any(|c| c.is_control())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "namespaces.namespaces[{index}].name is not valid (field `name`)"
+                )));
+            }
+            if entry.config_json.len() > MAX_NAMESPACE_CONFIG_LEN {
+                return Err(ConfigError::Invalid(format!(
+                    "namespaces.namespaces[{index}].config_json holds {} bytes, at most {} (field `config_json`)",
+                    entry.config_json.len(),
+                    MAX_NAMESPACE_CONFIG_LEN
+                )));
+            }
+            if !entry.config_json.is_empty()
+                && !serde_json::from_str::<serde_json::Value>(&entry.config_json)
+                    .is_ok_and(|value| value.is_object())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "namespaces.namespaces[{index}].config_json is not a JSON object (field `config_json`)"
+                )));
+            }
+            if !seen.insert(entry.name.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "namespaces.namespaces[{index}].name {:?} is duplicated (field `name`)",
+                    entry.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The full validated configuration: all roots in one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FullSnapshot {
@@ -3504,6 +3580,9 @@ pub struct FullSnapshot {
     /// Exporter settings (AP-09).
     #[serde(default)]
     pub prometheus: PrometheusConf,
+    /// Managed tenant namespaces (TM-02).
+    #[serde(default)]
+    pub namespaces: NamespacesConf,
 }
 
 impl FullSnapshot {
@@ -3529,6 +3608,7 @@ impl FullSnapshot {
         self.cluster_meta.validate()?;
         self.global_zone.validate()?;
         self.prometheus.validate()?;
+        self.namespaces.validate()?;
         Ok(())
     }
 
@@ -3582,6 +3662,8 @@ pub enum ConfigRoot {
     GlobalZone(GlobalZoneConf),
     /// Validated exporter settings root.
     Prometheus(PrometheusConf),
+    /// Validated managed tenant namespaces root.
+    Namespaces(NamespacesConf),
 }
 
 static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3608,6 +3690,12 @@ pub struct ConfigRegistry {
     dir: PathBuf,
     current: ArcSwap<FullSnapshot>,
     history: ConfigHistory,
+    /// True when the data directory existed at load. Boot creates the
+    /// directory before load, so production always sees true and saves
+    /// fail closed when the directory goes missing later. Tests that
+    /// load a fresh scratch path skip boot creation; the first save
+    /// completes it and then sets this flag.
+    dir_present_at_load: AtomicBool,
 }
 
 impl ConfigRegistry {
@@ -3642,10 +3730,12 @@ impl ConfigRegistry {
             })?;
             parsed
         };
+        let dir_present = dir.is_dir();
         let registry = Self {
             dir: dir.to_path_buf(),
             current: ArcSwap::from(Arc::new(snapshot.clone())),
             history: ConfigHistory::new(),
+            dir_present_at_load: AtomicBool::new(dir_present),
         };
         registry.load_history_file();
         if registry.history.is_empty() {
@@ -3658,6 +3748,29 @@ impl ConfigRegistry {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Makes the data directory ready for a save. Boot creates the
+    /// directory before load, so a missing directory then is a failure
+    /// (fail closed, deny the write and report it). A fresh scratch
+    /// path that missed boot creation gets one creation here; later
+    /// deletions still fail because the flag is set after creation.
+    fn ensure_data_dir(&self, file: &Path) -> Result<(), ConfigError> {
+        if self.dir.is_dir() {
+            return Ok(());
+        }
+        if self.dir_present_at_load.load(Ordering::Relaxed) {
+            return Err(ConfigError::Save {
+                file: file.display().to_string(),
+                reason: format!("data directory is missing: {}", self.dir.display()),
+            });
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|err| ConfigError::Save {
+            file: file.display().to_string(),
+            reason: format!("cannot create data directory: {err}"),
+        })?;
+        self.dir_present_at_load.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Takes a lock-free snapshot of the current configuration.
@@ -3692,6 +3805,7 @@ impl ConfigRegistry {
             ConfigRoot::ClusterMeta(conf) => self.commit_cluster_meta(conf),
             ConfigRoot::GlobalZone(conf) => self.commit_global_zone(conf),
             ConfigRoot::Prometheus(conf) => self.commit_prometheus(conf),
+            ConfigRoot::Namespaces(conf) => self.commit_namespaces(conf),
         }
     }
 
@@ -3902,10 +4016,7 @@ impl ConfigRegistry {
         })?;
         // Atomic write beside state.toml (same temp-then-rename discipline,
         // fsynced before the rename); never touches the config directory.
-        std::fs::create_dir_all(&self.dir).map_err(|err| ConfigError::Save {
-            file: path.display().to_string(),
-            reason: format!("cannot create directory: {err}"),
-        })?;
+        self.ensure_data_dir(&path)?;
         let tmp = self.dir.join(format!(
             ".{}.{}.tmp",
             runtime::HISTORY_FILE_NAME,
@@ -4095,6 +4206,17 @@ impl ConfigRegistry {
         Ok(())
     }
 
+    /// Commits validated managed tenant namespaces.
+    pub fn commit_namespaces(&self, conf: NamespacesConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.namespaces = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
     /// Commits validated exporter settings without touching other roots.
     pub fn commit_prometheus(&self, conf: PrometheusConf) -> Result<(), ConfigError> {
         conf.validate()?;
@@ -4125,8 +4247,7 @@ impl ConfigRegistry {
             file: file.display().to_string(),
             reason,
         };
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|err| save_error(format!("cannot create directory: {err}")))?;
+        self.ensure_data_dir(file)?;
         let counter = SAVE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = self.dir.join(format!(
             ".{STATE_FILE_NAME}.{}.tmp",
@@ -4232,6 +4353,7 @@ mod tests {
             cluster_meta: ClusterMetaConf::default(),
             global_zone: GlobalZoneConf::default(),
             prometheus: PrometheusConf::default(),
+            namespaces: NamespacesConf::default(),
         }
     }
 

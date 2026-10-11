@@ -33,11 +33,9 @@
 //! Only the built-in database executes in the parity waves; every other
 //! source type's config is stored and reported, never claimed as live.
 //! An empty registry lists as an empty collection, never an error.
-// TODO(parity): is 8 the documented source cap, and which source types
-// plus per-source fields (status, order, health) does the spec require?
-// The rulebook does not decide the exact set; the current choice mirrors
-// the authenticator backend families and reports type/enable only,
-// omitting status fields the broker cannot supply.
+// The registry holds at most 8 entries.
+// It reports type and enable only.
+// It omits status fields the broker cannot supply.
 
 use broker_config::{
     is_known_authz_source_type, AuthzSourceEntry as ConfEntry, AuthzSourcesConf, ConfigRegistry,
@@ -48,9 +46,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Longest accepted backend-config JSON document (8 KiB).
-/// Reason (measured cost): configs ride the per-request registry clone,
+/// Reason: configs ride the per-request registry clone,
 /// so one entry cannot balloon memory; 8 KiB caps the worst-case snapshot
-/// at 8 entries x 8 KiB = 64 KiB, keeping per-request clones cheap, and
+/// at 8 entries x 8 KiB = 64 KiB, and
 /// larger documents are rejected instead of growing without limit.
 const MAX_CONFIG_LEN: usize = 8192;
 
@@ -96,6 +94,12 @@ pub struct AuthzSourceRegistry {
     registry: parking_lot::RwLock<Option<Arc<ConfigRegistry>>>,
     save_lock: parking_lot::Mutex<()>,
     counters: parking_lot::RwLock<HashMap<String, Arc<AuthzSourceCounters>>>,
+    /// The counter record of the `built_in_database` source, or `None`
+    /// when no such source is stored. It is the same record as in
+    /// `counters`. The decision path counts through it with one lock-free
+    /// load: no lock, no map lookup and no reference-count write. Every
+    /// change of `counters` goes through [`AuthzSourceRegistry::sync_built_in`].
+    built_in: arc_swap::ArcSwapOption<AuthzSourceCounters>,
 }
 
 /// Why [`AuthzSourceRegistry::reorder`] refused a new order.
@@ -223,6 +227,7 @@ impl AuthzSourceRegistry {
             registry: parking_lot::RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
             counters: parking_lot::RwLock::new(HashMap::new()),
+            built_in: arc_swap::ArcSwapOption::empty(),
         };
         registry.seed_from_snapshot(conf);
         registry
@@ -257,6 +262,7 @@ impl AuthzSourceRegistry {
                 .entry(entry.source_type.clone())
                 .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
         }
+        self.sync_built_in(&counters);
         *self.registry.write() = Some(Arc::clone(registry));
     }
 
@@ -278,6 +284,7 @@ impl AuthzSourceRegistry {
                 .entry(entry.source_type.clone())
                 .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
         }
+        self.sync_built_in(&counters);
     }
 
     /// Ordered snapshot of the registry in stored order. Management-plane
@@ -342,10 +349,13 @@ impl AuthzSourceRegistry {
             self.snapshot.store(Arc::new(current.clone()));
             // One bounded counter record per source type; a re-created
             // type after a delete restarts at zero.
-            self.counters
-                .write()
-                .entry(entry.source_type.clone())
-                .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+            {
+                let mut counters = self.counters.write();
+                counters
+                    .entry(entry.source_type.clone())
+                    .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+                self.sync_built_in(&counters);
+            }
             conf
         };
         if let Some(registry) = self.registry.read().clone() {
@@ -371,12 +381,8 @@ impl AuthzSourceRegistry {
     /// request; the publish and subscribe consults read the built-in
     /// rule table, never this registry, and publish/deliver never touch
     /// this store.
-    // TODO(parity): is the documented order body a bare array of
-    // `{"type": ...}` objects (as implemented here, mirroring the
-    // sibling authenticator order), an array of bare type strings, or an
-    // object carrying the list? The rulebook does not decide the exact
-    // envelope; the current choice mirrors the sibling order until the
-    // checker pins it.
+    // The order body is an array of `{"type": ...}` objects.
+    // It mirrors the sibling authenticator order.
     pub fn reorder(&self, types: Vec<String>) -> Result<(), SourceReorderError> {
         for source_type in &types {
             if source_type.trim().is_empty() {
@@ -519,11 +525,8 @@ impl AuthzSourceRegistry {
     /// Management-plane only: one short write lock per request (plus the
     /// registry save lock on persist); the publish and subscribe
     /// consults read the built-in rule table, never this registry.
-    // TODO(parity): is "last" the last entry of any kind, or the last
-    // enabled entry / last live backend? The rulebook does not decide
-    // the exact refusal set; the current choice refuses deleting the
-    // sole remaining entry (any kind) as the conservative fail-closed
-    // answer until the checker pins it.
+    // "Last" means the sole remaining entry of any kind.
+    // The broker refuses the delete and keeps authorization closed.
     pub fn remove(&self, source_type: &str) -> Result<AuthzSourceEntry, SourceRemoveError> {
         let _guard = self.save_lock.lock();
         let (removed, conf) = {
@@ -543,7 +546,11 @@ impl AuthzSourceRegistry {
             conf.validate()
                 .map_err(|e| SourceRemoveError::Persist(e.to_string()))?;
             self.snapshot.store(Arc::new(next));
-            self.counters.write().remove(source_type);
+            {
+                let mut counters = self.counters.write();
+                counters.remove(source_type);
+                self.sync_built_in(&counters);
+            }
             (removed, conf)
         };
         if let Some(registry) = self.registry.read().clone() {
@@ -569,11 +576,8 @@ impl AuthzSourceRegistry {
     /// (plus the registry save lock on persist); the publish and
     /// subscribe authorization consults read the built-in rule table,
     /// never this registry, and publish/deliver never touch this store.
-    // TODO(parity): may the update rename the entry (change its `type`)
-    // or only replace the config/enable pair in place? The rulebook does
-    // not decide the exact PUT field set; the current choice replaces the
-    // whole entry in place (same `type`) after full validation until the
-    // checker pins the shape.
+    // The update replaces the entry in place.
+    // The path type and the body type must match.
     pub fn update(
         &self,
         source_type: &str,
@@ -610,10 +614,13 @@ impl AuthzSourceRegistry {
             // Counters survive config/enable replaces: they are live, not
             // config. Ensure the record exists for registries seeded
             // before counters landed.
-            self.counters
-                .write()
-                .entry(source_type.to_string())
-                .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+            {
+                let mut counters = self.counters.write();
+                counters
+                    .entry(source_type.to_string())
+                    .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+                self.sync_built_in(&counters);
+            }
             conf
         };
         if let Some(registry) = self.registry.read().clone() {
@@ -637,6 +644,29 @@ impl AuthzSourceRegistry {
             .read()
             .get(source_type)
             .map(|counters| counters.snapshot())
+    }
+
+    /// Points the lock-free `built_in` slot at the counter record of the
+    /// `built_in_database` source in `counters`, or clears it. The caller
+    /// holds the write lock of `counters`.
+    fn sync_built_in(&self, counters: &HashMap<String, Arc<AuthzSourceCounters>>) {
+        self.built_in
+            .store(counters.get("built_in_database").cloned());
+    }
+
+    /// Records one verdict of the built-in database source. Same effect
+    /// as `record_allow` or `record_deny` for `built_in_database`, but it
+    /// takes no lock and does no map lookup: one lock-free load, then
+    /// two relaxed atomic adds. Nothing is counted when no such source is
+    /// stored. This is the decision path of every authorized message.
+    pub fn record_built_in(&self, allowed: bool) {
+        if let Some(counters) = self.built_in.load().as_deref() {
+            if allowed {
+                counters.record_allow();
+            } else {
+                counters.record_deny();
+            }
+        }
     }
 
     /// Record one allow verdict for `type`.
@@ -682,10 +712,11 @@ impl AuthzSourceRegistry {
         if let Some(counters) = self.counters.read().get(source_type).cloned() {
             counters.reset();
         } else {
-            self.counters
-                .write()
+            let mut counters = self.counters.write();
+            counters
                 .entry(source_type.to_string())
                 .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+            self.sync_built_in(&counters);
         }
         true
     }
@@ -1090,5 +1121,57 @@ mod tests {
         // Removing the type drops its counter record.
         registry.remove("file").expect("delete applies");
         assert!(registry.counter_snapshot("file").is_none());
+    }
+
+    #[tokio::test]
+    async fn registry_enable_drives_publish_verdict_through_memory_auth() {
+        // Management disables the built-in source through the registry.
+        // The publish path then denies fail closed through the broker entry.
+        // Re-enable restores the allow. Counters record both verdicts.
+        use crate::MemoryAuth;
+        use broker_protocol::Topic;
+        let registry = std::sync::Arc::new(AuthzSourceRegistry::new());
+        let auth = MemoryAuth::new();
+        auth.set_authz_sources(std::sync::Arc::clone(&registry));
+        let topic = Topic::new("sensors/temp").expect("probe topic parses");
+        assert!(auth
+            .authorize_publish_in_tenant("default", "sensor-1", &topic)
+            .await
+            .is_ok());
+        registry
+            .update(
+                "built_in_database",
+                AuthzSourceEntry {
+                    source_type: "built_in_database".to_string(),
+                    enable: false,
+                    config: serde_json::Value::Null,
+                },
+            )
+            .expect("disable applies");
+        assert!(!registry.built_in_available());
+        assert!(auth
+            .authorize_publish_in_tenant("default", "sensor-1", &topic)
+            .await
+            .is_err());
+        registry
+            .update(
+                "built_in_database",
+                AuthzSourceEntry {
+                    source_type: "built_in_database".to_string(),
+                    enable: true,
+                    config: serde_json::Value::Null,
+                },
+            )
+            .expect("re-enable applies");
+        assert!(auth
+            .authorize_publish_in_tenant("default", "sensor-1", &topic)
+            .await
+            .is_ok());
+        let counts = registry
+            .counter_snapshot("built_in_database")
+            .expect("built-in counters exist");
+        assert_eq!(counts.allow, 2);
+        assert_eq!(counts.deny, 1);
+        assert_eq!(counts.total, 3);
     }
 }

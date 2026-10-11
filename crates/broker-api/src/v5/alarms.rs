@@ -155,7 +155,10 @@ impl AlarmStore {
         let details = normalise_details(details);
         let now = now_micros();
         let key = (tenant.clone(), name.clone());
-        let mut active = self.active.write().expect("alarm store lock");
+        let mut active = self
+            .active
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = active.get(&key) {
             return existing.clone();
         }
@@ -166,7 +169,7 @@ impl AlarmStore {
         // the same pair never sits in both tables at once.
         self.deactivated
             .write()
-            .expect("alarm store lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&key);
         let entry = AlarmEntry {
             name: name.clone(),
@@ -183,7 +186,10 @@ impl AlarmStore {
     /// stable pages. Each entry carries its tenant, so one tenant never
     /// reads another tenant's alarm as its own.
     pub fn list_active(&self) -> Vec<AlarmEntry> {
-        let map = self.active.read().expect("alarm store lock");
+        let map = self
+            .active
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out: Vec<AlarmEntry> = map.values().cloned().collect();
         out.sort_by(|a, b| (&a.tenant, &a.name).cmp(&(&b.tenant, &b.name)));
         out
@@ -191,7 +197,10 @@ impl AlarmStore {
 
     /// Snapshot of active alarms in one tenant, sorted by `name`.
     pub fn list_active_in_tenant(&self, tenant: &str) -> Vec<AlarmEntry> {
-        let map = self.active.read().expect("alarm store lock");
+        let map = self
+            .active
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out: Vec<AlarmEntry> = map
             .values()
             .filter(|e| e.tenant == tenant)
@@ -204,7 +213,10 @@ impl AlarmStore {
     /// Snapshot of deactivated alarms sorted by (`tenant`, `name`) for
     /// stable pages.
     pub fn list_deactivated(&self) -> Vec<DeactivatedAlarm> {
-        let map = self.deactivated.read().expect("alarm store lock");
+        let map = self
+            .deactivated
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out: Vec<DeactivatedAlarm> = map.values().cloned().collect();
         out.sort_by(|a, b| (&a.tenant, &a.name).cmp(&(&b.tenant, &b.name)));
         out
@@ -215,8 +227,14 @@ impl AlarmStore {
     /// `DELETE /alarms` route calls [`Self::deactivate_all`] so cleared
     /// alarms remain visible under `?activated=false`.
     pub fn clear(&self) {
-        self.active.write().expect("alarm store lock").clear();
-        self.deactivated.write().expect("alarm store lock").clear();
+        self.active
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.deactivated
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// Deactivate every active alarm into the deactivated history.
@@ -228,14 +246,20 @@ impl AlarmStore {
     pub fn deactivate_all(&self) -> usize {
         let now = now_micros();
         let entries: Vec<AlarmEntry> = {
-            let mut active = self.active.write().expect("alarm store lock");
+            let mut active = self
+                .active
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             active.drain().map(|(_, entry)| entry).collect()
         };
         let moved = entries.len();
         if moved == 0 {
             return 0;
         }
-        let mut history = self.deactivated.write().expect("alarm store lock");
+        let mut history = self
+            .deactivated
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for entry in entries {
             let key = (entry.tenant.clone(), entry.name.clone());
             let record = DeactivatedAlarm {
@@ -262,7 +286,10 @@ impl AlarmStore {
     pub fn deactivate(&self, name: &str) -> bool {
         let now = now_micros();
         let entries: Vec<AlarmEntry> = {
-            let mut active = self.active.write().expect("alarm store lock");
+            let mut active = self
+                .active
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let keys: Vec<(String, String)> =
                 active.keys().filter(|(_, n)| n == name).cloned().collect();
             if keys.is_empty() {
@@ -270,7 +297,10 @@ impl AlarmStore {
             }
             keys.into_iter().filter_map(|k| active.remove(&k)).collect()
         };
-        let mut history = self.deactivated.write().expect("alarm store lock");
+        let mut history = self
+            .deactivated
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for entry in entries {
             let key = (entry.tenant.clone(), entry.name.clone());
             let record = DeactivatedAlarm {
@@ -294,7 +324,10 @@ impl AlarmStore {
     /// nothing was stored under the pair.
     pub fn deactivate_in_tenant(&self, tenant: &str, name: &str) -> bool {
         let now = now_micros();
-        let mut active = self.active.write().expect("alarm store lock");
+        let mut active = self
+            .active
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(entry) = active.remove(&(tenant.to_string(), name.to_string())) else {
             return false;
         };
@@ -308,7 +341,10 @@ impl AlarmStore {
             deactivate_at_us: now.max(entry.activate_at_us),
             tenant: entry.tenant,
         };
-        let mut history = self.deactivated.write().expect("alarm store lock");
+        let mut history = self
+            .deactivated
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if history.len() >= MAX_ALARMS && !history.contains_key(&key) {
             evict_oldest_deactivated(&mut history);
         }
@@ -609,5 +645,21 @@ mod tests {
         assert_eq!(rendered["duration"], serde_json::json!(10));
         assert!(rendered["activate_at"].is_string());
         assert!(rendered.get("deactivate_at").is_none());
+    }
+
+    #[test]
+    fn serves_after_lock_poison() {
+        // A poisoned lock must not stop the store. Reads recover the lock.
+        let store = AlarmStore::new();
+        store.activate("before", "msg", serde_json::json!({}));
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let _guard = store.active.write().unwrap();
+                panic!("poison the alarm lock");
+            });
+            let _ = h.join();
+        });
+        store.activate("after", "msg", serde_json::json!({}));
+        assert_eq!(store.list_active().len(), 2);
     }
 }

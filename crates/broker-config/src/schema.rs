@@ -331,21 +331,21 @@ pub fn field_docs() -> Vec<FieldDoc> {
             FieldDoc {
                 path: "quotas.max_connections_per_tenant",
                 setting_type: "u32",
-                default: "10000",
+                default: "0",
                 range: "0..=1000000 (0 = unlimited opt-in)",
                 doc: "Default max live connections per tenant (0 = unlimited).",
             },
             FieldDoc {
                 path: "quotas.max_sessions_per_tenant",
                 setting_type: "u32",
-                default: "10000",
+                default: "0",
                 range: "0..=100000 (0 = unlimited opt-in)",
                 doc: "Default max sessions per tenant (0 = unlimited).",
             },
             FieldDoc {
                 path: "quotas.max_retained_per_tenant",
                 setting_type: "u32",
-                default: "10000",
+                default: "0",
                 range: "0..=100000 (0 = unlimited opt-in)",
                 doc: "Default max retained topics per tenant (0 = unlimited).",
             },
@@ -1450,20 +1450,20 @@ fn default_quota_max_publish_rate() -> u32 {
 fn default_burst_multiplier() -> f64 {
     2.0
 }
-// Reason: 10k live connections per tenant share the 1M listener bound
-// across many tenants without letting one tenant take it all.
+// Reason: no tenant holds a bound unless the operator sets one.
+// The listener bound stays the only default gate for connections.
 fn default_quota_max_connections_per_tenant() -> u32 {
-    10_000
+    0
 }
-// Reason: 10k sessions per tenant keep per-tenant session memory near
-// tens of MB while covering fleets far past real installs.
+// Reason: no tenant holds a bound unless the operator sets one.
+// A tenant with no quota setting stays unlimited.
 fn default_quota_max_sessions_per_tenant() -> u32 {
-    10_000
+    0
 }
-// Reason: 10k retained topics per tenant keep per-tenant retained memory
-// bounded while covering fleet state far past real installs.
+// Reason: no tenant holds a bound unless the operator sets one.
+// The global retained bound still caps total memory.
 fn default_quota_max_retained_per_tenant() -> u32 {
-    10_000
+    0
 }
 
 impl Default for QuotasConf {
@@ -3137,21 +3137,21 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 ),
                 int_field(
                     "max_connections_per_tenant",
-                    10_000,
+                    0,
                     0,
                     1_000_000,
                     "Default max live connections per tenant (0 = unlimited).",
                 ),
                 int_field(
                     "max_sessions_per_tenant",
-                    10_000,
+                    0,
                     0,
                     100_000,
                     "Default max sessions per tenant (0 = unlimited).",
                 ),
                 int_field(
                     "max_retained_per_tenant",
-                    10_000,
+                    0,
                     0,
                     100_000,
                     "Default max retained topics per tenant (0 = unlimited).",

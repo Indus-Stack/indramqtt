@@ -206,7 +206,10 @@ impl TraceStore {
     /// Snapshot of stored sessions sorted by `start_at` descending (newest
     /// first), ties broken by `name` for stable output.
     pub fn list(&self) -> Vec<TraceSession> {
-        let data = self.inner.read().expect("trace store lock");
+        let data = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out: Vec<TraceSession> = data.sessions.values().cloned().collect();
         out.sort_by(|a, b| {
             b.start_at
@@ -221,7 +224,7 @@ impl TraceStore {
     pub fn log_len(&self, name: &str) -> usize {
         self.inner
             .read()
-            .expect("trace store lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .logs
             .get(name)
             .map_or(0, Vec::len)
@@ -232,7 +235,10 @@ impl TraceStore {
     /// the size is the true buffer length, the time is the last append
     /// (or insert when nothing was captured yet). No field is a stand-in.
     pub fn log_detail(&self, name: &str) -> Option<(String, usize, u64)> {
-        let data = self.inner.read().expect("trace store lock");
+        let data = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !data.sessions.contains_key(name) {
             return None;
         }
@@ -245,7 +251,10 @@ impl TraceStore {
     /// session is unknown; returns an empty vector when the session
     /// exists but nothing has been captured yet.
     pub fn read_log(&self, name: &str) -> Option<Vec<u8>> {
-        let data = self.inner.read().expect("trace store lock");
+        let data = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !data.sessions.contains_key(name) {
             return None;
         }
@@ -262,11 +271,14 @@ impl TraceStore {
             return self
                 .inner
                 .read()
-                .expect("trace store lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .sessions
                 .contains_key(name);
         }
-        let mut data = self.inner.write().expect("trace store lock");
+        let mut data = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !data.sessions.contains_key(name) {
             return false;
         }
@@ -290,7 +302,7 @@ impl TraceStore {
     pub fn is_empty(&self) -> bool {
         self.inner
             .read()
-            .expect("trace store lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .sessions
             .is_empty()
     }
@@ -302,7 +314,7 @@ impl TraceStore {
     pub fn has_enabled(&self) -> bool {
         self.inner
             .read()
-            .expect("trace store lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .sessions
             .values()
             .any(|s| s.enable)
@@ -337,7 +349,10 @@ impl TraceStore {
     ) {
         let now = now_epoch_secs();
         let lines: Vec<(String, Vec<u8>)> = {
-            let data = self.inner.read().expect("trace store lock");
+            let data = self
+                .inner
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if data.sessions.is_empty() {
                 return;
             }
@@ -369,7 +384,10 @@ impl TraceStore {
     /// starts with an empty capture buffer: reads serve only what the
     /// packet path appends, never a synthesised header.
     pub fn insert(&self, session: TraceSession) -> Result<TraceSession, TraceInsertError> {
-        let mut data = self.inner.write().expect("trace store lock");
+        let mut data = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if data.sessions.contains_key(&session.name) {
             return Err(TraceInsertError::Duplicate);
         }
@@ -391,7 +409,10 @@ impl TraceStore {
 
     /// Remove every session and every capture buffer.
     pub fn clear(&self) {
-        let mut data = self.inner.write().expect("trace store lock");
+        let mut data = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         data.sessions.clear();
         data.logs.clear();
         data.mtimes.clear();
@@ -401,7 +422,7 @@ impl TraceStore {
     pub fn get(&self, name: &str) -> Option<TraceSession> {
         self.inner
             .read()
-            .expect("trace store lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .sessions
             .get(name)
             .cloned()
@@ -410,7 +431,10 @@ impl TraceStore {
     /// Drop the named session and its capture buffer. Returns true when
     /// a session was removed.
     pub fn remove(&self, name: &str) -> bool {
-        let mut data = self.inner.write().expect("trace store lock");
+        let mut data = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         data.logs.remove(name);
         data.mtimes.remove(name);
         data.sessions.remove(name).is_some()
@@ -419,7 +443,10 @@ impl TraceStore {
     /// Stop capture for the named session while keeping it listed.
     /// Returns the updated session, or `None` when unknown.
     pub fn stop(&self, name: &str) -> Option<TraceSession> {
-        let mut data = self.inner.write().expect("trace store lock");
+        let mut data = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = data.sessions.get_mut(name)?;
         entry.enable = false;
         Some(entry.clone())
@@ -2074,5 +2101,21 @@ mod tests {
                 .await;
         assert_eq!(status, StatusCode::OK);
         assert!(!state.tracing.is_enabled());
+    }
+
+    #[test]
+    fn serves_after_lock_poison() {
+        // A poisoned lock must not stop the store. Reads recover the lock.
+        let store = TraceStore::new();
+        assert!(store.list().is_empty());
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let _guard = store.inner.write().unwrap();
+                panic!("poison the trace lock");
+            });
+            let _ = h.join();
+        });
+        assert!(store.list().is_empty());
+        assert!(!store.has_enabled());
     }
 }

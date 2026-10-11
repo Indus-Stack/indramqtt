@@ -130,6 +130,13 @@ pub trait RetainedStore: Send + Sync {
     fn retained_cap_for_tenant(&self, _tenant: &str) -> usize {
         DEFAULT_MAX_RETAINED_PER_TENANT
     }
+    /// Removes every retained entry of one tenant together with its cap
+    /// override and its count, and returns the number of entries removed.
+    /// Used when the operator deletes a tenant, so a later tenant with the
+    /// same name starts empty.
+    async fn clear_tenant(&self, _tenant: &str) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 #[async_trait]
@@ -172,16 +179,16 @@ fn normalize_tenant_key(tenant: &str) -> std::sync::Arc<str> {
 /// never scanning without a cap, and take only short read locks so they
 /// never block delivery.
 ///
-/// 100_000 entries cover the documented unlimited default (`0`) while
-/// keeping per-entry memory (one shared topic string plus payload) under
-/// control on the 12 GB test host.
+/// Each entry holds one shared topic string plus payload.
+/// 100_000 entries bound total retained state.
+/// Inserts past the cap drop the new topic.
 pub const MAX_RETAINED_MESSAGES: usize = 100_000;
 
-/// Default max retained topics per tenant.
+/// Default max retained topics per tenant (0 = unlimited).
 ///
-/// Reason: 10k keeps per-tenant retained memory bounded while
-/// covering fleet state far past real installs.
-pub const DEFAULT_MAX_RETAINED_PER_TENANT: usize = 10_000;
+/// The broker sets no per-tenant bound unless the operator sets one. The
+/// global bound [`MAX_RETAINED_MESSAGES`] always applies.
+pub const DEFAULT_MAX_RETAINED_PER_TENANT: usize = 0;
 
 /// One retained table plus its per-tenant counts and caps.
 ///
@@ -386,6 +393,21 @@ impl RetainedStore for MemoryStore {
         Ok(())
     }
 
+    async fn clear_tenant(&self, tenant: &str) -> Result<usize> {
+        let scope = normalize_tenant_key(tenant);
+        // The default tenant never leaves.
+        if scope.as_ref() == DEFAULT_TENANT_ID {
+            return Ok(0);
+        }
+        let mut inner = self.retained.write();
+        let before = inner.map.len();
+        inner.map.retain(|(key_tenant, _), _| *key_tenant != scope);
+        let removed = before - inner.map.len();
+        inner.per_tenant.remove(scope.as_ref());
+        inner.caps.remove(scope.as_ref());
+        Ok(removed)
+    }
+
     async fn find_matching_in_tenant(
         &self,
         filter: &TopicFilter,
@@ -464,6 +486,46 @@ mod tests {
 
         store.update_cursor(101, offset).await.unwrap();
         assert_eq!(store.get_cursor(101).await.unwrap(), offset);
+    }
+
+    #[tokio::test]
+    async fn clear_tenant_removes_entries_cap_and_count() {
+        let store = MemoryStore::new();
+        let topic = Topic::new("device/state").unwrap();
+        store.set_retained_per_tenant_cap("t-gone", 5);
+        for tenant in ["t-gone", "t-kept", DEFAULT_TENANT_ID] {
+            store
+                .set_retained_in_tenant(
+                    topic.clone(),
+                    QoS::AtMostOnce,
+                    Bytes::from_static(b"v"),
+                    tenant,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.clear_tenant("t-gone").await.unwrap(), 1);
+        assert!(store
+            .get_retained_in_tenant(&topic, "t-gone")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.count_retained_in_tenant_sync("t-gone"), 0);
+        assert_eq!(
+            store.retained_cap_for_tenant_sync("t-gone"),
+            DEFAULT_MAX_RETAINED_PER_TENANT,
+            "the cap override is gone"
+        );
+        for tenant in ["t-kept", DEFAULT_TENANT_ID] {
+            assert!(store
+                .get_retained_in_tenant(&topic, tenant)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        // The default tenant is never cleared.
+        assert_eq!(store.clear_tenant(DEFAULT_TENANT_ID).await.unwrap(), 0);
+        assert_eq!(store.count_retained().await.unwrap(), 2);
     }
 
     #[tokio::test]

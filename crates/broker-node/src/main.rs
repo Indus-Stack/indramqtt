@@ -8441,6 +8441,16 @@ fn effective_tenant_limits(
         tracing::warn!(tenant = %tenant, "tenant limit store is unreachable: denying new use");
         return Err("limit store is unreachable");
     }
+    // The default tenant holds no bound. Only the listener bound
+    // gates it. A tenant with no quota setting reads the file
+    // defaults below, which default to unlimited.
+    if tenant == broker_session::tenant::DEFAULT_TENANT_ID {
+        return Ok(broker_session::tenant_limits::TenantLimits {
+            max_connections: 0,
+            max_sessions: 0,
+            max_retained: 0,
+        });
+    }
     let mut effective = shared.tenant_limits.effective(tenant);
     let Some(entry) = shared.namespaces.get(tenant) else {
         return Ok(effective);
@@ -11029,6 +11039,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a no-op (today's empty behaviour: `GET /actions` reads an empty
     // page).
     shared.actions.seed_from_registry(&shared.config);
+    // Managed namespaces (TM-02): seed the shared store in place (the
+    // same instance `serve_api` shares with `ApiState`), so management
+    // reads observe the persisted namespaces from the first
+    // connection. A failed save at runtime rolls the change back.
+    // Then apply the stored retained caps, because the retained
+    // store keeps caps in memory only. One seed plus one scan at
+    // boot; the connect path reads the live table.
+    shared.namespaces.seed_from_registry(&shared.config);
+    broker_api::v5::mt::apply_stored_retained_caps(&shared.namespaces, &*shared.retained);
     // Connector directory: seed the shared directory in place (the same
     // instance `serve_api` shares with `ApiState`), so management reads
     // observe the persisted connectors from the first connection. An empty
@@ -22366,6 +22385,51 @@ mod tests {
         assert_eq!(effective.max_connections, 2);
         assert_eq!(effective.max_sessions, 8);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tm06_default_tenant_holds_no_bound_through_broker() {
+        // File quotas cap managed tenants only. Two binds in the
+        // default tenant both succeed past a file limit of one, while
+        // a managed tenant with a limit of one refuses the second
+        // bind. Goes through the broker bind path.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_limits
+            .set_defaults(broker_session::tenant_limits::TenantLimits {
+                max_connections: 1,
+                max_sessions: 1,
+                max_retained: 1,
+            });
+        for (conn, client) in [(611u64, "tm06-d1"), (612u64, "tm06-d2")] {
+            let meta = encode_bind_meta(client, true, 60);
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0x00, "default tenant stays unlimited");
+        }
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "q-${username}")])
+            .expect("tenant rules store");
+        shared.namespaces.create("q-cap").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "q-cap",
+                serde_json::json!({"limits": {"max_connections": 1}}),
+            )
+            .expect("limit stores");
+        for (conn, client, want) in [(613u64, "tm06-c1", 0x00), (614u64, "tm06-c2", 0x8B)] {
+            let meta = encode_bind_meta_creds(client, true, 60, "cap", b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, want, "managed tenant enforces its limit");
+        }
     }
 
     #[tokio::test]

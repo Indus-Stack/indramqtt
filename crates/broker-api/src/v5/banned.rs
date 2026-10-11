@@ -129,7 +129,10 @@ impl BanStore {
     /// stable pages. Drops expired entries first (lazy expiry sweep).
     pub fn list_live(&self) -> Vec<BanEntry> {
         let now = now_epoch_secs();
-        let mut map = self.inner.write().expect("ban store lock");
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         sweep_expired_locked(&mut map, now);
         let mut out: Vec<BanEntry> = map.values().map(|s| s.entry.clone()).collect();
         out.sort_by(|a, b| (&a.tenant, &a.as_type, &a.who).cmp(&(&b.tenant, &b.as_type, &b.who)));
@@ -150,7 +153,10 @@ impl BanStore {
     /// Compiles a pattern kind once here, never on the hot path.
     pub fn insert(&self, entry: BanEntry) -> Result<BanEntry, BanInsertError> {
         let now = now_epoch_secs();
-        let mut map = self.inner.write().expect("ban store lock");
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         sweep_expired_locked(&mut map, now);
         let key = (
             entry.tenant.clone(),
@@ -169,7 +175,10 @@ impl BanStore {
 
     /// Remove every entry.
     pub fn clear(&self) {
-        self.inner.write().expect("ban store lock").clear();
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// Drop the (`as`, `who`) entries in every tenant. Sweeps expired
@@ -178,7 +187,10 @@ impl BanStore {
     /// stored under the pair.
     pub fn remove(&self, as_type: &str, who: &str) -> bool {
         let now = now_epoch_secs();
-        let mut map = self.inner.write().expect("ban store lock");
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         sweep_expired_locked(&mut map, now);
         let keys: Vec<(String, String, String)> = map
             .keys()
@@ -198,7 +210,10 @@ impl BanStore {
     /// entry was removed, false when nothing was stored under the key.
     pub fn remove_in_tenant(&self, tenant: &str, as_type: &str, who: &str) -> bool {
         let now = now_epoch_secs();
-        let mut map = self.inner.write().expect("ban store lock");
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         sweep_expired_locked(&mut map, now);
         map.remove(&(tenant.to_string(), as_type.to_string(), who.to_string()))
             .is_some()
@@ -244,7 +259,10 @@ impl BanStore {
         peerhost: Option<&str>,
     ) -> bool {
         let now = now_epoch_secs();
-        let map = self.inner.read().expect("ban store lock");
+        let map = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if map.is_empty() {
             return false;
         }
@@ -934,5 +952,20 @@ mod ban_match_tests {
             entry("peerhost", "192.0.2.9", &past),
         ]);
         assert!(!store.is_banned("old-id", Some("old-user"), Some("192.0.2.9")));
+    }
+
+    #[test]
+    fn serves_after_lock_poison() {
+        // A poisoned lock must not stop the store. Reads recover the lock.
+        let store = store_with(vec![entry("clientid", "kept-id", "infinity")]);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let _guard = store.inner.write().unwrap();
+                panic!("poison the ban lock");
+            });
+            let _ = h.join();
+        });
+        assert!(store.is_banned("kept-id", None, None));
+        assert!(!store.is_banned("other-id", None, None));
     }
 }

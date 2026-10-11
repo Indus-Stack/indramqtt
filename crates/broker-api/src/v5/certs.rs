@@ -54,22 +54,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::errors::ApiError;
 use crate::ApiState;
 
-/// Largest accepted upload file in bytes (1 MiB). Reason: the ticket
-/// allows the documented limit or 1 MiB and the spec states none, so
-/// 1 MiB applies; a PEM chain with a key stays far below it, and the cap
+/// Largest accepted upload file in bytes (1 MiB). Reason: a PEM chain
+/// with a key stays far below 1 MiB, and the cap
 /// bounds memory per request plus disk per file.
 const MAX_CERT_FILE_BYTES: usize = 1_048_576;
 /// Largest bundle count in one namespace. Reason: each list reads one
-/// directory per request, so 128 entries keep the scan to one short read
-/// while operators keep headroom for rotation.
+/// directory per request, so 128 entries bound the scan to one short read.
+/// Creates past the cap fail.
 const MAX_CERT_BUNDLES: usize = 128;
 /// Largest managed-namespace count. Reason: each namespace is one
-/// directory and uploads count them, so 64 keeps the count cheap and the
-/// disk use bounded.
+/// directory and uploads count them, so 64 bounds the count and the
+/// disk use. Uploads past the cap fail.
 const MAX_CERT_NAMESPACES: usize = 64;
 /// Longest accepted bundle or namespace name in bytes. Reason: a name
-/// becomes one path segment and the filesystem caps a segment at 255, so
-/// 128 keeps paths short while long operator names still fit.
+/// becomes one path segment and the filesystem caps a segment at 255,
+/// so 128 keeps paths short with room for parent prefixes.
+/// Longer names are rejected.
 const MAX_NAME_LEN: usize = 128;
 
 /// File name for an uploaded private key. Mode 600 (see [`KEY_MODE`]).
@@ -155,9 +155,8 @@ fn certs_root(state: &ApiState) -> PathBuf {
 }
 
 /// Directory for one namespace: `global` or `ns/<namespace>`.
-/// TODO(parity): may an upload create a managed namespace on demand, or
-/// must the namespace exist first? The spec does not say; the current
-/// choice creates it, so every valid name works without a registry.
+/// An upload creates the namespace on demand.
+/// Every valid name works without a registry.
 fn namespace_dir(state: &ApiState, namespace: Option<&str>) -> PathBuf {
     match namespace {
         None => certs_root(state).join("global"),
@@ -212,9 +211,8 @@ fn parse_certificates(pem: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 /// Finds the first private key in PEM bytes. Fails when no private key
 /// is present or the PEM does not parse. Encrypted keys have no item
 /// here, so they fail closed as missing.
-// TODO(parity): must an encrypted key store with its password for a
-// later check, or stay refused? The rulebook does not decide; the
-// current choice refuses it because the pair cannot be checked.
+/// The broker refuses an encrypted key.
+/// The pair cannot be checked without the password.
 fn parse_private_key(pem: &[u8]) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
     use rustls::pki_types::PrivateKeyDer;
     let items =
@@ -320,12 +318,49 @@ async fn stored_bytes(bundle: &std::path::Path, kind: &FileKind) -> Option<Vec<u
     tokio::fs::read(&path).await.ok()
 }
 
+/// Creates the bundle directory. On Unix the new directories get mode
+/// 700, because the bundle can hold key material.
+async fn create_bundle_dir(bundle: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(bundle).await
+}
+
+/// Writes one new file. The file is created with `mode` on Unix, so
+/// key material is never readable by other users, not even for a moment.
+/// The mode is never changed after the write. An existing file of that
+/// name is an error. A failed write removes the part file.
+async fn write_new_file(path: &std::path::Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(mode);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = options.open(path).await?;
+    let written = async {
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await
+    }
+    .await;
+    drop(file);
+    if written.is_err() {
+        tokio::fs::remove_file(path).await.ok();
+    }
+    written
+}
+
 /// Writes all validated files into the bundle directory. Each file goes
-/// to a temp name first with its final mode, then renames over the real
-/// name, so a reader sees the previous file or the complete new one.
-/// Fails with an internal error naming the kind but never the contents.
+/// to a temp name in the same directory, created with its final mode,
+/// then renames over the real name, so a reader sees the previous file
+/// or the complete new one. Fails with an internal error naming the kind
+/// but never the contents.
 async fn store_files(bundle: &std::path::Path, files: &[UploadFile]) -> Result<(), Box<Response>> {
-    if let Err(error) = tokio::fs::create_dir_all(bundle).await {
+    if let Err(error) = create_bundle_dir(bundle).await {
         return Err(Box::new(internal_error(format!(
             "cannot use bundle dir: {error}"
         ))));
@@ -333,33 +368,16 @@ async fn store_files(bundle: &std::path::Path, files: &[UploadFile]) -> Result<(
     for file in files {
         let slot = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = bundle.join(format!(".{}.part-{slot}", file.kind.filename));
-        if let Err(error) = tokio::fs::write(&tmp, &file.bytes).await {
-            return Err(Box::new(internal_error(format!(
-                "cannot write file {:?}: {error}",
-                file.kind.api
-            ))));
-        }
         let mode = if file.kind.secret {
             KEY_MODE
         } else {
             CERT_MODE
         };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(error) =
-                tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).await
-            {
-                tokio::fs::remove_file(&tmp).await.ok();
-                return Err(Box::new(internal_error(format!(
-                    "cannot set mode on file {:?}: {error}",
-                    file.kind.api
-                ))));
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = mode;
+        if let Err(error) = write_new_file(&tmp, &file.bytes, mode).await {
+            return Err(Box::new(internal_error(format!(
+                "cannot write file {:?}: {error}",
+                file.kind.api
+            ))));
         }
         if let Err(error) = tokio::fs::rename(&tmp, bundle.join(file.kind.filename)).await {
             tokio::fs::remove_file(&tmp).await.ok();
@@ -447,10 +465,8 @@ async fn upload_bundle(
     }
     // An upload that carries a fresh key with no chain anywhere is
     // checked against nothing yet; the chain upload checks the pair.
-    // TODO(parity): must a lone key match a later chain at once, or may
-    // a bundle hold a key before its chain arrives? The rulebook does not
-    // decide the order; the current choice stores a lone key and checks
-    // the pair when both exist.
+    // A bundle may hold a key before its chain arrives.
+    // The broker checks the pair when both exist.
     if let (Some(key_pem), Some(chain_pem)) = (eff_key, eff_chain) {
         let fresh_key = files.iter().any(|file| file.kind.api == "key");
         let fresh_chain = files.iter().any(|file| file.kind.api == "chain");
@@ -920,6 +936,68 @@ mod tests {
             .await;
         assert_eq!(status, 404);
         assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+    }
+
+    /// A secret file is never readable by other users, not even for a
+    /// moment: the temporary file is created with mode 600. A poller
+    /// reads the mode of every temporary file while an upload through
+    /// the HTTP routes stores a large secret.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn key_temp_file_is_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let state = standalone_state();
+        let server = HttpServer::start(state.clone()).await;
+        let dir = state
+            .config
+            .dir()
+            .join("certs")
+            .join("global")
+            .join("t-http-mode");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let poller = {
+            let (dir, stop, seen_open) = (dir.clone(), stop.clone(), seen_open.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if !name.starts_with(".key-password.part-") {
+                                continue;
+                            }
+                            if let Ok(meta) = entry.metadata() {
+                                if meta.permissions().mode() & 0o077 != 0 {
+                                    seen_open.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        let big = "x".repeat(512 * 1024);
+        let (status, _) = server
+            .call_json(
+                "POST",
+                "/certs/global/name/t-http-mode",
+                Some(serde_json::json!({ "key_password": big })),
+            )
+            .await;
+        assert_eq!(status, 204);
+        stop.store(true, Ordering::Relaxed);
+        poller.join().expect("poller ends");
+        assert!(
+            !seen_open.load(Ordering::Relaxed),
+            "the temporary key file was readable by other users"
+        );
+        let mode = std::fs::metadata(dir.join("key-password"))
+            .expect("key file exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the stored key keeps mode 600");
+        let dir_mode = std::fs::metadata(&dir).expect("dir").permissions().mode();
+        assert_eq!(dir_mode & 0o077, 0, "the bundle directory is private");
     }
 
     #[tokio::test]
