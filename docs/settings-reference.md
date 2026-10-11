@@ -10,7 +10,7 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 |---|---|---|---|---|
 | `node.id` | string | `indra-node-1` | string | Unique identifier for this broker node within the cluster. |
 | `node.data_dir` | string | `./data` | string | Directory holding kernel persistent state (state.toml). Created on boot when missing. |
-| `node.brokerlink_bind` | string | `127.0.0.1:18883` | string | BrokerLink IPC listen address for edge clients (TCP loopback). |
+| `node.brokerlink_bind` | string | `127.0.0.1:18883` | string | Deprecated. Ignored. The kernel serves clients directly. |
 
 ## listeners
 

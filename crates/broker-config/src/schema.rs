@@ -66,8 +66,8 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 path: "node.brokerlink_bind",
                 setting_type: "socket address string",
                 default: "\"127.0.0.1:18883\"",
-                range: "valid host:port, port 1..=65535",
-                doc: "BrokerLink IPC listen address for edge clients (TCP loopback).",
+                range: "any string, ignored",
+                doc: "Deprecated. Ignored. The kernel serves clients directly.",
             },
             FieldDoc {
                 path: "listeners.tcp.enabled",
@@ -867,7 +867,7 @@ pub struct NodeConf {
     /// Directory holding kernel persistent state (state.toml). Created on boot when missing.
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-    /// BrokerLink IPC listen address for edge clients (TCP loopback).
+    /// BrokerLink IPC listen address (deprecated, ignored).
     #[serde(default = "default_brokerlink_bind")]
     pub brokerlink_bind: String,
 }
@@ -881,7 +881,7 @@ fn default_node_id() -> String {
 fn default_data_dir() -> String {
     "./data".to_string()
 }
-// Reason: loopback IPC port keeps edge-to-kernel traffic off the network.
+// Reason: loopback IPC port kept so old files still load.
 fn default_brokerlink_bind() -> String {
     "127.0.0.1:18883".to_string()
 }
@@ -920,7 +920,8 @@ impl NodeConf {
                 "must not be empty",
             ));
         }
-        check_bind("node.brokerlink_bind", &self.brokerlink_bind, false)?;
+        // `node.brokerlink_bind` is deprecated and ignored: no check.
+        // Any value loads, so old files still boot.
         Ok(())
     }
 }
@@ -2935,7 +2936,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 str_field(
                     "brokerlink_bind",
                     "127.0.0.1:18883",
-                    "BrokerLink IPC listen address for edge clients (TCP loopback).",
+                    "Deprecated. Ignored. The kernel serves clients directly.",
                 ),
             ],
         ),
@@ -3852,7 +3853,7 @@ pub fn validate_json_sample(sample: &serde_json::Value) -> Result<(), String> {
             .map_err(|err| err.to_string())?;
         Ok(())
     };
-    check_bind_field("node", "brokerlink_bind", false)?;
+    // `node.brokerlink_bind` is deprecated and ignored: no check.
     check_bind_field("listeners", "tcp.bind", false)?;
     check_enum("logging", "level", KNOWN_LOG_LEVELS)?;
     check_enum(

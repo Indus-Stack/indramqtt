@@ -584,7 +584,7 @@
       "properties": {
         "brokerlink_bind": {
           "default": "127.0.0.1:18883",
-          "description": "BrokerLink IPC listen address for edge clients (TCP loopback).",
+          "description": "Deprecated. Ignored. The kernel serves clients directly.",
           "type": "string"
         },
         "data_dir": {

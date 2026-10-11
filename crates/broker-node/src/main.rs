@@ -24,7 +24,9 @@ use broker_session::{
 use broker_storage::stream::{DurableStreamStore, StreamConfig};
 use broker_storage::OfflineQueueStore;
 use broker_storage::{MemoryStore, RetainedStore};
-use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
+#[cfg(test)]
+use brokerlink::FramedTransport;
+use brokerlink::{BrokerFrame, BrokerLinkTransport, OpCode};
 use bytes::Bytes;
 use clap::Parser;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,7 +40,14 @@ use std::sync::Arc;
 #[cfg(test)]
 #[path = "../../broker-auth/src/jwks_test_support.rs"]
 mod jwks_test_support;
+/// Test harness for the removed link server (R3): drives kernel
+/// frame logic over loopback sockets in tests only.
+#[cfg(test)]
+mod link_harness;
 mod native;
+#[cfg(test)]
+use link_harness::{handle_connection, handle_inbound_frame};
+#[cfg(test)]
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tracing::{debug, info, warn};
@@ -53,8 +62,8 @@ struct Args {
     #[arg(short, long, default_value = "127.0.0.1:1883")]
     bind: String,
 
-    /// BrokerLink IPC listen address for BEAM edge clients (TCP loopback).
-    #[arg(long, default_value = "127.0.0.1:18883")]
+    /// Deprecated. Ignored. The kernel serves clients directly.
+    #[arg(long, hide = true, default_value = "127.0.0.1:18883")]
     brokerlink_bind: String,
 
     /// Management REST API listen address. Empty disables the API
@@ -504,14 +513,6 @@ struct Args {
     #[arg(long)]
     wss_verify_client_cert: Option<bool>,
 
-    /// Print the `erl` arguments of the edge and exit. The output has
-    /// one argument on each line. The arguments contain the resolved
-    /// listener settings. The edge holds the MQTT, TLS and WebSocket
-    /// sockets. Start the edge with these arguments. Then you set a
-    /// listener in `indra.toml` only.
-    #[arg(long)]
-    print_edge_args: bool,
-
     /// Validate the layered configuration and exit. Print `ok` on
     /// success. Read `indra.toml`, `conf.d` and the `INDRA_` variables.
     #[arg(long)]
@@ -659,6 +660,8 @@ fn failure_binding_v5(req: &BindRequest, rc: u8, server_max_pkt: u32) -> Session
 /// rather than the 3.1.1 identifier-rejected code. Anything too short
 /// for a head reads as version 4 (fail closed to the old code, never
 /// a guessed version).
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 fn bind_looks_v5(meta: &[u8]) -> bool {
     if meta.len() < 5 {
         return false;
@@ -725,6 +728,9 @@ fn v5_egress_refused(
 ///   expiry, server limits, reason string, echoed user properties).
 ///   Replies always mirror the request `conn_id` and `sequence_no`.
 /// * All other opcodes have no synchronous reply yet and return `None`.
+///
+/// Test harness only: production answers through the socket codecs.
+#[cfg(test)]
 fn reply_for_frame(frame: &BrokerFrame, sessions: &SessionManager) -> Option<BrokerFrame> {
     match frame.header.opcode {
         OpCode::Ping => Some(BrokerFrame::pong(
@@ -745,6 +751,8 @@ fn reply_for_frame(frame: &BrokerFrame, sessions: &SessionManager) -> Option<Bro
 /// a malformed v5 section answer with the v5 protocol-error code
 /// (`0x82`) plus a reason string instead, so a v5 client observes the
 /// failure honestly; version-4 bytes are unchanged.
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> BrokerFrame {
     // P2: the configured server packet limit rides every v5 reply.
     let server_max_pkt = sessions.max_packet_size();
@@ -1174,6 +1182,8 @@ async fn verify_jwks_connect(
 /// `0x86`, bad username/password, with no session created), then the
 /// per-user connection quota applies (overage short-circuits to `0x8B`),
 /// then the standard session resolution applies.
+/// Test harness only: production calls [`apply_bind_request`] directly.
+#[cfg(test)]
 async fn apply_bind(frame: &BrokerFrame, shared: &Shared) -> Option<BrokerFrame> {
     apply_bind_request(
         frame,
@@ -2456,23 +2466,33 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
 /// Longest accepted TLS certificate field (common name, subject or one
 /// subject-alt name). Reason: X.509 DN strings are short; 1 KiB bounds
 /// bind metadata while covering long distinguished names.
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 const MAX_CERT_FIELD_LEN: usize = 1024;
 
 /// Most subject-alt names accepted from one client certificate.
 /// Reason: client certificates carry short SAN lists; 16 entries bound
 /// bind-time allocation while covering multi-SAN certificates.
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 const MAX_CERT_SANS: usize = 16;
 
 /// Bind flag for a credentials section in the bind tail.
 /// Reason: the bit removes the peer-as-username ambiguity.
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 const BIND_FLAG_CREDS: u8 = 0x08;
 
 /// Bind flag for a peer-address section in the bind tail.
 /// Reason: the bit tells the peer section from credentials bytes.
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 const BIND_FLAG_PEER: u8 = 0x10;
 
 /// Bind flag for a certificate section in the bind tail.
 /// Reason: the bit tells the certificate section from other bytes.
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 const BIND_FLAG_CERT: u8 = 0x20;
 
 /// Decode `BindConnection` metadata.
@@ -2569,13 +2589,19 @@ struct BindRequest {
 
 /// Longest accepted listener name in a bind.
 /// Reason: listener names are short labels, so 64 chars bound bind memory.
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 const MAX_BIND_LISTENER_LEN: usize = 64;
 
 /// Bind flag for a listener-name section in the bind tail.
 /// Reason: the bit tells the listener section from other bytes.
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 const BIND_FLAG_LISTENER: u8 = 0x40;
 
 /// Largest v5 bind section in bytes (see [`BindRequest`]).
+/// Test harness only: production binds carry a decoded request.
+#[cfg(test)]
 const MAX_V5_SECTION_LEN: usize = 4096;
 /// Most client user properties carried per bind (see [`BindRequest`]).
 const MAX_V5_BIND_USERS: usize = 16;
@@ -2592,6 +2618,8 @@ struct BindWill {
     retain: bool,
 }
 
+/// Decode `BindConnection` metadata. Test harness only.
+#[cfg(test)]
 fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
     if meta.len() < 5 {
         return Err("bind meta too short");
@@ -2710,6 +2738,7 @@ fn decode_bind_meta(meta: &[u8]) -> Result<BindRequest, &'static str> {
 /// alias section: exact legacy parse first (no alias, maximum 0), else
 /// the last two bytes as the alias maximum over a legacy prefix.
 /// Anything else is malformed (fail closed).
+#[cfg(test)]
 fn decode_legacy_tail(rest: &[u8]) -> Result<(BindIdentity, u16), &'static str> {
     if let Ok(identity) = decode_bind_identity(rest) {
         return Ok((identity, 0));
@@ -2727,6 +2756,7 @@ fn decode_legacy_tail(rest: &[u8]) -> Result<(BindIdentity, u16), &'static str> 
 
 /// Decode a flagged bind tail. Flags decide each section.
 /// A short section fails closed with a truncation error.
+#[cfg(test)]
 fn decode_flagged_bind(
     client_id: &str,
     flags: u8,
@@ -2778,6 +2808,7 @@ fn decode_flagged_bind(
 /// Decode the flagged tail allowing the trailing alias section.
 /// Exact flagged parse first (no alias), else the last two bytes
 /// carry the alias maximum over a flagged prefix. Fail closed.
+#[cfg(test)]
 fn decode_flagged_tail(rest: &[u8], flags: u8) -> Result<(BindIdentity, u16), &'static str> {
     if let Ok(identity) = decode_flagged_identity(rest, flags) {
         return Ok((identity, 0));
@@ -2796,6 +2827,7 @@ fn decode_flagged_tail(rest: &[u8], flags: u8) -> Result<(BindIdentity, u16), &'
 /// Decode flagged credentials, peer, certificate and listener sections.
 /// A set flag needs its section. A clear flag needs no bytes.
 /// A short section fails with a truncation error.
+#[cfg(test)]
 fn decode_flagged_identity(rest: &[u8], flags: u8) -> Result<BindIdentity, &'static str> {
     let mut cursor = rest;
     let (username, password) = if flags & BIND_FLAG_CREDS != 0 {
@@ -2842,6 +2874,7 @@ fn decode_flagged_identity(rest: &[u8], flags: u8) -> Result<BindIdentity, &'sta
 
 /// Take one flagged listener section off the front.
 /// The name is UTF-8 and at most 64 chars. Short input fails.
+#[cfg(test)]
 fn take_flagged_listener(cursor: &[u8]) -> Result<(String, &[u8]), &'static str> {
     if cursor.len() < 2 {
         return Err("bind listener truncated");
@@ -2856,6 +2889,7 @@ fn take_flagged_listener(cursor: &[u8]) -> Result<(String, &[u8]), &'static str>
 
 /// Take one flagged credentials section off the front.
 /// Empty password fails. Short input fails as truncated.
+#[cfg(test)]
 fn take_flagged_creds(cursor: &[u8]) -> Result<(String, Vec<u8>, &[u8]), &'static str> {
     if cursor.len() < 2 {
         return Err("bind credentials truncated");
@@ -2881,16 +2915,19 @@ fn take_flagged_creds(cursor: &[u8]) -> Result<(String, Vec<u8>, &[u8]), &'stati
 
 /// Take one flagged peer section off the front.
 /// Only IP literals pass. Short input fails as truncated.
+#[cfg(test)]
 fn take_flagged_peer(cursor: &[u8]) -> Result<(String, &[u8]), &'static str> {
     let (peer, tail) = split_peer_prefix(cursor).ok_or("bind peer truncated")?;
     Ok((peer, tail))
 }
 
 /// Decoded flagged certificate section plus the rest.
+#[cfg(test)]
 type FlaggedCert<'a> = (Option<String>, Option<String>, Vec<String>, &'a [u8]);
 
 /// Take one flagged certificate section off the front.
 /// Short input fails as truncated.
+#[cfg(test)]
 fn take_flagged_cert(cursor: &[u8]) -> Result<FlaggedCert<'_>, &'static str> {
     if cursor.len() < 2 {
         return Err("bind certificate truncated");
@@ -2907,6 +2944,7 @@ fn take_flagged_cert(cursor: &[u8]) -> Result<FlaggedCert<'_>, &'static str> {
 
 /// Decoded X1-01 v5 section: the negotiated version plus the CONNECT
 /// properties the kernel needs.
+#[cfg(test)]
 struct BindV5 {
     version: u8,
     session_expiry: u32,
@@ -2920,6 +2958,7 @@ struct BindV5 {
 /// alias maximum, parsed by [`decode_legacy_tail`]) plus the decoded v5
 /// fields. Every length is checked (fail closed, never a guessed
 /// version).
+#[cfg(test)]
 fn decode_bind_v5_section(rest: &[u8]) -> Result<(&[u8], BindV5), &'static str> {
     // Smallest payload: Version:8 | Expiry:32 | RecvMax:16 | MaxPkt:32
     // | Count:16 with zero pairs (13 bytes), plus the alias maximum
@@ -2972,6 +3011,7 @@ fn decode_bind_v5_section(rest: &[u8]) -> Result<(&[u8], BindV5), &'static str> 
 /// Take one length-prefixed string off the front of the v5 user-property
 /// cursor. Overlong (beyond [`MAX_V5_BIND_STRING`]), non-UTF-8 or
 /// truncated fails the whole section (fail closed).
+#[cfg(test)]
 fn take_v5_string(cursor: &[u8]) -> Result<(String, &[u8]), &'static str> {
     if cursor.len() < 2 {
         return Err("bind v5 string truncated");
@@ -2989,6 +3029,7 @@ fn take_v5_string(cursor: &[u8]) -> Result<(String, &[u8]), &'static str> {
 /// Payload`. Returns the parsed will plus the unconsumed tail
 /// (credentials/peer/alias). Anything short or out of range is malformed
 /// (fail closed, never a guessed will).
+#[cfg(test)]
 fn decode_bind_will(rest: &[u8]) -> Result<(BindWill, &[u8]), &'static str> {
     if rest.len() < 8 {
         return Err("bind will truncated");
@@ -3045,6 +3086,7 @@ fn will_from_bind(req: &BindRequest) -> Result<Option<broker_session::StoredWill
 /// resolution and the delivery caps just applied, so the bind contract
 /// stays live in the kernel logs. CONNECT-only, never on the delivery
 /// path.
+#[cfg(test)]
 fn observe_bind_v5(req: &BindRequest) {
     tracing::debug!(
         client_id = %req.client_id,
@@ -3063,6 +3105,7 @@ fn observe_bind_v5(req: &BindRequest) {
 
 /// Credentials plus peer address plus certificate fields decoded from
 /// the bind tail. The listener name rides only in flagged binds.
+#[cfg(test)]
 struct BindIdentity {
     username: Option<String>,
     password: Option<Vec<u8>>,
@@ -3085,6 +3128,7 @@ struct BindIdentity {
 /// peer-aware edge carries only the peer (and optional certificate)
 /// sections. A trailing section that is none of these is malformed,
 /// exactly as trailing garbage was before the peer section.
+#[cfg(test)]
 fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
     if rest.is_empty() {
         return Ok(BindIdentity {
@@ -3208,6 +3252,7 @@ fn decode_bind_identity(rest: &[u8]) -> Result<BindIdentity, &'static str> {
 /// certificate or alias sections). `None` for a missing, empty,
 /// non-UTF-8 or non-IP peer: only IP literals travel here, anything else
 /// is malformed input, never a peer identity to match bans against.
+#[cfg(test)]
 fn split_peer_prefix(section: &[u8]) -> Option<(String, &[u8])> {
     if section.len() < 2 {
         return None;
@@ -3224,6 +3269,7 @@ fn split_peer_prefix(section: &[u8]) -> Option<(String, &[u8])> {
 /// Decode the optional trailing certificate tail: empty means no
 /// certificate; otherwise exactly one `CertLen:16be | CertPayload`
 /// section that must consume the whole tail, else `None` (malformed).
+#[cfg(test)]
 fn decode_cert_tail(tail: &[u8]) -> Option<(Option<String>, Option<String>, Vec<String>)> {
     if tail.is_empty() {
         return Some((None, None, Vec::new()));
@@ -3237,6 +3283,7 @@ fn decode_cert_tail(tail: &[u8]) -> Option<(Option<String>, Option<String>, Vec<
 /// within [`MAX_CERT_FIELD_LEN`], with at most [`MAX_CERT_SANS`] SANs;
 /// anything else is not a certificate section (fail closed: the caller
 /// treats it as malformed bind metadata).
+#[cfg(test)]
 fn decode_cert_section(section: &[u8]) -> Option<(Option<String>, Option<String>, Vec<String>)> {
     if section.len() < 2 {
         return None;
@@ -3272,6 +3319,7 @@ fn decode_cert_section(section: &[u8]) -> Option<(Option<String>, Option<String>
 /// Take one length-prefixed certificate string off the front of
 /// `cursor`. Empty decodes as absent (`None`); overlong or non-UTF-8
 /// fails the whole section (`None` at the section level).
+#[cfg(test)]
 fn take_cert_string(cursor: &mut &[u8]) -> Option<Option<String>> {
     if cursor.len() < 2 {
         return None;
@@ -4731,92 +4779,6 @@ fn load_startup_config(
     )
 }
 
-/// Splits one listener bind (`ip:port`) for the edge.
-///
-/// The edge binds a socket to an IP address. This function refuses a
-/// host name and gives the name of the setting in the error.
-fn edge_bind(setting: &str, bind: &str) -> Result<(std::net::IpAddr, u16), ConfigError> {
-    bind.parse::<std::net::SocketAddr>()
-        .map(|addr| (addr.ip(), addr.port()))
-        .map_err(|_| {
-            ConfigError::Invalid(format!(
-                "setting `{setting}` is invalid: `{bind}` must be an IP address and port, like 0.0.0.0:1883 (field `{setting}`)"
-            ))
-        })
-}
-
-/// Returns the `erl` arguments that give the resolved configuration to
-/// the edge. Each setting is three arguments:
-/// `-indra_edge <key> <Erlang term>`.
-///
-/// `indra_edge_sup` reads these keys. A string value is an Erlang string
-/// in quotation marks. If a listener binds all the interfaces, the
-/// function gives no address. That is the default of the edge.
-fn edge_args(cfg: &broker_config::schema::BrokerConfig) -> Result<Vec<String>, ConfigError> {
-    fn quoted(text: &str) -> String {
-        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
-    }
-    let mut out: Vec<String> = Vec::new();
-    let mut put = |key: &str, term: String| {
-        out.push("-indra_edge".to_string());
-        out.push(key.to_string());
-        out.push(term);
-    };
-    let listeners = &cfg.listeners;
-
-    let (ip, port) = edge_bind("node.brokerlink_bind", &cfg.node.brokerlink_bind)?;
-    // The edge connects to the kernel. If the kernel listens on all the
-    // interfaces, the edge uses the loopback address.
-    let kernel_host = if ip.is_unspecified() {
-        "127.0.0.1".to_string()
-    } else {
-        ip.to_string()
-    };
-    put("kernel_host", quoted(&kernel_host));
-    put("kernel_port", port.to_string());
-
-    let mut listener =
-        |prefix: &str, setting: &str, enabled: bool, bind: &str| -> Result<(), ConfigError> {
-            put(&format!("{prefix}_enabled"), enabled.to_string());
-            let (ip, port) = edge_bind(setting, bind)?;
-            put(&format!("{prefix}_port"), port.to_string());
-            if !ip.is_unspecified() {
-                put(&format!("{prefix}_ip"), quoted(&ip.to_string()));
-            }
-            Ok(())
-        };
-    // The kernel serves every enabled listener. The edge must bind no
-    // address, so a stale entrypoint that still starts it opens no
-    // socket. `native` is deprecated and ignored.
-    listener("mqtt", "listeners.tcp.bind", false, &listeners.tcp.bind)?;
-    listener("tls", "listeners.tls.bind", false, &listeners.tls.bind)?;
-    listener("ws", "listeners.ws.bind", false, &listeners.ws.bind)?;
-    listener("wss", "listeners.wss.bind", false, &listeners.wss.bind)?;
-    put("ws_path", quoted(&listeners.ws.path));
-    put("wss_path", quoted(&listeners.wss.path));
-    for (key, value) in [
-        ("tls_certfile", &listeners.tls.cert_file),
-        ("tls_keyfile", &listeners.tls.key_file),
-        ("wss_certfile", &listeners.wss.cert_file),
-        ("wss_keyfile", &listeners.wss.key_file),
-    ] {
-        if !value.is_empty() {
-            put(key, quoted(value));
-        }
-    }
-    // TM-08: the edge needs the verify switches to request client
-    // certificates. Off by default keeps handshakes unchanged.
-    put(
-        "tls_verify_client_cert",
-        listeners.tls.verify_client_cert.to_string(),
-    );
-    put(
-        "wss_verify_client_cert",
-        listeners.wss.verify_client_cert.to_string(),
-    );
-    Ok(out)
-}
-
 /// Returns the flags that the operator typed. These flags are the flag
 /// layer.
 ///
@@ -5396,318 +5358,6 @@ impl InMemoryBrokerSink {
     }
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    shared: Shared,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let peer = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
-    debug!("BrokerLink IPC connection from {}", peer);
-
-    let transport = FramedTransport::new(stream);
-    // Mailbox for guaranteed frames routed to this transport by other
-    // tasks (e.g. QoS 1/2 fan-out). QoS 0 rides the bounded
-    // per-subscriber backlog in `ConnTable` (D1-02) and is drained
-    // alongside this mailbox so a stalled subscriber sheds oldest-first
-    // without slowing publishers. The sender is registered under our
-    // conn_id once the edge binds. `waker` is this transport's directed
-    // QoS 0 wakeup: each bind points its slot at it so fan-out wakes
-    // exactly its owner (never the wrong shard).
-    let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
-    let waker = Arc::new(tokio::sync::Notify::new());
-    // Identities bound on this transport. One BrokerLink connection
-    // multiplexes every client of its edge shard, so a single slot only
-    // remembers the last bind and a dead socket would leak the rest as
-    // forever-connected (and their gauge counts). Every bind pushes;
-    // Unbind prunes; death detaches whatever remains. Each entry owns
-    // exactly one `inc_connections`, balanced by its prune or detach.
-    // Entries carry the full session key (MT-03) so a dead socket
-    // detaches only the owning tenant's sessions, never another
-    // tenant's namesake.
-    let mut bound: Vec<(SessionKey, u64)> = Vec::new();
-
-    loop {
-        tokio::select! {
-            inbound = transport.recv() => {
-                let frame = match inbound {
-                    Ok(frame) => frame,
-                    Err(brokerlink::BrokerLinkError::ConnectionClosed) => {
-                        debug!("BrokerLink IPC peer {} closed", peer);
-                        detach(&bound, &shared, &tx);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!("BrokerLink IPC error from {}: {}", peer, e);
-                        detach(&bound, &shared, &tx);
-                        return Err(Box::new(e));
-                    }
-                };
-
-                debug!(
-                    "BrokerLink recv opcode={:?} conn_id={} seq={}",
-                    frame.header.opcode, frame.header.conn_id, frame.header.sequence_no
-                );
-
-                handle_inbound_frame(frame, &shared, &tx, &transport, &mut bound, &waker).await?;
-                // Opportunistic egress: fan-out in the frame above may
-                // have queued QoS 0 for our own bound connections
-                // (self-delivery) while we were not waiting on the
-                // notify. Drain without waiting so a QoS-0-only burst
-                // never depends on winning a notify race.
-                if !bound.is_empty() {
-                    let mut rx_batch = Vec::new();
-                    let mut batch_bytes = 0usize;
-                    while rx_batch.len() < brokerlink::transport::MAX_BATCH_FRAMES
-                        && batch_bytes < brokerlink::transport::MAX_BATCH_BYTES
-                    {
-                        match rx.try_recv() {
-                            Ok(frame) => {
-                                batch_bytes += frame.total_frame_len();
-                                rx_batch.push(frame);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let qos0_batch = drain_qos0_for_transport(
-                        &shared,
-                        &bound,
-                        brokerlink::transport::MAX_BATCH_FRAMES
-                            .saturating_sub(rx_batch.len()),
-                        brokerlink::transport::MAX_BATCH_BYTES
-                            .saturating_sub(batch_bytes),
-                    );
-                    if !rx_batch.is_empty() || !qos0_batch.is_empty() {
-                        let batch = merge_egress_batch(rx_batch, qos0_batch);
-                        rearm_egress_if_full(&waker, &batch);
-                        let batch_len = batch.len() as u64;
-                        match transport.send_batch(&batch).await {
-                            Ok(()) => {
-                                shared.metrics.inc_transport_sent_by(batch_len);
-                            }
-                            Err(e) => {
-                                shared.metrics.inc_transport_send_failed();
-                                return Err(Box::new(e));
-                            }
-                        }
-                    }
-                }
-            }
-            outbound = rx.recv() => {
-                match outbound {
-                    Some(first) => {
-                        // PERF-05: flush once per poll. Coalesce what is
-                        // already queued (non-blocking drain, bounded by
-                        // frames and encoded bytes) into one write_all +
-                        // flush; order is arrival order within each class.
-                        // Guaranteed frames come from `rx`, QoS 0 from the
-                        // bounded backlog; the merge restores per-destination
-                        // sequence order so mixed qualities never reorder a
-                        // subscriber. No artificial delay: a lone frame
-                        // sends immediately.
-                        let mut rx_batch = vec![first];
-                        let mut batch_bytes =
-                            rx_batch[0].total_frame_len();
-                        while rx_batch.len() < brokerlink::transport::MAX_BATCH_FRAMES
-                            && batch_bytes
-                                < brokerlink::transport::MAX_BATCH_BYTES
-                        {
-                            match rx.try_recv() {
-                                Ok(frame) => {
-                                    batch_bytes += frame.total_frame_len();
-                                    rx_batch.push(frame);
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        let qos0_batch = drain_qos0_for_transport(
-                            &shared,
-                            &bound,
-                            brokerlink::transport::MAX_BATCH_FRAMES
-                                .saturating_sub(rx_batch.len()),
-                            brokerlink::transport::MAX_BATCH_BYTES
-                                .saturating_sub(batch_bytes),
-                        );
-                        let batch = merge_egress_batch(rx_batch, qos0_batch);
-                        rearm_egress_if_full(&waker, &batch);
-                        // Egress stage 0: `messages_forwarded` counted
-                        // admission into the mailboxes at `route()` time;
-                        // only a successful write counts as edge arrival.
-                        let batch_len = batch.len() as u64;
-                        match transport.send_batch(&batch).await {
-                            Ok(()) => {
-                                shared.metrics.inc_transport_sent_by(batch_len);
-                            }
-                            Err(e) => {
-                                shared.metrics.inc_transport_send_failed();
-                                return Err(Box::new(e));
-                            }
-                        }
-                    }
-                    None => {
-                        // Guaranteed senders gone; QoS 0 may still hold
-                        // queued frames for our bound connections: drain
-                        // what remains before detaching.
-                        let qos0_batch = drain_qos0_for_transport(
-                            &shared,
-                            &bound,
-                            brokerlink::transport::MAX_BATCH_FRAMES,
-                            brokerlink::transport::MAX_BATCH_BYTES,
-                        );
-                        if !qos0_batch.is_empty() {
-                            let batch_len = qos0_batch.len() as u64;
-                            match transport.send_batch(&qos0_batch).await {
-                                Ok(()) => {
-                                    shared.metrics.inc_transport_sent_by(batch_len);
-                                }
-                                Err(e) => {
-                                    shared.metrics.inc_transport_send_failed();
-                                    detach(&bound, &shared, &tx);
-                                    return Err(Box::new(e));
-                                }
-                            }
-                        }
-                        detach(&bound, &shared, &tx);
-                        return Ok(());
-                    }
-                }
-            }
-            () = waker.notified() => {
-                // QoS-0-only burst for our own bound connections (directed
-                // wakeup, never another shard's): drain both mailboxes in
-                // one batch so a QoS-0-only workload never sleeps.
-                let mut rx_batch = Vec::new();
-                let mut batch_bytes = 0usize;
-                while rx_batch.len() < brokerlink::transport::MAX_BATCH_FRAMES
-                    && batch_bytes < brokerlink::transport::MAX_BATCH_BYTES
-                {
-                    match rx.try_recv() {
-                        Ok(frame) => {
-                            batch_bytes += frame.total_frame_len();
-                            rx_batch.push(frame);
-                        }
-                        Err(_) => break,
-                    }
-                }
-                if rx_batch.is_empty() {
-                    // Spurious wakeup with nothing for us (another
-                    // transport's connections): park again without a
-                    // socket write. Check cheaply whether any of our
-                    // connections actually holds QoS 0 before draining.
-                    let mut ours = false;
-                    for (_, conn_id) in &bound {
-                        if shared.conns.qos0_len(*conn_id) > 0 {
-                            ours = true;
-                            break;
-                        }
-                    }
-                    if !ours {
-                        continue;
-                    }
-                }
-                let qos0_batch = drain_qos0_for_transport(
-                    &shared,
-                    &bound,
-                    brokerlink::transport::MAX_BATCH_FRAMES
-                        .saturating_sub(rx_batch.len()),
-                    brokerlink::transport::MAX_BATCH_BYTES
-                        .saturating_sub(batch_bytes),
-                );
-                if rx_batch.is_empty() && qos0_batch.is_empty() {
-                    continue;
-                }
-                let batch = merge_egress_batch(rx_batch, qos0_batch);
-                rearm_egress_if_full(&waker, &batch);
-                let batch_len = batch.len() as u64;
-                match transport.send_batch(&batch).await {
-                    Ok(()) => {
-                        shared.metrics.inc_transport_sent_by(batch_len);
-                    }
-                    Err(e) => {
-                        shared.metrics.inc_transport_send_failed();
-                        return Err(Box::new(e));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Wake the egress loop again when a batch used its full budget.
-///
-/// One wake writes at most one batch. A full batch means that more
-/// frames can be in the queues, and no later event is certain to wake
-/// the loop for them. The stored permit makes the next loop turn drain
-/// again, after the loop gave the inbound side its turn.
-fn rearm_egress_if_full(waker: &tokio::sync::Notify, batch: &[BrokerFrame]) {
-    if batch.len() >= brokerlink::transport::MAX_BATCH_FRAMES {
-        waker.notify_one();
-        return;
-    }
-    let bytes: usize = batch.iter().map(BrokerFrame::total_frame_len).sum();
-    if bytes >= brokerlink::transport::MAX_BATCH_BYTES {
-        waker.notify_one();
-    }
-}
-
-/// Drain QoS 0 backlogs for one transport's bound connections,
-/// round-robin so one stalled subscriber cannot starve a fast one on
-/// the same shard. Respects `max_frames` and `max_bytes` via the
-/// budget-aware drain in [`ConnTable`]; stops early when no connection
-/// makes progress. Never blocks; pops only what is queued.
-fn drain_qos0_for_transport(
-    shared: &Shared,
-    bound: &[(SessionKey, u64)],
-    max_frames: usize,
-    max_bytes: usize,
-) -> Vec<BrokerFrame> {
-    let mut out = Vec::new();
-    if max_frames == 0 || bound.is_empty() {
-        return out;
-    }
-    let mut out_bytes = 0usize;
-    // Round-robin one pass per connection per round: a full backlog on
-    // one connection fills at most its fair share of each batch.
-    loop {
-        if out.len() >= max_frames || out_bytes >= max_bytes {
-            break;
-        }
-        let mut progressed = false;
-        for (_, conn_id) in bound {
-            if out.len() >= max_frames || out_bytes >= max_bytes {
-                break;
-            }
-            let remaining_frames = max_frames - out.len();
-            let remaining_bytes = max_bytes.saturating_sub(out_bytes);
-            // Drain at most one frame per visit for fairness; the
-            // budget-aware drain still honours a single large frame.
-            let frames = shared.conns.drain_qos0_with_budget(
-                *conn_id,
-                remaining_frames.min(1),
-                remaining_bytes,
-            );
-            if frames.is_empty() {
-                // No backlog or budget spent for this connection.
-                // A single large frame with an empty batch still drains
-                // alone via the budget-aware path above (which returns
-                // it even when over budget); empty here means truly
-                // empty, so keep scanning the rest.
-                continue;
-            }
-            for frame in frames {
-                out_bytes += frame.total_frame_len();
-                out.push(frame);
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    out
-}
-
 /// Merge guaranteed (`rx`) and QoS 0 batches into one socket write
 /// while preserving per-destination order. Frames carry independent
 /// per-connection sequence numbers, so grouping by `conn_id` and
@@ -5869,22 +5519,6 @@ fn spawn_monitor_sampler(shared: Shared, interval_secs: u64) {
     });
 }
 
-/// Process one frame from the edge: direct replies go back on our own
-/// transport, routed frames fan out through the connection table.
-async fn handle_inbound_frame<S>(
-    frame: BrokerFrame,
-    shared: &Shared,
-    tx: &UnboundedSender<BrokerFrame>,
-    transport: &FramedTransport<S>,
-    bound: &mut Vec<(SessionKey, u64)>,
-    waker: &Arc<tokio::sync::Notify>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    handle_inbound_frame_with(frame, shared, tx, transport, bound, waker, None).await
-}
-
 /// Handles one inbound frame for any transport.
 ///
 /// A link transport gives `native_bind = None`, and the bind request is
@@ -5910,20 +5544,25 @@ where
     match frame.header.opcode {
         OpCode::BindConnection => {
             shared.metrics.inc_connect_received();
-            let bind_reply = match native_bind {
+            let bind_reply = if let Some(request) = native_bind {
                 // The bind operation has a large state. It runs one time
                 // for each connection, thus it is on the heap. The state
                 // of each connection task stays small.
-                Some(request) => {
-                    Box::pin(apply_bind_request(
-                        &frame,
-                        Ok(request.clone()),
-                        request.protocol_version == 5,
-                        shared,
-                    ))
-                    .await
-                }
-                None => Box::pin(apply_bind(&frame, shared)).await,
+                Box::pin(apply_bind_request(
+                    &frame,
+                    Ok(request.clone()),
+                    request.protocol_version == 5,
+                    shared,
+                ))
+                .await
+            } else {
+                // Production binds carry a request. The link-wire
+                // decode lives in the test harness only.
+                #[cfg(test)]
+                let reply = Box::pin(apply_bind(&frame, shared)).await;
+                #[cfg(not(test))]
+                let reply: Option<BrokerFrame> = None;
+                reply
             };
             if let Some(reply) = bind_reply {
                 let accepted = is_binding_accepted(&reply);
@@ -5938,7 +5577,10 @@ where
                 // shard, and death must detach every client on it.
                 let bind_parsed = match native_bind {
                     Some(request) => Ok(request.clone()),
+                    #[cfg(test)]
                     None => decode_bind_meta(&frame.metadata),
+                    #[cfg(not(test))]
+                    None => Err("link-wire bind decode is test-only"),
                 };
                 if let Ok(req) = bind_parsed {
                     // D1-02: label the mailbox for per-client shed
@@ -5988,13 +5630,19 @@ where
                     Some(request) => {
                         Box::pin(replay_offline_client(&frame, &request.client_id, shared)).await
                     }
+                    #[cfg(test)]
                     None => Box::pin(replay_offline(&frame, shared)).await,
+                    #[cfg(not(test))]
+                    None => 0,
                 };
                 shared.metrics.inc_messages_forwarded_by(replayed as u64);
             }
         }
         OpCode::Ping => {
             shared.metrics.inc_pingreq_received();
+            // The kernel listener answers PINGREQ directly. This arm
+            // serves the test harness link frames only.
+            #[cfg(test)]
             if let Some(reply) = reply_for_frame(&frame, &shared.sessions) {
                 shared.metrics.inc_pingresp_sent();
                 transport.send(reply).await?;
@@ -6162,17 +5810,10 @@ where
                 refresh_subscription_stats(shared);
             }
         }
-        OpCode::Credit => {
-            // Egress stage 1: the owning edge connection reports its
-            // pressure snapshot. Counted on receipt today; no delivery
-            // decision depends on it until the kernel queue split lands.
-            // Malformed snapshots are ignored: credit is advisory, and a
-            // single bad frame must never disturb live connections.
-            if decode_credit_meta(&frame.metadata).is_some() {
-                shared.metrics.inc_credit_received();
-            }
-        }
         _ => {
+            // Other opcodes carry no synchronous reply in production.
+            // The test harness answers Ping and Bind here.
+            #[cfg(test)]
             if let Some(reply) = reply_for_frame(&frame, &shared.sessions) {
                 transport.send(reply).await?;
             }
@@ -6804,6 +6445,8 @@ async fn apply_unsubscribe(frame: &BrokerFrame, shared: &Shared) -> Option<Broke
 /// of never-routed messages. Runs after the `SessionBinding` reply so
 /// the edge always observes binding before backlog. Returns the replayed
 /// frame count.
+/// Test harness only: production replays by client id directly.
+#[cfg(test)]
 async fn replay_offline(frame: &BrokerFrame, shared: &Shared) -> usize {
     match decode_bind_meta(&frame.metadata) {
         Ok(req) => replay_offline_client(frame, &req.client_id, shared).await,
@@ -9875,19 +9518,6 @@ fn decode_puback_meta(meta: &[u8]) -> Option<u16> {
     Some(packet_id)
 }
 
-/// Decode an edge flow-control (`Credit`) snapshot into
-/// `(used_frames, used_bytes)`. Layout `UsedFrames:32be |
-/// UsedBytes:32be` (mirrors `indra_brokerlink:encode_credit_meta/2`);
-/// exactly 8 bytes, anything else is malformed.
-fn decode_credit_meta(meta: &[u8]) -> Option<(u32, u32)> {
-    if meta.len() != 8 {
-        return None;
-    }
-    let used_frames = u32::from_be_bytes([meta[0], meta[1], meta[2], meta[3]]);
-    let used_bytes = u32::from_be_bytes([meta[4], meta[5], meta[6], meta[7]]);
-    Some((used_frames, used_bytes))
-}
-
 /// One decoded subscription request (X1-03): the filter plus the raw
 /// v5 options byte and subscription identifier. `has_options` is true
 /// only for the extended form (options byte plus 4-byte identifier);
@@ -10667,28 +10297,10 @@ async fn shutdown(shared: &Shared) {
     info!("Kernel stopped orderly");
 }
 
-async fn serve_brokerlink(bind: &str, shared: Shared) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(bind).await?;
-    info!("BrokerLink IPC listening on {}", bind);
-
-    // Clustered mode pumps peer-forwarded messages alongside edge traffic.
+/// Start background tasks for one kernel. Pumps peer messages when clustered.
+fn start_background_tasks(shared: &Shared) {
     if shared.cluster.is_some() {
         tokio::spawn(run_cluster_inbox(shared.clone()));
-    }
-
-    loop {
-        let (stream, addr) = listener.accept().await?;
-        debug!("BrokerLink IPC accepted {}", addr);
-        // PERF-08: hot-path socket tuning (`TCP_NODELAY` + 64 KiB
-        // buffers, matching the Erlang edge from PERF-07). Tuning
-        // errors are logged inside and never fail the connection.
-        brokerlink::transport::tune_brokerlink_tcp(&stream);
-        let shared = shared.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, shared).await {
-                warn!("BrokerLink connection {} ended with error: {}", addr, e);
-            }
-        });
     }
 }
 
@@ -10900,8 +10512,8 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
 ///
 /// Read the provenance of the layered startup configuration. Return one
 /// message per deprecated setting that a layer sets. The caller logs
-/// each message. A test sets the values through a file and checks
-/// the returned messages.
+/// each message. A test sets the values through a file, a flag
+/// layer and an environment layer and checks the returned messages.
 fn deprecated_startup_warnings(layered: &LayeredConfig) -> Vec<String> {
     let cfg = layered.config();
     let mut out = Vec::new();
@@ -10923,11 +10535,18 @@ fn deprecated_startup_warnings(layered: &LayeredConfig) -> Vec<String> {
             }
         }
     }
-    if layered.provenance().contains_key("node.brokerlink_bind") {
-        out.push(
-            "setting `node.brokerlink_bind` is deprecated: it remains until a later release removes it"
-                .to_string(),
-        );
+    if let Some(layer) = layered.provenance().get("node.brokerlink_bind") {
+        if matches!(layer, broker_config::layers::Layer::Flag(_)) {
+            out.push(
+                "flag `--brokerlink-bind` is deprecated and ignored: the kernel serves clients directly"
+                    .to_string(),
+            );
+        } else {
+            out.push(
+                "setting `node.brokerlink_bind` is deprecated: it remains until a later release removes it"
+                    .to_string(),
+            );
+        }
     }
     out
 }
@@ -10943,7 +10562,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Then copy the result to the fields that the startup reads. A typed
     // flag overrides the other layers. If no layer set a setting, the
     // field keeps the default of the flag.
-    // TODO(parity): which flag wins when `--check-config` meets `--print-edge-args`?
     if args.check_config {
         // Validate only and exit. Print `ok`.
         match check_config_outcome(&mut args, &matches) {
@@ -10970,12 +10588,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(err.into());
     }
     let cfg = layered.config().clone();
-    if args.print_edge_args {
-        for arg in edge_args(&cfg)? {
-            println!("{arg}");
-        }
-        return Ok(());
-    }
     // Start the log output after the configuration is resolved. Thus
     // `logging.level` applies. If the configuration has an error, `main`
     // returns the error and the runtime prints it on stderr.
@@ -10994,7 +10606,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         args.bind
     );
-    info!("BrokerLink IPC protocol initialized");
     info!("Clean-room architecture ready");
 
     let mut shared = Shared::new();
@@ -11835,16 +11446,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         record.running = true;
         shared.listener_store.update(record);
     }
-    // Run until the edge link ends or a stop signal arrives. The signal
-    // path leaves the edge link unchanged and stops the kernel in order.
-    tokio::select! {
-        result = serve_brokerlink(&args.brokerlink_bind, shared.clone()) => {
-            result?;
-        }
-        () = wait_for_shutdown() => {
-            shutdown(&shared).await;
-        }
-    }
+    // Start background tasks, then wait for the stop signal.
+    // The signal stops the kernel in order.
+    start_background_tasks(&shared);
+    wait_for_shutdown().await;
+    shutdown(&shared).await;
     Ok(())
 }
 
@@ -11908,8 +11514,6 @@ mod tests {
         assert!(args.allow_anonymous);
         assert_eq!(args.cluster_seeds.as_deref(), Some("a:1,b:2"));
         assert_eq!(args.webhook_breaker_threshold, 9);
-        // No layer set this setting. The field keeps the default of the flag.
-        assert_eq!(args.brokerlink_bind, "127.0.0.1:18883");
 
         // A typed flag overrides the file. The file sets the other values.
         let args = resolve_boot(&dir, &["--node-id", "from-flag", "--qos0-backlog", "3"]);
@@ -12208,81 +11812,10 @@ mod tests {
     }
 
     #[test]
-    fn edge_args_carry_the_resolved_listeners() {
-        let mut cfg = broker_config::schema::BrokerConfig::default();
-        let defaults = edge_args(&cfg).expect("defaults resolve");
-        let triple = |args: &[String], key: &str| -> Option<String> {
-            args.chunks(3)
-                .find(|chunk| chunk[0] == "-indra_edge" && chunk[1] == key)
-                .map(|chunk| chunk[2].clone())
-        };
-        assert_eq!(triple(&defaults, "mqtt_enabled").as_deref(), Some("false"));
-        assert_eq!(triple(&defaults, "mqtt_port").as_deref(), Some("1883"));
-        // All the interfaces is the default of the edge. No address is given.
-        assert_eq!(triple(&defaults, "mqtt_ip"), None);
-        assert_eq!(triple(&defaults, "tls_enabled").as_deref(), Some("false"));
-        assert_eq!(triple(&defaults, "ws_path").as_deref(), Some("\"/mqtt\""));
-        assert_eq!(
-            triple(&defaults, "kernel_host").as_deref(),
-            Some("\"127.0.0.1\"")
-        );
-        assert_eq!(triple(&defaults, "kernel_port").as_deref(), Some("18883"));
-        assert_eq!(triple(&defaults, "tls_certfile"), None);
-        // Verify switches stay off by default, so the edge requests
-        // no client certificate.
-        assert_eq!(
-            triple(&defaults, "tls_verify_client_cert").as_deref(),
-            Some("false")
-        );
-        assert_eq!(
-            triple(&defaults, "wss_verify_client_cert").as_deref(),
-            Some("false")
-        );
-
-        cfg.listeners.tcp.enabled = false;
-        cfg.listeners.tcp.bind = "10.0.0.5:11883".to_string();
-        cfg.listeners.wss.enabled = true;
-        cfg.listeners.wss.cert_file = "/etc/indramqtt/tls/cert.pem".to_string();
-        cfg.listeners.wss.key_file = "/etc/indramqtt/tls/key.pem".to_string();
-        let changed = edge_args(&cfg).expect("changed config resolves");
-        assert_eq!(triple(&changed, "mqtt_enabled").as_deref(), Some("false"));
-        assert_eq!(triple(&changed, "mqtt_port").as_deref(), Some("11883"));
-        assert_eq!(triple(&changed, "mqtt_ip").as_deref(), Some("\"10.0.0.5\""));
-        assert_eq!(triple(&changed, "wss_enabled").as_deref(), Some("false"));
-        assert_eq!(
-            triple(&changed, "wss_certfile").as_deref(),
-            Some("\"/etc/indramqtt/tls/cert.pem\"")
-        );
-        // The kernel serves every enabled listener. The edge opens no
-        // socket, so the two never bind one port. `native` is deprecated
-        // and ignored.
-        cfg.listeners.wss.native = true;
-        let native = edge_args(&cfg).expect("native config resolves");
-        assert_eq!(triple(&native, "wss_enabled").as_deref(), Some("false"));
-        cfg.listeners.wss.native = false;
-        // The edge gets the verify switches from the resolved config.
-        cfg.listeners.tls.verify_client_cert = true;
-        cfg.listeners.wss.verify_client_cert = true;
-        let verified = edge_args(&cfg).expect("verify flags resolve");
-        assert_eq!(
-            triple(&verified, "tls_verify_client_cert").as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            triple(&verified, "wss_verify_client_cert").as_deref(),
-            Some("true")
-        );
-
-        // The edge binds to an address. The error for a host name gives the setting.
-        cfg.listeners.ws.bind = "localhost:8083".to_string();
-        let err = edge_args(&cfg).expect_err("host names are refused");
-        assert!(err.to_string().contains("listeners.ws.bind"), "got: {err}");
-    }
-
-    #[test]
     fn deprecated_edge_settings_warn_at_startup() {
-        // The production entry is the file. The broker warns per
-        // deprecated setting that a layer sets.
+        // The production entries are the file, the flag layer and
+        // the environment layer. The broker warns per deprecated
+        // setting that a layer sets.
         let dir = unique_data_dir();
         std::fs::create_dir_all(&dir).expect("create config dir");
         std::fs::write(
@@ -12328,6 +11861,48 @@ mod tests {
         .expect("layers load");
         assert!(deprecated_startup_warnings(&layered).is_empty());
         std::fs::remove_dir_all(&clean).ok();
+
+        // The flag layer warns for `--brokerlink-bind`.
+        // The broker ignores the flag and serves clients directly.
+        let flag_dir = unique_data_dir();
+        std::fs::create_dir_all(&flag_dir).expect("create config dir");
+        let flag_cli = broker_config::layers::CliOverrides {
+            brokerlink_bind: Some("127.0.0.1:18883".to_string()),
+            ..Default::default()
+        };
+        let layered = broker_config::layers::load_layered_with_env(&flag_dir, &[], &flag_cli)
+            .expect("layers load");
+        let warnings = deprecated_startup_warnings(&layered);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("--brokerlink-bind") && w.contains("deprecated")),
+            "got: {warnings:?}"
+        );
+        std::fs::remove_dir_all(&flag_dir).ok();
+
+        // The environment layer warns for `INDRA_NODE__BROKERLINK_BIND`.
+        // The broker ignores the value and serves clients directly.
+        let env_dir = unique_data_dir();
+        std::fs::create_dir_all(&env_dir).expect("create config dir");
+        let env = vec![(
+            "INDRA_NODE__BROKERLINK_BIND".to_string(),
+            "127.0.0.1:18883".to_string(),
+        )];
+        let layered = broker_config::layers::load_layered_with_env(
+            &env_dir,
+            &env,
+            &broker_config::layers::CliOverrides::default(),
+        )
+        .expect("layers load");
+        let warnings = deprecated_startup_warnings(&layered);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("node.brokerlink_bind") && w.contains("deprecated")),
+            "got: {warnings:?}"
+        );
+        std::fs::remove_dir_all(&env_dir).ok();
     }
 
     #[test]
@@ -14812,71 +14387,6 @@ mod tests {
         assert_eq!(shared.metrics.offline_queue_evicted(), 0);
     }
 
-    /// Egress stage 0: a well-formed edge flow-control snapshot is
-    /// counted and changes nothing else (no gating yet).
-    #[tokio::test]
-    async fn credit_frame_is_counted_and_changes_nothing_else() {
-        let shared = test_shared();
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let _client = FramedTransport::new(client_io);
-        let server = FramedTransport::new(server_io);
-        let (tx, _rx) = unbounded_channel::<BrokerFrame>();
-        let mut bound = Vec::new();
-
-        let mut meta = Vec::new();
-        meta.extend_from_slice(&7u32.to_be_bytes());
-        meta.extend_from_slice(&1024u32.to_be_bytes());
-        let credit = BrokerFrame::new(OpCode::Credit, 91, 3, Bytes::from(meta), Bytes::new())
-            .expect("valid credit frame");
-        handle_inbound_frame(
-            credit,
-            &shared,
-            &tx,
-            &server,
-            &mut bound,
-            &Arc::new(tokio::sync::Notify::new()),
-        )
-        .await
-        .expect("credit handling succeeds");
-        assert_eq!(shared.metrics.credit_received(), 1);
-        // Nothing gated, nothing delivered, no connection state touched.
-        assert_eq!(shared.metrics.messages_forwarded(), 0);
-        assert_eq!(shared.metrics.transport_sent(), 0);
-        assert!(bound.is_empty());
-
-        // Malformed snapshot: ignored, uncounted.
-        let bad = BrokerFrame::new(
-            OpCode::Credit,
-            91,
-            4,
-            Bytes::from_static(b"short"),
-            Bytes::new(),
-        )
-        .expect("valid credit frame");
-        handle_inbound_frame(
-            bad,
-            &shared,
-            &tx,
-            &server,
-            &mut bound,
-            &Arc::new(tokio::sync::Notify::new()),
-        )
-        .await
-        .expect("malformed credit is ignored");
-        assert_eq!(shared.metrics.credit_received(), 1);
-    }
-
-    #[test]
-    fn credit_meta_decode_accepts_only_eight_bytes() {
-        let mut meta = Vec::new();
-        meta.extend_from_slice(&7u32.to_be_bytes());
-        meta.extend_from_slice(&1024u32.to_be_bytes());
-        assert_eq!(decode_credit_meta(&meta), Some((7, 1024)));
-        assert_eq!(decode_credit_meta(b"short"), None);
-        assert_eq!(decode_credit_meta(&[0u8; 9]), None);
-        assert_eq!(decode_credit_meta(&[]), None);
-    }
-
     #[test]
     fn egress_stage_counters_start_at_zero() {
         let metrics = Metrics::new();
@@ -14885,15 +14395,10 @@ mod tests {
         assert_eq!(metrics.egress_qos0_shed(), 0);
         assert_eq!(metrics.puback_deferred(), 0);
         assert_eq!(metrics.puback_deferred_released(), 0);
-        assert_eq!(metrics.credit_clamped(), 0);
-        assert_eq!(metrics.credit_exhausted(), 0);
-        assert_eq!(metrics.credit_received(), 0);
         let snap = metrics.snapshot();
         assert_eq!(snap.transport_sent, 0);
-        assert_eq!(snap.credit_received, 0);
         let text = metrics.render_prometheus_metrics();
         assert!(text.contains("indramqtt_transport_sent_total 0\n"));
-        assert!(text.contains("indramqtt_credit_received_total 0\n"));
     }
 
     /// T-31: a durable subscriber that disconnects with a QoS 1
@@ -17748,7 +17253,8 @@ mod tests {
         let mut shared2 = Shared::new();
         shared2.cluster = Some(plane2.clone() as Arc<dyn RoutingPlane>);
 
-        // One BrokerLink listener + one inbox pump per node.
+        // One link-harness listener per node. The production
+        // `start_background_tasks` pumps the cluster inbox per node.
         async fn serve_one(
             shared: Shared,
         ) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
@@ -17760,10 +17266,10 @@ mod tests {
             });
             (addr, vec![accept])
         }
-        let (addr1, mut tasks) = serve_one(shared1.clone()).await;
-        let (addr2, mut tasks2) = serve_one(shared2.clone()).await;
-        tasks.push(tokio::spawn(run_cluster_inbox(shared1)));
-        tasks2.push(tokio::spawn(run_cluster_inbox(shared2)));
+        let (addr1, tasks) = serve_one(shared1.clone()).await;
+        let (addr2, tasks2) = serve_one(shared2.clone()).await;
+        start_background_tasks(&shared1);
+        start_background_tasks(&shared2);
 
         // Client A subscribes to metrics/# on node 1 as conn 701.
         let sub = bind_client(addr1, 701, "metrics-fan", true).await;
@@ -17805,6 +17311,18 @@ mod tests {
         for task in tasks.into_iter().chain(tasks2) {
             task.abort();
         }
+    }
+
+    /// Background tasks start without work on one node.
+    ///
+    /// Calls the production entry with no cluster plane. Returns at
+    /// once and spawns nothing. The cross-node test above proves the
+    /// clustered pump path through the broker.
+    #[test]
+    fn background_tasks_start_without_cluster() {
+        let shared = Shared::new();
+        assert!(shared.cluster.is_none());
+        start_background_tasks(&shared);
     }
 
     #[tokio::test]
@@ -22878,8 +22396,8 @@ mod tests {
                 .expect("bind replies");
             let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
             assert_eq!(rc, 0);
-            // Mirror of the transport loop's bind hook
-            // (`serve_brokerlink`): register the mailbox, then stamp the
+            // Mirror of the connection bind hook
+            // (`handle_inbound_frame_with`): register the mailbox, then stamp the
             // client label and the tenant label from the session record
             // the bind just wrote.
             let (tx, _rx) = unbounded_channel::<BrokerFrame>();
