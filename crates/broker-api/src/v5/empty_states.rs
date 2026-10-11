@@ -4,8 +4,9 @@
 //! profiles, message queues, message streams, telemetry, load rebalance and
 //! node eviction. The management console loads these reads on main pages.
 //! A 404 breaks the page, so each read answers the documented shape with a
-//! true empty or disabled state. Each write answers 400 `BAD_REQUEST` with a
-//! message that the function is not available in this broker.
+//! true empty or disabled state. Each write answers 400 with the operation's
+//! own documented code and a message that the function is not available in
+//! this broker.
 //!
 //! Nothing here stores state. Handlers render fixed answers and take no
 //! lock. Publish and deliver never touch this module. The routes are
@@ -20,18 +21,41 @@ use axum::{
 
 use crate::errors::ApiError;
 use crate::node_scope::{local_node_name, resolve_node};
-use crate::pagination::{meta_page, PageParams};
 
-/// Fixed disabled queue config. Each value is the documented default. The
-/// broker has no queues, so `enable` is false and auto creation can never
-/// trigger. The console reads `enable` from this route.
+/// Refused write with the operation's own documented 400 code. The message
+/// states that the function is not available in this broker.
+fn refused(code: &str, message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"code": code, "message": message})),
+    )
+        .into_response()
+}
+
+/// Fixed disabled queue config. Each value is the documented default, so the
+/// answer validates against the specification. The broker has no queues, so
+/// `enable` is false and auto creation can never trigger. The console reads
+/// `enable` from this route.
 fn disabled_queue_config() -> serde_json::Value {
     serde_json::json!({
         "auto_create": {
             "lastvalue": {
                 "key_expression": "message.from",
+                "dispatch_strategy": "random",
+                "data_retention_period": "7d",
+                "limits": {
+                    "max_shard_message_bytes": "infinity",
+                    "max_shard_message_count": "infinity",
+                },
             },
-            "regular": {},
+            "regular": {
+                "dispatch_strategy": "random",
+                "data_retention_period": "7d",
+                "limits": {
+                    "max_shard_message_bytes": "infinity",
+                    "max_shard_message_count": "infinity",
+                },
+            },
         },
         "enable": false,
         "find_queue_retry_interval": "10s",
@@ -41,17 +65,28 @@ fn disabled_queue_config() -> serde_json::Value {
     })
 }
 
-/// Fixed disabled stream config. Each value is the documented default. The
-/// broker has no streams, so `enable` is false and auto creation can never
-/// trigger. The console reads `enable` from this route.
+/// Fixed disabled stream config. Each value is the documented default, so the
+/// answer validates against the specification. The broker has no streams, so
+/// `enable` is false and auto creation can never trigger. The console reads
+/// `enable` from this route.
 fn disabled_stream_config() -> serde_json::Value {
     serde_json::json!({
         "auto_create": {
             "lastvalue": {
                 "key_expression": "message.from",
+                "data_retention_period": "7d",
+                "limits": {
+                    "max_shard_message_bytes": "infinity",
+                    "max_shard_message_count": "infinity",
+                },
             },
             "regular": {
                 "key_expression": "message.from",
+                "data_retention_period": "7d",
+                "limits": {
+                    "max_shard_message_bytes": "infinity",
+                    "max_shard_message_count": "infinity",
+                },
             },
         },
         "enable": false,
@@ -64,13 +99,15 @@ fn disabled_stream_config() -> serde_json::Value {
 /// `GET /ai/providers`: empty list. The broker has no AI providers. The
 /// Flow Designer reads this list together with the completion profiles.
 pub async fn list_ai_providers() -> Response {
-    (StatusCode::OK, Json(serde_json::json!({ "items": [] }))).into_response()
+    (StatusCode::OK, Json(serde_json::json!([]))).into_response()
 }
 
 /// `POST /ai/providers`: refused. The broker has no AI providers.
 pub async fn create_ai_provider() -> Response {
-    ApiError::BadRequest("ai providers are not available in this broker".to_string())
-        .into_response()
+    refused(
+        "INVALID_CREDENTIAL",
+        "ai providers are not available in this broker",
+    )
 }
 
 /// `GET /ai/providers/{name}`: miss. Nothing is stored, so each name is
@@ -81,39 +118,47 @@ pub async fn get_ai_provider(Path(name): Path<String>) -> Response {
 
 /// `PUT /ai/providers/{name}`: refused. The broker has no AI providers.
 pub async fn update_ai_provider(Path(_name): Path<String>) -> Response {
-    ApiError::BadRequest("ai providers are not available in this broker".to_string())
-        .into_response()
+    refused(
+        "INVALID_CREDENTIAL",
+        "ai providers are not available in this broker",
+    )
 }
 
 /// `DELETE /ai/providers/{name}`: refused. The broker has no AI providers.
 pub async fn delete_ai_provider(Path(_name): Path<String>) -> Response {
-    ApiError::BadRequest("ai providers are not available in this broker".to_string())
-        .into_response()
+    refused(
+        "INVALID_CREDENTIAL",
+        "ai providers are not available in this broker",
+    )
 }
 
 /// `GET /ai/providers/{name}/models`: empty list. The broker has no AI
 /// providers, so no provider has models.
 pub async fn list_ai_provider_models(Path(_name): Path<String>) -> Response {
-    (StatusCode::OK, Json(serde_json::json!({ "items": [] }))).into_response()
+    (StatusCode::OK, Json(serde_json::json!([]))).into_response()
 }
 
 /// `POST /ai/models`: refused. The broker has no AI providers.
 pub async fn list_ai_models() -> Response {
-    ApiError::BadRequest("ai providers are not available in this broker".to_string())
-        .into_response()
+    refused(
+        "INVALID_CREDENTIAL",
+        "ai providers are not available in this broker",
+    )
 }
 
 /// `GET /ai/completion_profiles`: empty list. The broker has no completion
 /// profiles. The Flow Designer reads this list together with the providers.
 pub async fn list_ai_completion_profiles() -> Response {
-    (StatusCode::OK, Json(serde_json::json!({ "items": [] }))).into_response()
+    (StatusCode::OK, Json(serde_json::json!([]))).into_response()
 }
 
 /// `POST /ai/completion_profiles`: refused. The broker has no completion
 /// profiles.
 pub async fn create_ai_completion_profile() -> Response {
-    ApiError::BadRequest("ai completion profiles are not available in this broker".to_string())
-        .into_response()
+    refused(
+        "INVALID_COMPLETION_PROFILE",
+        "ai completion profiles are not available in this broker",
+    )
 }
 
 /// `GET /ai/completion_profiles/{name}`: miss. Nothing is stored, so each
@@ -125,34 +170,29 @@ pub async fn get_ai_completion_profile(Path(name): Path<String>) -> Response {
 /// `PUT /ai/completion_profiles/{name}`: refused. The broker has no
 /// completion profiles.
 pub async fn update_ai_completion_profile(Path(_name): Path<String>) -> Response {
-    ApiError::BadRequest("ai completion profiles are not available in this broker".to_string())
-        .into_response()
+    refused(
+        "INVALID_COMPLETION_PROFILE",
+        "ai completion profiles are not available in this broker",
+    )
 }
 
 /// `DELETE /ai/completion_profiles/{name}`: refused. The broker has no
 /// completion profiles.
 pub async fn delete_ai_completion_profile(Path(_name): Path<String>) -> Response {
-    ApiError::BadRequest("ai completion profiles are not available in this broker".to_string())
-        .into_response()
+    refused(
+        "INVALID_COMPLETION_PROFILE",
+        "ai completion profiles are not available in this broker",
+    )
 }
 
-/// `GET /queues`: empty page. The broker has no queues. The console reads
-/// the `data` list from the envelope, so the answer uses the envelope even
-/// though the specification schema says array. See BASELINE.md.
-pub async fn list_queues(params: PageParams) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": [],
-            "meta": meta_page(params.page, params.limit, 0),
-        })),
-    )
-        .into_response()
+/// `GET /queues`: empty list. The broker has no queues.
+pub async fn list_queues() -> Response {
+    (StatusCode::OK, Json(serde_json::json!([]))).into_response()
 }
 
 /// `POST /queues`: refused. The broker has no queues.
 pub async fn create_queue() -> Response {
-    ApiError::BadRequest("message queues are not available in this broker".to_string())
+    ApiError::AlreadyExists("message queues are not available in this broker".to_string())
         .into_response()
 }
 
@@ -185,23 +225,14 @@ pub async fn delete_queue(Path(_name): Path<String>) -> Response {
         .into_response()
 }
 
-/// `GET /streams`: empty page. The broker has no streams. The console reads
-/// the `data` list from the envelope, so the answer uses the envelope even
-/// though the specification schema says array. See BASELINE.md.
-pub async fn list_streams(params: PageParams) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": [],
-            "meta": meta_page(params.page, params.limit, 0),
-        })),
-    )
-        .into_response()
+/// `GET /streams`: empty list. The broker has no streams.
+pub async fn list_streams() -> Response {
+    (StatusCode::OK, Json(serde_json::json!([]))).into_response()
 }
 
 /// `POST /streams`: refused. The broker has no streams.
 pub async fn create_stream() -> Response {
-    ApiError::BadRequest("message streams are not available in this broker".to_string())
+    ApiError::AlreadyExists("message streams are not available in this broker".to_string())
         .into_response()
 }
 
@@ -345,10 +376,10 @@ mod tests {
     async fn ai_lists_read_empty() {
         let (status, body) = read(list_ai_providers().await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, serde_json::json!({ "items": [] }));
+        assert_eq!(body, serde_json::json!([]));
         let (status, body) = read(list_ai_completion_profiles().await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, serde_json::json!({ "items": [] }));
+        assert_eq!(body, serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -362,19 +393,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ai_writes_refuse() {
-        for response in [
-            create_ai_provider().await,
-            update_ai_provider(Path("x".to_string())).await,
-            delete_ai_provider(Path("x".to_string())).await,
-            create_ai_completion_profile().await,
-            update_ai_completion_profile(Path("x".to_string())).await,
-            delete_ai_completion_profile(Path("x".to_string())).await,
-            list_ai_models().await,
+    async fn ai_writes_refuse_with_documented_codes() {
+        for (response, code) in [
+            (create_ai_provider().await, "INVALID_CREDENTIAL"),
+            (
+                update_ai_provider(Path("x".to_string())).await,
+                "INVALID_CREDENTIAL",
+            ),
+            (
+                delete_ai_provider(Path("x".to_string())).await,
+                "INVALID_CREDENTIAL",
+            ),
+            (list_ai_models().await, "INVALID_CREDENTIAL"),
+            (
+                create_ai_completion_profile().await,
+                "INVALID_COMPLETION_PROFILE",
+            ),
+            (
+                update_ai_completion_profile(Path("x".to_string())).await,
+                "INVALID_COMPLETION_PROFILE",
+            ),
+            (
+                delete_ai_completion_profile(Path("x".to_string())).await,
+                "INVALID_COMPLETION_PROFILE",
+            ),
         ] {
             let (status, body) = read(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+            assert_eq!(body["code"], serde_json::json!(code));
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not available")),
+                "refusal names the missing function: {body}"
+            );
         }
     }
 
@@ -382,16 +434,14 @@ mod tests {
     async fn ai_provider_models_read_empty() {
         let (status, body) = read(list_ai_provider_models(Path("x".to_string())).await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, serde_json::json!({ "items": [] }));
+        assert_eq!(body, serde_json::json!([]));
     }
 
     #[tokio::test]
-    async fn queue_list_reads_empty_page() {
-        let (status, body) = read(list_queues(PageParams::default()).await).await;
+    async fn queue_list_reads_empty_array() {
+        let (status, body) = read(list_queues().await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["data"], serde_json::json!([]));
-        assert_eq!(body["meta"]["count"], serde_json::json!(0));
-        assert_eq!(body["meta"]["hasnext"], serde_json::json!(false));
+        assert_eq!(body, serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -404,14 +454,20 @@ mod tests {
         assert!(body.get("gc_interval").is_some());
         assert!(body.get("max_queue_count").is_some());
         assert!(body.get("regular_queue_retention_period").is_some());
-        assert!(body["auto_create"]["lastvalue"].get("limits").is_none());
-        assert!(body["auto_create"]["regular"].get("limits").is_none());
+        assert_eq!(
+            body["auto_create"]["lastvalue"]["key_expression"],
+            serde_json::json!("message.from")
+        );
+        assert!(body["auto_create"]["lastvalue"].get("limits").is_some());
+        assert!(body["auto_create"]["regular"].get("limits").is_some());
     }
 
     #[tokio::test]
-    async fn queue_writes_refuse() {
+    async fn queue_writes_refuse_with_documented_codes() {
+        let (status, body) = read(create_queue().await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], serde_json::json!("ALREADY_EXISTS"));
         for response in [
-            create_queue().await,
             put_queue_config().await,
             update_queue(Path("q1".to_string())).await,
             delete_queue(Path("q1".to_string())).await,
@@ -426,12 +482,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_list_reads_empty_page() {
-        let (status, body) = read(list_streams(PageParams::default()).await).await;
+    async fn stream_list_reads_empty_array() {
+        let (status, body) = read(list_streams().await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["data"], serde_json::json!([]));
-        assert_eq!(body["meta"]["count"], serde_json::json!(0));
-        assert_eq!(body["meta"]["hasnext"], serde_json::json!(false));
+        assert_eq!(body, serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -443,14 +497,20 @@ mod tests {
         assert!(body.get("gc_interval").is_some());
         assert!(body.get("max_stream_count").is_some());
         assert!(body.get("regular_stream_retention_period").is_some());
-        assert!(body["auto_create"]["lastvalue"].get("limits").is_none());
-        assert!(body["auto_create"]["regular"].get("limits").is_none());
+        assert_eq!(
+            body["auto_create"]["lastvalue"]["key_expression"],
+            serde_json::json!("message.from")
+        );
+        assert!(body["auto_create"]["lastvalue"].get("limits").is_some());
+        assert!(body["auto_create"]["regular"].get("limits").is_some());
     }
 
     #[tokio::test]
-    async fn stream_writes_refuse() {
+    async fn stream_writes_refuse_with_documented_codes() {
+        let (status, body) = read(create_stream().await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], serde_json::json!("ALREADY_EXISTS"));
         for response in [
-            create_stream().await,
             put_stream_config().await,
             update_stream(Path("s1".to_string())).await,
             delete_stream(Path("s1".to_string())).await,

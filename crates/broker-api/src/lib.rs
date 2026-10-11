@@ -3216,9 +3216,9 @@ mod tests {
         assert_eq!(text, "OK");
     }
 
-    /// Empty states of the console pages (AP-01): the reads answer the
-    /// documented shape with an empty or disabled state, and the writes
-    /// refuse with 400 `BAD_REQUEST`. Nothing is stored.
+    /// Empty states of the console pages (AP-01, AP2-02): the reads answer
+    /// the documented shape with an empty or disabled state, and the writes
+    /// refuse with the documented 400 code. Nothing is stored.
     #[tokio::test]
     async fn test_console_empty_states_are_honest() {
         let (server, _state) = TestServer::start().await;
@@ -3227,12 +3227,17 @@ mod tests {
         // AI lists read empty; the Flow Designer loads both together.
         let (status, body) = server.get_auth("/api/v5/ai/providers", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!({"items": []}));
+        assert_eq!(body, json!([]));
         let (status, body) = server
             .get_auth("/api/v5/ai/completion_profiles", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!({"items": []}));
+        assert_eq!(body, json!([]));
+        let (status, body) = server
+            .get_auth("/api/v5/ai/providers/no-such-provider/models", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
         let (status, body) = server
             .post_auth(
                 "/api/v5/ai/providers",
@@ -3241,7 +3246,25 @@ mod tests {
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("INVALID_CREDENTIAL"));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/ai/completion_profiles",
+                json!({"name": "x", "provider_name": "y", "type": "openai"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("INVALID_COMPLETION_PROFILE"));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/ai/models",
+                json!({"type": "openai", "api_key": "k"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("INVALID_CREDENTIAL"));
         let (status, body) = server
             .get_auth("/api/v5/ai/providers/no-such-provider", &token)
             .await;
@@ -3252,15 +3275,19 @@ mod tests {
         let (status, body) = server.get_auth("/api/v5/queues/config", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(false));
+        assert!(body["auto_create"]["lastvalue"].get("limits").is_some());
+        assert!(body["auto_create"]["regular"].get("limits").is_some());
         let (status, body) = server.get_auth("/api/v5/streams/config", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(false));
+        assert!(body["auto_create"]["lastvalue"].get("limits").is_some());
+        assert!(body["auto_create"]["regular"].get("limits").is_some());
         let (status, body) = server.get_auth("/api/v5/queues", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
+        assert_eq!(body, json!([]));
         let (status, body) = server.get_auth("/api/v5/streams", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
+        assert_eq!(body, json!([]));
         let (status, body) = server
             .put_auth("/api/v5/queues/config", json!({"enable": true}), &token)
             .await;
@@ -3270,7 +3297,12 @@ mod tests {
             .post_auth("/api/v5/queues", json!({"name": "q1"}), &token)
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        let (status, body) = server
+            .post_auth("/api/v5/streams", json!({"name": "s1"}), &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
 
         // Telemetry reads disabled; data misses while disabled.
         let (status, body) = server.get_auth("/api/v5/telemetry/status", &token).await;
@@ -17088,7 +17120,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(err["code"], json!("BAD_REQUEST"));
+        assert_eq!(err["code"], json!("BAD_NAME"));
         let (status, err) = server
             .get_auth("/api/v5/mqtt/topic_metrics2/alpha", &token)
             .await;

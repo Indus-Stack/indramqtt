@@ -192,20 +192,25 @@ is not changed.
   `/schemas/actions`, strips the label keys and reads paths inside the
   object. The broker returns the schema object, so the checker reports a
   type error for this row.
-- `GET /queues`, response 200. The specification declares a bare array,
-  but its own example shows one object with `data` and `meta`. The
-  management console reads one object with `data` and `meta`:
+- `GET /queues`, response 200. The specification declares a bare array.
+  The management console reads one object with `data` and `meta`:
   `getMessageQueues` in the API module of the console returns
   `ListDataWithCursor<MessageQueue>`, and the queue page reads
-  `res?.data`. The broker returns one object with `data` and the standard
-  page `meta`, so the checker reports a type error for this row.
-- `GET /streams`, response 200. The specification declares a bare array,
-  but its own example shows one object with `data` and `meta`. The
-  management console reads one object with `data` and `meta`:
+  `res?.data`. The broker has no queues, so it returns the documented
+  empty array. The console falls back to its own empty list.
+- `GET /streams`, response 200. The specification declares a bare array.
+  The management console reads one object with `data` and `meta`:
   `getMessageStreamList` in the API module of the console returns
   `ListDataWithCursor<MessageStreamItem>`, and the stream page reads
-  `res?.data`. The broker returns one object with `data` and the standard
-  page `meta`, so the checker reports a type error for this row.
+  `res?.data`. The broker has no streams, so it returns the documented
+  empty array. The console falls back to its own empty list.
+- `GET /queues/config` and `GET /streams/config`, response 200. The
+  `auto_create.lastvalue` and `auto_create.regular` fields each declare
+  one object variant plus a second variant of enum `[false]` with type
+  `string`. No value matches the second variant. The management console
+  builds the object form with `limits` of `infinity`. The broker returns
+  the object form with the documented defaults, so the checker accepts
+  the row.
 - `GET /authentication/{id}/status`, response 200. The specification schema
   types `node_error`, `node_metrics`, `node_resource_metrics` and
   `node_status` as single objects. The specification example answers one

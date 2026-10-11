@@ -1056,8 +1056,8 @@ pub fn protected_router() -> Router<ApiState> {
         // (AP-01): AI providers and completion profiles, message queues,
         // message streams, telemetry, load rebalance and node eviction.
         // Reads answer the documented shape with an empty or disabled
-        // state. Writes answer 400 `BAD_REQUEST`. Nothing is stored.
-        // Management-plane only; publish and deliver never touch it.
+        // state. Writes answer 400 with the documented code. Nothing is
+        // stored. Management-plane only; publish and deliver never touch it.
         .route(
             "/ai/providers",
             get(empty_states::list_ai_providers).post(empty_states::create_ai_provider),
