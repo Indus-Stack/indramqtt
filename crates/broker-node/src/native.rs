@@ -2537,6 +2537,58 @@ mod tests {
         );
     }
 
+    /// Burst binds with one credential share one hash. Each bind goes
+    /// through a real TCP socket on the production listener, not the
+    /// store alone. The join counter grows, so removing the dedup map
+    /// fails this test.
+    #[tokio::test]
+    async fn burst_same_credential_binds_share_one_verification() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        shared
+            .auth
+            .set_policy(broker_auth::PasswordHashPolicy::for_tests());
+        shared
+            .auth
+            .add_user("storm-only", b"storm-secret-value")
+            .expect("user stores");
+        let port = p2_tcp_listener(shared.clone()).await;
+        // 16 binds start together. Reason: 16 waiters prove sharing
+        // while staying inside the 32 verify permits.
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(17));
+        let mut tasks = Vec::new();
+        for index in 0..16u64 {
+            let gate = std::sync::Arc::clone(&gate);
+            tasks.push(tokio::spawn(async move {
+                gate.wait().await;
+                let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .expect("tcp dials");
+                client
+                    .write_all(&ws_test_connect_with_auth(
+                        &format!("storm-client-{index:02}"),
+                        "storm-only",
+                        b"storm-secret-value",
+                    ))
+                    .await
+                    .expect("CONNECT sends");
+                tcp_test_recv(&mut client).await
+            }));
+        }
+        gate.wait().await;
+        for task in tasks {
+            assert_eq!(
+                task.await.expect("bind task ends"),
+                vec![0x20, 0x02, 0x00, 0x00],
+                "burst bind is accepted"
+            );
+        }
+        assert!(
+            shared.auth.verify_dedup_join_count() > 0,
+            "burst shares verifications through the dedup map"
+        );
+    }
+
     #[tokio::test]
     async fn a_panic_in_one_connection_releases_only_that_connection() {
         let shared = Shared::new();
@@ -4076,6 +4128,77 @@ mod tests {
             vec![0x20, 0x02, 0x00, 0x00],
             "no verification connects"
         );
+    }
+
+    /// Opens a TLS 1.2 session that offers one legacy cipher list.
+    /// Returns `Ok` when the handshake passes. Uses the maintained
+    /// openssl crate, never hand-rolled cryptography.
+    async fn probe_legacy_dial(port: u16, cipher: &str) -> Result<(), String> {
+        use openssl::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+        use std::pin::Pin;
+        let mut builder =
+            SslContextBuilder::new(SslMethod::tls_client()).map_err(|e| e.to_string())?;
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(|e| e.to_string())?;
+        builder.set_cipher_list(cipher).map_err(|e| e.to_string())?;
+        let context = builder.build();
+        let ssl = Ssl::new(&context).map_err(|e| e.to_string())?;
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut stream = tokio_openssl::SslStream::new(ssl, tcp).map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(10), Pin::new(&mut stream).connect())
+            .await
+            .map_err(|_| "handshake timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// TLS suite probe. Dials the production TLS listener with a
+    /// modern client and with legacy CBC-only clients. Prints one
+    /// PROBE line per suite. Goes through the broker. The modern
+    /// handshake passes and its CONNECT gets CONNACK. Each legacy
+    /// probe reports OK or FAIL. The R1 note uses the result.
+    #[tokio::test]
+    async fn tls_suite_probe_matrix_reports_modern_and_legacy() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        let port = k1_05_listener(shared, super::TlsClientAuth::default()).await;
+
+        // Modern client with default suites. This probe must pass.
+        let mut modern = k1_05_dial(port, None).await.expect("modern TLS dials");
+        modern
+            .write_all(&ws_test_connect("tls-probe-modern"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            k1_05_recv(&mut modern).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "modern client connects"
+        );
+        println!("PROBE kernel modern OK (rustls handshake, CONNACK 0x00)");
+
+        // Legacy CBC suites. Probe each suite and report the result.
+        // The R1 note uses it. The probe records, it does not require.
+        let mut failures = 0u32;
+        for (label, cipher) in [
+            ("ecdhe-cbc", "ECDHE-RSA-AES128-SHA"),
+            ("rsa-cbc", "AES128-SHA"),
+        ] {
+            match probe_legacy_dial(port, cipher).await {
+                Ok(()) => println!("PROBE kernel {label} OK ({cipher})"),
+                Err(_) => {
+                    println!("PROBE kernel {label} FAIL (handshake failed)");
+                    failures += 1;
+                }
+            }
+        }
+        println!("PROBE done failures={failures} backlog=1024");
     }
 
     /// Two tenants stay apart on the certificate path. Each client

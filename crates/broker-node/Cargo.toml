@@ -29,6 +29,10 @@ path = "../../tests/mt_publish_bench.rs"
 name = "listener_conformance"
 path = "tests/listener_conformance.rs"
 
+[[test]]
+name = "reconnect_storm"
+path = "tests/reconnect_storm.rs"
+
 [dependencies]
 brokerlink = { workspace = true }
 broker-protocol = { workspace = true }

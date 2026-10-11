@@ -770,6 +770,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/api/v1/auth/users", get(list_users).post(create_user))
         .route("/api/v1/auth/users/:username", delete(delete_user))
+        .route("/api/v1/auth/verify_stats", get(get_verify_stats))
         .route("/api/v1/auth/acls", get(list_acls).post(create_acl))
         .route("/api/v1/auth/acls/:id", delete(delete_acl))
         .route("/api/v1/rules", get(list_rules).post(create_rule))
@@ -1295,6 +1296,19 @@ async fn create_user(
         Json(serde_json::json!({ "username": req.username, "quotas": stored })),
     )
         .into_response()
+}
+
+/// Live password verification counters for the storm test.
+/// `verifications` counts blocking hashes run; `dedup_joins` counts
+/// CONNECTs that shared a leader check. Both are memory-only and
+/// restart at zero. Management-plane read only; the CONNECT path
+/// increments them with lock-free atomics.
+async fn get_verify_stats(State(state): State<ApiState>) -> Response {
+    Json(serde_json::json!({
+        "verifications": state.auth.verify_run_count(),
+        "dedup_joins": state.auth.verify_dedup_join_count(),
+    }))
+    .into_response()
 }
 
 /// Creation payload for one ordered ACL entry.

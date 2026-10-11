@@ -230,7 +230,13 @@ impl AclRule {
 /// Expensive verifiers run in `tokio::task::spawn_blocking` off the
 /// accept path while CONNECT still awaits the verdict, gated by a
 /// semaphore with [`MAX_CONCURRENT_VERIFICATIONS`] permits; exhaustion
-/// fails closed instead of queueing unboundedly. Legacy SHA-256 verifies
+/// fails closed instead of queueing unboundedly. Concurrent CONNECTs
+/// with the same credential share one check through
+/// [`MAX_VERIFY_DEDUP_INFLIGHT`]; past the cap they verify directly.
+/// The sharing absorbs a reconnect burst: one hash serves many waiters.
+/// [`MemoryAuth::verify_run_count`] reports the hashes run, so a burst
+/// test proves the cost stays within the credential count.
+/// Legacy SHA-256 verifies
 /// inline: a single hash over at most [`MAX_PASSWORD_BYTES`] bytes with no
 /// tunable cost, so off-thread dispatch would add overhead without benefit.
 /// A successful legacy login migrates to the configured default off the
@@ -300,6 +306,17 @@ pub struct MemoryAuth {
     /// `Arc` so the async verifier can hold an owned permit across the
     /// blocking task without borrowing `self`.
     verify_gate: Arc<tokio::sync::Semaphore>,
+    /// In-flight dedup for concurrent same-credential expensive checks.
+    /// `Arc` so CONNECT tasks share entries without borrowing `self`.
+    /// Bound: at most [`MAX_VERIFY_DEDUP_INFLIGHT`] keys; past the cap
+    /// new CONNECTs verify directly without sharing.
+    verify_inflight: Arc<tokio::sync::Mutex<HashMap<VerifyDedupKey, Arc<VerifyInflight>>>>,
+    /// Waiters that joined a leader check instead of hashing again. One
+    /// atomic; the storm test reads it to prove sharing happened.
+    verify_dedup_joins: std::sync::atomic::AtomicU64,
+    /// Expensive verifications that ran the blocking hash. One atomic;
+    /// the storm test reads it to prove the burst cost stays bounded.
+    verify_runs: std::sync::atomic::AtomicU64,
     /// Bounds concurrent legacy-hash migrations (re-hashes at production
     /// cost). `Arc` so the async migration can hold an owned permit
     /// across the blocking task without borrowing `self`.
@@ -334,6 +351,9 @@ impl Default for MemoryAuth {
             authz_sources: RwLock::new(None),
             authz_settings: RwLock::new(None),
             verify_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
+            verify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            verify_dedup_joins: std::sync::atomic::AtomicU64::new(0),
+            verify_runs: std::sync::atomic::AtomicU64::new(0),
             migrate_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MIGRATIONS)),
         }
     }
@@ -387,6 +407,79 @@ pub const DEFAULT_ARGON2_KEY_LEN: usize = 32;
 /// excess CONNECTs fail closed instead of queueing unboundedly on the
 /// accept path.
 pub const MAX_CONCURRENT_VERIFICATIONS: usize = 32;
+/// Bound on concurrent same-credential dedup entries. Reason: one entry
+/// per verification permit in [`MAX_CONCURRENT_VERIFICATIONS`]; a burst
+/// holds at most one shared check per permit. Past the cap new CONNECTs
+/// verify directly.
+pub const MAX_VERIFY_DEDUP_INFLIGHT: usize = MAX_CONCURRENT_VERIFICATIONS;
+/// Key for concurrent same-credential verification sharing.
+/// The password hash is SHA-256 of the presented password.
+/// The verifier is the stored encoding the lookup found.
+/// Same inputs share one expensive check with the same result.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VerifyDedupKey {
+    tenant: String,
+    username: String,
+    pwd_hash: [u8; 32],
+    verifier: String,
+}
+/// In-flight expensive verification shared by concurrent CONNECTs.
+/// One leader runs the blocking check; waiters await the result.
+/// The result is atomic so the cancel path sets it without a lock.
+/// Values: 0 means pending, 1 means success, 2 means refusal.
+struct VerifyInflight {
+    notify: tokio::sync::Notify,
+    result: std::sync::atomic::AtomicU8,
+}
+impl VerifyInflight {
+    /// Pending leader check.
+    const PENDING: u8 = 0;
+    /// Successful leader check.
+    const OK: u8 = 1;
+    /// Failed or cancelled leader check.
+    const REFUSED: u8 = 2;
+}
+/// Guard that fails waiters closed and removes the entry on early exit.
+/// The leader sets `completed` on the normal path; early drop (cancel)
+/// records refusal, wakes waiters and removes the key when it still
+/// points at this entry.
+struct VerifyLeaderGuard {
+    map: Arc<tokio::sync::Mutex<HashMap<VerifyDedupKey, Arc<VerifyInflight>>>>,
+    key: Option<VerifyDedupKey>,
+    entry: Arc<VerifyInflight>,
+    completed: bool,
+}
+impl Drop for VerifyLeaderGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // Fail waiters closed. A stored outcome stays.
+        let _ = self.entry.result.compare_exchange(
+            VerifyInflight::PENDING,
+            VerifyInflight::REFUSED,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.entry.notify.notify_waiters();
+        if let Some(key) = self.key.take() {
+            if let Ok(mut table) = self.map.try_lock() {
+                let same = table
+                    .get(&key)
+                    .map(|current| Arc::ptr_eq(current, &self.entry))
+                    .unwrap_or(false);
+                if same {
+                    table.remove(&key);
+                }
+            } else {
+                // The lock is busy and Drop cannot await. The entry
+                // keeps its stored refusal and the next lookup for
+                // this key reclaims it. Log the miss, never stay silent.
+                tracing::warn!("mqtt authentication dedup entry reclaimed on next lookup");
+            }
+        }
+    }
+}
 /// Bound on concurrent legacy-hash migrations. Reason: a burst of legacy
 /// logins must not re-hash unboundedly at production cost (Argon2id
 /// 19 MiB, bcrypt cost 12, PBKDF2 600k iterations); at most this many
@@ -837,6 +930,20 @@ impl MemoryAuth {
     pub fn tenant_denial_count(&self) -> u64 {
         self.tenant_denials
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Same-credential verifications shared so far. Each count is one
+    /// CONNECT that awaited a leader check instead of hashing again.
+    pub fn verify_dedup_join_count(&self) -> u64 {
+        self.verify_dedup_joins
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Expensive verifications run so far. Each count is one blocking
+    /// hash for a non-legacy verifier. Shared bursts add one run per
+    /// different credential; waiters add none.
+    pub fn verify_run_count(&self) -> u64 {
+        self.verify_runs.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Total users across all tenants (drives the global open-mode gate).
@@ -2478,9 +2585,114 @@ impl MemoryAuth {
             )));
         }
 
-        // Expensive verifiers: one owned semaphore permit bounds
-        // concurrency; the blocking hash runs off the accept path while
-        // CONNECT still awaits this future's verdict.
+        // Expensive verifiers share one check for the same credential.
+        // Concurrent CONNECTs with the same tenant, username, password
+        // and verifier await the leader result instead of hashing again.
+        // The sharing stays bounded by [`MAX_VERIFY_DEDUP_INFLIGHT`];
+        // past the cap new CONNECTs verify directly.
+        let pwd_hash = Self::digest(&owned_password);
+        let verifier_encoded = encode_stored_verifier(&verifier);
+        let dedup_key = VerifyDedupKey {
+            tenant: owned_tenant.clone(),
+            username: owned_username.clone(),
+            pwd_hash,
+            verifier: verifier_encoded,
+        };
+        // One lock covers lookup and insert together. Reason: two tasks
+        // must never both lead for one key and overwrite each other.
+        let (joined, leader): (Option<Arc<VerifyInflight>>, Option<Arc<VerifyInflight>>) = {
+            let mut table = self.verify_inflight.lock().await;
+            if let Some(entry) = table.get(&dedup_key).cloned() {
+                // Reclaim a stored entry. Reason: a cancelled leader
+                // leaves a refusal; a new burst verifies fresh.
+                if entry.result.load(std::sync::atomic::Ordering::SeqCst) == VerifyInflight::PENDING
+                {
+                    (Some(entry), None)
+                } else {
+                    let fresh = Arc::new(VerifyInflight {
+                        notify: tokio::sync::Notify::new(),
+                        result: std::sync::atomic::AtomicU8::new(VerifyInflight::PENDING),
+                    });
+                    table.insert(dedup_key.clone(), fresh.clone());
+                    (None, Some(fresh))
+                }
+            } else if table.len() >= MAX_VERIFY_DEDUP_INFLIGHT {
+                (None, None)
+            } else {
+                let entry = Arc::new(VerifyInflight {
+                    notify: tokio::sync::Notify::new(),
+                    result: std::sync::atomic::AtomicU8::new(VerifyInflight::PENDING),
+                });
+                table.insert(dedup_key.clone(), entry.clone());
+                (None, Some(entry))
+            }
+        };
+        if let Some(entry) = joined {
+            // One waiter joined the leader check instead of hashing
+            // again. Count it so a burst test observes the sharing.
+            self.verify_dedup_joins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Register for the wakeup before reading the result.
+            // Reason: the leader stores the result before it wakes
+            // waiters, so a stored result needs no wait and a later
+            // wakeup still arrives.
+            let notified = entry.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let outcome = entry.result.load(std::sync::atomic::Ordering::SeqCst);
+            if outcome == VerifyInflight::PENDING {
+                notified.await;
+            }
+            let ok = entry.result.load(std::sync::atomic::Ordering::SeqCst) == VerifyInflight::OK;
+            if ok {
+                return Ok(());
+            }
+            return Err(AuthError::AuthenticationFailed(format!(
+                "{client_id} presented bad credentials"
+            )));
+        }
+        let Some(leader) = leader else {
+            // Past the cap: verify directly without sharing.
+            // One owned semaphore permit bounds concurrency; the blocking
+            // hash runs off the accept path while CONNECT awaits the verdict.
+            let permit = self.verify_gate.clone().try_acquire_owned().map_err(|_| {
+                // Fail closed: an unbounded queue of pending verifications
+                // would let a CONNECT flood grow memory without limit.
+                tracing::warn!(
+                    client_id,
+                    username = owned_username.as_str(),
+                    "mqtt authentication refused: verification permits exhausted"
+                );
+                AuthError::AuthenticationFailed(format!("{client_id} presented bad credentials"))
+            })?;
+            // Count the run. Reason: the storm test asserts real hashes
+            // stay within the credential count.
+            self.verify_runs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let verified = tokio::task::spawn_blocking(move || {
+                let ok = verify_blocking(&verifier, &owned_password);
+                drop(permit);
+                ok
+            })
+            .await
+            .unwrap_or(false);
+            if verified {
+                return Ok(());
+            }
+            return Err(AuthError::AuthenticationFailed(format!(
+                "{client_id} presented bad credentials"
+            )));
+        };
+        let mut guard = VerifyLeaderGuard {
+            map: self.verify_inflight.clone(),
+            key: Some(dedup_key),
+            entry: leader.clone(),
+            completed: false,
+        };
+        // One owned semaphore permit bounds concurrency; the blocking
+        // hash runs off the accept path while CONNECT awaits the verdict.
+        // Exhaustion fails closed. The guard fails joined waiters closed
+        // too when this return runs.
         let permit = self.verify_gate.clone().try_acquire_owned().map_err(|_| {
             // Fail closed: an unbounded queue of pending verifications
             // would let a CONNECT flood grow memory without limit.
@@ -2491,6 +2703,10 @@ impl MemoryAuth {
             );
             AuthError::AuthenticationFailed(format!("{client_id} presented bad credentials"))
         })?;
+        // Count the run. Reason: the storm test asserts real hashes stay
+        // within the credential count.
+        self.verify_runs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let verified = tokio::task::spawn_blocking(move || {
             let ok = verify_blocking(&verifier, &owned_password);
             drop(permit);
@@ -2498,6 +2714,29 @@ impl MemoryAuth {
         })
         .await
         .unwrap_or(false);
+        // Store the result before waking waiters. Reason: waiters
+        // register before they read, so no wakeup is lost.
+        leader.result.store(
+            if verified {
+                VerifyInflight::OK
+            } else {
+                VerifyInflight::REFUSED
+            },
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        leader.notify.notify_waiters();
+        {
+            let key = guard.key.take().expect("leader holds dedup key");
+            let mut table = self.verify_inflight.lock().await;
+            let same = table
+                .get(&key)
+                .map(|current| Arc::ptr_eq(current, &leader))
+                .unwrap_or(false);
+            if same {
+                table.remove(&key);
+            }
+        }
+        guard.completed = true;
         if verified {
             Ok(())
         } else {
