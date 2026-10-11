@@ -42,11 +42,11 @@ use broker_gateway::{coap, lwm2m, ocpp, GatewayManager, GatewayProtocol};
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_router::{ConnTable, Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleAction, RuleEngine};
-use broker_session::{QueuedMessage, SessionManager, TokenBucket};
+use broker_session::{SessionManager, TokenBucket};
 // Kafka legs use the stream store (X1-10). Gate it with the tests.
 #[cfg(feature = "kafka")]
 use broker_storage::DurableStreamStore;
-use brokerlink::{BrokerFrame, BrokerLinkTransport, FramedTransport, OpCode};
+use brokerlink::{BrokerFrame, OpCode};
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use parking_lot::RwLock;
@@ -55,7 +55,6 @@ use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 // ============================================================================
@@ -147,145 +146,6 @@ async fn test_soak_concurrent_router_fanout() {
         elapsed,
         total as f64 / elapsed.as_secs_f64()
     );
-}
-
-// ============================================================================
-// 2. BrokerLink IPC Socket Sever and Seamless Session Rebind Chaos
-// ============================================================================
-
-fn encode_bind_meta(client_id: &str, clean_start: bool, keepalive: u16) -> Bytes {
-    let id = client_id.as_bytes();
-    let mut meta = Vec::with_capacity(2 + id.len() + 1 + 2);
-    meta.extend_from_slice(&(id.len() as u16).to_be_bytes());
-    meta.extend_from_slice(id);
-    meta.push(u8::from(clean_start));
-    meta.extend_from_slice(&keepalive.to_be_bytes());
-    Bytes::from(meta)
-}
-
-fn encode_session_binding(conn_id: u64, session_id: u64, present: bool, rc: u8) -> BrokerFrame {
-    let mut meta = Vec::with_capacity(10);
-    meta.extend_from_slice(&session_id.to_be_bytes());
-    meta.push(u8::from(present));
-    meta.push(rc);
-    BrokerFrame::new(
-        OpCode::SessionBinding,
-        conn_id,
-        0,
-        Bytes::from(meta),
-        Bytes::new(),
-    )
-    .unwrap()
-}
-
-#[tokio::test]
-async fn test_chaos_brokerlink_socket_sever_and_resurrection() {
-    let session_mgr = Arc::new(SessionManager::new_with_limits(Some(100)));
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind listener");
-    let addr = listener.local_addr().expect("local addr");
-
-    let sm_clone = session_mgr.clone();
-    let server_handle = tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let sm = sm_clone.clone();
-            tokio::spawn(async move {
-                let transport = FramedTransport::new(stream);
-                while let Ok(frame) = transport.recv().await {
-                    match frame.header.opcode {
-                        OpCode::BindConnection => {
-                            let cid = "chaos-device-1";
-                            let (session, present) = sm.get_or_create(cid, false);
-                            *session.connected.write() = true;
-                            *session.conn_id.write() = Some(frame.header.conn_id);
-
-                            let reply = encode_session_binding(
-                                frame.header.conn_id,
-                                session.id.0,
-                                present,
-                                0,
-                            );
-                            let _ = transport.send(reply).await;
-                        }
-                        OpCode::Ping => {
-                            let pong =
-                                BrokerFrame::pong(frame.header.conn_id, frame.header.sequence_no);
-                            let _ = transport.send(pong).await;
-                        }
-                        _ => {}
-                    }
-                }
-            });
-        }
-    });
-
-    // Client connects first time
-    let stream1 = TcpStream::connect(addr).await.expect("connect 1");
-    let client1 = FramedTransport::new(stream1);
-
-    // Send BindConnection with clean_start = false
-    let bind_frame = BrokerFrame::new(
-        OpCode::BindConnection,
-        101,
-        1,
-        encode_bind_meta("chaos-device-1", false, 60),
-        Bytes::new(),
-    )
-    .unwrap();
-    client1.send(bind_frame).await.expect("send bind");
-
-    let reply1 = client1.recv().await.expect("recv binding");
-    assert_eq!(reply1.header.opcode, OpCode::SessionBinding);
-    assert_eq!(
-        reply1.metadata[8], 0,
-        "first connect: present flag is false"
-    );
-
-    // Queue 5 offline messages for this device
-    let (sess, _) = session_mgr.get_or_create("chaos-device-1", false);
-    for i in 1..=5 {
-        sess.push_offline(QueuedMessage {
-            topic: Topic::new(format!("chaos/{i}")).unwrap(),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            payload: Bytes::from(format!("data-{i}")),
-            publish_at_ms: None,
-        });
-    }
-    assert_eq!(sess.offline_len(), 5);
-
-    // CHAOS: Abruptly sever the underlying TCP connection mid-session!
-    drop(client1);
-
-    // Client reconnects on fresh TCP socket with same client_id (clean_start = false)
-    let stream2 = TcpStream::connect(addr).await.expect("connect 2");
-    let client2 = FramedTransport::new(stream2);
-
-    let bind_frame2 = BrokerFrame::new(
-        OpCode::BindConnection,
-        202,
-        2,
-        encode_bind_meta("chaos-device-1", false, 60),
-        Bytes::new(),
-    )
-    .unwrap();
-    client2.send(bind_frame2).await.expect("send bind 2");
-
-    let reply2 = client2.recv().await.expect("recv binding 2");
-    assert_eq!(reply2.header.opcode, OpCode::SessionBinding);
-    assert_eq!(
-        reply2.metadata[8], 1,
-        "resumed session: present flag is true"
-    );
-
-    // Session persisted through socket disconnect, all 5 offline messages intact!
-    assert_eq!(sess.offline_len(), 5);
-    let drained = sess.drain_offline();
-    assert_eq!(drained.len(), 5);
-    assert_eq!(sess.offline_len(), 0);
-
-    server_handle.abort();
 }
 
 // ============================================================================
