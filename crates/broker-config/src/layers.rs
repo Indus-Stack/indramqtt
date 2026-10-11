@@ -316,6 +316,8 @@ pub struct CliOverrides {
     pub webhook_cache_ttl_secs: Option<u64>,
     pub delayed_max_secs: Option<u64>,
     pub topic_alias_maximum: Option<u16>,
+    /// `--max-packet-size` -> `session.max_packet_size`.
+    pub max_packet_size: Option<u32>,
     pub monitor_sample_secs: Option<u64>,
     /// `--tls-verify-client-cert` -> `listeners.tls.verify_client_cert`.
     pub tls_verify_client_cert: Option<bool>,
@@ -829,6 +831,15 @@ impl CliOverrides {
                 "session.topic_alias_maximum",
                 toml::Value::Integer(value as i64),
                 "--topic-alias-maximum",
+            );
+        }
+        if let Some(value) = self.max_packet_size {
+            insert_path(
+                table,
+                provenance,
+                "session.max_packet_size",
+                toml::Value::Integer(value as i64),
+                "--max-packet-size",
             );
         }
         if let Some(value) = self.monitor_sample_secs {
@@ -1766,6 +1777,7 @@ mod tests {
             webhook_cache_ttl_secs: Some(1),
             delayed_max_secs: Some(1),
             topic_alias_maximum: Some(1),
+            max_packet_size: Some(1),
             monitor_sample_secs: Some(1),
             tls_verify_client_cert: Some(true),
             wss_verify_client_cert: Some(true),

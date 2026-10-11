@@ -471,6 +471,14 @@ struct Args {
     #[arg(long)]
     topic_alias_maximum: Option<u16>,
 
+    /// Largest MQTT packet in bytes. Sets the read limit and the WS
+    /// frame cap. Advertised in CONNACK. (P2) Default 1048576 matches
+    /// the documented server limit and bounds one connection near
+    /// 1 MiB. Range is 1..=268435455, the wire ceiling.
+    /// Schema home: `session.max_packet_size`.
+    #[arg(long)]
+    max_packet_size: Option<u32>,
+
     /// Monitor sampling interval in seconds (F1-02, T-72): how often the
     /// background sampler copies live counters into the bounded monitor
     /// ring behind `GET /monitor`. Default 10 keeps four hours of history
@@ -523,14 +531,6 @@ const DEFAULT_MONITOR_SAMPLE_SECS: u64 = 10;
 /// CONNACK property carries this value explicitly so a v5 client
 /// observes the negotiated limit instead of an absent property.
 const SERVER_V5_RECEIVE_MAXIMUM: u16 = u16::MAX;
-
-/// Server Maximum Packet Size advertised in v5 CONNACK properties
-/// (X1-02): 268435455, the MQTT Remaining Length maximum. Reason: a
-/// larger frame cannot arrive as a single MQTT packet, so this is the
-/// wire's own ceiling rather than a kernel policy; the kernel enforces
-/// no smaller inbound size cap today. Advertised explicitly so a v5
-/// client observes the negotiated limit.
-const SERVER_V5_MAX_PACKET_SIZE: u32 = 268_435_455;
 
 /// Largest SessionBinding v5 section in bytes (X1-02, mirrors
 /// [`MAX_V5_SECTION_LEN`] on the bind path): one section must leave
@@ -613,11 +613,11 @@ struct SessionBindingV5 {
 /// session expiry (the session's stored interval, echoed so the
 /// client observes what the kernel retained), the server limits, no
 /// reason string and no user properties.
-fn success_binding_v5(granted_expiry: u32) -> SessionBindingV5 {
+fn success_binding_v5(granted_expiry: u32, server_max_pkt: u32) -> SessionBindingV5 {
     SessionBindingV5 {
         granted_expiry,
         server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
-        server_max_pkt: SERVER_V5_MAX_PACKET_SIZE,
+        server_max_pkt,
         reason: String::new(),
         user_properties: Vec::new(),
     }
@@ -629,7 +629,7 @@ fn success_binding_v5(granted_expiry: u32) -> SessionBindingV5 {
 /// properties echoed back (bounded; over-bound input is dropped to the
 /// bound, never a truncated CONNACK — the refusal itself still goes
 /// out with the reason string).
-fn failure_binding_v5(req: &BindRequest, rc: u8) -> SessionBindingV5 {
+fn failure_binding_v5(req: &BindRequest, rc: u8, server_max_pkt: u32) -> SessionBindingV5 {
     let reason = v5_reason_string(rc)
         .unwrap_or("Connection refused")
         .to_string();
@@ -647,7 +647,7 @@ fn failure_binding_v5(req: &BindRequest, rc: u8) -> SessionBindingV5 {
     SessionBindingV5 {
         granted_expiry: 0,
         server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
-        server_max_pkt: SERVER_V5_MAX_PACKET_SIZE,
+        server_max_pkt,
         reason,
         user_properties: users,
     }
@@ -746,6 +746,8 @@ fn reply_for_frame(frame: &BrokerFrame, sessions: &SessionManager) -> Option<Bro
 /// (`0x82`) plus a reason string instead, so a v5 client observes the
 /// failure honestly; version-4 bytes are unchanged.
 fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> BrokerFrame {
+    // P2: the configured server packet limit rides every v5 reply.
+    let server_max_pkt = sessions.max_packet_size();
     let (session_id, present, return_code) = match decode_bind_meta(&frame.metadata) {
         Ok(req) => {
             // F1-01: validate the CONNECT last will before touching
@@ -755,7 +757,7 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
                 Ok(will) => will,
                 Err(_) => {
                     if req.protocol_version == 5 {
-                        let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR);
+                        let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR, server_max_pkt);
                         return session_binding_reply_with_v5(
                             frame,
                             0,
@@ -765,7 +767,13 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
                             &v5,
                         );
                     }
-                    return refusal_for_req(frame, &req, 2u8, sessions.max_topic_alias());
+                    return refusal_for_req(
+                        frame,
+                        &req,
+                        2u8,
+                        sessions.max_topic_alias(),
+                        server_max_pkt,
+                    );
                 }
             };
             // X1-02: a Receive Maximum of 0 is a protocol error on the
@@ -776,7 +784,7 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
             // exceeded); the rulebook does not decide it. Current
             // choice is the conservative protocol-error refusal.
             if req.protocol_version == 5 && req.receive_maximum == 0 {
-                let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR);
+                let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR, server_max_pkt);
                 return session_binding_reply_with_v5(
                     frame,
                     0,
@@ -834,7 +842,7 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
                     present,
                     0u8,
                     sessions.max_topic_alias(),
-                    &success_binding_v5(granted),
+                    &success_binding_v5(granted, server_max_pkt),
                 );
             }
             (session.id.0, present, 0u8)
@@ -844,7 +852,7 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
                 let v5 = SessionBindingV5 {
                     granted_expiry: 0,
                     server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
-                    server_max_pkt: SERVER_V5_MAX_PACKET_SIZE,
+                    server_max_pkt,
                     reason: v5_reason_string(V5_RC_PROTOCOL_ERROR)
                         .unwrap_or("Connection refused")
                         .to_string(),
@@ -1091,9 +1099,15 @@ fn decode_session_binding_full(
 /// binds get the extended reply with the server-side reason string
 /// and the echoed CONNECT user properties on top of the same `rc`.
 /// CONNECT-only, never on the delivery path.
-fn refusal_for_req(frame: &BrokerFrame, req: &BindRequest, rc: u8, alias_max: u16) -> BrokerFrame {
+fn refusal_for_req(
+    frame: &BrokerFrame,
+    req: &BindRequest,
+    rc: u8,
+    alias_max: u16,
+    server_max_pkt: u32,
+) -> BrokerFrame {
     if req.protocol_version == 5 {
-        let v5 = failure_binding_v5(req, rc);
+        let v5 = failure_binding_v5(req, rc, server_max_pkt);
         session_binding_reply_with_v5(frame, 0, false, rc, alias_max, &v5)
     } else {
         session_binding_reply(frame, 0, false, rc, alias_max)
@@ -1255,6 +1269,8 @@ async fn apply_bind_request_inner(
     // `SessionBinding` reply, including refusals, so the client always
     // learns it on the CONNECT event.
     let alias_max = shared.sessions.max_topic_alias();
+    // P2: the same replies carry the configured server packet limit.
+    let server_max_pkt = shared.sessions.max_packet_size();
     // Cache one render per distinct input for this bind.
     // The registry counts one rejection per render.
     // Reuse keeps one bind at one count.
@@ -1273,6 +1289,7 @@ async fn apply_bind_request_inner(
                 &req,
                 V5_RC_PROTOCOL_ERROR,
                 alias_max,
+                server_max_pkt,
             ));
         }
         // B1-03: banned identities never reach the session. The bind's
@@ -1324,7 +1341,13 @@ async fn apply_bind_request_inner(
                     duration_ms: 0,
                     tenant: tenant_for_ban.clone(),
                 });
-            return Some(refusal_for_req(frame, &req, 0x8A, alias_max));
+            return Some(refusal_for_req(
+                frame,
+                &req,
+                0x8A,
+                alias_max,
+                server_max_pkt,
+            ));
         }
         // TM-08: client-certificate check. Runs on connect only, never
         // on publish or deliver. No lock, no queue, no per-client store.
@@ -1338,7 +1361,13 @@ async fn apply_bind_request_inner(
                 listener = %req.listener,
                 "client certificate is missing or not valid: refusing CONNECT"
             );
-            return Some(refusal_for_req(frame, &req, 0x87, alias_max));
+            return Some(refusal_for_req(
+                frame,
+                &req,
+                0x87,
+                alias_max,
+                server_max_pkt,
+            ));
         }
         // W2-02: authenticator-chain consult. Loads one lock-free
         // snapshot per connect and never takes the chain write lock;
@@ -1362,7 +1391,13 @@ async fn apply_bind_request_inner(
             // entry so status shows the outage. CONNECT-only; publish and
             // deliver never touch these counters.
             shared.authn_chain.record_first_failed();
-            return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+            return Some(refusal_for_req(
+                frame,
+                &req,
+                0x86,
+                alias_max,
+                server_max_pkt,
+            ));
         }
         // W2-05: authentication-settings consult. Loads one lock-free
         // snapshot per connect to observe the backend-failure flag and
@@ -1403,7 +1438,13 @@ async fn apply_bind_request_inner(
                 // CONNECT-only; publish and deliver never touch these
                 // counters.
                 shared.authn_chain.record_built_in_failed();
-                return Some(refusal_for_req(frame, &req, 0x87, alias_max));
+                return Some(refusal_for_req(
+                    frame,
+                    &req,
+                    0x87,
+                    alias_max,
+                    server_max_pkt,
+                ));
             }
         } else {
             let password = req.password.as_deref();
@@ -1477,7 +1518,13 @@ async fn apply_bind_request_inner(
                         Err(()) => {
                             // W2-08: failed credential verdict. CONNECT-only.
                             shared.authn_chain.record_built_in_failed();
-                            return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                            return Some(refusal_for_req(
+                                frame,
+                                &req,
+                                0x86,
+                                alias_max,
+                                server_max_pkt,
+                            ));
                         }
                     }
                 } else if kerberos_enabled && looks_kerberos {
@@ -1485,13 +1532,25 @@ async fn apply_bind_request_inner(
                         shared.metrics.inc_auth_failures();
                         // W2-08: failed credential verdict. CONNECT-only.
                         shared.authn_chain.record_built_in_failed();
-                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                        return Some(refusal_for_req(
+                            frame,
+                            &req,
+                            0x86,
+                            alias_max,
+                            server_max_pkt,
+                        ));
                     };
                     let Some(token) = password else {
                         shared.metrics.inc_auth_failures();
                         // W2-08: failed credential verdict. CONNECT-only.
                         shared.authn_chain.record_built_in_failed();
-                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                        return Some(refusal_for_req(
+                            frame,
+                            &req,
+                            0x86,
+                            alias_max,
+                            server_max_pkt,
+                        ));
                     };
                     match kerberos.verify_token_in_tenant(&tenant_for_auth, &req.client_id, token) {
                         Ok(verified) => {
@@ -1519,7 +1578,13 @@ async fn apply_bind_request_inner(
                             shared.metrics.inc_auth_failures();
                             // W2-08: failed credential verdict. CONNECT-only.
                             shared.authn_chain.record_built_in_failed();
-                            return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                            return Some(refusal_for_req(
+                                frame,
+                                &req,
+                                0x86,
+                                alias_max,
+                                server_max_pkt,
+                            ));
                         }
                     }
                 } else if let Some(ldap) = shared.ldap.as_ref() {
@@ -1541,7 +1606,13 @@ async fn apply_bind_request_inner(
                         shared.metrics.inc_auth_failures();
                         // W2-08: failed credential verdict. CONNECT-only.
                         shared.authn_chain.record_built_in_failed();
-                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                        return Some(refusal_for_req(
+                            frame,
+                            &req,
+                            0x86,
+                            alias_max,
+                            server_max_pkt,
+                        ));
                     }
                 } else if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
                     // B5-03: database sources after the directory. A
@@ -1565,7 +1636,13 @@ async fn apply_bind_request_inner(
                         shared.metrics.inc_auth_failures();
                         // W2-08: failed credential verdict. CONNECT-only.
                         shared.authn_chain.record_built_in_failed();
-                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                        return Some(refusal_for_req(
+                            frame,
+                            &req,
+                            0x86,
+                            alias_max,
+                            server_max_pkt,
+                        ));
                     }
                 } else if let Some(webhook) = shared.webhook.as_ref() {
                     // B5-04: the local store (and the directory above)
@@ -1593,7 +1670,13 @@ async fn apply_bind_request_inner(
                         shared.metrics.inc_auth_failures();
                         // W2-08: failed credential verdict. CONNECT-only.
                         shared.authn_chain.record_built_in_failed();
-                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                        return Some(refusal_for_req(
+                            frame,
+                            &req,
+                            0x86,
+                            alias_max,
+                            server_max_pkt,
+                        ));
                     }
                 } else {
                     // No LDAP, no database, no webhook, and (no enabled Kerberos or a
@@ -1604,12 +1687,24 @@ async fn apply_bind_request_inner(
                         shared.metrics.inc_auth_failures();
                         // W2-08: failed credential verdict. CONNECT-only.
                         shared.authn_chain.record_built_in_failed();
-                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                        return Some(refusal_for_req(
+                            frame,
+                            &req,
+                            0x86,
+                            alias_max,
+                            server_max_pkt,
+                        ));
                     }
                     shared.metrics.inc_auth_failures();
                     // W2-08: failed credential verdict. CONNECT-only.
                     shared.authn_chain.record_built_in_failed();
-                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                    return Some(refusal_for_req(
+                        frame,
+                        &req,
+                        0x86,
+                        alias_max,
+                        server_max_pkt,
+                    ));
                 }
             } else if jwks_enabled && looks_jwt {
                 // B5-02: same JWKS verification as above for the empty
@@ -1624,7 +1719,13 @@ async fn apply_bind_request_inner(
                     Err(()) => {
                         // W2-08: failed credential verdict. CONNECT-only.
                         shared.authn_chain.record_built_in_failed();
-                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                        return Some(refusal_for_req(
+                            frame,
+                            &req,
+                            0x86,
+                            alias_max,
+                            server_max_pkt,
+                        ));
                     }
                 }
             } else if kerberos_enabled && looks_kerberos {
@@ -1632,13 +1733,25 @@ async fn apply_bind_request_inner(
                     shared.metrics.inc_auth_failures();
                     // W2-08: failed credential verdict. CONNECT-only.
                     shared.authn_chain.record_built_in_failed();
-                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                    return Some(refusal_for_req(
+                        frame,
+                        &req,
+                        0x86,
+                        alias_max,
+                        server_max_pkt,
+                    ));
                 };
                 let Some(token) = password else {
                     shared.metrics.inc_auth_failures();
                     // W2-08: failed credential verdict. CONNECT-only.
                     shared.authn_chain.record_built_in_failed();
-                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                    return Some(refusal_for_req(
+                        frame,
+                        &req,
+                        0x86,
+                        alias_max,
+                        server_max_pkt,
+                    ));
                 };
                 match kerberos.verify_token_in_tenant(&tenant_for_auth, &req.client_id, token) {
                     Ok(verified) => {
@@ -1663,7 +1776,13 @@ async fn apply_bind_request_inner(
                         shared.metrics.inc_auth_failures();
                         // W2-08: failed credential verdict. CONNECT-only.
                         shared.authn_chain.record_built_in_failed();
-                        return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                        return Some(refusal_for_req(
+                            frame,
+                            &req,
+                            0x86,
+                            alias_max,
+                            server_max_pkt,
+                        ));
                     }
                 }
             } else if let Some(ldap) = shared.ldap.as_ref() {
@@ -1685,7 +1804,13 @@ async fn apply_bind_request_inner(
                     shared.metrics.inc_auth_failures();
                     // W2-08: failed credential verdict. CONNECT-only.
                     shared.authn_chain.record_built_in_failed();
-                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                    return Some(refusal_for_req(
+                        frame,
+                        &req,
+                        0x86,
+                        alias_max,
+                        server_max_pkt,
+                    ));
                 }
             } else if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
                 // B5-03: a configured database disables the open mode
@@ -1710,7 +1835,13 @@ async fn apply_bind_request_inner(
                     shared.metrics.inc_auth_failures();
                     // W2-08: failed credential verdict. CONNECT-only.
                     shared.authn_chain.record_built_in_failed();
-                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                    return Some(refusal_for_req(
+                        frame,
+                        &req,
+                        0x86,
+                        alias_max,
+                        server_max_pkt,
+                    ));
                 }
             } else if let Some(webhook) = shared.webhook.as_ref() {
                 // B5-04: no local user matched and no directory verdict
@@ -1734,7 +1865,13 @@ async fn apply_bind_request_inner(
                     shared.metrics.inc_auth_failures();
                     // W2-08: failed credential verdict. CONNECT-only.
                     shared.authn_chain.record_built_in_failed();
-                    return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                    return Some(refusal_for_req(
+                        frame,
+                        &req,
+                        0x86,
+                        alias_max,
+                        server_max_pkt,
+                    ));
                 }
             } else if kerberos_enabled {
                 // Enabled Kerberos disables the open mode: a credentialed
@@ -1742,7 +1879,13 @@ async fn apply_bind_request_inner(
                 shared.metrics.inc_auth_failures();
                 // W2-08: failed credential verdict. CONNECT-only.
                 shared.authn_chain.record_built_in_failed();
-                return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                return Some(refusal_for_req(
+                    frame,
+                    &req,
+                    0x86,
+                    alias_max,
+                    server_max_pkt,
+                ));
             } else if jwks_enabled {
                 // B5-02: a configured JWKS endpoint disables the open mode
                 // like a directory does. A non-JWT password with no other
@@ -1751,7 +1894,13 @@ async fn apply_bind_request_inner(
                 shared.metrics.inc_auth_failures();
                 // W2-08: failed credential verdict. CONNECT-only.
                 shared.authn_chain.record_built_in_failed();
-                return Some(refusal_for_req(frame, &req, 0x86, alias_max));
+                return Some(refusal_for_req(
+                    frame,
+                    &req,
+                    0x86,
+                    alias_max,
+                    server_max_pkt,
+                ));
             } else {
                 // Open broker: no users, no directory, no database, no webhook, no enabled Kerberos
                 // or JWKS. Fall through to the session resolution below
@@ -1825,7 +1974,7 @@ async fn apply_bind_request_inner(
                     } else {
                         0x8B
                     };
-                    return Some(refusal_for_req(frame, &req, rc, alias_max));
+                    return Some(refusal_for_req(frame, &req, rc, alias_max, server_max_pkt));
                 }
                 // TM-06: per-tenant connection bound. Counts live
                 // sessions in the bind's own tenant only, so one full
@@ -1853,7 +2002,7 @@ async fn apply_bind_request_inner(
                     } else {
                         0x8B
                     };
-                    return Some(refusal_for_req(frame, &req, rc, alias_max));
+                    return Some(refusal_for_req(frame, &req, rc, alias_max, server_max_pkt));
                 }
             } else {
                 // TM-06: anonymous binds carry no username slot, but the
@@ -1874,7 +2023,7 @@ async fn apply_bind_request_inner(
                     } else {
                         0x8B
                     };
-                    return Some(refusal_for_req(frame, &req, rc, alias_max));
+                    return Some(refusal_for_req(frame, &req, rc, alias_max, server_max_pkt));
                 }
             }
             // W2-03: record the successful credentialed CONNECT in the
@@ -1986,7 +2135,7 @@ async fn apply_bind_request_inner(
             } else {
                 0x8B
             };
-            return Some(refusal_for_req(frame, &req, rc, alias_max));
+            return Some(refusal_for_req(frame, &req, rc, alias_max, server_max_pkt));
         }
     }
     let reply = match parsed.clone() {
@@ -1998,7 +2147,7 @@ async fn apply_bind_request_inner(
                 Ok(will) => will,
                 Err(_) => {
                     if req.protocol_version == 5 {
-                        let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR);
+                        let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR, server_max_pkt);
                         return Some(session_binding_reply_with_v5(
                             frame,
                             0,
@@ -2021,7 +2170,7 @@ async fn apply_bind_request_inner(
             // wire. Fail closed with no session created (see the
             // synchronous path for the code-choice rationale).
             if req.protocol_version == 5 && req.receive_maximum == 0 {
-                let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR);
+                let v5 = failure_binding_v5(&req, V5_RC_PROTOCOL_ERROR, server_max_pkt);
                 return Some(session_binding_reply_with_v5(
                     frame,
                     0,
@@ -2094,7 +2243,7 @@ async fn apply_bind_request_inner(
                     present,
                     0,
                     shared.sessions.max_topic_alias(),
-                    &success_binding_v5(granted),
+                    &success_binding_v5(granted, server_max_pkt),
                 )
             } else {
                 session_binding_reply(
@@ -2145,7 +2294,7 @@ async fn apply_bind_request_inner(
                 let v5 = SessionBindingV5 {
                     granted_expiry: 0,
                     server_recv_max: SERVER_V5_RECEIVE_MAXIMUM,
-                    server_max_pkt: SERVER_V5_MAX_PACKET_SIZE,
+                    server_max_pkt,
                     reason: v5_reason_string(V5_RC_PROTOCOL_ERROR)
                         .unwrap_or("Connection refused")
                         .to_string(),
@@ -4772,6 +4921,7 @@ fn cli_overrides(args: &Args, matches: &clap::ArgMatches) -> CliOverrides {
             .then_some(args.webhook_cache_ttl_secs),
         delayed_max_secs: typed("delayed_max_secs").then_some(args.delayed_max_secs),
         topic_alias_maximum: args.topic_alias_maximum,
+        max_packet_size: args.max_packet_size,
         monitor_sample_secs: typed("monitor_sample_secs").then_some(args.monitor_sample_secs),
         tls_verify_client_cert: args.tls_verify_client_cert,
         wss_verify_client_cert: args.wss_verify_client_cert,
@@ -10850,6 +11000,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .sessions
         .set_max_topic_alias(cfg.session.topic_alias_maximum);
+    // P2: apply the configured packet cap to the session manager
+    // before any bind. One atomic store at boot; connections read
+    // it per packet and advertise it in CONNACK. Resolves through
+    // the layers (`session.max_packet_size`).
+    shared
+        .sessions
+        .set_max_packet_size(cfg.session.max_packet_size);
     // TM-08: apply the client-certificate switches before any bind.
     // Off by default keeps handshakes unchanged. On denies binds
     // without a certificate on that listener. Connect only.
@@ -12648,7 +12805,7 @@ mod tests {
         let v5 = decode_session_binding_v5(&reply.metadata).expect("v5 section present");
         assert_eq!(v5.granted_expiry, 3600);
         assert_eq!(v5.server_recv_max, SERVER_V5_RECEIVE_MAXIMUM);
-        assert_eq!(v5.server_max_pkt, SERVER_V5_MAX_PACKET_SIZE);
+        assert_eq!(v5.server_max_pkt, sessions.max_packet_size());
         assert!(v5.reason.is_empty(), "success carries no reason string");
         assert!(
             v5.user_properties.is_empty(),
@@ -12996,7 +13153,7 @@ mod tests {
             user_properties: &[("b", "2"), ("a", "1")],
         });
         let req = decode_bind_meta(&meta).expect("v5 bind decodes");
-        let v5 = super::failure_binding_v5(&req, 0x86);
+        let v5 = super::failure_binding_v5(&req, 0x86, broker_session::DEFAULT_MAX_PACKET_SIZE);
         assert!(!v5.reason.is_empty());
         assert_eq!(
             v5.user_properties,

@@ -829,6 +829,13 @@
           "minimum": 1,
           "type": "integer"
         },
+        "max_packet_size": {
+          "default": 1048576,
+          "description": "Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK.",
+          "maximum": 268435455,
+          "minimum": 1,
+          "type": "integer"
+        },
         "max_qos0_backlog": {
           "default": 1000,
           "description": "Per-subscriber QoS 0 egress backlog bound; past it the oldest queued QoS 0 frame drops.",

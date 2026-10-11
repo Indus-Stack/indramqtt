@@ -73,6 +73,7 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `session.max_qos1_inflight` | integer | `100` | 1..=100000 | Per-session QoS 1 inflight window bound. |
 | `session.max_qos1_spill` | integer | `1000` | 1..=100000 | Per-session QoS 1 spill bound past the window. |
 | `session.topic_alias_maximum` | integer | `10` | 0..=65535 | Inbound topic-alias maximum advertised in CONNACK. |
+| `session.max_packet_size` | integer | `1048576` | 1..=268435455 | Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK. |
 | `session.keep_alive_grace` | number | `1.5` | 1.0..=5.0 | Keep-alive grace multiplier before disconnect. |
 
 ## logging

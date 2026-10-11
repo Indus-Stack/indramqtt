@@ -12,7 +12,7 @@
 
 use super::{
     decode_session_binding_full, detach, handle_inbound_frame_with, merge_egress_batch,
-    BindRequest, BindWill, Shared, SERVER_V5_MAX_PACKET_SIZE,
+    BindRequest, BindWill, Shared,
 };
 use async_trait::async_trait;
 use broker_protocol::wire::{self, kind, ConnackProperties, PublishOut, WireError};
@@ -48,9 +48,11 @@ const EGRESS_BATCH_BYTES: usize = 64 * 1024;
 /// Largest CONNECT packet. A client that is not authenticated yet must
 /// not make the broker keep more than this.
 const MAX_CONNECT_PACKET_BYTES: usize = 64 * 1024;
-/// Largest packet from a connected client. It becomes a setting of the
-/// configuration before this path ships.
-const MAX_PACKET_BYTES: usize = 1024 * 1024;
+/// Fallback packet cap when the session manager reports none.
+/// Reason: keeps one connection bounded near 1 MiB even if the
+/// manager value is missing; the configured `session.max_packet_size`
+/// sets the real limit at boot.
+const FALLBACK_MAX_PACKET_BYTES: usize = 1024 * 1024;
 /// A write to a client that does not read must end in this time. The
 /// connection then closes, thus a stalled client cannot keep its
 /// queues and its session for an unlimited time.
@@ -871,9 +873,6 @@ pub(super) async fn serve_native_mqtt_psk(
     }
 }
 
-/// WebSocket frame and message bound in bytes.
-/// Reason: matches the MQTT packet bound, so one peer cannot grow memory.
-const MAX_WS_FRAME_BYTES: usize = MAX_PACKET_BYTES;
 /// Largest number of queued WebSocket pongs on one connection.
 /// Reason: a peer sends Ping frames without reading. Four queued
 /// pongs use at most 500 bytes and cover a burst while the sink waits.
@@ -882,17 +881,29 @@ const MAX_QUEUED_PONGS: usize = 4;
 /// Reason: keeps the tungstenite WebSocketConfig default of 128 KiB, so small frames share one write.
 const WS_WRITE_BUFFER_BYTES: usize = 128 * 1024;
 
-/// Builds the WebSocket bound config.
-/// The frame bound matches the MQTT packet bound.
-fn ws_bound_config() -> WebSocketConfig {
+/// Builds the WebSocket bound config for one cap.
+/// The frame bound matches the MQTT packet bound, so one peer cannot
+/// grow memory past the configured `session.max_packet_size`.
+fn ws_bound_config(cap: usize) -> WebSocketConfig {
     WebSocketConfig {
         write_buffer_size: WS_WRITE_BUFFER_BYTES,
-        max_write_buffer_size: MAX_WS_FRAME_BYTES,
-        max_message_size: Some(MAX_WS_FRAME_BYTES),
-        max_frame_size: Some(MAX_WS_FRAME_BYTES),
+        max_write_buffer_size: cap,
+        max_message_size: Some(cap),
+        max_frame_size: Some(cap),
         accept_unmasked_frames: false,
         ..WebSocketConfig::default()
     }
+}
+
+/// Reads the configured packet cap of one shared state.
+/// Falls back to the documented default when the manager reports
+/// zero, so one connection stays bounded in tests that skip boot.
+fn packet_cap(shared: &Shared) -> usize {
+    let cap = shared.sessions.max_packet_size();
+    if cap == 0 {
+        return FALLBACK_MAX_PACKET_BYTES;
+    }
+    (cap as usize).min(broker_session::MAX_PACKET_SIZE_WIRE as usize)
 }
 
 /// Checks the WebSocket upgrade request.
@@ -981,6 +992,7 @@ pub(super) async fn serve_native_ws(
         let _ = stream.set_nodelay(true);
         let shared = shared.clone();
         let path = path.clone();
+        let cap = packet_cap(&shared);
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         let accepted_at = Instant::now();
         tokio::spawn(async move {
@@ -990,7 +1002,7 @@ pub(super) async fn serve_native_ws(
                 tokio_tungstenite::accept_hdr_async_with_config(
                     stream,
                     |req: &Request, resp: Response| ws_upgrade_answer(req, &path, resp),
-                    Some(ws_bound_config()),
+                    Some(ws_bound_config(cap)),
                 ),
             )
             .await
@@ -1008,7 +1020,7 @@ pub(super) async fn serve_native_ws(
                     return;
                 }
             };
-            let io = WsIo::new(ws);
+            let io = WsIo::new(ws, cap);
             if let Err(e) = run_connection(
                 io,
                 peer.ip().to_string(),
@@ -1064,6 +1076,7 @@ pub(super) async fn serve_native_wss(
         let shared = shared.clone();
         let acceptor = acceptor.clone();
         let path = path.clone();
+        let cap = packet_cap(&shared);
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         let accepted_at = Instant::now();
         tokio::spawn(async move {
@@ -1092,7 +1105,7 @@ pub(super) async fn serve_native_wss(
                 tokio_tungstenite::accept_hdr_async_with_config(
                     tls,
                     |req: &Request, resp: Response| ws_upgrade_answer(req, &path, resp),
-                    Some(ws_bound_config()),
+                    Some(ws_bound_config(cap)),
                 ),
             )
             .await
@@ -1113,7 +1126,7 @@ pub(super) async fn serve_native_wss(
                     return;
                 }
             };
-            let io = WsIo::new(ws);
+            let io = WsIo::new(ws, cap);
             if let Err(e) = run_connection(
                 io,
                 peer.ip().to_string(),
@@ -1139,6 +1152,8 @@ pub(super) async fn serve_native_wss(
 struct WsIo<S> {
     /// The WebSocket stream. It yields messages and takes replies.
     inner: S,
+    /// Largest accepted binary frame in bytes. Matches the MQTT cap.
+    max_frame_bytes: usize,
     /// Binary bytes not yet read by the MQTT layer.
     pending_in: BytesMut,
     /// MQTT bytes not yet sent as a binary frame.
@@ -1148,10 +1163,11 @@ struct WsIo<S> {
 }
 
 impl<S> WsIo<S> {
-    /// Wraps a WebSocket stream as a byte transport.
-    fn new(inner: S) -> Self {
+    /// Wraps a WebSocket stream as a byte transport with one frame cap.
+    fn new(inner: S, max_frame_bytes: usize) -> Self {
         Self {
             inner,
+            max_frame_bytes,
             pending_in: BytesMut::new(),
             pending_out: Vec::new(),
             pending_pong: Vec::new(),
@@ -1245,7 +1261,7 @@ where
                         if data.is_empty() {
                             continue;
                         }
-                        if data.len() > MAX_WS_FRAME_BYTES {
+                        if data.len() > this.max_frame_bytes {
                             return Poll::Ready(Err(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionAborted,
                                 "websocket frame is too large",
@@ -2104,12 +2120,21 @@ async fn drain_inbound(
             return Ok(None);
         };
         let limit = if conn.connected {
-            MAX_PACKET_BYTES.min(SERVER_V5_MAX_PACKET_SIZE as usize)
+            packet_cap(shared)
         } else {
             MAX_CONNECT_PACKET_BYTES
         };
         if header.packet_len() > limit {
-            return Err(WireError::Unsupported("packet is too large"));
+            // P2: an oversize packet closes only this connection. A v5
+            // client gets DISCONNECT 0x95 first. The close still counts
+            // as abnormal, so the will fires.
+            // TODO(parity): the rulebook does not decide whether the
+            // will fires on a size refusal. Current choice keeps the
+            // abnormal close, so the will fires.
+            if conn.level == 5 {
+                wire::encode_disconnect_v5(0x95, &mut sink.out.lock());
+            }
+            return Ok(Some(Stop::Abnormal));
         }
         if inbuf.len() < header.packet_len() {
             inbuf.reserve(header.packet_len() - inbuf.len());
@@ -3122,7 +3147,7 @@ mod tests {
         );
         big_client
             .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
-                vec![0u8; MAX_PACKET_BYTES + 1],
+                vec![0u8; FALLBACK_MAX_PACKET_BYTES + 1],
             ))
             .await
             .expect("big frame sends");
@@ -4587,6 +4612,404 @@ mod tests {
         let port = psk_test_listener(shared, empty).await;
         let denied = psk_test_dial(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
         assert!(denied.is_err(), "empty store denies");
+    }
+
+    /// Builds an MQTT 5 CONNECT packet with no properties.
+    fn p2_v5_connect(client_id: &str) -> Vec<u8> {
+        let mut body = vec![
+            0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3C, 0x00,
+        ];
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id.as_bytes());
+        let mut packet = vec![0x10];
+        broker_protocol::wire::encode_varint(body.len() as u32, &mut packet);
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Builds an MQTT 5 QoS 0 PUBLISH packet with no properties.
+    fn p2_v5_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(topic.as_bytes());
+        body.push(0x00);
+        body.extend_from_slice(payload);
+        let mut packet = vec![0x30];
+        broker_protocol::wire::encode_varint(body.len() as u32, &mut packet);
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Builds an MQTT 3.1.1 QoS 0 PUBLISH packet.
+    fn p2_v4_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(topic.as_bytes());
+        body.extend_from_slice(payload);
+        let mut packet = vec![0x30];
+        broker_protocol::wire::encode_varint(body.len() as u32, &mut packet);
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Builds a v5 PUBLISH whose full packet is exactly `cap + 1`
+    /// bytes. Grows the payload until the packet hits the size.
+    fn p2_exact_oversize_v5(topic: &str, cap: usize) -> Vec<u8> {
+        let mut len = 0usize;
+        loop {
+            let payload = vec![0xABu8; len];
+            let packet = p2_v5_publish(topic, &payload);
+            if packet.len() == cap + 1 {
+                return packet;
+            }
+            assert!(packet.len() < cap + 1, "packet jumps past cap + 1");
+            len += 1;
+        }
+    }
+
+    /// Builds a v4 PUBLISH whose full packet is exactly `cap + 1`
+    /// bytes. Grows the payload until the packet hits the size.
+    fn p2_exact_oversize_v4(topic: &str, cap: usize) -> Vec<u8> {
+        let mut len = 0usize;
+        loop {
+            let payload = vec![0xABu8; len];
+            let packet = p2_v4_publish(topic, &payload);
+            if packet.len() == cap + 1 {
+                return packet;
+            }
+            assert!(packet.len() < cap + 1, "packet jumps past cap + 1");
+            len += 1;
+        }
+    }
+
+    /// Reads one full MQTT packet from a TCP stream.
+    /// Handles multi-byte remaining lengths for large packets.
+    async fn p2_tcp_recv_full(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = Vec::new();
+        loop {
+            let header = broker_protocol::wire::fixed_header(&buf).expect("header parses");
+            if let Some(header) = header {
+                let need = header.packet_len();
+                while buf.len() < need {
+                    let mut chunk = vec![0u8; need - buf.len()];
+                    tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut chunk))
+                        .await
+                        .expect("body in time")
+                        .expect("socket stays open");
+                    buf.extend_from_slice(&chunk);
+                }
+                return buf;
+            }
+            let mut one = [0u8; 1];
+            tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut one))
+                .await
+                .expect("header in time")
+                .expect("socket stays open");
+            buf.push(one[0]);
+        }
+    }
+
+    /// Reads the Maximum Packet Size (property 39) of a v5 CONNACK.
+    /// Returns `None` when the property is absent.
+    fn p2_connack_max_packet(packet: &[u8]) -> Option<u32> {
+        let header = broker_protocol::wire::fixed_header(packet).ok()??;
+        let body = &packet[header.header_len..];
+        if body.len() < 3 {
+            return None;
+        }
+        let mut cursor = &body[2..];
+        let (prop_len, used) = broker_protocol::wire::decode_varint(cursor).ok()??;
+        cursor = &cursor[used..];
+        if cursor.len() < prop_len as usize {
+            return None;
+        }
+        let mut props = &cursor[..prop_len as usize];
+        while !props.is_empty() {
+            let id = props[0];
+            props = &props[1..];
+            match id {
+                17 => {
+                    props = props.get(4..)?;
+                }
+                33 | 34 => {
+                    props = props.get(2..)?;
+                }
+                39 => {
+                    let value = u32::from_be_bytes(props.get(..4)?.try_into().ok()?);
+                    return Some(value);
+                }
+                18 | 31 => {
+                    if props.len() < 2 {
+                        return None;
+                    }
+                    let len = u16::from_be_bytes([props[0], props[1]]) as usize;
+                    props = props.get(2 + len..)?;
+                }
+                38 => {
+                    for _ in 0..2 {
+                        if props.len() < 2 {
+                            return None;
+                        }
+                        let len = u16::from_be_bytes([props[0], props[1]]) as usize;
+                        props = props.get(2 + len..)?;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Asserts that a TCP stream closes soon after the read bytes.
+    async fn p2_assert_closed(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt as _;
+        let mut one = [0u8; 1];
+        let end = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut one)).await;
+        match end {
+            Ok(Ok(0)) => {}
+            Ok(Ok(_)) => panic!("socket must close, got a byte"),
+            Ok(Err(_)) => {}
+            Err(_) => panic!("socket must close in time"),
+        }
+    }
+
+    /// Starts one TCP listener on one [`Shared`]. Returns the port.
+    /// The task runs until the test aborts it.
+    async fn p2_tcp_listener(shared: Shared) -> u16 {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("tcp binds");
+        let port = tcp.local_addr().expect("tcp addr").port();
+        tokio::spawn(async move {
+            serve_native_mqtt(tcp, Some(1000), Arc::new(AtomicU64::new(0)), shared).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// CONNACK advertises the configured cap. Goes through the broker.
+    /// The default cap is 1 MiB. A set cap replaces it exactly.
+    #[tokio::test]
+    async fn max_packet_size_connack_advertises_configured_cap() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        assert_eq!(shared.sessions.max_packet_size(), 1_048_576);
+        let port = p2_tcp_listener(shared).await;
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        client
+            .write_all(&p2_v5_connect("p2-default-cap"))
+            .await
+            .expect("CONNECT sends");
+        let connack = p2_tcp_recv_full(&mut client).await;
+        assert_eq!(
+            p2_connack_max_packet(&connack),
+            Some(1_048_576),
+            "default CONNACK advertises 1 MiB"
+        );
+
+        let capped = Shared::new();
+        capped.sessions.set_max_packet_size(2048);
+        let port = p2_tcp_listener(capped).await;
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        client
+            .write_all(&p2_v5_connect("p2-custom-cap"))
+            .await
+            .expect("CONNECT sends");
+        let connack = p2_tcp_recv_full(&mut client).await;
+        assert_eq!(
+            p2_connack_max_packet(&connack),
+            Some(2048),
+            "CONNACK advertises the set cap"
+        );
+    }
+
+    /// An oversize PUBLISH closes the connection. Goes through the
+    /// broker. A v5 client gets DISCONNECT 0x95 first. A v4 client
+    /// gets no packet. The broker serves the next client.
+    #[tokio::test]
+    async fn max_packet_size_oversize_publish_closes_with_0x95() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        shared.sessions.set_max_packet_size(2048);
+        let port = p2_tcp_listener(shared).await;
+
+        let mut v5 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v5.write_all(&p2_v5_connect("p2-v5-big"))
+            .await
+            .expect("CONNECT sends");
+        let connack = p2_tcp_recv_full(&mut v5).await;
+        assert_eq!(p2_connack_max_packet(&connack), Some(2048));
+        v5.write_all(&p2_exact_oversize_v5("p2/big", 2048))
+            .await
+            .expect("PUBLISH sends");
+        let refused = p2_tcp_recv_full(&mut v5).await;
+        assert_eq!(refused, vec![0xE0, 0x01, 0x95], "v5 gets DISCONNECT 0x95");
+        p2_assert_closed(&mut v5).await;
+
+        let mut v4 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v4.write_all(&ws_test_connect("p2-v4-big"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut v4).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "v4 CONNACK accepts"
+        );
+        v4.write_all(&p2_exact_oversize_v4("p2/big", 2048))
+            .await
+            .expect("PUBLISH sends");
+        p2_assert_closed(&mut v4).await;
+
+        let mut fresh = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        fresh
+            .write_all(&ws_test_connect("p2-fresh"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut fresh).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "broker stays up"
+        );
+    }
+
+    /// The file entry drives the socket behaviour. Goes through the
+    /// broker. Loads `session.max_packet_size` from `indra.toml`,
+    /// applies it like boot does, then observes it on the socket.
+    #[tokio::test]
+    async fn max_packet_size_from_file_applies_to_socket() {
+        use tokio::io::AsyncWriteExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "indra-p2-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("config dir forms");
+        std::fs::write(
+            dir.join("indra.toml"),
+            "[session]\nmax_packet_size = 4096\n",
+        )
+        .expect("config writes");
+        let layered = broker_config::load_layered(&dir, &broker_config::CliOverrides::default())
+            .expect("config loads");
+        assert_eq!(layered.config().session.max_packet_size, 4096);
+        let shared = Shared::new();
+        shared
+            .sessions
+            .set_max_packet_size(layered.config().session.max_packet_size);
+        let port = p2_tcp_listener(shared).await;
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        client
+            .write_all(&p2_v5_connect("p2-file-cap"))
+            .await
+            .expect("CONNECT sends");
+        let connack = p2_tcp_recv_full(&mut client).await;
+        assert_eq!(
+            p2_connack_max_packet(&connack),
+            Some(4096),
+            "file cap shows in CONNACK"
+        );
+        client
+            .write_all(&p2_exact_oversize_v5("p2/file", 4096))
+            .await
+            .expect("PUBLISH sends");
+        let refused = p2_tcp_recv_full(&mut client).await;
+        assert_eq!(refused, vec![0xE0, 0x01, 0x95], "file cap refuses");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 3 MiB publish flows at a 4 MiB cap. Goes through the broker.
+    /// One TCP subscriber and one WS subscriber both get the bytes.
+    #[tokio::test]
+    async fn max_packet_size_large_publish_delivers_over_tcp_and_ws() {
+        use futures::SinkExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        shared.sessions.set_max_packet_size(4 * 1024 * 1024);
+        let (tcp_port, ws_port) = ws_test_listeners(shared).await;
+
+        let mut tcp_sub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_sub
+            .write_all(&ws_test_connect("p2-tcp-sub"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_sub
+            .write_all(&ws_test_subscribe(1, "p2/big"))
+            .await
+            .expect("SUBSCRIBE sends");
+        assert_eq!(tcp_test_recv(&mut tcp_sub).await[0], 0x90, "SUBACK answers");
+
+        let mut ws_sub = ws_test_dial(ws_port).await;
+        ws_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_connect("p2-ws-sub"),
+            ))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut ws_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        ws_sub
+            .send(tokio_tungstenite::tungstenite::protocol::Message::Binary(
+                ws_test_subscribe(1, "p2/big"),
+            ))
+            .await
+            .expect("ws SUBSCRIBE sends");
+        assert_eq!(
+            ws_test_recv(&mut ws_sub).await[0],
+            0x90,
+            "ws SUBACK answers"
+        );
+
+        let payload = vec![0x5Au8; 3 * 1024 * 1024];
+        let mut pub_client = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        pub_client
+            .write_all(&ws_test_connect("p2-pub"))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut pub_client).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "pub CONNACK accepts"
+        );
+        pub_client
+            .write_all(&p2_v4_publish("p2/big", &payload))
+            .await
+            .expect("PUBLISH sends");
+        let tcp_got = p2_tcp_recv_full(&mut tcp_sub).await;
+        assert_eq!(
+            tcp_got.len(),
+            payload.len() + 13,
+            "TCP gets the full publish"
+        );
+        assert!(tcp_got.ends_with(&payload[..]), "TCP payload intact");
+        let ws_got = ws_test_recv(&mut ws_sub).await;
+        assert_eq!(ws_got.len(), payload.len() + 13, "WS gets the full publish");
+        assert!(ws_got.ends_with(&payload[..]), "WS payload intact");
     }
 
     /// Identities from a keys file connect through the broker.

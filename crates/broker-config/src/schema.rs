@@ -667,6 +667,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
             FieldDoc { path: "session.max_qos1_inflight", setting_type: "usize", default: "100", range: "1..=100000", doc: "Per-session QoS 1 inflight window bound." },
             FieldDoc { path: "session.max_qos1_spill", setting_type: "usize", default: "1000", range: "1..=100000", doc: "Per-session QoS 1 spill bound past the window." },
             FieldDoc { path: "session.topic_alias_maximum", setting_type: "u16", default: "10", range: "0..=65535", doc: "Inbound topic-alias maximum advertised in CONNACK." },
+            FieldDoc { path: "session.max_packet_size", setting_type: "u32", default: "1048576", range: "1..=268435455", doc: "Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK." },
             FieldDoc { path: "rules_engine.spill_dir", setting_type: "string", default: "\"\"", range: "empty or directory path", doc: "Rule ingress spill directory." },
             FieldDoc { path: "delayed.max_secs", setting_type: "u64", default: "86400", range: "1..=86400", doc: "Upper bound for delayed deferrals in seconds." },
             FieldDoc { path: "observability.monitor_sample_secs", setting_type: "u64", default: "10", range: "0..=3600", doc: "Monitor sampling interval in seconds." },
@@ -1537,6 +1538,11 @@ pub struct SessionConf {
     /// Inbound topic-alias maximum advertised in CONNACK. Default 10; 0 disables inbound aliases.
     #[serde(default = "default_topic_alias_maximum")]
     pub topic_alias_maximum: u16,
+    /// Largest MQTT packet in bytes. Sets the TCP/TLS read limit and the
+    /// WS frame cap. Advertised in CONNACK. Default 1 MiB matches the
+    /// documented server limit; 268435455 is the wire ceiling.
+    #[serde(default = "default_max_packet_size")]
+    pub max_packet_size: u32,
     /// Keep-alive grace multiplier before disconnect.
     #[serde(default = "default_keep_alive_grace")]
     pub keep_alive_grace: f64,
@@ -1560,6 +1566,13 @@ fn default_qos1_spill() -> usize {
 // aliases.
 fn default_topic_alias_maximum() -> u16 {
     10
+}
+
+// Reason: 1 MiB matches the documented server limit and bounds one
+// connection near 1 MiB of read buffer plus one frame; 268435455 is the
+// wire ceiling for the range top.
+fn default_max_packet_size() -> u32 {
+    1_048_576
 }
 
 // Reason: one day covers durable sessions without pinning state forever;
@@ -1598,6 +1611,7 @@ impl Default for SessionConf {
             max_qos1_inflight: default_qos1_inflight_window(),
             max_qos1_spill: default_qos1_spill(),
             topic_alias_maximum: default_topic_alias_maximum(),
+            max_packet_size: default_max_packet_size(),
             keep_alive_grace: default_keep_alive_grace(),
         }
     }
@@ -1642,6 +1656,12 @@ impl SessionConf {
             u64::from(self.topic_alias_maximum),
             0,
             65_535,
+        )?;
+        check_range_u64(
+            "session.max_packet_size",
+            u64::from(self.max_packet_size),
+            1,
+            268_435_455,
         )?;
         if !(1.0..=5.0).contains(&self.keep_alive_grace) {
             return Err(invalid(
@@ -3198,6 +3218,13 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     65_535,
                     "Inbound topic-alias maximum advertised in CONNACK.",
                 ),
+                int_field(
+                    "max_packet_size",
+                    1_048_576,
+                    1,
+                    268_435_455,
+                    "Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK.",
+                ),
                 num_field(
                     "keep_alive_grace",
                     1.5,
@@ -4103,6 +4130,24 @@ mod tests {
         let mut cert = BrokerConfig::default();
         cert.listeners.tls.enabled = true;
         assert!(cert.validate().is_err(), "certificate needs files");
+    }
+
+    #[test]
+    fn schema_max_packet_size_default_is_bounded() {
+        // The packet cap default is 1 MiB with a finite wire-ceiling
+        // range. Through-the-broker proof lives in the kernel
+        // listener tests (connect, publish, deliver through sockets).
+        let config = BrokerConfig::default();
+        config.validate().expect("defaults validate");
+        assert_eq!(config.session.max_packet_size, 1_048_576);
+        let toml_text = config.to_toml().expect("defaults serialise");
+        let reparsed = BrokerConfig::parse_toml(&toml_text).expect("defaults round-trip");
+        assert_eq!(reparsed.session.max_packet_size, 1_048_576);
+        let parsed = BrokerConfig::parse_toml("[session]\nmax_packet_size = 4096\n")
+            .expect("packet size parses");
+        assert_eq!(parsed.session.max_packet_size, 4096);
+        let bad = BrokerConfig::parse_toml("[session]\nmax_packet_size = 0\n");
+        assert!(bad.is_err() || bad.is_ok_and(|c| c.validate().is_err()));
     }
 
     #[test]

@@ -480,6 +480,37 @@ fn connack5_has(body: &[u8], prop_id: usize) -> bool {
     false
 }
 
+/// Gets the Maximum Packet Size of a CONNACK.
+/// Returns None when the property is absent.
+fn connack5_max_packet(body: &[u8]) -> Option<u32> {
+    let (prop_len, used) = decode_varint(&body[2..]).expect("property length");
+    let mut props = &body[2 + used..][..prop_len];
+    while !props.is_empty() {
+        let (id, used) = decode_varint(props).expect("property id");
+        props = &props[used..];
+        if id == 39 {
+            let value = u32::from_be_bytes([props[0], props[1], props[2], props[3]]);
+            return Some(value);
+        }
+        match id {
+            17 | 39 => props = &props[4..],
+            33 | 34 => props = &props[2..],
+            18 | 28 | 31 => {
+                let len = u16::from_be_bytes([props[0], props[1]]) as usize;
+                props = &props[2 + len..];
+            }
+            38 => {
+                for _ in 0..2 {
+                    let len = u16::from_be_bytes([props[0], props[1]]) as usize;
+                    props = &props[2 + len..];
+                }
+            }
+            _ => panic!("unexpected CONNACK property {id}"),
+        }
+    }
+    None
+}
+
 /// Decodes one variable byte integer into value plus bytes used.
 fn decode_varint(mut bytes: &[u8]) -> Option<(usize, usize)> {
     let mut value = 0usize;
@@ -1168,11 +1199,7 @@ async fn lc_receive_maximum_sheds_above_window() {
     kernel.finish().await;
 }
 
-/// An oversize publish closes the connection. The CONNACK advertises a
-/// maximum packet size.
-/// TODO(parity): the rulebook does not decide the cap value or the v5
-/// 0x95 reply; the setting of step P2 is still missing, so this test
-/// documents the fixed 1 MiB cap only.
+/// An oversize publish closes the connection. The CONNACK advertises the cap.
 #[tokio::test]
 async fn lc_max_packet_size_documents_fixed_cap() {
     let kernel = spawn_kernel("max-packet", None).await;
@@ -1180,7 +1207,11 @@ async fn lc_max_packet_size_documents_fixed_cap() {
     send(&mut sub, &connect5("lc-maxpkt-sub", true, 60, 0)).await;
     let (head, body) = recv(&mut sub).await;
     assert_eq!(head & 0xF0, 0x20);
-    assert!(connack5_has(&body, 39), "CONNACK advertises a maximum size");
+    assert_eq!(
+        connack5_max_packet(&body),
+        Some(1_048_576),
+        "CONNACK advertises the cap"
+    );
 
     let mut big = dial(kernel.mqtt_port).await;
     send(&mut big, &connect5("lc-maxpkt-big", true, 60, 0)).await;
@@ -1188,13 +1219,19 @@ async fn lc_max_packet_size_documents_fixed_cap() {
     assert_eq!(head & 0xF0, 0x20);
     let payload = vec![0x41u8; 1024 * 1024 + 64];
     // A broken pipe already proves the close.
-    // Reason: the broker may close while the large write is in flight.
+    // Reason: the broker closes while the large write is in flight.
     let oversize = publish5("lc/maxpkt/big", 0, 0, false, None, &payload);
     let _ = tokio::time::timeout(STEP, big.write_all(&oversize)).await;
+    let refused = tokio::time::timeout(STEP, read_mqtt_packet(&mut big))
+        .await
+        .expect("refusal arrives in time")
+        .expect("refusal reads");
+    assert_eq!(refused.0, 0xE0, "oversize gets DISCONNECT");
+    assert_eq!(refused.1, vec![0x95], "reason is 0x95");
     let closed = tokio::time::timeout(STEP, read_mqtt_packet(&mut big)).await;
     assert!(
         closed.is_err() || matches!(&closed, Ok(Err(_))),
-        "oversize publish closes"
+        "socket closes after DISCONNECT"
     );
 
     let mut live = dial(kernel.mqtt_port).await;

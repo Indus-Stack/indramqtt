@@ -498,6 +498,16 @@ pub enum InflightTrackOutcome {
 /// and no alias is ever assigned on delivery).
 pub const DEFAULT_TOPIC_ALIAS_MAXIMUM: u16 = 10;
 
+/// Default largest MQTT packet in bytes (P2): 1048576 (1 MiB).
+/// Reason: 1 MiB matches the documented server limit and bounds one
+/// connection near 1 MiB of read buffer plus one frame. Configurable
+/// per manager via [`SessionManager::set_max_packet_size`].
+pub const DEFAULT_MAX_PACKET_SIZE: u32 = 1_048_576;
+
+/// Wire ceiling for one MQTT packet: 268435455, the MQTT Remaining
+/// Length maximum. Reason: a larger frame cannot arrive as one packet.
+pub const MAX_PACKET_SIZE_WIRE: u32 = 268_435_455;
+
 /// Maximum alias value the tables can ever index (wire `u16` range).
 pub const MAX_TOPIC_ALIAS_VALUE: u16 = u16::MAX;
 
@@ -1860,6 +1870,9 @@ pub struct SessionManager {
     /// after the last set (B4-05). One relaxed atomic load per new
     /// session; never touched on the publish fast path.
     max_topic_alias: AtomicU16,
+    /// Largest MQTT packet in bytes (P2). One relaxed atomic load per
+    /// new connection; never touched on the publish fast path.
+    max_packet_size: std::sync::atomic::AtomicU32,
     /// Durable backing for every detached offline queue (B4-06, T-93).
     /// `None` (the default) keeps memory-only queues exactly as before.
     /// The kernel installs one store at boot (see
@@ -1938,6 +1951,7 @@ impl SessionManager {
             max_qos1_inflight: AtomicUsize::new(max_qos1_inflight.max(1)),
             max_qos1_spill: AtomicUsize::new(max_qos1_spill.max(1)),
             max_topic_alias: AtomicU16::new(DEFAULT_TOPIC_ALIAS_MAXIMUM),
+            max_packet_size: std::sync::atomic::AtomicU32::new(DEFAULT_MAX_PACKET_SIZE),
             offline_store: RwLock::new(None),
         }
     }
@@ -2132,6 +2146,19 @@ impl SessionManager {
     /// empty until CONNECT carries the client's maximum.
     pub fn apply_topic_alias_limits(&self, session: &Arc<Session>) {
         session.set_inbound_alias_max(self.max_topic_alias());
+    }
+
+    /// Largest MQTT packet in bytes (default [`DEFAULT_MAX_PACKET_SIZE`]).
+    pub fn max_packet_size(&self) -> u32 {
+        self.max_packet_size.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Override the largest MQTT packet for connections after this call.
+    /// Values above the wire ceiling clamp to the ceiling; the code
+    /// never stores an unbounded value.
+    pub fn set_max_packet_size(&self, max: u32) {
+        self.max_packet_size
+            .store(max.clamp(1, MAX_PACKET_SIZE_WIRE), Ordering::Relaxed);
     }
 
     /// Sessions held in one tenant (live plus detached with state).
