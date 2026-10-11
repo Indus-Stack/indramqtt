@@ -7,10 +7,16 @@ scenario says otherwise.
 ## Method
 
 - Each scenario starts a fresh broker in a container. The container
-  has 4 pinned cores (`0-3`), 8 GiB of memory and the host network.
-- Load generators run in other containers on other cores. Publishers
-  run on `4-9,21-24`. Subscribers run on `10-17,19`.
-- The latency probe runs on core `20` alone. It sends 1000 msg/s in
+  has 4 pinned cores, 8 GiB of memory and the host network.
+- The suite reads permitted cores from
+  `/sys/fs/cgroup/cpuset.cpus.effective`. It falls back to process
+  affinity. It gives the first 4 cores to the broker, 1 core to the
+  probe, and splits the rest in two equal parts for publishers and
+  subscribers. It stops when fewer than 10 cores are permitted.
+  Override each part with `BENCH_BROKER_CPUS`, `BENCH_PUB_CPUS`,
+  `BENCH_SUB_CPUS` and   `BENCH_PROBE_CPUS`.
+- Load generators run in other containers on other cores.
+- The latency probe runs on its own core. It sends 1000 msg/s in
   total (20 pairs, 50 msg/s per pair). It records end-to-end latency
   in a histogram. It shows the latency under the main load.
 - Subscribers connect first. They stay for all steps. Each step starts
@@ -37,6 +43,28 @@ scenario says otherwise.
   times the fan-out.
 - The recommended load is the step with CPU nearest 75 percent. Steps
   with a limit flag or delivery below 90 percent do not count.
+- The broker runs from `debian:bookworm-slim` as one native binary.
+  A failed `docker run` stops the run with the stderr text.
+- Each generator VM sets `+S` to the core count of its cpuset. It sets
+  `+S 4` at most when a scenario starts more than 4 VMs. It keeps
+  `+sbwt none`.
+- The suite removes all containers with label `purpose=benchmark-temp`
+  on exit. It also kills the probe. It runs in its own process group.
+
+## Guards
+
+Each step has three guards:
+
+- Time limit: each step stops after `step_secs + 120` s. The suite
+  kills the generators, the probe and the broker containers. It writes
+  a result line with `"error": "step timeout"`. It continues with the
+  next scenario.
+- Host overload: the sampler reads `/proc/loadavg`. It stops the step
+  when the 1-minute load exceeds 3 times the permitted core count for
+  30 s. It writes `"error": "host overload"` and continues.
+- Subscriber connect: fan-in starts each subscriber group in sequence.
+  It waits for the subscription count through the broker API. It stops
+  with an error line when the groups do not connect in 60 s.
 
 ## Pass rule
 
@@ -75,7 +103,7 @@ is delivery below 90 percent or a stopped broker.
 | --- | --- |
 | `s1-qos0`, `s1-qos1`, `s1-qos2` | 1000 publishers, 1000 subscribers, 1000 topics, rising rate |
 | `s2-payload` | 20000 msg/s inbound, QoS 1, sizes 128 B, 1 KiB, 4 KiB, 8 KiB (`--rates` lists sizes) |
-| `s3-fanin` | 2000 publishers, 1000 subscribers in shared groups of 5; QoS 1 |
+| `s3-fanin` | 2000 publishers, 100 subscribers in 20 shared groups of 5; QoS 1 |
 | `s3-fanout` | 10 publishers, 2000 subscribers, 200 per topic; QoS 1; `--rates` is inbound rate |
 
 ## Bridging across two brokers (planned, not built)
@@ -91,14 +119,20 @@ for the product link. It does not test bridging today.
 
 ## Run the suite
 
-Set the generator image first. The default is a placeholder:
+Set the generator settings first. The suite has no default:
 
 ```bash
-export LOADGEN_IMAGE=mqtt-loadgen:latest
-export LOADGEN_BIN=/loadgen/bin/loadgen
+export LOADGEN_IMAGE=<generator-image>
+export LOADGEN_BIN=<generator-binary>
 bash benchmark/suite/build-probe.sh
-bash benchmark/suite/run_all.sh <commit> /tmp/bench-out
+bash benchmark/suite/run_all.sh <source-dir> <commit-label> /tmp/bench-out
 ```
+
+`run_all.sh` builds the probe when `bin/latency-probe` is absent.
+It builds the broker with `rust:1.96-bookworm` and a named cargo
+registry volume. It pins the build to the cores that the broker does
+not use. It uses `<outdir>/target` and deletes it after the copy.
+It stops when the build fails and prints the last 40 lines.
 
 Each step lasts 300 s by default. A full run takes many hours. Use
 `--step-secs 40 --warm 10 --rates ...` for short diagnosis runs only.
@@ -116,6 +150,4 @@ cd benchmark/suite && python3 -m unittest
 - The generator shares the machine with the broker.
 - The probe adds 1000 msg/s. The suite subtracts it.
 - Latency covers probe pairs only.
-- The CPU layout fits one machine shape. Override it with
-  `BENCH_BROKER_CPUS`, `BENCH_PUB_CPUS`, `BENCH_SUB_CPUS` and
-  `BENCH_PROBE_CPUS`.
+- The suite needs at least 10 permitted cores.

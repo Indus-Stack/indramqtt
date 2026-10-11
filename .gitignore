@@ -33,3 +33,4 @@ Thumbs.db
 # Dashboard folder (ignored as of now)
 /dashboard/
 __pycache__/
+benchmark/suite/__pycache__/

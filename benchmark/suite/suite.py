@@ -28,36 +28,149 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from cpu_layout import format_cpu_list, parse_cpu_list
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LABEL = "purpose=benchmark-temp"
-# TODO(parity): default generator image is a placeholder. The host sets
-# the real image with --bench-image. Which default is correct?
-DEFAULT_LOADGEN_IMAGE = os.environ.get("LOADGEN_IMAGE", "mqtt-loadgen:latest")
-DEFAULT_LOADGEN_BIN = os.environ.get("LOADGEN_BIN", "/loadgen/bin/loadgen")
-BROKER_IMAGE = "erlang:27"
-GEN_RUNTIME_FLAGS = "+sbwt none +sbwtdcpu none +sbwtdio none"
+BROKER_IMAGE = "debian:bookworm-slim"
+GEN_RUNTIME_BASE = "+sbwt none +sbwtdcpu none +sbwtdio none"
 ADMIN_PW = "Adm1n-test-pass!"
 API = "http://127.0.0.1:%d/api/v5"
 PAYLOAD_DEFAULT = 128
-
-# CPU layout of the test machine (24 cores, core 18 absent).
-# TODO(parity): this layout fits one machine only. What layout fits
-# other machines? Env vars below override each entry.
-CPUS = {
-    "broker": os.environ.get("BENCH_BROKER_CPUS", "0-3"),
-    "pub": os.environ.get("BENCH_PUB_CPUS", "4-9,21-24"),
-    "sub": os.environ.get("BENCH_SUB_CPUS", "10-17,19"),
-    "probe": os.environ.get("BENCH_PROBE_CPUS", "20"),
-}
+MIN_PERMITTED_CORES = 10
+EFFECTIVE_CPUSET_PATH = "/sys/fs/cgroup/cpuset.cpus.effective"
+LOADAVG_PATH = "/proc/loadavg"
 BROKER_CORES = 4
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def read_effective_cpus():
+    """Read permitted cores from the cgroup file or affinity."""
+    text = read_file(EFFECTIVE_CPUSET_PATH).strip()
+    if text:
+        try:
+            cores = parse_cpu_list(text)
+            if cores:
+                return cores
+        except ValueError:
+            pass
+    try:
+        return sorted(os.sched_getaffinity(0))
+    except Exception:
+        return []
+
+
+def build_cpu_layout(permitted):
+    """Assign broker, probe, publisher and subscriber cores."""
+    cores = sorted(set(permitted))
+    if len(cores) < MIN_PERMITTED_CORES:
+        raise SystemExit(
+            "Need at least %d permitted cores, found %d. "
+            "Set CPUs with BENCH_BROKER_CPUS, BENCH_PUB_CPUS, "
+            "BENCH_SUB_CPUS and BENCH_PROBE_CPUS." % (MIN_PERMITTED_CORES, len(cores)))
+    broker = cores[:4]
+    probe = cores[4:5]
+    rest = cores[5:]
+    half = len(rest) // 2
+    pub = rest[:half]
+    sub = rest[half:]
+    return {
+        "broker": format_cpu_list(broker),
+        "probe": format_cpu_list(probe),
+        "pub": format_cpu_list(pub),
+        "sub": format_cpu_list(sub),
+    }
+
+
+def resolve_cpus():
+    """Resolve CPU specs from the host or the override variables."""
+    permitted = read_effective_cpus()
+    if len(permitted) < MIN_PERMITTED_CORES:
+        raise SystemExit(
+            "Need at least %d permitted cores, found %d. "
+            "Set CPUs with BENCH_BROKER_CPUS, BENCH_PUB_CPUS, "
+            "BENCH_SUB_CPUS and BENCH_PROBE_CPUS." % (MIN_PERMITTED_CORES, len(permitted)))
+    defaults = build_cpu_layout(permitted)
+    return {
+        "broker": os.environ.get("BENCH_BROKER_CPUS") or defaults["broker"],
+        "pub": os.environ.get("BENCH_PUB_CPUS") or defaults["pub"],
+        "sub": os.environ.get("BENCH_SUB_CPUS") or defaults["sub"],
+        "probe": os.environ.get("BENCH_PROBE_CPUS") or defaults["probe"],
+    }
+
+
+CPUS = resolve_cpus()
+
+
+def refresh_cpus():
+    """Refresh global CPU specs from the host. Stop when too few."""
+    global CPUS
+    CPUS = resolve_cpus()
+    return CPUS
+
+
+def require_loadgen(image, binary):
+    """Check generator settings. Stop when a variable is missing."""
+    if image and binary:
+        return image, binary
+    raise SystemExit(
+        "Set LOADGEN_IMAGE and LOADGEN_BIN. "
+        "Missing image or binary.")
+
+
+def step_timeout_secs(step_secs):
+    """Return the hard time limit of one step."""
+    return int(step_secs) + 120
+
+
+def scheduler_count(cpus_spec, num_vms):
+    """Return the scheduler count for one generator VM."""
+    total = ncpus(cpus_spec) if cpus_spec else 0
+    if total <= 0:
+        return 1
+    if num_vms is not None and num_vms > 4:
+        return max(1, min(total, 4))
+    return max(1, total)
+
+
+def gen_runtime_flags(cpus_spec, num_vms):
+    """Return ERL_AFLAGS with a bounded scheduler count."""
+    return "%s +S %d" % (GEN_RUNTIME_BASE, scheduler_count(cpus_spec, num_vms))
+
+
+def read_load1():
+    """Read the 1-minute load average. Return None when unknown."""
+    try:
+        text = read_file(LOADAVG_PATH).strip()
+        return float(text.split()[0]) if text else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_overloaded(load1, num_cores):
+    """Check if the load exceeds three times the core count."""
+    if load1 is None or not num_cores:
+        return False
+    return load1 > 3.0 * num_cores
 
 
 def ncpus(spec):
     """Count cores in a spec like "4-9,21-24"."""
+    if not spec:
+        return 0
     n = 0
     for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
         if "-" in part:
             a, b = part.split("-")
             n += int(b) - int(a) + 1
@@ -67,12 +180,120 @@ def ncpus(spec):
 
 
 def sh(*args, input=None, timeout=None):
+    """Run a command. Return stdout only."""
     r = subprocess.run(list(args), capture_output=True, text=True, input=input, timeout=timeout)
-    return r.stdout + (r.stderr if r.returncode != 0 else "")
+    return r.stdout
 
 
 def shq(*args):
     return subprocess.run(list(args), capture_output=True, text=True)
+
+
+def docker_run(*args):
+    """Run a docker run command. Raise with stderr when it fails."""
+    r = subprocess.run(list(args), capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("docker run failed: %s" % (r.stderr.strip() or r.stdout.strip()))
+    return r.stdout
+
+
+def list_temp_containers():
+    """List benchmark containers. Return ids."""
+    r = shq("docker", "ps", "-aq", "--filter", "label=" + LABEL)
+    if r.returncode != 0:
+        return []
+    return [x for x in r.stdout.split() if x]
+
+
+def cleanup_temp_containers():
+    """Remove all benchmark containers."""
+    ids = list_temp_containers()
+    if ids:
+        shq("docker", "rm", "-f", *ids)
+    shq("docker", "rm", "-f", "bs-broker", "bs-pub", "bs-sub")
+    for i in range(1, 64):
+        shq("docker", "rm", "-f", "bs-sub-%d" % i)
+
+
+_TRACKED_PROBES = []
+
+
+def track_probe(p):
+    """Track a probe process for cleanup."""
+    if p is not None:
+        _TRACKED_PROBES.append(p)
+    return p
+
+
+def kill_tracked_probes():
+    """Kill tracked probe processes."""
+    for p in list(_TRACKED_PROBES):
+        try:
+            p.kill()
+        except Exception:
+            pass
+    _TRACKED_PROBES.clear()
+
+
+def cleanup_all():
+    """Remove containers and kill the probe."""
+    try:
+        kill_tracked_probes()
+    finally:
+        cleanup_temp_containers()
+
+
+def ensure_process_group():
+    """Put the suite in its own process group."""
+    try:
+        os.setpgrp()
+    except Exception:
+        pass
+
+
+def install_cleanup_handlers():
+    """Remove containers on exit and on termination signals."""
+    import atexit
+    import signal
+    atexit.register(cleanup_all)
+
+    def _on_signal(signum, _frame):
+        cleanup_all()
+        raise SystemExit("Stopped by signal %d." % signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _on_signal)
+        except Exception:
+            pass
+
+
+def subscription_count(broker):
+    """Count subscriptions through the broker API."""
+    try:
+        r = broker.api("GET", "/subscriptions")
+    except Exception:
+        return 0
+    if isinstance(r, list):
+        return len(r)
+    if isinstance(r, dict):
+        for key in ("data", "subscriptions", "items"):
+            v = r.get(key)
+            if isinstance(v, list):
+                return len(v)
+        if "error" in r:
+            return 0
+    return 0
+
+
+def wait_for_subscriptions(broker, expected, timeout=60, pause=2.0):
+    """Wait until the broker shows the expected subscription count."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if subscription_count(broker) >= expected:
+            return True
+        time.sleep(pause)
+    return subscription_count(broker) >= expected
 
 
 # ------------------------------------------------------------- scenarios
@@ -309,14 +530,6 @@ def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def read_file(path):
-    try:
-        with open(path) as f:
-            return f.read()
-    except OSError:
-        return ""
-
-
 def collect_env(binary):
     """Record CPU, memory, kernel and build identity. Show gaps plainly."""
     info = {"recorded_at": now_iso()}
@@ -453,10 +666,10 @@ class Broker:
             env += ["-e", "LD_PRELOAD=/usr/local/lib/libsyscount.so", "-e", "SYSCOUNT_FILE=/run/bs/syscount.bin"]
         if self.prof:
             env += ["-e", "DIAG_PROF_OUT=/run/bs/prof", "-e", "DIAG_PROF_HZ=%d" % self.prof]
-        sh("docker", "run", "-d", "--label", LABEL, "--name", self.name, "--network", "host",
-           "--cpus=%d" % BROKER_CORES, "--cpuset-cpus=" + CPUS["broker"], "--memory=8g", "--memory-swap=8g",
-           "--ulimit", "nofile=524288:524288", *env, *mounts, BROKER_IMAGE, "sh", "-c",
-           "mkdir -p /tmp/d && exec /usr/local/bin/indramqtt --api-bind 127.0.0.1:%d --data-dir /tmp/d" % self.api_port)
+        docker_run("docker", "run", "-d", "--label", LABEL, "--name", self.name, "--network", "host",
+                   "--cpus=%d" % BROKER_CORES, "--cpuset-cpus=" + CPUS["broker"], "--memory=8g", "--memory-swap=8g",
+                   "--ulimit", "nofile=524288:524288", *env, *mounts, BROKER_IMAGE, "sh", "-c",
+                   "mkdir -p /tmp/d && exec /usr/local/bin/indramqtt --api-bind 127.0.0.1:%d --data-dir /tmp/d" % self.api_port)
         ok = False
         for _ in range(80):
             time.sleep(0.5)
@@ -467,7 +680,14 @@ class Broker:
             except Exception:
                 pass
         if not ok:
-            raise RuntimeError("broker did not start: " + sh("docker", "logs", "--tail", "20", self.name))
+            logs = sh("docker", "logs", "--tail", "20", self.name)
+            ldd = ""
+            try:
+                lr = subprocess.run(["ldd", self.binary], capture_output=True, text=True, timeout=30)
+                ldd = (lr.stdout or "") + (lr.stderr or "")
+            except Exception as e:
+                ldd = "ldd failed: %s" % e
+            raise RuntimeError("broker did not start: %s\nldd %s:\n%s" % (logs, self.binary, ldd))
         self.cid = sh("docker", "inspect", "-f", "{{.Id}}", self.name).strip()
         self.pid = int(sh("docker", "inspect", "-f", "{{.State.Pid}}", self.name).strip())
         self.cg = cgroup_dir_of_container(self.cid)
@@ -505,11 +725,25 @@ def snapshot(broker, gens):
 
 
 class Sampler(threading.Thread):
-    def __init__(self, broker, gens, every=5.0):
+    def __init__(self, broker, gens, every=5.0, permitted_cores=0):
         super().__init__(daemon=True)
         self.broker, self.gens, self.every = broker, gens, every
         self.rows = []
         self.halt = False
+        self.permitted_cores = permitted_cores
+        self.overload_secs = 0.0
+        self.overloaded = False
+        self.load1 = None
+
+    def note_load(self, load1):
+        """Track overload time. Set the flag after 30 s."""
+        self.load1 = load1
+        if is_overloaded(load1, self.permitted_cores):
+            self.overload_secs += self.every
+        else:
+            self.overload_secs = 0.0
+        if self.overload_secs >= 30.0:
+            self.overloaded = True
 
     def run(self):
         while not self.halt:
@@ -518,6 +752,13 @@ class Sampler(threading.Thread):
                 self.rows.append(snapshot(self.broker, self.gens))
             except Exception as e:
                 print("sampler:", e, file=sys.stderr)
+            try:
+                self.note_load(read_load1())
+            except Exception as e:
+                print("sampler:", e, file=sys.stderr)
+            if self.overloaded:
+                print("sampler: host overload", file=sys.stderr)
+                break
             time.sleep(max(0.0, self.every - (time.monotonic() - t)))
 
 
@@ -528,11 +769,20 @@ def dropped_total(c):
 def start_generator(name, cpus, commands, bench_image):
     sh("docker", "rm", "-f", name)
     script = "\n".join(c + " &" for c in commands) + "\nwait\n"
-    sh("docker", "run", "-d", "--label", LABEL, "--name", name, "--network", "host",
-       "--cpuset-cpus=" + cpus, "--ulimit", "nofile=524288:524288",
-       "-e", "ERL_AFLAGS=" + GEN_RUNTIME_FLAGS, "--entrypoint", "sh", bench_image, "-c", script)
+    flags = gen_runtime_flags(cpus, len(commands))
+    docker_run("docker", "run", "-d", "--label", LABEL, "--name", name, "--network", "host",
+               "--cpuset-cpus=" + cpus, "--ulimit", "nofile=524288:524288",
+               "-e", "ERL_AFLAGS=" + flags, "--entrypoint", "sh", bench_image, "-c", script)
     cid = sh("docker", "inspect", "-f", "{{.Id}}", name).strip()
     return cid
+
+
+def stop_step_containers(broker_name="bs-broker"):
+    """Kill generator and broker containers of one step."""
+    shq("docker", "rm", "-f", "bs-pub", "bs-sub", broker_name)
+    for i in range(1, 64):
+        shq("docker", "rm", "-f", "bs-sub-%d" % i)
+    kill_tracked_probes()
 
 
 def gen_latency_from_text(text):
@@ -574,7 +824,9 @@ def run_probe(args, step_secs, warm, qos, run_id):
            "--pairs", str(args.probe_pairs), "--rate", str(args.probe_rate), "--qos", str(qos),
            "--duration", str(max(10, step_secs - 2)), "--warmup", str(max(0, warm - 1)),
            "--interval", "10", "--run", run_id]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         start_new_session=True)
+    return track_probe(p)
 
 
 def probe_result(p):
@@ -609,25 +861,126 @@ def delta(a, b, *path):
     return get(b) - get(a)
 
 
-def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos):
+def permitted_core_count():
+    """Count permitted cores for the overload guard."""
+    try:
+        cores = read_effective_cpus()
+        if cores:
+            return len(cores)
+    except Exception:
+        pass
+    try:
+        return sum(ncpus(CPUS[k]) for k in ("broker", "pub", "sub", "probe") if CPUS.get(k))
+    except Exception:
+        return 0
+
+
+def make_error_row(sc, step, secs, warm, message):
+    """Make a result row for a stopped step."""
+    return {
+        "scenario": sc.name, "step": step["label"], "payload": step["payload"],
+        "offered": step["offered"], "step_secs": secs, "warm_secs": warm,
+        "window_secs": 0.0, "in_rate": 0, "out_rate": 0,
+        "delivery_ratio": 0.0, "in_vs_offered": 0.0, "dropped": 0,
+        "cpu_pct_of_4": 0.0, "broker_alive": False,
+        "generator_limited": False, "drain_secs": 0.0,
+        "verdict": "fail", "failed": [message], "error": message,
+    }
+
+
+def sleep_guarded(total, deadline, sampler, poll=1.0):
+    """Sleep in chunks. Return "step timeout" or "host overload"."""
+    end = time.monotonic() + total
+    while time.monotonic() < end:
+        if time.monotonic() > deadline:
+            return "step timeout"
+        if sampler is not None and getattr(sampler, "overloaded", False):
+            return "host overload"
+        time.sleep(min(poll, max(0.0, end - time.monotonic())))
+    if time.monotonic() > deadline:
+        return "step timeout"
+    if sampler is not None and getattr(sampler, "overloaded", False):
+        return "host overload"
+    return None
+
+
+def abort_step(args, sc, broker, step, sub_names, pub_name, sampler, probe, message):
+    """Kill step processes and make an error row."""
+    try:
+        if sampler is not None:
+            sampler.halt = True
+        if probe is not None:
+            try:
+                probe.kill()
+            except Exception:
+                pass
+        shq("docker", "rm", "-f", pub_name, *sub_names)
+        shq("docker", "rm", "-f", broker.name)
+    finally:
+        pass
+    return make_error_row(sc, step, args.step_secs, args.warm, message)
+
+
+def fanin_expected_subs(sc):
+    """Count expected subscriber connections of a fan-in scenario."""
+    try:
+        return int(sc.groups) * int(sc.subs_per_group)
+    except Exception:
+        return 0
+
+
+def start_subscribers(args, sc, broker):
+    """Start subscriber generators. Return names and main cid."""
+    cmds = sc.sub_commands(args.bench_bin)
+    if isinstance(sc, FanIn):
+        names = []
+        for k, cmd in enumerate(cmds, 1):
+            name = "bs-sub-%d" % k
+            start_generator(name, CPUS["sub"], [cmd], args.bench_image)
+            names.append(name)
+            time.sleep(2.0)
+        expected = fanin_expected_subs(sc)
+        if expected and not wait_for_subscriptions(broker, expected, timeout=60):
+            return None, None, names
+        cid = sh("docker", "inspect", "-f", "{{.Id}}", names[0]).strip() if names else ""
+        return names[0], cid, names
+    name = "bs-sub"
+    cid = start_generator(name, CPUS["sub"], cmds, args.bench_image)
+    return name, cid, [name]
+
+
+def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos, sub_names=None):
     pub_name = "bs-pub"
     probe_id = "%s%d" % (sc.name[:4], int(time.time()) % 100000)
     secs, warm = args.step_secs, args.warm
+    subs = list(sub_names) if sub_names else [sub_name]
     gens = {"pub": None, "sub": cgroup_dir_of_container(sub_cid)}
-    t_start_iso = now_iso()
+    deadline = time.monotonic() + step_timeout_secs(secs)
     pub_cid = start_generator(pub_name, CPUS["pub"], sc.pub_commands(step, args.bench_bin), args.bench_image)
     gens["pub"] = cgroup_dir_of_container(pub_cid)
-    t0 = time.monotonic()
     probe = run_probe(args, secs, warm, probe_qos, probe_id)
-    sam = Sampler(broker, gens, every=args.sample_every)
+    sam = Sampler(broker, gens, every=args.sample_every,
+                  permitted_cores=permitted_core_count())
     sam.start()
-    time.sleep(warm)
+    hit = sleep_guarded(warm, deadline, sam)
+    if hit:
+        sam.halt = True
+        return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, hit)
     w0_wall = now_iso()
     if args.profile and not args.no_prof_window:
         open(broker.prof_prefix + ".start", "w").close()
     s_a = snapshot(broker, gens)
-    time.sleep(max(1, secs - warm))
+    hit = sleep_guarded(max(1, secs - warm), deadline, sam)
+    if hit:
+        sam.halt = True
+        return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, hit)
     s_b = snapshot(broker, gens)
+    if getattr(sam, "overloaded", False):
+        sam.halt = True
+        return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "host overload")
+    if time.monotonic() > deadline:
+        sam.halt = True
+        return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "step timeout")
     if args.profile and not args.no_prof_window:
         open(broker.prof_prefix + ".dump", "w").close()
     shq("docker", "kill", pub_name)
@@ -635,6 +988,12 @@ def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos):
     prev = broker.counters().get("messages.delivered", 0)
     for _ in range(30):
         time.sleep(1.0)
+        if time.monotonic() > deadline:
+            sam.halt = True
+            return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "step timeout")
+        if getattr(sam, "overloaded", False):
+            sam.halt = True
+            return abort_step(args, sc, broker, step, subs, pub_name, sam, probe, "host overload")
         cur = broker.counters().get("messages.delivered", 0)
         if cur == prev:
             break
@@ -731,6 +1090,10 @@ def run_step(args, sc, broker, step, sub_name, sub_cid, probe_qos):
 
 
 def run_scenario(args):
+    refresh_cpus()
+    args.bench_image, args.bench_bin = require_loadgen(
+        getattr(args, "bench_image", None) or os.environ.get("LOADGEN_IMAGE"),
+        getattr(args, "bench_bin", None) or os.environ.get("LOADGEN_BIN"))
     sc = SCENARIOS[args.scenario]
     rates = [float(x) for x in args.rates.split(",")] if args.rates else sc.default_rates
     rates = [int(r) if r == int(r) else r for r in rates]
@@ -746,10 +1109,18 @@ def run_scenario(args):
         json.dump(collect_env(binary), f, indent=1)
     jsonl = os.path.join(args.out, sc.name + ".jsonl")
     rows = []
-    sub_name = "bs-sub"
+    sub_names = []
     try:
         broker.start()
-        sub_cid = start_generator(sub_name, CPUS["sub"], sc.sub_commands(args.bench_bin), args.bench_image)
+        sub_name, sub_cid, sub_names = start_subscribers(args, sc, broker)
+        if sub_name is None:
+            step = sc.make_step(rates[0]) if rates else {"label": "init", "payload": 128, "offered": 0}
+            row = make_error_row(sc, step, args.step_secs, args.warm, "subscribers not connected")
+            rows.append(row)
+            with open(jsonl, "a") as f:
+                f.write(json.dumps(row) + "\n")
+            print(json.dumps(row), flush=True)
+            return rows
         time.sleep(args.sub_wait)
         steps = sc.steps(rates)
         fails_in_a_row = 0
@@ -758,7 +1129,7 @@ def run_scenario(args):
             if not broker.alive():
                 print("broker is not alive; stop", flush=True)
                 break
-            row = run_step(args, sc, broker, step, sub_name, sub_cid, sc.qos)
+            row = run_step(args, sc, broker, step, sub_name, sub_cid, sc.qos, sub_names)
             if args.profile:
                 for ext in ("svg", "folded"):
                     src = broker.prof_prefix + "." + ext
@@ -768,6 +1139,14 @@ def run_scenario(args):
             with open(jsonl, "a") as f:
                 f.write(json.dumps(row) + "\n")
             print(json.dumps(row), flush=True)
+            if row.get("error") in ("step timeout", "host overload"):
+                print("guard stopped the step; stop scenario", flush=True)
+                try:
+                    broker.start()
+                except Exception as e:
+                    print("broker restart failed: %s" % e, flush=True)
+                    break
+                break
             if is_failing(row):
                 fails_in_a_row += 1
             else:
@@ -776,8 +1155,16 @@ def run_scenario(args):
                 print("two failing steps in a row; stop scenario", flush=True)
                 break
     finally:
-        sh("docker", "rm", "-f", "bs-pub", sub_name)
-        broker.stop()
+        try:
+            if sub_names:
+                shq("docker", "rm", "-f", "bs-pub", *sub_names)
+            else:
+                shq("docker", "rm", "-f", "bs-pub", "bs-sub")
+        finally:
+            try:
+                broker.stop()
+            finally:
+                kill_tracked_probes()
     write_outputs(args, sc, rows)
     return rows
 
@@ -880,8 +1267,8 @@ def main():
     r.add_argument("--no-probe", action="store_true")
     r.add_argument("--probe-pairs", type=int, default=20)
     r.add_argument("--probe-rate", type=float, default=50)
-    r.add_argument("--bench-image", default=DEFAULT_LOADGEN_IMAGE, help="load generator image")
-    r.add_argument("--bench-bin", default=DEFAULT_LOADGEN_BIN, help="load generator binary in the image")
+    r.add_argument("--bench-image", default=None, help="load generator image")
+    r.add_argument("--bench-bin", default=None, help="load generator binary in the image")
     r.add_argument("--syscount", action="store_true", help="load libsyscount.so into the broker (diagnosis)")
     r.add_argument("--profile", type=int, nargs="?", const=499, default=0,
                    help="sampling profiler Hz; needs the diagnosis build of the broker")
@@ -909,7 +1296,12 @@ def main():
         for row in rows:
             print(json.dumps(row), flush=True)
         return
-    run_scenario(args)
+    ensure_process_group()
+    install_cleanup_handlers()
+    try:
+        run_scenario(args)
+    finally:
+        cleanup_all()
 
 
 if __name__ == "__main__":
