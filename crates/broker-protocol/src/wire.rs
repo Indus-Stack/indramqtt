@@ -1333,4 +1333,189 @@ mod tests {
         assert_eq!(decode_disconnect(&[4, 0], 5).unwrap(), 4);
         assert!(decode_disconnect(&[4], 4).is_err());
     }
+
+    #[test]
+    fn remaining_length_known_vectors() {
+        // Exact bytes from the specification examples.
+        let vectors: &[(u32, &[u8])] = &[
+            (0, &[0]),
+            (127, &[127]),
+            (128, &[0x80, 0x01]),
+            (16_383, &[0xFF, 0x7F]),
+            (16_384, &[0x80, 0x80, 0x01]),
+            (2_097_151, &[0xFF, 0xFF, 0x7F]),
+            (2_097_152, &[0x80, 0x80, 0x80, 0x01]),
+            (268_435_455, &[0xFF, 0xFF, 0xFF, 0x7F]),
+        ];
+        for (value, bytes) in vectors {
+            let mut out = Vec::new();
+            encode_varint(*value, &mut out);
+            assert_eq!(&out, bytes);
+            assert_eq!(decode_varint(&out).unwrap(), Some((*value, out.len())));
+        }
+    }
+
+    #[test]
+    fn concatenated_packets_split_at_packet_len() {
+        // Two packets in one buffer: the first header gives its length,
+        // and the rest parses as the second packet.
+        let both = [0xC0u8, 0x00, 0xD0, 0x00];
+        let first = fixed_header(&both).unwrap().unwrap();
+        assert_eq!((first.kind, first.packet_len()), (12, 2));
+        let second = fixed_header(&both[first.packet_len()..]).unwrap().unwrap();
+        assert_eq!((second.kind, second.packet_len()), (13, 2));
+        // A trailing byte stays in the buffer after the first packet.
+        let trailing = [0xC0u8, 0x00, 0xFF];
+        let head = fixed_header(&trailing).unwrap().unwrap();
+        assert_eq!(head.packet_len(), 2);
+        assert_eq!(&trailing[head.packet_len()..], &[0xFF]);
+    }
+
+    #[test]
+    fn five_byte_remaining_length_is_malformed() {
+        // A fourth length byte with the continue bit set needs a fifth
+        // byte, which the specification forbids.
+        assert!(fixed_header(&[0x30, 0xFF, 0xFF, 0xFF, 0x80, 0x00]).is_err());
+        assert!(decode_varint(&[0x80, 0x80, 0x80, 0x80, 0x01]).is_err());
+        // A cut length needs more bytes instead of an error.
+        assert_eq!(fixed_header(&[0x10, 0x80]).unwrap(), None);
+    }
+
+    #[test]
+    fn fixed_header_flags_for_each_packet_type() {
+        // Each correct first byte parses; each wrong flag fails.
+        let good: &[u8] = &[
+            0x10, 0x20, 0x30, 0x33, 0x3B, 0x40, 0x50, 0x62, 0x70, 0x82, 0x90, 0xA2, 0xB0, 0xC0,
+            0xD0, 0xE0, 0xF0,
+        ];
+        for first in good {
+            let packet = [*first, 0x00];
+            let header = fixed_header(&packet).unwrap().unwrap();
+            assert_eq!(header.packet_len(), 2);
+        }
+        let bad: &[u8] = &[
+            0x17, 0x21, 0x41, 0x51, 0x60, 0x72, 0x80, 0x91, 0xA0, 0xB1, 0xC1, 0xD2, 0xE4, 0xF1,
+        ];
+        for first in bad {
+            assert!(fixed_header(&[*first, 0x00]).is_err());
+        }
+        // Type 0 is reserved on the wire.
+        assert!(fixed_header(&[0x00, 0x00]).is_err());
+        // Type 15 (AUTH) decodes here; the connection refuses it later.
+        let auth = fixed_header(&[0xF0, 0x00]).unwrap().unwrap();
+        assert_eq!(auth.kind, 15);
+    }
+
+    #[test]
+    fn connect_level_3_decodes_and_unknown_levels_fail() {
+        // Level 3 uses the old protocol name and no properties.
+        let mut body = vec![0, 6, b'M', b'Q', b'I', b's', b'd', b'p', 3, 0x02, 0, 60];
+        body.extend_from_slice(&[0, 1, b'a']);
+        let connect = decode_connect(&body).unwrap();
+        assert_eq!(connect.level, 3);
+        assert_eq!(connect.client_id, "a");
+        assert!(connect.properties.is_none());
+        // An unknown level with the new name fails as unsupported.
+        let mut bad = vec![0, 4, b'M', b'Q', b'T', b'T', 6, 0x02, 0, 60];
+        bad.extend_from_slice(&[0, 1, b'a']);
+        assert_eq!(
+            decode_connect(&bad),
+            Err(WireError::Unsupported("protocol level"))
+        );
+        // An unknown name fails as malformed.
+        let mut name = vec![0, 4, b'X', b'Q', b'T', b'T', 4, 0x02, 0, 60];
+        name.extend_from_slice(&[0, 1, b'a']);
+        assert!(decode_connect(&name).is_err());
+    }
+
+    #[test]
+    fn alias_vectors_and_subscribe_options_ride_through() {
+        // A registered alias decodes with its number.
+        let body = [0, 1, b't', 3, 35, 0, 7, b'h', b'i'];
+        let publish = decode_publish(0, &body, 5).unwrap();
+        assert_eq!(publish.alias, Some(7));
+        // Alias 0 decodes as Some(0); the caller refuses it with 0x94.
+        let body = [0, 1, b't', 3, 35, 0, 0, b'h', b'i'];
+        let publish = decode_publish(0, &body, 5).unwrap();
+        assert_eq!(publish.alias, Some(0));
+        // An empty topic with an alias resolves through the reference.
+        let body = [0, 0, 3, 35, 0, 4, b'p'];
+        let publish = decode_publish(0, &body, 5).unwrap();
+        assert_eq!((publish.topic, publish.alias), ("", Some(4)));
+        // Reserved option bits ride through the decode; the kernel
+        // fails only that filter with 0x8F.
+        let sub = decode_subscribe(&[0, 7, 0, 0, 1, b'a', 0xC1], 5).unwrap();
+        assert_eq!(sub.filters, vec![("a", 0xC1)]);
+        // A long SUBACK uses the multibyte length form.
+        let mut out = Vec::new();
+        encode_suback(7, &[0u8; 126], 4, &mut out);
+        assert_eq!(&out[..3], &[0x90, 0x80, 0x01]);
+        assert_eq!(out.len(), 3 + 128);
+    }
+
+    #[test]
+    fn user_property_limits_fail_closed() {
+        // Seventeen user properties exceed the bound of sixteen.
+        let mut section = Vec::new();
+        for _ in 0..17 {
+            section.extend_from_slice(&[38, 0, 1, b'k', 0, 1, b'v']);
+        }
+        let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 5, 0x02, 0, 60];
+        body.push(section.len() as u8);
+        body.extend_from_slice(&section);
+        body.extend_from_slice(&[0, 1, b'a']);
+        assert!(decode_connect(&body).is_err());
+        // A key of 1025 bytes exceeds the bound of 1024.
+        let mut big = vec![38];
+        big.extend_from_slice(&1025u16.to_be_bytes());
+        big.extend_from_slice(&[b'k'; 1025]);
+        big.extend_from_slice(&[0, 1, b'v']);
+        let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 5, 0x02, 0, 60];
+        encode_varint(big.len() as u32, &mut body);
+        body.extend_from_slice(&big);
+        body.extend_from_slice(&[0, 1, b'a']);
+        assert!(decode_connect(&body).is_err());
+    }
+
+    #[test]
+    fn connack_vectors_for_both_levels() {
+        // Level 4 shapes: presence bit plus return code.
+        let vectors: &[(bool, u8, [u8; 4])] = &[
+            (false, 0, [0x20, 0x02, 0x00, 0x00]),
+            (true, 0, [0x20, 0x02, 0x01, 0x00]),
+            (false, 4, [0x20, 0x02, 0x00, 0x04]),
+            (true, 2, [0x20, 0x02, 0x01, 0x02]),
+        ];
+        for (present, code, bytes) in vectors {
+            let mut out = Vec::new();
+            encode_connack(*present, *code, &mut out);
+            assert_eq!(&out, bytes);
+        }
+        // Level 5 with every property kind: the section carries each
+        // identifier once, in the encoder order.
+        let users = vec![("k".to_string(), "v".to_string())];
+        let mut out = Vec::new();
+        encode_connack_v5(
+            false,
+            0,
+            &ConnackProperties {
+                session_expiry: Some(3600),
+                receive_maximum: Some(100),
+                maximum_packet_size: Some(65536),
+                topic_alias_maximum: Some(10),
+                assigned_client_id: Some("auto-9"),
+                reason_string: Some("ok"),
+                user_properties: &users,
+            },
+            &mut out,
+        );
+        assert_eq!(&out[..3], &[0x20, 40, 0x00]);
+        let body = &out[2..];
+        assert!(body.windows(3).any(|w| w == [34, 0, 10]));
+        assert!(body.windows(3).any(|w| w == [33, 0, 100]));
+        assert!(body.windows(5).any(|w| w == [39, 0, 1, 0, 0]));
+        assert!(body
+            .windows(9)
+            .any(|w| w == [18, 0, 6, b'a', b'u', b't', b'o', b'-', b'9']));
+    }
 }

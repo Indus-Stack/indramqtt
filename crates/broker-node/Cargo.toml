@@ -25,6 +25,10 @@ path = "../../tests/soak_chaos_suite.rs"
 name = "mt_publish_bench"
 path = "../../tests/mt_publish_bench.rs"
 
+[[test]]
+name = "listener_conformance"
+path = "tests/listener_conformance.rs"
+
 [dependencies]
 brokerlink = { workspace = true }
 broker-protocol = { workspace = true }

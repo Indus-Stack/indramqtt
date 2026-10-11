@@ -874,6 +874,10 @@ pub(super) async fn serve_native_mqtt_psk(
 /// WebSocket frame and message bound in bytes.
 /// Reason: matches the MQTT packet bound, so one peer cannot grow memory.
 const MAX_WS_FRAME_BYTES: usize = MAX_PACKET_BYTES;
+/// Largest number of queued WebSocket pongs on one connection.
+/// Reason: a peer sends Ping frames without reading. Four queued
+/// pongs use at most 500 bytes and cover a burst while the sink waits.
+const MAX_QUEUED_PONGS: usize = 4;
 /// Target size of the WebSocket write buffer in bytes.
 /// Reason: keeps the tungstenite WebSocketConfig default of 128 KiB, so small frames share one write.
 const WS_WRITE_BUFFER_BYTES: usize = 128 * 1024;
@@ -1155,30 +1159,45 @@ impl<S> WsIo<S> {
     }
 }
 
-/// Starts one send when the sink is ready. Queues nothing.
-fn ws_poll_send<S>(
-    inner: Pin<&mut S>,
+/// Sends queued pongs and flushes the sink.
+/// It returns pending when the sink is not ready.
+fn ws_drain_pong<S>(
+    mut inner: Pin<&mut S>,
     cx: &mut Context<'_>,
-    message: Message,
+    queued: &mut Vec<Vec<u8>>,
 ) -> Poll<std::io::Result<()>>
 where
     S: Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
-    let mut inner = inner;
-    match inner.as_mut().poll_ready(cx) {
-        Poll::Pending => Poll::Pending,
-        Poll::Ready(Ok(())) => match inner.as_mut().start_send(message) {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(e) => Poll::Ready(Err(std::io::Error::new(
+    while !queued.is_empty() {
+        match inner.as_mut().poll_ready(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("websocket send failed: {e}"),
+                )));
+            }
+            Poll::Ready(Ok(())) => {}
+        }
+        let Some(payload) = queued.pop() else {
+            break;
+        };
+        if let Err(e) = inner.as_mut().start_send(Message::Pong(payload)) {
+            return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 format!("websocket send failed: {e}"),
-            ))),
-        },
+            )));
+        }
+    }
+    match inner.as_mut().poll_flush(cx) {
+        Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
         Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
-            format!("websocket send failed: {e}"),
+            format!("websocket flush failed: {e}"),
         ))),
+        Poll::Pending => Poll::Pending,
     }
 }
 
@@ -1199,6 +1218,16 @@ where
             buf.put_slice(&this.pending_in[..take]);
             let _ = this.pending_in.split_to(take);
             return Poll::Ready(Ok(()));
+        }
+        // Send queued pongs before the next read.
+        // The MQTT task sends nothing while idle, so the read
+        // path must flush pongs. Otherwise a ping waits.
+        if !this.pending_pong.is_empty() {
+            match ws_drain_pong(Pin::new(&mut this.inner), cx, &mut this.pending_pong) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
         }
         loop {
             let next = Pin::new(&mut this.inner).poll_next(cx);
@@ -1230,14 +1259,23 @@ where
                         return Poll::Ready(Ok(()));
                     }
                     Message::Ping(payload) => {
-                        match ws_poll_send(
-                            Pin::new(&mut this.inner),
-                            cx,
-                            Message::Pong(payload.clone()),
-                        ) {
+                        // Queue the pong and send it at once.
+                        // The read path flushes, so an idle
+                        // connection still answers the ping.
+                        // Close the connection when the queue is full.
+                        // A peer that floods pings without reading
+                        // cannot grow the queue without bound.
+                        if this.pending_pong.len() >= MAX_QUEUED_PONGS {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionAborted,
+                                "too many queued pongs",
+                            )));
+                        }
+                        this.pending_pong.push(payload);
+                        match ws_drain_pong(Pin::new(&mut this.inner), cx, &mut this.pending_pong) {
                             Poll::Ready(Ok(())) => {}
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => this.pending_pong.push(payload),
+                            Poll::Pending => return Poll::Pending,
                         }
                         continue;
                     }
