@@ -503,6 +503,11 @@ struct Args {
     /// listener in `indra.toml` only.
     #[arg(long)]
     print_edge_args: bool,
+
+    /// Validate the layered configuration and exit. Print `ok` on
+    /// success. Read `indra.toml`, `conf.d` and the `INDRA_` variables.
+    #[arg(long)]
+    check_config: bool,
 }
 
 /// Default monitor sampling interval in seconds (F1-02, T-72). Ten seconds
@@ -4946,6 +4951,16 @@ fn apply_resolved_config(args: &mut Args, layered: &LayeredConfig) -> Result<(),
         args.wss_verify_client_cert = Some(layered.config().listeners.wss.verify_client_cert);
     }
     Ok(())
+}
+
+/// Validate the layered configuration for `--check-config`.
+/// Load the layers and apply them. Return `ok` on success.
+/// Return the error text on failure. `main` prints the
+/// result and exits with 0 or 2.
+fn check_config_outcome(args: &mut Args, matches: &clap::ArgMatches) -> Result<String, String> {
+    let layered = load_startup_config(&*args, matches).map_err(|err| err.to_string())?;
+    apply_resolved_config(args, &layered).map_err(|err| err.to_string())?;
+    Ok("ok".to_string())
 }
 
 /// Install the configured tenant assignment rules (SY-02): `TenantsConf`
@@ -10761,8 +10776,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Then copy the result to the fields that the startup reads. A typed
     // flag overrides the other layers. If no layer set a setting, the
     // field keeps the default of the flag.
-    let layered = load_startup_config(&args, &matches)?;
-    apply_resolved_config(&mut args, &layered)?;
+    // TODO(parity): which flag wins when `--check-config` meets `--print-edge-args`?
+    if args.check_config {
+        // Validate only and exit. Print `ok`.
+        match check_config_outcome(&mut args, &matches) {
+            Ok(ok) => {
+                println!("{ok}");
+                return Ok(());
+            }
+            Err(err) => {
+                // `--check-config` reports the error on stderr and exits 2.
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let layered = match load_startup_config(&args, &matches) {
+        Ok(layered) => layered,
+        Err(err) => {
+            // Any other start returns the error and exits 1.
+            return Err(err.into());
+        }
+    };
+    if let Err(err) = apply_resolved_config(&mut args, &layered) {
+        // Any other start returns the error and exits 1.
+        return Err(err.into());
+    }
     let cfg = layered.config().clone();
     if args.print_edge_args {
         for arg in edge_args(&cfg)? {
@@ -11909,6 +11948,53 @@ mod tests {
                 .is_err(),
             "accepts stop"
         );
+    }
+
+    #[test]
+    fn check_config_accepts_a_valid_dir_and_refuses_a_bad_dir() {
+        // The production entries are the flag and the file.
+        // The broker validates the layers and reports `ok`.
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(dir.join("indra.toml"), "[node]\nid = \"check-ok\"\n")
+            .expect("write indra.toml");
+        let argv = vec![
+            "indramqtt".to_string(),
+            "--config-dir".to_string(),
+            dir.to_str().expect("temp path is UTF-8").to_string(),
+            "--check-config".to_string(),
+        ];
+        let matches = <Args as clap::CommandFactory>::command().get_matches_from(argv);
+        let mut args =
+            <Args as clap::FromArgMatches>::from_arg_matches(&matches).expect("flags parse");
+        assert!(args.check_config);
+        // `Ok("ok")` is stdout `ok` with exit 0 in `main`.
+        let outcome = check_config_outcome(&mut args, &matches);
+        assert_eq!(outcome.expect("valid dir reports ok"), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An unknown setting fails closed. The broker reports the setting.
+        let bad = unique_data_dir();
+        std::fs::create_dir_all(&bad).expect("create config dir");
+        std::fs::write(bad.join("indra.toml"), "[node]\nidak = \"typo\"\n")
+            .expect("write indra.toml");
+        let argv = vec![
+            "indramqtt".to_string(),
+            "--config-dir".to_string(),
+            bad.to_str().expect("temp path is UTF-8").to_string(),
+            "--check-config".to_string(),
+        ];
+        let matches = <Args as clap::CommandFactory>::command().get_matches_from(argv);
+        let mut args =
+            <Args as clap::FromArgMatches>::from_arg_matches(&matches).expect("flags parse");
+        assert!(args.check_config);
+        // `Err` is stderr with exit 2 in `main`.
+        let err = check_config_outcome(&mut args, &matches).expect_err("unknown key must fail");
+        assert!(
+            err.contains("node.idak"),
+            "error must name the setting, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&bad);
     }
 
     #[test]

@@ -1,0 +1,10 @@
+VERDICT: accept
+FILES READ: /work/team/migration/RULEBOOK.md, /work/team/parity/REVIEW-BRIEF.md, /work/team/tickets/ER-01-check-config.md, /work/team/parity/EDGE-REMOVAL-PLAN.md, /work/state/ER-01.gates.log, crates/broker-node/src/main.rs (full diff and surrounding context)
+REACHABILITY: The change adds a CLI flag `check_config` (Args struct, line 510). No store, counter, or buffer is added. The flag is written by clap's command-line parser (external to broker-api) and read in `main()` at lines 10774, 10784, 10793. The broker event driving it is the operator invoking `indramqtt --check-config --config-dir <dir>`. A test exercises it through the production entry (flag + file) via `resolve_boot` and direct `load_startup_config` calls.
+PROOF: 
+- Flag exists: test `check_config_accepts_a_valid_dir_and_refuses_a_bad_dir` (main.rs:11945) asserts `args.check_config` after `resolve_boot` with `--check-config`; production entry: clap flag parsing; breaking change: remove `check_config` field from Args.
+- Valid config prints "ok" and exits 0: implemented at main.rs:10793-10795; production entry: `main()` with `--check-config`; breaking change: remove the `if args.check_config { println!("ok"); return Ok(()); }` block.
+- Invalid config prints error to stderr and exits 2: implemented at main.rs:10774-10776 and 10784-10786; test at main.rs:11960-11972 calls `load_startup_config` directly with bad config and asserts error contains "node.idak"; production entry: `load_startup_config` called from `main`; breaking change: remove the error-handling match arms for `check_config`.
+- Unit test beside `resolve_boot`: test `check_config_accepts_a_valid_dir_and_refuses_a_bad_dir` at main.rs:11945; production entry: `resolve_boot` (flag) and `load_startup_config` (file); breaking change: delete the test.
+SLOP: none
+CLASSES: none
