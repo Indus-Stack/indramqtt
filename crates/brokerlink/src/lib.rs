@@ -2,7 +2,6 @@ pub mod codec;
 pub mod error;
 pub mod frame;
 pub mod header;
-pub mod lane;
 pub mod opcode;
 pub mod transport;
 
@@ -10,7 +9,6 @@ pub use codec::FrameCodec;
 pub use error::{BrokerLinkError, Result};
 pub use frame::BrokerFrame;
 pub use header::{FrameHeader, HEADER_LEN, MAGIC, PROTOCOL_VERSION_1};
-pub use lane::LaneDispatcher;
 pub use opcode::OpCode;
 pub use transport::{BrokerLinkTransport, FramedTransport};
 
@@ -18,7 +16,6 @@ pub use transport::{BrokerLinkTransport, FramedTransport};
 mod tests {
     use super::*;
     use bytes::{Bytes, BytesMut};
-    use std::sync::Arc;
     use tokio::io::duplex;
 
     #[test]
@@ -183,15 +180,6 @@ mod tests {
         assert_eq!(buf.len(), 0);
     }
 
-    #[test]
-    fn credit_opcode_maps_to_expected_wire_value() {
-        assert_eq!(u16::from(OpCode::Credit), 0x0042);
-        assert_eq!(
-            OpCode::try_from(0x0042).expect("0x0042 decodes"),
-            OpCode::Credit
-        );
-    }
-
     #[tokio::test]
     async fn test_transport_bidirectional_duplex() {
         let (client_io, server_io) = duplex(1024);
@@ -207,26 +195,5 @@ mod tests {
 
         let received = server_transport.recv().await.unwrap();
         assert_eq!(received, expected_frame);
-    }
-
-    #[tokio::test]
-    async fn test_lane_dispatcher_affinity() {
-        let mut lanes: Vec<Arc<dyn BrokerLinkTransport>> = Vec::new();
-        for _ in 0..8 {
-            let (io1, _io2) = duplex(1024);
-            lanes.push(Arc::new(FramedTransport::new(io1)));
-        }
-
-        let dispatcher = LaneDispatcher::new(lanes);
-        assert_eq!(dispatcher.lane_count(), 8);
-
-        // Same connection id MUST always hit the exact same lane
-        let conn_id = 999999;
-        let expected_lane = (conn_id as usize) % 8;
-        assert_eq!(dispatcher.lane_for_conn(conn_id), expected_lane);
-
-        for _ in 0..100 {
-            assert_eq!(dispatcher.lane_for_conn(conn_id), expected_lane);
-        }
     }
 }

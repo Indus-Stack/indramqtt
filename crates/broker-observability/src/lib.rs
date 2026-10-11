@@ -112,12 +112,6 @@ pub struct Metrics {
     qos0_shed_by_client: std::sync::RwLock<HashMap<String, u64>>,
     puback_deferred: AtomicU64,
     puback_deferred_released: AtomicU64,
-    credit_clamped: AtomicU64,
-    credit_exhausted: AtomicU64,
-    // Edge flow-control frames observed. Counted on receipt today;
-    // per-connection gating against them lands with the kernel queue
-    // split, so no delivery decision may depend on this yet.
-    credit_received: AtomicU64,
 }
 
 /// One consistent read of every counter for API handlers.
@@ -169,9 +163,6 @@ pub struct MetricsSnapshot {
     pub egress_qos0_shed: u64,
     pub puback_deferred: u64,
     pub puback_deferred_released: u64,
-    pub credit_clamped: u64,
-    pub credit_exhausted: u64,
-    pub credit_received: u64,
 }
 
 impl Metrics {
@@ -592,23 +583,6 @@ impl Metrics {
             + 1
     }
 
-    /// Edge flow-control snapshots applied to a kernel credit balance
-    /// (fires with the kernel queue split; zero until then).
-    pub fn inc_credit_clamped(&self) -> u64 {
-        self.credit_clamped.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    /// Route refusals for exhausted credit (fires with the kernel queue
-    /// split; zero until then).
-    pub fn inc_credit_exhausted(&self) -> u64 {
-        self.credit_exhausted.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    /// Edge flow-control frames observed (counted today, gating later).
-    pub fn inc_credit_received(&self) -> u64 {
-        self.credit_received.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
     pub fn connect_received(&self) -> u64 {
         self.connect_received.load(Ordering::Relaxed)
     }
@@ -776,18 +750,6 @@ impl Metrics {
         self.puback_deferred_released.load(Ordering::Relaxed)
     }
 
-    pub fn credit_clamped(&self) -> u64 {
-        self.credit_clamped.load(Ordering::Relaxed)
-    }
-
-    pub fn credit_exhausted(&self) -> u64 {
-        self.credit_exhausted.load(Ordering::Relaxed)
-    }
-
-    pub fn credit_received(&self) -> u64 {
-        self.credit_received.load(Ordering::Relaxed)
-    }
-
     /// Copy every counter in one call for API handlers.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -834,9 +796,6 @@ impl Metrics {
             egress_qos0_shed: self.egress_qos0_shed(),
             puback_deferred: self.puback_deferred(),
             puback_deferred_released: self.puback_deferred_released(),
-            credit_clamped: self.credit_clamped(),
-            credit_exhausted: self.credit_exhausted(),
-            credit_received: self.credit_received(),
         }
     }
 
@@ -912,18 +871,9 @@ impl Metrics {
               # HELP indramqtt_puback_deferred_total QoS 1 publishes whose PUBACK is deferred for credit.\n\
               # TYPE indramqtt_puback_deferred_total counter\n\
               indramqtt_puback_deferred_total {}\n\
-              # HELP indramqtt_puback_deferred_released_total Deferred PUBACKs released after credit arrived.\n\
-              # TYPE indramqtt_puback_deferred_released_total counter\n\
-              indramqtt_puback_deferred_released_total {}\n\
-              # HELP indramqtt_credit_clamped_total Edge flow-control snapshots applied to a kernel credit balance.\n\
-              # TYPE indramqtt_credit_clamped_total counter\n\
-              indramqtt_credit_clamped_total {}\n\
-              # HELP indramqtt_credit_exhausted_total Route refusals for exhausted credit.\n\
-              # TYPE indramqtt_credit_exhausted_total counter\n\
-              indramqtt_credit_exhausted_total {}\n\
-              # HELP indramqtt_credit_received_total Edge flow-control frames observed.\n\
-              # TYPE indramqtt_credit_received_total counter\n\
-              indramqtt_credit_received_total {}\n",
+               # HELP indramqtt_puback_deferred_released_total Deferred PUBACKs released after credit arrived.\n\
+               # TYPE indramqtt_puback_deferred_released_total counter\n\
+               indramqtt_puback_deferred_released_total {}\n",
             self.messages_received(),
             self.messages_forwarded(),
             self.messages_dropped(),
@@ -948,9 +898,6 @@ impl Metrics {
             self.egress_qos0_shed(),
             self.puback_deferred(),
             self.puback_deferred_released(),
-            self.credit_clamped(),
-            self.credit_exhausted(),
-            self.credit_received(),
         )
     }
 }
@@ -1336,9 +1283,6 @@ mod tests {
         assert_eq!(metrics.inc_egress_qos0_shed(), 1);
         assert_eq!(metrics.inc_puback_deferred(), 1);
         assert_eq!(metrics.inc_puback_deferred_released(), 1);
-        assert_eq!(metrics.inc_credit_clamped(), 1);
-        assert_eq!(metrics.inc_credit_exhausted(), 1);
-        assert_eq!(metrics.inc_credit_received(), 1);
 
         let snap = metrics.snapshot();
         assert_eq!(snap.transport_sent, 5);
@@ -1346,9 +1290,6 @@ mod tests {
         assert_eq!(snap.egress_qos0_shed, 1);
         assert_eq!(snap.puback_deferred, 1);
         assert_eq!(snap.puback_deferred_released, 1);
-        assert_eq!(snap.credit_clamped, 1);
-        assert_eq!(snap.credit_exhausted, 1);
-        assert_eq!(snap.credit_received, 1);
 
         let text = metrics.render_prometheus_metrics();
         assert!(text.contains("indramqtt_transport_sent_total 5\n"));
@@ -1356,9 +1297,6 @@ mod tests {
         assert!(text.contains("indramqtt_egress_qos0_shed_total 1\n"));
         assert!(text.contains("indramqtt_puback_deferred_total 1\n"));
         assert!(text.contains("indramqtt_puback_deferred_released_total 1\n"));
-        assert!(text.contains("indramqtt_credit_clamped_total 1\n"));
-        assert!(text.contains("indramqtt_credit_exhausted_total 1\n"));
-        assert!(text.contains("indramqtt_credit_received_total 1\n"));
     }
 
     #[test]

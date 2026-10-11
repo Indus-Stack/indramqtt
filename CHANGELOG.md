@@ -46,8 +46,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Session count**: `GET /sessions_count` answers a JSON string with the number of sessions that have not expired, as the reference API documents. It reads the query `since` and no longer reads `node`.
 - **Node name**: every endpoint shows the node as `name@host`. The name is the `--node-id` value, and the host is the host name of the machine. A node id with an `@` is used as it is. `/nodes/{node}` accepts the full name and the bare node id. Before this change the endpoints showed the fixed text `indramqtt@127.0.0.1`.
 
-### Unstable
-- **Single sign-on**: the login endpoints of single sign-on answer the error that the reference API documents: 404 `BACKEND_NOT_FOUND` for `POST /sso/login/{backend}` and `POST /sso/saml/acs`, and 400 `BAD_REQUEST` for `GET /sso/oidc/callback` and `POST /sso/token_exchange`. The message says that single sign-on is not available in this release. The flows did not connect to an identity provider. The endpoints that store a backend stay.
+### Removed
+- **Edge flow-control telemetry**: the Prometheus series `indramqtt_credit_clamped_total`, `indramqtt_credit_exhausted_total` and `indramqtt_credit_received_total` are gone. The edge `Credit` frame and its counters go away with the edge path.
+
+### Unstable- **Single sign-on**: the login endpoints of single sign-on answer the error that the reference API documents: 404 `BACKEND_NOT_FOUND` for `POST /sso/login/{backend}` and `POST /sso/saml/acs`, and 400 `BAD_REQUEST` for `GET /sso/oidc/callback` and `POST /sso/token_exchange`. The message says that single sign-on is not available in this release. The flows did not connect to an identity provider. The endpoints that store a backend stay.
 
 ### Fixed
 - **Messages that did not arrive in a large fan-out**: the kernel wrote one batch for each wake of a link and then waited. A publish to more subscribers than one batch holds left messages in the queues, and the kernel counted them as delivered. The kernel now writes until the queues are empty.

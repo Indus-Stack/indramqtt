@@ -1,16 +1,10 @@
 //! BrokerLink opcode registry.
 //!
-//! Contracts (mirrored in `broker-node/src/main.rs`):
+//! Contract (mirrored in `broker-node/src/main.rs`):
 //! * `ConnClose` carries empty metadata and an empty payload; `conn_id`
 //!   in the header identifies the edge connection to close.
 //! * The kernel sends it and expects no reply.
 //! * An edge that receives it must close the socket (W0-25).
-//! * `Credit` flows edge -> kernel only: the owning edge connection
-//!   reports its egress pressure snapshot (`UsedFrames:32be |
-//!   UsedBytes:32be` meta; `conn_id` in the header names the connection).
-//!   The kernel counts it today; per-connection gating against it lands
-//!   with the kernel queue split (a later stage), so no behaviour may
-//!   depend on it yet.
 use crate::error::BrokerLinkError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,9 +39,6 @@ pub enum OpCode {
     // Disconnect
     DisconnectIn = 0x0040,
     ConnClose = 0x0041,
-
-    // Flow control (edge -> kernel only)
-    Credit = 0x0042,
 }
 
 impl TryFrom<u16> for OpCode {
@@ -76,7 +67,6 @@ impl TryFrom<u16> for OpCode {
             0x0033 => Ok(Self::UnsubAckOut),
             0x0040 => Ok(Self::DisconnectIn),
             0x0041 => Ok(Self::ConnClose),
-            0x0042 => Ok(Self::Credit),
             other => Err(BrokerLinkError::UnknownOpcode(other)),
         }
     }
