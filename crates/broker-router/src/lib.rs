@@ -1656,8 +1656,60 @@ impl Router {
         topic: &Topic,
         publisher: Option<&str>,
     ) {
-        if !matched.iter().any(|s| s.group.is_some()) {
+        // One pass finds shared entries and one group key.
+        // Fan-in publishes land here, so skip the group map.
+        let mut single_key: Option<(Arc<str>, Arc<str>)> = None;
+        let mut single = true;
+        let mut has_shared = false;
+        for sub in matched.iter() {
+            if let Some(group) = sub.group.as_ref() {
+                has_shared = true;
+                match single_key.as_ref() {
+                    Some((tenant, name))
+                        if tenant.as_ref() == sub.tenant.as_ref()
+                            && name.as_ref() == group.as_ref() => {}
+                    Some(_) => {
+                        single = false;
+                        break;
+                    }
+                    None => {
+                        single_key = Some((sub.tenant.clone(), group.clone()));
+                    }
+                }
+            }
+        }
+        if !has_shared {
             return;
+        }
+        let strategies = self.strategies.load_full();
+        if single {
+            if let Some((tenant, group)) = single_key {
+                // Move members out. Plain entries move back.
+                // No clone except the one picked entry.
+                let all: Vec<Subscription> = matched.drain().collect();
+                let mut members: Vec<Subscription> = Vec::with_capacity(all.len());
+                for sub in all {
+                    if sub.group.is_some() {
+                        members.push(sub);
+                    } else {
+                        matched.insert(sub);
+                    }
+                }
+                members.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+                let strategy = strategies.get(&group).copied().unwrap_or_default();
+                let pick = match strategy {
+                    SharedStrategy::RoundRobin => self.pick_round_robin(&tenant, &group, &members),
+                    SharedStrategy::Random => self.pick_random(&members),
+                    SharedStrategy::HashClientId => {
+                        let key = publisher.unwrap_or("");
+                        Self::pick_hash(&members, key)
+                    }
+                    SharedStrategy::HashTopic => Self::pick_hash(&members, topic.as_str()),
+                    SharedStrategy::Sticky => self.pick_sticky(&tenant, &group, &members),
+                };
+                matched.insert(pick);
+                return;
+            }
         }
         // Keyed by `(tenant, group)` (MT-02): the same group name in two
         // tenants balances independently, and a tenant-filtered match set
@@ -1678,9 +1730,8 @@ impl Router {
         if groups.is_empty() {
             return;
         }
-        // Lock-free strategy snapshot: one `ArcSwap` load for the whole
+        // Lock-free strategy snapshot loads once above for the whole
         // delivery, then no lock per group on the hot path.
-        let strategies = self.strategies.load_full();
         for ((tenant, group), mut members) in groups {
             members.sort_by(|a, b| a.client_id.cmp(&b.client_id));
             let strategy = strategies.get(&group).copied().unwrap_or_default();
@@ -2106,6 +2157,63 @@ mod tests {
             assert_eq!(matched.len(), 2);
             assert!(matched.iter().any(|s| s.client_id.as_ref() == "plain-c"));
             assert_eq!(matched.iter().filter(|s| s.group.is_some()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_shared_fast_path_single_group_keeps_plain() {
+        // PF-02 checks the fast path condition. One group plus one
+        // plain entry uses the fast path and keeps both parts.
+        let router = Router::new();
+        let inner = TopicFilter::new("fast/single").unwrap();
+        router.subscribe(
+            &inner,
+            Subscription::shared("fast-a", 1, QoS::AtMostOnce, "solo"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("fast-b", 2, QoS::AtMostOnce, "solo"),
+        );
+        router.subscribe(
+            &TopicFilter::new("fast/single").unwrap(),
+            Subscription::new("fast-plain", 3, QoS::AtMostOnce),
+        );
+        let topic = Topic::new("fast/single").unwrap();
+        for _ in 0..4 {
+            let matched = router.matches(&topic);
+            assert_eq!(matched.len(), 2);
+            assert!(matched.iter().any(|s| s.client_id.as_ref() == "fast-plain"));
+            assert_eq!(matched.iter().filter(|s| s.group.is_some()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_shared_fallback_multi_group_reduces_each() {
+        // PF-02 checks the fallback path. Two groups reduce to one
+        // member each, so the set holds two entries.
+        let router = Router::new();
+        let inner = TopicFilter::new("fast/multi").unwrap();
+        router.subscribe(
+            &inner,
+            Subscription::shared("multi-a", 1, QoS::AtMostOnce, "g1"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("multi-b", 2, QoS::AtMostOnce, "g1"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("multi-c", 3, QoS::AtMostOnce, "g2"),
+        );
+        router.subscribe(
+            &inner,
+            Subscription::shared("multi-d", 4, QoS::AtMostOnce, "g2"),
+        );
+        let topic = Topic::new("fast/multi").unwrap();
+        for _ in 0..4 {
+            let matched = router.matches(&topic);
+            assert_eq!(matched.len(), 2);
+            assert_eq!(matched.iter().filter(|s| s.group.is_some()).count(), 2);
         }
     }
 

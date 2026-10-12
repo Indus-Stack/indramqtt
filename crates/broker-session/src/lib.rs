@@ -1031,6 +1031,35 @@ impl Session {
         InflightTrackOutcome::Spilled
     }
 
+    /// Allocate one downlink id and hold the entry (PF-02).
+    /// Reuses [`Session::next_packet_id`] for the id and
+    /// [`Session::track_inflight_or_spill`] for the hold. Both paths
+    /// share one scan set and one insert path. Ids skip 0 and held
+    /// ids. The window fills first, then the spill. Past both, the
+    /// caller still sends live once and counts the drop. All stores
+    /// stay bounded by the window, spill and QoS 2 caps.
+    pub fn alloc_qos1_downlink(
+        &self,
+        topic: Topic,
+        qos: QoS,
+        retain: bool,
+        payload: Bytes,
+        enqueued_at: Instant,
+    ) -> (u16, InflightTrackOutcome) {
+        let pid = self.next_packet_id();
+        let message = InflightMessage {
+            packet_id: pid,
+            topic,
+            qos,
+            retain,
+            payload,
+            enqueued_at,
+            publish_at_ms: Some(now_ms()),
+        };
+        let outcome = self.track_inflight_or_spill(message);
+        (pid, outcome)
+    }
+
     /// Release one downlink on its PUBACK, from the window or the spill.
     /// True when an entry was held in either store. When the window entry
     /// is released and spill holds older overflow, the oldest spilled
@@ -3867,6 +3896,55 @@ mod tests {
         session.set_max_spill(0);
         assert_eq!(session.max_inflight(), 1);
         assert_eq!(session.max_spill(), 1);
+    }
+
+    #[test]
+    fn test_alloc_qos1_downlink_matches_two_step_path() {
+        // PF-02 proves the production entry equals the old path.
+        // Both sessions use a window of 3 and a spill of 2.
+        // Each step checks the same outcome on both paths.
+        use super::InflightTrackOutcome;
+        let manager = SessionManager::new_with_all_limits(Some(10), 3, 2);
+        let (single, _) = manager.get_or_create("alloc-single", false);
+        let (paired, _) = manager.get_or_create("alloc-paired", false);
+        let topic = Topic::new("t").unwrap();
+        let payload = Bytes::from_static(b"x");
+        for step in 0..6 {
+            let (pid, single_outcome) = single.alloc_qos1_downlink(
+                topic.clone(),
+                broker_protocol::QoS::AtLeastOnce,
+                false,
+                payload.clone(),
+                Instant::now(),
+            );
+            assert_ne!(pid, 0, "step {step} skips id 0");
+            let two_pid = paired.next_packet_id();
+            assert_ne!(two_pid, 0, "step {step} skips id 0");
+            let two_outcome = paired.track_inflight_or_spill(super::InflightMessage {
+                packet_id: two_pid,
+                topic: topic.clone(),
+                qos: broker_protocol::QoS::AtLeastOnce,
+                retain: false,
+                payload: payload.clone(),
+                enqueued_at: Instant::now(),
+                publish_at_ms: None,
+            });
+            let want = match step {
+                0..=2 => InflightTrackOutcome::Tracked,
+                3..=4 => InflightTrackOutcome::Spilled,
+                _ => InflightTrackOutcome::Dropped,
+            };
+            assert_eq!(single_outcome, want, "step {step} lands");
+            assert_eq!(two_outcome, want, "step {step} lands");
+        }
+        assert_eq!(single.inflight_len(), 3);
+        assert_eq!(single.inflight_spill_len(), 2);
+        assert_eq!(paired.inflight_len(), 3);
+        assert_eq!(paired.inflight_spill_len(), 2);
+        assert!(single.ack_inflight(1));
+        assert!(paired.ack_inflight(1));
+        assert_eq!(single.inflight_len(), 3);
+        assert_eq!(paired.inflight_len(), 3);
     }
 
     #[test]

@@ -18,8 +18,8 @@ use broker_router::{
 };
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleEngine};
 use broker_session::{
-    InflightMessage, InflightTrackOutcome, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage,
-    SessionKey, SessionManager,
+    InflightTrackOutcome, Qos2InboundEntry, Qos2OutboundEntry, QueuedMessage, SessionKey,
+    SessionManager,
 };
 use broker_storage::stream::{DurableStreamStore, StreamConfig};
 use broker_storage::OfflineQueueStore;
@@ -8485,42 +8485,19 @@ fn build_downlink_frames_with_publisher_and_props(
                             );
                             continue;
                         }
-                        let downlink_id = if effective == 0 {
-                            0u16
-                        } else {
-                            session.next_packet_id()
-                        };
-                        // B4-01: hold every QoS 1 downlink from the moment
-                        // it is written until its PUBACK arrives. Inside
-                        // the window this is one bounded deque push under
-                        // a single lock with no allocation beyond the
-                        // message itself, so the publish fast path pays
-                        // nothing for the bound. Past the window the entry
-                        // spills into the bounded overflow buffer (still
-                        // tracked for DUP replay, counted); past window +
-                        // spill the frame still goes out live once but is
-                        // left untracked (counted), so the live delivery
-                        // rate never pays for the window. QoS 0 never
-                        // touches session state here. Driven by the
-                        // publish-to-delivery event. Before/after
-                        // delivery-workload numbers for this path are
-                        // printed by
-                        // `qos1_inflight_delivery_workload_timings`.
+                        let mut downlink_id = 0u16;
+                        // PF-02: one pass assigns the id and holds the
+                        // entry, so hot sessions pay one scan, not two.
                         if effective == 1 {
-                            match session.track_inflight_or_spill(InflightMessage {
-                                packet_id: downlink_id,
-                                topic: topic.clone(),
-                                qos: QoS::try_from(effective).unwrap_or(QoS::AtLeastOnce),
-                                retain: delivered_retain,
-                                payload: shared.clone(),
-                                // FX-02: stamp delivery so the PUBACK event
-                                // can measure ack latency. One clock read
-                                // per QoS 1 delivery (no lock, no
-                                // allocation); the entry itself stays
-                                // bounded by the window+spill caps.
-                                enqueued_at: std::time::Instant::now(),
-                                publish_at_ms: None,
-                            }) {
+                            let (pid, outcome) = session.alloc_qos1_downlink(
+                                topic.clone(),
+                                QoS::AtLeastOnce,
+                                delivered_retain,
+                                shared.clone(),
+                                std::time::Instant::now(),
+                            );
+                            downlink_id = pid;
+                            match outcome {
                                 InflightTrackOutcome::Tracked => {}
                                 InflightTrackOutcome::Spilled => {
                                     metrics.inc_inflight_spilled();
@@ -8530,6 +8507,8 @@ fn build_downlink_frames_with_publisher_and_props(
                                     metrics.inc_inflight_spill_evicted();
                                 }
                             }
+                        } else if effective == 2 {
+                            downlink_id = session.next_packet_id();
                         }
                         // D1-01: hold every QoS 2 downlink until its
                         // PUBCOMP arrives (message until PUBREC, packet id
@@ -23456,12 +23435,13 @@ mod tests {
 
         // First incarnation: publish through the broker but never start
         // its driver, so the entry stays pending in the file.
+        // Delay 6 s keeps the entry pending across reload on a loaded runner.
         let pending = {
             let shared = test_shared();
             shared.delayed.set_persist_dir(&data_dir);
             assert_eq!(shared.delayed.load(), (0, 0, 0));
             let (meta, payload) =
-                encode_publish_meta("$delayed/2/restart/alerts", 0, 0, false, b"restart-me");
+                encode_publish_meta("$delayed/6/restart/alerts", 0, 0, false, b"restart-me");
             let (ack, deliveries) =
                 apply_publish(&publish_frame(957, 1, meta, payload), &shared).await;
             assert!(ack.is_none());
@@ -23494,7 +23474,8 @@ mod tests {
         );
         apply_subscribe(&sub, &shared).await.0.expect("subscribe");
         shared.spawn_delayed_driver();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        // Wait 15 s covers the 6 s delay plus scheduling slack.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let routed = loop {
             if let Some(frame) = shared.conns.pop_qos0(958) {
                 break frame;

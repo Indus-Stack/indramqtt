@@ -1315,6 +1315,62 @@ async fn lc_shared_subscription_delivers() {
     kernel.finish().await;
 }
 
+/// QoS 1 shared fan-in delivers once per publish.
+/// Two members share one group. Each publish reaches one member
+/// with QoS 1. The member acks. The other member stays quiet.
+#[tokio::test]
+async fn lc_shared_qos1_fan_in() {
+    let kernel = spawn_kernel("shared-qos1", None).await;
+    let topic = "lc/shared/qos1/fanin";
+    let filter = format!("$share/faninq/{topic}");
+    let mut first = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut first, "lc-shared-qos1-a", true, 60).await);
+    send(&mut first, &subscribe(1, &[(filter.as_str(), 1)])).await;
+    let (head, _) = recv(&mut first).await;
+    assert_eq!(head, 0x90);
+    let mut second = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut second, "lc-shared-qos1-b", true, 60).await);
+    send(&mut second, &subscribe(1, &[(filter.as_str(), 1)])).await;
+    let (head, _) = recv(&mut second).await;
+    assert_eq!(head, 0x90);
+    let mut publisher = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut publisher, "lc-shared-qos1-pub", true, 60).await);
+    send(
+        &mut publisher,
+        &publish311(topic, 7, 1, false, b"fanin-one"),
+    )
+    .await;
+    let (head, body) = recv(&mut publisher).await;
+    assert_eq!(head, 0x40);
+    assert_eq!(body, vec![0x00, 0x07]);
+    let (head, body) = recv(&mut first).await;
+    let got = parse_publish(head, &body);
+    assert_eq!(got.qos, 1);
+    assert_eq!(got.topic, topic);
+    assert_eq!(got.payload, b"fanin-one");
+    assert_ne!(got.packet_id, 0);
+    send(&mut first, &ack(0x40, got.packet_id)).await;
+    let quiet = tokio::time::timeout(QUIET, read_mqtt_packet(&mut second)).await;
+    assert!(quiet.is_err(), "one copy reaches one member");
+    send(
+        &mut publisher,
+        &publish311(topic, 8, 1, false, b"fanin-two"),
+    )
+    .await;
+    let (head, body) = recv(&mut publisher).await;
+    assert_eq!(head, 0x40);
+    assert_eq!(body, vec![0x00, 0x08]);
+    let (head, body) = recv(&mut second).await;
+    let got = parse_publish(head, &body);
+    assert_eq!(got.qos, 1);
+    assert_eq!(got.payload, b"fanin-two");
+    assert_ne!(got.packet_id, 0);
+    send(&mut second, &ack(0x40, got.packet_id)).await;
+    let quiet = tokio::time::timeout(QUIET, read_mqtt_packet(&mut first)).await;
+    assert!(quiet.is_err(), "next copy reaches the other member");
+    kernel.finish().await;
+}
+
 /// Kick closes the socket through the management API. A ban refuses a
 /// new CONNECT and its removal admits it again.
 #[tokio::test]
