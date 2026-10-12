@@ -2184,6 +2184,17 @@ impl Drop for ConnGuard {
     }
 }
 
+/// Gives the next socket read the full read buffer. A consumed packet
+/// leaves the front of the buffer unused, and the next packet then
+/// needs two reads. The call reuses the consumed space in place when no
+/// other handle holds the allocation. It does nothing when the room is
+/// enough, thus an idle connection does not grow.
+fn ensure_read_room(inbuf: &mut BytesMut) {
+    if inbuf.capacity() - inbuf.len() < READ_BUFFER_BYTES {
+        inbuf.reserve(READ_BUFFER_BYTES);
+    }
+}
+
 async fn run_connection<S>(
     mut io: S,
     peer: String,
@@ -2222,6 +2233,7 @@ where
     let mut last_packet = Instant::now();
 
     let stop = loop {
+        ensure_read_room(&mut inbuf);
         // One deadline: CONNECT in time, then the keepalive of the client.
         let deadline = if conn.connected {
             conn.keepalive.map(|keepalive| last_packet + keepalive)
@@ -6113,5 +6125,131 @@ mod tests {
         let stored =
             tokio::time::timeout(Duration::from_millis(800), tcp_test_recv(&mut late)).await;
         assert!(stored.is_err(), "no retained message under secret/");
+    }
+
+    /// A reader that serves whole packets from a queue. One call returns
+    /// bytes of the first packet only, as many as the caller accepts.
+    /// The rest of the packet waits for the next call. A packet is like
+    /// one TCP segment: the next packet is not yet there.
+    struct PacketReader {
+        packets: std::collections::VecDeque<Vec<u8>>,
+        /// Calls that returned data. Each one is one `recv` call.
+        reads: usize,
+    }
+
+    impl AsyncRead for PacketReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            let Some(front) = this.packets.front_mut() else {
+                // No packet left: the end of the stream.
+                return Poll::Ready(Ok(()));
+            };
+            let take = front.len().min(buf.remaining());
+            buf.put_slice(&front[..take]);
+            front.drain(..take);
+            if front.is_empty() {
+                this.packets.pop_front();
+            }
+            if take > 0 {
+                this.reads += 1;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// One PUBLISH packet (QoS 0) of `total` bytes. The fixed header has
+    /// a two-byte length. The body is not a valid PUBLISH body, because
+    /// the read loop reads only the fixed header.
+    fn test_publish_packet(total: usize) -> Vec<u8> {
+        let remaining = total - 3;
+        assert!((128..16384).contains(&remaining));
+        let mut packet = vec![
+            0x30,
+            (remaining & 0x7F) as u8 | 0x80,
+            (remaining >> 7) as u8,
+        ];
+        packet.resize(total, b'x');
+        packet
+    }
+
+    /// What one run of the test read loop did.
+    struct ReadRun {
+        reads: usize,
+        consumed: usize,
+        bytes: usize,
+        /// The largest capacity of the buffer, seen when the buffer was
+        /// empty and the room step was done.
+        max_empty_capacity: usize,
+    }
+
+    /// The buffer logic of `run_connection` without a socket: room step,
+    /// one read, then each complete packet is taken from the front the
+    /// same way as in `drain_inbound`.
+    async fn drive_read_loop(packets: Vec<Vec<u8>>) -> ReadRun {
+        let expected = packets.len();
+        let mut io = PacketReader {
+            packets: packets.into(),
+            reads: 0,
+        };
+        let mut inbuf = BytesMut::with_capacity(READ_BUFFER_BYTES);
+        let mut run = ReadRun {
+            reads: 0,
+            consumed: 0,
+            bytes: 0,
+            max_empty_capacity: 0,
+        };
+        while run.consumed < expected {
+            ensure_read_room(&mut inbuf);
+            if inbuf.is_empty() {
+                run.max_empty_capacity = run.max_empty_capacity.max(inbuf.capacity());
+            }
+            let read = io.read_buf(&mut inbuf).await.expect("the reader works");
+            assert!(read > 0, "the reader ended before all packets arrived");
+            while let Ok(Some(header)) = wire::fixed_header(&inbuf) {
+                if inbuf.len() < header.packet_len() {
+                    inbuf.reserve(header.packet_len() - inbuf.len());
+                    break;
+                }
+                let packet = inbuf.split_to(header.packet_len()).freeze();
+                run.bytes += packet.len();
+                run.consumed += 1;
+            }
+        }
+        run.reads = io.reads;
+        run
+    }
+
+    /// A packet of 146 bytes (a PUBLISH with a payload of 128 bytes)
+    /// needs one read, also after many packets. Without the room step,
+    /// the unused front of the buffer leaves 110 bytes of room, and each
+    /// packet needs two reads. An idle connection keeps the small buffer.
+    #[tokio::test]
+    async fn small_packets_need_one_read_each() {
+        let packets: Vec<Vec<u8>> = (0..100).map(|_| test_publish_packet(146)).collect();
+        let run = drive_read_loop(packets).await;
+        assert_eq!(run.consumed, 100);
+        assert_eq!(run.bytes, 100 * 146);
+        assert_eq!(run.reads, 100, "one read for each packet");
+        assert!(
+            run.max_empty_capacity <= READ_BUFFER_BYTES,
+            "an empty buffer does not grow: {}",
+            run.max_empty_capacity
+        );
+    }
+
+    /// A packet larger than the buffer is read completely. The buffer
+    /// grows to the size of the packet, as `drain_inbound` reserves the
+    /// missing bytes. It keeps that capacity until the connection ends.
+    /// This test does not check the capacity after the packet.
+    #[tokio::test]
+    async fn packet_larger_than_the_buffer_is_read_completely() {
+        let run = drive_read_loop(vec![test_publish_packet(600)]).await;
+        assert_eq!(run.consumed, 1);
+        assert_eq!(run.bytes, 600);
+        assert!(run.reads <= 3, "reads for 600 bytes: {}", run.reads);
     }
 }
