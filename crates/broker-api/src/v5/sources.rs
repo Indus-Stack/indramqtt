@@ -279,7 +279,10 @@ impl SourceStore {
     pub fn from_registry(registry: &Arc<broker_config::ConfigRegistry>) -> Self {
         let store = Self::new();
         store.seed_from_snapshot(&registry.snapshot().sources);
-        *store.registry.write().expect("source store lock") = Some(Arc::clone(registry));
+        *store
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(registry));
         store
     }
 
@@ -291,11 +294,17 @@ impl SourceStore {
     /// (today's empty behaviour).
     pub fn seed_from_registry(&self, registry: &Arc<broker_config::ConfigRegistry>) {
         self.seed_from_snapshot(&registry.snapshot().sources);
-        *self.registry.write().expect("source store lock") = Some(Arc::clone(registry));
+        *self
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(registry));
     }
 
     fn seed_from_snapshot(&self, conf: &broker_config::SourcesConf) {
-        let mut map = self.inner.write().expect("source store lock");
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         map.clear();
         for entry in &conf.sources {
             // Old files store an empty document. New files store the
@@ -354,7 +363,10 @@ impl SourceStore {
 
     /// Snapshot of live entries sorted by id for stable reads.
     pub fn snapshot(&self) -> Vec<SourceEntry> {
-        let map = self.inner.read().expect("source store lock");
+        let map = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out: Vec<SourceEntry> = map.values().cloned().collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
@@ -364,7 +376,10 @@ impl SourceStore {
     /// disabled). Computed on demand from the snapshot, never stored,
     /// so the counts always track creates and deletes.
     pub fn summary_counts(&self) -> (usize, usize, usize) {
-        let map = self.inner.read().expect("source store lock");
+        let map = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let total = map.len();
         let enabled = map.values().filter(|entry| entry.enable).count();
         (total, enabled, total - enabled)
@@ -374,7 +389,10 @@ impl SourceStore {
     /// (caller maps to `ALREADY_EXISTS`) or the store is at
     /// [`MAX_SOURCES`] (caller maps to `BAD_REQUEST`).
     pub fn insert(&self, entry: SourceEntry) -> Result<SourceEntry, SourceInsertError> {
-        let mut map = self.inner.write().expect("source store lock");
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if map.contains_key(&entry.id) {
             return Err(SourceInsertError::Duplicate);
         }
@@ -390,7 +408,7 @@ impl SourceStore {
     pub fn remove(&self, id: &str) -> bool {
         self.inner
             .write()
-            .expect("source store lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(id)
             .is_some()
     }
@@ -402,7 +420,7 @@ impl SourceStore {
     pub fn get(&self, id: &str) -> Option<SourceEntry> {
         self.inner
             .read()
-            .expect("source store lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(id)
             .cloned()
     }
@@ -410,7 +428,10 @@ impl SourceStore {
     /// Resolve a path id to the stored bare id. Accepts the bare name
     /// and the `{type}:{name}` key. Returns `None` for unknown ids.
     pub fn resolve_id(&self, requested: &str) -> Option<String> {
-        let map = self.inner.read().expect("source store lock");
+        let map = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if map.contains_key(requested) {
             return Some(requested.to_string());
         }
@@ -456,7 +477,10 @@ impl SourceStore {
     /// Management-plane only; publish and deliver never call this
     /// (ingress consults a snapshot off the message path).
     pub fn set_enabled(&self, id: &str, enable: bool) -> Option<SourceEntry> {
-        let mut map = self.inner.write().expect("source store lock");
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = map.get_mut(id)?;
         entry.enable = enable;
         Some(entry.clone())
@@ -469,7 +493,10 @@ impl SourceStore {
     /// update can never trip the store cap. Management-plane only;
     /// publish and deliver never call this.
     pub fn replace(&self, id: &str, entry: SourceEntry) -> bool {
-        let mut map = self.inner.write().expect("source store lock");
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !map.contains_key(id) {
             return false;
         }
@@ -483,7 +510,10 @@ impl SourceStore {
     /// `parameters`, `resource_opts`) plus the opaque extras as a JSON
     /// document. Nothing derived is stored: only inputs persist.
     fn export_conf(&self) -> broker_config::SourcesConf {
-        let map = self.inner.read().expect("source store lock");
+        let map = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut entries: Vec<broker_config::SourceEntry> = map
             .values()
             .map(|entry| {
@@ -520,11 +550,18 @@ impl SourceStore {
     /// atomic save). Stores without a registry (unit tests, standalone
     /// state) are memory-only and persist as a no-op.
     fn persist(&self) -> Result<(), broker_config::ConfigError> {
-        let registry = self.registry.read().expect("source store lock").clone();
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let Some(registry) = registry else {
             return Ok(());
         };
-        let _guard = self.save_lock.lock().expect("source store lock");
+        let _guard = self
+            .save_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let conf = self.export_conf();
         registry.commit_sources(conf)?;
         registry.save()?;
@@ -1237,5 +1274,21 @@ mod tests {
         assert!(is_known_source_type("kafka"));
         assert!(!is_known_source_type("no_such_kind_xyz"));
         assert!(!is_known_source_type(""));
+    }
+
+    #[test]
+    fn serves_after_lock_poison() {
+        // A poisoned lock must not stop the store. Reads recover the lock.
+        let store = SourceStore::new();
+        assert!(store.insert(entry("a", true)).is_ok());
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let _guard = store.inner.write().unwrap();
+                panic!("poison the source lock");
+            });
+            let _ = h.join();
+        });
+        assert!(store.get("a").is_some());
+        assert_eq!(store.snapshot().len(), 1);
     }
 }

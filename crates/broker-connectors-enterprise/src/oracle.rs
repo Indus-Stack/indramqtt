@@ -528,7 +528,19 @@ impl Sink for OracleSink {
         };
 
         if should_flush {
-            self.flush().await?;
+            // While backing off, keep rows buffered instead of failing the
+            // send: an explicit flush reports the backoff without dropping.
+            if self.backoff.lock().check().is_err() {
+                return Ok(());
+            }
+            if let Err(e) = self.flush().await {
+                if let ConnectorError::Connection(msg) = &e {
+                    if msg == "sink backing off after errors" {
+                        return Ok(());
+                    }
+                }
+                return Err(e);
+            }
         }
         Ok(())
     }

@@ -345,7 +345,7 @@ pub(super) struct TlsClientAuth {
     pub verify_peer: bool,
     /// True when the legacy switch requests a chain check.
     pub legacy_verify: bool,
-    /// CA file for the chain check. Empty selects the system roots.
+    /// CA file for the chain check. Required when a check is on.
     pub cacertfile: String,
     /// True when a missing certificate fails the handshake.
     pub fail_if_no_peer_cert: bool,
@@ -365,17 +365,15 @@ impl TlsClientAuth {
 }
 
 /// Loads the trust roots for client certificate checks.
-/// An empty path selects the bundled system roots.
-/// A set path must name a PEM file with at least one certificate.
-/// A missing file, an unreadable file and an empty file return an
-/// error. The caller fails the listener start on an error.
+/// The path must name a PEM file with at least one certificate.
+/// An empty path, a missing file, an unreadable file and an empty
+/// file return an error. No default set of public authorities
+/// applies. The caller fails the listener start on an error.
 fn load_client_roots(
     cacertfile: &str,
 ) -> Result<rustls::RootCertStore, Box<dyn std::error::Error + Send + Sync>> {
     if cacertfile.trim().is_empty() {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        return Ok(roots);
+        return Err("client certificate verification needs a CA file (cacertfile)".into());
     }
     let file = std::fs::File::open(cacertfile)?;
     let mut reader = std::io::BufReader::new(file);
@@ -464,6 +462,9 @@ pub(super) struct PeerCert {
     pub subject: Option<String>,
     /// DNS and IP subject-alt names of the leaf.
     pub sans: Vec<String>,
+    /// Verified PSK identity of the connection, if the handshake
+    /// used PSK. The bind carries it as the username.
+    pub psk_identity: Option<String>,
 }
 
 /// Pulls CN, subject and SANs from the leaf peer certificate.
@@ -497,6 +498,7 @@ fn peer_cert_fields(certs: Option<&[rustls::pki_types::CertificateDer<'_>]>) -> 
             cn,
             subject: None,
             sans: Vec::new(),
+            psk_identity: None,
         };
     }
     subject.truncate(MAX_NATIVE_CERT_FIELD_LEN);
@@ -531,6 +533,7 @@ fn peer_cert_fields(certs: Option<&[rustls::pki_types::CertificateDer<'_>]>) -> 
         cn,
         subject: Some(subject),
         sans,
+        psk_identity: None,
     }
 }
 
@@ -607,10 +610,48 @@ const PSK_CIPHER_LIST: &str = "PSK-AES128-GCM-SHA256:PSK-AES256-GCM-SHA384";
 /// Reason: the two GCM suites cover 128 and 256 bit keys.
 const PSK_CIPHERSUITES: &str = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384";
 
+/// Length of the PSK server secret in bytes.
+/// Reason: 256 bits stop guessing across restarts.
+const PSK_SERVER_SECRET_LEN: usize = 32;
+
+/// Makes one random PSK server secret. The stand-in key for an
+/// unknown identity derives from it. Fails closed when the platform
+/// generator fails: no listener starts without a secret.
+fn psk_new_server_secret() -> Result<[u8; PSK_SERVER_SECRET_LEN], openssl::error::ErrorStack> {
+    let mut secret = [0u8; PSK_SERVER_SECRET_LEN];
+    openssl::rand::rand_bytes(&mut secret)?;
+    Ok(secret)
+}
+
+/// Derives the stand-in key for an unknown PSK identity. HMAC with
+/// the per-boot server secret keeps the value unpredictable. The
+/// handshake then fails at the same check as a wrong key. A failed
+/// HMAC yields zeros, which still fail the handshake.
+fn psk_fake_key(secret: &[u8; PSK_SERVER_SECRET_LEN], identity: &[u8]) -> [u8; 32] {
+    use openssl::hash::MessageDigest;
+    let mut out = [0u8; 32];
+    let Ok(pkey) = openssl::pkey::PKey::hmac(secret) else {
+        return out;
+    };
+    let Ok(mut signer) = openssl::sign::Signer::new(MessageDigest::sha256(), &pkey) else {
+        return out;
+    };
+    if signer.update(identity).is_err() {
+        return out;
+    }
+    let Ok(len) = signer.len() else {
+        return out;
+    };
+    if len != out.len() || signer.sign(&mut out).is_err() {
+        out = [0u8; 32];
+    }
+    out
+}
+
 /// Raw OpenSSL handshake hooks for TLS 1.3 external PSK.
 /// The safe wrapper exposes only the TLS 1.2 callback, so this
 /// module calls `SSL_CTX_set_psk_find_session_callback` directly.
-/// Both callbacks read the same store.
+/// Both callbacks read the same store and the same server secret.
 mod psk_tls13 {
     use std::collections::HashMap;
     use std::os::raw::{c_char, c_int, c_uchar, c_void};
@@ -643,11 +684,16 @@ mod psk_tls13 {
         fn OPENSSL_sk_value(stack: *const c_void, index: c_int) -> *mut c_void;
     }
 
+    /// Store plus server secret for one PSK context.
+    struct PskContext {
+        store: Arc<broker_auth::PskStore>,
+        secret: [u8; super::PSK_SERVER_SECRET_LEN],
+    }
+
     /// Context pointer to store map. One entry for each PSK listener.
     /// Holds at most [`MAX_PSK_CONTEXTS`] entries.
-    fn ctx_stores() -> &'static parking_lot::Mutex<HashMap<usize, Arc<broker_auth::PskStore>>> {
-        static CELL: OnceLock<parking_lot::Mutex<HashMap<usize, Arc<broker_auth::PskStore>>>> =
-            OnceLock::new();
+    fn ctx_stores() -> &'static parking_lot::Mutex<HashMap<usize, PskContext>> {
+        static CELL: OnceLock<parking_lot::Mutex<HashMap<usize, PskContext>>> = OnceLock::new();
         CELL.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
     }
 
@@ -656,20 +702,26 @@ mod psk_tls13 {
     /// The rest covers restarts and tests.
     pub(super) const MAX_PSK_CONTEXTS: usize = 16;
 
-    /// Remembers the store for one context pointer.
+    /// Remembers the store and the secret for one context pointer.
     /// Refuses a new context past the bound and reports false.
     /// The caller fails the listener start on false.
-    pub(super) fn register(ctx: *mut c_void, store: Arc<broker_auth::PskStore>) -> bool {
+    pub(super) fn register(
+        ctx: *mut c_void,
+        store: Arc<broker_auth::PskStore>,
+        secret: [u8; super::PSK_SERVER_SECRET_LEN],
+    ) -> bool {
         let mut map = ctx_stores().lock();
         if !map.contains_key(&(ctx as usize)) && map.len() >= MAX_PSK_CONTEXTS {
             return false;
         }
-        map.insert(ctx as usize, store);
+        map.insert(ctx as usize, PskContext { store, secret });
         true
     }
 
     /// Sets the TLS 1.3 find-session callback on one context.
     pub(super) fn set_callback(ctx: *mut c_void) {
+        // Sound: the pointer is a live server context from the
+        // builder, and the callback has the required signature.
         unsafe {
             SSL_CTX_set_psk_find_session_callback(ctx, Some(find_session_cb));
         }
@@ -678,21 +730,31 @@ mod psk_tls13 {
     /// Picks a TLS 1.3 cipher for the new session.
     /// Prefers an AES GCM suite, else takes the first suite.
     unsafe fn pick_cipher(ssl: *const c_void) -> *const c_void {
+        // Sound: the handshake passes a live handshake object, so
+        // the cipher list call reads valid state.
         let stack = SSL_get_ciphers(ssl);
         if stack.is_null() {
             return std::ptr::null();
         }
+        // Sound: the stack pointer is valid, and the count call
+        // reads only the stack header.
         let count = OPENSSL_sk_num(stack);
         let mut first: *const c_void = std::ptr::null();
         let mut index = 0;
         while index < count {
+            // Sound: the index stays below the count, so the
+            // element call returns a valid cipher pointer.
             let cipher = OPENSSL_sk_value(stack, index) as *const c_void;
             if !cipher.is_null() {
                 if first.is_null() {
                     first = cipher;
                 }
+                // Sound: the cipher pointer is valid, so the name
+                // call returns a valid string pointer.
                 let name = SSL_CIPHER_get_name(cipher);
                 if !name.is_null()
+                    // Sound: the name pointer points to a valid
+                    // NUL-ended string owned by the library.
                     && std::ffi::CStr::from_ptr(name)
                         .to_bytes()
                         .starts_with(b"TLS_AES_")
@@ -705,10 +767,34 @@ mod psk_tls13 {
         first
     }
 
+    /// Key for one TLS 1.3 identity. An unknown identity gets the
+    /// stand-in key, so the handshake fails at the binder check like
+    /// a wrong key does. It never logs the identity.
+    fn session_key(context: &PskContext, identity: &[u8]) -> Vec<u8> {
+        match context.store.lookup(identity) {
+            Some(key) => key,
+            None => super::psk_fake_key(&context.secret, identity).to_vec(),
+        }
+    }
+
     /// TLS 1.3 session lookup. Runs during the handshake.
-    /// Unknown identity fails with 0, same as a wrong key later does.
-    /// It never logs the identity.
+    /// A panic never crosses the FFI boundary: any panic becomes
+    /// a refused lookup.
     unsafe extern "C" fn find_session_cb(
+        ssl: *mut c_void,
+        identity: *const c_uchar,
+        idlen: usize,
+        sess_out: *mut *mut c_void,
+    ) -> c_int {
+        let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            find_session_inner(ssl, identity, idlen, sess_out)
+        }));
+        step.unwrap_or(0)
+    }
+
+    /// Body of the TLS 1.3 session lookup. Runs inside the panic
+    /// guard above, so no panic reaches the library.
+    unsafe fn find_session_inner(
         ssl: *mut c_void,
         identity: *const c_uchar,
         idlen: usize,
@@ -717,32 +803,50 @@ mod psk_tls13 {
         if identity.is_null() || sess_out.is_null() {
             return 0;
         }
+        // Sound: the handshake passes a valid identity buffer of
+        // idlen bytes when the pointer is not null.
         let id = std::slice::from_raw_parts(identity, idlen);
+        // Sound: the handshake passes a live handshake object, so
+        // the context call reads valid state.
         let ctx = SSL_get_SSL_CTX(ssl);
         let key = ctx_stores()
             .lock()
             .get(&(ctx as usize))
-            .and_then(|store| store.lookup(id));
+            .map(|context| session_key(context, id));
         let Some(key) = key else {
             return 0;
         };
+        // Sound: the constructor returns either a valid session or
+        // null, and the null case returns at once.
         let sess = SSL_SESSION_new();
         if sess.is_null() {
             return 0;
         }
+        // Sound: the session pointer is valid here, and the key
+        // slice is live for the call.
         if SSL_SESSION_set1_master_key(sess, key.as_ptr(), key.len()) != 1 {
+            // Sound: the session pointer is valid and owned here,
+            // so the free call releases it exactly once.
             SSL_SESSION_free(sess);
             return 0;
         }
         let cipher = pick_cipher(ssl);
+        // Sound: the session pointer is valid here.
         if cipher.is_null() || SSL_SESSION_set_cipher(sess, cipher) != 1 {
+            // Sound: the session pointer is valid and owned here,
+            // so the free call releases it exactly once.
             SSL_SESSION_free(sess);
             return 0;
         }
+        // Sound: the session pointer is valid here.
         if SSL_SESSION_set_protocol_version(sess, TLS1_3_VERSION) != 1 {
+            // Sound: the session pointer is valid and owned here,
+            // so the free call releases it exactly once.
             SSL_SESSION_free(sess);
             return 0;
         }
+        // Sound: the caller passes a valid output pointer, and the
+        // session is fully built, so ownership moves to the library.
         *sess_out = sess;
         1
     }
@@ -750,9 +854,11 @@ mod psk_tls13 {
 
 /// Builds the OpenSSL server context for the PSK listener.
 /// Uses only PSK suites and no certificate. Wires the TLS 1.2
-/// server callback and the TLS 1.3 find-session callback to
-/// the same store. Releases idle buffers. Fails closed on
-/// any OpenSSL error.
+/// server callback and the TLS 1.3 find-session callback to the
+/// same store and the same per-boot secret. An unknown identity
+/// gets a stand-in key, so it fails at the same check as a wrong
+/// key. Releases idle buffers. Refuses tickets, so every handshake
+/// runs the lookup. Fails closed on any OpenSSL error.
 pub(super) fn build_psk_ssl_context(
     store: Arc<broker_auth::PskStore>,
 ) -> Result<openssl::ssl::SslContext, Box<dyn std::error::Error + Send + Sync>> {
@@ -762,25 +868,36 @@ pub(super) fn build_psk_ssl_context(
     builder.set_cipher_list(PSK_CIPHER_LIST)?;
     builder.set_ciphersuites(PSK_CIPHERSUITES)?;
     // Reason: every PSK handshake runs the full lookup, so no
-    // session resumes and the cache would only spend memory.
+    // session resumes and the cache would only spend memory. No
+    // tickets either, so a client cannot resume without the lookup.
     builder.set_session_cache_mode(openssl::ssl::SslSessionCacheMode::OFF);
+    builder.set_options(openssl::ssl::SslOptions::NO_TICKET);
     builder.set_mode(openssl::ssl::SslMode::RELEASE_BUFFERS);
+    // One secret serves both protocol versions, so the stand-in
+    // key is the same on TLS 1.2 and TLS 1.3.
+    let secret = psk_new_server_secret()?;
     let lookup = store.clone();
-    // An unknown identity fails here. A wrong key fails at the
-    // Finished check. The two paths differ as far as the library
-    // permits. Neither path names the identity.
+    // An unknown identity gets the stand-in key, so the handshake
+    // fails at the Finished check like a wrong key does. Both
+    // failures carry the same alert. Neither path names the
+    // identity. A panic never escapes into the library: any panic
+    // becomes a refused handshake.
     builder.set_psk_server_callback(move |_ssl, identity, psk| {
-        let id = identity.unwrap_or_default();
-        let key = lookup
-            .lookup(id)
-            .ok_or_else(openssl::error::ErrorStack::get)?;
+        let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let id = identity.unwrap_or_default();
+            match lookup.lookup(id) {
+                Some(key) => key,
+                None => psk_fake_key(&secret, id).to_vec(),
+            }
+        }));
+        let key = step.map_err(|_| openssl::error::ErrorStack::get())?;
         if key.len() > psk.len() {
             return Err(openssl::error::ErrorStack::get());
         }
         psk[..key.len()].copy_from_slice(&key);
         Ok(key.len())
     });
-    if !psk_tls13::register(builder.as_ptr() as *mut std::ffi::c_void, store) {
+    if !psk_tls13::register(builder.as_ptr() as *mut std::ffi::c_void, store, secret) {
         return Err(format!(
             "PSK context table holds {} entries",
             psk_tls13::MAX_PSK_CONTEXTS
@@ -795,10 +912,12 @@ pub(super) fn build_psk_ssl_context(
 /// starting this listener. The certificate TLS listener stays
 /// unchanged and keeps its rustls path. Each handshake runs in
 /// the task of the connection with the TLS time limit. An
-/// unknown identity and a wrong key both fail the handshake.
-/// The failure never names the identity. The listener name is
-/// `tls` for tenant rules. The same packet limits, the connect
-/// timeout from accept, and `max_connections` apply as on TCP.
+/// unknown identity and a wrong key both fail the handshake with
+/// the same alert. The failure never names the identity. The
+/// verified identity rides to the bind step as the username. The
+/// listener name is `tls` for tenant rules. The same packet
+/// limits, the connect timeout from accept, and `max_connections`
+/// apply as on TCP.
 pub(super) async fn serve_native_mqtt_psk(
     listener: TcpListener,
     psk: Arc<broker_auth::PskStore>,
@@ -856,13 +975,17 @@ pub(super) async fn serve_native_mqtt_psk(
                 debug!("Kernel MQTT PSK handshake with {} failed: {}", peer, e);
                 return;
             }
+            // The handshake verified the PSK identity. It rides to
+            // the bind step as the username, so authentication uses
+            // the verified value, never the CONNECT text.
+            let peer_cert = psk_peer_cert(&tls);
             if let Err(e) = run_connection(
                 tls,
                 peer.ip().to_string(),
                 conn_id,
                 shared,
                 "tls",
-                PeerCert::default(),
+                peer_cert,
                 accepted_at,
             )
             .await
@@ -873,13 +996,35 @@ pub(super) async fn serve_native_mqtt_psk(
     }
 }
 
-/// Largest number of queued WebSocket pongs on one connection.
-/// Reason: a peer sends Ping frames without reading. Four queued
-/// pongs use at most 500 bytes and cover a burst while the sink waits.
-const MAX_QUEUED_PONGS: usize = 4;
+/// Builds the peer fields of one PSK connection. The handshake
+/// verified the identity, so the bind trusts it. A missing or
+/// non-UTF-8 identity fails closed with empty fields.
+fn psk_peer_cert(tls: &tokio_openssl::SslStream<tokio::net::TcpStream>) -> PeerCert {
+    let psk_identity = tls
+        .ssl()
+        .psk_identity()
+        .and_then(|id| std::str::from_utf8(id).ok())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    PeerCert {
+        psk_identity,
+        ..PeerCert::default()
+    }
+}
+
+/// Largest HTTP upgrade head the broker reads, in bytes.
+/// Reason: the security task sets an 8 KiB upgrade limit.
+/// 8 KiB bounds memory per connection. Larger heads are rejected.
+const MAX_WS_UPGRADE_BYTES: usize = 8 * 1024;
 /// Target size of the WebSocket write buffer in bytes.
-/// Reason: keeps the tungstenite WebSocketConfig default of 128 KiB, so small frames share one write.
-const WS_WRITE_BUFFER_BYTES: usize = 128 * 1024;
+/// Reason: the transport batches one MQTT flush into one frame,
+/// so the library buffer only needs small frames in one write.
+const WS_WRITE_BUFFER_BYTES: usize = 8 * 1024;
+/// Most ping frames without an MQTT byte before the close.
+/// Reason: MQTT sends a ping only when idle.
+/// 32 pings with no MQTT byte show a flood.
+/// The broker then closes the connection.
+const MAX_WS_PINGS_WITHOUT_BINARY: u32 = 32;
 
 /// Builds the WebSocket bound config for one cap.
 /// The frame bound matches the MQTT packet bound, so one peer cannot
@@ -961,11 +1106,15 @@ fn ws_upgrade_answer(
 
 /// Accepts MQTT clients over WebSocket and runs one task for each.
 /// The HTTP upgrade requires the configured path and the `mqtt`
-/// subprotocol. A wrong path gets 404. A missing subprotocol gets
-/// 400. MQTT travels in binary frames. A text frame is a protocol
-/// error and closes the connection. Ping gets pong. The listener
-/// name is `ws` for tenant rules. The same packet limits, the
-/// connect timeout from accept, and `max_connections` apply as on TCP.
+/// subprotocol. The upgrade head holds at most 8 KiB, and the
+/// upgrade keeps the connect time limit. A wrong path gets 404.
+/// A missing subprotocol gets 400. MQTT travels in binary frames.
+/// A text frame is a protocol error and closes the connection.
+/// This transport answers a ping with one pong. A ping flood closes
+/// the connection. The
+/// listener name is `ws` for tenant rules. The same packet limits,
+/// the connect timeout from accept, and `max_connections` apply
+/// as on TCP.
 // The handshake callback returns the HTTP response type of the library.
 // That type exceeds the lint limit. The signature is fixed.
 #[allow(clippy::result_large_err)]
@@ -997,10 +1146,10 @@ pub(super) async fn serve_native_ws(
         let accepted_at = Instant::now();
         tokio::spawn(async move {
             let _slot = slot;
-            let ws = match tokio::time::timeout(
+            let mut ws = match tokio::time::timeout(
                 CONNECT_TIMEOUT,
                 tokio_tungstenite::accept_hdr_async_with_config(
-                    stream,
+                    HandshakeLimit::new(stream),
                     |req: &Request, resp: Response| ws_upgrade_answer(req, &path, resp),
                     Some(ws_bound_config(cap)),
                 ),
@@ -1020,6 +1169,9 @@ pub(super) async fn serve_native_ws(
                     return;
                 }
             };
+            // The upgrade passed. The read cap ends here, so MQTT
+            // bytes never count against it.
+            ws.get_mut().release();
             let io = WsIo::new(ws, cap);
             if let Err(e) = run_connection(
                 io,
@@ -1100,10 +1252,10 @@ pub(super) async fn serve_native_wss(
                     }
                 };
             let peer_cert = peer_cert_fields(tls.get_ref().1.peer_certificates());
-            let ws = match tokio::time::timeout(
+            let mut ws = match tokio::time::timeout(
                 CONNECT_TIMEOUT,
                 tokio_tungstenite::accept_hdr_async_with_config(
-                    tls,
+                    HandshakeLimit::new(tls),
                     |req: &Request, resp: Response| ws_upgrade_answer(req, &path, resp),
                     Some(ws_bound_config(cap)),
                 ),
@@ -1126,6 +1278,9 @@ pub(super) async fn serve_native_wss(
                     return;
                 }
             };
+            // The upgrade passed. The read cap ends here, so MQTT
+            // bytes never count against it.
+            ws.get_mut().release();
             let io = WsIo::new(ws, cap);
             if let Err(e) = run_connection(
                 io,
@@ -1147,73 +1302,153 @@ pub(super) async fn serve_native_wss(
     }
 }
 
+/// Read cap for the WebSocket upgrade head. Counts bytes read
+/// while armed and fails past [`MAX_WS_UPGRADE_BYTES`]. The
+/// handshake disarms it, so MQTT bytes never count. One peer
+/// cannot hold more than the cap before the handshake ends.
+struct HandshakeLimit<S> {
+    /// The socket. Plain TCP or the TLS stream.
+    inner: S,
+    /// Bytes read while armed.
+    read: usize,
+    /// True until the handshake passes.
+    armed: bool,
+}
+
+impl<S> HandshakeLimit<S> {
+    /// Wraps one socket with the cap armed.
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            read: 0,
+            armed: true,
+        }
+    }
+
+    /// Disarms the cap after the handshake passes.
+    fn release(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for HandshakeLimit<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.armed && this.read >= MAX_WS_UPGRADE_BYTES {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "websocket upgrade head is too large",
+            )));
+        }
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if this.armed {
+                    this.read += buf.filled().len().saturating_sub(before);
+                    if this.read > MAX_WS_UPGRADE_BYTES {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "websocket upgrade head is too large",
+                        )));
+                    }
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for HandshakeLimit<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// One WebSocket connection as a byte transport.
-/// Binary payloads are MQTT bytes. Ping gets pong. Text is an error.
+/// Binary payloads are MQTT bytes. This transport answers a ping
+/// with one pong. Text is an error.
+/// A ping flood closes the connection.
+/// Idle memory of one connection: the three empty buffers below
+/// (about one hundred bytes) plus the small library state. The
+/// library keeps no read buffer in this version, and the write
+/// buffer stays empty with nothing queued, so one idle connection
+/// holds well under one KiB plus socket state.
 struct WsIo<S> {
     /// The WebSocket stream. It yields messages and takes replies.
     inner: S,
-    /// Largest accepted binary frame in bytes. Matches the MQTT cap.
+    /// Largest accepted binary frame in bytes. It is the packet limit of the listener.
     max_frame_bytes: usize,
     /// Binary bytes not yet read by the MQTT layer.
     pending_in: BytesMut,
     /// MQTT bytes not yet sent as a binary frame.
     pending_out: Vec<u8>,
-    /// Pong payloads that wait for the next flush.
-    pending_pong: Vec<Vec<u8>>,
+    /// One pong payload that waits for the next flush. At most
+    /// one: a newer ping replaces the older one.
+    pending_pong: Option<Vec<u8>>,
+    /// Ping frames since the last binary frame. Past
+    /// [`MAX_WS_PINGS_WITHOUT_BINARY`] the connection closes.
+    pings_since_binary: u32,
+    /// A pong is in the sink and the flush did not end yet.
+    /// An idle connection has no MQTT write that flushes it.
+    pong_unflushed: bool,
 }
 
 impl<S> WsIo<S> {
-    /// Wraps a WebSocket stream as a byte transport with one frame cap.
+    /// Wraps a WebSocket stream as a byte transport.
     fn new(inner: S, max_frame_bytes: usize) -> Self {
         Self {
             inner,
             max_frame_bytes,
             pending_in: BytesMut::new(),
             pending_out: Vec::new(),
-            pending_pong: Vec::new(),
+            pending_pong: None,
+            pings_since_binary: 0,
+            pong_unflushed: false,
         }
     }
 }
 
-/// Sends queued pongs and flushes the sink.
-/// It returns pending when the sink is not ready.
-fn ws_drain_pong<S>(
-    mut inner: Pin<&mut S>,
+/// Starts one send when the sink is ready. Queues nothing.
+fn ws_poll_send<S>(
+    inner: Pin<&mut S>,
     cx: &mut Context<'_>,
-    queued: &mut Vec<Vec<u8>>,
+    message: Message,
 ) -> Poll<std::io::Result<()>>
 where
     S: Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
-    while !queued.is_empty() {
-        match inner.as_mut().poll_ready(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    format!("websocket send failed: {e}"),
-                )));
-            }
-            Poll::Ready(Ok(())) => {}
-        }
-        let Some(payload) = queued.pop() else {
-            break;
-        };
-        if let Err(e) = inner.as_mut().start_send(Message::Pong(payload)) {
-            return Poll::Ready(Err(std::io::Error::new(
+    let mut inner = inner;
+    match inner.as_mut().poll_ready(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(())) => match inner.as_mut().start_send(message) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 format!("websocket send failed: {e}"),
-            )));
-        }
-    }
-    match inner.as_mut().poll_flush(cx) {
-        Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            ))),
+        },
         Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
-            format!("websocket flush failed: {e}"),
+            format!("websocket send failed: {e}"),
         ))),
-        Poll::Pending => Poll::Pending,
     }
 }
 
@@ -1229,21 +1464,35 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = &mut *self;
+        // The pong of an idle connection goes out on the read path.
+        if let Some(payload) = this.pending_pong.take() {
+            match ws_poll_send(
+                Pin::new(&mut this.inner),
+                cx,
+                Message::Pong(payload.clone()),
+            ) {
+                Poll::Ready(Ok(())) => this.pong_unflushed = true,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => this.pending_pong = Some(payload),
+            }
+        }
+        if this.pong_unflushed {
+            match Pin::new(&mut this.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => this.pong_unflushed = false,
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("websocket send failed: {e}"),
+                    )));
+                }
+                Poll::Pending => this.pong_unflushed = true,
+            }
+        }
         if !this.pending_in.is_empty() {
             let take = this.pending_in.len().min(buf.remaining());
             buf.put_slice(&this.pending_in[..take]);
             let _ = this.pending_in.split_to(take);
             return Poll::Ready(Ok(()));
-        }
-        // Send queued pongs before the next read.
-        // The MQTT task sends nothing while idle, so the read
-        // path must flush pongs. Otherwise a ping waits.
-        if !this.pending_pong.is_empty() {
-            match ws_drain_pong(Pin::new(&mut this.inner), cx, &mut this.pending_pong) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {}
-            }
         }
         loop {
             let next = Pin::new(&mut this.inner).poll_next(cx);
@@ -1258,6 +1507,7 @@ where
                 }
                 Poll::Ready(Some(Ok(message))) => match message {
                     Message::Binary(data) => {
+                        this.pings_since_binary = 0;
                         if data.is_empty() {
                             continue;
                         }
@@ -1275,23 +1525,33 @@ where
                         return Poll::Ready(Ok(()));
                     }
                     Message::Ping(payload) => {
-                        // Queue the pong and send it at once.
-                        // The read path flushes, so an idle
-                        // connection still answers the ping.
-                        // Close the connection when the queue is full.
-                        // A peer that floods pings without reading
-                        // cannot grow the queue without bound.
-                        if this.pending_pong.len() >= MAX_QUEUED_PONGS {
+                        this.pings_since_binary = this.pings_since_binary.saturating_add(1);
+                        if this.pings_since_binary > MAX_WS_PINGS_WITHOUT_BINARY {
                             return Poll::Ready(Err(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionAborted,
-                                "too many queued pongs",
+                                "websocket ping flood",
                             )));
                         }
-                        this.pending_pong.push(payload);
-                        match ws_drain_pong(Pin::new(&mut this.inner), cx, &mut this.pending_pong) {
-                            Poll::Ready(Ok(())) => {}
+                        match ws_poll_send(
+                            Pin::new(&mut this.inner),
+                            cx,
+                            Message::Pong(payload.clone()),
+                        ) {
+                            // Flush now. An idle connection must answer the ping.
+                            Poll::Ready(Ok(())) => match Pin::new(&mut this.inner).poll_flush(cx) {
+                                Poll::Ready(Ok(())) => this.pong_unflushed = false,
+                                Poll::Ready(Err(e)) => {
+                                    return Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionAborted,
+                                        format!("websocket send failed: {e}"),
+                                    )));
+                                }
+                                Poll::Pending => this.pong_unflushed = true,
+                            },
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
+                            Poll::Pending => {
+                                this.pending_pong = Some(payload);
+                            }
                         }
                         continue;
                     }
@@ -1334,9 +1594,13 @@ where
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = &mut *self;
         // Readiness runs before any take, so no bytes are lost.
-        while !this.pending_pong.is_empty() {
+        // At most one pong waits here (see `poll_read`).
+        if let Some(payload) = this.pending_pong.take() {
             match Pin::new(&mut this.inner).poll_ready(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    this.pending_pong = Some(payload);
+                    return Poll::Pending;
+                }
                 Poll::Ready(Err(e)) => {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionAborted,
@@ -1345,9 +1609,6 @@ where
                 }
                 Poll::Ready(Ok(())) => {}
             }
-            let Some(payload) = this.pending_pong.pop() else {
-                break;
-            };
             if let Err(e) = Pin::new(&mut this.inner).start_send(Message::Pong(payload)) {
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionAborted,
@@ -1686,6 +1947,10 @@ struct Conn {
     connected: bool,
     keepalive: Option<Duration>,
     peer: String,
+    /// Set by the kernel when it orders the close of this connection (a
+    /// denial with `deny_action = disconnect`). Packets that are already
+    /// in the read buffer are not handled after that.
+    closing: Option<Arc<AtomicBool>>,
 }
 
 impl Conn {
@@ -1707,9 +1972,7 @@ impl Conn {
 /// `cn` selects the common name. `dn` selects the subject name.
 /// `disabled` and unknown modes return `None`.
 /// An absent or empty source returns `None`.
-/// TODO(parity): the rulebook does not decide whether a bind with
-/// mapping on but no certificate keeps the CONNECT values (current)
-/// or fails. The current choice keeps accepted behavior unchanged.
+/// A bind with mapping on but no certificate keeps the CONNECT values.
 fn cert_identity_value(mode: &str, peer_cert: &PeerCert) -> Option<String> {
     let value = match mode {
         "cn" => peer_cert.cn.clone(),
@@ -1729,9 +1992,7 @@ fn cert_identity_value(mode: &str, peer_cert: &PeerCert) -> Option<String> {
 /// username and client identifier from the certificate when set.
 /// Connections the edge holds keep their CONNECT values: the edge
 /// has no such setting.
-/// TODO(parity): the rulebook does not decide whether edge-held binds
-/// honor `peer_cert_as_*`. The current code maps only kernel-held
-/// connections and keeps edge behavior unchanged.
+/// Only kernel-held connections map `peer_cert_as_*`.
 fn bind_request(
     connect: wire::Connect,
     peer: &str,
@@ -1741,11 +2002,20 @@ fn bind_request(
     peer_as_clientid: &str,
 ) -> BindRequest {
     let props = connect.properties;
+    // A verified PSK identity replaces the CONNECT username: the
+    // bind carries the value authentication checks.
+    // A PSK bind keeps accepted behavior.
+    // It never grants a session by username.
+    let username = peer_cert
+        .psk_identity
+        .clone()
+        .or_else(|| cert_identity_value(peer_as_username, peer_cert))
+        .or(connect.username);
     BindRequest {
         client_id: cert_identity_value(peer_as_clientid, peer_cert).unwrap_or(connect.client_id),
         clean_start: connect.clean_start,
         keepalive_secs: connect.keepalive,
-        username: cert_identity_value(peer_as_username, peer_cert).or(connect.username),
+        username,
         password: connect.password,
         peerhost: Some(peer.to_string()),
         client_alias_max: props
@@ -1947,6 +2217,7 @@ where
         connected: false,
         keepalive: None,
         peer,
+        closing: None,
     };
     let mut last_packet = Instant::now();
 
@@ -2116,6 +2387,16 @@ async fn drain_inbound(
     peer_cert: &PeerCert,
 ) -> Result<Option<Stop>, WireError> {
     loop {
+        // One atomic load for each packet, no lock. After a close order the
+        // rest of the buffer is not handled: the task writes the close
+        // packet and ends.
+        if conn
+            .closing
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Ok(None);
+        }
         let Some(header) = wire::fixed_header(inbuf)? else {
             return Ok(None);
         };
@@ -2197,6 +2478,7 @@ async fn drain_inbound(
                 }
                 if sink.accepted.load(Ordering::Relaxed) {
                     conn.connected = true;
+                    conn.closing = shared.conns.closing_flag(conn.conn_id);
                 } else {
                     // Refused: the CONNACK with the reason is in the sink.
                     return Ok(Some(Stop::Clean));
@@ -2772,7 +3054,7 @@ mod tests {
     /// Server config loads with and without client verification.
     /// The fixture is the test server certificate and key.
     /// Verification on requests a client certificate.
-    /// An empty CA path selects the bundled system roots.
+    /// A set CA file loads. An empty CA path returns an error.
     /// A missing CA file returns an error.
     #[test]
     fn tls_config_loads_with_and_without_verify() {
@@ -2786,6 +3068,7 @@ mod tests {
         assert!(super::load_tls_config(&cert, &key, &off).is_ok());
         let on = TlsClientAuth {
             verify_peer: true,
+            cacertfile: format!("{base}/ca-cert.pem"),
             ..TlsClientAuth::default()
         };
         assert!(super::load_tls_config(&cert, &key, &on).is_ok());
@@ -3226,6 +3509,346 @@ mod tests {
             "the broker stays up"
         );
         let _ = fresh.close(None).await;
+    }
+
+    /// An upgrade head past 8 KiB is refused. A normal upgrade
+    /// still passes on a fresh socket. Goes through the broker.
+    #[tokio::test]
+    async fn ws_oversized_upgrade_head_is_refused() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", ws_port))
+            .await
+            .expect("tcp dials");
+        let mut request = format!(
+            "GET /mqtt HTTP/1.1\r\nHost: 127.0.0.1:{ws_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\nX-Pad: "
+        );
+        while request.len() < 9 * 1024 {
+            request.push('A');
+        }
+        request.push_str("\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("request sends");
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer)).await;
+        let text = String::from_utf8_lossy(&answer);
+        assert!(
+            !text.contains("101"),
+            "an oversized head gets no upgrade: {text}"
+        );
+        let normal = ws_test_raw_status(ws_port, "/mqtt", Some("mqtt")).await;
+        assert!(
+            normal.contains("101"),
+            "a normal upgrade still passes: {normal}"
+        );
+    }
+
+    /// One ping keeps the connection open. A ping flood with no
+    /// MQTT byte closes only that connection. Goes through the broker.
+    #[tokio::test]
+    async fn ws_ping_flood_closes_only_that_connection() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::protocol::Message;
+        let shared = Shared::new();
+        let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
+        // One ping gets a pong and the connection stays open.
+        // The library may answer the ping itself as well, so skip
+        // pongs until the CONNACK arrives.
+        let mut calm = ws_test_dial(ws_port).await;
+        calm.send(Message::Ping(b"one".to_vec()))
+            .await
+            .expect("ping sends");
+        calm.send(Message::Binary(ws_test_connect("ws-calm")))
+            .await
+            .expect("ws CONNECT sends");
+        let mut got_connack = false;
+        for _ in 0..4 {
+            let message = tokio::time::timeout(Duration::from_secs(5), calm.next())
+                .await
+                .expect("a reply in time")
+                .expect("the stream stays open")
+                .expect("a correct frame");
+            match message {
+                Message::Pong(_) => continue,
+                Message::Binary(data) => {
+                    assert_eq!(data, vec![0x20, 0x02, 0x00, 0x00], "WS CONNACK accepts");
+                    got_connack = true;
+                    break;
+                }
+                other => panic!("CONNACK expected, got: {other:?}"),
+            }
+        }
+        assert!(got_connack, "one ping keeps the connection open");
+        // A flood of pings with no MQTT byte closes the connection.
+        // The library answers each ping itself too, so drain both
+        // pongs per ping until the close arrives. A stall (no more
+        // messages with the socket open) is not a close.
+        let mut loud = ws_test_dial(ws_port).await;
+        for _ in 0..(super::MAX_WS_PINGS_WITHOUT_BINARY + 8) {
+            loud.send(Message::Ping(b"flood".to_vec()))
+                .await
+                .expect("ping sends");
+        }
+        let mut closed = false;
+        for _ in 0..(2 * super::MAX_WS_PINGS_WITHOUT_BINARY + 16) {
+            match tokio::time::timeout(Duration::from_secs(5), loud.next()).await {
+                Ok(Some(Ok(Message::Pong(_)))) => continue,
+                Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                    closed = true;
+                    break;
+                }
+                Ok(Some(Ok(other))) => panic!("close expected, got: {other:?}"),
+                Err(_) => break,
+            }
+        }
+        assert!(closed, "a ping flood closes the connection");
+        let _ = calm.close(None).await;
+    }
+
+    /// Limits hold while MQTT still delivers through the broker.
+    /// An oversized upgrade head gets no upgrade. A ping flood with
+    /// no MQTT byte closes only that connection. Fresh clients then
+    /// still subscribe and exchange a publish in both directions.
+    /// Goes through the broker.
+    #[tokio::test]
+    async fn ws_limits_hold_while_mqtt_delivers_through_broker() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio_tungstenite::tungstenite::protocol::Message;
+        let shared = Shared::new();
+        let (tcp_port, ws_port) = ws_test_listeners(shared).await;
+        // An oversized head gets no upgrade.
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", ws_port))
+            .await
+            .expect("tcp dials");
+        let mut request = format!(
+            "GET /mqtt HTTP/1.1\r\nHost: 127.0.0.1:{ws_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\nX-Pad: "
+        );
+        while request.len() < 9 * 1024 {
+            request.push('A');
+        }
+        request.push_str("\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("request sends");
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer)).await;
+        assert!(
+            !String::from_utf8_lossy(&answer).contains("101"),
+            "an oversized head gets no upgrade"
+        );
+        // A ping flood with no MQTT byte closes only that connection.
+        let mut loud = ws_test_dial(ws_port).await;
+        for _ in 0..(super::MAX_WS_PINGS_WITHOUT_BINARY + 8) {
+            loud.send(Message::Ping(b"flood".to_vec()))
+                .await
+                .expect("ping sends");
+        }
+        let mut closed = false;
+        for _ in 0..(2 * super::MAX_WS_PINGS_WITHOUT_BINARY + 16) {
+            match tokio::time::timeout(Duration::from_secs(5), loud.next()).await {
+                Ok(Some(Ok(Message::Pong(_)))) => continue,
+                Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+                    closed = true;
+                    break;
+                }
+                Ok(Some(Ok(other))) => panic!("close expected, got: {other:?}"),
+                Err(_) => break,
+            }
+        }
+        assert!(closed, "a ping flood closes the connection");
+        // Fresh clients still exchange publishes both ways.
+        let mut tcp_sub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_sub
+            .write_all(&ws_test_connect("ws-lim-tcp-sub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_sub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_sub
+            .write_all(&ws_test_subscribe(1, "ws/limits/check"))
+            .await
+            .expect("tcp SUBSCRIBE sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_sub).await[0],
+            0x90,
+            "TCP SUBACK answers"
+        );
+        let mut ws = ws_test_dial(ws_port).await;
+        ws.send(Message::Binary(ws_test_connect("ws-lim-sub")))
+            .await
+            .expect("ws CONNECT sends");
+        assert_eq!(
+            ws_test_recv(&mut ws).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "WS CONNACK accepts"
+        );
+        ws.send(Message::Binary(ws_test_subscribe(1, "ws/limits/check")))
+            .await
+            .expect("ws SUBSCRIBE sends");
+        assert_eq!(ws_test_recv(&mut ws).await[0], 0x90, "WS SUBACK answers");
+        ws.send(Message::Binary(ws_test_publish(
+            "ws/limits/check",
+            b"from-ws",
+        )))
+        .await
+        .expect("ws PUBLISH sends");
+        assert!(
+            tcp_test_recv(&mut tcp_sub).await.ends_with(b"from-ws"),
+            "TCP gets the WS publish"
+        );
+        // The broker also delivers the publish to the subscriber
+        // that sent it, so drain the own echo before the next
+        // publish. Else the next read returns the echo.
+        assert!(
+            ws_test_recv(&mut ws).await.ends_with(b"from-ws"),
+            "WS gets its own publish"
+        );
+        let mut tcp_pub = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port))
+            .await
+            .expect("tcp dials");
+        tcp_pub
+            .write_all(&ws_test_connect("ws-lim-tcp-pub"))
+            .await
+            .expect("tcp CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut tcp_pub).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "TCP CONNACK accepts"
+        );
+        tcp_pub
+            .write_all(&ws_test_publish("ws/limits/check", b"from-tcp"))
+            .await
+            .expect("tcp PUBLISH sends");
+        assert!(
+            ws_test_recv(&mut ws).await.ends_with(b"from-tcp"),
+            "WS gets the TCP publish"
+        );
+        let _ = ws.close(None).await;
+    }
+
+    /// A second pong never queues behind the first. Two pings while
+    /// the transport cannot send leave one pong only. Unit test of
+    /// the bound. The next test proves pongs through the broker.
+    #[test]
+    fn second_pending_pong_replaces_the_first() {
+        use std::collections::VecDeque;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead as _, ReadBuf};
+        use tokio_tungstenite::tungstenite::protocol::Message;
+
+        /// A transport that never sends. Reads stay queued and the
+        /// sink never turns ready, so pongs park in the transport.
+        struct Parked {
+            inbound: VecDeque<Message>,
+        }
+        impl futures::Stream for Parked {
+            type Item = Result<Message, tokio_tungstenite::tungstenite::Error>;
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                match self.inbound.pop_front() {
+                    Some(message) => Poll::Ready(Some(Ok(message))),
+                    None => Poll::Pending,
+                }
+            }
+        }
+        impl futures::Sink<Message> for Parked {
+            type Error = tokio_tungstenite::tungstenite::Error;
+            fn poll_ready(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+            fn start_send(
+                self: std::pin::Pin<&mut Self>,
+                _item: Message,
+            ) -> Result<(), Self::Error> {
+                unreachable!("the sink never turns ready");
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+        }
+
+        let inner = Parked {
+            inbound: VecDeque::from([
+                Message::Ping(b"one".to_vec()),
+                Message::Ping(b"two".to_vec()),
+            ]),
+        };
+        let mut io = super::WsIo::new(inner, super::FALLBACK_MAX_PACKET_BYTES);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf = [0u8; 64];
+        let mut read_buf = ReadBuf::new(&mut buf);
+        let polled = std::pin::Pin::new(&mut io).poll_read(&mut cx, &mut read_buf);
+        assert!(matches!(polled, Poll::Pending), "no MQTT byte is ready");
+        assert_eq!(
+            io.pending_pong,
+            Some(b"two".to_vec()),
+            "the second pong replaces the first"
+        );
+    }
+
+    /// Two rapid pings get pongs through the broker. The connection
+    /// stays open and the CONNECT still gets a CONNACK. Goes through
+    /// the broker.
+    #[tokio::test]
+    async fn two_rapid_pings_get_pongs_through_broker() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::protocol::Message;
+        let shared = Shared::new();
+        let (_tcp_port, ws_port) = ws_test_listeners(shared).await;
+        let mut ws = ws_test_dial(ws_port).await;
+        ws.send(Message::Ping(b"one".to_vec()))
+            .await
+            .expect("first ping sends");
+        ws.send(Message::Ping(b"two".to_vec()))
+            .await
+            .expect("second ping sends");
+        ws.send(Message::Binary(ws_test_connect("ws-two-ping")))
+            .await
+            .expect("ws CONNECT sends");
+        let mut got_connack = false;
+        for _ in 0..8 {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("a reply in time")
+                .expect("the stream stays open")
+                .expect("a correct frame");
+            match message {
+                Message::Pong(_) => continue,
+                Message::Binary(data) => {
+                    assert_eq!(data, vec![0x20, 0x02, 0x00, 0x00], "WS CONNACK accepts");
+                    got_connack = true;
+                    break;
+                }
+                other => panic!("CONNACK expected, got: {other:?}"),
+            }
+        }
+        assert!(got_connack, "two pings keep the connection open");
+        let _ = ws.close(None).await;
     }
 
     /// Two tenants stay apart on the WebSocket path. Goes through the
@@ -4539,47 +5162,33 @@ mod tests {
         assert!(delivered.ends_with(b"psk-secret"), "own publish delivers");
     }
 
-    /// An unknown identity and a wrong key both fail before MQTT.
-    /// Neither failure names the identity. Goes through the broker.
+    /// An unknown identity and a wrong key fail with the same alert.
+    /// The unknown identity gets a stand-in key, so it fails at the
+    /// Finished check like a wrong key does. Neither failure names
+    /// the identity. Goes through the broker.
     /// Both failures run in the same handshake budget, as far as
-    /// the library permits. The two alerts may differ.
+    /// the library permits.
     #[tokio::test]
     async fn psk_unknown_identity_and_wrong_key_fail_without_leak() {
         let shared = Shared::new();
         let port = psk_test_listener(shared, psk_test_store()).await;
-        // The library fails the two cases at different stages, so
-        // exact equality is impossible. Both must fail inside the
-        // handshake budget and within one order of magnitude.
-        let start = std::time::Instant::now();
         let unknown = psk_test_dial(port, "no-such-device", vec![0x2Au8; 32]).await;
-        let unknown_ms = start.elapsed().as_millis();
         assert!(unknown.is_err(), "unknown identity fails");
         let unknown_text = unknown.err().unwrap_or_default();
         assert!(
             !unknown_text.contains("no-such-device"),
             "failure names no identity"
         );
-        let start = std::time::Instant::now();
         let wrong = psk_test_dial(port, PSK_TEST_IDENTITY, vec![0x33u8; 32]).await;
-        let wrong_ms = start.elapsed().as_millis();
         assert!(wrong.is_err(), "wrong key fails");
         let wrong_text = wrong.err().unwrap_or_default();
         assert!(
             !wrong_text.contains(PSK_TEST_IDENTITY),
             "failure names no identity"
         );
-        assert!(
-            unknown_ms < 10_000 && wrong_ms < 10_000,
-            "both fail inside the handshake budget, got {unknown_ms}ms and {wrong_ms}ms"
-        );
-        let (fast, slow) = if unknown_ms < wrong_ms {
-            (unknown_ms, wrong_ms)
-        } else {
-            (wrong_ms, unknown_ms)
-        };
-        assert!(
-            slow <= 10 * fast.max(1) + 50,
-            "both fail in the same time, got {unknown_ms}ms and {wrong_ms}ms"
+        assert_eq!(
+            unknown_text, wrong_text,
+            "both failures carry the same alert"
         );
         // The broker stays up after both failed handshakes.
         let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
@@ -4594,6 +5203,43 @@ mod tests {
             .expect("CONNACK in time")
             .expect("socket stays open");
         assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "broker stays up");
+    }
+
+    /// The verified PSK identity reaches the bind as the username.
+    /// A CONNECT username of another user does not pass: the
+    /// session carries the verified identity. Goes through the broker.
+    #[tokio::test]
+    async fn psk_verified_identity_reaches_the_bind() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        let port = psk_test_listener(shared.clone(), psk_test_store()).await;
+        let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        client
+            .write_all(&ws_test_connect_with_auth(
+                "k1-04-psk-bound",
+                "intruder",
+                b"wrong",
+            ))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "PSK CONNECT connects");
+        let username = shared
+            .sessions
+            .get("k1-04-psk-bound")
+            .expect("session exists")
+            .username
+            .read()
+            .clone();
+        assert_eq!(
+            username.as_deref(),
+            Some(PSK_TEST_IDENTITY),
+            "the bind carries the verified identity"
+        );
     }
 
     /// Opens a TLS 1.3 PSK session to the test port. Forces TLS 1.3,
@@ -4710,19 +5356,25 @@ mod tests {
             .expect("PUBLISH sends");
         let delivered = k1_05_recv(&mut client).await;
         assert!(delivered.ends_with(b"psk13-secret"), "own publish delivers");
-        // An unknown identity and a wrong key both fail over TLS 1.3.
-        // Neither failure names the identity.
+        // An unknown identity and a wrong key both fail over TLS 1.3
+        // with the same alert. Neither failure names the identity.
         let unknown = psk_test_dial_tls13(port, "no-such-device", vec![0x2Au8; 32]).await;
         assert!(unknown.is_err(), "unknown identity fails");
+        let unknown_text = unknown.err().unwrap_or_default();
         assert!(
-            !unknown.err().unwrap_or_default().contains("no-such-device"),
+            !unknown_text.contains("no-such-device"),
             "failure names no identity"
         );
         let wrong = psk_test_dial_tls13(port, PSK_TEST_IDENTITY, vec![0x33u8; 32]).await;
         assert!(wrong.is_err(), "wrong key fails");
+        let wrong_text = wrong.err().unwrap_or_default();
         assert!(
-            !wrong.err().unwrap_or_default().contains(PSK_TEST_IDENTITY),
+            !wrong_text.contains(PSK_TEST_IDENTITY),
             "failure names no identity"
+        );
+        assert_eq!(
+            unknown_text, wrong_text,
+            "both TLS 1.3 failures carry the same alert"
         );
     }
 
@@ -5167,5 +5819,299 @@ mod tests {
             .expect("socket stays open");
         assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "file identity connects");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A keys file drives the same-alert check through the broker.
+    /// The store loads from the file entry. An unknown identity and
+    /// a wrong key then fail with the same alert. A valid identity
+    /// still connects, and its publish still delivers. Goes through
+    /// the broker.
+    #[tokio::test]
+    async fn psk_file_entry_same_alert_and_delivers_through_broker() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let path = std::env::temp_dir().join(format!(
+            "indra-psk-k104-{}-same-alert.txt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!("{}:{}\n", PSK_TEST_IDENTITY, "2a".repeat(32)),
+        )
+        .expect("psk file writes");
+        let store = std::sync::Arc::new(broker_auth::PskStore::new());
+        let count = store
+            .load_file(path.to_str().expect("path shows"))
+            .expect("psk file loads");
+        assert_eq!(count, 1, "one identity loads");
+        let shared = Shared::new();
+        let port = psk_test_listener(shared, store).await;
+        let unknown = psk_test_dial(port, "no-such-device", vec![0x2Au8; 32]).await;
+        assert!(unknown.is_err(), "unknown identity fails");
+        let unknown_text = unknown.err().unwrap_or_default();
+        let wrong = psk_test_dial(port, PSK_TEST_IDENTITY, vec![0x33u8; 32]).await;
+        assert!(wrong.is_err(), "wrong key fails");
+        let wrong_text = wrong.err().unwrap_or_default();
+        assert_eq!(
+            unknown_text, wrong_text,
+            "both failures carry the same alert"
+        );
+        let mut client = psk_test_connect(port, PSK_TEST_IDENTITY, vec![0x2Au8; 32]).await;
+        client
+            .write_all(&ws_test_connect("k1-04-psk-file-alert"))
+            .await
+            .expect("CONNECT sends");
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("CONNACK in time")
+            .expect("socket stays open");
+        assert_eq!(head, [0x20, 0x02, 0x00, 0x00], "file identity connects");
+        client
+            .write_all(&ws_test_subscribe(1, "k1-04/pskfile/#"))
+            .await
+            .expect("SUBSCRIBE sends");
+        let suback = k1_05_recv(&mut client).await;
+        assert_eq!(suback[0], 0x90, "SUBACK answers");
+        client
+            .write_all(&ws_test_publish("k1-04/pskfile/x", b"psk-file-secret"))
+            .await
+            .expect("PUBLISH sends");
+        let delivered = k1_05_recv(&mut client).await;
+        assert!(
+            delivered.ends_with(b"psk-file-secret"),
+            "own publish delivers"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Security tests: client certificate roots, publish after a denial
+    // with disconnect, and delayed publish authorization.
+
+    /// Client certificate verification needs a CA file. An empty path
+    /// does not select any default set of public authorities.
+    #[test]
+    fn client_verification_without_ca_file_is_refused() {
+        let cert = k1_05_file("server-cert.pem");
+        let key = k1_05_file("server-key.pem");
+        for (verify_peer, legacy_verify) in [(true, false), (false, true)] {
+            let policy = super::TlsClientAuth {
+                verify_peer,
+                legacy_verify,
+                cacertfile: String::new(),
+                fail_if_no_peer_cert: false,
+            };
+            let result = super::load_tls_config(&cert, &key, &policy);
+            assert!(
+                result.is_err(),
+                "verification with no CA file must not load"
+            );
+        }
+        let with_ca = k1_05_policy(false);
+        assert!(super::load_tls_config(&cert, &key, &with_ca).is_ok());
+    }
+
+    /// The listener controller refuses to start a secure listener with
+    /// client verification on and no CA file, for TLS and for secure
+    /// WebSocket.
+    #[tokio::test]
+    async fn controller_does_not_start_secure_listener_without_ca_file() {
+        use broker_api::v5::listeners::{ListenerController as _, ListenerRecord};
+        let record = |kind: &str| ListenerRecord {
+            id: format!("{kind}:default"),
+            name: "default".to_string(),
+            kind: kind.to_string(),
+            bind: "127.0.0.1:0".to_string(),
+            enable: true,
+            running: false,
+            kernel_owned: true,
+            max_connections: None,
+            acceptors: None,
+            backlog: 0,
+            cert_file: k1_05_file("server-cert.pem"),
+            key_file: k1_05_file("server-key.pem"),
+            zone: "default".to_string(),
+            mountpoint: String::new(),
+            tcp_options: None,
+            ssl_options: None,
+            websocket: None,
+        };
+        let mut conf = broker_config::schema::ListenersConf::default();
+        conf.tls.verify = "verify_peer".to_string();
+        conf.wss.cert_file = k1_05_file("server-cert.pem");
+        conf.wss.key_file = k1_05_file("server-key.pem");
+        conf.wss.verify_client_cert = true;
+        let control = NativeListenerController::new(Shared::new(), conf);
+        for kind in ["ssl", "wss"] {
+            let refused = control.start_listener(&record(kind));
+            assert!(refused.is_err(), "{kind} must not start without a CA file");
+            assert!(
+                refused
+                    .expect_err("refused")
+                    .to_lowercase()
+                    .contains("ca file"),
+                "the error names the CA file"
+            );
+        }
+    }
+
+    /// Rules for the authorization tests: publish to `secret/#` is
+    /// denied and everything else is allowed.
+    fn acl_deny_secret(shared: &Shared, deny_action: &str) {
+        shared
+            .auth
+            .add_rule(broker_auth::AclRule::new(
+                "*",
+                broker_auth::AclAction::Publish,
+                "secret/#",
+                false,
+            ))
+            .expect("rule adds");
+        shared
+            .auth
+            .add_rule(broker_auth::AclRule::new(
+                "*",
+                broker_auth::AclAction::All,
+                "#",
+                true,
+            ))
+            .expect("rule adds");
+        shared
+            .authz_settings
+            .replace(broker_config::AuthzSettingsConf {
+                no_match: "deny".to_string(),
+                deny_action: deny_action.to_string(),
+                ..broker_config::AuthzSettingsConf::default()
+            })
+            .expect("settings replace");
+    }
+
+    /// Opens a TCP client, sends CONNECT and reads the CONNACK.
+    async fn tcp_test_client(port: u16, client_id: &str) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt as _;
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        stream
+            .write_all(&ws_test_connect(client_id))
+            .await
+            .expect("CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut stream).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "CONNACK accepts"
+        );
+        stream
+    }
+
+    /// Subscribes a TCP client to the filters and reads the SUBACKs.
+    async fn tcp_test_subscribe(stream: &mut tokio::net::TcpStream, filters: &[&str]) {
+        use tokio::io::AsyncWriteExt as _;
+        for (index, filter) in filters.iter().enumerate() {
+            stream
+                .write_all(&ws_test_subscribe(index as u16 + 1, filter))
+                .await
+                .expect("SUBSCRIBE sends");
+            assert_eq!(tcp_test_recv(stream).await[0], 0x90, "SUBACK answers");
+        }
+    }
+
+    /// With `deny_action = disconnect` the first denied PUBLISH ends the
+    /// connection. The PUBLISH packets that follow it in the same read
+    /// buffer are not routed.
+    #[tokio::test]
+    async fn denied_publish_with_disconnect_stops_the_rest_of_the_buffer() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let shared = Shared::new();
+        acl_deny_secret(&shared, "disconnect");
+        let (tcp_port, _ws_port) = ws_test_listeners(shared).await;
+
+        let mut subscriber = tcp_test_client(tcp_port, "sec-h2-sub").await;
+        tcp_test_subscribe(&mut subscriber, &["secret/x", "open/x"]).await;
+        let mut offender = tcp_test_client(tcp_port, "sec-h2-bad").await;
+
+        // One write: the denied PUBLISH, then more PUBLISH packets.
+        let mut burst = ws_test_publish("secret/x", b"first");
+        for index in 0..20 {
+            burst.extend(ws_test_publish(
+                "secret/x",
+                format!("later-{index}").as_bytes(),
+            ));
+        }
+        offender.write_all(&burst).await.expect("burst sends");
+
+        let leaked =
+            tokio::time::timeout(Duration::from_millis(800), tcp_test_recv(&mut subscriber)).await;
+        assert!(
+            leaked.is_err(),
+            "no packet of the offender reaches a subscriber"
+        );
+
+        // The connection of the offender ends.
+        let mut scratch = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match offender.read(&mut scratch).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the denied connection is closed");
+
+        // The path still works for a client that is allowed.
+        let mut good = tcp_test_client(tcp_port, "sec-h2-good").await;
+        good.write_all(&ws_test_publish("open/x", b"fine"))
+            .await
+            .expect("PUBLISH sends");
+        let delivered = tcp_test_recv(&mut subscriber).await;
+        assert!(delivered.ends_with(b"fine"), "an allowed publish arrives");
+    }
+
+    /// A delayed publish is checked on its inner topic, also with the
+    /// retain flag. An inner topic that the rules allow is delivered
+    /// after the delay.
+    #[tokio::test]
+    async fn delayed_publish_is_authorized_on_the_inner_topic() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = Shared::new();
+        acl_deny_secret(&shared, "ignore");
+        shared.spawn_delayed_driver();
+        let (tcp_port, _ws_port) = ws_test_listeners(shared).await;
+
+        let mut subscriber = tcp_test_client(tcp_port, "sec-h3-sub").await;
+        tcp_test_subscribe(&mut subscriber, &["secret/#", "open/#"]).await;
+        let mut publisher = tcp_test_client(tcp_port, "sec-h3-pub").await;
+
+        let mut retained = ws_test_publish("$delayed/1/secret/kept", b"hidden-kept");
+        retained[0] = 0x31;
+        publisher.write_all(&retained).await.expect("PUBLISH sends");
+        publisher
+            .write_all(&ws_test_publish("$delayed/1/secret/x", b"hidden"))
+            .await
+            .expect("PUBLISH sends");
+        publisher
+            .write_all(&ws_test_publish("$delayed/1/open/x", b"shown"))
+            .await
+            .expect("PUBLISH sends");
+
+        // The only packet is the allowed one, after the delay.
+        let first = tokio::time::timeout(Duration::from_secs(6), tcp_test_recv(&mut subscriber))
+            .await
+            .expect("the allowed delayed publish arrives");
+        assert!(first.ends_with(b"shown"), "first packet is the allowed one");
+        let more =
+            tokio::time::timeout(Duration::from_millis(1500), tcp_test_recv(&mut subscriber)).await;
+        assert!(more.is_err(), "the denied inner topic is not delivered");
+
+        // The denied retained message was not stored.
+        let mut late = tcp_test_client(tcp_port, "sec-h3-late").await;
+        late.write_all(&ws_test_subscribe(1, "secret/#"))
+            .await
+            .expect("SUBSCRIBE sends");
+        assert_eq!(tcp_test_recv(&mut late).await[0], 0x90);
+        let stored =
+            tokio::time::timeout(Duration::from_millis(800), tcp_test_recv(&mut late)).await;
+        assert!(stored.is_err(), "no retained message under secret/");
     }
 }

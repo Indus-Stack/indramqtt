@@ -1,9 +1,7 @@
 //! Management-plane audit log for the v5 management API.
 //!
 //! Covers `GET /audit` (paged query over real management entries,
-//! C05-07). Entries come from the management authentication middleware
-//! and from the kernel CONNECT path
-//! (`crates/broker-node/src/main.rs`, bind path).
+//! C05-07). Entries come from the management authentication middleware.
 //! Publish and deliver never touch this store, and audit writes never
 //! take a blocking lock on any message path.
 //!

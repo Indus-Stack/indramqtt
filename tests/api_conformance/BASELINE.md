@@ -170,8 +170,9 @@ is not changed.
   console reads one object with `data` and `meta`:
   `queryAuditLogs` in the API module of the console returns
   `ListDataWithPagination<AuditLogItem>`, and the audit page reads
-  `res.data`. The broker returns one object with `data` and `meta`, so the
-  checker reports a type error for this row.
+  `res.data`. The broker returns the documented array with one page
+  object, so the checker accepts the shape. The console page keeps its
+  own reader.
 - `GET /rule_events`, response 200. The specification declares one object
   (the schema of one event). The management console reads an array of
   events: `const events: RuleEvent[] = await http.get('/rule_events')` in
@@ -194,27 +195,50 @@ is not changed.
   `/schemas/actions`, strips the label keys and reads paths inside the
   object. The broker returns the schema object, so the checker reports a
   type error for this row.
-- `GET /queues`, response 200. The specification declares a bare array,
-  but its own example shows one object with `data` and `meta`. The
-  management console reads one object with `data` and `meta`:
+- `GET /queues`, response 200. The specification declares a bare array.
+  The management console reads one object with `data` and `meta`:
   `getMessageQueues` in the API module of the console returns
   `ListDataWithCursor<MessageQueue>`, and the queue page reads
-  `res?.data`. The broker returns one object with `data` and the standard
-  page `meta`, so the checker reports a type error for this row.
-- `GET /streams`, response 200. The specification declares a bare array,
-  but its own example shows one object with `data` and `meta`. The
-  management console reads one object with `data` and `meta`:
+  `res?.data`. The broker has no queues, so it returns the documented
+  empty array. The console falls back to its own empty list.
+- `GET /streams`, response 200. The specification declares a bare array.
+  The management console reads one object with `data` and `meta`:
   `getMessageStreamList` in the API module of the console returns
   `ListDataWithCursor<MessageStreamItem>`, and the stream page reads
-  `res?.data`. The broker returns one object with `data` and the standard
-  page `meta`, so the checker reports a type error for this row.
+  `res?.data`. The broker has no streams, so it returns the documented
+  empty array. The console falls back to its own empty list.
+- `GET /queues/config` and `GET /streams/config`, response 200. The
+  `auto_create.lastvalue` and `auto_create.regular` fields each declare
+  one object variant plus a second variant of enum `[false]` with type
+  `string`. No value matches the second variant. The management console
+  builds the object form with `limits` of `infinity`. The broker returns
+  the object form with the documented defaults, so the checker accepts
+  the row.
 - `GET /authentication/{id}/status`, response 200. The specification schema
   types `node_error`, `node_metrics`, `node_resource_metrics` and
   `node_status` as single objects. The specification example answers one
-  array per field with one object per node, and the management console
-  reads arrays (`node_status: Array<{node, status}>`,
-  `node_metrics: Array<...>`). The broker returns one row per node in each
-  array, so the checker reports a type error for this row.
+  array per field with one object per node. The broker follows the
+  documented object shape: one object per field for the local node, with
+  live counters inside `node_metrics` and `node_resource_metrics` and
+  only the node name inside `node_error` (the broker tracks no per-node
+  error text). `status` and `node_status` stay omitted: the broker runs
+  no backend health probe. The management console reads arrays
+  (`node_status: Array<{node, status}>`,
+  `node_metrics: Array<...>`), so it renders empty rows for this route
+  until its reader accepts the documented shape.
+- `POST /authentication`, `GET /authentication/{id}` and
+  `GET /authentication`, `mongodb` variants. The specification example
+  for `password_based:mongodb` carries no `mongo_type`, but every
+  `authn.mongo_*` schema requires it. The management console always
+  sends `mongo_type` (`single`, `sharded` or `rs`). The broker stores
+  and reports the fields it receives, so the specification example on
+  its own matches no variant. The conformance cases use the console
+  form with `mongo_type`.
+- `POST /authentication`, `jwt` and `cinfo` variants. The documented
+  shapes carry no `backend`. The broker defaults a missing backend to
+  the mechanism name and reports it back as an extra field, which the
+  checker accepts. The management console sends the same backend-free
+  form.
 - `POST /sso/mfa/setup_info`, response 401. The specification documents
   401 `UNAUTHORIZED` for an invalid or expired token. The management console
   sends `backend`, `setup_token` and `username` and reads `secret` plus
@@ -233,10 +257,10 @@ is not changed.
   evaluation order gates the next verdict.
 - `POST /trace`, `PUT /trace/{name}/stop` and `GET /trace`, response 200,
   field `log_size`. The specification declares an array of objects. The
-  management console reads an object keyed by node name. Its trace type
-  declares `log_size` as a map from node name to byte count. Its trace
-  table sums the values of that object. The broker returns one object
-  keyed by node name, so the checker reports a type error for these rows.
+  broker returns that array with one row per node. The generated console
+  types read the same array. One hand-written console type reads an object
+  keyed by node name instead. That type is stale. The broker follows the
+  specification.
 - `GET /data/files/{filename}`, response 200. The specification declares
   a JSON string with the single value `binary`. The management console
   reads a file body. Its backup download call requests the path with a
@@ -415,8 +439,11 @@ is not changed.
   creates a rule (`createRules` in the copy dialog sends
   `{ sql, enable, description, actions, id }`), so the broker accepts `id`
   and keeps `name` as the fallback. The cases that create a rule send `id`
-  for this reason, because a case needs a known id to clean up.
+  for this reason, because a case needs a known id to clean up. A create
+  with neither `id` nor `name` gets an assigned id of 8 lowercase hex
+  chars, the form the documented example shows.
 - `POST /rules`, `PUT /rules/{id}`, response, field `actions`. The specification declares
   `oneOf` for each item, but a `republish` or `console` item also matches the
   schema `user_provided_function` (a string `function` and an object `args`).
   The checker reports this overlap as a warning, not as an error.
+- `GET /clients/{clientid}/authorization/cache`, response 200. The specification declares one object with `access`, `result`, `topic` and `updated_time`. One session holds many decisions, one per topic and access type. The broker returns a bare array with one object per decision, oldest first. An empty cache returns an empty array. The checker reports a type error for this row.

@@ -6,9 +6,9 @@
 //! `PUT /mqtt/topic_metrics2/{name}/reset` (reset) and
 //! `DELETE /mqtt/topic_metrics2` (remove all). The broker keeps no
 //! per-filter counters, so this module applies the honest-empty rules:
-//! reads answer the documented shape with an empty state; creates fail
-//! with `BAD_REQUEST`; named reads, removals and resets miss with the
-//! documented `NAME_NOT_FOUND`; the bulk delete reports success.
+//! reads answer the documented shape with an empty state; the create fails
+//! with the documented `BAD_NAME`; named reads, removals and resets miss
+//! with the documented `NAME_NOT_FOUND`; the bulk delete reports success.
 //! Nothing here stores state and nothing runs on the publish path.
 //!
 //! The legacy `/mqtt/topic_metrics` paths carry no operation in the
@@ -26,7 +26,6 @@ use axum::{
 };
 use std::collections::HashMap;
 
-use crate::errors::ApiError;
 use crate::ApiState;
 
 /// `GET /mqtt/topic_metrics2`: no collections. The broker tracks no
@@ -36,9 +35,16 @@ pub async fn list_collections() -> Response {
 }
 
 /// `POST /mqtt/topic_metrics2`: refused. The broker has no
-/// per-filter counters to collect into.
+/// per-filter counters to collect into. The operation documents
+/// `BAD_NAME` first, so the refusal uses it.
 pub async fn create_collection(State(_state): State<ApiState>) -> Response {
-    ApiError::BadRequest("topic metrics are not available in this broker".to_string())
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "code": "BAD_NAME",
+            "message": "topic metrics are not available in this broker",
+        })),
+    )
         .into_response()
 }
 
@@ -133,11 +139,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_refuse_with_bad_request() {
+    async fn write_refuses_with_documented_code() {
         let state = standalone_state();
         let (status, body) = read(create_collection(State(state)).await).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+        assert_eq!(body["code"], serde_json::json!("BAD_NAME"));
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not available")),
+            "refusal names the missing function: {body}"
+        );
     }
 
     #[tokio::test]

@@ -58,9 +58,9 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 | `quotas.default_max_connections` | integer | `10000` | 0..=1000000 | Default max connections per authenticated username (0 = unlimited). |
 | `quotas.default_max_publish_rate` | integer | `50000` | 0..=10000000 | Default token-bucket publish rate limit in messages per second (0 = unlimited). |
 | `quotas.burst_multiplier` | number | `2.0` | 1.0..=10.0 | Token bucket burst multiplier (allows bursts up to burst times rate). |
-| `quotas.max_connections_per_tenant` | integer | `10000` | 0..=1000000 | Default max live connections per tenant (0 = unlimited). |
-| `quotas.max_sessions_per_tenant` | integer | `10000` | 0..=100000 | Default max sessions per tenant (0 = unlimited). |
-| `quotas.max_retained_per_tenant` | integer | `10000` | 0..=100000 | Default max retained topics per tenant (0 = unlimited). |
+| `quotas.max_connections_per_tenant` | integer | `0` | 0..=1000000 | Default max live connections per tenant (0 = unlimited). |
+| `quotas.max_sessions_per_tenant` | integer | `0` | 0..=100000 | Default max sessions per tenant (0 = unlimited). |
+| `quotas.max_retained_per_tenant` | integer | `0` | 0..=100000 | Default max retained topics per tenant (0 = unlimited). |
 
 ## session
 

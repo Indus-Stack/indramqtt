@@ -13,8 +13,6 @@
 /.git/
 .github/
 
-# The image uses no file from beam/.
-beam/
 
 # Frontend workspace (not part of the image).
 dashboard/node_modules/

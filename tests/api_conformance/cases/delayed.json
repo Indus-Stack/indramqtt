@@ -84,7 +84,28 @@
     "query": {},
     "body": null,
     "expect_status": 204,
-    "setup": [],
-    "cleanup": []
+    "setup": [
+      {
+        "mqtt_connect": {
+          "clientid": "conf-delayed-del"
+        }
+      },
+      {
+        "mqtt_publish": {
+          "clientid": "conf-delayed-del",
+          "topic": "$delayed/600/conf/delayed/chain",
+          "qos": 1,
+          "payload": "hello-delayed",
+          "packet_id": 13
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "mqtt_disconnect": {
+          "clientid": "conf-delayed-del"
+        }
+      }
+    ]
   }
 ]

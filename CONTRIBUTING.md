@@ -28,8 +28,6 @@ All the code in this repository is under MIT OR Apache-2.0. There is no enterpri
 
 ### Prerequisites
 * **Rust**: `1.80+` ([rustup.rs](https://rustup.rs/))
-* **Erlang/OTP**: `26+` ([erlang.org](https://www.erlang.org/))
-* **Rebar3**: `3.22+` ([rebar3.org](https://www.rebar3.org/))
 
 ### Cloning & Building
 ```bash
@@ -46,11 +44,6 @@ cargo test --workspace
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Build and test the Erlang BEAM edge
-cd beam
-rebar3 compile
-rebar3 eunit
-cd ..
 ```
 
 ---

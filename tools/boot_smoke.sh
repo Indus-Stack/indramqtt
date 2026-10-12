@@ -212,6 +212,18 @@ all_status=$?
 [ "$all_status" = 0 ] || head -3 "$ROOT/all.log"
 check "indra.toml accepts each setting in schemas/config-schema.json" "$all_status"
 
+# --- 3a. Client verification needs a CA file ---
+# A TLS listener with verification on and no CA file must not start.
+# This check runs the config validation only. It must fail.
+mkdir -p "$ROOT/badca"
+cat > "$ROOT/badca/indra.toml" <<EOF
+[listeners.tls]
+verify = "verify_peer"
+cacertfile = ""
+EOF
+"$KERNEL" --config-dir "$ROOT/badca" --check-config > "$ROOT/badca.log" 2>&1
+if [ $? = 0 ]; then fail "verification on without a CA file fails the config check"; else pass "verification on without a CA file fails the config check"; fi
+
 # --- 4. The kernel serves the listeners from the resolved configuration ---
 # The kernel already serves. This step starts no extra process.
 "$KERNEL" --config-dir "$ROOT/cfg" --check-config > "$ROOT/cfg.log" 2>&1

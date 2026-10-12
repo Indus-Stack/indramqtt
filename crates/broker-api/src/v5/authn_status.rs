@@ -15,14 +15,13 @@
 //! `NOT_FOUND` in the documented `{code, message}` shape. Backend health
 //! is stored state only: no new outbound connections are opened here.
 //!
-//! Shape note: each `node_*` field is an array with one object per node
-//! (today one node). The management console reads the same arrays. Rate
-//! fields are absent: the broker tracks counters only, never rates.
-//! Health fields the broker does not measure are absent as well: no
-//! `status` or `node_status` is reported because the broker performs no
-//! backend health probe (an enabled built-in entry executes locally, a
-//! stored-only backend never executes, and neither state is a measured
-//! connection).
+//! Shape note: each `node_*` field is one object for the local node,
+//! as the documented schema types them. Rate fields are absent: the
+//! broker tracks counters only, never rates. Health fields the broker
+//! does not measure are absent as well: no `status` or `node_status`
+//! is reported because the broker performs no backend health probe
+//! (an enabled built-in entry executes locally, a stored-only backend
+//! never executes, and neither state is a measured connection).
 
 use axum::{
     extract::{Path, Query, State},
@@ -38,14 +37,16 @@ use crate::ApiState;
 /// authenticator.
 ///
 /// Returns 200 with the stored `id`/`enable`, the live counter-only
-/// `metrics` (and its single-node `node_metrics` row), the live
+/// `metrics` (and its single-node `node_metrics` object), the live
 /// counter-only `resource_metrics` (and its single-node
-/// `node_resource_metrics` row) and the empty `node_error` list.
-/// Health fields the broker does not measure (`status`,
-/// `node_status`, rates) are omitted, never invented: no backend
-/// health probe runs here. Unknown ids fail with `NOT_FOUND` in
-/// the documented `{code, message}` shape. Unknown query keys are
-/// ignored: the route is not paged, so extra keys never become a 400.
+/// `node_resource_metrics` object) and the single-node `node_error`
+/// object. The error object carries only the node name while the
+/// broker tracks no per-node error text. Health fields the broker does
+/// not measure (`status`, `node_status`, rates) are omitted, never
+/// invented: no backend health probe runs here. Unknown ids fail with
+/// `NOT_FOUND` in the documented `{code, message}` shape. Unknown query
+/// keys are ignored: the route is not paged, so extra keys never become
+/// a 400.
 /// Management-plane read only: one short chain lock plus lock-free atomic
 /// loads; publish and deliver never touch this store.
 pub async fn get_authn_status(
@@ -85,10 +86,10 @@ pub async fn get_authn_status(
             "id": entry.id,
             "enable": entry.enable,
             "metrics": metrics,
-            "node_metrics": [{"node": node, "metrics": metrics}],
+            "node_metrics": {"node": node, "metrics": metrics},
             "resource_metrics": resource_metrics,
-            "node_resource_metrics": [{"node": node, "metrics": resource_metrics}],
-            "node_error": [],
+            "node_resource_metrics": {"node": node, "metrics": resource_metrics},
+            "node_error": {"node": node},
         })),
     )
         .into_response()
@@ -260,15 +261,17 @@ mod tests {
         assert_eq!(body["metrics"]["total"], serde_json::json!(3));
         assert!(body["metrics"]["nomatch"].is_number());
         assert_eq!(
-            body["node_metrics"][0]["metrics"]["total"],
+            body["node_metrics"]["metrics"]["total"],
             body["metrics"]["total"]
         );
-        assert_eq!(body["node_error"], serde_json::json!([]));
-        // Each remaining `node_*` field is an array with one row per node.
-        assert!(body["node_metrics"].is_array());
-        assert!(body["node_resource_metrics"].is_array());
+        assert_eq!(body["node_metrics"]["node"], body["node_error"]["node"]);
+        // Each `node_*` field is one object for the local node, as the
+        // documented schema types them.
+        assert!(body["node_metrics"].is_object());
+        assert!(body["node_resource_metrics"].is_object());
+        assert!(body["node_error"].is_object());
         assert_eq!(
-            body["node_resource_metrics"][0]["metrics"]["matched"],
+            body["node_resource_metrics"]["metrics"]["matched"],
             body["metrics"]["total"]
         );
         assert_eq!(

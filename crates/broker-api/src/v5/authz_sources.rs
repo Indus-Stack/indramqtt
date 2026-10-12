@@ -102,6 +102,10 @@ enum CreateError {
 /// `type` that names no documented source fails with `NOT_FOUND`; an
 /// already-stored `type` fails with `ALREADY_EXISTS` instead of merging;
 /// a full registry fails with `BAD_REQUEST`.
+// TODO(parity): does the documented API reject a write that matches no
+// variant (a `redis` source without `cmd`, a `file` source without
+// `rules`)? The current choice stores it leniently, so older minimal
+// bodies keep working, until the checker pins the rejection set.
 pub async fn create_authz_source(State(state): State<ApiState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -2291,5 +2295,62 @@ mod tests {
         assert_eq!(counters.deny, 0);
         assert_eq!(counters.total, 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn create_and_read_round_trip_each_documented_variant() {
+        // Each documented source keeps its required fields through the
+        // write and the read. The row reports them flat at the top
+        // level, so the answer matches the documented variant.
+        let state = standalone_state();
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!({
+                "type": "redis",
+                "redis_type": "single",
+                "server": "127.0.0.1:6379",
+                "cmd": "HGETALL mqtt_acl:${username}",
+            }),
+            serde_json::json!({
+                "type": "ldap",
+                "server": "127.0.0.1:389",
+                "base_dn": "ou=users,dc=example,dc=org",
+                "username": "cn=reader",
+            }),
+            serde_json::json!({
+                "type": "http",
+                "method": "post",
+                "url": "http://127.0.0.1:8080/acl",
+            }),
+            serde_json::json!({
+                "type": "file",
+                "rules": "{allow, all}.",
+            }),
+            serde_json::json!({
+                "type": "mysql",
+                "server": "127.0.0.1:3306",
+                "database": "mqtt",
+                "query": "SELECT action, permission, topic FROM acl WHERE username = ${username}",
+            }),
+            serde_json::json!({
+                "type": "postgresql",
+                "server": "127.0.0.1:5432",
+                "database": "mqtt",
+                "username": "root",
+                "query": "SELECT action, permission, topic FROM acl WHERE username = ${username}",
+            }),
+        ];
+        for sent in &cases {
+            let source_type = sent["type"].as_str().expect("case names a type");
+            let (status, _, _) =
+                parts(create_authz_source(State(state.clone()), body(sent.clone())).await).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let (status, read, _) =
+                parts(get_authz_source(State(state.clone()), Path(source_type.to_string())).await)
+                    .await;
+            assert_eq!(status, StatusCode::OK);
+            for (key, want) in sent.as_object().expect("case is an object") {
+                assert_eq!(&read[key], want, "variant field {key} round-trips");
+            }
+        }
     }
 }

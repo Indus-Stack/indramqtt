@@ -3230,9 +3230,9 @@ mod tests {
         assert_eq!(text, "OK");
     }
 
-    /// Empty states of the console pages (AP-01): the reads answer the
-    /// documented shape with an empty or disabled state, and the writes
-    /// refuse with 400 `BAD_REQUEST`. Nothing is stored.
+    /// Empty states of the console pages (AP-01, AP2-02): the reads answer
+    /// the documented shape with an empty or disabled state, and the writes
+    /// refuse with the documented 400 code. Nothing is stored.
     #[tokio::test]
     async fn test_console_empty_states_are_honest() {
         let (server, _state) = TestServer::start().await;
@@ -3241,12 +3241,17 @@ mod tests {
         // AI lists read empty; the Flow Designer loads both together.
         let (status, body) = server.get_auth("/api/v5/ai/providers", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!({"items": []}));
+        assert_eq!(body, json!([]));
         let (status, body) = server
             .get_auth("/api/v5/ai/completion_profiles", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body, json!({"items": []}));
+        assert_eq!(body, json!([]));
+        let (status, body) = server
+            .get_auth("/api/v5/ai/providers/no-such-provider/models", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
         let (status, body) = server
             .post_auth(
                 "/api/v5/ai/providers",
@@ -3255,7 +3260,25 @@ mod tests {
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("INVALID_CREDENTIAL"));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/ai/completion_profiles",
+                json!({"name": "x", "provider_name": "y", "type": "openai"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("INVALID_COMPLETION_PROFILE"));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/ai/models",
+                json!({"type": "openai", "api_key": "k"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("INVALID_CREDENTIAL"));
         let (status, body) = server
             .get_auth("/api/v5/ai/providers/no-such-provider", &token)
             .await;
@@ -3266,15 +3289,19 @@ mod tests {
         let (status, body) = server.get_auth("/api/v5/queues/config", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(false));
+        assert!(body["auto_create"]["lastvalue"].get("limits").is_some());
+        assert!(body["auto_create"]["regular"].get("limits").is_some());
         let (status, body) = server.get_auth("/api/v5/streams/config", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body["enable"], json!(false));
+        assert!(body["auto_create"]["lastvalue"].get("limits").is_some());
+        assert!(body["auto_create"]["regular"].get("limits").is_some());
         let (status, body) = server.get_auth("/api/v5/queues", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
+        assert_eq!(body, json!([]));
         let (status, body) = server.get_auth("/api/v5/streams", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["data"], json!([]));
+        assert_eq!(body, json!([]));
         let (status, body) = server
             .put_auth("/api/v5/queues/config", json!({"enable": true}), &token)
             .await;
@@ -3284,7 +3311,12 @@ mod tests {
             .post_auth("/api/v5/queues", json!({"name": "q1"}), &token)
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        let (status, body) = server
+            .post_auth("/api/v5/streams", json!({"name": "s1"}), &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
 
         // Telemetry reads disabled; data misses while disabled.
         let (status, body) = server.get_auth("/api/v5/telemetry/status", &token).await;
@@ -6367,14 +6399,32 @@ mod tests {
         assert_eq!(status, 400);
         assert_eq!(body["code"], json!("BAD_REQUEST"));
 
-        let (status, _) = server
+        // A create with only `sql` succeeds: the broker assigns an id
+        // and `GET /rules/{id}` finds the rule.
+        let (status, created) = server
             .post_auth(
                 "/api/v5/rules",
                 json!({"sql": "SELECT * FROM \"t/#\"", "actions": []}),
                 &token,
             )
             .await;
-        assert_eq!(status, 400);
+        assert_eq!(status, 201, "sql-only create answered {created}");
+        let id = created["id"].as_str().expect("created rule has id");
+        assert_eq!(id.len(), 8, "assigned id has 8 chars, got {id:?}");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "assigned id is hex, got {id:?}"
+        );
+        let (status, fetched) = server
+            .get_auth(&format!("/api/v5/rules/{id}"), &token)
+            .await;
+        assert_eq!(status, 200, "assigned id reads back");
+        assert_eq!(fetched["id"], json!(id));
+        assert_eq!(fetched["sql"], json!("SELECT * FROM \"t/#\""));
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{id}"), &token)
+            .await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]
@@ -9796,17 +9846,18 @@ mod tests {
         assert_eq!(body["metrics"]["failed"], json!(0));
         assert_eq!(body["metrics"]["total"], json!(0));
         assert!(body["metrics"]["nomatch"].is_number());
-        assert!(body["node_metrics"].is_array());
-        assert!(body["node_resource_metrics"].is_array());
+        assert!(body["node_metrics"].is_object());
+        assert!(body["node_resource_metrics"].is_object());
+        assert!(body["node_error"].is_object());
         assert_eq!(
-            body["node_metrics"][0]["metrics"]["total"],
+            body["node_metrics"]["metrics"]["total"],
             body["metrics"]["total"]
         );
         assert_eq!(
-            body["node_resource_metrics"][0]["metrics"]["matched"],
+            body["node_resource_metrics"]["metrics"]["matched"],
             body["metrics"]["total"]
         );
-        assert_eq!(body["node_error"], json!([]));
+        assert!(body["node_error"]["node"].is_string());
 
         // Create a user through the broker, then CONNECT through the
         // broker: success moves the live counters.
@@ -13574,7 +13625,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 200);
-        assert!(created["log_size"].is_object());
+        assert!(created["log_size"].is_array());
         let (status, detail) = server
             .get_auth("/api/v5/trace/http-trace-1/log_detail", &token)
             .await;
@@ -13588,7 +13639,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         assert_eq!(stopped["status"], json!("stopped"));
-        assert!(stopped["log_size"].is_object());
+        assert!(stopped["log_size"].is_array());
         let (status, _) = server
             .get_auth("/api/v5/trace/http-trace-1/log_detail", &token)
             .await;
@@ -15702,7 +15753,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["matched"], json!(true));
         assert_eq!(body["projected"], json!({"temperature": 72.5}));
 
-        // Non-matching sample reports no-match.
+        // Non-matching sample answers 412 with the documented code.
         let (status, body) = server
             .post_auth(
                 "/api/v5/rule_test",
@@ -15714,8 +15765,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["matched"], json!(false));
+        assert_eq!(status, 412);
+        assert_eq!(body["code"], json!("NOT_MATCH"));
 
         // Malformed rule bodies are rejected with the documented shape.
         let (status, body) = server
@@ -15807,7 +15858,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(body["projected"], json!({"temperature": 150.0}));
         assert_eq!(body["output"], body["projected"]);
 
-        // Non-matching sample reports no-match.
+        // Non-matching sample answers 412 with the documented code.
         let (status, body) = server
             .post_auth(
                 "/api/v5/rules/w3-16-rule/test",
@@ -15818,9 +15869,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["matched"], json!(false));
-        assert!(body["projected"].is_null());
+        assert_eq!(status, 412);
+        assert_eq!(body["code"], json!("NOT_MATCH"));
 
         // Malformed samples are rejected with the documented shape.
         let (status, body) = server
@@ -16979,6 +17029,20 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn configs_dashboard_reports_default_password() {
+        // AP2-05 failing test: `GET /configs/dashboard` carries the
+        // documented `default_password`. Before: the root read as `{}`.
+        // Broker-through: the read goes through the served management
+        // API on `ApiState`. The value is the true initial admin
+        // password, never a stand-in.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server.get_auth("/api/v5/configs/dashboard", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["default_password"], json!("public"));
+    }
+
+    #[tokio::test]
     async fn mqtt_group_delayed_rewrite_topicmetrics_over_http() {
         // AP-04 failing test: the `/mqtt` group answers the documented
         // shapes through the served management API. Before: delayed
@@ -17102,7 +17166,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(err["code"], json!("BAD_REQUEST"));
+        assert_eq!(err["code"], json!("BAD_NAME"));
         let (status, err) = server
             .get_auth("/api/v5/mqtt/topic_metrics2/alpha", &token)
             .await;
@@ -19133,6 +19197,48 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn client_detail_reads_mqtt_connected_session() {
+        // Detail read finds a kernel-bind session and a console
+        // session. Unknown ids still answer 404.
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // Kernel-bind session: same calls as the edge bind path
+        // (create in tenant, pin the connection, record keepalive).
+        let (bind_session, _, _) = state.sessions.get_or_create_v5_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "ap03-bind-1",
+            true,
+            4,
+            0,
+            100,
+            65536,
+        );
+        state.sessions.bind_session(&bind_session, 9101);
+        *bind_session.keepalive_secs.write() = 60;
+        let (status, body) = server.get_auth("/api/v5/clients/ap03-bind-1", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], json!("ap03-bind-1"));
+        assert_eq!(body["connected"], json!(true));
+        // Console session over the live socket.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("ap03-ws-1", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        let (status, body) = server.get_auth("/api/v5/clients/ap03-ws-1", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], json!("ap03-ws-1"));
+        assert_eq!(body["connected"], json!(true));
+        let (status, body) = server
+            .get_auth("/api/v5/clients/ap03-ws-missing", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("CLIENTID_NOT_FOUND"));
+    }
+
+    #[tokio::test]
     async fn client_keepalive_write_returns_detail_shape() {
         // Hidden keepalive route: takes `interval`, answers the full
         // detail shape with the new value applied to live state.
@@ -19499,6 +19605,34 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .delete_auth("/api/v5/api_key/w228-audit-b", &token)
             .await;
         assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn audit_log_ignores_reads() {
+        // AP2-05 failing test: a read through the API makes no audit
+        // record. GET /clients then GET /audit shows no entry for the
+        // read. Before: it had one.
+        // Broker-through: both steps go through the served management
+        // API on `ApiState`, not only through the store. The entries
+        // are recorded by the management auth middleware
+        // (`crates/broker-api/src/api_auth.rs`, `require_api_auth`).
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server.get_auth("/api/v5/clients", &token).await;
+        assert_eq!(status, 200);
+        let (status, body) = server.get_auth("/api/v5/audit", &token).await;
+        assert_eq!(status, 200);
+        let data = body[0]["data"].as_array().expect("data is a list");
+        assert!(
+            data.iter()
+                .all(|entry| entry["operation_id"] != json!("/api/v5/clients")),
+            "reads leave no audit record: {body:?}"
+        );
+        assert!(
+            data.iter()
+                .all(|entry| entry["http_method"] != json!("get")),
+            "audit holds only documented methods: {body:?}"
+        );
     }
 
     #[tokio::test]

@@ -60,20 +60,33 @@ impl PrometheusStore {
     /// Seed from the registry snapshot and persist later mutations.
     pub fn from_registry(registry: &Arc<ConfigRegistry>) -> Self {
         let store = Self::new();
-        *store.inner.write().expect("exporter store lock") = registry.snapshot().prometheus.clone();
-        *store.registry.write().expect("exporter store lock") = Some(Arc::clone(registry));
+        *store
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            registry.snapshot().prometheus.clone();
+        *store
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(registry));
         store
     }
 
     /// Snapshot the current settings.
     pub fn get(&self) -> PrometheusConf {
-        self.inner.read().expect("exporter store lock").clone()
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Replace the settings after full validation, then persist. The
     /// caller validates first; this only swaps and runs the commit.
     fn replace(&self, next: PrometheusConf) -> Result<PrometheusConf, broker_config::ConfigError> {
-        *self.inner.write().expect("exporter store lock") = next.clone();
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.clone();
         self.persist()?;
         Ok(next)
     }
@@ -82,11 +95,18 @@ impl PrometheusStore {
     /// save failure surfaces so callers answer 500 and the loss is
     /// never silent. Stores without a registry stay memory-only.
     fn persist(&self) -> Result<(), broker_config::ConfigError> {
-        let registry = self.registry.read().expect("exporter store lock").clone();
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let Some(registry) = registry else {
             return Ok(());
         };
-        let _guard = self.save_lock.lock().expect("exporter store lock");
+        let _guard = self
+            .save_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let conf = self.get();
         registry.commit_prometheus(conf)?;
         registry.save()?;
@@ -138,9 +158,9 @@ fn settings_json(conf: &PrometheusConf) -> serde_json::Value {
             Some(rate) => serde_json::json!({"rate": rate}),
             None => serde_json::json!({}),
         };
-        body.as_object_mut()
-            .expect("settings body is an object")
-            .insert("namespaced_metrics_limiter".to_string(), entry);
+        if let Some(object) = body.as_object_mut() {
+            object.insert("namespaced_metrics_limiter".to_string(), entry);
+        }
     }
     body
 }
@@ -804,5 +824,20 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(area, text);
         }
+    }
+
+    #[test]
+    fn serves_after_lock_poison() {
+        // A poisoned lock must not stop the store. Reads recover the lock.
+        let store = PrometheusStore::new();
+        assert!(store.get().enable_basic_auth);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let _guard = store.inner.write().unwrap();
+                panic!("poison the prometheus lock");
+            });
+            let _ = h.join();
+        });
+        assert!(store.get().enable_basic_auth);
     }
 }

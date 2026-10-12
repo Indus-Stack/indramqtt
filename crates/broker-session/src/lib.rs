@@ -2403,6 +2403,25 @@ impl SessionManager {
             .collect()
     }
 
+    /// Every session that carries `client_id`, one per owning tenant.
+    /// Each item pairs the owning tenant key with its session, so a
+    /// caller never reads another tenant's row by mistake. Covers
+    /// connected and detached sessions. One short map read; clones at
+    /// most one `Arc` per tenant (bounded by [`MAX_TENANTS`]).
+    /// Management-plane only, never publish or deliver.
+    pub fn sessions_for_client(&self, client_id: &str) -> Vec<(String, Arc<Session>)> {
+        self.sessions
+            .read()
+            .iter()
+            .filter_map(|(tenant, inner)| {
+                inner
+                    .get(client_id)
+                    .cloned()
+                    .map(|session| (tenant.clone(), session))
+            })
+            .collect()
+    }
+
     /// Snapshot every subscription in the system for the global list
     /// (W1-14). Reads the session mirror written by the subscribe
     /// routes, not the router trie, so list reads never block the

@@ -54,6 +54,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Unstable- **Single sign-on**: the login endpoints of single sign-on answer the error that the reference API documents: 404 `BACKEND_NOT_FOUND` for `POST /sso/login/{backend}` and `POST /sso/saml/acs`, and 400 `BAD_REQUEST` for `GET /sso/oidc/callback` and `POST /sso/token_exchange`. The message says that single sign-on is not available in this release. The flows did not connect to an identity provider. The endpoints that store a backend stay.
 
+### Security
+- **Client certificate roots**: a listener with client certificate verification on (`verify = "verify_peer"` or `verify_client_cert = true`) needs `cacertfile`. The configuration check refuses an empty value, and a secure listener does not start without a CA file. The broker no longer uses a built-in set of public authorities for client certificates.
+- **Publish without a session**: a PUBLISH from a connection with no bound session is not routed, and the broker closes that connection. After a denial with `deny_action = disconnect`, the broker does not handle the packets that the connection still holds in its read buffer.
+- **Delayed publish**: a publish to `$delayed/<seconds>/<topic>` is checked against the access rules, the database rules and the webhook with the target topic, also with the retain flag.
+- **Gateway publish**: a CoAP publish is checked against the access rules, the database rules and the webhook in the default tenant, and a denied publish stores nothing and answers 4.01.
+- **Certificate key files**: the broker creates key files with mode 0600 at creation, writes to a temporary file in the same directory and renames it over the target. A failed write removes the temporary file. The bundle directory has mode 0700.
+- **Publish check cost**: the publish check loads the settings and the source registry without locks, counts verdicts with lock-free counters, and takes no lock for the default tenant with no rules. A non-empty tenant adds one short read lock.
+- **Default tenant quotas**: the default tenant has no connection, session or retained limit, and a tenant with no quota setting has none. The listener connection bound still applies. The file defaults for the three per-tenant quotas are now 0 (unlimited). An operator sets a bound explicitly per tenant.
+- **Tenant namespaces**: managed namespaces persist through the configuration registry across restarts, with the stored retained caps applied at boot. A failed save rolls the change back. Delete removes the retained messages, the retained cap and the managed entry, so a later tenant with the same name starts empty.
+- **PSK handshake**: an unknown identity gets a stand-in key from the per-boot server secret, so it fails with the same alert as a wrong key on TLS 1.2 and TLS 1.3. Session tickets are off, so every handshake runs the lookup. The verified identity is the username of the bind.
+- **WebSocket limits**: the upgrade head is limited to 8 KiB with the connect time limit. At most one pong waits for the next flush, and a ping flood with no MQTT byte closes the connection. The library write buffer is 8 KiB.
+- **Management stores**: the stores keep serving after a lock failure instead of stopping the process.
+
 ### Fixed
 - **Messages that did not arrive in a large fan-out**: the kernel wrote one batch for each wake of a link and then waited. A publish to more subscribers than one batch holds left messages in the queues, and the kernel counted them as delivered. The kernel now writes until the queues are empty.
 

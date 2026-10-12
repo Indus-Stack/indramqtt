@@ -712,7 +712,7 @@ fn v5_egress_refused(
 
 /// Map an inbound frame to its synchronous reply, if any.
 ///
-/// Contracts (mirrored in `beam/src/indra_brokerlink.erl`):
+/// Contracts:
 /// * `Ping` is answered immediately with a `Pong` carrying the identical
 ///   `conn_id` and `sequence_no`.
 /// * `BindConnection` metadata is `ClientIdLen:16be | ClientId (UTF-8)
@@ -1329,28 +1329,7 @@ async fn apply_bind_request_inner(
                 &format!("banned CONNECT refused for '{}'", req.client_id),
                 serde_json::json!({"clientid": req.client_id}),
             );
-            // CONNECT drives the audit ring.
-            // Record the refusal with measured values only.
-            // CONNECT is rare, so the write stays off the hot path.
-            shared
-                .audit
-                .record(broker_api::v5::audit::AuditRecordInput {
-                    created_at_us: broker_api::v5::audit::now_micros(),
-                    node: shared.node_id.clone(),
-                    from: broker_api::v5::audit::AUDIT_FROM_MQTT.to_string(),
-                    source: req
-                        .username
-                        .clone()
-                        .unwrap_or_else(|| req.client_id.clone()),
-                    source_ip: req.peerhost.clone().unwrap_or_default(),
-                    operation_id: "/mqtt/connect".to_string(),
-                    operation_type: broker_api::v5::audit::operation_type_for_path("/mqtt/connect"),
-                    operation_result: broker_api::v5::audit::outcome_for_status(403).to_string(),
-                    http_method: "connect".to_string(),
-                    http_status_code: 403,
-                    duration_ms: 0,
-                    tenant: tenant_for_ban.clone(),
-                });
+            // No audit record here. The log holds only post, put and delete.
             return Some(refusal_for_req(
                 frame,
                 &req,
@@ -2208,29 +2187,7 @@ async fn apply_bind_request_inner(
             session.set_tenant_id(tenant_for_bind.clone());
             shared.sessions.bind_session(&session, frame.header.conn_id);
             *session.keepalive_secs.write() = req.keepalive_secs;
-            // CONNECT drives the audit ring.
-            // Record the success with measured values only, in the
-            // bind's own tenant. CONNECT is rare, so the write stays
-            // off the hot path.
-            shared
-                .audit
-                .record(broker_api::v5::audit::AuditRecordInput {
-                    created_at_us: broker_api::v5::audit::now_micros(),
-                    node: shared.node_id.clone(),
-                    from: broker_api::v5::audit::AUDIT_FROM_MQTT.to_string(),
-                    source: req
-                        .username
-                        .clone()
-                        .unwrap_or_else(|| req.client_id.clone()),
-                    source_ip: req.peerhost.clone().unwrap_or_default(),
-                    operation_id: "/mqtt/connect".to_string(),
-                    operation_type: broker_api::v5::audit::operation_type_for_path("/mqtt/connect"),
-                    operation_result: broker_api::v5::audit::outcome_for_status(200).to_string(),
-                    http_method: "connect".to_string(),
-                    http_status_code: 200,
-                    duration_ms: 0,
-                    tenant: tenant_for_bind.clone(),
-                });
+            // No audit record here. The log holds only post, put and delete.
             // B4-05: a new connection renegotiates aliases. The inbound
             // bound is the manager default (advertised below in CONNACK);
             // the outbound bound is the client's CONNECT maximum (0 when
@@ -4546,6 +4503,8 @@ fn spawn_rule_spill_driver(engine: Arc<RuleEngine>) {
 /// immediate publish takes (retained store, rules, fan-out, cluster
 /// forward), then count it. Runs in the delayed driver task, never on
 /// the live publish or deliver path.
+/// TODO(parity): the entry was checked at schedule time. Rules can change
+/// before it fires. Does the fire need a second check?
 async fn deliver_delayed_entry(shared: &Shared, entry: DelayedEntry) {
     let Ok(topic) = Topic::new(entry.topic.clone()) else {
         shared.delayed.note_malformed();
@@ -6804,7 +6763,30 @@ async fn apply_publish(
     let tenant: &str = tenant_buf
         .as_deref()
         .unwrap_or(broker_session::tenant::DEFAULT_TENANT_ID);
+    // A `$delayed/<secs>/<topic>` publish is authorised on the inner
+    // target topic: the rules, the databases and the webhook decide on the
+    // topic that the message reaches, never on the marker name. The
+    // check only runs while delayed delivery is on, as the marker routes
+    // as a plain topic otherwise. Ordinary topics take one prefix test and
+    // no allocation.
+    let delayed_target: Option<Topic> = if shared.delayed.is_enabled() {
+        match strip_delayed_prefix(&topic_str) {
+            Some((_, inner)) => match Topic::new(inner.to_string()) {
+                Ok(inner_topic) => Some(inner_topic),
+                Err(e) => {
+                    shared.delayed.note_malformed();
+                    warn!("Dropping delayed publish with bad inner topic: {}", e);
+                    return (None, Vec::new());
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
     if let Some(publisher) = publisher_opt {
+        // The authorisation steps below use the target topic.
+        let topic = delayed_target.as_ref().unwrap_or(&topic);
         // B1-03: a client banned mid-session stops being served. The ban
         // directory is consulted on every publish authorisation: one read
         // lock that returns after a length check when no bans exist, one
@@ -6838,7 +6820,7 @@ async fn apply_publish(
         // and no allocation on the single-tenant fast path.
         let allowed = shared
             .auth
-            .authorize_publish_in_tenant(tenant, &publisher, &topic)
+            .authorize_publish_in_tenant(tenant, &publisher, topic)
             .await
             .is_ok();
         // Per-client decision cache (W2-01): record the publish decision
@@ -6906,7 +6888,7 @@ async fn apply_publish(
             if !is_local {
                 let key = username.as_deref().unwrap_or(&publisher);
                 if db
-                    .authorize_publish_in_tenant(tenant, key, &topic)
+                    .authorize_publish_in_tenant(tenant, key, topic)
                     .await
                     .is_err()
                 {
@@ -6962,7 +6944,7 @@ async fn apply_publish(
             // own tenant (deferred: only the built-in table holds
             // per-tenant state).
             if webhook
-                .authorize_publish_in_tenant(tenant, &publisher, &topic)
+                .authorize_publish_in_tenant(tenant, &publisher, topic)
                 .await
                 .is_err()
             {
@@ -7035,6 +7017,13 @@ async fn apply_publish(
                 },
             );
         }
+    } else {
+        // No session is bound to this connection, so no rule, ban, database
+        // or webhook can decide about the publish. Fail closed: nothing is
+        // routed or stored, and the connection is closed.
+        shared.metrics.inc_messages_dropped();
+        order_unbound_close(shared, frame.header.conn_id);
+        return (None, Vec::new());
     }
 
     // Rate policing (INDRA-128): token bucket per publishing client,
@@ -7844,6 +7833,11 @@ async fn forward_cluster(
     }
 }
 
+/// Identity the CoAP gateway uses at authorization.
+///
+/// CoAP carries no client credential. The gateway checks this fixed id.
+const COAP_GATEWAY_CLIENT_ID: &str = "coap-gateway";
+
 /// CoAP gateway ingress and observe fan-out (B1-04).
 ///
 /// A CoAP POST/PUT to `/ps/<topic>` enters here after URI validation:
@@ -7860,12 +7854,64 @@ async fn forward_cluster(
 /// after a length check. When observers exist the hook snapshots at
 /// most 32 entries for this topic and spawns the UDP sends, so fan-out
 /// never blocks on the network.
+///
+/// Callers without a publisher id:
+/// - `apply_publish` with no session denies and closes (client path).
+/// - `apply_coap_publish` checks the gateway id here (client path).
+/// - `deliver_delayed_entry` replays a checked entry (trusted source).
+/// - QoS 2 second phase uses the stored publisher (trusted source).
+/// - Last will checks before ingress (trusted source).
+/// - Cluster inbox fans out checked ingress (trusted source).
 async fn apply_coap_publish(
     shared: &Shared,
     topic_str: &str,
     payload: &Bytes,
 ) -> Option<Vec<(u64, BrokerFrame)>> {
     let topic = Topic::new(topic_str.to_string()).ok()?;
+    // Authorize the gateway publish before it stores or routes.
+    // The gateway serves the default tenant only.
+    // A denial stores nothing and routes nothing.
+    let tenant = broker_session::tenant::DEFAULT_TENANT_ID;
+    if shared
+        .bans
+        .is_banned_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, None, None)
+    {
+        warn!("Dropping CoAP publish: gateway identity is banned");
+        shared.metrics.inc_messages_dropped();
+        return None;
+    }
+    if shared
+        .auth
+        .authorize_publish_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, &topic)
+        .await
+        .is_err()
+    {
+        warn!("Dropping CoAP publish: access rules deny the topic");
+        shared.metrics.inc_messages_dropped();
+        return None;
+    }
+    if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+        if db
+            .authorize_publish_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, &topic)
+            .await
+            .is_err()
+        {
+            warn!("Dropping CoAP publish: database rules deny the topic");
+            shared.metrics.inc_messages_dropped();
+            return None;
+        }
+    }
+    if let Some(webhook) = shared.webhook.as_ref() {
+        if webhook
+            .authorize_publish_in_tenant(tenant, COAP_GATEWAY_CLIENT_ID, &topic)
+            .await
+            .is_err()
+        {
+            warn!("Dropping CoAP publish: webhook denies the topic");
+            shared.metrics.inc_messages_dropped();
+            return None;
+        }
+    }
     shared.metrics.inc_publish_received();
     shared.metrics.inc_qos0_received();
     shared.metrics.inc_messages_received();
@@ -7973,9 +8019,21 @@ async fn run_coap_gateway(shared: Shared, socket: Arc<tokio::net::UdpSocket>) {
                     continue;
                 }
                 let payload = req.payload.clone();
-                let deliveries = apply_coap_publish(&shared, &topic_str, &payload)
-                    .await
-                    .unwrap_or_default();
+                let Some(deliveries) = apply_coap_publish(&shared, &topic_str, &payload).await
+                else {
+                    // Denied gateway publish stores nothing and routes
+                    // nothing. Answer 4.01 so the client learns the denial.
+                    let resp = CoapMessage {
+                        message_type: broker_gateway::coap::CoapType::Acknowledgement,
+                        code: CoapCode::UNAUTHORIZED,
+                        message_id: req.message_id,
+                        token: req.token.clone(),
+                        options: Vec::new(),
+                        payload: Bytes::new(),
+                    };
+                    let _ = socket.send_to(&resp.encode(), peer).await;
+                    continue;
+                };
                 let mut enqueued = 0u64;
                 let mut enqueued_bytes = 0u64;
                 for (conn_id, routed) in deliveries {
@@ -8175,6 +8233,16 @@ fn effective_tenant_limits(
         shared.tenant_limits.count_store_denied();
         tracing::warn!(tenant = %tenant, "tenant limit store is unreachable: denying new use");
         return Err("limit store is unreachable");
+    }
+    // The default tenant holds no bound. Only the listener bound
+    // gates it. A tenant with no quota setting reads the file
+    // defaults below, which default to unlimited.
+    if tenant == broker_session::tenant::DEFAULT_TENANT_ID {
+        return Ok(broker_session::tenant_limits::TenantLimits {
+            max_connections: 0,
+            max_sessions: 0,
+            max_retained: 0,
+        });
     }
     let mut effective = shared.tenant_limits.effective(tenant);
     let Some(entry) = shared.namespaces.get(tenant) else {
@@ -9899,7 +9967,7 @@ fn order_alias_disconnect(shared: &Shared, conn_id: u64) {
         Bytes::from(vec![protocol_v5::REASON_TOPIC_ALIAS_INVALID]),
         Bytes::new(),
     ) {
-        let _ = shared.conns.route(conn_id, close);
+        let _ = shared.conns.order_close(conn_id, close);
     }
     // Owner key first (MT-03), decoded id behind: a faulty connection in
     // one tenant detaches and sweeps only its own tenant, never another
@@ -9943,7 +10011,7 @@ fn order_authz_disconnect(shared: &Shared, conn_id: u64) {
         Bytes::from(vec![AUTHZ_DISCONNECT_RC]),
         Bytes::new(),
     ) {
-        let _ = shared.conns.route(conn_id, close);
+        let _ = shared.conns.order_close(conn_id, close);
     }
     // Owner key first (MT-03), decoded id behind: a denied connection in
     // one tenant detaches and sweeps only its own tenant, never another
@@ -9966,6 +10034,23 @@ fn order_authz_disconnect(shared: &Shared, conn_id: u64) {
                 }
             }
         }
+    }
+}
+
+/// Closes a connection that sends a PUBLISH while no session is bound to
+/// it. Nothing is routed. A connection can reach this state when a
+/// refused CONNECT or an earlier denial removed its session while more
+/// packets were still buffered. Fail closed: the close order carries the
+/// not-authorized reason. Rejects only, never on an allowed message.
+fn order_unbound_close(shared: &Shared, conn_id: u64) {
+    if let Ok(close) = BrokerFrame::new(
+        OpCode::ConnClose,
+        conn_id,
+        0,
+        Bytes::from(vec![AUTHZ_DISCONNECT_RC]),
+        Bytes::new(),
+    ) {
+        let _ = shared.conns.order_close(conn_id, close);
     }
 }
 
@@ -10838,6 +10923,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a no-op (today's empty behaviour: `GET /actions` reads an empty
     // page).
     shared.actions.seed_from_registry(&shared.config);
+    // Managed namespaces (TM-02): seed the shared store in place (the
+    // same instance `serve_api` shares with `ApiState`), so management
+    // reads observe the persisted namespaces from the first
+    // connection. A failed save at runtime rolls the change back.
+    // Then apply the stored retained caps, because the retained
+    // store keeps caps in memory only. One seed plus one scan at
+    // boot; the connect path reads the live table.
+    shared.namespaces.seed_from_registry(&shared.config);
+    broker_api::v5::mt::apply_stored_retained_caps(&shared.namespaces, &*shared.retained);
     // Connector directory: seed the shared directory in place (the same
     // instance `serve_api` shares with `ApiState`), so management reads
     // observe the persisted connectors from the first connection. An empty
@@ -11769,8 +11863,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create config dir");
         std::fs::write(
             dir.join("indra.toml"),
-            "[listeners.tls]\nverify_client_cert = true\n\
-             [listeners.wss]\nverify_client_cert = true\n",
+            "[listeners.tls]\nverify_client_cert = true\ncacertfile = \"/etc/indramqtt/ca.pem\"\n\
+             [listeners.wss]\nverify_client_cert = true\ncacertfile = \"/etc/indramqtt/ca.pem\"\n",
         )
         .expect("write indra.toml");
         let args = resolve_boot(&dir, &[]);
@@ -12202,6 +12296,15 @@ mod tests {
     fn publish_frame(conn_id: u64, seq: u64, meta: Bytes, payload: Bytes) -> BrokerFrame {
         BrokerFrame::new(OpCode::PublishIn, conn_id, seq, meta, payload)
             .expect("valid publish frame")
+    }
+
+    /// Binds a publisher client on `conn_id` through the bind entry. A
+    /// PUBLISH from a connection with no session routes nothing, so a test
+    /// that publishes from a bare connection id binds one first.
+    fn bind_test_publisher(shared: &Shared, conn_id: u64) {
+        let client_id = format!("test-publisher-{conn_id}");
+        let bind = bind_frame(conn_id, 1, encode_bind_meta(&client_id, true, 60));
+        reply_for_frame(&bind, &shared.sessions).expect("bind replies");
     }
 
     fn test_shared() -> Shared {
@@ -13068,6 +13171,7 @@ mod tests {
             .await
             .0
             .expect("subscribe");
+        bind_test_publisher(&shared, 40);
         let (meta, payload) = encode_publish_meta("k1/data", 0, 0, false, b"first");
         let (_, before) = apply_publish(&publish_frame(40, 1, meta, payload), &shared).await;
         assert!(!before.is_empty(), "delivery before unsubscribe");
@@ -13147,6 +13251,7 @@ mod tests {
             .await
             .0
             .expect("subscribe");
+        bind_test_publisher(&shared, 40);
         let (meta, payload) = encode_publish_meta("k3/tasks", 0, 0, false, b"job");
         let (_, before) = apply_publish(&publish_frame(40, 1, meta, payload), &shared).await;
         assert_eq!(before.len(), 1, "shared member delivers before unsubscribe");
@@ -13312,6 +13417,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_v5_retain_handling_variants() {
         let shared = test_shared();
+        bind_test_publisher(&shared, 90);
         // Store one retained message via the broker publish path.
         let (meta, payload) = encode_publish_meta("rh/topic", 0, 0, true, b"kept");
         apply_publish(&publish_frame(90, 1, meta, payload), &shared).await;
@@ -13415,6 +13521,7 @@ mod tests {
         apply_subscribe(&frame, &shared).await.0.expect("subscribe");
         let (session, _) = shared.sessions.get_or_create("sub-id-1", true);
         *session.conn_id.write() = Some(61);
+        bind_test_publisher(&shared, 62);
         let (meta, payload) = encode_publish_meta("id/topic", 0, 0, false, b"v");
         let (_, deliveries) = apply_publish(&publish_frame(62, 1, meta, payload), &shared).await;
         assert_eq!(deliveries.len(), 1);
@@ -13441,6 +13548,7 @@ mod tests {
         apply_subscribe(&frame, &shared).await.0.expect("subscribe");
         let (session, _) = shared.sessions.get_or_create("sub-props", true);
         *session.conn_id.write() = Some(61);
+        bind_test_publisher(&shared, 62);
         let (meta, payload) = encode_publish_meta_v5(
             "props/topic",
             0,
@@ -13586,6 +13694,7 @@ mod tests {
             let (session, _) = shared.sessions.get_or_create(client, true);
             *session.conn_id.write() = Some(conn);
         }
+        bind_test_publisher(&shared, 40);
 
         let (meta, payload) = encode_publish_meta("sport/tennis", 5, 1, false, b"hello");
         let (ack, deliveries) = apply_publish(&publish_frame(40, 2, meta, payload), &shared).await;
@@ -14208,6 +14317,7 @@ mod tests {
         let sub = subscribe_frame(51, 1, encode_subscribe_meta(3, "q1-sub", &[("t", 1)]));
         let (reply, _) = apply_subscribe(&sub, &shared).await;
         reply.expect("subscribe replies");
+        bind_test_publisher(&shared, 52);
 
         let (meta, payload) = encode_publish_meta("t", 42, 1, false, b"data");
         let (ack, deliveries) = apply_publish(&publish_frame(52, 8, meta, payload), &shared).await;
@@ -14249,6 +14359,7 @@ mod tests {
         let mut bound = Vec::new();
 
         let (meta, payload) = encode_publish_meta("t", 42, 1, false, b"data");
+        bind_test_publisher(&shared, 52);
         handle_inbound_frame(
             publish_frame(52, 8, meta, payload),
             &shared,
@@ -14299,6 +14410,7 @@ mod tests {
         let mut bound = Vec::new();
 
         let (meta, payload) = encode_publish_meta("t", 9, 1, false, b"data");
+        bind_test_publisher(&shared, 72);
         handle_inbound_frame(
             publish_frame(72, 8, meta, payload),
             &shared,
@@ -14346,6 +14458,7 @@ mod tests {
         let mut bound = Vec::new();
 
         let (meta, payload) = encode_publish_meta("t", 11, 1, false, b"data");
+        bind_test_publisher(&shared, 82);
         handle_inbound_frame(
             publish_frame(82, 8, meta, payload),
             &shared,
@@ -14395,6 +14508,7 @@ mod tests {
         // Live mailbox: the downlink is routed (inflight, unacked).
         let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(61, tx61);
+        bind_test_publisher(&shared, 62);
         let (meta, payload) = encode_publish_meta("t", 7, 1, false, b"redeliver-me");
         let (_, deliveries) = apply_publish(&publish_frame(62, 3, meta, payload), &shared).await;
         assert_eq!(
@@ -14858,6 +14972,7 @@ mod tests {
 
         let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(61, tx61);
+        bind_test_publisher(&shared, 62);
         let (meta, payload) = encode_publish_meta("t", 7, 1, false, b"acked-me");
         let (_, deliveries) = apply_publish(&publish_frame(62, 3, meta, payload), &shared).await;
         assert_eq!(deliveries.len(), 1);
@@ -14905,6 +15020,7 @@ mod tests {
         let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(61, tx61);
         let mut sent_pids = Vec::new();
+        bind_test_publisher(&shared, 62);
         for (i, body) in [
             b"m-one".as_slice(),
             b"m-two".as_slice(),
@@ -14966,6 +15082,7 @@ mod tests {
 
         let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(61, tx61);
+        bind_test_publisher(&shared, 62);
         let (meta, payload) = encode_publish_meta("t", 7, 1, false, b"volatile");
         let (_, deliveries) = apply_publish(&publish_frame(62, 3, meta, payload), &shared).await;
         assert_eq!(deliveries.len(), 1);
@@ -15024,6 +15141,7 @@ mod tests {
 
         let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(61, tx61);
+        bind_test_publisher(&shared, 62);
         for i in 0..DEFAULT_MAX_QOS1_INFLIGHT {
             let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"x");
             let (_, deliveries) =
@@ -15089,6 +15207,7 @@ mod tests {
         );
         let mut live_pids = Vec::new();
         let mut live_payloads = Vec::new();
+        bind_test_publisher(&shared, 62);
         for i in 0..total {
             let body = format!("spill-{i:04}");
             let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, body.as_bytes());
@@ -15166,6 +15285,7 @@ mod tests {
 
         let (tx61, mut rx61) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(61, tx61);
+        bind_test_publisher(&shared, 62);
         for i in 0..6u16 {
             let (meta, payload) = encode_publish_meta("t", i, 1, false, b"x");
             let (_, deliveries) = apply_publish(
@@ -15223,6 +15343,7 @@ mod tests {
         // lock is never taken (guarded by `has_spill`).
         let steady_iters = 200usize;
         let steady_start = Instant::now();
+        bind_test_publisher(&shared, 62);
         for i in 0..steady_iters {
             let (meta, payload) = encode_publish_meta("t", i as u16, 1, false, b"x");
             let (_, deliveries) =
@@ -15832,6 +15953,7 @@ mod tests {
     #[tokio::test]
     async fn publish_qos0_needs_no_ack() {
         let shared = test_shared();
+        bind_test_publisher(&shared, 60);
         let (meta, payload) = encode_publish_meta("t", 0, 0, false, b"x");
         let (ack, deliveries) = apply_publish(&publish_frame(60, 1, meta, payload), &shared).await;
         assert!(ack.is_none(), "QoS 0 needs no PubAck");
@@ -16129,6 +16251,7 @@ mod tests {
         // Reconnect durably on a new connection: the subscription routes.
         let rebind = bind_frame(92, 1, encode_bind_meta("tk04-durable", false, 60));
         apply_bind(&rebind, &shared).await.expect("rebind replies");
+        bind_test_publisher(&shared, 99);
         let (meta, payload) = encode_publish_meta("tk04/kept", 0, 0, false, b"live");
         let (_, deliveries) = apply_publish(&publish_frame(99, 4, meta, payload), &shared).await;
         assert_eq!(deliveries.len(), 1);
@@ -16893,6 +17016,7 @@ mod tests {
             // Five QoS 1 publishes buffer while detached. Each `await`
             // returns after the durable append: the publisher's ack is
             // only observed once the entry has reached stable storage.
+            bind_test_publisher(&shared, 62);
             for i in 0..5u8 {
                 let (meta, payload) = encode_publish_meta("job/queue", 9, 1, false, &[i]);
                 let (ack, _) = apply_publish(
@@ -17029,6 +17153,7 @@ mod tests {
             )
             .expect("valid unbind frame");
             apply_unbind(&unbind, &shared);
+            bind_test_publisher(&shared, 62);
             for i in 0..5u8 {
                 let (meta, payload) = encode_publish_meta("torn/topic", 9, 1, false, &[i]);
                 let _ = apply_publish(
@@ -18218,6 +18343,7 @@ mod tests {
         assert!(!shared.slow_subs_settings.is_enabled());
         let iters = 200usize;
         let before_start = Instant::now();
+        bind_test_publisher(&shared, 72);
         for i in 0..iters {
             let (meta, payload) = encode_publish_meta("slow/q1", i as u16, 1, false, b"x");
             let frame = publish_frame(72, 1000 + i as u64, meta, payload);
@@ -18674,6 +18800,7 @@ mod tests {
         sub_reply.expect("subscribe replies");
         let (tx101, _rx101) = unbounded_channel::<BrokerFrame>();
         shared.conns.register(101, tx101);
+        bind_test_publisher(&shared, 102);
         let (meta, payload) = encode_publish_meta("jwt/topic", 1, 0, false, b"hello-jwt");
         let publish = publish_frame(102, 3, meta, payload);
         let (_, deliveries) = apply_publish(&publish, &shared).await;
@@ -20730,6 +20857,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn publish_from_a_connection_with_no_session_is_dropped_and_closed() {
+        // A PUBLISH frame from a connection with no bound session routes
+        // nothing and orders the close of that connection, with and
+        // without rules. Drives bind, subscribe and publish through the
+        // broker.
+        let shared = test_shared();
+        authz_test_bind(&shared, 241, "nb-sub");
+        let (tx, mut rx_unbound) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(242, tx);
+        let sub = subscribe_frame(241, 1, encode_subscribe_meta(1, "nb-sub", &[("nb/#", 0)]));
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        assert_eq!(&reply.expect("subscribe replies").metadata[2..], &[0u8]);
+
+        let (meta, payload) = encode_publish_meta("nb/data", 5, 1, false, b"x");
+        let (ack, deliveries) = apply_publish(&publish_frame(242, 1, meta, payload), &shared).await;
+        assert!(ack.is_none(), "no ack for an unbound connection");
+        assert!(deliveries.is_empty(), "nothing routes without a session");
+        let close = rx_unbound.try_recv().expect("the connection is closed");
+        assert_eq!(close.header.opcode, OpCode::ConnClose);
+        assert_eq!(close.header.conn_id, 242);
+    }
+
     /// Test mirror of the edge peer-address section: append
     /// `PeerLen:16be | PeerIp` to an encoded bind.
     fn encode_bind_meta_peer(base: Bytes, peer: &str) -> Bytes {
@@ -22332,6 +22482,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tm06_default_tenant_holds_no_bound_through_broker() {
+        // File quotas cap managed tenants only. Two binds in the
+        // default tenant both succeed past a file limit of one, while
+        // a managed tenant with a limit of one refuses the second
+        // bind. Goes through the broker bind path.
+        use broker_session::tenant::TenantRule;
+        let shared = test_shared();
+        shared
+            .tenant_limits
+            .set_defaults(broker_session::tenant_limits::TenantLimits {
+                max_connections: 1,
+                max_sessions: 1,
+                max_retained: 1,
+            });
+        for (conn, client) in [(611u64, "tm06-d1"), (612u64, "tm06-d2")] {
+            let meta = encode_bind_meta(client, true, 60);
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, 0x00, "default tenant stays unlimited");
+        }
+        shared
+            .tenant_registry
+            .replace(vec![TenantRule::new("", "tenant", "q-${username}")])
+            .expect("tenant rules store");
+        shared.namespaces.create("q-cap").expect("ns stores");
+        shared
+            .namespaces
+            .put_config(
+                "q-cap",
+                serde_json::json!({"limits": {"max_connections": 1}}),
+            )
+            .expect("limit stores");
+        for (conn, client, want) in [(613u64, "tm06-c1", 0x00), (614u64, "tm06-c2", 0x8B)] {
+            let meta = encode_bind_meta_creds(client, true, 60, "cap", b"pw");
+            let reply = apply_bind(&bind_frame(conn, 1, meta), &shared)
+                .await
+                .expect("bind replies");
+            let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+            assert_eq!(rc, want, "managed tenant enforces its limit");
+        }
+    }
+
+    #[tokio::test]
     async fn tm06_unreachable_limit_store_denies_new_use() {
         // Fail closed: an unreachable store denies new connections.
         use broker_session::tenant::TenantRule;
@@ -23267,6 +23462,7 @@ mod tests {
         // The single shared driver serves the wheel; without it nothing
         // fires (one task per node, never one task per message).
         shared.spawn_delayed_driver();
+        bind_test_publisher(shared, 952);
         let (meta, payload) = encode_publish_meta("$delayed/1/alerts", 0, 0, false, b"later");
         let ack = apply_publish(&publish_frame(952, 1, meta, payload), shared).await;
         (rx, ack.0)
@@ -23313,6 +23509,7 @@ mod tests {
     #[tokio::test]
     async fn delayed_publish_rejects_garbage() {
         let shared = test_shared();
+        bind_test_publisher(&shared, 953);
         // Non-numeric delay is not a delayed target at all: it publishes
         // literally (no subscribers exist for it here).
         let (meta, payload) = encode_publish_meta("$delayed/soon/t", 0, 0, false, b"x");
@@ -23442,6 +23639,7 @@ mod tests {
             assert_eq!(shared.delayed.load(), (0, 0, 0));
             let (meta, payload) =
                 encode_publish_meta("$delayed/6/restart/alerts", 0, 0, false, b"restart-me");
+            bind_test_publisher(&shared, 957);
             let (ack, deliveries) =
                 apply_publish(&publish_frame(957, 1, meta, payload), &shared).await;
             assert!(ack.is_none());
@@ -23579,6 +23777,7 @@ mod tests {
         // BEFORE: immediate publish-to-delivery, no delayed work.
         let steady_iters = 200usize;
         let steady_start = Instant::now();
+        bind_test_publisher(&shared, 970);
         for i in 0..steady_iters {
             let (meta, payload) = encode_publish_meta("wload/base", 0, 0, false, b"x");
             let (_, deliveries) =
@@ -23644,6 +23843,7 @@ mod tests {
         otime.spawn_delayed_driver();
         let ontime_count = 5usize;
         let ontime_start = Instant::now();
+        bind_test_publisher(&otime, 973);
         for i in 0..ontime_count {
             let (meta, payload) = encode_publish_meta("$delayed/1/wload/ontime", 0, 0, false, b"y");
             let (_, deliveries) =
@@ -24281,6 +24481,7 @@ mod tests {
         }
 
         let mut fast_got: Vec<Vec<u8>> = Vec::new();
+        bind_test_publisher(&shared, 99);
         for i in 0..6u8 {
             let (meta, payload) =
                 encode_publish_meta("q0/t", 0, 0, false, std::slice::from_ref(&i));
@@ -24338,6 +24539,7 @@ mod tests {
         shared.conns.register(61, tx);
         shared.conns.set_client_label(61, "q0-block");
 
+        bind_test_publisher(&shared, 99);
         for i in 0..10_000u32 {
             let (meta, payload) = encode_publish_meta("q0/b", 0, 0, false, &[(i % 251) as u8]);
             let (_, deliveries) = apply_publish(
@@ -24382,6 +24584,7 @@ mod tests {
         shared.conns.register(61, tx);
         shared.conns.set_client_label(61, "q01-mixed");
 
+        bind_test_publisher(&shared, 99);
         for i in 0..4u8 {
             let (meta, payload) =
                 encode_publish_meta("q01/t", 0, 0, false, std::slice::from_ref(&i));
@@ -24467,6 +24670,148 @@ mod tests {
         assert!(apply_coap_publish(&shared, "", &payload).await.is_none());
     }
 
+    /// SEC-01: the CoAP gateway checks access rules before it routes.
+    ///
+    /// Sends POST datagrams through a UDP socket to the gateway task.
+    /// A denied topic answers 4.01 and reaches no subscriber.
+    /// An allowed topic answers 2.04 and reaches the subscriber.
+    #[tokio::test]
+    async fn coap_publish_denied_topic_is_refused_over_udp() {
+        use broker_gateway::coap::{option_number, CoapOption, CoapType};
+        let shared = test_shared();
+        shared
+            .auth
+            .add_rule(AclRule::new("*", AclAction::Publish, "secret/#", false))
+            .expect("rule adds");
+        shared
+            .auth
+            .add_rule(AclRule::new("*", AclAction::All, "#", true))
+            .expect("rule adds");
+
+        // One MQTT subscriber for both probe topics.
+        let sub = subscribe_frame(
+            71,
+            1,
+            encode_subscribe_meta(1, "coap-acl-sub", &[("secret/x", 0), ("open/x", 0)]),
+        );
+        let (reply, _) = apply_subscribe(&sub, &shared).await;
+        reply.expect("subscribe replies");
+        let (session, _) = shared.sessions.get_or_create("coap-acl-sub", true);
+        *session.conn_id.write() = Some(71);
+        *session.connected.write() = true;
+        let (tx, mut rx) = unbounded_channel::<BrokerFrame>();
+        shared.conns.register(71, tx);
+
+        // Start the gateway on loopback. The task runs until the test ends.
+        let gateway = Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("gateway binds"),
+        );
+        let gateway_addr = gateway.local_addr().expect("gateway addr");
+        let gateway_shared = shared.clone();
+        let gateway_socket = gateway.clone();
+        tokio::spawn(async move {
+            run_coap_gateway(gateway_shared, gateway_socket).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client binds");
+
+        // Build one POST for `/ps/<topic>`.
+        let coap_post = |mid: u16, token: &[u8], topic: &str, payload: &[u8]| {
+            let mut options = vec![CoapOption {
+                number: option_number::URI_PATH,
+                value: Bytes::from_static(b"ps"),
+            }];
+            for part in topic.split('/') {
+                options.push(CoapOption {
+                    number: option_number::URI_PATH,
+                    value: Bytes::copy_from_slice(part.as_bytes()),
+                });
+            }
+            broker_gateway::coap::CoapMessage {
+                message_type: CoapType::Confirmable,
+                code: CoapCode::POST,
+                message_id: mid,
+                token: Bytes::copy_from_slice(token),
+                options,
+                payload: Bytes::copy_from_slice(payload),
+            }
+        };
+
+        // Denied topic: the gateway refuses and routes nothing.
+        let denied_msg = coap_post(11, b"d1", "secret/x", b"hidden");
+        client
+            .send_to(&denied_msg.encode(), gateway_addr)
+            .await
+            .expect("POST sends");
+        let mut buf = [0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("answer arrives")
+        .expect("udp recv");
+        let denied =
+            broker_gateway::coap::CoapMessage::decode(&buf[..len]).expect("answer decodes");
+        assert_eq!(denied.code, CoapCode::UNAUTHORIZED);
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(800), rx.recv()).await;
+        assert!(leaked.is_err(), "denied CoAP publish routes nothing");
+        // QoS 0 rides the bounded backlog, not the mailbox.
+        // A denied publish queues nothing there either.
+        assert!(
+            shared.conns.pop_qos0(71).is_none(),
+            "denied CoAP publish queues nothing"
+        );
+        let stored = shared
+            .retained
+            .get_retained(&Topic::new("secret/x").unwrap())
+            .await
+            .expect("retained read");
+        assert!(stored.is_none(), "denied CoAP publish stores nothing");
+
+        // Allowed topic: the gateway confirms and delivers.
+        let allowed_msg = coap_post(12, b"a1", "open/x", b"shown");
+        client
+            .send_to(&allowed_msg.encode(), gateway_addr)
+            .await
+            .expect("POST sends");
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("answer arrives")
+        .expect("udp recv");
+        let allowed =
+            broker_gateway::coap::CoapMessage::decode(&buf[..len]).expect("answer decodes");
+        assert_eq!(allowed.code, CoapCode::CHANGED);
+        // QoS 0 rides the bounded backlog, not the mailbox.
+        // Poll the backlog until the frame arrives.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let delivered = loop {
+            if let Some(frame) = shared.conns.pop_qos0(71) {
+                break frame;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("allowed CoAP publish arrives");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(delivered.payload, Bytes::from_static(b"shown"));
+        assert!(rx.try_recv().is_err(), "QoS 0 uses the backlog");
+        let stored = shared
+            .retained
+            .get_retained(&Topic::new("open/x").unwrap())
+            .await
+            .expect("retained read")
+            .expect("allowed CoAP publish is retained");
+        assert_eq!(stored.payload, Bytes::from_static(b"shown"));
+    }
+
     /// B1-04: an ordinary MQTT publish notifies a registered CoAP
     /// observer over UDP.
     ///
@@ -24493,6 +24838,7 @@ mod tests {
             .coap
             .register_observer("notify/topic", client_addr, token.clone()));
         assert!(shared.coap.has_observers());
+        bind_test_publisher(&shared, 90);
 
         // Ordinary MQTT publish on the observed topic.
         let (meta, payload) = encode_publish_meta("notify/topic", 7, 0, false, b"hello-udp");
@@ -24932,6 +25278,7 @@ mod tests {
         );
         let (reply, _) = apply_subscribe(&sub, &shared).await;
         reply.expect("subscribe replies");
+        bind_test_publisher(&shared, 62);
 
         // Publish the original name through the real ingress event.
         let (meta, payload) = encode_publish_meta("sensors/temp", 0, 0, false, b"21.5");
@@ -24965,6 +25312,7 @@ mod tests {
         let sub = subscribe_frame(63, 1, encode_subscribe_meta(4, "rw-p", &[("p/a", 0)]));
         let (reply, _) = apply_subscribe(&sub, &shared).await;
         reply.expect("subscribe replies");
+        bind_test_publisher(&shared, 64);
         // Publishing the same name rewrites away from the subscription.
         let (meta, payload) = encode_publish_meta("p/a", 0, 0, false, b"x");
         let (_, deliveries) = apply_publish(&publish_frame(64, 1, meta, payload), &shared).await;
@@ -24995,6 +25343,7 @@ mod tests {
         // Subscribing to the pre-rewrite name lands on the rewritten filter.
         let sub = subscribe_frame(65, 1, encode_subscribe_meta(6, "rw-s", &[("s/a", 0)]));
         apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        bind_test_publisher(&shared, 66);
         // Publishing the rewritten name (untouched by the rule) delivers.
         let (meta, payload) = encode_publish_meta("sub/a", 0, 0, false, b"y");
         let (_, deliveries) = apply_publish(&publish_frame(66, 1, meta, payload), &shared).await;
@@ -25022,6 +25371,7 @@ mod tests {
         *session.conn_id.write() = Some(67);
         let sub = subscribe_frame(67, 1, encode_subscribe_meta(7, "rw-b", &[("b/a", 0)]));
         apply_subscribe(&sub, &shared).await.0.expect("subscribe");
+        bind_test_publisher(&shared, 68);
         let (meta, payload) = encode_publish_meta("b/a", 0, 0, false, b"z");
         let (_, deliveries) = apply_publish(&publish_frame(68, 1, meta, payload), &shared).await;
         assert_eq!(deliveries.len(), 1);
@@ -25054,6 +25404,7 @@ mod tests {
             let sub = subscribe_frame(69, 1, encode_subscribe_meta(8, "rw-o", &[(filter, 0)]));
             apply_subscribe(&sub, &shared).await.0.expect("subscribe");
         }
+        bind_test_publisher(&shared, 70);
         // First matching rule wins.
         let (meta, payload) = encode_publish_meta("o/x", 0, 0, false, b"o");
         let (_, deliveries) = apply_publish(&publish_frame(70, 1, meta, payload), &shared).await;
@@ -25126,6 +25477,7 @@ mod tests {
         apply_subscribe(&sub, &shared).await.0.expect("subscribe");
         let off_iters = 200usize;
         let off_start = Instant::now();
+        bind_test_publisher(&shared, 72);
         for i in 0..off_iters {
             let (meta, payload) = encode_publish_meta("load/plain", 0, 0, false, b"x");
             let (_, deliveries) =

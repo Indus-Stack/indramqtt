@@ -17,7 +17,6 @@ Describe the tests you ran to verify your changes:
 - [ ] `cargo test --workspace` passes without errors
 - [ ] `cargo check --workspace --all-targets` passes with 0 warnings
 - [ ] `cargo clippy --workspace --all-targets` clean
-- [ ] EUnit tests pass (`cd beam && rebar3 eunit`)
 
 ## Zero-Limit Scale Invariant Checklist
 - [ ] No hardcoded buffer depths or magic constant caps introduced.

@@ -38,8 +38,8 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: OS version, architecture, Rust version, Erlang version, and IndraMQTT commit/version.
-      placeholder: "e.g., Linux x86_64, Rust 1.80, OTP 26, IndraMQTT v0.1.0 (commit a09eb88)"
+      description: OS version, architecture, Rust version, and IndraMQTT commit/version.
+      placeholder: "e.g., Linux x86_64, Rust 1.80, IndraMQTT v0.1.0 (commit a09eb88)"
     validations:
       required: true
   - type: textarea

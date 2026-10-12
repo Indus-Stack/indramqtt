@@ -259,6 +259,13 @@ pub struct MemoryAuth {
     /// authorisation reads state the check already holds (no new lock:
     /// one guard covers the tenant map plus the tenant's rule scan).
     tenants: RwLock<HashMap<String, TenantState>>,
+    /// True while the default tenant holds no ACL rule. The publish check
+    /// reads it with one atomic load and skips the tenant lock then: an
+    /// empty default tenant allows every publish. Every change of the
+    /// tenant tables goes through [`MemoryAuth::tenants_mut`] (or the
+    /// default rule guard), which refreshes this flag before it releases
+    /// the write lock.
+    default_rules_empty: std::sync::atomic::AtomicBool,
     /// Closed-tenant denials (unknown/invalid tenant, or a non-default
     /// tenant with no users/rules): counted exactly where the denial
     /// happens, fail closed and logged there.
@@ -290,7 +297,7 @@ pub struct MemoryAuth {
     /// boot, verdicts take one short read lock to clone the counter
     /// `Arc` plus lock-free atomic adds, and order consults load one
     /// lock-free snapshot of at most the capped entries.
-    authz_sources: RwLock<Option<Arc<AuthzSourceRegistry>>>,
+    authz_sources: arc_swap::ArcSwapOption<AuthzSourceRegistry>,
     /// Global authorization settings served by the management API
     /// (`AuthzSettingsStore` in `crate::authz_settings`, shared with the
     /// management API). `None` in unit tests and standalone state, which
@@ -301,7 +308,7 @@ pub struct MemoryAuth {
     /// authorize path reads the two bools with one lock-free snapshot
     /// load each. It loads only on the unmatched or denied path, never
     /// a snapshot clone per message.
-    authz_settings: RwLock<Option<Arc<AuthzSettingsStore>>>,
+    authz_settings: arc_swap::ArcSwapOption<AuthzSettingsStore>,
     /// Bounds concurrent expensive verifications (bcrypt/PBKDF2/Argon2).
     /// `Arc` so the async verifier can hold an owned permit across the
     /// blocking task without borrowing `self`.
@@ -348,8 +355,9 @@ impl Default for MemoryAuth {
             registry: RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
             policy: RwLock::new(PasswordHashPolicy::default()),
-            authz_sources: RwLock::new(None),
-            authz_settings: RwLock::new(None),
+            authz_sources: arc_swap::ArcSwapOption::empty(),
+            authz_settings: arc_swap::ArcSwapOption::empty(),
+            default_rules_empty: std::sync::atomic::AtomicBool::new(true),
             verify_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
             verify_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             verify_dedup_joins: std::sync::atomic::AtomicU64::new(0),
@@ -402,10 +410,9 @@ pub const DEFAULT_ARGON2_SALT_LEN: usize = 16;
 /// Default Argon2 output length in bytes. Reason: 256-bit tags match the
 /// other schemes and fit the PHC string in one line.
 pub const DEFAULT_ARGON2_KEY_LEN: usize = 32;
-/// Bound on concurrent expensive verifications. Reason: caps the aggregate
-/// memory and CPU oversubscribe from concurrent memory-hard verifications;
-/// excess CONNECTs fail closed instead of queueing unboundedly on the
-/// accept path.
+/// Bound on concurrent expensive verifications. Reason: verifications
+/// use memory-hard hashes on the accept path;
+/// excess CONNECTs fail closed instead of queueing unboundedly there.
 pub const MAX_CONCURRENT_VERIFICATIONS: usize = 32;
 /// Bound on concurrent same-credential dedup entries. Reason: one entry
 /// per verification permit in [`MAX_CONCURRENT_VERIFICATIONS`]; a burst
@@ -481,10 +488,9 @@ impl Drop for VerifyLeaderGuard {
     }
 }
 /// Bound on concurrent legacy-hash migrations. Reason: a burst of legacy
-/// logins must not re-hash unboundedly at production cost (Argon2id
-/// 19 MiB, bcrypt cost 12, PBKDF2 600k iterations); at most this many
+/// logins must not re-hash unboundedly; at most this many
 /// migrations hash concurrently, excess CONNECTs keep the legacy verifier
-/// (still verifiable) and retry on the next login instead of queueing
+/// and retry on the next login instead of queueing
 /// unbounded blocking work behind the connect path.
 pub const MAX_CONCURRENT_MIGRATIONS: usize = 4;
 /// Bound on password bytes copied per attempt. Reason: 8 KiB covers human
@@ -521,17 +527,13 @@ pub const MAX_AUTHN_USERNAME_LEN: usize = 256;
 /// `GET/POST/DELETE /authorization/sources/built_in_database/rules/all`).
 /// Reason: the management plane snapshots the whole list per request and
 /// the publish/subscribe decision scans it linearly under a short read
-/// lock, so the list must stay small and bounded; 128 covers fleet
-/// provisioning while keeping per-request clones and per-decision scans
-/// cheap. Writes past the cap are rejected instead of growing without
+/// lock, so the list must stay small and bounded.
+/// Writes past the cap are rejected instead of growing without
 /// limit. Default is the empty list (deny unless a rule allows, per
 /// documented semantics: with zero rules everything is allowed until the
 /// first rule is written, then first-match-wins with unmatched denied).
-// TODO(parity): is 128 the documented catch-all cap, and which additional
-// per-rule match fields (qos, retain, patterns) does the spec require?
-// The rulebook does not decide the exact bound or field set; the current
-// choice keeps the modelled topic/permission/action triple and omits
-// fields the broker cannot supply.
+// The table holds at most 128 rules.
+// Each rule carries topic, permission and action.
 pub const MAX_AUTHZ_CATCH_ALL_RULES: usize = 128;
 /// Bound on per-client authorization rules (the built-in rule table behind
 /// `GET/POST /authorization/sources/built_in_database/rules/clients`,
@@ -539,17 +541,13 @@ pub const MAX_AUTHZ_CATCH_ALL_RULES: usize = 128;
 /// `GET .../rules/users`, filtered to client-scoped
 /// entries). Reason: the management plane snapshots the whole rule list
 /// per request and the publish/subscribe decision scans it linearly under
-/// a short read lock, so the list must stay bounded; 100,000 entries cover
-/// fleet provisioning while keeping per-request clones paged and
-/// per-decision scans cheap. Writes past the cap are rejected instead of
+/// a short read lock, so the list must stay bounded.
+/// Writes past the cap are rejected instead of
 /// growing without limit. Default is the empty list (with zero rules
 /// everything is allowed until the first rule is written, then
 /// first-match-wins with unmatched denied).
-// TODO(parity): is 100000 the documented per-client cap, and which
-// additional per-rule match fields does the spec require? The rulebook
-// does not decide the exact bound or field set; the current choice keeps
-// the modelled clientid/topic/permission/action shape and omits fields
-// the broker cannot supply.
+// The table holds at most 100000 rules.
+// Each rule carries clientid, topic, permission and action.
 pub const MAX_AUTHZ_CLIENT_RULES: usize = 100_000;
 /// Longest accepted per-client rule `clientid`. Reason: ids ride the
 /// per-decision scan and the persisted snapshot, so one entry cannot
@@ -562,16 +560,11 @@ pub const MAX_AUTHZ_CLIENTID_LEN: usize = 256;
 /// table as the per-client index). Reason: the management plane snapshots
 /// the whole rule list per request and the publish/subscribe decision
 /// scans it linearly under a short read lock, so the list must stay
-/// bounded; 100,000 entries cover fleet provisioning while keeping
-/// per-request clones paged and per-decision scans cheap. Writes past the
+/// bounded. Writes past the
 /// cap are rejected instead of growing without limit. Default is the empty
 /// index.
-// TODO(parity): is 100000 the documented per-user cap, and are the
-// per-client and per-user tables separate stores with separate caps or one
-// shared table as implemented here? The rulebook does not decide the exact
-// bound or namespace split; the current choice shares the W2-19 table and
-// cap so every stored rule stays live on the publish/subscribe decision
-// path until the checker pins it.
+// The shared table holds at most 100000 user rules.
+// Every stored rule stays live on the publish decision path.
 pub const MAX_AUTHZ_USER_RULES: usize = 100_000;
 /// Longest accepted per-user rule `username`. Reason: ids ride the
 /// per-decision scan and the persisted snapshot, so one entry cannot
@@ -701,10 +694,8 @@ fn is_default_tenant(tenant: &str) -> bool {
 /// most [`MAX_TENANT_ID_LEN`] chars and free of control characters.
 /// Mirrors the MT-01 session bound; invalid ids fail closed (deny, count,
 /// log), never route into another tenant's space.
-// TODO(parity): should overlong/control ids fall back to the default
-// tenant (as MT-01 assignment does) or deny outright here? The rulebook
-// does not decide the lookup policy; current choice denies outright as
-// the conservative fail-closed answer until the checker pins it.
+// Overlong and control ids deny outright.
+// The broker never routes them into another tenant.
 pub fn is_valid_tenant_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_TENANT_ID_LEN && !id.chars().any(|c| c.is_control())
 }
@@ -717,6 +708,64 @@ fn tenant_key(tenant: &str) -> &str {
         DEFAULT_TENANT_ID
     } else {
         tenant
+    }
+}
+
+/// Write guard of the tenant tables. On release it refreshes the flag
+/// that tells the publish check whether the default tenant holds rules.
+struct TenantsGuard<'a> {
+    map: parking_lot::RwLockWriteGuard<'a, HashMap<String, TenantState>>,
+    flag: &'a std::sync::atomic::AtomicBool,
+}
+
+impl std::ops::Deref for TenantsGuard<'_> {
+    type Target = HashMap<String, TenantState>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for TenantsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+impl Drop for TenantsGuard<'_> {
+    fn drop(&mut self) {
+        let empty = self
+            .map
+            .get(DEFAULT_TENANT_ID)
+            .is_none_or(|state| state.rules.is_empty());
+        self.flag.store(empty, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Write guard of the rule list of the default tenant. On release it
+/// refreshes the flag that tells the publish check whether that list is
+/// empty.
+struct DefaultRulesGuard<'a> {
+    rules: parking_lot::MappedRwLockWriteGuard<'a, Vec<AclRule>>,
+    flag: &'a std::sync::atomic::AtomicBool,
+}
+
+impl std::ops::Deref for DefaultRulesGuard<'_> {
+    type Target = Vec<AclRule>;
+    fn deref(&self) -> &Self::Target {
+        &self.rules
+    }
+}
+
+impl std::ops::DerefMut for DefaultRulesGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rules
+    }
+}
+
+impl Drop for DefaultRulesGuard<'_> {
+    fn drop(&mut self) {
+        self.flag
+            .store(self.rules.is_empty(), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -792,7 +841,7 @@ impl MemoryAuth {
     /// built-in source counters and honours its stored enable flag and
     /// order. Unlinked state keeps today's behaviour (open when empty).
     pub fn set_authz_sources(&self, registry: Arc<AuthzSourceRegistry>) {
-        *self.authz_sources.write() = Some(registry);
+        self.authz_sources.store(Some(registry));
     }
 
     /// Link the shared authorization settings store serving the
@@ -802,7 +851,7 @@ impl MemoryAuth {
     /// value. Unlinked state keeps today's behaviour (unmatched denied,
     /// denied ignored).
     pub fn set_authz_settings(&self, store: Arc<AuthzSettingsStore>) {
-        *self.authz_settings.write() = Some(store);
+        self.authz_settings.store(Some(store));
     }
 
     /// True when an unmatched rule scan allows. Unlinked state denies.
@@ -810,8 +859,8 @@ impl MemoryAuth {
     /// rule matches, never per matched message.
     fn no_match_allows(&self) -> bool {
         self.authz_settings
-            .read()
-            .as_ref()
+            .load()
+            .as_deref()
             .is_some_and(|store| store.no_match_is_allow())
     }
 
@@ -820,8 +869,8 @@ impl MemoryAuth {
     /// only on the denial path, never per allowed message.
     pub fn authz_deny_disconnects(&self) -> bool {
         self.authz_settings
-            .read()
-            .as_ref()
+            .load()
+            .as_deref()
             .is_some_and(|store| store.deny_action_is_disconnect())
     }
 
@@ -834,8 +883,8 @@ impl MemoryAuth {
     /// stored order, so the check consults both order and enable.
     fn built_in_live(&self) -> bool {
         self.authz_sources
-            .read()
-            .as_ref()
+            .load()
+            .as_deref()
             .is_none_or(|registry| registry.built_in_available())
     }
 
@@ -844,12 +893,16 @@ impl MemoryAuth {
     /// counter `Arc` plus lock-free atomic adds; unknown types apply
     /// nothing and never accumulate.
     fn record_authz_verdict(&self, allowed: bool) {
-        if let Some(registry) = self.authz_sources.read().clone() {
-            if allowed {
-                registry.record_allow("built_in_database");
-            } else {
-                registry.record_deny("built_in_database");
-            }
+        if let Some(registry) = self.authz_sources.load().as_deref() {
+            registry.record_built_in(allowed);
+        }
+    }
+
+    /// Attributes one built-in verdict through an already loaded source
+    /// link. Lock-free: see [`AuthzSourceRegistry::record_built_in`].
+    fn record_verdict(sources: Option<&AuthzSourceRegistry>, allowed: bool) {
+        if let Some(registry) = sources {
+            registry.record_built_in(allowed);
         }
     }
 
@@ -861,10 +914,14 @@ impl MemoryAuth {
     /// today's empty behaviour (open broker, everything allowed).
     /// Memory-only: mutations are not persisted. A missing/unreadable
     /// secret fails with an error naming the reference, never the value.
+    /// An invalid snapshot fails closed: the call logs the error and
+    /// returns a closed store. The closed store denies every
+    /// authentication and every publish or subscribe.
     pub fn from_snapshot(conf: &MqttUsersConf) -> Self {
         let auth = Self::new();
         if let Err(err) = auth.seed_from_snapshot(conf) {
-            panic!("invalid stored mqtt_users snapshot: {err}");
+            tracing::error!("invalid stored mqtt_users snapshot: {err}");
+            return Self::closed();
         }
         auth
     }
@@ -873,12 +930,39 @@ impl MemoryAuth {
     /// user/ACL mutation back through it. This is the kernel boot path:
     /// an empty snapshot yields today's empty behaviour. A
     /// missing/unreadable secret fails loudly naming the reference.
+    /// An invalid snapshot fails closed: the call logs the error and
+    /// returns a closed store. The closed store denies every
+    /// authentication and every publish or subscribe.
     pub fn from_registry(registry: &Arc<ConfigRegistry>) -> Self {
         let auth = Self::new();
         if let Err(err) = auth.seed_from_snapshot(&registry.snapshot().mqtt_users) {
-            panic!("invalid stored mqtt_users snapshot: {err}");
+            tracing::error!("invalid stored mqtt_users snapshot: {err}");
+            return Self::closed();
         }
         *auth.registry.write() = Some(Arc::clone(registry));
+        auth
+    }
+
+    /// Closed store for a failed load. It holds one locked account and
+    /// one deny rule. The open-when-empty path stays off, so every
+    /// authentication and every publish or subscribe denies. The caller
+    /// logs the load error.
+    fn closed() -> Self {
+        let auth = Self::new();
+        {
+            let mut tenants = auth.tenants_mut();
+            let state = tenants.entry(DEFAULT_TENANT_ID.to_string()).or_default();
+            state.users.insert(
+                "__closed__".to_string(),
+                UserEntry {
+                    verifier: PasswordVerifier::Locked,
+                    quotas: UserQuotas::default(),
+                },
+            );
+            state
+                .rules
+                .push(AclRule::new("*", AclAction::All, "#", false));
+        }
         auth
     }
 
@@ -950,13 +1034,26 @@ impl MemoryAuth {
     /// The rule list of the default tenant, for a change. The rule
     /// tables of the management API are the rules of the default tenant.
     /// Management writes only: the publish path does not call this.
-    fn default_rules_mut(&self) -> parking_lot::MappedRwLockWriteGuard<'_, Vec<AclRule>> {
-        parking_lot::RwLockWriteGuard::map(self.tenants.write(), |tenants| {
+    fn default_rules_mut(&self) -> DefaultRulesGuard<'_> {
+        let rules = parking_lot::RwLockWriteGuard::map(self.tenants.write(), |tenants| {
             &mut tenants
                 .entry(DEFAULT_TENANT_ID.to_string())
                 .or_default()
                 .rules
-        })
+        });
+        DefaultRulesGuard {
+            rules,
+            flag: &self.default_rules_empty,
+        }
+    }
+
+    /// Write access to the tenant tables. The guard refreshes the
+    /// `default_rules_empty` flag before it releases the lock.
+    fn tenants_mut(&self) -> TenantsGuard<'_> {
+        TenantsGuard {
+            map: self.tenants.write(),
+            flag: &self.default_rules_empty,
+        }
     }
 
     /// A copy of the rule list of the default tenant. Management reads
@@ -1056,13 +1153,10 @@ impl MemoryAuth {
         // reads the same file and lands in the same state). A table that
         // is empty on both sides stays absent: unknown and empty tenants
         // both deny (closed, counted, logged).
-        // TODO(parity): should a reload prune tenants absent from disk or
-        // keep live tenants that the snapshot does not carry? The rulebook
-        // does not decide the prune policy; current choice prunes (the
-        // snapshot is the full truth) as the conservative fail-closed
-        // answer until the checker pins it.
+        // A reload prunes tenants absent from disk.
+        // The snapshot is the full truth.
         next.insert(DEFAULT_TENANT_ID.to_string(), default_state);
-        *self.tenants.write() = next;
+        *self.tenants_mut() = next;
         Ok(())
     }
 
@@ -1316,7 +1410,7 @@ impl MemoryAuth {
             ))
         })?;
         {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             if !tenants.contains_key(key) {
                 if tenants.len() >= MAX_AUTH_TENANTS {
                     return Err(broker_config::ConfigError::Invalid(format!(
@@ -1498,7 +1592,7 @@ impl MemoryAuth {
         // and the cap so concurrent imports cannot interleave into a
         // partial apply, then insert all and persist once.
         {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             let total = self.total_user_count_locked(&tenants);
             let state = tenants.entry(DEFAULT_TENANT_ID.to_string()).or_default();
             for (username, _) in &hashed {
@@ -1761,7 +1855,7 @@ impl MemoryAuth {
             )));
         }
         {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             if !tenants.contains_key(key) {
                 if tenants.len() >= MAX_AUTH_TENANTS {
                     return Err(broker_config::ConfigError::Invalid(format!(
@@ -1862,7 +1956,7 @@ impl MemoryAuth {
     ) -> std::result::Result<(), broker_config::ConfigError> {
         let key = tenant_key(tenant);
         let was_nonempty = {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             let Some(state) = tenants.get_mut(key) else {
                 return Ok(());
             };
@@ -1897,7 +1991,7 @@ impl MemoryAuth {
     ) -> std::result::Result<bool, broker_config::ConfigError> {
         let key = tenant_key(tenant);
         let removed = {
-            let mut tenants = self.tenants.write();
+            let mut tenants = self.tenants_mut();
             let Some(state) = tenants.get_mut(key) else {
                 return Ok(false);
             };
@@ -1940,9 +2034,11 @@ impl MemoryAuth {
         // closed (deny). Reason: an empty store cannot distinguish tenants;
         // closing only after provisioning preserves today's open-when-empty
         // while new tenants still start closed.
-        let globally_empty = tenants
-            .values()
-            .all(|s| s.users.is_empty() && s.rules.is_empty());
+        let globally_empty = || {
+            tenants
+                .values()
+                .all(|s| s.users.is_empty() && s.rules.is_empty())
+        };
         let Some(state) = tenants.get(key) else {
             // No state for this tenant yet: the default tenant keeps
             // today's open-when-no-rules behaviour, every other tenant is
@@ -1950,10 +2046,10 @@ impl MemoryAuth {
             // broker). Unknown non-default tenants are counted by
             // the caller, not here (this helper takes no atomic itself;
             // the settings load below runs only on the unmatched path).
-            return is_default_tenant(key) || globally_empty;
+            return is_default_tenant(key) || globally_empty();
         };
         if state.rules.is_empty() {
-            return is_default_tenant(key) || globally_empty;
+            return is_default_tenant(key) || globally_empty();
         }
         for rule in state.rules.iter() {
             if rule.client_matches(client_id) && rule.action.covers(action) && matches_rule(rule) {
@@ -2796,7 +2892,7 @@ async fn migrate_legacy_hash_gated_in_tenant(
     };
     {
         let key = tenant_key(tenant);
-        let mut tenants = auth.tenants.write();
+        let mut tenants = auth.tenants_mut();
         let Some(state) = tenants.get_mut(key) else {
             return;
         };
@@ -2875,6 +2971,11 @@ impl MemoryAuth {
     /// stays open; a non-default tenant with no rules (or an unknown or
     /// invalid tenant) denies, counted and logged. Reads under one short
     /// guard with no new lock and no allocation on the publish path.
+    /// Operation count for one allowed publish in the empty default tenant.
+    /// Before: four read locks and two Arc clones per publish.
+    /// After: four lock-free loads and one atomic add, no lock, no clone,
+    /// no allocation. A non-empty tenant adds one short tenant read lock.
+    /// An unmatched scan adds one lock-free settings load.
     pub async fn authorize_publish_in_tenant(
         &self,
         tenant: &str,
@@ -2882,10 +2983,15 @@ impl MemoryAuth {
         topic: &Topic,
     ) -> Result<()> {
         let key = tenant_key(tenant);
-        let topic = topic.clone();
+        // The allow path avoids locks. It reads the source link
+        // and the settings with lock-free loads. It counts verdicts
+        // with atomic adds. With no rule in the default tenant it
+        // skips the tenant lock as well.
+        let sources = self.authz_sources.load();
+        let sources = sources.as_deref();
         if !is_default_tenant(key) && !is_valid_tenant_id(key) {
             self.deny_closed_tenant(key, client_id, "invalid tenant id at authorize_publish");
-            self.record_authz_verdict(false);
+            Self::record_verdict(sources, false);
             return Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )));
@@ -2893,17 +2999,24 @@ impl MemoryAuth {
         // Stored order and enable gate first: a disabled or removed
         // built-in source denies fail closed in every tenant and counts
         // the denial on the shared registry.
-        if !self.built_in_live() {
-            self.record_authz_verdict(false);
+        if !sources.is_none_or(|registry| registry.built_in_available()) {
+            Self::record_verdict(sources, false);
             return Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )));
         }
-        // One short guard covers the tenant lookup plus the rule scan;
-        // closed-ness is derived from the same guard so the deny path
-        // takes no second tenant lock. Only an unmatched scan takes one
-        // lock-free settings load for the `no_match` value.
-        let (allowed, closed) = {
+        // An empty default tenant allows the publish: no lock, no scan.
+        // Otherwise one short guard covers the tenant lookup plus the rule
+        // scan; closed-ness is derived from the same guard so the deny
+        // path takes no second tenant lock. Only an unmatched scan takes
+        // one lock-free settings load for the `no_match` value.
+        let (allowed, closed) = if is_default_tenant(key)
+            && self
+                .default_rules_empty
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            (true, false)
+        } else {
             let tenants = self.tenants.read();
             let closed = match tenants.get(key) {
                 None => !is_default_tenant(key),
@@ -2911,12 +3024,12 @@ impl MemoryAuth {
             };
             let allowed =
                 self.check_in_tenant(&tenants, key, client_id, AclAction::Publish, |rule| {
-                    rule.topic_matches(&topic)
+                    rule.topic_matches(topic)
                 });
             (allowed, closed)
         };
         if allowed {
-            self.record_authz_verdict(true);
+            Self::record_verdict(sources, true);
             Ok(())
         } else {
             // Count only genuinely closed tenants (unknown or a
@@ -2926,7 +3039,7 @@ impl MemoryAuth {
             if closed {
                 self.deny_closed_tenant(key, client_id, "closed tenant at authorize_publish");
             }
-            self.record_authz_verdict(false);
+            Self::record_verdict(sources, false);
             Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )))
@@ -3305,6 +3418,85 @@ mod tests {
             .authenticate("someone", Some("u"), Some(b"p"))
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_snapshot_fails_closed_without_panic() {
+        // A duplicated tenant table is invalid. The load fails closed:
+        // no panic, and every authentication and publish denies.
+        let conf = MqttUsersConf {
+            users: Vec::new(),
+            acls: Vec::new(),
+            tenants: vec![
+                broker_config::TenantMqttConf {
+                    tenant: "dup".to_string(),
+                    users: Vec::new(),
+                    acls: Vec::new(),
+                },
+                broker_config::TenantMqttConf {
+                    tenant: "dup".to_string(),
+                    users: Vec::new(),
+                    acls: Vec::new(),
+                },
+            ],
+        };
+        let auth = MemoryAuth::from_snapshot(&conf);
+        assert!(auth
+            .authenticate("any", Some("u"), Some(b"p"))
+            .await
+            .is_err());
+        assert!(auth.authorize_publish("any", &topic("a/b")).await.is_err());
+        assert!(auth
+            .authorize_subscribe("any", &filter("a/b"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_default_tenant_flag_follows_rules_and_verdicts_are_counted() {
+        // An empty default tenant allows without the tenant lock. The flag
+        // that drives this follows every rule change, and each verdict is
+        // counted on the shared source registry.
+        let auth = MemoryAuth::new();
+        let registry = Arc::new(AuthzSourceRegistry::new());
+        auth.set_authz_sources(Arc::clone(&registry));
+        auth.authorize_publish("client-a", &topic("own/data"))
+            .await
+            .expect("an empty default tenant allows");
+        auth.add_rule(AclRule::new(
+            "client-a",
+            AclAction::Publish,
+            "other/#",
+            true,
+        ))
+        .expect("memory-only persist cannot fail");
+        assert!(auth
+            .authorize_publish("client-a", &topic("own/data"))
+            .await
+            .is_err());
+        auth.authorize_publish("client-a", &topic("other/data"))
+            .await
+            .expect("the rule allows");
+        auth.clear_rules().expect("memory-only persist cannot fail");
+        auth.authorize_publish("client-a", &topic("own/data"))
+            .await
+            .expect("no rule allows again");
+        auth.add_rule(AclRule::new(
+            "client-a",
+            AclAction::Publish,
+            "other/#",
+            true,
+        ))
+        .expect("memory-only persist cannot fail");
+        auth.replace_rules(Vec::new())
+            .expect("memory-only persist cannot fail");
+        auth.authorize_publish("client-a", &topic("own/data"))
+            .await
+            .expect("replaced with no rule allows");
+        let counts = registry
+            .counter_snapshot("built_in_database")
+            .expect("built-in counters exist");
+        assert_eq!((counts.allow, counts.deny, counts.total), (4, 1, 5));
     }
 
     #[tokio::test]

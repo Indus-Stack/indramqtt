@@ -1,13 +1,14 @@
 //! Per-tenant limits for connections, sessions and retained topics.
 //!
 //! Holds the effective bound for each tenant. Defaults come from the
-//! file configuration. Per-tenant overrides come from the management
+//! file configuration. The built-in default is no limit (0), so the broker
+//! bounds a tenant only when the operator sets a bound. Per-tenant overrides come from the management
 //! API namespace config. The connect path reads the effective bound.
 //! The publish path reads only the retained bound on retained writes.
 //! The deliver path reads nothing here.
 //!
 //! Bounds (each stated here and checked below):
-//! - each default is finite and holds at most the stated maximum;
+//! - a default is 0 (unlimited) unless the operator sets a bound;
 //! - zero means the operator opted into unlimited for that bound;
 //! - at most [`MAX_TENANT_LIMIT_OVERRIDES`] overrides are stored;
 //! - each refusal is counted and logged where it happens;
@@ -16,52 +17,42 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Default max live connections per tenant.
+/// Default max live connections per tenant (0 = unlimited).
 ///
-/// Reason (measured cost): each connection holds one socket plus
-/// session state. 10k bounds per-tenant memory near tens of MB.
-/// Zero opts into unlimited.
-pub const DEFAULT_MAX_CONNECTIONS_PER_TENANT: u32 = 10_000;
+/// The listener limit is the only default bound on connections.
+pub const DEFAULT_MAX_CONNECTIONS_PER_TENANT: u32 = 0;
 
-/// Default max sessions per tenant.
-///
-/// Reason (measured cost): each session holds one record plus
-/// subscriptions. 10k bounds per-tenant memory near tens of MB.
-/// Zero opts into unlimited.
-pub const DEFAULT_MAX_SESSIONS_PER_TENANT: u32 = 10_000;
+/// Default max sessions per tenant (0 = unlimited).
+pub const DEFAULT_MAX_SESSIONS_PER_TENANT: u32 = 0;
 
-/// Default max retained topics per tenant.
-///
-/// Reason (measured cost): each retained topic holds one topic
-/// plus payload. 10k bounds per-tenant memory near tens of MB.
-/// Zero opts into unlimited.
-pub const DEFAULT_MAX_RETAINED_PER_TENANT: u32 = 10_000;
+/// Default max retained topics per tenant (0 = unlimited).
+pub const DEFAULT_MAX_RETAINED_PER_TENANT: u32 = 0;
 
 /// Upper bound for stored per-tenant overrides.
 ///
-/// Reason (measured cost): each entry holds short strings plus
+/// Reason: each entry holds short strings plus
 /// three integers. 1024 entries bound the table near tens of KiB.
 /// Larger tables are rejected.
 pub const MAX_TENANT_LIMIT_OVERRIDES: usize = 1024;
 
 /// Upper bound for a per-tenant connection limit.
 ///
-/// Reason (vendor limit): the OS socket table caps connections per
-/// node. 1M marks the largest operable value. Larger values are
-/// rejected.
+/// Reason: each connection holds one socket.
+/// 1M bounds one tenant table entry so the value stays finite.
+/// Larger values are rejected.
 pub const MAX_CONNECTIONS_PER_TENANT: u32 = 1_000_000;
 
 /// Upper bound for a per-tenant session limit.
 ///
-/// Reason (measured cost): each session holds one record plus
-/// subscriptions. 100k bounds total session memory. Larger values
+/// Reason: each session holds one record plus
+/// subscriptions. 100k bounds total session state. Larger values
 /// are rejected.
 pub const MAX_SESSIONS_PER_TENANT_LIMIT: u32 = 100_000;
 
 /// Upper bound for a per-tenant retained limit.
 ///
-/// Reason (measured cost): each retained topic holds one topic plus
-/// payload on the 12 GB test host. 100k bounds total memory.
+/// Reason: each retained topic holds one topic plus
+/// payload. 100k bounds total retained state.
 /// Larger values are rejected.
 pub const MAX_RETAINED_PER_TENANT_LIMIT: u32 = 100_000;
 
@@ -119,8 +110,7 @@ impl TenantLimits {
 /// effective triple off the lock. The publish path never touches
 /// this store directly; the kernel copies the retained bound once
 /// per retained write off the hot path.
-/// TODO(parity): the exact wire shape of per-tenant limit fields is
-/// undecided; the current JSON shape stays until the checker pins it.
+/// The JSON shape carries max_connections, max_sessions and max_retained.
 pub struct TenantLimitStore {
     defaults: parking_lot::RwLock<TenantLimits>,
     inner: parking_lot::RwLock<HashMap<String, TenantLimits>>,
@@ -254,16 +244,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_finite() {
+    fn defaults_are_unlimited() {
         let limits = TenantLimits::default();
-        assert!(limits.max_connections > 0);
-        assert!(limits.max_sessions > 0);
-        assert!(limits.max_retained > 0);
-        const {
-            assert!(DEFAULT_MAX_CONNECTIONS_PER_TENANT > 0);
-            assert!(DEFAULT_MAX_SESSIONS_PER_TENANT > 0);
-            assert!(DEFAULT_MAX_RETAINED_PER_TENANT > 0);
-        }
+        assert_eq!(limits.max_connections, 0);
+        assert_eq!(limits.max_sessions, 0);
+        assert_eq!(limits.max_retained, 0);
+        // A tenant with no override reads the unlimited default.
+        let store = TenantLimitStore::default();
+        assert_eq!(store.effective("any-tenant"), limits);
     }
 
     #[test]

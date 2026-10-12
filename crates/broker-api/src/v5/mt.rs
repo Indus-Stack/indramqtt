@@ -28,8 +28,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use broker_config::{ConfigRegistry, NamespaceEntry, NamespacesConf};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::ApiError;
@@ -81,6 +83,13 @@ pub struct ManagedNamespace {
 /// value.
 pub struct NamespaceStore {
     inner: std::sync::RwLock<HashMap<String, ManagedNamespace>>,
+    /// Kernel config registry that receives every change (`None` in unit
+    /// tests and standalone state, which stay memory-only). The registry
+    /// keeps the namespaces and their limits across a restart.
+    registry: std::sync::RwLock<Option<Arc<ConfigRegistry>>>,
+    /// Serialises a change together with its save, so two changes cannot
+    /// interleave into a lost update on disk.
+    save_lock: std::sync::Mutex<()>,
     /// Creation time of the store itself (unix seconds). Serves as the
     /// `created_at` of the default tenant, which has no entry.
     born_at: u64,
@@ -91,6 +100,8 @@ impl NamespaceStore {
     pub fn new() -> Self {
         Self {
             inner: std::sync::RwLock::new(HashMap::new()),
+            registry: std::sync::RwLock::new(None),
+            save_lock: std::sync::Mutex::new(()),
             born_at: unix_now_secs(),
         }
     }
@@ -122,34 +133,134 @@ impl NamespaceStore {
             .is_empty()
     }
 
+    /// Seed from the current snapshot of the registry and persist every
+    /// later change through it. Boot path.
+    pub fn from_registry(registry: &Arc<ConfigRegistry>) -> Self {
+        let store = Self::new();
+        store.seed_from_registry(registry);
+        store
+    }
+
+    /// Attach the registry and replace the current contents with its
+    /// snapshot, in place on the same instance. An entry whose stored
+    /// config no longer parses is kept with an empty config.
+    pub fn seed_from_registry(&self, registry: &Arc<ConfigRegistry>) {
+        let entries = registry.snapshot().namespaces.namespaces.clone();
+        let mut next = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            let config = serde_json::from_str::<serde_json::Value>(&entry.config_json)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            next.insert(
+                entry.name.clone(),
+                ManagedNamespace {
+                    name: entry.name,
+                    config,
+                    created_at: entry.created_at,
+                },
+            );
+        }
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = next;
+        *self
+            .registry
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(registry));
+    }
+
+    /// Applies one change under the save lock. The change runs on the
+    /// table, then the table is committed and saved. When the commit or
+    /// the save fails, the table and the registry return to the state
+    /// before the change and the error is returned.
+    fn change<T>(
+        &self,
+        apply: impl FnOnce(&mut HashMap<String, ManagedNamespace>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _guard = self
+            .save_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let before = inner.clone();
+        let out = apply(&mut inner)?;
+        if let Err(message) = self.persist(&inner) {
+            *inner = before;
+            return Err(message);
+        }
+        Ok(out)
+    }
+
+    /// Commits the table to the registry and saves it. On a failure the
+    /// previous root returns to the registry, so memory and disk agree.
+    /// A failed rollback is logged and reported, never silent.
+    fn persist(&self, table: &HashMap<String, ManagedNamespace>) -> Result<(), String> {
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let Some(registry) = registry else {
+            return Ok(());
+        };
+        let mut entries: Vec<NamespaceEntry> = table
+            .values()
+            .map(|namespace| NamespaceEntry {
+                name: namespace.name.clone(),
+                created_at: namespace.created_at,
+                config_json: namespace.config.to_string(),
+            })
+            .collect();
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let previous = registry.snapshot().namespaces.clone();
+        let saved = registry
+            .commit_namespaces(NamespacesConf {
+                namespaces: entries,
+            })
+            .and_then(|()| registry.save());
+        if let Err(error) = saved {
+            if let Err(rollback) = registry.commit_namespaces(previous) {
+                tracing::warn!("mt persist: rollback failed: {rollback}");
+                return Err(format!(
+                    "cannot save namespaces: {error}; rollback failed: {rollback}"
+                ));
+            }
+            return Err(format!("cannot save namespaces: {error}"));
+        }
+        Ok(())
+    }
+
     /// Insert one namespace with an empty config.
     pub fn create(&self, name: &str) -> Result<(), String> {
         validate_ns_id(name)?;
         if is_default_ns(name) {
             return Err(format!("namespace {name:?} is reserved"));
         }
-        let mut inner = self
-            .inner
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if inner.contains_key(name) {
-            return Err(format!("namespace {name:?} already exists"));
-        }
-        if inner.len() >= MAX_MANAGED_NAMESPACES {
-            return Err(format!(
-                "namespace table holds {} entries, at most {MAX_MANAGED_NAMESPACES}",
-                inner.len()
-            ));
-        }
-        inner.insert(
-            name.to_string(),
-            ManagedNamespace {
-                name: name.to_string(),
-                config: serde_json::json!({}),
-                created_at: unix_now_secs(),
-            },
-        );
-        Ok(())
+        self.change(|inner| {
+            if inner.contains_key(name) {
+                return Err(format!("namespace {name:?} already exists"));
+            }
+            if inner.len() >= MAX_MANAGED_NAMESPACES {
+                return Err(format!(
+                    "namespace table holds {} entries, at most {MAX_MANAGED_NAMESPACES}",
+                    inner.len()
+                ));
+            }
+            inner.insert(
+                name.to_string(),
+                ManagedNamespace {
+                    name: name.to_string(),
+                    config: serde_json::json!({}),
+                    created_at: unix_now_secs(),
+                },
+            );
+            Ok(())
+        })
     }
 
     /// Insert or replace one namespace config (bulk upsert path).
@@ -159,44 +270,40 @@ impl NamespaceStore {
             return Err(format!("namespace {name:?} is reserved"));
         }
         validate_ns_config(&config)?;
-        let mut inner = self
-            .inner
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if !inner.contains_key(name) && inner.len() >= MAX_MANAGED_NAMESPACES {
-            return Err(format!(
-                "namespace table holds {} entries, at most {MAX_MANAGED_NAMESPACES}",
-                inner.len()
-            ));
-        }
-        let created_at = inner
-            .get(name)
-            .map(|entry| entry.created_at)
-            .unwrap_or_else(unix_now_secs);
-        inner.insert(
-            name.to_string(),
-            ManagedNamespace {
-                name: name.to_string(),
-                config,
-                created_at,
-            },
-        );
-        Ok(())
+        self.change(|inner| {
+            if !inner.contains_key(name) && inner.len() >= MAX_MANAGED_NAMESPACES {
+                return Err(format!(
+                    "namespace table holds {} entries, at most {MAX_MANAGED_NAMESPACES}",
+                    inner.len()
+                ));
+            }
+            let created_at = inner
+                .get(name)
+                .map(|entry| entry.created_at)
+                .unwrap_or_else(unix_now_secs);
+            inner.insert(
+                name.to_string(),
+                ManagedNamespace {
+                    name: name.to_string(),
+                    config,
+                    created_at,
+                },
+            );
+            Ok(())
+        })
     }
 
     /// Replace the config of one existing namespace.
     pub fn put_config(&self, name: &str, config: serde_json::Value) -> Result<(), String> {
         validate_ns_id(name)?;
         validate_ns_config(&config)?;
-        let mut inner = self
-            .inner
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let Some(entry) = inner.get_mut(name) else {
-            return Err(format!("namespace {name:?} not found"));
-        };
-        entry.config = config;
-        Ok(())
+        self.change(|inner| {
+            let Some(entry) = inner.get_mut(name) else {
+                return Err(format!("namespace {name:?} not found"));
+            };
+            entry.config = config;
+            Ok(())
+        })
     }
 
     /// Read one namespace (the default tenant reads with empty config).
@@ -215,16 +322,14 @@ impl NamespaceStore {
             .cloned()
     }
 
-    /// Remove one namespace. The default tenant never leaves.
-    pub fn remove(&self, name: &str) -> bool {
+    /// Remove one namespace. The default tenant never leaves. Returns
+    /// whether an entry existed. A failed save leaves the entry in place
+    /// and returns the error.
+    pub fn remove(&self, name: &str) -> Result<bool, String> {
         if is_default_ns(name) {
-            return false;
+            return Ok(false);
         }
-        self.inner
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(name)
-            .is_some()
+        self.change(|inner| Ok(inner.remove(name).is_some()))
     }
 
     /// Sorted names of explicitly managed namespaces.
@@ -509,7 +614,8 @@ pub async fn create_ns(State(state): State<ApiState>, Path(ns): Path<String>) ->
 ///
 /// Answers 204 with no body, even for an unknown id (idempotent
 /// delete). Kicks each connected client of the tenant first, then drops
-/// the managed entry plus the tenant credential and rule rows, so a
+/// the managed entry plus the tenant credential and rule rows, the retained
+/// messages and the retained cap, so a
 /// deleted tenant denies (closed, counted, logged) instead of serving
 /// stale users. A registry save failure after the in-memory drop answers
 /// 500 with code `INTERNAL_ERROR` (the loss must never be silent). The
@@ -527,8 +633,44 @@ pub async fn delete_ns(State(state): State<ApiState>, Path(ns): Path<String>) ->
     if let Err(message) = remove_tenant_credentials(&state, &ns) {
         return ApiError::InternalError(message).into_response();
     }
-    state.namespaces.remove(&ns);
+    if let Err(message) = purge_tenant(&state, &ns).await {
+        return ApiError::InternalError(message).into_response();
+    }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Applies the stored retained cap of every managed namespace to the
+/// retained store. The kernel calls it once at boot after the registry
+/// seeded the namespaces, because the store keeps caps in memory only.
+pub fn apply_stored_retained_caps(
+    namespaces: &NamespaceStore,
+    retained: &dyn broker_storage::RetainedStore,
+) {
+    for name in namespaces.managed_sorted() {
+        let Some(entry) = namespaces.get(&name) else {
+            continue;
+        };
+        if let Ok(limits) = ns_limit_override(&entry.config) {
+            if let Some(cap) = limits.max_retained {
+                retained.set_retained_per_tenant_cap(&name, cap as usize);
+            }
+        }
+    }
+}
+
+/// Removes a deleted tenant from every store that holds data of it: the
+/// managed entry (and with it the stored limits), the retained messages
+/// and the retained cap. A later tenant with the same name starts empty.
+/// The entry goes last, so a failed step can be repeated with the same
+/// delete call.
+async fn purge_tenant(state: &ApiState, tenant: &str) -> Result<(), String> {
+    state
+        .retained
+        .clear_tenant(tenant)
+        .await
+        .map_err(|error| format!("cannot drop retained messages of tenant {tenant:?}: {error}"))?;
+    state.namespaces.remove(tenant)?;
+    Ok(())
 }
 
 /// Kick each connected client of one tenant.
@@ -841,13 +983,7 @@ pub async fn put_ns_config(
         }
         return ApiError::BadRequest(message).into_response();
     }
-    if let Ok(override_) = ns_limit_override(&config) {
-        if let Some(cap) = override_.max_retained {
-            state
-                .retained
-                .set_retained_per_tenant_cap(&ns, cap as usize);
-        }
-    }
+    apply_ns_retained_cap(&state, &ns, &config);
     (StatusCode::OK, Json(config)).into_response()
 }
 
@@ -879,6 +1015,17 @@ pub async fn ns_metrics(State(state): State<ApiState>, Path(ns): Path<String>) -
         return ns_not_found(&ns);
     }
     (StatusCode::OK, Json(serde_json::json!({ "metrics": {} }))).into_response()
+}
+
+/// Sets the live retained cap from one namespace config, when the
+/// config carries limits. Runs after every config write, so the next
+/// retained write enforces the stored bound without a restart.
+fn apply_ns_retained_cap(state: &ApiState, ns: &str, config: &serde_json::Value) {
+    if let Ok(override_) = ns_limit_override(config) {
+        if let Some(cap) = override_.max_retained {
+            state.retained.set_retained_per_tenant_cap(ns, cap as usize);
+        }
+    }
 }
 
 /// Body of `DELETE /mt/bulk_delete_ns`: `{"nss": [...]}`.
@@ -921,7 +1068,9 @@ pub async fn bulk_delete_ns(State(state): State<ApiState>, body: bytes::Bytes) -
         if let Err(message) = remove_tenant_credentials(&state, ns) {
             return ApiError::InternalError(message).into_response();
         }
-        state.namespaces.remove(ns);
+        if let Err(message) = purge_tenant(&state, ns).await {
+            return ApiError::InternalError(message).into_response();
+        }
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1011,9 +1160,13 @@ pub async fn bulk_import_configs(State(state): State<ApiState>, body: bytes::Byt
         .into_response();
     }
     for entry in entries {
-        if let Err(message) = state.namespaces.upsert_config(&entry.ns, entry.config) {
+        if let Err(message) = state
+            .namespaces
+            .upsert_config(&entry.ns, entry.config.clone())
+        {
             return ApiError::BadRequest(message).into_response();
         }
+        apply_ns_retained_cap(&state, &entry.ns, &entry.config);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1083,6 +1236,7 @@ pub async fn bulk_import_ns_configs(State(state): State<ApiState>, body: bytes::
         if let Err(message) = state.namespaces.upsert_config(ns, config.clone()) {
             return ApiError::BadRequest(message).into_response();
         }
+        apply_ns_retained_cap(&state, ns, config);
     }
     (StatusCode::OK, Json(configs)).into_response()
 }
@@ -1592,5 +1746,136 @@ mod mt_tests {
         assert!(store
             .put_config("tm02-never", serde_json::json!({}))
             .is_err());
+    }
+    fn temp_config_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "indra-mt-{tag}-{}-{}",
+            std::process::id(),
+            unix_now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("config dir");
+        dir
+    }
+
+    /// A namespace and its limits survive a restart of the store. The
+    /// second store reads the same directory through a new registry.
+    #[test]
+    fn namespaces_and_limits_survive_a_restart() {
+        let dir = temp_config_dir("restart");
+        {
+            let registry = Arc::new(ConfigRegistry::load(&dir).expect("registry loads"));
+            let store = NamespaceStore::from_registry(&registry);
+            store.create("t-keep").expect("create");
+            store.create("t-drop").expect("create");
+            store
+                .put_config(
+                    "t-keep",
+                    serde_json::json!({ "limits": { "max_connections": 7, "max_retained": 3 } }),
+                )
+                .expect("config stores");
+            store.remove("t-drop").expect("remove");
+        }
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("registry reloads"));
+        let store = NamespaceStore::from_registry(&registry);
+        assert_eq!(store.managed_sorted(), vec!["t-keep".to_string()]);
+        let entry = store.get("t-keep").expect("namespace is back");
+        let limits = ns_limit_override(&entry.config).expect("limits parse");
+        assert_eq!(limits.max_connections, Some(7));
+        assert_eq!(limits.max_retained, Some(3));
+        assert!(store.get("t-drop").is_none() || is_default_ns("t-drop"));
+        // The stored caps reach the retained store at boot.
+        let retained = broker_storage::MemoryStore::new();
+        apply_stored_retained_caps(&store, &retained);
+        assert_eq!(retained.retained_cap_for_tenant_sync("t-keep"), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed save returns an error and leaves the table as it was.
+    #[test]
+    fn failed_save_rolls_the_namespace_change_back() {
+        let dir = temp_config_dir("rollback");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("registry loads"));
+        let store = NamespaceStore::from_registry(&registry);
+        store.create("t-first").expect("create");
+        // The directory goes away, so the next save fails.
+        std::fs::remove_dir_all(&dir).expect("remove dir");
+        let refused = store.create("t-second");
+        assert!(refused.is_err(), "the save must fail");
+        assert_eq!(store.managed_sorted(), vec!["t-first".to_string()]);
+        assert_eq!(registry.snapshot().namespaces.namespaces.len(), 1);
+    }
+
+    /// Delete removes the retained messages and the retained cap of the
+    /// tenant. A new tenant with the same name starts empty.
+    #[tokio::test]
+    async fn delete_removes_retained_messages_and_cap() {
+        let (server, state) = TestServer::start().await;
+        let admin = admin_token(&state.inner);
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/mt/ns/t-purge",
+                Some(serde_json::json!({})),
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/mt/ns/t-purge/config",
+                Some(serde_json::json!({ "limits": { "max_retained": 5 } })),
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let topic = broker_protocol::Topic::new("purge/topic").expect("topic");
+        state
+            .inner
+            .retained
+            .set_retained_in_tenant(
+                topic.clone(),
+                broker_protocol::QoS::AtMostOnce,
+                bytes::Bytes::from_static(b"old"),
+                "t-purge",
+            )
+            .await
+            .expect("retained stores");
+        assert_eq!(state.inner.retained.retained_cap_for_tenant("t-purge"), 5);
+        let (status, _) = server
+            .send("DELETE", "/api/v5/mt/ns/t-purge", None, Some(&admin))
+            .await;
+        assert_eq!(status, 204);
+        assert!(state
+            .inner
+            .retained
+            .get_retained_in_tenant(&topic, "t-purge")
+            .await
+            .expect("read")
+            .is_none());
+        assert_eq!(
+            state.inner.retained.retained_cap_for_tenant("t-purge"),
+            broker_storage::DEFAULT_MAX_RETAINED_PER_TENANT
+        );
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/mt/ns/t-purge",
+                Some(serde_json::json!({})),
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 204);
+        assert_eq!(
+            state
+                .inner
+                .retained
+                .count_retained_in_tenant("t-purge")
+                .await
+                .expect("count"),
+            0,
+            "a tenant with the same name starts empty"
+        );
     }
 }

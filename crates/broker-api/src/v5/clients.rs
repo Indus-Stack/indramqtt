@@ -31,33 +31,63 @@ pub struct ClientFilters {
 }
 
 /// One optional tenant scope for a per-client read (`GET
-/// /clients/:clientid` and its subscription list). Absent or empty rides
-/// as the default tenant, so bare reads keep the current shape. A set
-/// value reads that tenant only; an unknown tenant misses, never another
-/// tenant's session.
-// TODO(parity): does a bare id with namesakes in two tenants miss or
-// need a tenant? The rulebook does not decide the bare-id policy; the
-// current choice keeps the default tenant so old callers work.
+/// /clients/:clientid` and its subscription list). Absent or empty
+/// reads the default tenant first, then the one other tenant that
+/// holds the id. A set value reads that tenant only; an unknown
+/// tenant misses, never another tenant's session. Two namesakes in
+/// two non-default tenants miss, so a bare read never picks another
+/// tenant's row; the caller then sets `?tenant=` to select one.
 #[derive(Deserialize, Default)]
 pub struct TenantScope {
     #[serde(default)]
     pub tenant: Option<String>,
 }
 
-/// Resolve one tenant scope to the tenant to read. `None` means the
-/// default tenant (bare reads keep the current shape).
-fn scoped_tenant(scope: &TenantScope) -> &str {
+/// Resolve one bare client id to its owning tenant plus session.
+/// Default tenant first, so old callers keep their shape. Else the
+/// one hit in another tenant. No hit or several hits miss, so a bare
+/// read never takes another tenant's row. Management-plane only.
+fn resolve_bare_client(
+    state: &ApiState,
+    client_id: &str,
+) -> Option<(String, std::sync::Arc<broker_session::Session>)> {
+    if let Some(session) = state.sessions.get(client_id) {
+        return Some((
+            broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
+            session,
+        ));
+    }
+    let mut hits = state.sessions.sessions_for_client(client_id);
+    hits.retain(|(tenant, _)| tenant.as_str() != broker_session::tenant::DEFAULT_TENANT_ID);
+    if hits.len() == 1 {
+        hits.pop()
+    } else {
+        None
+    }
+}
+
+/// Resolve one scoped per-client read to its owning tenant plus
+/// session. A set scope reads that tenant only. A bare scope uses
+/// the bare-id rule above. Management-plane only.
+fn resolve_scoped_client(
+    state: &ApiState,
+    client_id: &str,
+    scope: &TenantScope,
+) -> Option<(String, std::sync::Arc<broker_session::Session>)> {
     match scope.tenant.as_deref() {
-        None => broker_session::tenant::DEFAULT_TENANT_ID,
-        Some("") => broker_session::tenant::DEFAULT_TENANT_ID,
-        Some(raw) => raw,
+        None | Some("") => resolve_bare_client(state, client_id),
+        Some(tenant) => state
+            .sessions
+            .get_in_tenant(tenant, client_id)
+            .map(|session| (tenant.to_string(), session)),
     }
 }
 
 /// Fallback keepalive when the session record is gone.
-/// Reason: 60 seconds is the common MQTT default.
+/// Reason: 0 disables the timer on the wire, so a raced read
+/// reports no demand instead of a made-up interval.
 /// The read uses it only during a snapshot race.
-const MISSING_SESSION_KEEPALIVE_SECS: u16 = 60;
+const MISSING_SESSION_KEEPALIVE_SECS: u16 = 0;
 
 /// Resolve one list filter to the tenant to keep, if any. `None` means
 /// no filter (the global list the reference API documents). An empty
@@ -106,13 +136,10 @@ fn client_detail_json(
     let mut map = serde_json::Map::with_capacity(20);
     map.insert("clientid".to_string(), serde_json::Value::from(client_id));
     map.insert("mountpoint".to_string(), serde_json::Value::from(tenant));
-    match session.and_then(|s| s.username.read().clone()) {
-        Some(name) => {
-            map.insert("username".to_string(), serde_json::Value::from(name));
-        }
-        None => {
-            map.insert("username".to_string(), serde_json::Value::Null);
-        }
+    // The API types `username` as a string. Omit the field for
+    // an anonymous session, never send null.
+    if let Some(name) = session.and_then(|s| s.username.read().clone()) {
+        map.insert("username".to_string(), serde_json::Value::from(name));
     }
     map.insert(
         "connected".to_string(),
@@ -299,33 +326,26 @@ pub async fn get_client(
     Path(client_id): Path<String>,
     Query(scope): Query<TenantScope>,
 ) -> Response {
-    // Tenant-scoped detail read. A bare id reads the default tenant
-    // (the current shape); `?tenant=` reads that tenant only. A miss in
-    // the scoped tenant answers not-found, never another tenant's row.
-    let tenant = scoped_tenant(&scope);
-    let session = state.sessions.get_in_tenant(tenant, &client_id);
-    let is_connected = session
-        .as_ref()
-        .map(|s| *s.connected.read())
-        .unwrap_or(false);
+    // Tenant-scoped detail read. A set scope reads that tenant only.
+    // A bare id reads the default tenant first, then the one other
+    // tenant that holds the id. A miss answers not-found, never
+    // another tenant's row.
+    let (tenant, session) = match resolve_scoped_client(&state, &client_id, &scope) {
+        Some(hit) => hit,
+        None => {
+            return ApiError::ClientIdNotFound("Client not found".to_string()).into_response();
+        }
+    };
+    let is_connected = *session.connected.read();
 
-    if session.is_none() && !is_connected {
-        return ApiError::ClientIdNotFound("Client not found".to_string()).into_response();
-    }
-
-    // Use the fallback only during a snapshot race.
-    // Reason lives at `MISSING_SESSION_KEEPALIVE_SECS`.
-    let keepalive = session
-        .as_ref()
-        .map(|s| *s.keepalive_secs.read())
-        .unwrap_or(MISSING_SESSION_KEEPALIVE_SECS);
+    let keepalive = *session.keepalive_secs.read();
 
     (
         StatusCode::OK,
         Json(client_detail_json(
             &client_id,
-            tenant,
-            session.as_ref(),
+            tenant.as_str(),
+            Some(&session),
             is_connected,
             keepalive,
         )),
@@ -348,8 +368,11 @@ pub async fn get_client(
 /// into its registration tenant. The detach itself never fires, so the
 /// edge's later death notice finds an empty slot and cannot double-fire.
 fn kick_one(state: &ApiState, client_id: &str) -> (bool, Option<broker_session::StoredWill>) {
-    let session = match state.sessions.get(client_id) {
-        Some(session) => session,
+    // Bare-id rule: default tenant first, then the one other tenant
+    // that holds the id. The detach runs in the owning tenant, so one
+    // tenant's kick never drops another tenant's namesake session.
+    let (tenant, session) = match resolve_bare_client(state, client_id) {
+        Some(hit) => hit,
         None => return (false, None),
     };
     let conn_id = *session.conn_id.read();
@@ -385,7 +408,9 @@ fn kick_one(state: &ApiState, client_id: &str) -> (bool, Option<broker_session::
         ),
     }
     state.conns.unregister(conn_id);
-    state.sessions.unbind_connection(client_id, conn_id);
+    state
+        .sessions
+        .unbind_connection_in_tenant(&tenant, client_id, conn_id);
     (true, will)
 }
 
@@ -478,14 +503,13 @@ pub async fn get_client_subscriptions(
     Path(client_id): Path<String>,
     Query(scope): Query<TenantScope>,
 ) -> Response {
-    // Tenant-scoped per-client list. A bare id reads the default
-    // tenant (the current shape); `?tenant=` reads that tenant only. A
-    // miss in the scoped tenant answers not-found, never another
-    // tenant's rows. Rows keep the documented shape (the reference API
-    // has no tenant field here), so the tenant selects the rows only.
-    let tenant = scoped_tenant(&scope);
-    let session = match state.sessions.get_in_tenant(tenant, &client_id) {
-        Some(session) => session,
+    // Tenant-scoped per-client list. A set scope reads that tenant
+    // only. A bare id reads the default tenant first, then the one
+    // other tenant that holds the id. A miss answers not-found, never
+    // another tenant's rows. Rows keep the documented shape (no
+    // tenant field here), so the tenant selects the rows only.
+    let (_tenant, session) = match resolve_scoped_client(&state, &client_id, &scope) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
@@ -531,13 +555,16 @@ pub async fn get_client_subscriptions(
 }
 
 /// One management subscribe against the real router and session index.
+/// The router copy and the session mirror both land in the owning
+/// tenant, so one tenant's subscribe never registers another tenant's
+/// row.
 fn apply_single_subscribe(
     state: &ApiState,
     client_id: &str,
     entry: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    let session = match state.sessions.get(client_id) {
-        Some(session) => session,
+    let (tenant, session) = match resolve_bare_client(state, client_id) {
+        Some(hit) => hit,
         None => {
             return Err(ApiError::ClientIdNotFound("client not found".to_string()));
         }
@@ -549,17 +576,24 @@ fn apply_single_subscribe(
     // B4-08 bound: a new entry past the subscription-table cap is denied
     // fail closed with the documented quota error, registering nothing
     // and changing no session state (no session mirror on failure).
-    let stored = state
-        .router
-        .subscribe(&filter, Subscription::new(client_id, conn_id, qos));
+    let stored = state.router.subscribe(
+        &filter,
+        Subscription::new_in_tenant(client_id, conn_id, qos, &tenant),
+    );
     if !stored {
         return Err(ApiError::TooManyRequests(
             "subscription table full".to_string(),
         ));
     }
-    state
-        .sessions
-        .add_subscription_with_options(client_id, filter.clone(), qos, nl, rap, rh);
+    state.sessions.add_subscription_with_options_in_tenant(
+        &tenant,
+        client_id,
+        filter.clone(),
+        qos,
+        nl,
+        rap,
+        rh,
+    );
 
     Ok(serde_json::json!({
         "clientid": client_id,
@@ -678,7 +712,7 @@ pub async fn bulk_subscribe(
     // Unknown clients fail with not-found. Each entry installs one
     // subscription. Bad entries are skipped. The answer holds only
     // subscription objects.
-    if state.sessions.get(&client_id).is_none() {
+    if resolve_bare_client(&state, &client_id).is_none() {
         return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
     }
     let mut results = Vec::with_capacity(entries.len());
@@ -691,6 +725,8 @@ pub async fn bulk_subscribe(
 }
 
 /// One management unsubscribe against the real router and session index.
+/// The router copy and the session mirror both clear in the owning
+/// tenant, so one tenant's teardown never clears another tenant's row.
 ///
 /// Shared by the single and bulk routes; bulk reuses this per entry so
 /// both paths remove the same state. It touches the session map and the
@@ -704,12 +740,19 @@ fn apply_single_unsubscribe(
     client_id: &str,
     entry: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    if state.sessions.get(client_id).is_none() {
-        return Err(ApiError::ClientIdNotFound("client not found".to_string()));
-    }
+    let (tenant, _session) = match resolve_bare_client(state, client_id) {
+        Some(hit) => hit,
+        None => {
+            return Err(ApiError::ClientIdNotFound("client not found".to_string()));
+        }
+    };
     let filter = parse_unsubscribe_entry(entry)?;
-    state.sessions.remove_subscription(client_id, &filter);
-    state.router.unsubscribe(&filter, client_id);
+    state
+        .sessions
+        .remove_subscription_in_tenant(&tenant, client_id, &filter);
+    state
+        .router
+        .unsubscribe_in_tenant(&filter, client_id, &tenant);
     Ok(serde_json::json!({
         "topic": filter.as_str(),
     }))
@@ -768,7 +811,7 @@ pub async fn bulk_unsubscribe(
     };
     // Unknown clients fail with not-found. Each entry removes one
     // filter. One bad entry fails the batch. Absent filters still succeed.
-    if state.sessions.get(&client_id).is_none() {
+    if resolve_bare_client(&state, &client_id).is_none() {
         return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
     }
     for entry in &entries {
@@ -875,8 +918,10 @@ pub async fn get_client_inflight(
     Query(query): Query<ClientMessagesQuery>,
 ) -> Response {
     // Unknown clients read as not-found with the documented error shape.
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // A bare id reads the owning session in any tenant (default first,
+    // then the one other tenant that holds the id).
+    let (_tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
@@ -1005,8 +1050,10 @@ pub async fn get_client_mqueue(
     Query(query): Query<ClientMessagesQuery>,
 ) -> Response {
     // Unknown clients read as not-found with the documented error shape.
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // A bare id reads the owning session in any tenant (default first,
+    // then the one other tenant that holds the id).
+    let (_tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
@@ -1084,8 +1131,10 @@ pub async fn get_client_authz_cache(
     Path(client_id): Path<String>,
     Query(_ignored): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // A bare id reads the owning session in any tenant (default
+    // first, then the one other tenant that holds the id).
+    let (_tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
@@ -1111,8 +1160,10 @@ pub async fn clear_client_authz_cache(
     State(state): State<ApiState>,
     Path(client_id): Path<String>,
 ) -> Response {
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // A bare id clears the owning session in any tenant (default
+    // first, then the one other tenant that holds the id).
+    let (_tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
@@ -1127,8 +1178,10 @@ pub async fn put_client_keepalive(
     Path(client_id): Path<String>,
     body: Bytes,
 ) -> Response {
-    let session = match state.sessions.get(&client_id) {
-        Some(session) => session,
+    // A bare id writes the owning session in any tenant (default
+    // first, then the one other tenant that holds the id).
+    let (tenant, session) = match resolve_bare_client(&state, &client_id) {
+        Some(hit) => hit,
         None => {
             return ApiError::ClientIdNotFound("client not found".to_string()).into_response();
         }
@@ -1165,7 +1218,7 @@ pub async fn put_client_keepalive(
         StatusCode::OK,
         Json(client_detail_json(
             &client_id,
-            broker_session::tenant::DEFAULT_TENANT_ID,
+            tenant.as_str(),
             Some(&session),
             is_connected,
             interval,
@@ -2896,6 +2949,42 @@ mod tests {
             )
             .await;
         assert_eq!(status, 404);
+    }
+
+    /// A bare id finds the one tenant that holds it. Two namesakes
+    /// in two tenants still miss, so a bare read never picks another
+    /// tenant's row.
+    #[tokio::test]
+    async fn tm09_bare_id_finds_single_non_default_session() {
+        let (server, state) = Tm09Server::start().await;
+        let admin = tm09_admin(&state);
+        tm09_seed(&state, "tm09-a", "tm09-lone", 7261, "tm09/lone");
+
+        let (status, body) = server
+            .request("GET", "/api/v5/clients/tm09-lone", Some(&admin))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], serde_json::json!("tm09-lone"));
+        assert_eq!(body["mountpoint"], serde_json::json!("tm09-a"));
+
+        let (status, body) = server
+            .request(
+                "GET",
+                "/api/v5/clients/tm09-lone/subscriptions",
+                Some(&admin),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let rows = body.as_array().expect("subscription list is an array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["topic"], serde_json::json!("tm09/lone"));
+
+        tm09_seed(&state, "tm09-b", "tm09-lone", 7262, "tm09/lone-b");
+        let (status, body) = server
+            .request("GET", "/api/v5/clients/tm09-lone", Some(&admin))
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], serde_json::json!("CLIENTID_NOT_FOUND"));
     }
 
     /// The global subscription list keeps its shape without a filter
