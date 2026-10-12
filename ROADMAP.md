@@ -19,9 +19,9 @@ This is a plan. The order can change.
 
 | Period | Work |
 | :--- | :--- |
-| October to November 2026 | MQTT listener of the kernel for TCP and TLS (done, off by default). WebSocket, secure WebSocket, PSK, client certificates and UNSUBSCRIBE on the kernel listener. MQTT over QUIC. A wider broker comparison with more brokers. |
-| December 2026 to January 2027 | The end-to-end test suite on the kernel listener. The kernel listener becomes the default and the Erlang edge is deprecated. Tenant management. Connections stay open during a planned restart. |
-| February to April 2027 | Connections stay open after a crash, and TLS with kTLS. Removal of the Erlang edge. Removal of the last licence functions. Connector qualification against real servers. Cluster and soak tests. Security review. Documentation. Stable release 1.0. |
+| October to November 2026 | MQTT listeners of the kernel for TCP, TLS, WebSocket, secure WebSocket, PSK, client certificates and UNSUBSCRIBE (done). MQTT over QUIC. A wider broker comparison with more brokers. |
+| December 2026 to January 2027 | The end-to-end test suite runs on the kernel listener (done). The kernel serves all listeners and the image runs one process (done). Tenant management. Connections stay open during a planned restart. |
+| February to April 2027 | Connections stay open after a crash, and TLS with kTLS. Removal of the remaining edge files. Removal of the last licence functions. Connector qualification against real servers. Cluster and soak tests. Security review. Documentation. Stable release 1.0. |
 
 The steps of the move to one Rust process are in the section "One Rust Process" below.
 
@@ -91,17 +91,17 @@ gantt
 
 ---
 
-## One Rust Process (in work)
+## One Rust Process (listeners done, restart in work)
 
-The broker moves from an Erlang edge plus a Rust kernel to one Rust process. The reason and the measured loads are in the README.
+The broker moved from an Erlang edge plus a Rust kernel to one Rust process. The kernel serves all MQTT listeners. The image runs one process. The reason and the measured loads are in the README.
 
-1. MQTT listener of the kernel for TCP and TLS (done, off by default).
-2. WebSocket, secure WebSocket, PSK, client certificates and UNSUBSCRIBE on the kernel listener.
+1. MQTT listeners of the kernel for TCP and TLS (done).
+2. WebSocket, secure WebSocket, PSK, client certificates and UNSUBSCRIBE on the kernel listener (done).
 3. MQTT over QUIC on the kernel listener.
-4. The end-to-end test suite on the kernel listener.
-5. The kernel listener becomes the default. The Erlang edge is deprecated.
+4. The end-to-end test suite on the kernel listener (done).
+5. The kernel serves all listeners. The edge is deprecated (done).
 6. Connections stay open during a restart: planned restart for TCP and WebSocket, then the crash case, then TLS with kTLS.
-7. The Erlang edge is removed.
+7. Removal of the remaining edge files.
 
 ---
 

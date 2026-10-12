@@ -36,31 +36,19 @@ The method, the tool, the broker settings, the MQTT 3.1.1 results and the raw da
 > - The test does not use TLS. The load generator runs on the same server as the broker.
 > - IndraMQTT is behind rumqttd in the fan-in scenario and in the memory with no clients.
 > - With MQTT 3.1.1, IndraMQTT uses more memory for each connection than EMQX (21 KiB and 18 KiB).
-> - The IndraMQTT numbers use the MQTT listener of the kernel (`listeners.tcp.native = true`). This listener is off by default at this time. The default path holds approximately 5,000 msg/s in the point-to-point scenario. See [Direction: One Rust Process](#direction-one-rust-process).
+> - The IndraMQTT numbers use the MQTT listener of the kernel. This listener is the default path.
 
 ---
 
-## Direction: One Rust Process
+## One Rust Process
 
-IndraMQTT started with two processes. An Erlang/OTP edge held the client sockets. A Rust kernel did the routing, the sessions and the rules. We measured the two paths on the same server with 1 CPU and 1 GB.
+IndraMQTT used two processes. An Erlang edge held the client sockets. A Rust kernel did the routing, the sessions and the rules. The kernel now serves all MQTT listeners directly. The container image runs one process.
 
-| Path for MQTT clients | Point-to-point QoS 0, highest sustained load | Status |
-| :--- | :--- | :--- |
-| Erlang edge, then the kernel through an IPC link (the default today) | approximately 5,000 msg/s | It works with all listeners. It will be deprecated. |
-| MQTT listener of the kernel, Rust only (`listeners.tcp.native = true`) | 100,000 msg/s | It is new. It is the path of the comparison table. |
-
-Because of these results, IndraMQTT moves to one Rust process. These are the steps:
-
-1. The kernel listener gets the functions that only the edge has today: WebSocket, secure WebSocket, PSK and client certificates.
-2. The full end-to-end test suite moves to the kernel listener.
-3. The kernel listener becomes the default.
-4. The Erlang edge is deprecated. A later release removes it.
-
-Until step 3, a broker with the default settings uses the Erlang edge and has the lower load. Set `listeners.tcp.native = true` to get the load of the comparison table. The value for the Erlang edge is from a run of 2026-10-04 with a smaller load generator.
+Do not set `listeners.*.native` in new files. The four `native` settings are deprecated and ignored. Files that set them still load with a warning. A later release removes them.
 
 ### Connections during a restart
 
-With the Erlang edge, a client stays connected when the kernel restarts. This is a property of the Erlang path only. The kernel listener does not have this property at this time. When the kernel restarts, the clients of the kernel listener connect again.
+When the kernel stops, it closes the client sockets. Clients connect again. Durable sessions resume when the offline store keeps them. Clean sessions subscribe again when the new session has no state.
 
 The plan for the Rust process keeps this property. The plan adds no work to the message path.
 
@@ -102,9 +90,6 @@ The code still contains licence functions from the earlier model. Examples are t
 ## Limits at This Time
 
 - IndraMQTT is not stable. The behaviour and the settings can change before release 1.0.
-- UNSUBSCRIBE is not available. The broker closes a connection that sends it.
-- The kernel listener has no WebSocket, no PSK and no client certificates. The Erlang edge has them.
-- The end-to-end test suite uses the Erlang edge. The kernel listener has the boot test and unit tests only.
 - Most connectors have tests with a test transport only. [`crates/broker-connectors/CAPABILITY.md`](crates/broker-connectors/CAPABILITY.md) shows what each connector was tested with.
 - A default build does not contain all connectors. Build with `--features full` to get all of them. The container image contains all of them.
 - Single sign-on is not stable and is not available. You can store a backend, but the login endpoints answer the error that the reference API documents (404 or 400). Log in with a user name and a password, with MFA when the user has it, or use an API key.
@@ -120,7 +105,7 @@ The code still contains licence functions from the earlier model. Examples are t
 - QoS 0, QoS 1 and QoS 2.
 - Retained messages, the last will, shared subscriptions (`$share`) and delayed messages (`$delayed`).
 - MQTT 5 subscription options, subscription identifiers, topic aliases, user properties and reason codes.
-- WebSocket and secure WebSocket on the Erlang edge.
+- WebSocket and secure WebSocket on the kernel listener.
 - Sessions that stay after a disconnect, with an offline queue.
 
 ### Routing
@@ -183,29 +168,18 @@ The source is [`crates/broker-node/benches/broker_throughput.rs`](crates/broker-
 
 ## Architecture at This Time
 
-The diagram shows the default path of today, with the Erlang edge. With `listeners.tcp.native = true`, the clients connect to the Rust kernel directly and the edge is not in the path.
+The diagram shows the broker. Clients connect to the kernel directly.
 
 ```
-                     MQTT CLIENTS
-                          │
-              TCP / TLS / WebSocket
-                          │
-              ┌──────────────────────┐
-              │     ERLANG EDGE      │
-              │  (to be deprecated)  │
-              │                      │
-              │ sockets              │
-              │ MQTT packet codec    │
-              │ keepalive timers     │
-              └──────────┬───────────┘
-                         │
-                 BrokerLink (IPC)
-                         │
-      ┌──────────────────▼───────────────────┐
-      │             RUST KERNEL              │
-      │                                      │
-      │ MQTT listener (TCP, TLS)             │
-      │ Sessions                             │
+                      MQTT CLIENTS
+                           │
+               TCP / TLS / WebSocket
+                           │
+       ┌──────────────────▼───────────────────┐
+       │             RUST KERNEL              │
+       │                                      │
+       │ MQTT listeners (TCP, TLS, WS, WSS)   │
+       │ Sessions                             │
       │ Router (radix trie)                  │
       │ Authentication and access rules      │
       │ Quotas and rate limits               │
@@ -231,10 +205,9 @@ The diagram shows the default path of today, with the Erlang edge. With `listene
 
 ```
 indramqtt/
-├── beam/                 # Erlang edge (to be deprecated)
 ├── benchmark/            # Broker comparison: method, tool, raw results
 ├── crates/
-│   ├── brokerlink/       # Frames between the edge and the kernel
+│   ├── brokerlink/       # Frame codec for tests
 │   ├── broker-protocol/  # MQTT types and the wire codec
 │   ├── broker-router/    # Topic router
 │   ├── broker-session/   # Sessions and QoS state
@@ -271,7 +244,7 @@ Open the dashboard at `http://localhost:18083/dashboard`. MQTT clients connect t
 
 ### Build from source
 
-You need Rust 1.80 or later. For the Erlang edge you also need Erlang/OTP 26 or later.
+You need Rust 1.80 or later.
 
 ```bash
 # Build the kernel and the operator command.
@@ -280,18 +253,8 @@ cargo build --release -p broker-node --features full
 # Run the tests.
 cargo test --workspace
 
-# Compile the Erlang edge.
-cd beam && mkdir -p ebin && erlc -o ebin src/*.erl && cp src/indra_edge.app.src ebin/indra_edge.app && cd ..
-
 # Start the kernel.
 cargo run --release -p broker-node --bin indramqtt
-```
-
-To use the kernel listener without the Erlang edge, put this in `indra.toml`:
-
-```toml
-[listeners.tcp]
-native = true
 ```
 
 ---

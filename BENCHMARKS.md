@@ -66,9 +66,8 @@ The following baselines are externally published end-to-end network performance 
 To complement our function-level microbenchmarks with rigorous, defensible end-to-end network figures, we are building an automated end-to-end benchmark harness using `mqtt-benchmark` and load generation tools:
 
 * **Target Workload**:
-  - Full TCP socket listener (`:1883`) backed by BEAM network edge.
-  - Multi-lane BrokerLink binary IPC transport to Rust core.
-  - Real MQTT v3.1.1 packet parsing (v5 is not supported yet), QoS 0 and QoS 1 framing, and network socket fan-out.
+  - Full TCP socket listener (`:1883`) of the kernel.
+  - Real MQTT packet parsing (3.1, 3.1.1 and 5), QoS 0 and QoS 1 framing, and network socket fan-out.
 * **No throughput target is claimed**: the suite reports what it measures. Measured end-to-end rates, with delivery percentages, latencies, hardware class (`environment` block: CPU model, core count, memory, OS) and load shapes, live in `benchmark_suite/benchmark_results_v5.json`. No single-core loopback target is stated because no such local measurement is committed in-tree.
 
 ---

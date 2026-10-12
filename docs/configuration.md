@@ -104,9 +104,9 @@ A listener bind must be an IP address and a port. The broker applies
 bind. Each kernel WebSocket listener uses the limit of the plaintext
 listener.
 
-## Which process owns an MQTT listener
+## MQTT listeners
 
-The kernel accepts the MQTT clients of every enabled listener. The
+The kernel accepts the clients of every enabled listener. The
 four `native` settings (`listeners.tcp.native`,
 `listeners.tls.native`, `listeners.ws.native`,
 `listeners.wss.native`) are deprecated and ignored: files and

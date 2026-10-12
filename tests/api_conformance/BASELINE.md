@@ -1,5 +1,7 @@
 # API conformance baseline — 2026-09-19 (T-14)
 
+Note on the stack: the recorded run used the old two-process stack (kernel plus edge). The next baseline run uses the kernel listener only.
+
 First live run of `tests/api_conformance` against a real kernel. This is the
 number to improve against. No broker code was changed for this baseline.
 

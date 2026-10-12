@@ -69,7 +69,7 @@ All scenarios use a payload of 256 bytes.
 
 | Broker | Image | Settings |
 |---|---|---|
-| IndraMQTT | built from this repository with the `Dockerfile` | Default settings. The kernel owns the MQTT listener (`listeners.tcp.native = true`). |
+| IndraMQTT | built from this repository with the `Dockerfile` | Default settings. |
 | EMQX Enterprise 6.3.0 | `emqx/emqx-enterprise:6.3.0` (`sha256:3b6d9c0c419930074b7e0e6cba07baceea584b2094d22f16ff02f6c075c3d5b8`) | Default settings and the default licence of the image. |
 | rumqttd 0.19.0 | `bytebeamio/rumqttd:latest` (`sha256:1680d711368202be466128ee771c5f5cf84224166fe2b62f7a16728b747ac1ba`) | The output of `rumqttd generate-config` with two changes: `max_connections = 40000` and `max_segment_size = 1048576`. MQTT 5 uses its listener on port 1884. |
 
@@ -86,12 +86,11 @@ Notes about the settings:
   in `mqtt311-three-brokers.jsonl` is an earlier build. The build in
   `mqtt311-ours-newer-build.jsonl` and `mqtt5-three-brokers.jsonl`
   contains the correction of the subscription statistics. In these
-  builds an environment variable selected the kernel listener. The
-  setting `listeners.tcp.native` replaced it after the runs. The data
-  path is the same.
-- In these runs the IndraMQTT container also runs the edge process,
-  which has no clients. Its memory (about 48 MiB) is in the IndraMQTT
-  numbers.
+  builds an environment variable selected the kernel listener. Later
+  builds use the kernel listener by default. The data path is the same.
+- In these runs the IndraMQTT container also ran an edge process,
+  which had no clients. Its memory (about 48 MiB) is in the IndraMQTT
+  numbers. Newer images run one process.
 
 ## 5. Results for MQTT 3.1.1
 
@@ -171,7 +170,7 @@ export BENCH_SUB_CPUS=10,11,12,14,15,16,19,20,21,25,26
 export BENCH_MQTT_VERSION=4        # 5 for MQTT 5
 
 python3 benchmark/sustained_load.py /tmp/bench-out \
-  'indramqtt=indramqtt:test|-e|INDRA_LISTENERS__TCP__NATIVE=true' \
+  'indramqtt=indramqtt:test' \
   'emqx=emqx/emqx-enterprise:6.3.0' \
   'rumqttd=bytebeamio/rumqttd:latest|-v|/tmp/rumqttd.toml:/rumqttd.toml:ro|--|-c|/rumqttd.toml'
 ```
