@@ -28,6 +28,7 @@ pub mod config_runtime;
 pub mod dashboard;
 pub mod errors;
 pub mod licence;
+pub mod mcp;
 pub mod mfa_totp;
 pub mod node_scope;
 pub mod pagination;
@@ -348,6 +349,12 @@ pub struct ApiState {
     /// one registry with no second copy. Management-plane only; publish
     /// and deliver never touch this store.
     pub namespaces: Arc<crate::v5::mt::NamespaceStore>,
+    /// Built-in MCP endpoint settings (MC-01): two atomic flags from
+    /// the `[mcp]` boot configuration. The kernel shares its instance
+    /// (`crates/broker-node/src/main.rs`, boot plus the `serve_api`
+    /// share) so the handler reads the file values. Management-plane
+    /// only; publish and deliver never touch this store.
+    pub mcp: Arc<crate::mcp::McpStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -615,6 +622,7 @@ impl ApiState {
                 crate::v5::schema_registry::SchemaRegistryStore::from_registry(&config),
             ),
             namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
+            mcp: Arc::new(crate::mcp::McpStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -722,6 +730,7 @@ impl ApiState {
             transformations: Arc::new(crate::v5::transformations::TransformChainStore::new()),
             schema_registry: Arc::new(crate::v5::schema_registry::SchemaRegistryStore::new()),
             namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
+            mcp: Arc::new(crate::mcp::McpStore::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -816,6 +825,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/version", get(get_dashboard_version))
         .route("/ws/mqtt", get(ws::ws_mqtt_handler))
         .route("/healthz", get(|| async { "OK" }))
+        // Built-in MCP endpoint (MC-01). The handler runs its own API
+        // key check and refuses dashboard tokens, so it stays public
+        // here and never passes the management auth layer.
+        .route("/mcp", post(crate::mcp::post_mcp))
         // Public alias of `GET /api/v5/status` for load balancers. It needs no token.
         .route("/status", get(v5::status::get_status))
         .nest("/api/v5", v5::public_router())

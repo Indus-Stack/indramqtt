@@ -172,6 +172,13 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 |---|---|---|---|---|
 | `observability.monitor_sample_secs` | integer | `10` | 0..=3600 | Monitor sampling interval in seconds. |
 
+## mcp
+
+| Setting | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `mcp.enabled` | boolean | `true` | boolean | Whether the built-in MCP endpoint on the management listener serves requests. |
+| `mcp.read_only` | boolean | `false` | boolean | Whether the MCP endpoint refuses mutating tool calls. |
+
 ## jwks
 
 | Setting | Type | Default | Range | Description |

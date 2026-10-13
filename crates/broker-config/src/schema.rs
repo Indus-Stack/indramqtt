@@ -525,6 +525,20 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 doc: "Days before expiry that the approaching-expiry alarm and log warning start.",
             },
             FieldDoc {
+                path: "mcp.enabled",
+                setting_type: "bool",
+                default: "true",
+                range: "true | false",
+                doc: "Whether the built-in MCP endpoint on the management listener serves requests.",
+            },
+            FieldDoc {
+                path: "mcp.read_only",
+                setting_type: "bool",
+                default: "false",
+                range: "true | false",
+                doc: "Whether the MCP endpoint refuses mutating tool calls.",
+            },
+            FieldDoc {
                 path: "gateway.coap_bind",
                 setting_type: "socket address string",
                 default: "\"\"",
@@ -2391,6 +2405,9 @@ pub struct BrokerConfig {
     /// Observability sampling.
     #[serde(default)]
     pub observability: ObservabilityConf,
+    /// Built-in MCP endpoint settings.
+    #[serde(default)]
+    pub mcp: McpConf,
     /// Metrics exporter file settings (AP-09). Only scalar settings
     /// have a file home; push headers and the namespaced limiter stay
     /// managed through the management API.
@@ -2709,6 +2726,43 @@ impl Default for ObservabilityConf {
     }
 }
 
+/// Built-in MCP endpoint settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConf {
+    /// Whether the built-in MCP endpoint on the management listener serves requests.
+    #[serde(default = "default_mcp_enabled")]
+    pub enabled: bool,
+    /// Whether the MCP endpoint refuses mutating tool calls.
+    #[serde(default = "default_mcp_read_only")]
+    pub read_only: bool,
+}
+
+// Reason: on keeps operator automation working without extra setup.
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+// Reason: off keeps the first tool usable; operators opt into read-only mode.
+fn default_mcp_read_only() -> bool {
+    false
+}
+
+impl Default for McpConf {
+    fn default() -> Self {
+        Self {
+            enabled: default_mcp_enabled(),
+            read_only: default_mcp_read_only(),
+        }
+    }
+}
+
+impl McpConf {
+    /// Validates the MCP settings. Both flags accept only booleans.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        Ok(())
+    }
+}
+
 impl BrokerConfig {
     /// Validates every section. Empty defaults are valid.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -2730,6 +2784,7 @@ impl BrokerConfig {
         self.jwks.validate()?;
         self.dbauth.validate()?;
         self.webhook.validate()?;
+        self.mcp.validate()?;
         self.prometheus.validate()?;
         Ok(())
     }
@@ -3510,6 +3565,21 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 3_600,
                 "Monitor sampling interval in seconds.",
             )],
+        ),
+        (
+            "mcp",
+            vec![
+                bool_field(
+                    "enabled",
+                    true,
+                    "Whether the built-in MCP endpoint on the management listener serves requests.",
+                ),
+                bool_field(
+                    "read_only",
+                    false,
+                    "Whether the MCP endpoint refuses mutating tool calls.",
+                ),
+            ],
         ),
         (
             "jwks",

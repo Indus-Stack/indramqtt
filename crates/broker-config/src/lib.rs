@@ -23,7 +23,9 @@ pub mod runtime;
 pub mod schema;
 pub mod secrets;
 
-pub use layers::{load_layered, CliOverrides, LayeredConfig, DEFAULT_CONFIG_DIR};
+pub use layers::{
+    load_layered, load_layered_with_env, CliOverrides, LayeredConfig, DEFAULT_CONFIG_DIR,
+};
 pub use runtime::{ConfigDiff, ConfigHistory, ConfigVersion};
 pub use schema::BrokerConfig;
 

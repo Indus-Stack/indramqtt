@@ -532,6 +532,89 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 4f. The built-in MCP endpoint answers on the management listener ---
+# The kernel boots with the default `[mcp]` settings, so the path serves.
+# An operator key calls `initialize`, `tools/list` and `tools/call
+# broker_status` through the production HTTP entry. A call with no key
+# and a call with a wrong key get 401. An unknown method gets -32601.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request, urllib.error
+api_port, key = sys.argv[1], sys.argv[2]
+
+def mcp(payload, auth):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}/mcp", data=data, method="POST",
+        headers={"Content-Type": "application/json"})
+    if auth is not None:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode())
+        except ValueError:
+            return e.code, {}
+
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+
+good_auth = f"Bearer {key}"
+status, body = mcp({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18",
+                               "capabilities": {},
+                               "clientInfo": {"name": "smoke", "version": "0"}}},
+                   good_auth)
+report("the MCP endpoint answers initialize with a server version",
+       status == 200
+       and body.get("result", {}).get("protocolVersion") == "2025-06-18")
+
+status, body = mcp({"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                    "params": {}},
+                   good_auth)
+tools = body.get("result", {}).get("tools", [])
+report("the MCP tool list holds broker_status",
+       status == 200
+       and any(tool.get("name") == "broker_status" for tool in tools))
+
+status, body = mcp({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "broker_status", "arguments": {}}},
+                   good_auth)
+content = body.get("result", {}).get("content", [])
+text = content[0].get("text", "") if content else ""
+try:
+    detail = json.loads(text)
+except ValueError:
+    detail = {}
+report("the broker_status tool returns version, uptime and node name",
+       status == 200
+       and isinstance(detail.get("version"), str)
+       and isinstance(detail.get("uptime_seconds"), int)
+       and isinstance(detail.get("node"), str))
+
+status, body = mcp({"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}},
+                   None)
+report("the MCP endpoint refuses a call with no key with 401",
+       status == 401 and "jsonrpc" not in body)
+
+status, body = mcp({"jsonrpc": "2.0", "id": 5, "method": "ping", "params": {}},
+                   "Bearer wrong-key-wrong-key")
+report("the MCP endpoint refuses a call with a wrong key with 401",
+       status == 401 and "jsonrpc" not in body)
+
+status, body = mcp({"jsonrpc": "2.0", "id": 6, "method": "nope/method",
+                    "params": {}},
+                   good_auth)
+report("the MCP endpoint answers an unknown method with -32601",
+       status == 200 and body.get("error", {}).get("code") == -32601)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 # --- 4a. Unsubscribe on the kernel listener keeps the connection ---
 # A client subscribes, gets a message, unsubscribes, gets UNSUBACK,
 # and gets no more messages. It covers MQTT 3.1.1 and MQTT 5.

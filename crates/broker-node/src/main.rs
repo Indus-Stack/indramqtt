@@ -4187,6 +4187,12 @@ struct Shared {
     /// handshakes take one short read lock per lookup. The keys file fills
     /// it at boot. Empty by default, so every handshake fails closed.
     psk: Arc<broker_auth::PskStore>,
+    /// Built-in MCP endpoint settings (MC-01): shared with the
+    /// management API so `POST /mcp` reads the `[mcp]` boot values
+    /// without a restart. One `Arc` clone at boot; the handler takes
+    /// two atomic loads per request. Management-plane only; publish
+    /// and deliver never touch it.
+    mcp: Arc<broker_api::mcp::McpStore>,
 }
 
 impl Shared {
@@ -4377,6 +4383,7 @@ impl Shared {
             wss_peer_cert_as_username: "disabled".to_string(),
             wss_peer_cert_as_clientid: "disabled".to_string(),
             psk: Arc::new(broker_auth::PskStore::new()),
+            mcp: Arc::new(broker_api::mcp::McpStore::new()),
         };
         // Mirror the boot path: the rule table consults the same settings
         // instance the management plane serves, so validated writes are
@@ -10555,6 +10562,10 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // read the boot configuration plus the running flags the kernel
     // controls, and management writes reach the bound sockets.
     state.listener_store = shared.listener_store.clone();
+    // MC-01: share the MCP settings so `POST /mcp` reads the `[mcp]`
+    // boot values. One `Arc` clone; the handler takes two atomic loads
+    // per request.
+    state.mcp = shared.mcp.clone();
     if let Some(startup) = shared
         .api_startup_config
         .read()
@@ -10722,6 +10733,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .tls_peer_cert_as_clientid
         .clone_from(&cfg.listeners.tls.peer_cert_as_clientid);
+    // MC-01: apply the `[mcp]` boot values before the API serves.
+    // The file, the fragments and `INDRA_MCP__ENABLED` /
+    // `INDRA_MCP__READ_ONLY` set them through the typed layers.
+    shared.mcp = Arc::new(broker_api::mcp::McpStore::from_config(&cfg.mcp));
     shared.wss_verify_peer = cfg.listeners.wss.verify == "verify_peer";
     shared.wss_fail_if_no_peer_cert = cfg.listeners.wss.fail_if_no_peer_cert;
     shared

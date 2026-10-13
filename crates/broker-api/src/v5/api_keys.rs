@@ -660,6 +660,11 @@ const SSO_FLOW_SEGMENTS: [&str; 6] = ["login", "mfa", "running", "oidc", "saml",
 /// new route is closed for keys until it has an entry here.
 pub fn access_for_path(path: &str) -> PathAccess {
     let trimmed = path.trim();
+    // Built-in MCP endpoint (MC-01): a monitoring read while its only
+    // tool reads. Later tasks remap mutating tools to their scopes.
+    if trimmed == "/mcp" {
+        return PathAccess::Scope("monitoring");
+    }
     let native = trimmed.starts_with("/api/v1/");
     let group = crate::v5::audit::operation_type_for_path(trimmed);
     if native {

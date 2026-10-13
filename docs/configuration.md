@@ -49,7 +49,7 @@ Section names follow the schema: `[node]`, `[listeners.tcp]`,
 accepted), `[listeners.wss]`, `[listeners.api]`, `[quotas]`,
 `[session]`, `[logging]`, `[rules_engine]` (`[rules]` still accepted),
 `[auth]`, `[cluster]`, `[licence]`, `[gateway]`, `[persistence]`,
-`[ldap]`, `[kerberos]`. See `docs/settings-reference.md` and
+`[ldap]`, `[kerberos]`, `[mcp]`. See `docs/settings-reference.md` and
 `indramqtt.example.toml` for every setting.
 
 ## Environment: `INDRA_` plus the setting path
