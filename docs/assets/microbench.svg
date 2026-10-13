@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" role="img">
+<title>In-process microbenchmark rates</title>
+<text x="320.0" y="24" text-anchor="middle" fill="currentColor" font-size="16">In-process microbenchmark rates</text>
+<line x1="64" y1="48" x2="64" y2="296" stroke="currentColor"/>
+<line x1="64" y1="296" x2="616" y2="296" stroke="currentColor"/>
+<text x="16" y="180.0" text-anchor="middle" fill="currentColor" font-size="12" transform="rotate(-90 16 180.0)">rate (million ops/s)</text>
+<text x="340.0" y="348" text-anchor="middle" fill="currentColor" font-size="12">benchmark</text>
+<rect x="110.0" y="215.2" width="92.0" height="80.8" fill="#4c78a8"><title>router hit-path: 3.05 million lookups/s</title></rect>
+<text x="156.0" y="209.2" text-anchor="middle" fill="currentColor" font-size="12">3.05</text>
+<text x="156.0" y="316.0" text-anchor="middle" fill="currentColor" font-size="12">router hit-path</text>
+<rect x="294.0" y="89.3" width="92.0" height="206.7" fill="#f58518"><title>router fast-miss: 7.8 million lookups/s</title></rect>
+<text x="340.0" y="83.3" text-anchor="middle" fill="currentColor" font-size="12">7.8</text>
+<text x="340.0" y="316.0" text-anchor="middle" fill="currentColor" font-size="12">router fast-miss</text>
+<rect x="478.0" y="169.6" width="92.0" height="126.4" fill="#54a24b"><title>rule ingress: 4.77 million events/s</title></rect>
+<text x="524.0" y="163.6" text-anchor="middle" fill="currentColor" font-size="12">4.77</text>
+<text x="524.0" y="316.0" text-anchor="middle" fill="currentColor" font-size="12">rule ingress</text>
+</svg>

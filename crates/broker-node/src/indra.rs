@@ -2382,10 +2382,21 @@ async fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
-            // Clap usage errors exit 2 by default; remap to the validation
-            // code so 2 keeps meaning authentication failure only.
-            error.print().expect("clap error renders");
-            std::process::exit(EXIT_VALIDATION);
+            // Clap reports help and version as errors. Show the text.
+            // Exit with success for help and version.
+            // Remap other usage errors to the validation code.
+            // Code 2 keeps its authentication meaning.
+            use clap::error::ErrorKind;
+            match error.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                    error.print().expect("clap error renders");
+                    std::process::exit(EXIT_OK);
+                }
+                _ => {
+                    error.print().expect("clap error renders");
+                    std::process::exit(EXIT_VALIDATION);
+                }
+            }
         }
     };
     let TopCommand::Ctl(ctl) = cli.command;

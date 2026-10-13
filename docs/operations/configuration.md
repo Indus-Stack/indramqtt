@@ -1,3 +1,10 @@
+---
+title: "Configuration"
+description: "File, environment and flag layers for each setting."
+sidebar:
+  order: 71
+---
+
 # IndraMQTT configuration layers
 
 Every startup setting has exactly one typed home in the configuration
@@ -15,6 +22,15 @@ over the ones before it:
 built-in schema defaults, then `indra.toml`, then `conf.d/*.toml` in file-name order, then `INDRA_*` environment variables, then command-line flags, then runtime changes made through the API or CLI.
 ```
 
+```mermaid
+flowchart LR
+    Def["schema defaults"] -- "read" --> File["indra.toml"]
+    File -- "read" --> Frag["conf.d fragments"]
+    Frag -- "read" --> Env["INDRA_* variables"]
+    Env -- "read" --> Flag["command flags"]
+    Flag -- "apply" --> Kernel["kernel values"]
+```
+
 An explicitly passed command-line flag always wins over files and the
 environment, so an operator can override anything at startup without
 editing files. Runtime changes (history, `explain`, secrets) arrive with
@@ -26,13 +42,15 @@ by the broker.
 The config directory (`--config-dir`, default `/etc/indramqtt`) holds
 the operator's main file `<config-dir>/indra.toml` and optional
 drop-in fragments `<config-dir>/conf.d/*.toml`, applied in file-name
-order so `20-local.toml` wins over `10-base.toml`. Only `*.toml`
-entries are read. A missing config directory or a missing `indra.toml`
-starts on defaults. An unreadable file, a TOML syntax error, an unknown
-setting, a wrong-typed value or a validation failure refuses startup
-with an error naming the file and the setting.
+order so `20-local.toml` wins over `10-base.toml`. The broker reads
+only `*.toml` entries. A missing config directory or a missing `indra.toml`
+starts on defaults. The broker refuses startup on bad input. Bad input
+means an unreadable file, a TOML syntax error, an unknown setting, a
+wrong-typed value or a validation failure. Each error names the file
+and the setting.
 
-```toml
+```toml no-test
+# Fragment: shows one file only. It is not a full boot file.
 # /etc/indramqtt/indra.toml
 [node]
 id = "indra-node-1"
@@ -44,19 +62,20 @@ max_qos0_backlog = 1000
 allow_anonymous = false
 ```
 
-Section names follow the schema: `[node]`, `[listeners.tcp]`,
-`[listeners.tls]`, `[listeners.ws]` (`[listeners.websocket]` still
-accepted), `[listeners.wss]`, `[listeners.api]`, `[quotas]`,
-`[session]`, `[logging]`, `[rules_engine]` (`[rules]` still accepted),
-`[auth]`, `[cluster]`, `[licence]`, `[gateway]`, `[persistence]`,
-`[ldap]`, `[kerberos]`. See `docs/settings-reference.md` and
-`indramqtt.example.toml` for every setting.
+Section names follow the schema. Use `[node]`, `[listeners.tcp]`,
+`[listeners.tls]`, `[listeners.ws]`, `[listeners.wss]`, `[listeners.api]`,
+`[quotas]`, `[session]`, `[logging]`, `[rules_engine]`, `[auth]`,
+`[cluster]`, `[licence]`, `[gateway]`, `[persistence]`, `[ldap]` and
+`[kerberos]`. `[listeners.websocket]` still means `[listeners.ws]`.
+`[rules]` still means `[rules_engine]`. See `docs/reference/settings.md`
+and `indramqtt.example.toml` for every setting.
 
 ## Environment: `INDRA_` plus the setting path
 
 `INDRA_` plus the setting path with `__` between levels:
 
-```sh
+```sh no-test
+# Example only: lists the variable names. Values differ per site.
 INDRA_LISTENERS__TCP__BIND=0.0.0.0:1883
 INDRA_SESSION__MAX_QOS0_BACKLOG=1000
 INDRA_AUTH__ALLOW_ANONYMOUS=false
@@ -65,17 +84,17 @@ INDRA_CLUSTER__SEED_NODES=host1:19883,host2:19883
 
 Values are typed by the schema: booleans take `true`/`false`, integers
 and floats parse as numbers, everything else is a string, and string
-lists split on commas. A wrong-typed value is a startup error naming
-the variable; an unknown `INDRA_*` variable is a startup error, so a
-typo can never boot a broker the operator did not ask for.
+lists split on commas. A wrong-typed value stops startup. The error
+names the variable. An unknown `INDRA_*` variable stops startup. A typo
+never boots an unwanted broker.
 
 Two names from the shipped container files keep working as aliases:
 `INDRA_LICENSE_KEY` sets `licence.license_key` and `INDRA_API_BIND`
 sets `listeners.api.bind`. The canonical `INDRA_LICENCE__LICENSE_KEY`
 and `INDRA_LISTENERS__API__BIND` forms win when both are set.
 
-Two `INDRA_` variables contain credentials. They are not settings. They
-have no schema home, and `explain` and the exports do not show them.
+Two `INDRA_` variables hold credentials. They are not settings. They
+have no schema home. `explain` and the exports omit them.
 
 - `INDRA_API_KEYS`: the operator API keys that the broker accepts. Use
   a comma between keys. Each key must have 16 characters or more.
@@ -106,16 +125,16 @@ listener.
 
 ## MQTT listeners
 
-The kernel accepts the clients of every enabled listener. The
-four `native` settings (`listeners.tcp.native`,
-`listeners.tls.native`, `listeners.ws.native`,
-`listeners.wss.native`) are deprecated and ignored: files and
-`INDRA_*` variables that set them still load, and the kernel logs a
-warning for each one that a layer sets. A value of `native = false`
+The kernel accepts the clients of every enabled listener. The kernel
+ignores four `native` settings. They are `listeners.tcp.native`,
+`listeners.tls.native`, `listeners.ws.native` and `listeners.wss.native`.
+Files and `INDRA_*` variables that set them still load. The kernel logs
+a warning for each one that a layer sets. A value of `native = false`
 requests the removed edge, so its warning is stronger. Do not set
 `native` in new files:
 
-```toml
+```toml no-test
+# Fragment: shows listeners only. It is not a full boot file.
 [listeners.tcp]
 bind = "0.0.0.0:1883"
 

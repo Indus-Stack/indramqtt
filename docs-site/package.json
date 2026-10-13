@@ -1,0 +1,18 @@
+{
+  "name": "indramqtt-docs-site",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Static site for the IndraMQTT user documentation in docs/.",
+  "license": "MIT",
+  "scripts": {
+    "sync-docs": "rm -rf src/content/docs && mkdir -p src/content && cp -r ../docs src/content/docs",
+    "dev": "npm run sync-docs && astro dev",
+    "build": "npm run sync-docs && astro build"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.30.0",
+    "astro": "^5.0.0",
+    "sharp": "^0.33.0"
+  }
+}

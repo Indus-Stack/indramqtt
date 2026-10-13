@@ -7,7 +7,7 @@
 
 **Website**: [indramqtt.com](https://indramqtt.com)
 
-[Benchmark](benchmark/README.md) • [Roadmap](ROADMAP.md) • [Architecture](ARCHITECTURE.md) • [Configuration](docs/configuration.md) • [Changelog](CHANGELOG.md) • [Contributing](CONTRIBUTING.md)
+[Benchmark](benchmark/README.md) • [Roadmap](ROADMAP.md) • [Architecture](ARCHITECTURE.md) • [Configuration](docs/operations/configuration.md) • [Changelog](CHANGELOG.md) • [Contributing](CONTRIBUTING.md)
 
 IndraMQTT is an open-source MQTT broker with a rule engine and connectors. It is for IoT, industrial edge and cloud systems. All the code is under the MIT licence or the Apache-2.0 licence.
 
@@ -21,7 +21,7 @@ The table shows the highest load that each broker holds for 180 s with 1 CPU and
 
 The method, the tool, the broker settings, the MQTT 3.1.1 results and the raw data are in [`benchmark/`](benchmark/README.md).
 
-| Scenario | IndraMQTT | EMQX Enterprise 6.3.0 | rumqttd 0.19.0 |
+| Scenario | IndraMQTT | Other broker A | Other broker B |
 | :--- | :--- | :--- | :--- |
 | Point-to-point QoS 0 | **100,000 msg/s** | 20,000 msg/s | none: memory increases |
 | Point-to-point QoS 1 | **30,000 msg/s** | 7,500 msg/s | none: memory increases |
@@ -34,37 +34,21 @@ The method, the tool, the broker settings, the MQTT 3.1.1 results and the raw da
 > **Limits of this comparison**
 > - Each result is one search and one 180 s run on a shared server.
 > - The test does not use TLS. The load generator runs on the same server as the broker.
-> - IndraMQTT is behind rumqttd in the fan-in scenario and in the memory with no clients.
-> - With MQTT 3.1.1, IndraMQTT uses more memory for each connection than EMQX (21 KiB and 18 KiB).
+> - IndraMQTT is behind the other brokers in the fan-in scenario and in the memory with no clients.
+> - With MQTT 3.1.1, IndraMQTT uses more memory for each connection than the other broker (21 KiB and 18 KiB).
 > - The IndraMQTT numbers use the MQTT listener of the kernel. This listener is the default path.
 
 ---
 
 ## One Rust Process
 
-IndraMQTT used two processes. An Erlang edge held the client sockets. A Rust kernel did the routing, the sessions and the rules. The kernel now serves all MQTT listeners directly. The container image runs one process.
+IndraMQTT is one Rust process. The kernel holds the client sockets. It does the routing, the sessions and the rules. The container image runs one process.
 
 Do not set `listeners.*.native` in new files. The four `native` settings are deprecated and ignored. Files that set them still load with a warning. A later release removes them.
 
 ### Connections during a restart
 
 When the kernel stops, it closes the client sockets. Clients connect again. Durable sessions resume when the offline store keeps them. Clean sessions subscribe again when the new session has no state.
-
-The plan for the Rust process keeps this property. The plan adds no work to the message path.
-
-| Case | Plan | What a client sees |
-| :--- | :--- | :--- |
-| Planned restart (upgrade, change of the configuration) | The old process gives each open socket and a small record of the connection to the new process. | A short pause. No new connection. |
-| Crash of the process | A small process holds a copy of each socket. It gives the sockets to a new broker process. It does not touch the messages. | Most clients stay connected. A client that was in the middle of a packet connects again. |
-
-This plan has limits:
-
-- It is for Linux only.
-- TLS connections stay connected only when the encryption runs in the Linux kernel (kTLS).
-- QUIC connections connect again.
-- Session state that is only in memory is lost in a crash. This is the same today.
-
-This work starts after the kernel listener is the default. The order is: planned restart for TCP and WebSocket, then the crash case, then TLS.
 
 ---
 
@@ -138,7 +122,7 @@ The full list and the test level of each connector are in [`crates/broker-connec
 - The command `indra ctl` for an operator.
 - Prometheus metrics at `/api/v1/metrics`.
 - Users, access rules, tenants and API keys.
-- One configuration file (`indra.toml`), with environment variables and command flags as more layers. See [docs/configuration.md](docs/configuration.md).
+- One configuration file (`indra.toml`), with environment variables and command flags as more layers. See [docs/operations/configuration.md](docs/operations/configuration.md).
 
 ### Cluster
 

@@ -14,6 +14,10 @@ name = "indra"
 path = "src/indra.rs"
 
 [[test]]
+name = "docs_examples"
+path = "tests/docs_examples.rs"
+
+[[test]]
 name = "e2e_integration"
 path = "../../tests/e2e_integration.rs"
 

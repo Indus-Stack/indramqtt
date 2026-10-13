@@ -11,7 +11,7 @@
 //! command-line flags, then runtime changes made through the API or CLI.
 //! ```
 //!
-//! The same sentence appears verbatim in `docs/configuration.md` (checked
+//! The same sentence appears verbatim in `docs/operations/configuration.md` (checked
 //! by `docs_state_the_documented_precedence` below) and in the M1-04 task
 //! report. Command-line flags sit above the environment: an explicitly
 //! passed flag always wins over files and the environment, so an operator
@@ -101,7 +101,7 @@ pub const ENV_PREFIX: &str = "INDRA_";
 pub const DEFAULT_CONFIG_DIR: &str = "/etc/indramqtt";
 
 /// The documented precedence order, stated verbatim here, in
-/// `docs/configuration.md` and in the task report.
+/// `docs/operations/configuration.md` and in the task report.
 #[must_use]
 pub fn precedence_statement() -> &'static str {
     "built-in schema defaults, then `indra.toml`, then `conf.d/*.toml` in file-name order, then `INDRA_*` environment variables, then command-line flags, then runtime changes made through the API or CLI."
@@ -1913,9 +1913,14 @@ mod tests {
             .join("..")
             .join("..")
             .join("docs")
+            .join("operations")
             .join("configuration.md");
-        let text = std::fs::read_to_string(&docs)
-            .unwrap_or_else(|_| panic!("docs/configuration.md must exist at {}", docs.display()));
+        let text = std::fs::read_to_string(&docs).unwrap_or_else(|_| {
+            panic!(
+                "docs/operations/configuration.md must exist at {}",
+                docs.display()
+            )
+        });
         assert!(
             text.contains(precedence_statement()),
             "user docs must state the precedence verbatim"
