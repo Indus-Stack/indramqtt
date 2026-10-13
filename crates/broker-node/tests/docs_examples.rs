@@ -212,8 +212,18 @@ fn start_broker(toml: &str) -> Broker {
     std::fs::write(
         cfg.join("conf.d").join("99-docs-test.toml"),
         format!(
-            "[node]\ndata_dir = \"{}\"\n",
-            work.path().join("data").display()
+            "[node]\ndata_dir = \"{}\"\n\
+             [listeners.tcp]\nbind = \"127.0.0.1:{}\"\n\
+             [listeners.tls]\nbind = \"127.0.0.1:{}\"\n\
+             [listeners.ws]\nbind = \"127.0.0.1:{}\"\n\
+             [listeners.wss]\nbind = \"127.0.0.1:{}\"\n\
+             [listeners.api]\nbind = \"127.0.0.1:{}\"\n",
+            work.path().join("data").display(),
+            ports[0],
+            ports[1],
+            ports[2],
+            ports[3],
+            ports[4],
         ),
     )
     .expect("write test fragment");
@@ -335,6 +345,72 @@ fn docs_examples() {
     }
     println!("DOCS_EXAMPLES tested={tested} untested={untested} files={files}");
     assert!(tested > 0, "docs hold no tested example");
+}
+
+/// Check that each page carries a visual with valid syntax.
+///
+/// Each page under `docs/` holds at least one `mermaid` diagram or
+/// one chart image. Each `mermaid` block opens with a known diagram.
+/// A page with no visual fails.
+#[test]
+fn docs_visuals() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let docs = root.join("../../docs");
+    let docs = docs.canonicalize().expect("docs dir");
+    let mut files = 0usize;
+    for page in docs_pages(&docs) {
+        let text = std::fs::read_to_string(&page)
+            .unwrap_or_else(|error| panic!("read {}: {error}", page.display()));
+        let name = page
+            .strip_prefix(&docs)
+            .unwrap_or(&page)
+            .display()
+            .to_string();
+        let mut diagrams: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut open: Option<(usize, Vec<String>)> = None;
+        for (index, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("```") {
+                if let Some((_, body)) = open.as_mut() {
+                    body.push(line.to_string());
+                }
+                continue;
+            }
+            if let Some((start, body)) = open.take() {
+                diagrams.push((start, body));
+            } else if let Some(rest) = trimmed.strip_prefix("```mermaid") {
+                let mut body = Vec::new();
+                if !rest.trim().is_empty() {
+                    body.push(rest.trim().to_string());
+                }
+                open = Some((index + 1, body));
+            }
+        }
+        if open.is_some() {
+            panic!("{name}: mermaid fence never closes");
+        }
+        for (start, body) in &diagrams {
+            let first = body
+                .iter()
+                .map(|line| line.trim())
+                .find(|line| !line.is_empty())
+                .unwrap_or("");
+            if !(first.starts_with("flowchart")
+                || first.starts_with("graph ")
+                || first.starts_with("sequenceDiagram")
+                || first.starts_with("stateDiagram"))
+            {
+                panic!("{name}:{start}: unknown mermaid diagram `{first}`");
+            }
+        }
+        let has_chart = text.contains(".svg");
+        if diagrams.is_empty() && !has_chart {
+            panic!("{name}: page carries no visual");
+        }
+        files += 1;
+    }
+    println!("DOCS_VISUALS files={files}");
+    assert!(files > 0, "docs hold no pages");
 }
 
 /// Check the committed chart against the script output.

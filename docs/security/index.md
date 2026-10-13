@@ -7,17 +7,25 @@ sidebar:
 
 # Security
 
-The broker denies access when credentials fail. It fails closed: an unreachable user store denies access and logs the fault. It never grants access on an error.
+The broker denies access when credentials fail. It fails closed when a user store is unreachable. Use it to choose TLS, authentication and authorization before you expose the broker. You get closed access with logged denials.
 
 ```mermaid
 flowchart TD
-    Conn["CONNECT"] -- "has user" --> Local["local users + acl"]
-    Conn -- "has token" --> Ext["jwks or webhook"]
-    Local -- "allow" --> In["accept"]
-    Local -- "deny" --> Out["deny + log"]
-    Ext -- "allow" --> In
-    Ext -- "deny" --> Out
+    Sec["Security"] -- "encrypt" --> TLS["tls.md"]
+    Sec -- "secret" --> PSK["psk.md"]
+    Sec -- "check identity" --> Auth["authentication.md"]
+    Auth -- "example" --> Builtin["authentication-builtin.md"]
+    Auth -- "example" --> Jwt["authentication-jwt.md"]
+    Sec -- "allow" --> Authz["authorization.md"]
+    Sec -- "operate" --> Mgmt["management-access.md"]
+    Sec -- "review" --> Audit["audit-log.md"]
 ```
+
+## Before you start
+
+- Install the binaries from [Install](../getting-started/install.md).
+- Keep ports 1883, 8083 and 18083 free.
+- Pick an API key with 16 characters or more.
 
 ## API keys
 
@@ -53,6 +61,10 @@ id = "docs-security"
 
 [listeners.tcp]
 bind = "0.0.0.0:1883"
+
+[listeners.ws]
+bind = "0.0.0.0:8083"
+path = "/mqtt"
 
 [listeners.api]
 bind = "0.0.0.0:18083"
@@ -96,3 +108,15 @@ PY
 ```output
 201
 ```
+
+## Limits
+
+- Operator keys in `INDRA_API_KEYS` need 16 characters or more. Short keys fail closed.
+- With zero users the broker is open. The first user closes anonymous access.
+- An unreachable user store denies access. It never grants access on an error.
+
+## Next steps
+
+- Guard listeners with [TLS](./tls.md).
+- Add users with [Authentication](./authentication.md).
+- Grant topics with [Authorization](./authorization.md).

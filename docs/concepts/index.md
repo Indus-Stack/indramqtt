@@ -7,16 +7,22 @@ sidebar:
 
 # Concepts
 
-One process does all broker work. It holds the client sockets and it routes, stores and rules each message. There is no second process.
+One process does all broker work. It holds client sockets and it routes, stores and rules each message. Use it to plan topics, sessions and delivery before you configure listeners. You get one binary with routing, storage and rules.
 
 ```mermaid
 flowchart LR
-    Pub["publisher"] -- "PUBLISH topic" --> Router["router"]
-    Router -- "match filter" --> Session["sessions"]
-    Session -- "queue" --> Sub["subscriber"]
-    Router -- "read" --> Engine["rule engine"]
-    Engine -- "republish" --> Router
+    Pub["publisher"] -- "PUBLISH topic" --> Router["broker-router"]
+    Router -- "match filter" --> Sess["broker-session"]
+    Sess -- "queue" --> Sub["subscriber"]
+    Router -- "read" --> Rules["broker-rules"]
+    Rules -- "republish" --> Router
 ```
+
+## Before you start
+
+- Install the binaries from [Install](../getting-started/install.md).
+- Keep ports 1883, 8083 and 18083 free.
+- Read [Listeners](./listeners.md) for the four listeners.
 
 ## Topics
 
@@ -57,6 +63,10 @@ id = "docs-concepts"
 [listeners.tcp]
 bind = "0.0.0.0:1883"
 
+[listeners.ws]
+bind = "0.0.0.0:8083"
+path = "/mqtt"
+
 [listeners.api]
 bind = "0.0.0.0:18083"
 
@@ -67,7 +77,7 @@ level = "warn"
 allow_anonymous = true
 
 [session]
-max_offline_queue = 50000
+max_offline_queue = 10000
 ```
 
 Subscribe to `docs/hello`. Publish `hello-docs` to it. The subscriber prints the payload.
@@ -103,3 +113,14 @@ PY
 ```output
 hello-docs
 ```
+
+## Limits
+
+- The offline queue holds at most 10000 messages per session by default. 10000 messages cover reconnect storms without drops. See `session.max_offline_queue` in the [settings reference](../reference/settings.md).
+- Packets hold at most 1048576 bytes. 1 MiB matches the server limit. See `session.max_packet_size` in the [settings reference](../reference/settings.md).
+
+## Next steps
+
+- Serve clients with [Listeners](./listeners.md).
+- Add users with [Authentication](../security/authentication.md).
+- See every setting in the [settings reference](../reference/settings.md).
