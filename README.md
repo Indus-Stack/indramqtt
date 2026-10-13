@@ -7,9 +7,9 @@
 
 **Website**: [indramqtt.com](https://indramqtt.com)
 
-[Benchmark](benchmark/README.md) • [Roadmap](ROADMAP.md) • [Architecture](ARCHITECTURE.md) • [Configuration](docs/operations/configuration.md) • [Changelog](CHANGELOG.md) • [Contributing](CONTRIBUTING.md)
+[Benchmark](benchmark/README.md) • [Documentation](docs/index.md) • [Roadmap](ROADMAP.md) • [Architecture](ARCHITECTURE.md) • [Configuration](docs/operations/configuration.md) • [Operations](docs/operations/index.md) • [Migration](docs/migration.md) • [Changelog](CHANGELOG.md) • [Contributing](CONTRIBUTING.md)
 
-IndraMQTT is an open-source MQTT broker with a rule engine and connectors. It is for IoT, industrial edge and cloud systems. All the code is under the MIT licence or the Apache-2.0 licence.
+IndraMQTT is the complete MQTT platform in one small binary: broker, SQL rules, data connectors and multi-tenancy in a single process. It is for IoT, industrial edge and cloud systems. All the code is under the MIT licence or the Apache-2.0 licence.
 
 IndraMQTT is not stable yet. The first stable release is planned for April 2027. Read the [limits](#limits-at-this-time) before you use it.
 
@@ -28,7 +28,7 @@ The method, the tool, the broker settings, the MQTT 3.1.1 results and the raw da
 | Fan-in QoS 0 (N publishers, 1 subscriber) | 40,000 msg/s | 10,000 msg/s | **80,000 msg/s** |
 | Fan-out QoS 0 (1 publisher, N subscribers) | **160,000 deliveries/s** | 20,000 deliveries/s | 80,000 deliveries/s |
 | 10,000 idle connections, memory | **283 MiB** | 720 MiB | 638 MiB (161 clients not connected) |
-| Memory with no clients | 76 MiB | 322 MiB | **1.5 MiB** |
+| Memory with no clients | 76 MiB | 391 MiB | **1.6 MiB** |
 
 > [!IMPORTANT]
 > **Limits of this comparison**

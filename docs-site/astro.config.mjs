@@ -35,6 +35,13 @@ export default defineConfig({
         { label: 'Operations', autogenerate: { directory: 'operations' } },
         { label: 'Reference', autogenerate: { directory: 'reference' } },
         { label: 'Benchmarks', autogenerate: { directory: 'benchmarks' } },
+        {
+          label: 'More',
+          items: [
+            { label: 'Migration', slug: 'migration' },
+            { label: 'MCP', slug: 'mcp' },
+          ],
+        },
       ],
     }),
   ],

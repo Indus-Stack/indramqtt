@@ -7,14 +7,36 @@ sidebar:
 
 # Operations
 
-Read [Configuration](./configuration.md) for the full layer model. This page lists daily tasks.
+This section covers daily production work. Use it to deploy, size, back up, upgrade, watch, and fix the broker. You get a broker that stays up and a plan for each fault.
 
 ```mermaid
 flowchart LR
-    Check["--check-config"] -- "ok" --> Start["start kernel"]
-    Start -- "serve" --> Watch["scrape /api/v1/metrics"]
-    Watch -- "keep" --> Keep["back up node.data_dir"]
+    Deploy["deployment"] -- "size" --> Size["sizing"]
+    Size -- "keep" --> Back["backup"]
+    Back -- "move" --> Up["upgrade"]
+    Up -- "watch" --> Mon["monitoring"]
+    Mon -- "read" --> Log["logs"]
+    Log -- "fix" --> Fix["troubleshooting"]
+    Fix -- "tune" --> Deploy
 ```
+
+## Before you start
+
+- Install the broker from [Install](../getting-started/install.md).
+- Read [Configuration](./configuration.md) for the full layer model.
+- Keep ports 1883 and 18083 free.
+
+## Map
+
+| Page | Use it when |
+|---|---|
+| [Deployment](./deployment.md) | You install as binary, container, or service |
+| [Sizing](./sizing.md) | You pick CPU and memory from measured numbers |
+| [Backup and restore](./backup.md) | You keep state and bring it back |
+| [Upgrade](./upgrade.md) | You move to a new release |
+| [Monitoring](./monitoring.md) | You wire health, metrics, and alarms |
+| [Logs](./logging.md) | You set levels and read output |
+| [Troubleshooting](./troubleshooting.md) | A check turns red |
 
 ## Validate before start
 
@@ -43,11 +65,11 @@ indra ctl --endpoint http://localhost:18083 --api-key "$API_KEY" config explain 
 
 ## Observe
 
-Scrape Prometheus metrics at `/api/v1/metrics`. It needs credentials. Set buckets and the push target with the `prometheus.*` settings.
+Scrape Prometheus metrics at `/api/v1/metrics`. It needs credentials. Set buckets and the push target with the `prometheus.*` settings. See [Monitoring](./monitoring.md).
 
 ## Back up
 
-Keep the data directory (`node.data_dir`). It holds users, access rules, sessions and retained messages. A restart on the same directory keeps them.
+Keep the data directory (`node.data_dir`). It holds users, access rules, sessions and retained messages. A restart on the same directory keeps them. See [Backup](./backup.md).
 
 ## Bounds
 
@@ -78,3 +100,8 @@ level = "warn"
 ```output
 ok
 ```
+
+## Next steps
+
+- Deploy with [Deployment](./deployment.md).
+- Read measured numbers in [Benchmarks](../benchmarks/index.md).
