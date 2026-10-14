@@ -88,10 +88,11 @@ pub use aws_iot::{
 };
 #[cfg(feature = "azure_blob")]
 pub use azure_blob::{
-    azure_error_code, canonicalized_resource, classify_blob_status, container_string_to_sign,
-    shared_key_authorization, string_to_sign as azure_blob_string_to_sign, AzureBlobAuth,
-    AzureBlobCompression, AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig,
-    AzureBlobTransport, HttpAzureBlobTransport, MockAzureBlobTransport, AZURE_STORAGE_VERSION,
+    azure_error_code, blob_request_path, canonicalized_resource, classify_blob_status,
+    container_request_path, container_string_to_sign, shared_key_authorization,
+    string_to_sign as azure_blob_string_to_sign, AzureBlobAuth, AzureBlobCompression,
+    AzureBlobOutcome, AzureBlobPut, AzureBlobSink, AzureBlobSinkConfig, AzureBlobTransport,
+    HttpAzureBlobTransport, MockAzureBlobTransport, AZURE_STORAGE_VERSION,
 };
 #[cfg(feature = "azure_eventhubs")]
 pub use azure_eventhubs::{

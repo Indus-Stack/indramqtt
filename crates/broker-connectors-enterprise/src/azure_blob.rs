@@ -287,9 +287,54 @@ fn validate_container_name(name: &str) -> Result<()> {
 // the maintained `hmac` + `sha2` crates).
 // ---------------------------------------------------------------------------
 
-/// Canonicalized resource for one blob PUT.
-pub fn canonicalized_resource(account: &str, container: &str, blob_path: &str) -> String {
-    format!("/{account}/{container}/{blob_path}")
+/// Path prefix of the configured endpoint, without a trailing slash.
+///
+/// Host style (`https://{account}.blob.core.windows.net`) has no path,
+/// so this returns empty. Path style
+/// (`http://host:10000/{account}`) returns `/{account}`. The request
+/// path is this prefix plus container and blob.
+fn endpoint_path_prefix(endpoint: &str) -> String {
+    let after_scheme = match endpoint.find("://") {
+        Some(i) => &endpoint[i + 3..],
+        None => endpoint,
+    };
+    let path = match after_scheme.find('/') {
+        Some(i) => &after_scheme[i..],
+        None => "",
+    };
+    let path = match path.find(|c| c == '?' || c == '#') {
+        Some(i) => &path[..i],
+        None => path,
+    };
+    path.trim_end_matches('/').to_string()
+}
+
+/// Request path as sent on the wire for one blob PUT.
+pub fn blob_request_path(endpoint: &str, container: &str, blob_path: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        endpoint_path_prefix(endpoint),
+        container,
+        blob_path.trim_start_matches('/')
+    )
+}
+
+/// Request path as sent on the wire for one container create.
+pub fn container_request_path(endpoint: &str, container: &str) -> String {
+    format!(
+        "{endpoint_prefix}/{container}",
+        endpoint_prefix = endpoint_path_prefix(endpoint)
+    )
+}
+
+/// Canonicalized resource from the documented rule: a slash, the
+/// account name, then the encoded path of the request URI.
+pub fn canonicalized_resource(account: &str, request_path: &str) -> String {
+    if request_path.starts_with('/') {
+        format!("/{account}{request_path}")
+    } else {
+        format!("/{account}/{request_path}")
+    }
 }
 
 /// Build the Shared Key `StringToSign` for `PUT /{container}/{path}`.
@@ -297,10 +342,11 @@ pub fn canonicalized_resource(account: &str, container: &str, blob_path: &str) -
 /// ```text
 /// PUT\n\n\n{content_length}\n\n{content_type}\n\n\n\n\n\n\n
 /// x-ms-blob-type:BlockBlob\nx-ms-date:{date}\nx-ms-version:2021-08-06\n
-/// /{account}/{container}/{blob_path}
+/// /{account}{request_path}
 /// ```
 pub fn string_to_sign(
     account: &str,
+    endpoint: &str,
     container: &str,
     blob_path: &str,
     content_length: usize,
@@ -313,7 +359,7 @@ pub fn string_to_sign(
          x-ms-date:{date}\n\
          x-ms-version:{AZURE_STORAGE_VERSION}\n\
          {}",
-        canonicalized_resource(account, container, blob_path)
+        canonicalized_resource(account, &blob_request_path(endpoint, container, blob_path))
     )
 }
 
@@ -518,17 +564,23 @@ impl AzureBlobTransport for MockAzureBlobTransport {
 /// `PUT /{container}?restype=container` (idempotent container create).
 ///
 /// ```text
-/// PUT\n\n\n0\n\n\n\n\n\n\n\n\n
+/// PUT\n\n\n\n\n\n\n\n\n\n\n\n
 /// x-ms-date:{date}\nx-ms-version:2021-08-06\n
-/// /{account}/{container}\nrestype:container
+/// /{account}{request_path}\nrestype:container
 /// ```
-pub fn container_string_to_sign(account: &str, container: &str, date: &str) -> String {
+pub fn container_string_to_sign(
+    account: &str,
+    endpoint: &str,
+    container: &str,
+    date: &str,
+) -> String {
     format!(
-        "PUT\n\n\n0\n\n\n\n\n\n\n\n\n\
+        "PUT\n\n\n\n\n\n\n\n\n\n\n\n\
          x-ms-date:{date}\n\
          x-ms-version:{AZURE_STORAGE_VERSION}\n\
-         /{account}/{container}\n\
-         restype:container"
+         {}\n\
+         restype:container",
+        canonicalized_resource(account, &container_request_path(endpoint, container))
     )
 }
 
@@ -582,6 +634,7 @@ impl HttpAzureBlobTransport {
                 account_key,
                 &container_string_to_sign(
                     &self.config.account_name,
+                    &self.config.base_endpoint(),
                     &self.config.container_name,
                     date,
                 ),
@@ -791,6 +844,7 @@ impl AzureBlobSink {
                 account_key,
                 &string_to_sign(
                     &self.config.account_name,
+                    &self.config.base_endpoint(),
                     &self.config.container_name,
                     &path,
                     body.len(),
@@ -956,6 +1010,7 @@ mod tests {
     fn test_string_to_sign_builder() {
         let sts = string_to_sign(
             "mydeviceblobs",
+            "https://mydeviceblobs.blob.core.windows.net",
             "telemetry",
             "telemetry/year=2026/month=09/day=12/0.json",
             17,
@@ -973,6 +1028,86 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_key_signing_both_endpoint_styles() {
+        // Host style: request URL is
+        // `https://mydeviceblobs.blob.core.windows.net/telemetry/telemetry/0.json`.
+        // Request path is `/telemetry/telemetry/0.json`.
+        // Resource is `/mydeviceblobs` plus the request path.
+        let host_sts = string_to_sign(
+            "mydeviceblobs",
+            "https://mydeviceblobs.blob.core.windows.net",
+            "telemetry",
+            "telemetry/0.json",
+            17,
+            "application/x-ndjson",
+            "Sat, 12 Sep 2026 11:18:09 GMT",
+        );
+        assert_eq!(
+            host_sts,
+            "PUT\n\n\n17\n\napplication/x-ndjson\n\n\n\n\n\n\n\
+             x-ms-blob-type:BlockBlob\n\
+             x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
+             x-ms-version:2021-08-06\n\
+             /mydeviceblobs/telemetry/telemetry/0.json"
+        );
+        // Host style container: request path is `/telemetry`.
+        // Resource is `/mydeviceblobs/telemetry`.
+        let host_container = container_string_to_sign(
+            "mydeviceblobs",
+            "https://mydeviceblobs.blob.core.windows.net",
+            "telemetry",
+            "Sat, 12 Sep 2026 11:18:09 GMT",
+        );
+        assert_eq!(
+            host_container,
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\n\
+             x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
+             x-ms-version:2021-08-06\n\
+             /mydeviceblobs/telemetry\n\
+             restype:container"
+        );
+        // Path style: request URL is
+        // `http://127.0.0.1:10000/devstoreaccount1/qual-b303/qual/0.json`.
+        // Request path is `/devstoreaccount1/qual-b303/qual/0.json`.
+        // Resource is `/devstoreaccount1` plus the request path.
+        // The old code misses the prefix and signs the wrong text.
+        let path_sts = string_to_sign(
+            "devstoreaccount1",
+            "http://127.0.0.1:10000/devstoreaccount1",
+            "qual-b303",
+            "qual/0.json",
+            17,
+            "application/x-ndjson",
+            "Sat, 12 Sep 2026 11:18:09 GMT",
+        );
+        assert_eq!(
+            path_sts,
+            "PUT\n\n\n17\n\napplication/x-ndjson\n\n\n\n\n\n\n\
+             x-ms-blob-type:BlockBlob\n\
+             x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
+             x-ms-version:2021-08-06\n\
+             /devstoreaccount1/devstoreaccount1/qual-b303/qual/0.json"
+        );
+        // Path style container: request path is
+        // `/devstoreaccount1/qual-b303`.
+        // Resource is `/devstoreaccount1/devstoreaccount1/qual-b303`.
+        let path_container = container_string_to_sign(
+            "devstoreaccount1",
+            "http://127.0.0.1:10000/devstoreaccount1",
+            "qual-b303",
+            "Sat, 12 Sep 2026 11:18:09 GMT",
+        );
+        assert_eq!(
+            path_container,
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\n\
+             x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
+             x-ms-version:2021-08-06\n\
+             /devstoreaccount1/devstoreaccount1/qual-b303\n\
+             restype:container"
+        );
+    }
+
+    #[test]
     fn test_shared_key_known_answer() {
         // Independent Python (hmac/hashlib/base64) vector over the
         // StringToSign above with key b"0123456789abcdef"*2.
@@ -981,6 +1116,7 @@ mod tests {
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
             &string_to_sign(
                 "mydeviceblobs",
+                "https://mydeviceblobs.blob.core.windows.net",
                 "telemetry",
                 "telemetry/year=2026/month=09/day=12/0.json",
                 17,
@@ -1270,12 +1406,13 @@ mod tests {
         // Documented Create Container StringToSign over REST.
         let sts = container_string_to_sign(
             "mydeviceblobs",
+            "https://mydeviceblobs.blob.core.windows.net",
             "telemetry",
             "Sat, 12 Sep 2026 11:18:09 GMT",
         );
         assert_eq!(
             sts,
-            "PUT\n\n\n0\n\n\n\n\n\n\n\n\n\
+            "PUT\n\n\n\n\n\n\n\n\n\n\n\n\
              x-ms-date:Sat, 12 Sep 2026 11:18:09 GMT\n\
              x-ms-version:2021-08-06\n\
              /mydeviceblobs/telemetry\n\
@@ -1521,12 +1658,22 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs Azurite (see AZURE_BLOB_* env)"]
     async fn test_qualify_rest_write_path() {
-        fn get_sign(account: &str, container: &str, rest: &str, date: &str) -> String {
+        fn get_sign(
+            account: &str,
+            endpoint: &str,
+            container: &str,
+            rest: &str,
+            date: &str,
+        ) -> String {
+            let resource = canonicalized_resource(
+                account,
+                &format!("{}{rest}", container_request_path(endpoint, container)),
+            );
             format!(
                 "GET\n\n\n\n\n\n\n\n\n\n\n\n\
                  x-ms-date:{date}\n\
                  x-ms-version:{AZURE_STORAGE_VERSION}\n\
-                 /{account}/{container}{rest}"
+                 {resource}"
             )
         }
 
@@ -1653,6 +1800,7 @@ mod tests {
         );
         let list_sts = get_sign(
             &account,
+            &base,
             &container,
             &format!("\ncomp:list\nmaxresults:100\nprefix:{prefix}\nrestype:container"),
             &date,
@@ -1667,7 +1815,7 @@ mod tests {
         for name in &names {
             let date = crate::oci_streaming::rfc1123_date(now_millis());
             let get_url = format!("{base}/{container}/{name}");
-            let get_sts = get_sign(&account, &container, &format!("/{name}"), &date);
+            let get_sts = get_sign(&account, &base, &container, &format!("/{name}"), &date);
             let bytes =
                 signed_get(&client, &get_url, &account, &key, &get_sts, &date, timeout).await;
             let text = std::str::from_utf8(&bytes).expect("qual utf8");
@@ -1694,6 +1842,8 @@ mod tests {
             .expect("qual retry send");
         let err = retry_sink.flush().await.expect_err("429 must fail first");
         assert!(matches!(err, ConnectorError::Connection(_)));
+        // Reset backoff and retry flush.
+        *retry_sink.backoff.lock() = BackoffState::default();
         retry_sink.flush().await.expect("429 retry must succeed");
         assert_eq!(retry_sink.sent_records(), 1);
         eprintln!("qual 429 retry asserted: first=Connection retry=success");
@@ -1704,11 +1854,15 @@ mod tests {
         for name in &names {
             let date = crate::oci_streaming::rfc1123_date(now_millis());
             let del_url = format!("{base}/{container}/{name}");
+            let del_resource = canonicalized_resource(
+                account.as_str(),
+                &blob_request_path(&base, &container, name),
+            );
             let del_sts = format!(
                 "DELETE\n\n\n\n\n\n\n\n\n\n\n\n\
                  x-ms-date:{date}\n\
                  x-ms-version:{AZURE_STORAGE_VERSION}\n\
-                 /{account}/{container}/{name}"
+                 {del_resource}"
             );
             let auth =
                 shared_key_authorization(&account, &key, &del_sts).expect("qual signs DELETE");
