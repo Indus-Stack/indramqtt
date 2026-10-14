@@ -9,7 +9,9 @@
 //! Device path segments sanitize to valid IoTDB node identifiers;
 //! measurement values coerce from JSON by the configured data types
 //! (missing fields fail loudly). HTTP 305 (cluster routing) and 5xx
-//! retry with backoff; other non-2xx statuses are terminal.
+//! retry with backoff; other non-2xx statuses are terminal. Errors
+//! carry the server answer text; a 200 answer with a failing code
+//! is terminal too.
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -397,17 +399,19 @@ pub struct IotDbTabletRequest {
     pub values: Vec<Vec<serde_json::Value>>,
 }
 
-/// Render the `insertTablet` JSON body.
+/// Render the `insertTablet` JSON body. Field names match the
+/// REST API (`is_aligned`, `data_types`). Values use column-major
+/// order (one array per measurement).
 pub fn render_tablet_body(tablet: &IotDbTabletRequest) -> Vec<u8> {
     let mut body = String::from("{\"device\":");
     body.push_str(&serde_json::to_string(&tablet.device).unwrap_or_default());
-    body.push_str(",\"isAligned\":");
+    body.push_str(",\"is_aligned\":");
     body.push_str(if tablet.is_aligned { "true" } else { "false" });
     body.push_str(",\"timestamps\":");
     body.push_str(&serde_json::to_string(&tablet.timestamps).unwrap_or_default());
     body.push_str(",\"measurements\":");
     body.push_str(&serde_json::to_string(&tablet.measurements).unwrap_or_default());
-    body.push_str(",\"dataTypes\":[");
+    body.push_str(",\"data_types\":[");
     for (index, data_type) in tablet.data_types.iter().enumerate() {
         if index > 0 {
             body.push(',');
@@ -415,7 +419,17 @@ pub fn render_tablet_body(tablet: &IotDbTabletRequest) -> Vec<u8> {
         body.push_str(&serde_json::to_string(data_type.as_str()).unwrap_or_default());
     }
     body.push_str("],\"values\":");
-    body.push_str(&serde_json::to_string(&tablet.values).unwrap_or_default());
+    // Transpose row-major rows to column-major columns.
+    let mut columns: Vec<Vec<serde_json::Value>> =
+        vec![Vec::with_capacity(tablet.values.len()); tablet.measurements.len()];
+    for row in &tablet.values {
+        for (index, value) in row.iter().enumerate() {
+            if let Some(column) = columns.get_mut(index) {
+                column.push(value.clone());
+            }
+        }
+    }
+    body.push_str(&serde_json::to_string(&columns).unwrap_or_default());
     body.push('}');
     body.into_bytes()
 }
@@ -525,15 +539,37 @@ impl IotDbTransport for HttpIotDbTransport {
             .await
             .map_err(|e| ConnectorError::Connection(format!("iotdb insert failed: {e}")))?;
         let status = response.status().as_u16();
+        // Read the body once: each error below carries the server text.
+        let raw = response
+            .bytes()
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("iotdb read failed: {e}")))?;
+        // Reason: 800 chars keep the server text in the error without
+        // storing a full error page per failed flush.
+        let text: String = String::from_utf8_lossy(&raw).chars().take(800).collect();
         if status == 305 || (500..=504).contains(&status) {
             return Err(ConnectorError::Connection(format!(
-                "iotdb throttled with {status}"
+                "iotdb throttled with {status}: {text}"
             )));
         }
         if !(200..=299).contains(&status) {
             return Err(ConnectorError::Dispatch(format!(
-                "iotdb insert failed with {status}"
+                "iotdb insert failed with {status}: {text}"
             )));
+        }
+        // The server answers 200 with a JSON code: a failing code is a
+        // terminal failure, never a counted success.
+        if !raw.is_empty() {
+            if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                if let Some(code) = doc.get("code").and_then(|v| v.as_i64()) {
+                    if code != 200 {
+                        let message = doc.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                        return Err(ConnectorError::Dispatch(format!(
+                            "iotdb insert failed with code {code} {message}"
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -970,7 +1006,7 @@ mod tests {
         let body = String::from_utf8(render_tablet_body(&captured[0].tablet)).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(doc["device"], "root.factory.plant1.sensor42");
-        assert_eq!(doc["dataTypes"], serde_json::json!(["FLOAT", "DOUBLE"]));
+        assert_eq!(doc["data_types"], serde_json::json!(["FLOAT", "DOUBLE"]));
         assert_eq!(doc["values"].as_array().expect("rows").len(), 2);
         assert_eq!(sink.sent_records(), 2);
     }
@@ -1039,5 +1075,399 @@ mod tests {
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
         assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    /// It fails closed when the environment lacks the named address.
+    fn qual_required(name: &str) -> String {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| panic!("{name} must name a real server for qualification"))
+    }
+
+    /// Append `/rest/v2` unless the endpoint already carries it.
+    fn qual_rest_base(endpoint: &str) -> String {
+        let trimmed = endpoint.trim_end_matches('/');
+        if trimmed.ends_with("/rest/v2") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/rest/v2")
+        }
+    }
+
+    /// Strip `/rest/v2` for the `/ping` probe (it lives on the root).
+    fn qual_server_root(endpoint: &str) -> String {
+        let trimmed = endpoint.trim_end_matches('/');
+        match trimmed.strip_suffix("/rest/v2") {
+            Some(root) => root.to_string(),
+            None => trimmed.to_string(),
+        }
+    }
+
+    /// Run one `nonQuery` statement and answer with the raw body text.
+    async fn qual_non_query(
+        client: &reqwest::Client,
+        rest: &str,
+        auth: &str,
+        sql: &str,
+    ) -> std::result::Result<String, String> {
+        let response = client
+            .post(format!("{rest}/nonQuery"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({"sql": sql}).to_string())
+            .send()
+            .await
+            .map_err(|e| format!("qual nonQuery send failed: {e}"))?;
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| format!("qual nonQuery read failed: {e}"))?;
+        let text = String::from_utf8_lossy(&body).to_string();
+        if !(200..=299).contains(&status) {
+            return Err(format!("qual nonQuery failed with {status}: {text}"));
+        }
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(code) = doc.get("code").and_then(|v| v.as_i64()) {
+                if code != 200 {
+                    let message = doc.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    return Err(format!("qual nonQuery failed with code {code} {message}"));
+                }
+            }
+        }
+        Ok(text)
+    }
+
+    /// Run one `query` statement and answer with the parsed body.
+    async fn qual_query(
+        client: &reqwest::Client,
+        rest: &str,
+        auth: &str,
+        sql: &str,
+        row_limit: u64,
+    ) -> serde_json::Value {
+        let response = client
+            .post(format!("{rest}/query"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({"sql": sql, "row_limit": row_limit}).to_string())
+            .send()
+            .await
+            .expect("qual query sends");
+        let status = response.status().as_u16();
+        let body = response.bytes().await.expect("qual query reads");
+        let text = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            (200..=299).contains(&status),
+            "qual query failed with {status}: {text}"
+        );
+        serde_json::from_str(&text).expect("qual query answers JSON")
+    }
+
+    /// This test qualifies the sink against a real server over the production
+    /// tablet transport (DDL and read-back use the REST query entry).
+    ///
+    /// Run with e.g.:
+    /// `IOTDB_ENDPOINT=http://127.0.0.1:18080 IOTDB_USER=root \
+    ///  IOTDB_PASSWORD=root IOTDB_DEVICE=root.qual_b323 \
+    ///  cargo +1.96.0 test -p broker-connectors-enterprise --all-features --lib iotdb::tests::test_qualify_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// - Write 500 rows through [`IotDbSink`] on [`HttpIotDbTransport`].
+    /// - Assert the exact count and the first/last content through
+    ///   `/rest/v2/query`.
+    /// - Prove bad credentials fail as a dispatch error with the server text.
+    /// - Delete the database.
+    #[tokio::test]
+    #[ignore = "needs a real server (see IOTDB_* env)"]
+    async fn test_qualify_write_path() {
+        let endpoint = qual_required("IOTDB_ENDPOINT");
+        let username = qual_required("IOTDB_USER");
+        let password = qual_required("IOTDB_PASSWORD");
+        let device = qual_required("IOTDB_DEVICE");
+        assert!(
+            device.starts_with("root."),
+            "qual device must start with root., got {device:?}"
+        );
+        let rest = qual_rest_base(&endpoint);
+        let root = qual_server_root(&endpoint);
+        // Reason: 30 s per request fails closed on a stalled server
+        // instead of blocking the 2400 s qualification budget.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("qual client builds");
+        let auth = IotDbAuth {
+            username: username.clone(),
+            password: password.clone(),
+        };
+        let auth_header = auth.header_value().expect("qual auth builds");
+
+        // Liveness: the `/ping` entry answers without credentials.
+        let ping = client
+            .get(format!("{root}/ping"))
+            .send()
+            .await
+            .expect("qual ping sends");
+        let ping_status = ping.status().as_u16();
+        let ping_body = ping.bytes().await.expect("qual ping reads");
+        let ping_text = String::from_utf8_lossy(&ping_body).to_string();
+        assert_eq!(ping_status, 200, "qual ping: {ping_text}");
+        assert!(
+            ping_text.contains("SUCCESS_STATUS"),
+            "qual ping must report success, got {ping_text:?}"
+        );
+        eprintln!("qual ping: {ping_text}");
+
+        // Identity: only the real product answers `SHOW VERSION`.
+        let version_doc = qual_query(&client, &rest, &auth_header, "SHOW VERSION", 10).await;
+        let version_text = version_doc.to_string();
+        assert!(
+            version_text.to_lowercase().contains("version"),
+            "qual version must name a version, got {version_text:?}"
+        );
+        let mut version_cells = Vec::new();
+        if let Some(columns) = version_doc.get("values").and_then(|v| v.as_array()) {
+            for column in columns {
+                if let Some(cells) = column.as_array() {
+                    for cell in cells {
+                        if let Some(text) = cell.as_str() {
+                            version_cells.push(text.to_string());
+                        } else if cell.is_number() {
+                            version_cells.push(cell.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            !version_cells.is_empty(),
+            "qual version must list rows, got {version_text:?}"
+        );
+        let version_line = version_cells.join(" ");
+        assert!(
+            version_line.contains('.'),
+            "qual version must read a dotted version, got {version_line:?}"
+        );
+        eprintln!("qual server: version={version_line}");
+
+        // Stale state from a prior run goes first (tolerated: the
+        // database may not exist yet).
+        match qual_non_query(
+            &client,
+            &rest,
+            &auth_header,
+            &format!("DELETE DATABASE {device}"),
+        )
+        .await
+        {
+            Ok(body) => eprintln!("qual cleanup stale: {body}"),
+            Err(e) => eprintln!("qual cleanup stale (tolerated): {e}"),
+        }
+        // The database for this run exists before the first flush.
+        match qual_non_query(
+            &client,
+            &rest,
+            &auth_header,
+            &format!("CREATE DATABASE {device}"),
+        )
+        .await
+        {
+            Ok(body) => eprintln!("qual create database: {body}"),
+            Err(e)
+                if e.to_lowercase().contains("exist") || e.to_lowercase().contains("already") =>
+            {
+                eprintln!("qual create database (tolerated): {e}")
+            }
+            Err(e) => panic!("qual create database: {e}"),
+        }
+
+        // Reason: 200 rows keep one tablet a single small request while
+        // spreading per-request overhead across the batch.
+        let config = IotDbSinkConfig {
+            endpoint: rest.clone(),
+            device_path_template: device.clone(),
+            auth: auth.clone(),
+            is_aligned: false,
+            measurements: vec!["seq".to_string(), "reading".to_string()],
+            data_types: vec![IotDbDataType::Int64, IotDbDataType::Double],
+            batch_size: Some(200),
+            batch_bytes: Some(2_097_152),
+            linger_ms: Some(10),
+            max_retries: Some(3),
+            initial_backoff_ms: Some(100),
+            max_backoff_ms: Some(2_000),
+            timeout_ms: Some(30_000),
+        };
+        config.validate().expect("qual config validates");
+        // The production transport below posts tablet JSON itself.
+        let transport = Arc::new(
+            HttpIotDbTransport::new(&config, client.clone()).expect("qual transport builds"),
+        );
+        let sink = Arc::new(IotDbSink::new(config.clone(), transport).expect("qual sink builds"));
+        assert_eq!(sink.kind(), "iotdb");
+
+        const ROWS: usize = 500;
+        let topic = Topic::new("qual/iotdb/b323").unwrap();
+        for seq in 0..ROWS {
+            // Reason: 20.0 + seq * 0.5 stays exact in binary floating
+            // point, so the read-back compares without rounding doubt.
+            let reading = 20.0 + seq as f64 * 0.5;
+            let payload = Bytes::from(format!(r#"{{"seq":{seq},"reading":{reading:.1}}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+            // Reason: one row per 2 ms keeps timestamps unique (the
+            // server keys rows by time) for 500 rows in about one second.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), ROWS as u64, "qual row count");
+        eprintln!("qual rows sent: records={ROWS} device={device}");
+
+        // The read-back uses the server query entry (column-major
+        // `values`: one array per selected measurement).
+        let select = format!("SELECT seq, reading FROM {device}");
+        let mut doc = serde_json::Value::Null;
+        for _ in 0..30 {
+            let current = qual_query(&client, &rest, &auth_header, &select, 1000).await;
+            let got = current
+                .get("timestamps")
+                .and_then(|v| v.as_array())
+                .map(Vec::len)
+                .unwrap_or(0);
+            doc = current;
+            if got == ROWS {
+                break;
+            }
+            // Reason: 1 s between polls lets a synchronous write become
+            // visible without busy polling the server.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let timestamps = doc
+            .get("timestamps")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(timestamps.len(), ROWS, "qual count: {doc}");
+        let columns = doc
+            .get("values")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(columns.len(), 2, "qual columns: {doc}");
+        let seq_column = columns[0].as_array().cloned().unwrap_or_default();
+        let reading_column = columns[1].as_array().cloned().unwrap_or_default();
+        assert_eq!(seq_column.len(), ROWS, "qual seq column: {doc}");
+        assert_eq!(reading_column.len(), ROWS, "qual reading column: {doc}");
+        let mut pairs: Vec<(i64, f64)> = seq_column
+            .iter()
+            .zip(reading_column.iter())
+            .map(|(seq_value, reading_value)| {
+                (
+                    seq_value.as_i64().expect("qual seq parses"),
+                    reading_value.as_f64().expect("qual reading parses"),
+                )
+            })
+            .collect();
+        pairs.sort_by_key(|(seq, _)| *seq);
+        assert_eq!(
+            pairs.first().map(|(seq, _)| *seq),
+            Some(0),
+            "qual first seq"
+        );
+        assert_eq!(
+            pairs.last().map(|(seq, _)| *seq),
+            Some((ROWS - 1) as i64),
+            "qual last seq"
+        );
+        // Reason: 1e-6 absorbs JSON round-trip noise while exact keys
+        // still compare (at-least-once permits duplicates, never loss).
+        assert!(
+            (pairs[0].1 - 20.0).abs() < 1e-6,
+            "qual first reading: {:?}",
+            pairs[0]
+        );
+        let last_reading = 20.0 + (ROWS - 1) as f64 * 0.5;
+        assert!(
+            (pairs[ROWS - 1].1 - last_reading).abs() < 1e-6,
+            "qual last reading: {:?}",
+            pairs[ROWS - 1]
+        );
+        eprintln!(
+            "qual rows asserted: count={ROWS} first=(0,20.0) last=({},{last_reading})",
+            ROWS - 1
+        );
+
+        // Fault: bad credentials fail closed with the server text.
+        let bad_auth = IotDbAuth {
+            username: username.clone(),
+            password: "qual-wrong-password".to_string(),
+        };
+        let bad_header = bad_auth.header_value().expect("qual bad auth builds");
+        let probe = client
+            .post(format!("{rest}/query"))
+            .header(reqwest::header::AUTHORIZATION, &bad_header)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({"sql": "SHOW VERSION", "row_limit": 1}).to_string())
+            .send()
+            .await
+            .expect("qual bad probe sends");
+        let probe_status = probe.status().as_u16();
+        let probe_body = probe.bytes().await.expect("qual bad probe reads");
+        let probe_text = String::from_utf8_lossy(&probe_body).to_string();
+        assert_eq!(probe_status, 401, "qual bad probe: {probe_text}");
+        let server_token = serde_json::from_str::<serde_json::Value>(&probe_text)
+            .ok()
+            .and_then(|parsed| {
+                parsed
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| "401".to_string());
+        let bad_config = IotDbSinkConfig {
+            auth: bad_auth,
+            ..config
+        };
+        let bad_transport = Arc::new(
+            HttpIotDbTransport::new(&bad_config, client.clone())
+                .expect("qual bad transport builds"),
+        );
+        let bad_sink =
+            Arc::new(IotDbSink::new(bad_config, bad_transport).expect("qual bad sink builds"));
+        bad_sink
+            .send(
+                &topic,
+                &Bytes::from_static(br#"{"seq":1,"reading":20.5}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual bad buffer");
+        let err = bad_sink.flush().await.expect_err("bad password must fail");
+        match &err {
+            ConnectorError::Dispatch(message) => assert!(
+                message.contains(&server_token),
+                "qual fault must carry the server text, got {message:?} (server said {server_token:?})"
+            ),
+            other => panic!("bad password must be terminal, got {other:?}"),
+        }
+        eprintln!("qual fault asserted: bad password is a dispatch error");
+
+        // Cleanup: delete the database for this run (tolerated: the
+        // next run deletes stale state first).
+        match qual_non_query(
+            &client,
+            &rest,
+            &auth_header,
+            &format!("DELETE DATABASE {device}"),
+        )
+        .await
+        {
+            Ok(body) => eprintln!("qual cleanup: deleted {device}: {body}"),
+            Err(e) => eprintln!("qual cleanup FAILED for {device} (tolerated): {e}"),
+        }
+        eprintln!("qual done: rows={ROWS} device={device} cleaned database");
     }
 }
