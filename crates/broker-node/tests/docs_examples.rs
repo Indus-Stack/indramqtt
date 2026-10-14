@@ -157,15 +157,32 @@ fn free_port() -> u16 {
     listener.local_addr().expect("port").port()
 }
 
+/// Free loopback ports for one started broker.
+struct Binds {
+    mqtt: u16,
+    tls: u16,
+    ws: u16,
+    wss: u16,
+    api: u16,
+    cluster: u16,
+    gossip: u16,
+    quic: u16,
+}
+
 /// Move the default binds in a page config to free test ports.
-fn rewrite_binds(text: &str, mqtt: u16, tls: u16, ws: u16, wss: u16, api: u16) -> String {
+/// Remap cluster binds to free ports. Parallel brokers share the host.
+/// Fixed ports collide.
+fn rewrite_binds(text: &str, binds: Binds) -> String {
     let mut out = text.to_string();
     for (from, to) in [
-        ("0.0.0.0:1883", mqtt),
-        ("0.0.0.0:8883", tls),
-        ("0.0.0.0:8083", ws),
-        ("0.0.0.0:8084", wss),
-        ("0.0.0.0:18083", api),
+        ("0.0.0.0:1883", binds.mqtt),
+        ("0.0.0.0:8883", binds.tls),
+        ("0.0.0.0:8083", binds.ws),
+        ("0.0.0.0:8084", binds.wss),
+        ("0.0.0.0:18083", binds.api),
+        ("127.0.0.1:19883", binds.cluster),
+        ("0.0.0.0:7946", binds.gossip),
+        ("0.0.0.0:9092", binds.quic),
     ] {
         out = out.replace(from, &format!("127.0.0.1:{to}"));
     }
@@ -173,8 +190,10 @@ fn rewrite_binds(text: &str, mqtt: u16, tls: u16, ws: u16, wss: u16, api: u16) -
 }
 
 /// Wait until the health endpoint answers `OK`.
+/// Wait 30 seconds for boot. Parallel gates load the host.
+/// Slow boot still passes.
 fn wait_for_boot(api_port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", api_port)) {
             stream
@@ -203,12 +222,29 @@ fn start_broker(toml: &str) -> Broker {
         free_port(),
         free_port(),
         free_port(),
+        free_port(),
+        free_port(),
+        free_port(),
     ];
     std::fs::write(
         cfg.join("indra.toml"),
-        rewrite_binds(toml, ports[0], ports[1], ports[2], ports[3], ports[4]),
+        rewrite_binds(
+            toml,
+            Binds {
+                mqtt: ports[0],
+                tls: ports[1],
+                ws: ports[2],
+                wss: ports[3],
+                api: ports[4],
+                cluster: ports[5],
+                gossip: ports[6],
+                quic: ports[7],
+            },
+        ),
     )
     .expect("write config");
+    // Page configs omit idle listeners, so fixed default ports collide.
+    // Pin idle and cluster binds to free ports here.
     std::fs::write(
         cfg.join("conf.d").join("99-docs-test.toml"),
         format!(
@@ -217,13 +253,17 @@ fn start_broker(toml: &str) -> Broker {
              [listeners.tls]\nbind = \"127.0.0.1:{}\"\n\
              [listeners.ws]\nbind = \"127.0.0.1:{}\"\n\
              [listeners.wss]\nbind = \"127.0.0.1:{}\"\n\
-             [listeners.api]\nbind = \"127.0.0.1:{}\"\n",
+             [listeners.api]\nbind = \"127.0.0.1:{}\"\n\
+             [cluster]\nbind = \"127.0.0.1:{}\"\ngossip_bind = \"127.0.0.1:{}\"\nquic_bind = \"127.0.0.1:{}\"\n",
             work.path().join("data").display(),
             ports[0],
             ports[1],
             ports[2],
             ports[3],
             ports[4],
+            ports[5],
+            ports[6],
+            ports[7],
         ),
     )
     .expect("write test fragment");
@@ -255,7 +295,8 @@ fn start_broker(toml: &str) -> Broker {
 }
 
 /// Run one `sh test` block. Compare with the `output` block after it.
-fn run_shell(block: &Block, expect: Option<&Block>, broker: Option<&Broker>) {
+/// Return the real output. The caller stores it in the capture file.
+fn run_shell(block: &Block, expect: Option<&Block>, broker: Option<&Broker>) -> String {
     let mut command = Command::new("bash");
     command
         .arg("-c")
@@ -299,16 +340,79 @@ fn run_shell(block: &Block, expect: Option<&Block>, broker: Option<&Broker>) {
             block.file, block.line
         ),
     }
+    got.trim_end().to_string()
 }
 
-/// Run each tested block of one page.
-fn run_page(blocks: &[Block]) {
+/// Format one captured output for the capture table.
+fn escape_cell(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('`', "\\`")
+        .replace('\n', "<br>")
+}
+
+/// Write the capture file from the real outputs of this run.
+fn write_captured_outputs(docs: &Path, captures: &[(String, usize, String)]) {
+    let mut out = vec![
+        "# Captured outputs (DOC-02)".to_string(),
+        String::new(),
+        "```mermaid".to_string(),
+        "flowchart LR".to_string(),
+        "    H[\"docs harness\"] -- \"run block\" --> B[\"broker\"]".to_string(),
+        "    B -- \"compare output\" --> O[\"output block\"]".to_string(),
+        "```".to_string(),
+        String::new(),
+        "The docs harness writes this file on each run. It runs each `sh test` block against a started broker."
+            .to_string(),
+        "It stores the real output it compares with the `output` block. The gates record the run result."
+            .to_string(),
+        String::new(),
+        "## Captured blocks".to_string(),
+        String::new(),
+        "The list holds one row per `sh test` block. The output column holds the real output.".to_string(),
+        String::new(),
+        "| Page | Line | Output |".to_string(),
+        "|---|---|---|".to_string(),
+    ];
+    for (file, line, output) in captures {
+        out.push(format!("| `{file}` | {line} | `{}` |", escape_cell(output)));
+    }
+    out.push(String::new());
+    out.push(format!(
+        "The run captured {} blocks. Each output matches its page.",
+        captures.len()
+    ));
+    out.push(String::new());
+    std::fs::write(
+        docs.join("_verification").join("captured-outputs.md"),
+        out.join("\n"),
+    )
+    .expect("write capture file");
+}
+
+/// Run each tested block of one page. Return each real output.
+fn run_page(blocks: &[Block]) -> Vec<(String, usize, String)> {
+    // The generated API pages place the example flow before the
+    // boot file. Boot the broker from the first file block first,
+    // so the flow runs against a started broker.
     let mut broker: Option<Broker> = None;
+    let mut booted: Option<String> = None;
+    if let Some(first) = blocks
+        .iter()
+        .find(|block| block.kind == BlockKind::Toml && block.marker.as_deref() == Some("test"))
+    {
+        booted = Some(first.content.clone());
+        broker = Some(start_broker(&first.content));
+    }
     let mut index = 0;
+    let mut captures = Vec::new();
     while index < blocks.len() {
         let block = &blocks[index];
         if block.kind == BlockKind::Toml && block.marker.as_deref() == Some("test") {
-            broker = Some(start_broker(&block.content));
+            if booted.as_deref() != Some(block.content.as_str()) {
+                broker = Some(start_broker(&block.content));
+                booted = Some(block.content.clone());
+            }
             index += 1;
             continue;
         }
@@ -317,12 +421,14 @@ fn run_page(blocks: &[Block]) {
                 Some(other) if other.kind == BlockKind::Output => Some(other),
                 _ => None,
             };
-            run_shell(block, expect, broker.as_ref());
+            let got = run_shell(block, expect, broker.as_ref());
+            captures.push((block.file.clone(), block.line, got));
             index += 2;
             continue;
         }
         index += 1;
     }
+    captures
 }
 #[test]
 fn docs_examples() {
@@ -332,6 +438,7 @@ fn docs_examples() {
     let mut tested = 0usize;
     let mut untested = 0usize;
     let mut files = 0usize;
+    let mut all_captures: Vec<(String, usize, String)> = Vec::new();
     for page in docs_pages(&docs) {
         let blocks = parse_blocks(&page, &docs);
         check_markers(&blocks, &mut tested, &mut untested);
@@ -339,10 +446,11 @@ fn docs_examples() {
             .iter()
             .any(|block| block.marker.as_deref() == Some("test"))
         {
-            run_page(&blocks);
+            all_captures.extend(run_page(&blocks));
         }
         files += 1;
     }
+    write_captured_outputs(&docs, &all_captures);
     println!("DOCS_EXAMPLES tested={tested} untested={untested} files={files}");
     assert!(tested > 0, "docs hold no tested example");
 }

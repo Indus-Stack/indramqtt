@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// One row of the schema catalogue: the single place a setting's type,
-/// default, valid range and documentation string are stated together.
+/// default, valid range, restart need and documentation string live together.
 ///
 /// The struct definitions below mirror these rows; the `--help` text, the
 /// settings reference and the JSON Schema are generated from them.
@@ -39,6 +39,10 @@ pub struct FieldDoc {
     pub range: &'static str,
     /// Short documentation string (also used in `--help` output).
     pub doc: &'static str,
+    /// Restart need when known. None leaves the reference Restart cell
+    /// empty: the reload path never applies file settings live, and no
+    /// entry has proven otherwise. Deprecated settings stay None.
+    pub requires_restart: Option<bool>,
 }
 
 /// The full catalogue. Each entry's `doc` string is the canonical wording:
@@ -54,6 +58,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"indra-node-1\"",
                 range: "1..=64 chars, letters/digits/dots/dashes",
                 doc: "Unique identifier for this broker node within the cluster.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "node.data_dir",
@@ -61,6 +66,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"./data\"",
                 range: "non-empty path",
                 doc: "Directory holding kernel persistent state (state.toml). Created on boot when missing.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "node.brokerlink_bind",
@@ -68,6 +74,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"127.0.0.1:18883\"",
                 range: "any string, ignored",
                 doc: "Deprecated. Ignored. The kernel serves clients directly.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.enabled",
@@ -75,6 +82,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "true",
                 range: "true | false",
                 doc: "Whether the plaintext MQTT listener accepts connections.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.bind",
@@ -82,6 +90,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:1883\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Bind address for the plaintext MQTT listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.max_connections",
@@ -89,6 +98,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1000000",
                 range: "1..=10000000",
                 doc: "Maximum concurrent connections on the plaintext MQTT listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.backlog",
@@ -96,6 +106,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1024",
                 range: "1..=65536",
                 doc: "Listener accept backlog for the plaintext MQTT listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tcp.native",
@@ -103,6 +114,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Deprecated. Ignored. The kernel always serves this listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.enabled",
@@ -110,6 +122,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the secure TLS MQTT listener accepts connections.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.bind",
@@ -117,6 +130,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:8883\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Bind address for the secure TLS MQTT listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.cert_file",
@@ -124,6 +138,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when TLS is enabled",
                 doc: "Path to the PEM server certificate for the TLS listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.key_file",
@@ -131,6 +146,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when TLS is enabled",
                 doc: "Path to the PEM private key for the TLS listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.native",
@@ -138,6 +154,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Deprecated. Ignored. The kernel always serves this listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.psk_enabled",
@@ -145,6 +162,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.psk_keys_file",
@@ -152,6 +170,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "file path; empty means no identities",
                 doc: "Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.verify_client_cert",
@@ -159,6 +178,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the TLS listener requests and verifies a client certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.verify",
@@ -166,6 +186,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"verify_none\"",
                 range: "verify_none | verify_peer",
                 doc: "Client certificate chain check mode of the TLS listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.cacertfile",
@@ -173,6 +194,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when client verification is on",
                 doc: "CA file for client certificate checks of the TLS listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.fail_if_no_peer_cert",
@@ -180,6 +202,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the TLS listener refuses a handshake without a certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.peer_cert_as_username",
@@ -187,6 +210,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"disabled\"",
                 range: "disabled | cn | dn",
                 doc: "Source for the bind username from the client certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.tls.peer_cert_as_clientid",
@@ -194,6 +218,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"disabled\"",
                 range: "disabled | cn | dn",
                 doc: "Source for the bind client identifier from the client certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.ws.enabled",
@@ -201,6 +226,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "true",
                 range: "true | false",
                 doc: "Whether the MQTT-over-WebSocket listener accepts connections.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.ws.bind",
@@ -208,6 +234,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:8083\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Bind address for the MQTT-over-WebSocket listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.ws.path",
@@ -215,6 +242,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"/mqtt\"",
                 range: "must start with '/'",
                 doc: "HTTP path serving MQTT-over-WebSocket traffic.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.ws.native",
@@ -222,6 +250,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Deprecated. Ignored. The kernel always serves this listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.enabled",
@@ -229,6 +258,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the secure WebSocket listener accepts connections.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.bind",
@@ -236,6 +266,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:8084\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Bind address for the secure WebSocket listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.path",
@@ -243,6 +274,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"/mqtt\"",
                 range: "must start with '/'",
                 doc: "HTTP path serving secure WebSocket traffic.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.cert_file",
@@ -250,6 +282,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when secure WebSocket is enabled",
                 doc: "Path to the PEM server certificate for the secure WebSocket listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.key_file",
@@ -257,6 +290,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when secure WebSocket is enabled",
                 doc: "Path to the PEM private key for the secure WebSocket listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.verify_client_cert",
@@ -264,6 +298,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the secure WebSocket listener requests and verifies a client certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.verify",
@@ -271,6 +306,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"verify_none\"",
                 range: "verify_none | verify_peer",
                 doc: "Client certificate chain check mode of the secure WebSocket listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.cacertfile",
@@ -278,6 +314,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; required when client verification is on",
                 doc: "CA file for client certificate checks of the secure WebSocket listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.fail_if_no_peer_cert",
@@ -285,6 +322,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the secure WebSocket listener refuses a handshake without a certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.peer_cert_as_username",
@@ -292,6 +330,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"disabled\"",
                 range: "disabled | cn | dn",
                 doc: "Source for the bind username from the client certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.peer_cert_as_clientid",
@@ -299,6 +338,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"disabled\"",
                 range: "disabled | cn | dn",
                 doc: "Source for the bind client identifier from the client certificate.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.wss.native",
@@ -306,6 +346,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Deprecated. Ignored. The kernel always serves this listener.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.api.enabled",
@@ -313,6 +354,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "true",
                 range: "true | false",
                 doc: "Whether the management REST API and dashboard serve requests.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "listeners.api.bind",
@@ -320,6 +362,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"0.0.0.0:18083\"",
                 range: "valid host:port, port 1..=65535; empty disables the API",
                 doc: "Bind address for the management REST API. Empty disables the API.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "quotas.default_max_connections",
@@ -327,6 +370,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "10000",
                 range: "0..=1000000 (0 = unlimited opt-in)",
                 doc: "Default max connections per authenticated username (0 = unlimited).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "quotas.max_connections_per_tenant",
@@ -334,6 +378,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "0",
                 range: "0..=1000000 (0 = unlimited opt-in)",
                 doc: "Default max live connections per tenant (0 = unlimited).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "quotas.max_sessions_per_tenant",
@@ -341,6 +386,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "0",
                 range: "0..=100000 (0 = unlimited opt-in)",
                 doc: "Default max sessions per tenant (0 = unlimited).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "quotas.max_retained_per_tenant",
@@ -348,6 +394,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "0",
                 range: "0..=100000 (0 = unlimited opt-in)",
                 doc: "Default max retained topics per tenant (0 = unlimited).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "quotas.default_max_publish_rate",
@@ -355,6 +402,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "50000",
                 range: "0..=10000000 msg/s (0 = unlimited opt-in)",
                 doc: "Default token-bucket publish rate limit in messages per second (0 = unlimited).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "quotas.burst_multiplier",
@@ -362,6 +410,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "2.0",
                 range: "1.0..=10.0",
                 doc: "Token bucket burst multiplier (allows bursts up to burst times rate).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.max_session_expiry_secs",
@@ -369,6 +418,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "86400",
                 range: "0..=2592000 seconds (0 = unlimited opt-in)",
                 doc: "Max session expiry interval in seconds.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.max_offline_queue",
@@ -376,6 +426,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "50000",
                 range: "1..=1000000",
                 doc: "Maximum queued offline messages per session.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.max_inflight_messages",
@@ -383,6 +434,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "65535",
                 range: "1..=65535",
                 doc: "Maximum inflight unacknowledged QoS 1 and QoS 2 messages.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.max_qos0_backlog",
@@ -390,6 +442,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1000",
                 range: "1..=100000",
                 doc: "Per-subscriber QoS 0 egress backlog bound; past it the oldest queued QoS 0 frame drops.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "session.keep_alive_grace",
@@ -397,6 +450,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1.5",
                 range: "1.0..=5.0",
                 doc: "Keep-alive grace multiplier before disconnect.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "logging.level",
@@ -404,6 +458,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"info\"",
                 range: "trace | debug | info | warn | error",
                 doc: "Logging verbosity for the kernel (trace, debug, info, warn, error).",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "rules_engine.window_channel_depth",
@@ -411,6 +466,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "65536",
                 range: "1..=1000000",
                 doc: "Ingress ring buffer channel depth for stateful window worker tasks.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "rules_engine.backpressure_policy",
@@ -418,6 +474,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"DropOldest\"",
                 range: "Block | DropNewest | DropOldest | SpillToDisk | RejectPublisher",
                 doc: "Default memory backpressure policy when the rule buffer is full.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "auth.enabled",
@@ -425,6 +482,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "true",
                 range: "true | false",
                 doc: "Whether authentication checks apply to client connects.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "auth.password_hash",
@@ -432,6 +490,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"sha256\"",
                 range: "sha256 | bcrypt",
                 doc: "Password hashing algorithm for stored credentials.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "auth.allow_anonymous",
@@ -439,6 +498,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether anonymous connections are accepted while no users are configured.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "auth.superusers",
@@ -446,13 +506,15 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "[\"admin\", \"root\"]",
                 range: "0..=100 entries",
                 doc: "Superuser usernames bypassing ACL rules.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.enabled",
                 setting_type: "bool",
                 default: "false",
                 range: "true | false",
-                doc: "Whether multi-node distributed clustering is enabled.",
+                doc: "Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.bind",
@@ -460,20 +522,23 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"127.0.0.1:19883\"",
                 range: "valid host:port, port 1..=65535",
                 doc: "Cluster SWIM UDP bind address for peer discovery and membership.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.gossip_bind",
                 setting_type: "socket address string",
                 default: "\"0.0.0.0:7946\"",
                 range: "valid host:port, port 1..=65535",
-                doc: "Gossip membership bind address for peer discovery.",
+                doc: "Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.quic_bind",
                 setting_type: "socket address string",
                 default: "\"0.0.0.0:9092\"",
                 range: "valid host:port, port 1..=65535",
-                doc: "Multiplexed data plane bind address for inter-broker message routing.",
+                doc: "Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "cluster.seed_nodes",
@@ -481,6 +546,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "[]",
                 range: "0..=64 entries, each host:port",
                 doc: "Seed node addresses to join an existing cluster.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.license_file",
@@ -488,6 +554,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"/etc/indramqtt/license.key\"",
                 range: "any path; empty means none installed",
                 doc: "Path to the enterprise cryptographic license key file.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.license_key",
@@ -495,6 +562,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any string; empty means use stored token or environment",
                 doc: "Enterprise commercial license key for multi-node clustering.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.trusted_keys_path",
@@ -502,6 +570,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "JSON file or directory; empty trusts nothing",
                 doc: "Trusted licence-signing keys: a JSON file or directory of JSON files.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.request_out",
@@ -509,6 +578,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any path; empty disables request generation",
                 doc: "Write the installation licence request to this path and exit.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.install_file",
@@ -516,6 +586,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any path; empty disables licence installation",
                 doc: "Install the licence token read from this path and exit.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "licence.expiry_warn_days",
@@ -523,6 +594,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "30",
                 range: "0..=365 days",
                 doc: "Days before expiry that the approaching-expiry alarm and log warning start.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "gateway.coap_bind",
@@ -530,6 +602,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "empty disables the gateway, else valid host:port",
                 doc: "CoAP gateway UDP listen address. Empty disables the gateway.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "persistence.stream_dir",
@@ -537,6 +610,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any directory; empty disables journaling",
                 doc: "Durable stream journal directory. Empty disables journaling.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.server_url",
@@ -544,6 +618,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "empty disables LDAP, else ldap:// or ldaps:// URL",
                 doc: "Directory server URL for LDAP authentication. Empty disables LDAP.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.base_dn",
@@ -551,6 +626,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any DN; required when LDAP is enabled",
                 doc: "Base DN under which directory users are searched.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.bind_dn",
@@ -558,6 +634,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any DN",
                 doc: "Service account DN used for the initial bind plus search.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.bind_password",
@@ -565,6 +642,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any string",
                 doc: "Service account password for the initial bind.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.user_filter",
@@ -572,6 +650,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"(uid={username})\"",
                 range: "must contain {username} when LDAP is enabled",
                 doc: "User search filter with a {username} placeholder, escaped per RFC 4515.",
+                requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.group_attribute",
@@ -579,6 +658,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"memberOf\"",
                 range: "non-empty when LDAP is enabled",
                 doc: "User-entry attribute listing directory groups.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.required_group",
@@ -586,6 +666,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any DN; empty disables the group check",
                 doc: "Required group DN: the entry must list this DN to connect.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.ca_cert_path",
@@ -593,6 +674,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "PEM file path; empty uses system roots",
                 doc: "Path to a PEM CA certificate for private directories.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.pool_size",
@@ -600,6 +682,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "8",
                 range: "1..=32",
                 doc: "Bound on concurrent directory authentications.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.connect_timeout_ms",
@@ -607,6 +690,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "5000",
                 range: "100..=60000 ms",
                 doc: "Timeout covering TCP connect plus TLS handshake.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "ldap.read_timeout_ms",
@@ -614,6 +698,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "5000",
                 range: "100..=60000 ms",
                 doc: "Timeout covering each directory bind/search round-trip.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.keytab_path",
@@ -621,6 +706,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "keytab v2 file; empty disables Kerberos",
                 doc: "Keytab file for Kerberos authentication. Empty disables Kerberos.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.service_principal",
@@ -628,6 +714,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "required when Kerberos is enabled",
                 doc: "Service principal name held in the keytab.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.realm",
@@ -635,6 +722,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "any realm; empty disables the realm check",
                 doc: "Expected service realm. Empty disables the realm check on the service name.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.allowed_realms",
@@ -642,6 +730,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "[]",
                 range: "0..=32 entries",
                 doc: "Trusted client realms. Empty allows any realm that verifies.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.clock_skew_secs",
@@ -649,6 +738,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "300",
                 range: "1..=3600 seconds",
                 doc: "Clock-skew allowance in seconds for ticket validity and authenticator timestamps.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.role_map",
@@ -656,6 +746,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "\"\"",
                 range: "comma-separated principal=role pairs; empty leaves every principal at user",
                 doc: "Comma-separated principal=role mappings for verified client principals.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "kerberos.replay_max_entries",
@@ -663,53 +754,144 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "1024",
                 range: "16..=8192",
                 doc: "Replay-cache bound for Kerberos authenticators.",
+            requires_restart: None,
             },
-            FieldDoc { path: "session.max_qos1_inflight", setting_type: "usize", default: "100", range: "1..=100000", doc: "Per-session QoS 1 inflight window bound." },
-            FieldDoc { path: "session.max_qos1_spill", setting_type: "usize", default: "1000", range: "1..=100000", doc: "Per-session QoS 1 spill bound past the window." },
-            FieldDoc { path: "session.topic_alias_maximum", setting_type: "u16", default: "10", range: "0..=65535", doc: "Inbound topic-alias maximum advertised in CONNACK." },
-            FieldDoc { path: "session.max_packet_size", setting_type: "u32", default: "1048576", range: "1..=268435455", doc: "Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK." },
-            FieldDoc { path: "rules_engine.spill_dir", setting_type: "string", default: "\"\"", range: "empty or directory path", doc: "Rule ingress spill directory." },
-            FieldDoc { path: "delayed.max_secs", setting_type: "u64", default: "86400", range: "1..=86400", doc: "Upper bound for delayed deferrals in seconds." },
-            FieldDoc { path: "observability.monitor_sample_secs", setting_type: "u64", default: "10", range: "0..=3600", doc: "Monitor sampling interval in seconds." },
-            FieldDoc { path: "jwks.url", setting_type: "string", default: "\"\"", range: "empty or https URL", doc: "JWKS endpoint URL for JWT authentication." },
-            FieldDoc { path: "jwks.issuer", setting_type: "string", default: "\"\"", range: "any string", doc: "Expected JWT issuer." },
-            FieldDoc { path: "jwks.audience", setting_type: "string", default: "\"\"", range: "any string", doc: "Expected JWT audience." },
-            FieldDoc { path: "dbauth.postgres_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "PostgreSQL URL for database authentication." },
-            FieldDoc { path: "webhook.url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "HTTP webhook verdict endpoint." },
-            FieldDoc { path: "jwks.refresh_period_secs", setting_type: "u64", default: "300", range: "1..=86400", doc: "Seconds between background JWKS refreshes." },
-            FieldDoc { path: "jwks.fetch_timeout_ms", setting_type: "u64", default: "5000", range: "100..=60000", doc: "Timeout for one JWKS fetch in milliseconds." },
-            FieldDoc { path: "jwks.refresh_timeout_ms", setting_type: "u64", default: "5000", range: "100..=60000", doc: "Longest a CONNECT waits for a JWKS refresh in milliseconds." },
-            FieldDoc { path: "jwks.cache_max_keys", setting_type: "usize", default: "32", range: "1..=256", doc: "Most JWKS keys held in the cache." },
-            FieldDoc { path: "jwks.cache_ttl_secs", setting_type: "u64", default: "300", range: "1..=86400", doc: "Seconds a cached JWKS key stays valid." },
-            FieldDoc { path: "jwks.clock_skew_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Clock skew tolerated when checking token times, in seconds." },
-            FieldDoc { path: "jwks.ca_cert", setting_type: "string", default: "\"\"", range: "empty or path to a PEM file", doc: "Extra CA certificate trusted for the JWKS endpoint." },
-            FieldDoc { path: "dbauth.mysql_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "MySQL URL for database authentication." },
-            FieldDoc { path: "dbauth.redis_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "Redis URL for database authentication." },
-            FieldDoc { path: "dbauth.mongodb_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "MongoDB URL for database authentication." },
-            FieldDoc { path: "dbauth.pool_size", setting_type: "usize", default: "8", range: "1..=32", doc: "Connections kept per authentication database." },
-            FieldDoc { path: "dbauth.connect_timeout_ms", setting_type: "u64", default: "3000", range: "100..=60000", doc: "Timeout for connecting to an authentication database in milliseconds." },
-            FieldDoc { path: "dbauth.read_timeout_ms", setting_type: "u64", default: "3000", range: "100..=60000", doc: "Timeout for one authentication lookup in milliseconds." },
-            FieldDoc { path: "dbauth.cache_size", setting_type: "usize", default: "1024", range: "0..=100000", doc: "Cached database verdicts per source; 0 disables the cache." },
-            FieldDoc { path: "dbauth.cache_ttl_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Seconds a cached database verdict stays valid." },
-            FieldDoc { path: "webhook.pool_size", setting_type: "usize", default: "8", range: "1..=32", doc: "Concurrent requests allowed to the webhook endpoint." },
-            FieldDoc { path: "webhook.timeout_ms", setting_type: "u64", default: "2000", range: "100..=60000", doc: "Timeout for one webhook request in milliseconds." },
-            FieldDoc { path: "webhook.breaker_threshold", setting_type: "u32", default: "5", range: "1..=100", doc: "Consecutive webhook failures that open the circuit breaker." },
-            FieldDoc { path: "webhook.breaker_reset_ms", setting_type: "u64", default: "30000", range: "1000..=600000", doc: "Milliseconds an open circuit breaker waits before retrying the webhook." },
-            FieldDoc { path: "webhook.cache_size", setting_type: "usize", default: "1024", range: "0..=100000", doc: "Cached webhook verdicts; 0 disables the cache." },
-            FieldDoc { path: "webhook.cache_ttl_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Seconds a cached webhook verdict stays valid." },
-            FieldDoc { path: "prometheus.enable_basic_auth", setting_type: "bool", default: "true", range: "true | false", doc: "Require credentials on the scrape endpoints." },
-            FieldDoc { path: "prometheus.latency_buckets", setting_type: "string", default: "\"10ms, 100ms, 1s, 5s, 30s\"", range: "comma-separated durations", doc: "Latency histogram buckets for the exposition." },
-            FieldDoc { path: "prometheus.push_gateway.enable", setting_type: "bool", default: "false", range: "true | false", doc: "Push the exposition to the push target." },
-            FieldDoc { path: "prometheus.push_gateway.url", setting_type: "string", default: "\"http://127.0.0.1:9091\"", range: "http(s) URL", doc: "Push target URL for the exposition." },
-            FieldDoc { path: "prometheus.push_gateway.interval", setting_type: "string", default: "\"15s\"", range: "duration text", doc: "Push interval for the exposition." },
-            FieldDoc { path: "prometheus.push_gateway.job_name", setting_type: "string", default: "\"${name}/instance/${name}~${host}\"", range: "template text", doc: "Job name template for each push." },
-            FieldDoc { path: "prometheus.push_gateway.method", setting_type: "string", default: "\"put\"", range: "put | post", doc: "Push method for the exposition." },
-            FieldDoc { path: "prometheus.collectors.mnesia", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Store collector switch for load analysis." },
-            FieldDoc { path: "prometheus.collectors.vm_dist", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Distribution collector switch for load analysis." },
-            FieldDoc { path: "prometheus.collectors.vm_memory", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Memory collector switch for load analysis." },
-            FieldDoc { path: "prometheus.collectors.vm_msacc", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Microstate accounting collector switch for load analysis." },
-            FieldDoc { path: "prometheus.collectors.vm_statistics", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "Statistics collector switch for load analysis." },
-            FieldDoc { path: "prometheus.collectors.vm_system_info", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled", doc: "System information collector switch for load analysis." },
+            FieldDoc { path: "session.max_qos1_inflight", setting_type: "usize", default: "100", range: "1..=100000", doc: "Per-session QoS 1 inflight window bound.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "session.max_qos1_spill", setting_type: "usize", default: "1000", range: "1..=100000", doc: "Per-session QoS 1 spill bound past the window.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "session.topic_alias_maximum", setting_type: "u16", default: "10", range: "0..=65535", doc: "Inbound topic-alias maximum advertised in CONNACK.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "session.max_packet_size", setting_type: "u32", default: "1048576", range: "1..=268435455", doc: "Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "rules_engine.spill_dir", setting_type: "string", default: "\"\"", range: "empty or directory path", doc: "Rule ingress spill directory.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "delayed.max_secs", setting_type: "u64", default: "86400", range: "1..=86400", doc: "Upper bound for delayed deferrals in seconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "observability.monitor_sample_secs", setting_type: "u64", default: "10", range: "0..=3600", doc: "Monitor sampling interval in seconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.url", setting_type: "string", default: "\"\"", range: "empty or https URL", doc: "JWKS endpoint URL for JWT authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.issuer", setting_type: "string", default: "\"\"", range: "any string", doc: "Expected JWT issuer.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.audience", setting_type: "string", default: "\"\"", range: "any string", doc: "Expected JWT audience.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.postgres_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "PostgreSQL URL for database authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "HTTP webhook verdict endpoint.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.refresh_period_secs", setting_type: "u64", default: "300", range: "1..=86400", doc: "Seconds between background JWKS refreshes.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.fetch_timeout_ms", setting_type: "u64", default: "5000", range: "100..=60000", doc: "Timeout for one JWKS fetch in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.refresh_timeout_ms", setting_type: "u64", default: "5000", range: "100..=60000", doc: "Longest a CONNECT waits for a JWKS refresh in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.cache_max_keys", setting_type: "usize", default: "32", range: "1..=256", doc: "Most JWKS keys held in the cache.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.cache_ttl_secs", setting_type: "u64", default: "300", range: "1..=86400", doc: "Seconds a cached JWKS key stays valid.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.clock_skew_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Clock skew tolerated when checking token times, in seconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "jwks.ca_cert", setting_type: "string", default: "\"\"", range: "empty or path to a PEM file", doc: "Extra CA certificate trusted for the JWKS endpoint.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.mysql_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "MySQL URL for database authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.redis_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "Redis URL for database authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.mongodb_url", setting_type: "string", default: "\"\"", range: "empty or URL", doc: "MongoDB URL for database authentication.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.pool_size", setting_type: "usize", default: "8", range: "1..=32", doc: "Connections kept per authentication database.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.connect_timeout_ms", setting_type: "u64", default: "3000", range: "100..=60000", doc: "Timeout for connecting to an authentication database in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.read_timeout_ms", setting_type: "u64", default: "3000", range: "100..=60000", doc: "Timeout for one authentication lookup in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.cache_size", setting_type: "usize", default: "1024", range: "0..=100000", doc: "Cached database verdicts per source; 0 disables the cache.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "dbauth.cache_ttl_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Seconds a cached database verdict stays valid.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.pool_size", setting_type: "usize", default: "8", range: "1..=32", doc: "Concurrent requests allowed to the webhook endpoint.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.timeout_ms", setting_type: "u64", default: "2000", range: "100..=60000", doc: "Timeout for one webhook request in milliseconds.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.breaker_threshold", setting_type: "u32", default: "5", range: "1..=100", doc: "Consecutive webhook failures that open the circuit breaker.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.breaker_reset_ms", setting_type: "u64", default: "30000", range: "1000..=600000", doc: "Milliseconds an open circuit breaker waits before retrying the webhook.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.cache_size", setting_type: "usize", default: "1024", range: "0..=100000", doc: "Cached webhook verdicts; 0 disables the cache.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "webhook.cache_ttl_secs", setting_type: "u64", default: "60", range: "0..=3600", doc: "Seconds a cached webhook verdict stays valid.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.enable_basic_auth", setting_type: "bool", default: "true", range: "true | false", doc: "Require credentials on the scrape endpoints.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.latency_buckets", setting_type: "string", default: "\"10ms, 100ms, 1s, 5s, 30s\"", range: "comma-separated durations", doc: "Latency histogram buckets for the exposition.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.push_gateway.enable", setting_type: "bool", default: "false", range: "true | false",                 doc: "Stored push intent. The broker runs no push client.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.push_gateway.url", setting_type: "string", default: "\"http://127.0.0.1:9091\"", range: "http(s) URL", doc: "Push target URL for the exposition.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.push_gateway.interval", setting_type: "string", default: "\"15s\"", range: "duration text", doc: "Push interval for the exposition.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.push_gateway.job_name", setting_type: "string", default: "\"${name}/instance/${name}~${host}\"", range: "template text", doc: "Job name template for each push.", requires_restart: None },
+            FieldDoc { path: "prometheus.push_gateway.method", setting_type: "string", default: "\"put\"", range: "put | post", doc: "Push method for the exposition.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.mnesia", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_dist", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_memory", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_msacc", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_statistics", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
+            FieldDoc { path: "prometheus.collectors.vm_system_info", setting_type: "enum string", default: "\"disabled\"", range: "enabled | disabled",                 doc: "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+            requires_restart: None,
+            },
         ]
 }
 
@@ -3274,7 +3456,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 str_field(
                     "spill_dir",
                     "",
-                    "Rule ingress spill directory. Empty keeps memory-only DropOldest; set to a directory to build the rule engine with SpillToDisk backpressure (1 MiB segments, 64 MiB total).",
+                    "Rule ingress spill directory.",
                 ),
             ],
         ),
@@ -3306,7 +3488,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 bool_field(
                     "enabled",
                     false,
-                    "Whether multi-node distributed clustering is enabled.",
+                    "Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.",
                 ),
                 str_field(
                     "bind",
@@ -3316,12 +3498,12 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 str_field(
                     "gossip_bind",
                     "0.0.0.0:7946",
-                    "Gossip membership bind address for peer discovery.",
+                    "Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only.",
                 ),
                 str_field(
                     "quic_bind",
                     "0.0.0.0:9092",
-                    "Multiplexed data plane bind address for inter-broker message routing.",
+                    "Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only.",
                 ),
                 list_field(
                     "seed_nodes",
@@ -3702,7 +3884,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 bool_field(
                     "push_gateway.enable",
                     false,
-                    "Push the exposition to the push target.",
+                    "Stored push intent. The broker runs no push client.",
                 ),
                 str_field(
                     "push_gateway.url",
@@ -3729,37 +3911,37 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                     "collectors.mnesia",
                     "disabled",
                     &["enabled", "disabled"],
-                    "Store collector switch for load analysis.",
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
                 ),
                 enum_field(
                     "collectors.vm_dist",
                     "disabled",
                     &["enabled", "disabled"],
-                    "Distribution collector switch for load analysis.",
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
                 ),
                 enum_field(
                     "collectors.vm_memory",
                     "disabled",
                     &["enabled", "disabled"],
-                    "Memory collector switch for load analysis.",
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
                 ),
                 enum_field(
                     "collectors.vm_msacc",
                     "disabled",
                     &["enabled", "disabled"],
-                    "Microstate accounting collector switch for load analysis.",
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
                 ),
                 enum_field(
                     "collectors.vm_statistics",
                     "disabled",
                     &["enabled", "disabled"],
-                    "Statistics collector switch for load analysis.",
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
                 ),
                 enum_field(
                     "collectors.vm_system_info",
                     "disabled",
                     &["enabled", "disabled"],
-                    "System information collector switch for load analysis.",
+                    "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
                 ),
             ],
         ),
@@ -4262,5 +4444,132 @@ mod tests {
         let toml_text = config.to_toml().expect("defaults serialise");
         let reparsed = BrokerConfig::parse_toml(&toml_text).expect("defaults round-trip");
         assert_eq!(reparsed.session.max_qos0_backlog, 1_000);
+    }
+
+    /// Drift test for the generated configuration page (DOC-02).
+    ///
+    /// The generator owns the page. This test runs it in check mode.
+    /// It then parses each `toml test` block through the production
+    /// file loader, so no example goes out of date.
+    #[test]
+    fn generated_configuration_page_matches_schema() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let output = std::process::Command::new("python3")
+            .arg("tools/gen_reference_docs.py")
+            .arg("--check")
+            .arg("config")
+            .current_dir(&root)
+            .output()
+            .expect("python3 runs the generator");
+        assert!(
+            output.status.success(),
+            "generator check failed:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let page =
+            std::fs::read_to_string(root.join("docs").join("reference").join("configuration.md"))
+                .expect("committed page exists");
+        // Each documented row names a catalogued setting.
+        let mut rows = 0;
+        for line in page.lines() {
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let path = line.split('`').nth(1).expect("row carries a setting name");
+            assert!(
+                doc_for(path).is_some(),
+                "documented setting is catalogued: {path}"
+            );
+            rows += 1;
+        }
+        // Each catalogued setting owns one row.
+        for row in field_docs() {
+            assert!(page.contains(row.path), "page documents {}", row.path);
+        }
+        assert_eq!(
+            rows,
+            field_docs().len(),
+            "page documents each setting exactly once"
+        );
+        // Each row carries the restart need from the catalogue.
+        for line in page.lines() {
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let path = line.split('`').nth(1).expect("row carries a setting name");
+            let row = field_docs()
+                .into_iter()
+                .find(|row| row.path == path)
+                .expect("documented setting is catalogued");
+            let want = match row.requires_restart {
+                Some(true) => "| yes |",
+                Some(false) => "| no |",
+                None => "|  |",
+            };
+            assert!(
+                line.trim_end().ends_with(want),
+                "row carries the restart need: {path}"
+            );
+        }
+        // Each catalogued setting owns one detail entry.
+        let mut headings = 0;
+        for line in page.lines() {
+            if line.starts_with("### `") && line.ends_with('`') {
+                let path = line.trim_start_matches("### `").trim_end_matches('`');
+                assert!(
+                    doc_for(path).is_some(),
+                    "detail entry is catalogued: {path}"
+                );
+                headings += 1;
+            }
+        }
+        assert_eq!(
+            headings,
+            field_docs().len(),
+            "page carries one detail entry per setting"
+        );
+        // Each configuration example loads through the file loader.
+        let mut blocks = 0;
+        let mut fenced = String::new();
+        let mut current: Option<String> = None;
+        for line in page.lines() {
+            if line.trim_start().starts_with("```toml") {
+                current = Some(String::new());
+                continue;
+            }
+            if line.trim_start().starts_with("```") {
+                if let Some(text) = current.take() {
+                    let parsed = BrokerConfig::parse_toml(&text).expect("page example parses");
+                    parsed.validate().expect("page example validates");
+                    fenced.push_str(&text);
+                    fenced.push('\n');
+                    blocks += 1;
+                }
+                continue;
+            }
+            if let Some(text) = current.as_mut() {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        assert!(blocks >= 1, "page carries at least one tested example");
+        // Each example line sits in a fenced file, except
+        // `node.data_dir`: the file omits its relative default.
+        for row in field_docs() {
+            if row.path == "node.data_dir" {
+                continue;
+            }
+            let leaf = row.path.rsplit('.').next().expect("leaf");
+            let want = format!("{leaf} = ");
+            assert!(
+                fenced
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&want)),
+                "fenced file sets {}",
+                row.path
+            );
+        }
     }
 }

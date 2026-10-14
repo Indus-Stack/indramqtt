@@ -1475,4 +1475,77 @@ mod tests {
         assert!(snap.connections <= 99);
         assert!(snap.subscriptions <= 198);
     }
+
+    /// Drift test for the generated metrics page (DOC-02).
+    ///
+    /// The generator owns the page. This test runs it in check mode.
+    /// It then checks each documented name against the code that
+    /// registers it: the exposition for exposed counters, the
+    /// snapshot shape for snapshot fields.
+    #[test]
+    fn generated_metrics_page_matches_registered_metrics() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let output = std::process::Command::new("python3")
+            .arg("tools/gen_reference_docs.py")
+            .arg("--check")
+            .arg("metrics")
+            .current_dir(&root)
+            .output()
+            .expect("python3 runs the generator");
+        assert!(
+            output.status.success(),
+            "generator check failed:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let page = std::fs::read_to_string(root.join("docs").join("reference").join("metrics.md"))
+            .expect("committed page exists");
+        let exposed = page
+            .split("## Snapshot counters")
+            .next()
+            .expect("exposed section exists");
+        let snapshot = page
+            .split("## Snapshot counters")
+            .nth(1)
+            .expect("snapshot section exists");
+        let metrics = Metrics::new();
+        let text = metrics.render_prometheus_metrics();
+        let mut exposed_rows = 0;
+        for line in exposed.lines() {
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let name = line.split('`').nth(1).expect("row carries a name");
+            assert!(
+                text.contains(name),
+                "exposition serves documented metric {name}"
+            );
+            exposed_rows += 1;
+        }
+        assert!(exposed_rows >= 1, "page lists exposed metrics");
+        // Each exposition name owns one row, so the page cannot
+        // miss a counter that the broker serves.
+        for line in text.lines() {
+            let name = line.split_whitespace().next().unwrap_or("");
+            if !name.starts_with("indramqtt_") {
+                continue;
+            }
+            assert!(page.contains(name), "page documents served metric {name}");
+        }
+        let shape = format!("{:?}", MetricsSnapshot::default());
+        let mut snapshot_rows = 0;
+        for line in snapshot.lines() {
+            if !line.starts_with("| `") {
+                continue;
+            }
+            let field = line.split('`').nth(1).expect("row carries a field");
+            assert!(
+                shape.contains(field),
+                "snapshot carries documented field {field}"
+            );
+            snapshot_rows += 1;
+        }
+        assert!(snapshot_rows >= 1, "page lists snapshot fields");
+    }
 }
