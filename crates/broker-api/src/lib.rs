@@ -357,6 +357,13 @@ pub struct ApiState {
     /// path reads it. Management-plane only; publish and deliver never
     /// touch this store.
     pub mcp: Arc<crate::mcp::McpStore>,
+    /// Running message collects for `POST /mcp` tool
+    /// `subscribe_collect` (MC-04): bounded filter-keyed slots fed by
+    /// the publish paths. The kernel shares its instance (the serve
+    /// path hands it over), so MQTT ingress feeds the same slots the
+    /// tool drains. Idle publishes pay one atomic load; feeds take one
+    /// short lock and clone only for matching slots.
+    pub collectors: Arc<crate::mcp::CollectRegistry>,
     ws_conn_counter: Arc<AtomicU64>,
 }
 
@@ -625,6 +632,7 @@ impl ApiState {
             ),
             namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
             mcp: Arc::new(crate::mcp::McpStore::new()),
+            collectors: Arc::new(crate::mcp::CollectRegistry::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -733,6 +741,7 @@ impl ApiState {
             schema_registry: Arc::new(crate::v5::schema_registry::SchemaRegistryStore::new()),
             namespaces: Arc::new(crate::v5::mt::NamespaceStore::new()),
             mcp: Arc::new(crate::mcp::McpStore::new()),
+            collectors: Arc::new(crate::mcp::CollectRegistry::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
         }
     }
@@ -834,7 +843,9 @@ pub fn router(state: ApiState) -> Router {
         // a disabled endpoint answers 404. Tool calls re-enter the router
         // below, so key scopes and the viewer rule apply through the same
         // middleware. The default body cap stays off here: the handler
-        // enforces the 8 MiB tool limit itself.
+        // enforces the 8 MiB tool limit itself. The `subscribe_collect`
+        // messaging tool (MC-04) rides the same endpoint and the same
+        // key check; its temporary subscription is management-plane only.
         .route(
             "/mcp",
             post(crate::mcp::post_mcp).layer(axum::extract::DefaultBodyLimit::disable()),

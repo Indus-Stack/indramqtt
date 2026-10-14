@@ -4087,6 +4087,12 @@ struct Shared {
     /// first (one relaxed atomic load, no lock, no allocation when
     /// disabled). Disabled by default: no sessions means no capture.
     tracing: Arc<broker_api::v5::tracing::TracingFlagStore>,
+    /// Running message collects for `POST /mcp` tool
+    /// `subscribe_collect` (MC-04): bounded filter-keyed slots shared
+    /// with the management API so kernel ingress feeds the same slots
+    /// the tool drains. One Arc clone; the publish fast path pays one
+    /// relaxed atomic load when no collect runs.
+    collectors: Arc<broker_api::mcp::CollectRegistry>,
     /// Async handoff from the egress hook to the slow recorder (F1-03).
     /// Bounded at [`SLOW_RECORD_CHANNEL_BOUND`] pending records (each a
     /// topic truncated to 512 chars plus two integers, well under one
@@ -4362,6 +4368,7 @@ impl Shared {
             ),
             traces: Arc::new(broker_api::v5::trace::TraceStore::new()),
             tracing: Arc::new(broker_api::v5::tracing::TracingFlagStore::new()),
+            collectors: Arc::new(broker_api::mcp::CollectRegistry::new()),
             slow_tx,
             slow_rx: Arc::new(tokio::sync::Mutex::new(Some(slow_rx))),
             slow_burst_start_ms: Arc::new(AtomicU64::new(0)),
@@ -7778,6 +7785,13 @@ async fn ingress_pipeline_with_publisher_and_props(
     // only for matching sessions.
     maybe_capture_trace(shared, publisher, topic, payload);
 
+    // Agent collects (MC-04): hand accepted ingress to running collects
+    // in the publisher tenant. Idle publishes pay one atomic load
+    // inside `feed`; feeds clone only for matching collects.
+    shared
+        .collectors
+        .feed(publisher_tenant, topic, qos, retain, payload);
+
     let deliveries = build_downlink_frames_with_publisher_and_props(
         &shared.router,
         &shared.sessions,
@@ -10552,6 +10566,10 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // appends reuse the store's per-session byte cap.
     state.traces = shared.traces.clone();
     state.tracing = shared.tracing.clone();
+    // Share the collect registry (MC-04) so kernel ingress feeds the
+    // same slots the `subscribe_collect` tool drains. One `Arc` clone;
+    // the publish fast path pays one atomic load when idle.
+    state.collectors = shared.collectors.clone();
     // SY-02: share the boot-resolved listeners and startup provenance so
     // `GET /listeners` and `explain` report the running configuration
     // instead of defaults. `None` in tests keeps the defaults behaviour.

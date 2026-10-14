@@ -4,8 +4,8 @@
 //! Protocol with JSON responses: `initialize`, `ping`, `tools/list`
 //! and `tools/call`. It authenticates API keys through the same code
 //! path as the management API (`api_auth`) and refuses dashboard login
-//! tokens: an agent authenticates with a key. A key needs the
-//! `monitoring` scope for `/mcp` itself. Each tool call then re-enters
+//! tokens: an agent authenticates with a key. A key reaches `/mcp`
+//! itself with the `monitoring` scope or the `publish` scope. Each tool call then re-enters
 //! the live axum router in process with the same `Authorization`
 //! header. Per-operation scopes and the viewer rule apply exactly as
 //! over HTTP. One request body holds one JSON-RPC object or one batch
@@ -15,8 +15,13 @@
 //! and deliver never touch this module.
 
 pub mod catalog;
+pub mod collect;
 pub mod route_scan;
 
+use crate::admin_users::AdminRole;
+use crate::api_auth::{parse_credentials, Credentials};
+use crate::v5::api_keys::{key_decision, KeyDecision, KeyGrant, KeyRole};
+use crate::ApiState;
 use axum::{
     body::Body,
     extract::{Query, State},
@@ -24,17 +29,15 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use broker_protocol::{QoS, TopicFilter};
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::admin_users::AdminRole;
-use crate::api_auth::{parse_credentials, Credentials};
-use crate::v5::api_keys::{key_decision, KeyDecision, KeyGrant, KeyRole};
-use crate::ApiState;
-
 use catalog::{build_catalog, list_entry_for, tool_by_name, ToolDef};
+
+pub use collect::CollectRegistry;
 
 /// Largest `/mcp` request body in bytes (8 MiB).
 /// Reason: one operator call stays far below the disk-backed store
@@ -221,7 +224,8 @@ struct RpcCall {
 ///
 /// Disabled answers 404 before authentication runs. Missing or wrong
 /// credentials answer 401 with the management error shape, never a
-/// JSON-RPC body. A key without the `monitoring` scope answers 403.
+/// JSON-RPC body. A key with neither the `monitoring` scope nor the
+/// `publish` scope answers 403.
 /// Oversize bodies answer 413. Anything else answers 200 with a
 /// JSON-RPC response. A notification answers 202 with an empty body.
 pub async fn post_mcp(
@@ -275,30 +279,37 @@ pub async fn post_mcp(
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    // A key needs the `monitoring` scope for `/mcp` itself.
-    // Per-tool scopes apply again inside each call.
+    // A key reaches `/mcp` itself with the `monitoring` scope or
+    // with the `publish` scope. The messaging tools (`publish` plus
+    // `subscribe_collect`) need publish rights only, so a publish-only
+    // key must get past this gate. Per-tool scopes apply again inside
+    // each call, so no tool escapes its own scope here.
     if let Some(grant) = caller.grant.clone() {
-        match key_decision(&grant, "/mcp") {
-            KeyDecision::Allowed => {}
-            KeyDecision::LoginOnly => {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({
-                        "code": "FORBIDDEN",
-                        "message": "this operation needs an API key",
-                    })),
-                )
-                    .into_response();
-            }
-            KeyDecision::Forbidden => {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({
-                        "code": "FORBIDDEN",
-                        "message": "this API key has no right to call /mcp",
-                    })),
-                )
-                    .into_response();
+        let monitoring = key_decision(&grant, "/mcp");
+        let publishing = key_decision(&grant, "/api/v5/publish");
+        if monitoring != KeyDecision::Allowed && publishing != KeyDecision::Allowed {
+            match monitoring {
+                KeyDecision::Allowed => {}
+                KeyDecision::LoginOnly => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "code": "FORBIDDEN",
+                            "message": "this operation needs an API key",
+                        })),
+                    )
+                        .into_response();
+                }
+                KeyDecision::Forbidden => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "code": "FORBIDDEN",
+                            "message": "this API key has no right to call /mcp",
+                        })),
+                    )
+                        .into_response();
+                }
             }
         }
     }
@@ -427,7 +438,14 @@ async fn serve_call_value(
         "ping" => with_envelope(&call.id, serde_json::json!({"result": {}})),
         "tools/list" => {
             let tools = visible_tools(state, caller, query);
-            let entries: Vec<Value> = tools.iter().map(tool_list_entry).collect();
+            let mut entries: Vec<Value> = tools
+                .iter()
+                .filter(|tool| tool.name != SUBSCRIBE_COLLECT_TOOL)
+                .map(tool_list_entry)
+                .collect();
+            if tools.iter().any(|tool| tool.name == SUBSCRIBE_COLLECT_TOOL) {
+                entries.push(subscribe_collect_entry());
+            }
             with_envelope(&call.id, serde_json::json!({"result": {"tools": entries}}))
         }
         "tools/call" => {
@@ -441,10 +459,14 @@ async fn serve_call_value(
     Some(answer)
 }
 
-/// Tools the caller may see: the selected toolsets minus the tools
-/// the key may not call. `list_toolsets` is always present.
+/// Tools the caller may see for the selected toolsets.
+/// Unknown names select nothing and give an empty list.
+/// `list_toolsets` is present for each known selection.
 fn visible_tools(state: &ApiState, caller: &Caller, query: &ToolsetQuery) -> Vec<ToolDef> {
     let selected = select_toolsets(query);
+    if selected.is_empty() {
+        return Vec::new();
+    }
     let mut out = vec![list_toolsets_def()];
     out.extend(
         build_catalog()
@@ -452,6 +474,10 @@ fn visible_tools(state: &ApiState, caller: &Caller, query: &ToolsetQuery) -> Vec
             .filter(|tool| selected.contains(&tool.toolset))
             .filter(|tool| caller_may_call(state, caller, tool)),
     );
+    let collect = subscribe_collect_def();
+    if selected.contains(&collect.toolset) && caller_may_call(state, caller, &collect) {
+        out.push(collect);
+    }
     out
 }
 
@@ -499,6 +525,62 @@ fn tool_list_entry(tool: &ToolDef) -> Value {
         });
     }
     list_entry_for(tool)
+}
+
+/// Name of the temporary-subscription collect tool (MC-04). It has
+/// no HTTP route: it registers a temporary internal subscription,
+/// drains matching publishes until its limit or its time bound, then
+/// removes the subscription on every exit path.
+pub const SUBSCRIBE_COLLECT_TOOL: &str = "subscribe_collect";
+
+/// Short description of the collect tool.
+const SUBSCRIBE_COLLECT_SUMMARY: &str = "Subscribe briefly and collect matching messages.";
+
+/// Input schema of the collect tool. Hand-written: no HTTP route
+/// defines it. Limits come from the task: 1 to 100 messages, 1 to 30
+/// seconds, QoS 0 or 1.
+fn subscribe_collect_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "topic_filter": {"type": "string"},
+            "max_messages": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
+            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5},
+            "qos": {"type": "integer", "enum": [0, 1]}
+        },
+        "required": ["topic_filter", "qos"]
+    })
+}
+
+/// Definition of the collect tool for permission checks. It rides the
+/// `publish` toolset (core) and needs the publish scope, exactly like
+/// the publish operation. The HTTP subscribe operation is a POST (a
+/// write for viewers), so read-only mode and the viewer role hide it.
+/// Keys carry no tenant here, so the collect observes the default
+/// tenant only, like every management publish.
+fn subscribe_collect_def() -> ToolDef {
+    ToolDef {
+        name: SUBSCRIBE_COLLECT_TOOL.to_string(),
+        method: "POST",
+        path: "/api/v5/publish",
+        summary: SUBSCRIBE_COLLECT_SUMMARY,
+        read_only: false,
+        destructive: false,
+        toolset: "publish",
+    }
+}
+
+/// One `tools/list` entry for the collect tool.
+fn subscribe_collect_entry() -> Value {
+    serde_json::json!({
+        "name": SUBSCRIBE_COLLECT_TOOL,
+        "description": SUBSCRIBE_COLLECT_SUMMARY,
+        "inputSchema": subscribe_collect_schema(),
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": false,
+        },
+    })
 }
 
 /// The pseudo-tool behind `list_toolsets`. It is always present and
@@ -596,6 +678,28 @@ async fn call_tool(
         return (200, broker_status_result(), name.to_string());
     }
     let catalog = build_catalog();
+    if name == SUBSCRIBE_COLLECT_TOOL {
+        let def = subscribe_collect_def();
+        if state.mcp.read_only() && !def.read_only {
+            return (
+                403,
+                serde_json::json!({"result": {
+                    "content": [{"type": "text", "text": "FORBIDDEN: the MCP endpoint is read-only"}],
+                    "isError": true,
+                }}),
+                name.to_string(),
+            );
+        }
+        if !caller_may_call(state, caller, &def) {
+            return (
+                403,
+                rpc_error(-32602, "this key may not call this tool"),
+                name.to_string(),
+            );
+        }
+        let (status, result) = call_collect(state, &arguments).await;
+        return (status, result, name.to_string());
+    }
     let tool = match tool_by_name(&catalog, name) {
         Some(tool) => tool.clone(),
         None => {
@@ -650,6 +754,208 @@ async fn call_tool(
     (status, result, name.to_string())
 }
 
+/// Run the `subscribe_collect` tool: register a temporary internal
+/// subscription, collect until the limit or the time bound, then
+/// remove the subscription. The guard removes it on every exit path.
+/// Keys carry no tenant here, so the collect observes the default
+/// tenant only, like every management publish.
+async fn call_collect(
+    state: &ApiState,
+    arguments: &serde_json::Map<String, Value>,
+) -> (u16, Value) {
+    let filter_text = match arg_string(arguments, "topic_filter", true) {
+        Ok(value) => value.unwrap_or_default(),
+        Err(message) => return (400, rpc_error(-32602, &invalid_params(&message))),
+    };
+    if broker_router::strip_delayed_prefix(&filter_text).is_some() {
+        return (
+            400,
+            rpc_error(
+                -32602,
+                "invalid params: delayed topics cannot be subscribed",
+            ),
+        );
+    }
+    let filter = match TopicFilter::new(filter_text.clone()) {
+        Ok(filter) => filter,
+        Err(error) => {
+            return (
+                400,
+                rpc_error(
+                    -32602,
+                    &invalid_params(&format!("invalid topic filter `{filter_text}`: {error}")),
+                ),
+            );
+        }
+    };
+    let max_messages = match arg_bounded(arguments, "max_messages", 10, 1, 100) {
+        Ok(value) => value as usize,
+        Err(message) => return (400, rpc_error(-32602, &invalid_params(&message))),
+    };
+    let timeout_secs = match arg_bounded(arguments, "timeout_seconds", 5, 1, 30) {
+        Ok(value) => value,
+        Err(message) => return (400, rpc_error(-32602, &invalid_params(&message))),
+    };
+    let qos_raw = match arguments.get("qos") {
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(0) => 0u8,
+            Some(1) => 1u8,
+            _ => {
+                return (
+                    400,
+                    rpc_error(-32602, "invalid params: field `qos` must be 0 or 1"),
+                );
+            }
+        },
+        Some(_) => {
+            return (
+                400,
+                rpc_error(-32602, "invalid params: field `qos` must be 0 or 1"),
+            );
+        }
+        None => {
+            return (
+                400,
+                rpc_error(-32602, "invalid params: field `qos` is required"),
+            );
+        }
+    };
+    // TODO(parity): should a future per-key tenant scope the collect?
+    // No key record holds one today; the conservative choice keeps
+    // default-only reads.
+    let tenant = broker_session::tenant::DEFAULT_TENANT_ID;
+    let handle = match state.collectors.register(filter.clone(), qos_raw, tenant) {
+        Ok(handle) => handle,
+        Err(collect::CollectError::Full) => {
+            return (
+                429,
+                serde_json::json!({"result": {
+                    "content": [{"type": "text", "text": "TOO_MANY_REQUESTS: too many concurrent collects"}],
+                    "isError": true,
+                }}),
+            );
+        }
+    };
+    let qos = if qos_raw == 1 {
+        QoS::AtLeastOnce
+    } else {
+        QoS::AtMostOnce
+    };
+    if !state.router.subscribe(
+        &filter,
+        broker_router::Subscription::new_in_tenant(handle.client_id.as_str(), 0, qos, tenant),
+    ) {
+        state.collectors.unregister(handle.id);
+        return (
+            503,
+            serde_json::json!({"result": {
+                "content": [{"type": "text", "text": "TOO_MANY_REQUESTS: subscription table full"}],
+                "isError": true,
+            }}),
+        );
+    }
+    let collect::CollectHandle {
+        id: collect_id,
+        client_id,
+        filter,
+        tenant,
+        mut rx,
+    } = handle;
+    let guard = collect::CollectGuard {
+        registry: state.collectors.clone(),
+        router: state.router.clone(),
+        id: collect_id,
+        client_id,
+        filter,
+        tenant,
+    };
+    let mut messages = Vec::new();
+    // Retained replay: a new subscription observes stored retained
+    // messages first. Bounded by the collect limit. A failed lookup
+    // collects nothing; live messages still flow. A replayed message
+    // always carries the retain flag, like the kernel subscribe path.
+    if let Ok(stored) = state
+        .retained
+        .find_matching_in_tenant(&guard.filter, &guard.tenant)
+        .await
+    {
+        for one in stored.into_iter().take(max_messages) {
+            let (bytes, truncated) = collect::truncate_payload(&one.payload);
+            messages.push(collect::render_collected(&collect::CollectedMessage {
+                topic: one.topic.as_str().to_string(),
+                qos: std::cmp::min(u8::from(one.qos), qos_raw),
+                retain: true,
+                payload: bytes,
+                truncated,
+            }));
+        }
+    }
+    let deadline = std::time::Duration::from_secs(timeout_secs);
+    let _ = tokio::time::timeout(deadline, async {
+        while messages.len() < max_messages {
+            match rx.recv().await {
+                Some(next) => messages.push(collect::render_collected(&next)),
+                None => break,
+            }
+        }
+    })
+    .await;
+    drop(guard);
+    (
+        200,
+        serde_json::json!({"result": {
+            "content": [{"type": "text", "text": serde_json::json!({"messages": messages}).to_string()}],
+        }}),
+    )
+}
+
+/// Read one required string field. Fails closed on other types.
+fn arg_string(
+    args: &serde_json::Map<String, Value>,
+    field: &str,
+    required: bool,
+) -> Result<Option<String>, String> {
+    match args.get(field) {
+        None => {
+            if required {
+                return Err(format!("field `{field}` is required"));
+            }
+            Ok(None)
+        }
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(format!("field `{field}` must be a string")),
+    }
+}
+
+/// Read one bounded integer field with a default. Fails closed on
+/// other types and out-of-range values.
+fn arg_bounded(
+    args: &serde_json::Map<String, Value>,
+    field: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    match args.get(field) {
+        None => Ok(default),
+        Some(Value::Number(n)) => {
+            let value = n
+                .as_u64()
+                .ok_or_else(|| format!("field `{field}` must be an integer {min}..={max}"))?;
+            if value < min || value > max {
+                return Err(format!("field `{field}` must be an integer {min}..={max}"));
+            }
+            Ok(value)
+        }
+        Some(_) => Err(format!("field `{field}` must be an integer {min}..={max}")),
+    }
+}
+
+/// Prefix one validation detail for JSON-RPC invalid params.
+fn invalid_params(message: &str) -> String {
+    format!("invalid params: {message}")
+}
+
 /// One audit record per `tools/call`, through the existing audit log.
 /// The record carries the key name, the tool name and the result
 /// code. It never carries tool arguments: arguments may hold secrets.
@@ -691,13 +997,17 @@ fn broker_status_result() -> Value {
 /// caller permission: a key sees only the tools it may call.
 fn list_toolsets_result(state: &ApiState, caller: &Caller) -> Value {
     let catalog = build_catalog();
+    let collect = subscribe_collect_def();
     let mut sets: Vec<Value> = Vec::new();
     for set in catalog::TOOLSETS {
-        let tools: Vec<&ToolDef> = catalog
+        let mut tools: Vec<&ToolDef> = catalog
             .iter()
             .filter(|tool| tool.toolset == set.name)
             .filter(|tool| caller_may_call(state, caller, tool))
             .collect();
+        if set.name == collect.toolset && caller_may_call(state, caller, &collect) {
+            tools.push(&collect);
+        }
         if tools.is_empty() {
             continue;
         }
@@ -1068,5 +1378,392 @@ mod tests {
         assert_eq!(catalog::toolset_for("/api/v5/mt/ns_list"), "tenants");
         assert_eq!(catalog::toolset_for("/api/v5/listeners"), "listeners");
         assert_eq!(catalog::toolset_for("/api/v5/configs"), "configuration");
+    }
+
+    /// Standalone state with one administrator key. Proofs below read
+    /// through a real loopback socket; setup writes (keys) mirror boot.
+    fn keyed_state() -> (ApiState, String) {
+        let engine = std::sync::Arc::new(broker_rules::RuleEngine::new(
+            16,
+            broker_rules::BackpressurePolicy::DropOldest,
+        ));
+        let state = ApiState::standalone(engine);
+        let mut new = crate::v5::api_keys::NewApiKey::new("mcp-admin");
+        new.role = crate::v5::api_keys::KeyRole::Administrator;
+        let secret = state.api_keys.create(new).expect("key mints").1;
+        (state, secret)
+    }
+
+    /// Socket client for the handler tests: the real production
+    /// router on a real loopback socket. Every proof below reads
+    /// through HTTP.
+    #[derive(Clone, Copy)]
+    struct McpClient {
+        port: u16,
+    }
+
+    impl McpClient {
+        /// POST one path with a JSON body through the socket.
+        async fn post(
+            &self,
+            path: &str,
+            token: Option<&str>,
+            body: &serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let raw = serde_json::to_vec(body).expect("test body serialises");
+            let mut head = format!(
+                "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+                raw.len()
+            );
+            if let Some(token) = token {
+                head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            }
+            head.push_str("Connection: close\r\n\r\n");
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                .await
+                .expect("connect test server");
+            stream.write_all(head.as_bytes()).await.expect("write head");
+            stream.write_all(&raw).await.expect("write body");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let text = String::from_utf8(buf).expect("response is UTF-8");
+            let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
+            let status: u16 = head.lines().next().expect("status line")[9..12]
+                .parse()
+                .expect("status code");
+            let json = if body.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(body).expect("response body is JSON")
+            };
+            (
+                StatusCode::from_u16(status).expect("test status is valid"),
+                json,
+            )
+        }
+    }
+
+    /// One served test router plus its client. Dropped at test end.
+    struct McpServer {
+        client: McpClient,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl McpServer {
+        async fn start(state: ApiState) -> Self {
+            let app = crate::router(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let port = listener.local_addr().expect("local addr").port();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve test app");
+            });
+            Self {
+                client: McpClient { port },
+                task,
+            }
+        }
+    }
+
+    impl Drop for McpServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Mint one API key in the store. Setup write; proofs use HTTP.
+    fn mint_key(state: &ApiState, name: &str, role: crate::v5::api_keys::KeyRole) -> String {
+        let mut new = crate::v5::api_keys::NewApiKey::new(name);
+        new.role = role;
+        state.api_keys.create(new).expect("key mints").1
+    }
+
+    /// Names of the listed tools for one credential through the socket.
+    async fn listed_names(client: &McpClient, token: &str) -> Vec<String> {
+        let (status, body) = client
+            .post(
+                "/mcp",
+                Some(token),
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        body["result"]["tools"]
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn default_list_holds_the_messaging_tools() {
+        let (state, token) = keyed_state();
+        let server = McpServer::start(state).await;
+        let names = listed_names(&server.client, &token).await;
+        assert!(
+            names.contains(&"post_api_v5_publish".to_string()),
+            "core set holds the publish operation"
+        );
+        assert!(names.contains(&SUBSCRIBE_COLLECT_TOOL.to_string()));
+        let (status, body) = server
+            .client
+            .post(
+                "/mcp",
+                Some(&token),
+                &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"].as_array().expect("tools list");
+        let collect = tools
+            .iter()
+            .find(|tool| tool["name"] == SUBSCRIBE_COLLECT_TOOL)
+            .expect("collect entry");
+        assert_eq!(
+            collect["annotations"]["readOnlyHint"],
+            serde_json::json!(false)
+        );
+        assert!(collect["inputSchema"]["properties"]
+            .as_object()
+            .expect("schema properties")
+            .contains_key("topic_filter"));
+    }
+
+    #[tokio::test]
+    async fn collect_validates_its_limits_through_the_socket() {
+        let (state, token) = keyed_state();
+        let server = McpServer::start(state).await;
+        for args in [
+            serde_json::json!({"topic_filter": "a/b", "qos": 0, "max_messages": 101}),
+            serde_json::json!({"topic_filter": "a/b", "qos": 0, "timeout_seconds": 0}),
+            serde_json::json!({"topic_filter": "a/b", "qos": 0, "timeout_seconds": 31}),
+            serde_json::json!({"topic_filter": "a/b", "qos": 2}),
+            serde_json::json!({"topic_filter": "a/b"}),
+            serde_json::json!({"topic_filter": "bad/#/x", "qos": 0}),
+        ] {
+            let (status, body) = server
+                .client
+                .post(
+                    "/mcp",
+                    Some(&token),
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 5,
+                        "method": "tools/call",
+                        "params": {"name": SUBSCRIBE_COLLECT_TOOL, "arguments": args}
+                    }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body["error"]["code"],
+                serde_json::json!(-32602),
+                "args {args} fail"
+            );
+        }
+    }
+
+    /// Publish one message through the HTTP route on the same server.
+    async fn http_publish(client: &McpClient, token: &str, topic: &str, payload: &str) {
+        let (status, _) = client
+            .post(
+                "/api/v5/publish",
+                Some(token),
+                &serde_json::json!({"topic": topic, "payload": payload}),
+            )
+            .await;
+        assert!(
+            status == StatusCode::OK
+                || status == StatusCode::ACCEPTED
+                || status == StatusCode::SERVICE_UNAVAILABLE,
+            "publish answers, got {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_returns_published_messages_through_the_socket() {
+        let (state, token) = keyed_state();
+        let server = McpServer::start(state.clone()).await;
+        // A publish before the collect registers never arrives.
+        // Collects observe publishes inside their own window.
+        http_publish(&server.client, &token, "mcp/self/one", "hello").await;
+        let client = server.client;
+        let call_token = token.clone();
+        let pending = tokio::spawn(async move {
+            client
+                .post(
+                    "/mcp",
+                    Some(&call_token),
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 6,
+                        "method": "tools/call",
+                        "params": {
+                            "name": SUBSCRIBE_COLLECT_TOOL,
+                            "arguments": {
+                                "topic_filter": "mcp/self/#",
+                                "max_messages": 1,
+                                "timeout_seconds": 5,
+                                "qos": 0
+                            }
+                        }
+                    }),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        http_publish(&server.client, &token, "mcp/self/two", "world").await;
+        let (status, body) = pending.await.expect("collect ends");
+        assert_eq!(status, StatusCode::OK);
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: serde_json::Value = serde_json::from_str(text).expect("result is JSON");
+        let messages = result["messages"].as_array().expect("messages list");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["topic"], serde_json::json!("mcp/self/two"));
+        assert_eq!(messages[0]["payload"], serde_json::json!("world"));
+        assert_eq!(messages[0]["payload_encoding"], serde_json::json!("plain"));
+        assert_eq!(messages[0]["truncated"], serde_json::json!(false));
+        assert_eq!(state.collectors.count(), 0, "exit removes the collect");
+    }
+
+    #[tokio::test]
+    async fn collect_replays_retained_first_through_the_socket() {
+        let (state, token) = keyed_state();
+        let server = McpServer::start(state.clone()).await;
+        // A retained publish before the collect replays first, with
+        // the retain flag set like the kernel subscribe path.
+        let (status, _) = server
+            .client
+            .post(
+                "/api/v5/publish",
+                Some(&token),
+                &serde_json::json!({
+                    "topic": "mcp/ret/old",
+                    "payload": "stale",
+                    "retain": true
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "no subscriber yet");
+        let (status, body) = server
+            .client
+            .post(
+                "/mcp",
+                Some(&token),
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": SUBSCRIBE_COLLECT_TOOL,
+                        "arguments": {
+                            "topic_filter": "mcp/ret/#",
+                            "max_messages": 10,
+                            "timeout_seconds": 1,
+                            "qos": 0
+                        }
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let result: serde_json::Value = serde_json::from_str(text).expect("result is JSON");
+        let messages = result["messages"].as_array().expect("messages list");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["topic"], serde_json::json!("mcp/ret/old"));
+        assert_eq!(messages[0]["payload"], serde_json::json!("stale"));
+        assert_eq!(messages[0]["retain"], serde_json::json!(true));
+        assert_eq!(state.collectors.count(), 0, "exit removes the collect");
+    }
+
+    #[tokio::test]
+    async fn keys_need_publish_rights_through_the_socket() {
+        let (state, _) = keyed_state();
+        let publish_secret = mint_key(&state, "mcp-pub", crate::v5::api_keys::KeyRole::Publisher);
+        let viewer_secret = mint_key(&state, "mcp-view", crate::v5::api_keys::KeyRole::Viewer);
+        let server = McpServer::start(state).await;
+
+        let names = listed_names(&server.client, &publish_secret).await;
+        assert!(names.contains(&"post_api_v5_publish".to_string()));
+        assert!(names.contains(&SUBSCRIBE_COLLECT_TOOL.to_string()));
+
+        let names = listed_names(&server.client, &viewer_secret).await;
+        assert!(
+            !names.contains(&SUBSCRIBE_COLLECT_TOOL.to_string()),
+            "viewer hides the collect tool"
+        );
+        let (status, refused) = server
+            .client
+            .post(
+                "/mcp",
+                Some(&viewer_secret),
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": SUBSCRIBE_COLLECT_TOOL,
+                        "arguments": {"topic_filter": "mcp/keys/#", "qos": 0}
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(refused.get("error").is_some(), "viewer cannot collect");
+    }
+
+    #[tokio::test]
+    async fn read_only_and_disabled_modes_answer_through_the_socket() {
+        let (state, token) = keyed_state();
+        state.mcp.apply(true, true);
+        let server = McpServer::start(state).await;
+        let names = listed_names(&server.client, &token).await;
+        assert!(
+            !names.contains(&SUBSCRIBE_COLLECT_TOOL.to_string()),
+            "read-only mode hides the collect tool"
+        );
+        let (status, refused) = server
+            .client
+            .post(
+                "/mcp",
+                Some(&token),
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": SUBSCRIBE_COLLECT_TOOL,
+                               "arguments": {"topic_filter": "mcp/ro/#", "qos": 0}}
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let refused_read_only = refused.get("error").is_some()
+            || refused
+                .get("result")
+                .and_then(|result| result.get("isError"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        assert!(refused_read_only, "read-only mode refuses");
+
+        let (disabled, _) = keyed_state();
+        disabled.mcp.apply(false, false);
+        let gone = McpServer::start(disabled).await;
+        let (status, _) = gone
+            .client
+            .post(
+                "/mcp",
+                None,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "disabled answers 404");
     }
 }

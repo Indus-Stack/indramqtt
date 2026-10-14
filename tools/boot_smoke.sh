@@ -576,8 +576,10 @@ PY
 # --- 4f. The built-in MCP endpoint answers on the management listener ---
 # The kernel boots with the default `[mcp]` settings, so the path serves.
 # An operator key calls `initialize`, `tools/list` and `tools/call
-# get_api_v5_status` through the production HTTP entry. A call with no key
-# and a call with a wrong key get 401. An unknown method gets -32601.
+# get_api_v5_status` through the production HTTP entry. The list also
+# holds the messaging tools: the publish operation and
+# `subscribe_collect`. A call with no key and a call with a wrong key
+# get 401. An unknown method gets -32601.
 python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
 import json, sys, urllib.request, urllib.error
 api_port, key = sys.argv[1], sys.argv[2]
@@ -597,6 +599,8 @@ def mcp(payload, auth):
             return e.code, json.loads(e.read().decode())
         except ValueError:
             return e.code, {}
+    except OSError:
+        return 0, {}
 
 failures = 0
 def report(name, good):
@@ -623,6 +627,10 @@ report("the MCP tool list holds get_api_v5_status",
        and any(tool.get("name") == "get_api_v5_status" for tool in tools)
        and any(tool.get("name") == "get_status" for tool in tools))
 
+names = [tool.get("name") for tool in tools]
+report("the MCP tool list holds the messaging tools",
+       "post_api_v5_publish" in names and "subscribe_collect" in names)
+
 status, body = mcp({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                     "params": {"name": "get_api_v5_status",
                                "arguments": {"query": {"format": "json"}}}},
@@ -642,7 +650,8 @@ report("the get_api_v5_status tool returns the HTTP status document",
 status, body = mcp({"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}},
                    None)
 report("the MCP endpoint refuses a call with no key with 401",
-       status == 401 and "jsonrpc" not in body)
+       status == 401 and body.get("code") == "UNAUTHORIZED"
+       and "jsonrpc" not in body)
 
 status, body = mcp({"jsonrpc": "2.0", "id": 5, "method": "ping", "params": {}},
                    "Bearer wrong-key-wrong-key")

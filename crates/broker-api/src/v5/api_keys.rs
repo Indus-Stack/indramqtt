@@ -702,6 +702,10 @@ pub fn access_for_path(path: &str) -> PathAccess {
     match group.as_str() {
         "status" | "error_codes" => PathAccess::Anonymous,
         "current_user" | "features" => PathAccess::AnyKey,
+        // The agent endpoint multiplexes every operation, so no single
+        // scope fits it. Any key reaches it; the endpoint gates each
+        // tool itself against the key scopes (MC-04).
+        "mcp" => PathAccess::AnyKey,
         "clients" | "clients_v2" | "subscriptions" | "topics" | "sessions_count" | "banned"
         | "queues" | "queue" | "streams" | "stream" => PathAccess::Scope("connections"),
         "publish" => PathAccess::Scope("publish"),

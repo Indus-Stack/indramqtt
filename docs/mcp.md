@@ -53,8 +53,10 @@ sequenceDiagram
 - Use an API key: Basic `api_key:api_secret`, the secret as a bearer
   credential, or an operator key from the environment.
 - The check uses the same code path as the management API.
-- A key needs the `monitoring` scope for `/mcp`, as for other
-  monitoring reads. A key without it gets `403`.
+- A key reaches `/mcp` itself with the `monitoring` scope or the
+  `publish` scope. A key with neither scope gets `403`.
+- A publish-only key sees the messaging tools and no monitoring tool.
+  A monitoring-only key sees the monitoring tools and no messaging tool.
 - No key or a wrong key gets HTTP `401` with the management error
   shape. The body is never a JSON-RPC response.
 - A dashboard login token gets `401`. Agents authenticate with keys.
@@ -126,6 +128,22 @@ names the groups with their tool counts.
 
 - `get_api_v5_status` reads the node status. `get_status` is its
   public alias. Both run the same handler through the router.
+- `post_api_v5_publish` runs the management publish operation. It
+  takes the same body as HTTP `POST /api/v5/publish` and returns the
+  same answer. It sits in the `publish` toolset, in the `core` set.
+  The key needs the `publish` scope, as over HTTP.
+- `subscribe_collect` subscribes briefly and collects matching
+  messages. It has no HTTP route. It takes `topic_filter` (required),
+  `max_messages` (1 to 100, default 10), `timeout_seconds` (1 to 30,
+  default 5) and `qos` (0 or 1, required). It returns one row per
+  message with `topic`, `qos`, `retain`, `payload`,
+  `payload_encoding` (`plain`, or `base64` for binary payloads) and
+  `truncated` (true when the payload passed 64 KiB and was cut). It
+  removes its temporary subscription on every exit path, including a
+  client disconnect mid-collect. It sits in the `publish` toolset, in
+  the `core` set. It needs the `publish` scope: the HTTP subscribe
+  operation is a POST (a write), so read-only mode and viewer keys
+  hide it.
 - `broker_status` reads the version, uptime and node name without a
   router round trip. It proves the path end to end.
 - `list_toolsets` names the tool groups with their tool counts. It is
@@ -197,6 +215,8 @@ The code holds one exclusion table with a reason for each entry:
   Keep tool arguments small.
 - One tool answer holds 8 MiB or less. Larger files stay available
   over the HTTP route directly.
+- At most 8 collects run at once. The ninth fails closed. Each
+  collect holds at most 128 queued messages of at most 64 KiB each.
 - No multipart operation exists in the router. File uploads take JSON
   or raw bytes through `body` or `body_base64`; file downloads return
   through the base64 envelope. The same 8 MiB limit applies both ways.
@@ -210,6 +230,9 @@ The code holds one exclusion table with a reason for each entry:
 - A tool call adds no tenant logic. It forwards the same HTTP request
   an operator would send, so tenant scoping stays exactly as over
   HTTP. No new message path exists, so no new tenant test is needed.
+- `subscribe_collect` observes the default tenant only. Keys carry no
+  tenant, so the collect cannot name one. Publishes of other tenants
+  never reach it.
 
 ## Open work
 

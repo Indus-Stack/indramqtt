@@ -1996,6 +1996,16 @@ async fn do_mgmt_publish(
         .dispatch_ingress(topic, payload, qos, &sink)
         .await;
     state.metrics.inc_rules_executed_by(rules_fired as u64);
+    // Agent collects (MC-04): hand accepted ingress to running
+    // collects in the default tenant. Idle publishes pay one atomic
+    // load inside `feed`; feeds clone only for matching collects.
+    state.collectors.feed(
+        broker_storage::DEFAULT_TENANT_ID,
+        topic,
+        qos,
+        retain,
+        payload,
+    );
     // Topic index (W1-15): remember the concrete publish topic before
     // fan-out so the list/detail reads observe it. Bounded short-lock
     // insert; delivery proceeds even when the index is full.
@@ -2013,11 +2023,18 @@ pub async fn publish_message(State(state): State<ApiState>, body: Bytes) -> Resp
             return ApiError::BadRequest(format!("invalid publish body: {error}")).into_response();
         }
     };
-    let (topic, payload, qos, retain) = match parse_publish_entry(&value) {
+    handle_publish_value(&state, &value).await
+}
+
+/// Shared publish path for `POST /publish` and the `publish` agent
+/// tool (MC-04): validate, inject, then render. Both callers observe
+/// identical validation, rule, retained and fan-out behaviour.
+pub(crate) async fn handle_publish_value(state: &ApiState, value: &serde_json::Value) -> Response {
+    let (topic, payload, qos, retain) = match parse_publish_entry(value) {
         Ok(parts) => parts,
         Err(message) => return ApiError::BadRequest(message).into_response(),
     };
-    let (matched, enqueued, offline) = do_mgmt_publish(&state, &topic, &payload, qos, retain).await;
+    let (matched, enqueued, offline) = do_mgmt_publish(state, &topic, &payload, qos, retain).await;
     if matched == 0 {
         return (
             StatusCode::ACCEPTED,
