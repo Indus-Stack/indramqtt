@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +31,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use broker_connectors::{
     now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
+};
+// Maintained OPC-UA client for the production transport below.
+// Short names (Variant, NodeId, Session) name the driver types;
+// the broker types keep the OpcUa prefix, so nothing collides.
+use opcua::client::{ClientBuilder, IdentityToken, Session};
+use opcua::types::{
+    AttributeId, ByteString, DataValue, DateTime, MessageSecurityMode, NodeId, NumericRange,
+    QualifiedName, ReadValueId, StatusCode, TimestampsToReturn, UAString, Variant, WriteValue,
 };
 
 // ---------------------------------------------------------------------------
@@ -990,7 +999,8 @@ impl OpcUaTransport for MemoryOpcUaTransport {
 }
 
 /// TCP transport: HEL/ACK handshake, then framed writes with
-/// sequence accounting.
+/// sequence accounting. Offline unit tests only; production wiring
+/// uses [`DriverOpcUaTransport`].
 pub struct TcpOpcUaTransport {
     host: String,
     port: u16,
@@ -1113,6 +1123,275 @@ impl OpcUaTransport for TcpOpcUaTransport {
             .write_all(&packet)
             .await
             .map_err(|e| ConnectorError::Connection(format!("opc-ua write failed: {e}")))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Driver transport (production): maintained `async-opcua` client.
+// ---------------------------------------------------------------------------
+
+/// Map a sink variant onto the driver variant of the same type.
+/// DateTime ticks use the same 1601 epoch on both sides, so the
+/// value crosses unchanged.
+fn map_variant_to_driver(value: &OpcUaVariant) -> Variant {
+    match value {
+        OpcUaVariant::Boolean(v) => Variant::Boolean(*v),
+        OpcUaVariant::SByte(v) => Variant::SByte(*v),
+        OpcUaVariant::Byte(v) => Variant::Byte(*v),
+        OpcUaVariant::Int16(v) => Variant::Int16(*v),
+        OpcUaVariant::UInt16(v) => Variant::UInt16(*v),
+        OpcUaVariant::Int32(v) => Variant::Int32(*v),
+        OpcUaVariant::UInt32(v) => Variant::UInt32(*v),
+        OpcUaVariant::Int64(v) => Variant::Int64(*v),
+        OpcUaVariant::UInt64(v) => Variant::UInt64(*v),
+        OpcUaVariant::Float(v) => Variant::Float(*v),
+        OpcUaVariant::Double(v) => Variant::Double(*v),
+        OpcUaVariant::Text(v) => Variant::String(UAString::from(v.as_str())),
+        OpcUaVariant::DateTime(ticks) => Variant::from(DateTime::from(*ticks)),
+        OpcUaVariant::ByteString(bytes) => Variant::ByteString(ByteString::from(bytes.clone())),
+    }
+}
+
+/// Convert a sink value to the server value type.
+/// The sink sends integers as Int64. The server holds UInt32
+/// slow nodes. The value crosses only when it fits.
+/// Out-of-range values stay BadTypeMismatch. Never wrap.
+fn coerce_to_target(source: &OpcUaVariant, target: &Variant) -> Option<Variant> {
+    match (source, target) {
+        (OpcUaVariant::Boolean(v), Variant::Boolean(_)) => Some(Variant::Boolean(*v)),
+        (OpcUaVariant::SByte(v), Variant::SByte(_)) => Some(Variant::SByte(*v)),
+        (OpcUaVariant::Byte(v), Variant::Byte(_)) => Some(Variant::Byte(*v)),
+        (OpcUaVariant::Int16(v), Variant::Int16(_)) => Some(Variant::Int16(*v)),
+        (OpcUaVariant::UInt16(v), Variant::UInt16(_)) => Some(Variant::UInt16(*v)),
+        (OpcUaVariant::Int32(v), Variant::Int32(_)) => Some(Variant::Int32(*v)),
+        (OpcUaVariant::UInt32(v), Variant::UInt32(_)) => Some(Variant::UInt32(*v)),
+        (OpcUaVariant::Int64(v), Variant::Int64(_)) => Some(Variant::Int64(*v)),
+        (OpcUaVariant::UInt64(v), Variant::UInt64(_)) => Some(Variant::UInt64(*v)),
+        (OpcUaVariant::Float(v), Variant::Float(_)) => Some(Variant::Float(*v)),
+        (OpcUaVariant::Double(v), Variant::Double(_)) => Some(Variant::Double(*v)),
+        (OpcUaVariant::Text(v), Variant::String(_)) => {
+            Some(Variant::String(UAString::from(v.as_str())))
+        }
+        (OpcUaVariant::Int64(v), Variant::UInt32(_)) => u32::try_from(*v).ok().map(Variant::UInt32),
+        (OpcUaVariant::Int64(v), Variant::Int32(_)) => i32::try_from(*v).ok().map(Variant::Int32),
+        (OpcUaVariant::Int64(v), Variant::UInt16(_)) => u16::try_from(*v).ok().map(Variant::UInt16),
+        (OpcUaVariant::Int64(v), Variant::Int16(_)) => i16::try_from(*v).ok().map(Variant::Int16),
+        (OpcUaVariant::Int64(v), Variant::Byte(_)) => u8::try_from(*v).ok().map(Variant::Byte),
+        (OpcUaVariant::Int64(v), Variant::SByte(_)) => i8::try_from(*v).ok().map(Variant::SByte),
+        (OpcUaVariant::Int64(v), Variant::UInt64(_)) => u64::try_from(*v).ok().map(Variant::UInt64),
+        (OpcUaVariant::Int64(v), Variant::Double(_)) => Some(Variant::Double(*v as f64)),
+        (OpcUaVariant::Int64(v), Variant::Float(_)) => Some(Variant::Float(*v as f32)),
+        (OpcUaVariant::UInt64(v), Variant::UInt32(_)) => {
+            u32::try_from(*v).ok().map(Variant::UInt32)
+        }
+        (OpcUaVariant::UInt64(v), Variant::Int64(_)) => i64::try_from(*v).ok().map(Variant::Int64),
+        _ => None,
+    }
+}
+
+/// Production transport on the maintained `async-opcua` driver: real
+/// session connect with username auth plus typed writes,
+/// negotiated by the driver instead of by hand. The hand-written
+/// [`TcpOpcUaTransport`] stays for offline unit tests only.
+///
+/// Bound: one cached driver session plus the sink buffer in front
+/// of it (batch rows default 100); no pool, no background queue.
+/// The default is finite because an unbounded session pool under
+/// fan-in would exhaust file descriptors. The sink send path runs
+/// behind the rule engine bounded queue, so no numbers are needed.
+pub struct DriverOpcUaTransport {
+    endpoint_url: String,
+    auth: OpcUaAuth,
+    security_policy: OpcUaSecurityPolicy,
+    security_mode: OpcUaSecurityMode,
+    pki_dir: std::path::PathBuf,
+    session: parking_lot::Mutex<Option<std::sync::Arc<Session>>>,
+}
+
+impl DriverOpcUaTransport {
+    pub fn new(config: &OpcUaSinkConfig) -> Result<Self> {
+        config.validate()?;
+        // Fail closed on certificate auth: the driver needs a
+        // file-backed identity, and the config carries PEM text.
+        // TODO(parity): support certificate auth via temp files —
+        // which directory should hold the material?
+        let auth = match &config.auth {
+            OpcUaAuth::Anonymous | OpcUaAuth::UsernamePassword { .. } => config.auth.clone(),
+            OpcUaAuth::Certificate { .. } => {
+                return Err(ConnectorError::Dispatch(
+                    "opc-ua certificate auth is not supported by the driver transport".to_string(),
+                ));
+            }
+        };
+        Ok(Self {
+            endpoint_url: config.endpoint_url.clone(),
+            auth,
+            security_policy: config.security_policy,
+            security_mode: config.security_mode,
+            // Reason: a stable directory keeps one client identity
+            // across restarts instead of minting a keypair per boot.
+            pki_dir: std::env::temp_dir().join("indra-opcua-pki"),
+            session: parking_lot::Mutex::new(None),
+        })
+    }
+
+    fn identity_token(&self) -> Result<IdentityToken> {
+        match &self.auth {
+            OpcUaAuth::Anonymous => Ok(IdentityToken::Anonymous),
+            OpcUaAuth::UsernamePassword { username, password } => Ok(IdentityToken::UserName(
+                username.clone(),
+                password.clone().into(),
+            )),
+            OpcUaAuth::Certificate { .. } => Err(ConnectorError::Dispatch(
+                "opc-ua certificate auth is not supported by the driver transport".to_string(),
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl OpcUaTransport for DriverOpcUaTransport {
+    async fn connect(&self) -> Result<()> {
+        if self.session.lock().is_some() {
+            return Ok(());
+        }
+        // Reason: the driver mints its keypair here on first use.
+        std::fs::create_dir_all(&self.pki_dir)
+            .map_err(|e| ConnectorError::Connection(format!("opc-ua pki dir failed: {e}")))?;
+        let mut client = ClientBuilder::new()
+            .application_name("IndraMQTT OPC-UA bridge")
+            .application_uri("urn:indra:mqtt:opc-ua-bridge")
+            .trust_server_certs(true)
+            .verify_server_certs(false)
+            .create_sample_keypair(true)
+            .pki_dir(self.pki_dir.clone())
+            .session_retry_limit(0)
+            .client()
+            .map_err(|e| {
+                ConnectorError::Dispatch(format!("opc-ua driver client is not valid: {e:?}"))
+            })?;
+        // Reason: the server selects the endpoint from
+        // discovery, so the transport uses the configured policy.
+        let driver_mode = match self.security_mode {
+            OpcUaSecurityMode::None => MessageSecurityMode::None,
+            OpcUaSecurityMode::Sign => MessageSecurityMode::Sign,
+            OpcUaSecurityMode::SignAndEncrypt => MessageSecurityMode::SignAndEncrypt,
+        };
+        let (session, event_loop) = client
+            .connect_to_matching_endpoint(
+                (
+                    self.endpoint_url.as_str(),
+                    self.security_policy.uri(),
+                    driver_mode,
+                ),
+                self.identity_token()?,
+            )
+            .await
+            .map_err(|e| {
+                ConnectorError::Connection(format!("opc-ua driver connect failed: {e}"))
+            })?;
+        // Reason: the event loop drives keepalive and session
+        // renewal; dropping the handle detaches it, and the task
+        // ends with the session.
+        let _handle = event_loop.spawn();
+        if !session.wait_for_connection().await {
+            return Err(ConnectorError::Connection(
+                "opc-ua driver session did not connect".to_string(),
+            ));
+        }
+        *self.session.lock() = Some(session);
+        Ok(())
+    }
+
+    async fn write(&self, frame: &OpcUaWriteFrame) -> Result<()> {
+        self.connect().await?;
+        let node_id = NodeId::from_str(&frame.node_id.display())
+            .map_err(|e| ConnectorError::Dispatch(format!("opc-ua driver node id failed: {e}")))?;
+        let session = self
+            .session
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ConnectorError::Connection("opc-ua not connected".to_string()))?;
+        // Reason: the driver answers per-node codes; one call can
+        // mix Good and Bad results, so each code is checked.
+        let direct = WriteValue {
+            node_id: node_id.clone(),
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            value: DataValue::value_only(map_variant_to_driver(&frame.variant)),
+        };
+        let codes = session
+            .write(std::slice::from_ref(&direct))
+            .await
+            .map_err(|e| {
+                *self.session.lock() = None;
+                ConnectorError::Connection(format!("opc-ua driver write failed: {e}"))
+            })?;
+        let first = codes.first();
+        if first.is_none() {
+            return Ok(());
+        }
+        if first.is_some_and(|code| code.is_good()) {
+            return Ok(());
+        }
+        // Reason: the sink sends integers as Int64. The server
+        // holds UInt32 slow nodes. A mismatch triggers one read
+        // of the server type and one retry with the fitting value.
+        let is_mismatch =
+            first.is_some_and(|code| code.bits() == StatusCode::BadTypeMismatch.bits());
+        if !is_mismatch {
+            let text = first.map_or("empty".to_string(), |code| format!("{code}"));
+            return Err(ConnectorError::Dispatch(format!(
+                "opc-ua server rejected write: {text}"
+            )));
+        }
+        let probe = ReadValueId {
+            node_id: node_id.clone(),
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            data_encoding: QualifiedName::null(),
+        };
+        let current = session
+            .read(
+                std::slice::from_ref(&probe),
+                TimestampsToReturn::Neither,
+                0.0,
+            )
+            .await
+            .map_err(|e| ConnectorError::Connection(format!("opc-ua driver read failed: {e}")))?;
+        let target = current.first().and_then(|found| found.value.clone());
+        let Some(target) = target else {
+            return Err(ConnectorError::Dispatch(
+                "opc-ua server rejected write: BadTypeMismatch".to_string(),
+            ));
+        };
+        let Some(converted) = coerce_to_target(&frame.variant, &target) else {
+            return Err(ConnectorError::Dispatch(
+                "opc-ua server rejected write: BadTypeMismatch".to_string(),
+            ));
+        };
+        let retry = WriteValue {
+            node_id,
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            value: DataValue::value_only(converted),
+        };
+        let codes = session
+            .write(std::slice::from_ref(&retry))
+            .await
+            .map_err(|e| {
+                *self.session.lock() = None;
+                ConnectorError::Connection(format!("opc-ua driver write failed: {e}"))
+            })?;
+        for code in &codes {
+            if code.is_bad() {
+                return Err(ConnectorError::Dispatch(format!(
+                    "opc-ua server rejected write: {code}"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -1703,5 +1982,304 @@ mod tests {
             .await
             .expect("server done")
             .expect("server task");
+    }
+
+    /// It fails closed when the environment lacks the named address.
+    fn qual_require(name: &str) -> String {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| panic!("{name} must name a real server for qualification"))
+    }
+
+    /// Qualification against a real OPC-UA server over the
+    /// maintained `async-opcua` driver ([`DriverOpcUaTransport`]).
+    ///
+    /// Run with e.g.:
+    /// `OPCUA_ENDPOINT=opc.tcp://127.0.0.1:50000 OPCUA_USERNAME=qual \
+    ///  OPCUA_PASSWORD=qualpass1 \
+    ///  cargo +1.96.0 test -p broker-connectors-enterprise --all-features --lib opc_ua::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Uses the existing `SlowUInt1` slow node. The server
+    /// rejects AddNodes with BadServiceUnsupported, so the run
+    /// creates no nodes. It freezes the slow simulation, streams
+    /// 500 rows through [`OpcUaSink`] on
+    /// [`DriverOpcUaTransport`], asserts each write through an
+    /// independent session, proves an unknown node fails with the
+    /// server text, then restores the simulation. Panics when its
+    /// environment is missing (fail closed, never skips).
+    #[tokio::test]
+    #[ignore = "needs a real OPC-UA server (see OPCUA_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use opcua::client::{ClientBuilder, IdentityToken};
+        use opcua::types::{
+            AttributeId, DataValue, MessageSecurityMode, NodeId, NumericRange, QualifiedName,
+            ReadValueId, TimestampsToReturn, Variant, WriteValue,
+        };
+
+        const ROWS: usize = 500;
+
+        let endpoint = qual_require("OPCUA_ENDPOINT");
+        let username = qual_require("OPCUA_USERNAME");
+        let password = qual_require("OPCUA_PASSWORD");
+        assert!(
+            endpoint.starts_with("opc.tcp://"),
+            "qual endpoint must start with opc.tcp://, got {endpoint:?}"
+        );
+
+        // Reason: the driver mints its keypair under this directory.
+        let pki_dir = std::env::temp_dir().join("indra-opcua-qual-pki");
+        std::fs::create_dir_all(&pki_dir).expect("qual pki dir builds");
+        let mut client = ClientBuilder::new()
+            .application_name("IndraMQTT OPC-UA qualification")
+            .application_uri("urn:indra:mqtt:opc-ua-qual")
+            .trust_server_certs(true)
+            .verify_server_certs(false)
+            .create_sample_keypair(true)
+            .pki_dir(pki_dir)
+            .session_retry_limit(0)
+            .client()
+            .expect("qual client builds");
+
+        // Identity: only the real product answers GetEndpoints with
+        // its own application description.
+        let endpoints = client
+            .get_server_endpoints_from_url(endpoint.clone())
+            .await
+            .unwrap_or_else(|e| panic!("qual endpoints read failed: {e}"));
+        assert!(!endpoints.is_empty(), "qual server must list endpoints");
+        let mut product = String::new();
+        for listed in &endpoints {
+            assert!(
+                listed.endpoint_url.as_ref().starts_with("opc.tcp://"),
+                "qual endpoint url must use opc.tcp"
+            );
+            product.push_str(listed.server.application_uri.as_ref());
+            product.push(' ');
+            product.push_str(listed.server.product_uri.as_ref());
+            product.push(' ');
+            product.push_str(listed.server.application_name.text.as_ref());
+            product.push(' ');
+        }
+        let product_lower = product.to_lowercase();
+        assert!(
+            product_lower.contains("opcplc") || product_lower.contains("microsoft"),
+            "qual server must identify its product, got {product:?}"
+        );
+        eprintln!(
+            "qual server: product={product} endpoints={}",
+            endpoints.len()
+        );
+
+        // One independent session drives setup and read-back. The
+        // sink below opens its own session through the transport.
+        // Reason: the server disables the unsecured endpoint,
+        // so qualification uses the secured endpoint.
+        let (session, event_loop) = client
+            .connect_to_matching_endpoint(
+                (
+                    endpoint.as_str(),
+                    "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
+                    MessageSecurityMode::SignAndEncrypt,
+                ),
+                IdentityToken::UserName(username.clone(), password.clone().into()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("qual session connects: {e}"));
+        // Reason: the event loop drives the session; dropping the
+        // handle detaches it, and the task ends with the session.
+        let _handle = event_loop.spawn();
+        assert!(
+            session.wait_for_connection().await,
+            "qual session must connect"
+        );
+
+        // Address: the slow nodes live in the PLC namespace.
+        // Reason: the index moves per server, so the run reads it.
+        let plc_ns = session
+            .get_namespace_index("http://microsoft.com/Opc/OpcPlc/")
+            .await
+            .unwrap_or_else(|e| panic!("qual plc namespace is missing: {e}"));
+        // Reason: --sn=50 starts SlowUInt1..SlowUInt50 as UInt32.
+        // The run uses SlowUInt1 and freezes the simulation first.
+        let target_id = NodeId::new(plc_ns, "SlowUInt1".to_string());
+        let freeze_id = NodeId::new(plc_ns, "SlowNumberOfUpdates".to_string());
+
+        // Freeze: stop the 1 s simulation update for stable reads.
+        // Reason: the simulator would overwrite the rows mid-run.
+        let freeze = WriteValue {
+            node_id: freeze_id.clone(),
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            value: DataValue::value_only(Variant::Int32(0)),
+        };
+        let codes = session
+            .write(std::slice::from_ref(&freeze))
+            .await
+            .unwrap_or_else(|e| panic!("qual freeze write failed: {e}"));
+        assert!(
+            codes.first().is_some_and(|code| code.is_good()),
+            "qual freeze rejected: {codes:?}"
+        );
+
+        // Probe: the target holds a UInt32 value for this user.
+        let probe = ReadValueId {
+            node_id: target_id.clone(),
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            data_encoding: QualifiedName::null(),
+        };
+        let found = session
+            .read(
+                std::slice::from_ref(&probe),
+                TimestampsToReturn::Neither,
+                0.0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("qual probe read failed: {e}"));
+        assert!(
+            matches!(
+                found.first().and_then(|item| item.value.clone()),
+                Some(Variant::UInt32(_))
+            ),
+            "qual target must hold UInt32, got {found:?}"
+        );
+        eprintln!("qual target: ns={plc_ns} s=SlowUInt1 holds UInt32");
+
+        // Sink: one subscription drives the existing slow node.
+        // Reason: the server rejects AddNodes, so the run reuses
+        // the simulated node instead of creating nodes.
+        let target_text = format!("ns={plc_ns};s=SlowUInt1");
+        OpcUaNodeId::parse(&target_text).expect("qual target id parses");
+        let config = OpcUaSinkConfig {
+            endpoint_url: endpoint.clone(),
+            security_policy: OpcUaSecurityPolicy::Basic256Sha256,
+            security_mode: OpcUaSecurityMode::SignAndEncrypt,
+            auth: OpcUaAuth::UsernamePassword {
+                username: username.clone(),
+                password: password.clone(),
+            },
+            node_subscriptions: vec![NodeSubscriptionConfig {
+                node_id: target_text,
+                sampling_interval_ms: 1_000,
+                publish_topic_template: "qual/opcua/${node.sanitized_id}".to_string(),
+                write_topic_pattern: Some("qual/opcua/w/0".to_string()),
+            }],
+            buffer_capacity: None,
+            batch_size: Some(200),
+            linger_ms: Some(10),
+            timeout_ms: None,
+        };
+        config.validate().expect("qual config validates");
+        let transport =
+            Arc::new(DriverOpcUaTransport::new(&config).expect("qual transport builds"));
+        let sink = Arc::new(OpcUaSink::new(config, transport).expect("qual sink builds"));
+        assert_eq!(sink.kind(), "opc_ua");
+
+        // Drive: send 500 integers through the sink. The transport
+        // coerces Int64 to the UInt32 server type when it fits.
+        // Reason: each write reads back at once, so the count is exact.
+        let topic = Topic::new("qual/opcua/w/0").expect("qual topic builds");
+        let mut verified: usize = 0;
+        for seq in 0..ROWS {
+            sink.send(&topic, &Bytes::from(seq.to_string()), QoS::AtLeastOnce)
+                .await
+                .expect("qual send");
+            sink.flush().await.expect("qual flush");
+            let check = session
+                .read(
+                    std::slice::from_ref(&probe),
+                    TimestampsToReturn::Neither,
+                    0.0,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("qual read back failed at {seq}: {e}"));
+            assert_eq!(
+                check.first().and_then(|item| item.value.clone()),
+                Some(Variant::UInt32(seq as u32)),
+                "qual row {seq}"
+            );
+            verified += 1;
+        }
+        assert_eq!(verified, ROWS, "qual verified count");
+        assert_eq!(sink.sent_records(), ROWS as u64, "qual row count");
+        eprintln!(
+            "qual rows sent: records={ROWS} verified={verified} first=0 last={}",
+            ROWS - 1
+        );
+
+        // Final read: the last row persists on the server node.
+        let last = session
+            .read(
+                std::slice::from_ref(&probe),
+                TimestampsToReturn::Neither,
+                0.0,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("qual final read failed: {e}"));
+        assert_eq!(
+            last.first().and_then(|item| item.value.clone()),
+            Some(Variant::UInt32((ROWS - 1) as u32)),
+            "qual last row"
+        );
+        eprintln!("qual rows asserted: count={ROWS} first=0 last={}", ROWS - 1);
+
+        // Fault: an unknown node fails with the server text.
+        let bad_config = OpcUaSinkConfig {
+            endpoint_url: endpoint.clone(),
+            security_policy: OpcUaSecurityPolicy::Basic256Sha256,
+            security_mode: OpcUaSecurityMode::SignAndEncrypt,
+            auth: OpcUaAuth::UsernamePassword {
+                username: username.clone(),
+                password: password.clone(),
+            },
+            node_subscriptions: vec![NodeSubscriptionConfig {
+                node_id: format!("ns={plc_ns};s=indra-qual-no-such-node"),
+                sampling_interval_ms: 1_000,
+                publish_topic_template: "qual/opcua/${node.sanitized_id}".to_string(),
+                write_topic_pattern: Some("qual/opcua/bad/+".to_string()),
+            }],
+            buffer_capacity: None,
+            batch_size: Some(500),
+            linger_ms: Some(10),
+            timeout_ms: None,
+        };
+        let bad_transport =
+            Arc::new(DriverOpcUaTransport::new(&bad_config).expect("qual bad transport builds"));
+        let bad_sink =
+            Arc::new(OpcUaSink::new(bad_config, bad_transport).expect("qual bad sink builds"));
+        bad_sink
+            .send(
+                &Topic::new("qual/opcua/bad/0").expect("qual bad topic builds"),
+                &Bytes::from_static(b"7"),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("qual bad send buffers");
+        let err = bad_sink.flush().await.expect_err("unknown node must fail");
+        match &err {
+            ConnectorError::Dispatch(message) => assert!(
+                message.contains("BadNodeIdUnknown"),
+                "qual fault must carry the server text, got {message:?}"
+            ),
+            other => panic!("unknown node must be terminal, got {other:?}"),
+        }
+        eprintln!("qual fault asserted: unknown node is a dispatch error");
+
+        // Cleanup: restore indefinite simulation updates.
+        // Reason: the run created no nodes (AddNodes is
+        // unsupported), so only the freeze needs a restore.
+        let thaw = WriteValue {
+            node_id: freeze_id,
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            value: DataValue::value_only(Variant::Int32(-1)),
+        };
+        match session.write(std::slice::from_ref(&thaw)).await {
+            Ok(codes) => eprintln!("qual cleanup: restored simulation {codes:?}"),
+            Err(e) => eprintln!("qual cleanup FAILED (tolerated): {e}"),
+        }
+        let _ = session.disconnect().await;
+        eprintln!("qual done: rows={ROWS} restored simulation");
     }
 }

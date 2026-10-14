@@ -141,6 +141,11 @@ prost = { version = "0.13" }
 # unconditionally, which the licence gate rejects, while 0.25 exposes
 # the same RESP/AUTH/SELECT/multiplexed API without it.
 redis = { version = "0.25", default-features = false, features = ["tokio-comp"] }
+# OPC-UA sink on the maintained `async-opcua` driver (MPL-2.0):
+# session connect with username auth plus typed writes and
+# reads. The hand-written `TcpOpcUaTransport` stays for offline
+# unit tests only; production wiring uses `DriverOpcUaTransport`.
+async-opcua = { version = "0.19", default-features = false, features = ["client"] }
 # Microsoft SQL Server sink on the maintained `tiberius` driver
 # (MIT/Apache-2.0): TDS (PRELOGIN, LOGIN7, sp_executesql) with SQL auth
 # and typed params over tokio (`tokio-util` compat). The hand-written

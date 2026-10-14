@@ -1992,7 +1992,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid opc_ua config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::TcpOpcUaTransport::new(&config)
+                    broker_connectors_enterprise::DriverOpcUaTransport::new(&config)
                         .map_err(|e| format!("invalid opc_ua transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::OpcUaSink::new(config, transport)

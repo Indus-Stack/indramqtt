@@ -3552,7 +3552,7 @@ pub(crate) async fn register_live_sink(
                 timeout_ms,
             };
             if let Ok(transport) =
-                broker_connectors_enterprise::opc_ua::TcpOpcUaTransport::new(&config)
+                broker_connectors_enterprise::opc_ua::DriverOpcUaTransport::new(&config)
             {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
