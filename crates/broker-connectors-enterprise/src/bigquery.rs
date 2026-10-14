@@ -1949,11 +1949,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a real BigQuery server (see BIGQUERY_* env)"]
     async fn test_qualify_driver_write_path() {
-        let project = qual_env("BIGQUERY_PROJECT").unwrap_or_default();
-        if project.is_empty() {
-            eprintln!("BIGQUERY_PROJECT is empty; skipping qualification");
-            return;
-        }
+        let project = qual_env("BIGQUERY_PROJECT").unwrap_or_else(|| {
+            panic!("BIGQUERY_PROJECT must name the qual project; failing closed")
+        });
         let dataset_id = qual_env("BIGQUERY_DATASET").unwrap_or_else(|| "bq_qual_b306".to_string());
         let table_id = qual_env("BIGQUERY_TABLE").unwrap_or_else(|| "qual_rows".to_string());
         let sa_key_file = qual_env("GOOGLE_APPLICATION_CREDENTIALS")
@@ -1961,9 +1959,45 @@ mod tests {
             .unwrap_or_default();
         let endpoint = qual_env("BIGQUERY_ENDPOINT");
         if sa_key_file.is_empty() && endpoint.is_none() {
-            eprintln!("no service-account key and no BIGQUERY_ENDPOINT; skipping qualification");
-            return;
+            panic!(
+                "GOOGLE_APPLICATION_CREDENTIALS or BIGQUERY_SA_KEY_FILE or BIGQUERY_ENDPOINT must point at the qual server; failing closed"
+            );
         }
+        // Read the key file for the sink credential.
+        // The driver uses the file path.
+        // The sink uses the email and key values.
+        let sink_auth = if endpoint.is_some() {
+            // Loopback server checks no credential.
+            GcpAuth::None
+        } else {
+            let key_text = std::fs::read_to_string(&sa_key_file).unwrap_or_else(|e| {
+                panic!(
+                    "service-account key file {sa_key_file} must be readable for qualification: {e}"
+                )
+            });
+            let key_json: serde_json::Value = serde_json::from_str(&key_text).unwrap_or_else(|e| {
+                panic!("service-account key file {sa_key_file} must hold JSON: {e}")
+            });
+            let client_email = key_json
+                .get("client_email")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let private_key_pem = key_json
+                .get("private_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if client_email.trim().is_empty() || private_key_pem.trim().is_empty() {
+                panic!(
+                    "service-account key file {sa_key_file} must hold client_email and private_key; failing closed"
+                );
+            }
+            GcpAuth::ServiceAccountKey {
+                client_email,
+                private_key_pem,
+            }
+        };
 
         let driver_client: gcp_bigquery_client::Client = if sa_key_file.is_empty() {
             let auth: std::sync::Arc<dyn gcp_bigquery_client::auth::Authenticator> =
@@ -2038,7 +2072,7 @@ mod tests {
             dataset_id: dataset_id.clone(),
             table_template: table_id.clone(),
             endpoint: endpoint.clone(),
-            auth: GcpAuth::None,
+            auth: sink_auth,
             ignore_unknown_values: true,
             skip_invalid_rows: false,
             template_suffix: None,
