@@ -48,6 +48,7 @@ pub mod mqtt_bridge;
 pub mod mssql;
 pub mod mysql;
 pub mod opentsdb;
+pub mod pg_numbers;
 pub mod postgres;
 #[cfg(feature = "rabbitmq")]
 pub mod rabbitmq;

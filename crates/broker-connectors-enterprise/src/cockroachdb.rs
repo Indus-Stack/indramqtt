@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use broker_connectors::pg_numbers::{coerce_scalar_value, PgScalarValue};
 use broker_connectors::{BackoffState, BatchQueue, Connector, ConnectorError, Result, Sink};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -378,6 +379,19 @@ pub fn extract_cockroach_row(payload: &[u8], topic: &str) -> Result<CockroachRow
 pub trait CockroachDbTransport: Send + Sync {
     async fn execute(&self, query: &str, params: &[CockroachValue])
         -> Result<CockroachQueryResult>;
+
+    /// Execute with column names in parameter order. The default runs
+    /// [`CockroachDbTransport::execute`]; the driver transport prepares
+    /// the statement and converts each value by its declared type.
+    async fn execute_typed(
+        &self,
+        query: &str,
+        columns: &[String],
+        params: &[CockroachValue],
+    ) -> Result<CockroachQueryResult> {
+        let _ = columns;
+        self.execute(query, params).await
+    }
 }
 
 fn format_cockroach_value(v: &CockroachValue) -> String {
@@ -667,6 +681,10 @@ pub fn cockroach_connect_config(config: &CockroachDbConfig) -> tokio_postgres::C
 /// `Null` becomes `None::<String>` so the driver binds SQL NULL; numbers,
 /// integers, booleans and strings keep their native PostgreSQL types and
 /// travel out-of-band, so quoting bugs are structurally impossible.
+///
+/// Kept for offline paths; the driver transport binds through
+/// [`coerce_cockroach_params_for_types`] instead, which converts each
+/// value by the declared parameter type that `prepare` reports.
 pub fn cockroach_value_to_boxed(
     value: &CockroachValue,
 ) -> Box<dyn tokio_postgres::types::ToSql + Sync + Send> {
@@ -677,6 +695,55 @@ pub fn cockroach_value_to_boxed(
         CockroachValue::Number(n) => Box::new(*n),
         CockroachValue::Boolean(b) => Box::new(*b),
     }
+}
+
+/// Read one [`CockroachValue`] as the shared scalar binding value.
+fn cockroach_scalar(value: &CockroachValue) -> PgScalarValue {
+    match value {
+        CockroachValue::Null => PgScalarValue::Null,
+        CockroachValue::Boolean(b) => PgScalarValue::Boolean(*b),
+        CockroachValue::Integer(i) => PgScalarValue::Integer(*i),
+        CockroachValue::Number(n) => PgScalarValue::Float(*n),
+        CockroachValue::String(s) => PgScalarValue::Text(s.clone()),
+    }
+}
+
+/// Convert each value by the declared parameter type from `prepare`.
+///
+/// `columns` lists each chunk column once; `params` runs row-major over
+/// it. Errors name the column; a missing name falls back to the
+/// parameter index, so the error still names the parameter.
+pub fn coerce_cockroach_params_for_types(
+    params: &[CockroachValue],
+    columns: &[String],
+    pg_types: &[tokio_postgres::types::Type],
+) -> Result<Vec<Box<dyn tokio_postgres::types::ToSql + Send + Sync>>> {
+    if params.len() != pg_types.len() {
+        return Err(ConnectorError::Dispatch(format!(
+            "cockroachdb bind parameter count {} does not match declared type count {}",
+            params.len(),
+            pg_types.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(params.len());
+    for (index, value) in params.iter().enumerate() {
+        // Parameters run row-major over `columns`, so position `index`
+        // belongs to `columns[index % len]`; multi-row chunks repeat the
+        // same column types per row.
+        let column_name: std::borrow::Cow<'_, str> = columns
+            .get(index % columns.len().max(1))
+            .map(String::as_str)
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(format!("parameter {}", index + 1)));
+        let boxed = coerce_scalar_value(
+            cockroach_scalar(value),
+            &pg_types[index],
+            column_name.as_ref(),
+            "cockroachdb",
+        )?;
+        out.push(boxed);
+    }
+    Ok(out)
 }
 
 /// Map a `tokio-postgres` error onto [`ConnectorError`], preserving the
@@ -829,17 +896,40 @@ impl CockroachDbTransport for PgDriverCockroachDbTransport {
         query: &str,
         params: &[CockroachValue],
     ) -> Result<CockroachQueryResult> {
+        // Without column names the errors name the parameter index.
+        let columns: Vec<String> = (0..params.len())
+            .map(|i| format!("parameter {}", i + 1))
+            .collect();
+        self.execute_typed(query, &columns, params).await
+    }
+
+    async fn execute_typed(
+        &self,
+        query: &str,
+        columns: &[String],
+        params: &[CockroachValue],
+    ) -> Result<CockroachQueryResult> {
         let client = self.connect_client().await?;
+        // `prepare` asks the server for the declared parameter types,
+        // so each value binds as the column type expects. This adds one
+        // server round trip per flush (not per message); the batch
+        // still rides one statement.
+        // PERF(parity): the fast version caches the prepared statement
+        // per query text instead of preparing on every flush.
+        let statement = tokio::time::timeout(self.config.timeout(), client.prepare(query))
+            .await
+            .map_err(|_| ConnectorError::Connection("cockroachdb query timeout".to_string()))?
+            .map_err(|e| map_cockroach_driver_error(&e))?;
         // Hot-path allocation numbers: exactly 2 Vec allocations per execute
         // (owned: P boxed params, refs: P borrows) plus P box allocations,
         // where P = params.len(); e.g. P=2 -> 2 Vec allocs + 2 boxes.
         // Parameters travel bound out-of-band so no per-value SQL string is
         // formatted on this path.
-        let owned: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            params.iter().map(cockroach_value_to_boxed).collect();
+        let pg_types: Vec<tokio_postgres::types::Type> = statement.params().to_vec();
+        let owned = coerce_cockroach_params_for_types(params, columns, &pg_types)?;
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             owned.iter().map(|b| b.as_ref() as _).collect();
-        let rows = tokio::time::timeout(self.config.timeout(), client.execute(query, &refs))
+        let rows = tokio::time::timeout(self.config.timeout(), client.execute(&statement, &refs))
             .await
             .map_err(|_| ConnectorError::Connection("cockroachdb query timeout".to_string()))?
             .map_err(|e| map_cockroach_driver_error(&e))?;
@@ -1162,7 +1252,11 @@ impl CockroachDbSink {
 
             while attempts < max_attempts {
                 attempts += 1;
-                match self.transport.execute(&query, &params).await {
+                match self
+                    .transport
+                    .execute_typed(&query, &columns, &params)
+                    .await
+                {
                     Ok(_) => {
                         self.sent.fetch_add(chunk_len as u64, Ordering::Relaxed);
                         chunk_ok = true;
@@ -1237,7 +1331,11 @@ impl CockroachDbSink {
                             .unwrap_or(CockroachValue::Null);
                         single_params.push(val);
                     }
-                    match self.transport.execute(&single_query, &single_params).await {
+                    match self
+                        .transport
+                        .execute_typed(&single_query, &columns, &single_params)
+                        .await
+                    {
                         Ok(_) => {
                             self.sent.fetch_add(1, Ordering::Relaxed);
                             row_idx += 1;
@@ -1439,6 +1537,165 @@ mod tests {
         assert_eq!(
             json_to_cockroach_value(&serde_json::json!("edge-node")),
             CockroachValue::String("edge-node".into())
+        );
+    }
+
+    #[test]
+    fn test_integer_and_float_json_bind_to_float_column() {
+        use tokio_postgres::types::{ToSql, Type};
+        // The defect: the old path boxes the integer directly, and the
+        // driver accepts that binding for INT8 only, so it refuses a
+        // FLOAT8 parameter before the statement reaches the server.
+        let old: Box<dyn ToSql + Send + Sync> = Box::new(0i64);
+        assert!(old
+            .to_sql_checked(&Type::FLOAT8, &mut bytes::BytesMut::new())
+            .is_err());
+
+        // The production path: the same coercion the driver transport
+        // runs after `prepare` reports the declared parameter types. An
+        // integer JSON number and a float JSON number both reach one
+        // FLOAT8 column.
+        let columns = vec!["temp".to_string()];
+        let types = vec![Type::FLOAT8];
+        for payload in [serde_json::json!(0), serde_json::json!(20.5)] {
+            let value = json_to_cockroach_value(&payload);
+            let boxed = coerce_cockroach_params_for_types(&[value], &columns, &types)
+                .expect("number binds to float column");
+            let mut out = bytes::BytesMut::new();
+            boxed[0]
+                .to_sql_checked(&Type::FLOAT8, &mut out)
+                .expect("driver accepts the coerced binding");
+            assert_eq!(out.len(), 8);
+        }
+        // The integer keeps its value through the float binding.
+        let boxed =
+            coerce_cockroach_params_for_types(&[CockroachValue::Integer(20)], &columns, &types)
+                .expect("integer binds");
+        let mut out = bytes::BytesMut::new();
+        boxed[0]
+            .to_sql_checked(&Type::FLOAT8, &mut out)
+            .expect("driver accepts");
+        let got = f64::from_be_bytes(out[..8].try_into().expect("8 float bytes"));
+        assert!(
+            (got - 20.0).abs() < 0.001,
+            "integer keeps its value, got {got}"
+        );
+    }
+
+    #[test]
+    fn test_numbers_bind_to_float_numeric_and_text_columns() {
+        use tokio_postgres::types::Type;
+        // The production coercion reaches every documented target: an
+        // integer JSON number binds to FLOAT4, NUMERIC and TEXT, and a
+        // float JSON number binds to FLOAT8.
+        let columns = vec!["temp".to_string()];
+        let int_value = json_to_cockroach_value(&serde_json::json!(20));
+        for ty in [Type::FLOAT4, Type::NUMERIC, Type::TEXT] {
+            let boxed = coerce_cockroach_params_for_types(
+                std::slice::from_ref(&int_value),
+                &columns,
+                std::slice::from_ref(&ty),
+            )
+            .expect("integer binds");
+            boxed[0]
+                .to_sql_checked(&ty, &mut bytes::BytesMut::new())
+                .expect("driver accepts the coerced binding");
+        }
+        let float_value = json_to_cockroach_value(&serde_json::json!(20.5));
+        let boxed = coerce_cockroach_params_for_types(&[float_value], &columns, &[Type::FLOAT8])
+            .expect("float binds");
+        let mut out = bytes::BytesMut::new();
+        boxed[0]
+            .to_sql_checked(&Type::FLOAT8, &mut out)
+            .expect("driver accepts");
+        let got = f64::from_be_bytes(out[..8].try_into().expect("8 float bytes"));
+        assert!(
+            (got - 20.5).abs() < 0.001,
+            "float keeps its value, got {got}"
+        );
+    }
+
+    #[test]
+    fn test_integer_out_of_range_names_the_column() {
+        use tokio_postgres::types::Type;
+        // An integer past the INT4 range is a permanent error that names
+        // the column, never a panic and never a silent cut.
+        let columns = vec!["temp".to_string()];
+        let types = vec![Type::INT4];
+        let err = coerce_cockroach_params_for_types(
+            &[CockroachValue::Integer(3_000_000_000)],
+            &columns,
+            &types,
+        )
+        .expect_err("out-of-range integer must fail");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "range error is permanent, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("temp"),
+            "range error names the column, got {err}"
+        );
+        // The error carries the out-of-range SQLSTATE, so the sink
+        // counts the row rejected instead of restoring it forever.
+        assert_eq!(
+            classify_cockroach_sqlstate(&err.to_string()),
+            CockroachErrorClassification::DataRejected
+        );
+        // The boundary still binds.
+        assert!(coerce_cockroach_params_for_types(
+            &[CockroachValue::Integer(i32::MAX as i64)],
+            &columns,
+            &types,
+        )
+        .is_ok());
+        // The same rule holds for INT2.
+        let int2 = vec![Type::INT2];
+        assert!(coerce_cockroach_params_for_types(
+            &[CockroachValue::Integer(32767)],
+            &columns,
+            &int2,
+        )
+        .is_ok());
+        let err =
+            coerce_cockroach_params_for_types(&[CockroachValue::Integer(32768)], &columns, &int2)
+                .expect_err("out-of-range integer must fail");
+        assert!(err.to_string().contains("temp"));
+    }
+
+    #[test]
+    fn test_multi_row_params_map_columns_row_major() {
+        use tokio_postgres::types::Type;
+        // Two rows over two columns: position `index` belongs to
+        // `columns[index % 2]`, so the second row binds the same types.
+        let columns = vec!["seq".to_string(), "temp".to_string()];
+        let types = vec![Type::INT4, Type::FLOAT8, Type::INT4, Type::FLOAT8];
+        let params = vec![
+            CockroachValue::Integer(1),
+            CockroachValue::Integer(20),
+            CockroachValue::Integer(2),
+            CockroachValue::Number(21.5),
+        ];
+        let boxed =
+            coerce_cockroach_params_for_types(&params, &columns, &types).expect("rows bind");
+        assert_eq!(boxed.len(), 4);
+        for (param, ty) in boxed.iter().zip(types.iter()) {
+            param
+                .to_sql_checked(ty, &mut bytes::BytesMut::new())
+                .expect("driver accepts");
+        }
+        // An out-of-range value in the second row names its column.
+        let bad = vec![
+            CockroachValue::Integer(1),
+            CockroachValue::Integer(20),
+            CockroachValue::Integer(3_000_000_000),
+            CockroachValue::Number(21.5),
+        ];
+        let err = coerce_cockroach_params_for_types(&bad, &columns, &types)
+            .expect_err("out-of-range integer must fail");
+        assert!(
+            err.to_string().contains("seq"),
+            "range error names the column, got {err}"
         );
     }
 
@@ -2160,13 +2417,35 @@ mod tests {
         // server-generated serialization failure (via force_retry), then
         // delegates to the real driver transport. The 40001 text below comes
         // from the live server, never from a fabricated string.
-        let force_retry_err = client
+        //
+        // Use an explicit transaction for the forced retry. A bare
+        // SELECT runs as an implicit transaction. The server retries
+        // an implicit transaction without notice. Each retry forces a
+        // new retry, so the call never returns. BEGIN and COMMIT
+        // return the retry error to the client.
+        //
+        // The first statement in a transaction retries without
+        // notice. Run a placeholder first so force_retry runs second
+        // and returns 40001.
+        client
+            .batch_execute("BEGIN")
+            .await
+            .expect("begin explicit transaction for force_retry");
+        client
+            .execute("SELECT 1", &[])
+            .await
+            .expect("placeholder selects before force_retry");
+        let select_outcome = client
             .execute(
-                "SELECT crdb_internal.force_retry(CAST('100ms' AS INTERVAL))",
+                "SELECT crdb_internal.force_retry(CAST('1s' AS INTERVAL))",
                 &[],
             )
-            .await
-            .expect_err("force_retry must produce a server-side retry error");
+            .await;
+        let commit_outcome = client.batch_execute("COMMIT").await;
+        let force_retry_err = select_outcome
+            .err()
+            .or(commit_outcome.err())
+            .expect("force_retry must produce a server-side retry error");
         let force_probe = if let Some(db) = force_retry_err.as_db_error() {
             format!("{}: {}", db.code().code(), db.message())
         } else {

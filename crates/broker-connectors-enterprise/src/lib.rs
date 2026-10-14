@@ -73,10 +73,11 @@ pub mod timestream;
 
 pub use alloydb::{
     alloydb_connect_config, alloydb_value_to_boxed, build_alloydb_insert_query,
-    classify_alloydb_error, extract_alloydb_row, map_driver_error, resolve_alloydb_password,
-    AlloydbAuth, AlloydbColumnMapping, AlloydbConfig, AlloydbConnector, AlloydbErrorClassification,
-    AlloydbQueryResult, AlloydbRow, AlloydbSink, AlloydbTransport, AlloydbValue,
-    CapturedAlloydbExecution, MockAlloydbTransport, PgDriverAlloydbTransport, TcpAlloydbTransport,
+    classify_alloydb_error, coerce_alloydb_params_for_types, extract_alloydb_row, map_driver_error,
+    resolve_alloydb_password, AlloydbAuth, AlloydbColumnMapping, AlloydbConfig, AlloydbConnector,
+    AlloydbErrorClassification, AlloydbQueryResult, AlloydbRow, AlloydbSink, AlloydbTransport,
+    AlloydbValue, CapturedAlloydbExecution, MockAlloydbTransport, PgDriverAlloydbTransport,
+    TcpAlloydbTransport,
 };
 #[cfg(feature = "aws_iot")]
 pub use aws_iot::{
@@ -122,11 +123,12 @@ pub use cassandra::{
 };
 pub use cockroachdb::{
     build_native_upsert_query, build_on_conflict_upsert_query, classify_cockroach_sqlstate,
-    cockroach_connect_config, cockroach_use_tls, cockroach_value_to_boxed, extract_cockroach_row,
-    map_cockroach_driver_error, CapturedCockroachExecution, CockroachDbConfig,
-    CockroachDbConnector, CockroachDbSink, CockroachDbTransport, CockroachErrorClassification,
-    CockroachQueryResult, CockroachRow, CockroachValue, MockCockroachDbTransport,
-    PgDriverCockroachDbTransport, TcpCockroachDbTransport,
+    cockroach_connect_config, cockroach_use_tls, cockroach_value_to_boxed,
+    coerce_cockroach_params_for_types, extract_cockroach_row, map_cockroach_driver_error,
+    CapturedCockroachExecution, CockroachDbConfig, CockroachDbConnector, CockroachDbSink,
+    CockroachDbTransport, CockroachErrorClassification, CockroachQueryResult, CockroachRow,
+    CockroachValue, MockCockroachDbTransport, PgDriverCockroachDbTransport,
+    TcpCockroachDbTransport,
 };
 #[cfg(feature = "confluent")]
 pub use confluent::{
