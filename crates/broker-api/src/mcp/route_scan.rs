@@ -267,7 +267,9 @@ fn read_ident(chars: &[char], i: &mut usize) -> String {
 
 /// Path parameters of a template (`:name` and `*name` segments).
 ///
-/// The catalog uses this; `build.rs` does not.
+/// `build.rs` does not use this; the catalog does. The allow keeps the
+/// build script warning-free under `-D warnings`.
+#[allow(dead_code)]
 pub fn path_params(path: &str) -> Vec<String> {
     path.split('/')
         .filter_map(|segment| {

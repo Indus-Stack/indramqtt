@@ -4,6 +4,8 @@ The broker exposes a Model Context Protocol (MCP) server on the
 management listener. Use it when an agent must do what an operator
 does. Each tool runs the same handler as one HTTP route. You get one
 tool for each management operation, with the same permissions.
+Tools form groups selected with `toolsets=a,b` on `/mcp` (see
+Toolsets below).
 
 ```mermaid
 sequenceDiagram
@@ -12,6 +14,7 @@ sequenceDiagram
     participant Switch as McpStore (mcp.enabled, mcp.read_only)
     participant Router as Axum router (tower oneshot)
     participant Handler as Route handler
+    participant Audit as Audit log
     Agent->>MCP: tools/call get_api_v5_status
     MCP->>Switch: check enabled, check read_only
     Switch-->>MCP: pass
@@ -19,6 +22,7 @@ sequenceDiagram
     Router->>Handler: get_status
     Handler-->>Router: JSON body
     Router-->>MCP: HTTP response
+    MCP->>Audit: key name, tool, result code
     MCP-->>Agent: text content (isError on status 400+)
 ```
 
@@ -59,12 +63,56 @@ sequenceDiagram
 
 > NOTE: The dashboard session token always fails here. Use an API key.
 
+## Toolsets
+
+Tools form groups by operation tag. The client selects groups with the
+query parameter `toolsets=a,b` on `/mcp`. With no parameter the client
+gets the `core` set. `toolsets=all` gives every tool. Unknown group
+names select nothing. The tool `list_toolsets` is always present. It
+names the groups with their tool counts.
+
+| Toolset | Holds | In `core` |
+|---|---|---|
+| `status` | Node status and version | Yes |
+| `clients` | Connected clients, bans, session counts | Yes |
+| `subscriptions` | Subscription listing | Yes |
+| `topics` | Topic listing and retained topics | Yes |
+| `publish` | Publish of messages through the broker | Yes |
+| `metrics` | Metrics, alarms, traces, monitor history | Yes |
+| `rules` | Rules, actions, sources, schemas, transformations | No |
+| `connectors` | Connector instances and probes | No |
+| `authentication` | Users, authenticators, single sign-on | No |
+| `authorization` | Authorization sources, rules, caches | No |
+| `tenants` | Managed tenant namespaces | No |
+| `listeners` | Network listeners and their status | No |
+| `configuration` | Broker configuration, certificates, data files | No |
+| `cluster` | Cluster topology and nodes | No |
+| `gateways` | Protocol gateways | No |
+| `license` | Licence document and settings | No |
+| `audit` | Management audit log | No |
+
+## Permissions
+
+- The scope of the API key applies exactly as over HTTP. A tool that
+  the key may not call is absent from `tools/list` and refused in
+  `tools/call` with JSON-RPC error `-32602`.
+- A viewer key sees read tools only and cannot call a write tool.
+- An operator key from the environment keeps full access, as over HTTP.
+- `list_toolsets` is always present: every key sees it and may call it.
+
+## Audit
+
+- Every `tools/call` writes one audit record through the existing audit log.
+- The record carries the key name, the tool name and the result code.
+- It never carries tool arguments: arguments may hold secrets.
+- Read the records with `GET /api/v5/audit`, for example with `from=mcp`.
+
 ## Settings
 
 | Setting | Default | Effect |
 |---|---|---|
 | `mcp.enabled` (`INDRA_MCP__ENABLED`) | `true` | `false` answers `404` on `POST /mcp` for every call. |
-| `mcp.read_only` (`INDRA_MCP__READ_ONLY`) | `false` | `true` refuses every tool that writes with `FORBIDDEN`. Reads still work. `tools/list` still lists all tools. |
+| `mcp.read_only` (`INDRA_MCP__READ_ONLY`) | `false` | `true` lists and runs read-only tools only, for every key. A write call is refused with `FORBIDDEN` and `isError`. |
 
 - Set `[mcp]` keys in `indra.toml` to change the endpoint. A `conf.d`
   fragment or the environment works too.
@@ -78,6 +126,10 @@ sequenceDiagram
 
 - `get_api_v5_status` reads the node status. `get_status` is its
   public alias. Both run the same handler through the router.
+- `broker_status` reads the version, uptime and node name without a
+  router round trip. It proves the path end to end.
+- `list_toolsets` names the tool groups with their tool counts. It is
+  always present, for every key and every query.
 - Every other tool maps to one HTTP operation. The build scans the
   router source and emits one row per `(method, path)` pair. The tool
   list derives from that table at startup. No hand-written copy of a
@@ -122,6 +174,13 @@ The test
 answer equals the HTTP answer on a live server. The boot smoke script
 `tools/boot_smoke.sh` repeats the call against a booted kernel.
 
+List the default tool set with a key. The answer holds
+`broker_status` and `list_toolsets` plus the core groups. Repeat the
+call with no `Authorization` header. The endpoint refuses it with
+HTTP `401`. The test suite covers the default set, a named set,
+`all`, a viewer key, read-only mode and the audit record. Read the
+call history with `GET /api/v5/audit?from=mcp`.
+
 ## Exclusions
 
 The code holds one exclusion table with a reason for each entry:
@@ -141,6 +200,10 @@ The code holds one exclusion table with a reason for each entry:
 - No multipart operation exists in the router. File uploads take JSON
   or raw bytes through `body` or `body_base64`; file downloads return
   through the base64 envelope. The same 8 MiB limit applies both ways.
+- The management API defines no request rate limit, so `/mcp` defines
+  none either. TODO(parity): decide a shared management rate limit.
+- Each inner handler still applies its own body cap to the re-entered
+  request, exactly as over HTTP.
 
 ## Tenants
 
@@ -150,12 +213,11 @@ The code holds one exclusion table with a reason for each entry:
 
 ## Open work
 
-- Toolsets (the next MC task).
-- Audit records with tool names (the middleware already audits the
-  inner write by path).
+- None in this area: toolsets, permissions and audit ship in this task.
 
 ## Next steps
 
 - Read `docs/settings-reference.md` for the `mcp` settings table.
 - Read `docs/configuration.md` for file, fragment and environment layers.
+- Query `GET /api/v5/audit?from=mcp` for the call history.
 <!-- screenshot: management dashboard showing the MCP tool list -->

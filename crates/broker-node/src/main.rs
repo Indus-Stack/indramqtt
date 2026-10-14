@@ -10573,7 +10573,8 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
         .clone()
     {
         // MC-02: apply the `mcp` section to the management switch.
-        // Disabled answers 404 on `POST /mcp`. Read-only refuses writes.
+        // Disabled answers 404 on `POST /mcp`. Read-only lists and runs
+        // read tools only.
         let mcp = startup.config().mcp.clone();
         state.mcp.apply(mcp.enabled, mcp.read_only);
         *state.startup_config.write().expect("startup config lock") = Some(startup);

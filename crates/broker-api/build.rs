@@ -114,8 +114,9 @@ fn describe_route(
 ///
 /// A leading `v5::` segment points under `src/v5/`; any other leading
 /// module of a `src/v5/mod.rs` route points under `src/v5/` too, while
-/// a leading module of a `src/lib.rs` route points under `src/`. A bare
-/// name resolves against the router file itself (`__router__`).
+/// a leading module of a `src/lib.rs` route points under `src/` (for
+/// example `config_runtime::validate_config`). A bare name resolves
+/// against the router file itself (`__router__`).
 fn split_handler(handler: &str, from_v5: bool) -> (String, String) {
     let mut parts: Vec<&str> = handler.split("::").collect();
     let name = parts.pop().unwrap_or_default().to_string();

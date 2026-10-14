@@ -9,15 +9,17 @@
 //! the live axum router in process with the same `Authorization`
 //! header. Per-operation scopes and the viewer rule apply exactly as
 //! over HTTP. One request body holds one JSON-RPC object or one batch
-//! array. Management-plane only; publish and deliver never touch this
-//! module.
+//! array. Tools form groups selected with `toolsets=a,b` on `/mcp`:
+//! no parameter selects the `core` set, `all` selects every tool, and
+//! `list_toolsets` is always present. Management-plane only; publish
+//! and deliver never touch this module.
 
 pub mod catalog;
 pub mod route_scan;
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -27,8 +29,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::admin_users::AdminRole;
 use crate::api_auth::{parse_credentials, Credentials};
-use crate::v5::api_keys::{KeyDecision, KeyGrant};
+use crate::v5::api_keys::{key_decision, KeyDecision, KeyGrant, KeyRole};
 use crate::ApiState;
 
 use catalog::{build_catalog, list_entry_for, tool_by_name, ToolDef};
@@ -131,6 +134,75 @@ impl Default for McpStore {
     }
 }
 
+/// Query string of `POST /mcp`: the client selects tool groups with
+/// `toolsets=a,b`. No parameter selects the `core` set; `all` selects
+/// every tool.
+#[derive(Debug, Deserialize, Default)]
+pub struct ToolsetQuery {
+    #[serde(default)]
+    toolsets: Option<String>,
+}
+
+/// The caller behind one `/mcp` request.
+#[derive(Debug, Clone)]
+struct Caller {
+    /// Audit name: `api-key:<name>` for key-store keys.
+    username: String,
+    /// True when the caller holds the viewer role.
+    viewer: bool,
+    /// Grant of a key-store key. `None` for operator keys, which
+    /// keep full access like over HTTP.
+    grant: Option<KeyGrant>,
+}
+
+/// Resolve the caller behind the headers: a key-store key (Basic or
+/// Bearer secret) or an operator key from the environment. Dashboard
+/// login tokens resolve to nothing: agents use keys.
+fn resolve_caller(state: &ApiState, headers: &HeaderMap) -> Option<Caller> {
+    match parse_credentials(headers)? {
+        Credentials::Bearer(token) => {
+            if let Some(key) = state.api_keys.resolve(&token) {
+                return Some(key_caller(key.name, key.grant));
+            }
+            state.operator_api_keys.resolve(&token).map(|info| Caller {
+                username: info.username,
+                viewer: info.role == AdminRole::Viewer,
+                grant: None,
+            })
+        }
+        Credentials::Basic { username, secret } => state
+            .api_keys
+            .resolve_basic(&username, &secret)
+            .map(|key| key_caller(key.name, key.grant)),
+    }
+}
+
+/// Caller record for a key-store key.
+fn key_caller(name: String, grant: KeyGrant) -> Caller {
+    Caller {
+        username: format!("api-key:{name}"),
+        viewer: grant.role == KeyRole::Viewer,
+        grant: Some(grant),
+    }
+}
+
+/// True when the caller may see and call the tool. Read-only mode
+/// and the viewer role keep read tools only. A key-store key keeps
+/// only the paths its scopes allow (exactly as over HTTP).
+/// `list_toolsets` is always allowed: every key sees it.
+fn caller_may_call(state: &ApiState, caller: &Caller, tool: &ToolDef) -> bool {
+    if tool.name == catalog::LIST_TOOLSETS_TOOL {
+        return true;
+    }
+    if (state.mcp.read_only() || caller.viewer) && !tool.read_only {
+        return false;
+    }
+    match &caller.grant {
+        Some(grant) => key_decision(grant, tool.path) == KeyDecision::Allowed,
+        None => true,
+    }
+}
+
 /// One JSON-RPC 2.0 message. Fields stay optional so a malformed
 /// message gives `-32600`, never a 500.
 #[derive(Debug, Deserialize)]
@@ -152,7 +224,12 @@ struct RpcCall {
 /// JSON-RPC body. A key without the `monitoring` scope answers 403.
 /// Oversize bodies answer 413. Anything else answers 200 with a
 /// JSON-RPC response. A notification answers 202 with an empty body.
-pub async fn post_mcp(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn post_mcp(
+    State(state): State<ApiState>,
+    Query(query): Query<ToolsetQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     if !state.mcp.enabled() {
         return (
             StatusCode::NOT_FOUND,
@@ -173,23 +250,35 @@ pub async fn post_mcp(State(state): State<ApiState>, headers: HeaderMap, body: B
         )
             .into_response();
     }
+    // Dashboard session tokens never open this path: agents use keys.
+    if crate::v5::auth::authenticated_user(&state, &headers).is_some() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "code": "UNAUTHORIZED",
+                "message": "missing or invalid API key",
+            })),
+        )
+            .into_response();
+    }
+    let Some(caller) = resolve_caller(&state, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "code": "UNAUTHORIZED",
+                "message": "missing or invalid API key",
+            })),
+        )
+            .into_response();
+    };
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    match resolve_mcp_identity(&state, &headers) {
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "code": "UNAUTHORIZED",
-                    "message": "missing or invalid API key",
-                })),
-            )
-                .into_response();
-        }
-        Some(McpIdentity::Key { grant }) => match crate::v5::api_keys::key_decision(&grant, "/mcp")
-        {
+    // A key needs the `monitoring` scope for `/mcp` itself.
+    // Per-tool scopes apply again inside each call.
+    if let Some(grant) = caller.grant.clone() {
+        match key_decision(&grant, "/mcp") {
             KeyDecision::Allowed => {}
             KeyDecision::LoginOnly => {
                 return (
@@ -211,8 +300,7 @@ pub async fn post_mcp(State(state): State<ApiState>, headers: HeaderMap, body: B
                 )
                     .into_response();
             }
-        },
-        Some(McpIdentity::Operator) => {}
+        }
     }
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -244,7 +332,9 @@ pub async fn post_mcp(State(state): State<ApiState>, headers: HeaderMap, body: B
                     )
                 }
             };
-            if let Some(answer) = serve_call_value(&state, authorization.clone(), call).await {
+            if let Some(answer) =
+                serve_call_value(&state, &caller, authorization.clone(), &query, call).await
+            {
                 answers.push(answer);
             }
         }
@@ -272,48 +362,19 @@ pub async fn post_mcp(State(state): State<ApiState>, headers: HeaderMap, body: B
             )
         }
     };
-    serve_call(&state, authorization, call).await
-}
-
-/// Identity that may call the endpoint: an operator key or a scoped
-/// API key with its grant.
-enum McpIdentity {
-    Operator,
-    Key { grant: KeyGrant },
-}
-
-/// Resolve an API key through the management key path and refuse the
-/// dashboard session token. Returns the identity or `None` when the
-/// request carries no usable API key.
-fn resolve_mcp_identity(state: &ApiState, headers: &HeaderMap) -> Option<McpIdentity> {
-    match parse_credentials(headers)? {
-        Credentials::Bearer(token) => {
-            if crate::v5::auth::authenticated_user(state, headers).is_some() {
-                return None;
-            }
-            if let Some(key) = state.api_keys.resolve(&token) {
-                return Some(McpIdentity::Key {
-                    grant: key.grant.clone(),
-                });
-            }
-            if state.operator_api_keys.resolve(&token).is_some() {
-                return Some(McpIdentity::Operator);
-            }
-            None
-        }
-        Credentials::Basic { username, secret } => state
-            .api_keys
-            .resolve_basic(&username, &secret)
-            .map(|key| McpIdentity::Key {
-                grant: key.grant.clone(),
-            }),
-    }
+    serve_call(&state, &caller, authorization, query, call).await
 }
 
 /// Answer one parsed call. Notifications (no id, or a `notifications/`
 /// method) run without an answer body.
-async fn serve_call(state: &ApiState, authorization: Option<String>, call: RpcCall) -> Response {
-    match serve_call_value(state, authorization, call).await {
+async fn serve_call(
+    state: &ApiState,
+    caller: &Caller,
+    authorization: Option<String>,
+    query: ToolsetQuery,
+    call: RpcCall,
+) -> Response {
+    match serve_call_value(state, caller, authorization, &query, call).await {
         Some(answer) => (StatusCode::OK, Json(answer)).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
@@ -325,7 +386,9 @@ async fn serve_call(state: &ApiState, authorization: Option<String>, call: RpcCa
 /// always has a body for requests with an id.
 async fn serve_call_value(
     state: &ApiState,
+    caller: &Caller,
     authorization: Option<String>,
+    query: &ToolsetQuery,
     call: RpcCall,
 ) -> Option<Value> {
     if call.jsonrpc.as_deref() != Some("2.0") {
@@ -363,16 +426,93 @@ async fn serve_call_value(
         }
         "ping" => with_envelope(&call.id, serde_json::json!({"result": {}})),
         "tools/list" => {
-            let tools: Vec<Value> = build_catalog().iter().map(list_entry_for).collect();
-            with_envelope(&call.id, serde_json::json!({"result": {"tools": tools}}))
+            let tools = visible_tools(state, caller, query);
+            let entries: Vec<Value> = tools.iter().map(tool_list_entry).collect();
+            with_envelope(&call.id, serde_json::json!({"result": {"tools": entries}}))
         }
         "tools/call" => {
-            let result = call_tool(state, authorization, call.params).await;
+            let started = std::time::Instant::now();
+            let (status, result, tool) = call_tool(state, caller, authorization, call.params).await;
+            audit_tool_call(state, &caller.username, &tool, status, started.elapsed());
             with_envelope(&call.id, result)
         }
         _ => with_envelope(&call.id, rpc_error(-32601, "unknown method")),
     };
     Some(answer)
+}
+
+/// Tools the caller may see: the selected toolsets minus the tools
+/// the key may not call. `list_toolsets` is always present.
+fn visible_tools(state: &ApiState, caller: &Caller, query: &ToolsetQuery) -> Vec<ToolDef> {
+    let selected = select_toolsets(query);
+    let mut out = vec![list_toolsets_def()];
+    out.extend(
+        build_catalog()
+            .into_iter()
+            .filter(|tool| selected.contains(&tool.toolset))
+            .filter(|tool| caller_may_call(state, caller, tool)),
+    );
+    out
+}
+
+/// Toolsets named by the `toolsets` query value: `None` selects the
+/// `core` set, `all` selects every toolset, else the named sets.
+/// Unknown names select nothing.
+fn select_toolsets(query: &ToolsetQuery) -> Vec<&'static str> {
+    match query.toolsets.as_deref() {
+        None => catalog::CORE_TOOLSETS.to_vec(),
+        Some(raw) => {
+            let names: Vec<String> = raw
+                .split(',')
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect();
+            if names.iter().any(|name| name == "all") {
+                return catalog::TOOLSETS.iter().map(|set| set.name).collect();
+            }
+            catalog::TOOLSETS
+                .iter()
+                .map(|set| set.name)
+                .filter(|known| names.iter().any(|name| name == known))
+                .collect()
+        }
+    }
+}
+
+/// One `tools/list` entry: a catalog tool, or the built-in
+/// `list_toolsets` entry.
+fn tool_list_entry(tool: &ToolDef) -> Value {
+    if tool.name == catalog::LIST_TOOLSETS_TOOL {
+        return serde_json::json!({
+            "name": catalog::LIST_TOOLSETS_TOOL,
+            "description": "List the MCP toolsets with their tool counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false,
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+            },
+        });
+    }
+    list_entry_for(tool)
+}
+
+/// The pseudo-tool behind `list_toolsets`. It is always present and
+/// carries no HTTP operation.
+fn list_toolsets_def() -> ToolDef {
+    ToolDef {
+        name: catalog::LIST_TOOLSETS_TOOL.to_string(),
+        method: "GET",
+        path: "/api/v5/status",
+        summary: "List the MCP toolsets with their tool counts.",
+        read_only: true,
+        destructive: false,
+        toolset: "status",
+    }
 }
 
 /// Pick the protocol version for `initialize`: the asked version when
@@ -408,15 +548,18 @@ fn rpc_error(code: i32, message: &str) -> Value {
     serde_json::json!({"error": {"code": code, "message": message}})
 }
 
-/// Run one `tools/call`: find the tool, build the HTTP request from
-/// the arguments, run the live router in process, and shape the
-/// answer. Returns a `result` body with `content` (and `isError` for
-/// HTTP failures) or an `error` body for bad tool use.
+/// Run one `tools/call`: find the tool, check the permission, build
+/// the HTTP request from the arguments, run the live router in
+/// process, and shape the answer. Returns the HTTP status for the
+/// audit record, the `result`/`error` body and the tool name.
+/// The audit record carries the tool name and the result only: tool
+/// arguments may carry secrets and are never logged.
 async fn call_tool(
     state: &ApiState,
+    caller: &Caller,
     authorization: Option<String>,
     params: Option<Value>,
-) -> Value {
+) -> (u16, Value, String) {
     let params = params.unwrap_or(Value::Null);
     let name = params
         .get("name")
@@ -424,32 +567,68 @@ async fn call_tool(
         .unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     if name.is_empty() || (!arguments.is_object() && !arguments.is_null()) {
-        return rpc_error(-32602, "tools/call needs a name and an arguments object");
+        return (
+            400,
+            rpc_error(-32602, "tools/call needs a name and an arguments object"),
+            name.to_string(),
+        );
     }
     let arguments = if arguments.is_null() {
         serde_json::Map::new()
     } else {
         arguments.as_object().cloned().unwrap_or_default()
     };
+    if name == catalog::LIST_TOOLSETS_TOOL {
+        return (200, list_toolsets_result(state, caller), name.to_string());
+    }
+    if name == catalog::BROKER_STATUS_TOOL {
+        let catalog = build_catalog();
+        let status_tool = tool_by_name(&catalog, catalog::BROKER_STATUS_TOOL)
+            .cloned()
+            .expect("status tool");
+        if !caller_may_call(state, caller, &status_tool) {
+            return (
+                403,
+                rpc_error(-32602, "this key may not call this tool"),
+                name.to_string(),
+            );
+        }
+        return (200, broker_status_result(), name.to_string());
+    }
     let catalog = build_catalog();
     let tool = match tool_by_name(&catalog, name) {
         Some(tool) => tool.clone(),
         None => {
             if is_excluded_tool_name(name) {
-                return rpc_error(-32602, "this operation has no tool");
+                return (
+                    400,
+                    rpc_error(-32602, "this operation has no tool"),
+                    name.to_string(),
+                );
             }
-            return rpc_error(-32602, "unknown tool");
+            return (404, rpc_error(-32602, "unknown tool"), name.to_string());
         }
     };
     if state.mcp.read_only() && !tool.read_only {
-        return serde_json::json!({"result": {
-            "content": [{"type": "text", "text": "FORBIDDEN: the MCP endpoint is read-only"}],
-            "isError": true,
-        }});
+        return (
+            403,
+            serde_json::json!({"result": {
+                "content": [{"type": "text", "text": "FORBIDDEN: the MCP endpoint is read-only"}],
+                "isError": true,
+            }}),
+            name.to_string(),
+        );
+    }
+    if !caller_may_call(state, caller, &tool) {
+        return (
+            403,
+            rpc_error(-32602, "this key may not call this tool"),
+            name.to_string(),
+        );
     }
     let request = match tool_request(&tool, &arguments) {
         Ok(request) => request,
-        Err(message) => return rpc_error(-32602, &message),
+        Err(message) => return (400, rpc_error(-32602, &message), name.to_string()),
     };
     let mut request = request;
     if let Some(authorization) = authorization {
@@ -466,7 +645,71 @@ async fn call_tool(
         Ok(response) => response,
         Err(never) => match never {},
     };
-    tool_result(response).await
+    let status = response.status().as_u16();
+    let result = tool_result(response).await;
+    (status, result, name.to_string())
+}
+
+/// One audit record per `tools/call`, through the existing audit log.
+/// The record carries the key name, the tool name and the result
+/// code. It never carries tool arguments: arguments may hold secrets.
+fn audit_tool_call(
+    state: &ApiState,
+    source: &str,
+    tool: &str,
+    status: u16,
+    elapsed: std::time::Duration,
+) {
+    state.audit.record(crate::v5::audit::AuditRecordInput {
+        created_at_us: crate::v5::audit::now_micros(),
+        node: state.node_id.clone(),
+        from: "mcp".to_string(),
+        source: source.to_string(),
+        source_ip: String::new(),
+        operation_id: format!("mcp:{tool}"),
+        operation_type: "mcp".to_string(),
+        operation_result: crate::v5::audit::outcome_for_status(status).to_string(),
+        http_method: "post".to_string(),
+        http_status_code: status,
+        duration_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+        tenant: broker_session::tenant::DEFAULT_TENANT_ID.to_string(),
+    });
+}
+
+/// The built-in status answer: version, uptime and node name.
+fn broker_status_result() -> Value {
+    serde_json::json!({"result": {
+        "content": [{"type": "text", "text": serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_ms": crate::v5::nodes::uptime_ms(),
+            "node": crate::node_scope::local_node_name(),
+        }).to_string()}],
+    }})
+}
+
+/// The built-in toolset listing: groups with tool counts for the
+/// caller permission: a key sees only the tools it may call.
+fn list_toolsets_result(state: &ApiState, caller: &Caller) -> Value {
+    let catalog = build_catalog();
+    let mut sets: Vec<Value> = Vec::new();
+    for set in catalog::TOOLSETS {
+        let tools: Vec<&ToolDef> = catalog
+            .iter()
+            .filter(|tool| tool.toolset == set.name)
+            .filter(|tool| caller_may_call(state, caller, tool))
+            .collect();
+        if tools.is_empty() {
+            continue;
+        }
+        sets.push(catalog::toolset_entry_for(
+            set.name,
+            set.description,
+            &tools,
+        ));
+    }
+    serde_json::json!({"result": {
+        "content": [{"type": "text", "text": serde_json::json!({"toolsets": sets}).to_string()}],
+    }})
 }
 
 /// True when `name` is the tool name of an excluded operation.
@@ -751,6 +994,7 @@ mod tests {
             summary: "DELETE /api/v5/rules/:id",
             read_only: false,
             destructive: true,
+            toolset: "rules",
         };
         let args: serde_json::Map<String, Value> =
             serde_json::from_value(serde_json::json!({"id": "a/b"})).expect("map");
@@ -771,10 +1015,58 @@ mod tests {
             summary: "GET /assets/*path",
             read_only: true,
             destructive: false,
+            toolset: "configuration",
         };
         let args: serde_json::Map<String, Value> =
             serde_json::from_value(serde_json::json!({"path": "a/b"})).expect("map");
         let request = tool_request(&wild, &args).expect("request builds");
         assert_eq!(request.uri().to_string(), "/assets/a/b");
+    }
+    #[test]
+    fn toolset_selection_defaults_to_core() {
+        let query = ToolsetQuery { toolsets: None };
+        assert_eq!(select_toolsets(&query), catalog::CORE_TOOLSETS.to_vec());
+    }
+
+    #[test]
+    fn toolset_selection_names_sets_and_all() {
+        let named = ToolsetQuery {
+            toolsets: Some("rules,connectors".to_string()),
+        };
+        assert_eq!(select_toolsets(&named), vec!["rules", "connectors"]);
+        let all = ToolsetQuery {
+            toolsets: Some("all".to_string()),
+        };
+        assert_eq!(select_toolsets(&all).len(), catalog::TOOLSETS.len());
+        let unknown = ToolsetQuery {
+            toolsets: Some("nope".to_string()),
+        };
+        assert!(select_toolsets(&unknown).is_empty());
+    }
+
+    #[test]
+    fn toolset_mapping_covers_core_groups() {
+        assert_eq!(catalog::toolset_for("/api/v5/status"), "status");
+        assert_eq!(catalog::toolset_for("/api/v5/clients"), "clients");
+        assert_eq!(
+            catalog::toolset_for("/api/v5/subscriptions"),
+            "subscriptions"
+        );
+        assert_eq!(catalog::toolset_for("/api/v5/topics"), "topics");
+        assert_eq!(catalog::toolset_for("/api/v5/publish"), "publish");
+        assert_eq!(catalog::toolset_for("/api/v5/metrics"), "metrics");
+        assert_eq!(catalog::toolset_for("/api/v5/rules"), "rules");
+        assert_eq!(catalog::toolset_for("/api/v5/connectors"), "connectors");
+        assert_eq!(
+            catalog::toolset_for("/api/v5/authentication"),
+            "authentication"
+        );
+        assert_eq!(
+            catalog::toolset_for("/api/v5/authorization/sources"),
+            "authorization"
+        );
+        assert_eq!(catalog::toolset_for("/api/v5/mt/ns_list"), "tenants");
+        assert_eq!(catalog::toolset_for("/api/v5/listeners"), "listeners");
+        assert_eq!(catalog::toolset_for("/api/v5/configs"), "configuration");
     }
 }

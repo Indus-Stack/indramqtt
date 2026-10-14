@@ -216,6 +216,8 @@ pub struct ToolDef {
     pub read_only: bool,
     /// True for DELETE and for stop, kick, purge and reset operations.
     pub destructive: bool,
+    /// Toolset (group) name for `toolsets=` selection.
+    pub toolset: &'static str,
 }
 
 /// Path segments that mark a non-DELETE operation destructive.
@@ -239,12 +241,181 @@ pub fn is_destructive(method: &str, path: &str) -> bool {
     DESTRUCTIVE_MARKERS.iter().any(|mark| path.contains(mark))
 }
 
-/// All tools: one tool per non-excluded router row, in route-table
-/// order. `GET /status` and `GET /api/v5/status` are two rows, so they
-/// give two tools (`get_status` and `get_api_v5_status`) that run the
-/// same handler through the router.
+/// Toolset (group) of one operation path.
+///
+/// Groups follow the operation tags (see `TOOLSETS`). Every
+/// non-excluded path maps to exactly one group. Unknown paths map to
+/// `configuration`, so a new operation stays callable under
+/// `toolsets=all` while the mapping waits for its own group.
+pub fn toolset_for(path: &str) -> &'static str {
+    if path == "/api/v5/status" || path == "/status" {
+        return "status";
+    }
+    if let Some(rest) = path.strip_prefix("/api/v5/") {
+        let head = rest.split('/').next().unwrap_or_default();
+        return match head {
+            "clients" | "clients_v2" | "sessions_count" | "banned" => "clients",
+            "subscriptions" => "subscriptions",
+            "topics" => "topics",
+            "publish" => "publish",
+            "metrics" | "monitor" | "monitor_current" | "stats" | "alarms" | "trace"
+            | "tracing" | "slow_subscriptions" | "telemetry" | "prometheus" => "metrics",
+            "rules"
+            | "rule_engine"
+            | "rule_events"
+            | "rule_test"
+            | "actions"
+            | "actions_probe"
+            | "actions_summary"
+            | "action_types"
+            | "sources"
+            | "sources_probe"
+            | "sources_summary"
+            | "source_types"
+            | "schemas"
+            | "schema_registry"
+            | "message_transformations"
+            | "ai" => "rules",
+            "connectors" | "connectors_probe" => "connectors",
+            "authentication" | "users" | "user_scopes" | "sso" | "current_user" => "authentication",
+            "authorization" => "authorization",
+            "mt" => "tenants",
+            "listeners" | "listeners_status" => "listeners",
+            "configs" | "configs_reset" | "mqtt" | "data" | "certs" | "queues" | "queue"
+            | "streams" | "stream" | "features" | "error_codes" => "configuration",
+            "nodes" | "cluster" | "load_rebalance" | "node_eviction" => "cluster",
+            "gateways" => "gateways",
+            "license" => "license",
+            "audit" => "audit",
+            _ => "configuration",
+        };
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/") {
+        let head = rest.split('/').next().unwrap_or_default();
+        return match head {
+            "nodes" => "cluster",
+            "clients" => "clients",
+            "metrics" => "metrics",
+            "connectors" | "rules" => "rules",
+            "auth" => "authentication",
+            "config" => "configuration",
+            "licence" => "license",
+            _ => "configuration",
+        };
+    }
+    "configuration"
+}
+
+/// One toolset: name plus short description for `list_toolsets`.
+pub struct ToolsetDef {
+    /// Group name used in `toolsets=a,b`.
+    pub name: &'static str,
+    /// Short description of the group.
+    pub description: &'static str,
+}
+
+/// Every toolset with its description.
+pub const TOOLSETS: &[ToolsetDef] = &[
+    ToolsetDef {
+        name: "status",
+        description: "Node status and version.",
+    },
+    ToolsetDef {
+        name: "clients",
+        description: "Connected clients, bans and session counts.",
+    },
+    ToolsetDef {
+        name: "subscriptions",
+        description: "Subscription listing.",
+    },
+    ToolsetDef {
+        name: "topics",
+        description: "Topic listing and retained topics.",
+    },
+    ToolsetDef {
+        name: "publish",
+        description: "Publish messages through the broker.",
+    },
+    ToolsetDef {
+        name: "metrics",
+        description: "Metrics, alarms, traces and monitor history.",
+    },
+    ToolsetDef {
+        name: "rules",
+        description: "Rules, actions, sources, schemas and transformations.",
+    },
+    ToolsetDef {
+        name: "connectors",
+        description: "Connector instances and probes.",
+    },
+    ToolsetDef {
+        name: "authentication",
+        description: "Users, authenticators and single sign-on.",
+    },
+    ToolsetDef {
+        name: "authorization",
+        description: "Authorization sources, rules and caches.",
+    },
+    ToolsetDef {
+        name: "tenants",
+        description: "Managed tenant namespaces.",
+    },
+    ToolsetDef {
+        name: "listeners",
+        description: "Network listeners and their status.",
+    },
+    ToolsetDef {
+        name: "configuration",
+        description: "Broker configuration, certificates and data files.",
+    },
+    ToolsetDef {
+        name: "cluster",
+        description: "Cluster topology and nodes.",
+    },
+    ToolsetDef {
+        name: "gateways",
+        description: "Protocol gateways.",
+    },
+    ToolsetDef {
+        name: "license",
+        description: "Licence document and settings.",
+    },
+    ToolsetDef {
+        name: "audit",
+        description: "Management audit log.",
+    },
+];
+
+/// Toolsets selected with no `toolsets` parameter.
+///
+/// Reason: the task names this default set: status, clients,
+/// subscriptions, topics, publish and metrics.
+pub const CORE_TOOLSETS: &[&str] = &[
+    "status",
+    "clients",
+    "subscriptions",
+    "topics",
+    "publish",
+    "metrics",
+];
+
+/// Name of the built-in toolset listing tool. It is always present:
+/// every key sees it and every key may call it.
+pub const LIST_TOOLSETS_TOOL: &str = "list_toolsets";
+
+/// All tools: the built-in status tool first, then one tool per
+/// non-excluded router row, in route-table order.
 pub fn build_catalog() -> Vec<ToolDef> {
     let mut tools = Vec::new();
+    tools.push(ToolDef {
+        name: BROKER_STATUS_TOOL.to_string(),
+        method: "GET",
+        path: "/api/v5/status",
+        summary: "Read the version, uptime and node name of this node.",
+        read_only: true,
+        destructive: false,
+        toolset: "status",
+    });
     for row in MCP_ROUTE_TABLE {
         if find_exclusion(row.method, row.path).is_some() {
             continue;
@@ -256,10 +427,14 @@ pub fn build_catalog() -> Vec<ToolDef> {
             summary: row.summary,
             read_only: row.method == "GET",
             destructive: is_destructive(row.method, row.path),
+            toolset: toolset_for(row.path),
         });
     }
     tools
 }
+
+/// The built-in status tool (proves the path end to end).
+pub const BROKER_STATUS_TOOL: &str = "broker_status";
 
 /// Find the exclusion for `(method, path)`, if any.
 pub fn find_exclusion(method: &str, path: &str) -> Option<&'static Exclusion> {
@@ -331,5 +506,19 @@ pub fn list_entry_for(tool: &ToolDef) -> Value {
             "readOnlyHint": tool.read_only,
             "destructiveHint": tool.destructive,
         },
+    })
+}
+
+/// One toolset row for `list_toolsets`: name, description and count.
+pub fn toolset_entry_for(name: &str, description: &str, tools: &[&ToolDef]) -> Value {
+    let names: Vec<Value> = tools
+        .iter()
+        .map(|tool| Value::String(tool.name.clone()))
+        .collect();
+    json!({
+        "name": name,
+        "description": description,
+        "tool_count": tools.len(),
+        "tools": names,
     })
 }
