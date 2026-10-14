@@ -65,6 +65,33 @@ sequenceDiagram
 
 > NOTE: The dashboard session token always fails here. Use an API key.
 
+## Connect a client
+
+Point any agent client at the management address. Send the API key
+in the `Authorization` header. Replace `<api_secret>` with the
+secret of the key.
+
+<!-- client-config-example -->
+
+```json
+{
+  "mcpServers": {
+    "indramqtt": {
+      "url": "http://127.0.0.1:18083/mcp",
+      "headers": {
+        "Authorization": "Bearer <api_secret>"
+      }
+    }
+  }
+}
+```
+
+The Basic form works too. Send `api_key:api_secret` encoded in
+base64 after the word `Basic`. A user login token is refused with
+`401`. The endpoint accepts an API key only.
+
+<!-- screenshot: agent client configuration screen with URL and header fields -->
+
 ## Toolsets
 
 Tools form groups by operation tag. The client selects groups with the
@@ -198,6 +225,21 @@ call with no `Authorization` header. The endpoint refuses it with
 HTTP `401`. The test suite covers the default set, a named set,
 `all`, a viewer key, read-only mode and the audit record. Read the
 call history with `GET /api/v5/audit?from=mcp`.
+
+Publish one message through `/mcp` with an API key:
+
+```json
+{"jsonrpc": "2.0", "method": "tools/call",
+ "params": {"name": "post_api_v5_publish",
+            "arguments": {"body": {"topic": "mcp/docs",
+                                   "payload": "hello"}}}, "id": 2}
+```
+
+The tool runs the same handler as HTTP `POST /api/v5/publish`
+and returns the same answer. With no subscriber the answer is
+`202` with `no_matching_subscribers`. The test `mcp_client_proof`
+publishes a retained message through the tool and reads it
+with `subscribe_collect`, which proves the publish path end to end.
 
 ## Exclusions
 
