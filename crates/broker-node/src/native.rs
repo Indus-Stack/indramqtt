@@ -404,6 +404,9 @@ pub(super) fn load_tls_config(
     client_auth: &TlsClientAuth,
 ) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error + Send + Sync>> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    // Install the default provider. The engine enables `ring`.
+    // This keeps the verifier builder safe under unification.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let mut cert_reader = std::io::BufReader::new(std::fs::File::open(cert_file)?);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)?

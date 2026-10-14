@@ -145,8 +145,10 @@ redis = { version = "0.25", default-features = false, features = ["tokio-comp"] 
 # (MIT/Apache-2.0): TDS (PRELOGIN, LOGIN7, sp_executesql) with SQL auth
 # and typed params over tokio (`tokio-util` compat). The hand-written
 # `NativeMssqlTransport` stays for offline unit tests only; production
-# wiring uses `DriverMssqlTransport` below.
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "tokio", "rustls"] }
+# wiring uses `DriverMssqlTransport` below. TLS uses the OS
+# (`native-tls`): the `rustls` feature pulls `rustls` 0.21, which has
+# no fix. The OS TLS keeps server TLS working.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "tokio", "native-tls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 # TDengine sink on the maintained `reqwest` REST SQL driver
 # (MIT/Apache-2.0): `POST {base}/rest/sql/{database}` carrying the

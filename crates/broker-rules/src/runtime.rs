@@ -55,6 +55,7 @@
 
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
+use rekuiper_core::SharedMap;
 use rekuiper_core::StreamRecord;
 use std::collections::HashMap;
 
@@ -174,7 +175,7 @@ pub fn ingress_to_stream_record(
     );
     StreamRecord {
         timestamp: crate::now_ms() as i64,
-        data,
+        data: SharedMap::new(data),
     }
 }
 
@@ -199,7 +200,7 @@ pub struct FeederRecord {
 /// Split a [`StreamRecord`] back into feeder input. Returns `None` when the
 /// transport keys are missing or malformed (fail closed: the record is
 /// counted and skipped, never evaluated against a guessed topic).
-pub fn split_stream_record(mut data: HashMap<String, serde_json::Value>) -> Option<FeederRecord> {
+pub fn split_stream_record(mut data: SharedMap) -> Option<FeederRecord> {
     let topic_value = data.remove(RUNTIME_TOPIC_KEY)?;
     let topic_str = topic_value.as_str()?.to_string();
     let tenant = data.remove(RUNTIME_TENANT_KEY)?.as_str()?.to_string();
@@ -232,7 +233,7 @@ pub fn split_stream_record(mut data: HashMap<String, serde_json::Value>) -> Opti
         tenant,
         topic,
         qos,
-        record: data,
+        record: data.into_inner(),
         injected: added,
         has_object,
     })

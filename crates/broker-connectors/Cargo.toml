@@ -118,8 +118,10 @@ aws-sdk-kinesis = { version = "1", default-features = false, features = ["behavi
 # MSSQL qualification shim only: the enterprise sink owns the `tiberius`
 # driver; this dev-edge lets `-p broker-connectors --lib
 # mssql::tests::test_qualify_driver_write_path` drive the enterprise
-# sink without a runtime dep cycle.
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "tokio", "rustls"] }
+# sink without a runtime dep cycle. TLS uses the OS
+# (`native-tls`): the `rustls` feature pulls `rustls` 0.21, which has
+# no fix. The OS TLS keeps server TLS working.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "tokio", "native-tls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 # Redshift qualification shim only: the enterprise sink owns the driver;
 # this dev-edge lets `-p broker-connectors --lib

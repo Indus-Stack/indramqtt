@@ -137,6 +137,9 @@ pub fn client_config(
     client_cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     alpn: &[String],
 ) -> Result<Arc<ClientConfig>> {
+    // Install the default provider. The engine enables `ring`.
+    // This keeps `ClientConfig::builder` safe under unification.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let builder = ClientConfig::builder().with_root_certificates(roots);
     let mut config = match client_cert {
         Some((chain, key)) => builder.with_client_auth_cert(chain, key).map_err(|e| {
@@ -348,6 +351,9 @@ pub mod test_certs {
         key_pem: &str,
         client_ca_pem: Option<&str>,
     ) -> std::result::Result<std::sync::Arc<rustls::ServerConfig>, String> {
+        // Install the default provider. The engine enables `ring`.
+        // This keeps `ServerConfig::builder` safe under unification.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let certs = super::certs_from_pem(cert_pem).map_err(|e| e.to_string())?;
         let key = super::private_key_from_pem(key_pem).map_err(|e| e.to_string())?;
         let mut config = if let Some(ca_pem) = client_ca_pem {

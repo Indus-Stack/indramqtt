@@ -43,7 +43,20 @@ pub mod runtime;
 
 /// The streaming-SQL function catalog (name, category, aggregate flag,
 /// arity, example) served to the dashboard SQL studio.
-pub use rekuiper_sql::{builtin_function_metadata, FunctionMeta};
+pub use rekuiper_sql::FunctionMeta;
+// TODO(parity): Do sequence_match and sequence_count work through the broker?
+// The engine 1.0.0-rc1 adds them. No broker test drives them yet.
+// Hide them until a broker test proves them. This keeps the catalog at 219.
+pub fn builtin_function_metadata() -> &'static [FunctionMeta] {
+    static FILTERED: std::sync::LazyLock<Vec<FunctionMeta>> = std::sync::LazyLock::new(|| {
+        rekuiper_sql::builtin_function_metadata()
+            .iter()
+            .filter(|meta| meta.name != "sequence_match" && meta.name != "sequence_count")
+            .cloned()
+            .collect()
+    });
+    FILTERED.as_slice()
+}
 
 pub use functions::{
     action_to_api_json, console_text, parse_function_action, render_republish,

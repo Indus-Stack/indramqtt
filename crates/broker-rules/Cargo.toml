@@ -15,12 +15,13 @@ bytes = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }
 parking_lot = { workspace = true }
-rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "4bbf0e5e59dc0c485af717b7cc1fb4bdfa9d81f0" }
+rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "65b53c63b83ded3d15716ba54180f175c4e6a8b8" }
 # Same revision as rekuiper-sql: only the public user-function registry is
 # used (no engine behaviour is changed by this dependency).
-rekuiper-core = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "4bbf0e5e59dc0c485af717b7cc1fb4bdfa9d81f0" }
-# Pinned to the revision the tree is tested with today (RQ-01); moving to a
-# newer revision is a separate, reviewed task.
+rekuiper-core = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "65b53c63b83ded3d15716ba54180f175c4e6a8b8" }
+# Pinned to the revision DEP-01 sets (rule engine with sqlx 0.8 and a
+# maintained YAML library); moving to a newer revision is a separate,
+# reviewed task.
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

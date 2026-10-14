@@ -130,6 +130,9 @@ pub struct TestJwksServer {
 impl TestJwksServer {
     pub async fn start(initial: Vec<serde_json::Value>) -> Self {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // Install the default provider. The engine enables `ring`.
+        // This keeps `ServerConfig::builder` safe under unification.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let keys = Arc::new(RwLock::new(initial));
         let mut cert_reader = std::io::BufReader::new(TEST_CERT_PEM.as_bytes());
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
