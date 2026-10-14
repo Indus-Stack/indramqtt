@@ -1,140 +1,158 @@
-# Built-in MCP endpoint
+# MCP server
 
-The broker serves a built-in MCP endpoint on the management listener.
-Use it when an AI agent must act as an operator.
-The agent gets the same rights as its API key, nothing more.
-The endpoint exposes management functions as tools.
+The broker exposes a Model Context Protocol (MCP) server on the
+management listener. Use it when an agent must do what an operator
+does. Each tool runs the same handler as one HTTP route. You get one
+tool for each management operation, with the same permissions.
 
 ```mermaid
 sequenceDiagram
-    participant Agent as AI agent
-    participant Listener as Management listener (POST /mcp)
-    participant Auth as api_auth.rs parsers
-    participant Store as McpStore (mcp.enabled, mcp.read_only)
-    participant Tool as broker_status tool
-    Agent->>Listener: initialize (protocolVersion)
-    Listener->>Auth: check API key (Basic or Bearer)
-    Auth-->>Listener: identity or 401
-    Listener->>Store: read enabled and read_only flags
-    Store-->>Listener: flags
-    Listener-->>Agent: protocolVersion 2025-06-18
-    Agent->>Listener: tools/call broker_status
-    Listener->>Tool: read version, uptime, node name
-    Tool-->>Agent: text item with JSON document
+    participant Agent as Agent
+    participant MCP as POST /mcp (post_mcp)
+    participant Switch as McpStore (mcp.enabled, mcp.read_only)
+    participant Router as Axum router (tower oneshot)
+    participant Handler as Route handler
+    Agent->>MCP: tools/call get_api_v5_status
+    MCP->>Switch: check enabled, check read_only
+    Switch-->>MCP: pass
+    MCP->>Router: same request, same Authorization header
+    Router->>Handler: get_status
+    Handler-->>Router: JSON body
+    Router-->>MCP: HTTP response
+    MCP-->>Agent: text content (isError on status 400+)
 ```
-
-## Reference check
-
-The reference specification 6.3.0 defines no MCP surface.
-The file `openapi.json` holds no path, tag or schema with `mcp`.
-The paths and shapes below are therefore new and broker-specific.
-
-## Implementation choice
-
-The endpoint implements the JSON-RPC 2.0 subset by hand on the HTTP stack of the management API.
-It uses no external MCP crate.
-The hand implementation keeps the dependency gate clean: no new crate enters `Cargo.lock` and `deny.toml` stays unchanged.
-An SDK stays an option for a later task with many tools, after its licence check passes and its release proves recent.
-
-## Before you start
-
-- Start the broker with the management listener active.
-- Create an API key with the `monitoring` scope.
-- Keep the key secret. Send it as a header on each call.
 
 ## Endpoint
 
-- Route: `POST /mcp` on the management listener.
-- Transport: Streamable HTTP with JSON responses.
-- The endpoint serves no SSE stream.
+- `POST /mcp` takes a JSON-RPC 2.0 message and returns a JSON-RPC 2.0
+  response. Other methods get `405`.
+- The server speaks Streamable HTTP with JSON responses only. It sends
+  no server-sent events.
 - One request body holds one JSON-RPC object or one batch array.
-- A notification (no id) answers `202` with an empty body.
-- One body is at most 64 KiB.
-
-> WARNING: A body above 64 KiB answers `413`. Keep tool arguments small.
-
-## Methods
-
-| Method | Answer |
-|---|---|
-| `initialize` | Server protocol version, tool capability and server info. |
-| `ping` | Empty result. |
-| `tools/list` | Tool list. This task ships `broker_status`. |
-| `tools/call` | Tool result for the named tool. |
-| Any other method | JSON-RPC error `-32601`. |
-
-Protocol negotiation answers the server version `2025-06-18`.
-The client sends its version in `initialize`.
-The server answers its own version in every case.
-
-## Tool `broker_status`
-
-The tool takes no arguments.
-It returns one text item with a JSON document:
-
-- `version`: build version of the broker.
-- `uptime_seconds`: seconds since the node started.
-- `node`: local node name.
-
-All three values come from the live node.
-No constant stands in for a measurement.
+  A notification (no id) answers `202` with an empty body.
+- Methods: `initialize`, `ping`, `tools/list`, `tools/call`.
+  A method that starts with `notifications/` gets `202` with an empty
+  body. Any other unknown method gets JSON-RPC error `-32601`.
+- `initialize` negotiates the protocol version. The server names the
+  newest version it speaks. It accepts an older known version back.
+- A malformed envelope gets `400`. A body above the size limit gets
+  `413`. A valid envelope with a method error gets `200` with the
+  JSON-RPC error body.
+- The reference specification defines no MCP surface, so this shape is
+  our own. The implementation parses JSON-RPC by hand on the existing
+  HTTP stack. Reason: a hand-written subset needs no new dependency,
+  and the one new dependency (`tower` with `util`, MIT) only dispatches
+  calls in process. A full SDK would add review surface for no gain.
 
 ## Authentication
 
-- Send an API key as `Authorization: Basic base64(api_key:api_secret)` or `Authorization: Bearer <api_secret>`.
-- An operator key from the process environment also works as a bearer credential.
-- The check runs through `api_auth.rs`: same parsers and same key stores as the management API.
-- A missing or wrong credential answers HTTP `401` with a plain error object.
-- The `401` body carries no JSON-RPC member.
-- A dashboard session token never authenticates here and answers `401`.
-- A key needs the `monitoring` scope for `/mcp`, as for other monitoring reads.
-- A viewer key calls read-only tools only.
+- Use an API key: Basic `api_key:api_secret`, the secret as a bearer
+  credential, or an operator key from the environment.
+- The check uses the same code path as the management API.
+- A key needs the `monitoring` scope for `/mcp`, as for other
+  monitoring reads. A key without it gets `403`.
+- No key or a wrong key gets HTTP `401` with the management error
+  shape. The body is never a JSON-RPC response.
+- A dashboard login token gets `401`. Agents authenticate with keys.
+- A tool call re-enters the router with the same `Authorization`
+  header. Key scopes and the viewer read-only rule apply as over HTTP.
 
 > NOTE: The dashboard session token always fails here. Use an API key.
 
 ## Settings
 
-```toml
-[mcp]
-enabled = true
-read_only = false
-```
+| Setting | Default | Effect |
+|---|---|---|
+| `mcp.enabled` (`INDRA_MCP__ENABLED`) | `true` | `false` answers `404` on `POST /mcp` for every call. |
+| `mcp.read_only` (`INDRA_MCP__READ_ONLY`) | `false` | `true` refuses every tool that writes with `FORBIDDEN`. Reads still work. `tools/list` still lists all tools. |
 
-- `mcp.enabled` turns the path on or off. Default: `true`. A disabled path answers `404`.
-- `mcp.read_only` refuses mutating tool calls. Default: `false`. Read-only mode still serves `broker_status`.
-- Set each value in `indra.toml`, in a `conf.d` fragment or through the environment: `INDRA_MCP__ENABLED`, `INDRA_MCP__READ_ONLY`.
-- An unknown tool answers `-32602` in read-write mode and `-32600` (read-only refusal) in read-only mode.
+- Set `[mcp]` keys in `indra.toml` to change the endpoint. A `conf.d`
+  fragment or the environment works too.
+- Boot applies the resolved section to the shared switch. A disabled
+  endpoint answers `404` with the management error shape.
+
+> Read-only mode refuses at the MCP layer before dispatch. The inner
+> write never runs, so no audit record and no state change result.
+
+## Tools
+
+- `get_api_v5_status` reads the node status. `get_status` is its
+  public alias. Both run the same handler through the router.
+- Every other tool maps to one HTTP operation. The build scans the
+  router source and emits one row per `(method, path)` pair. The tool
+  list derives from that table at startup. No hand-written copy of a
+  schema exists.
+- The tool name derives from the method and the path in snake case,
+  for example `get_api_v5_clients_by_clientid`. Names stay stable while
+  routes stay stable.
+- The tool description reuses the first doc line of the handler. A
+  route without docs falls back to `METHOD path`. Descriptions never
+  copy the reference text.
+- `inputSchema` derives from the path template and the method:
+  path segments become required string fields, `query` carries query
+  keys, `body` carries the JSON body, `body_base64` carries raw bytes
+  in base64. Use either `body` or `body_base64`, never both.
+- Annotations: `readOnlyHint` is true for `GET`; `destructiveHint` is
+  true for `DELETE` and for operations that stop, kick, purge, reset,
+  restart, deactivate or evacuate.
+- `tools/call` returns the JSON body as text content. An HTTP status
+  of 400 or more gives `isError: true` with the code and message of
+  the API. A binary answer (file downloads) returns base64 inside a
+  small JSON envelope with its content type. Text answers return as
+  text.
 
 ## Check that it works
 
-Run these commands against a local broker.
-Replace `KEY` with a valid API secret.
+Call the status tool through `/mcp` with an API key:
 
-```sh
-curl -s http://127.0.0.1:18083/mcp \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer KEY" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
-curl -s http://127.0.0.1:18083/mcp \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer KEY" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-curl -s http://127.0.0.1:18083/mcp \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer KEY" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"broker_status","arguments":{}}}'
+```json
+{"jsonrpc": "2.0", "method": "tools/call",
+ "params": {"name": "get_api_v5_status",
+            "arguments": {"query": {"format": "json"}}}, "id": 1}
 ```
 
-The first call returns `protocolVersion` `2025-06-18`.
-The second call lists a tool named `broker_status`.
-The third call returns one text item with `version`, `uptime_seconds` and `node`.
-A call with no key returns HTTP `401` with no JSON-RPC member.
+The result content holds the same JSON as HTTP
+`GET /api/v5/status?format=json`. The object has four fields:
+`rel_vsn` (the build version with a `v` prefix), `node_name`,
+`broker_status` (`started` or `stopped`) and `app_status`
+(`running` or `not_running`).
 
-## Limits of this task
+The test
+`mcp_initialize_lists_and_calls_over_a_real_socket` asserts the MCP
+answer equals the HTTP answer on a live server. The boot smoke script
+`tools/boot_smoke.sh` repeats the call against a booted kernel.
 
-- Only `broker_status` exists. Later tasks add the remaining management tools.
-- Later tasks map each new tool to its management scope.
-- Later tasks decide the session and SSE behaviour, if the scope needs it.
+## Exclusions
+
+The code holds one exclusion table with a reason for each entry:
+
+- The API key group: key management stays operator-only.
+- Login, logout, MFA setup and single sign-on flows: agents use keys,
+  not sign-in flows.
+- Console pages, assets, probes and the transport itself: these are
+  not management operations.
+
+## Limits
+
+- One `/mcp` body holds 8 MiB or less. A larger body gets `413`.
+  Keep tool arguments small.
+- One tool answer holds 8 MiB or less. Larger files stay available
+  over the HTTP route directly.
+- No multipart operation exists in the router. File uploads take JSON
+  or raw bytes through `body` or `body_base64`; file downloads return
+  through the base64 envelope. The same 8 MiB limit applies both ways.
+
+## Tenants
+
+- A tool call adds no tenant logic. It forwards the same HTTP request
+  an operator would send, so tenant scoping stays exactly as over
+  HTTP. No new message path exists, so no new tenant test is needed.
+
+## Open work
+
+- Toolsets (the next MC task).
+- Audit records with tool names (the middleware already audits the
+  inner write by path).
 
 ## Next steps
 

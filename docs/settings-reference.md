@@ -176,8 +176,8 @@ Every setting has exactly one typed home in the configuration schema. Wrong type
 
 | Setting | Type | Default | Range | Description |
 |---|---|---|---|---|
-| `mcp.enabled` | boolean | `true` | boolean | Whether the built-in MCP endpoint on the management listener serves requests. |
-| `mcp.read_only` | boolean | `false` | boolean | Whether the MCP endpoint refuses mutating tool calls. |
+| `mcp.enabled` | boolean | `true` | boolean | Whether the MCP endpoint on the management listener serves tool calls. |
+| `mcp.read_only` | boolean | `false` | boolean | Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available. |
 
 ## jwks
 

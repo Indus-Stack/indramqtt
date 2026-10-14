@@ -585,12 +585,12 @@
       "properties": {
         "enabled": {
           "default": true,
-          "description": "Whether the built-in MCP endpoint on the management listener serves requests.",
+          "description": "Whether the MCP endpoint on the management listener serves tool calls.",
           "type": "boolean"
         },
         "read_only": {
           "default": false,
-          "description": "Whether the MCP endpoint refuses mutating tool calls.",
+          "description": "Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available.",
           "type": "boolean"
         }
       }

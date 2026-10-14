@@ -182,6 +182,44 @@ fi
     config explain --key node.id 2>/dev/null | grep -q 'boot-smoke'
 check "explain shows the value from indra.toml" $?
 
+# --- 2a. The MCP endpoint answers on the management listener ---
+# A key opens tools/list. No key gives 401. The list holds the status tool.
+# A disabled endpoint gives 404. Boot reads both from [mcp] in indra.toml.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request, urllib.error
+api, key = sys.argv[1:3]
+def post(body, headers):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}/mcp", method="POST",
+        headers={"Content-Type": "application/json", **headers},
+        data=json.dumps(body).encode())
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, json.loads(res.read().decode())
+    except urllib.error.HTTPError as err:
+        return err.code, json.loads(err.read().decode())
+status, listed = post({"jsonrpc": "2.0", "method": "tools/list", "id": 1},
+                      {"Authorization": f"Bearer {key}"})
+assert status == 200, f"tools/list: {status}"
+names = [tool["name"] for tool in listed["result"]["tools"]]
+assert "get_api_v5_status" in names, "tools/list holds get_api_v5_status"
+assert "get_status" in names, "tools/list holds get_status"
+status, called = post({"jsonrpc": "2.0", "method": "tools/call",
+                       "params": {"name": "get_api_v5_status",
+                                  "arguments": {"query": {"format": "json"}}},
+                       "id": 2},
+                      {"Authorization": f"Bearer {key}"})
+assert status == 200, f"tools/call: {status}"
+assert "isError" not in called["result"], f"status call works: {called}"
+answer = json.loads(called["result"]["content"][0]["text"])
+assert answer["broker_status"] in ("started", "stopped"), f"status shape: {answer}"
+assert answer["rel_vsn"].startswith("v"), f"version shape: {answer}"
+status, _ = post({"jsonrpc": "2.0", "method": "ping", "id": 3}, {})
+assert status == 401, f"no key: {status}"
+print("the MCP endpoint lists tools for a key and refuses calls with no key")
+PY
+check "the MCP endpoint lists tools for a key and refuses calls with no key" $?
+
 # --- 3. Each setting in the schema is permitted in indra.toml ---
 python3 - "$ROOT" > "$ROOT/all.count" <<'PY'
 import json, os, sys
@@ -535,7 +573,7 @@ PY
 # --- 4f. The built-in MCP endpoint answers on the management listener ---
 # The kernel boots with the default `[mcp]` settings, so the path serves.
 # An operator key calls `initialize`, `tools/list` and `tools/call
-# broker_status` through the production HTTP entry. A call with no key
+# get_api_v5_status` through the production HTTP entry. A call with no key
 # and a call with a wrong key get 401. An unknown method gets -32601.
 python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
 import json, sys, urllib.request, urllib.error
@@ -577,12 +615,14 @@ status, body = mcp({"jsonrpc": "2.0", "id": 2, "method": "tools/list",
                     "params": {}},
                    good_auth)
 tools = body.get("result", {}).get("tools", [])
-report("the MCP tool list holds broker_status",
+report("the MCP tool list holds get_api_v5_status",
        status == 200
-       and any(tool.get("name") == "broker_status" for tool in tools))
+       and any(tool.get("name") == "get_api_v5_status" for tool in tools)
+       and any(tool.get("name") == "get_status" for tool in tools))
 
 status, body = mcp({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                    "params": {"name": "broker_status", "arguments": {}}},
+                    "params": {"name": "get_api_v5_status",
+                               "arguments": {"query": {"format": "json"}}}},
                    good_auth)
 content = body.get("result", {}).get("content", [])
 text = content[0].get("text", "") if content else ""
@@ -590,11 +630,11 @@ try:
     detail = json.loads(text)
 except ValueError:
     detail = {}
-report("the broker_status tool returns version, uptime and node name",
+report("the get_api_v5_status tool returns the HTTP status document",
        status == 200
-       and isinstance(detail.get("version"), str)
-       and isinstance(detail.get("uptime_seconds"), int)
-       and isinstance(detail.get("node"), str))
+       and detail.get("broker_status") in ("started", "stopped")
+       and isinstance(detail.get("rel_vsn"), str)
+       and detail.get("rel_vsn", "").startswith("v"))
 
 status, body = mcp({"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}},
                    None)

@@ -349,11 +349,13 @@ pub struct ApiState {
     /// one registry with no second copy. Management-plane only; publish
     /// and deliver never touch this store.
     pub namespaces: Arc<crate::v5::mt::NamespaceStore>,
-    /// Built-in MCP endpoint settings (MC-01): two atomic flags from
+    /// MCP endpoint switch (MC-01, MC-02): two atomic flags from
     /// the `[mcp]` boot configuration. The kernel shares its instance
     /// (`crates/broker-node/src/main.rs`, boot plus the `serve_api`
-    /// share) so the handler reads the file values. Management-plane
-    /// only; publish and deliver never touch this store.
+    /// share) so the handler reads the file values, and each test gets
+    /// its own instance through `new` so tests stay isolated. No broker
+    /// path reads it. Management-plane only; publish and deliver never
+    /// touch this store.
     pub mcp: Arc<crate::mcp::McpStore>,
     ws_conn_counter: Arc<AtomicU64>,
 }
@@ -825,10 +827,18 @@ pub fn router(state: ApiState) -> Router {
         .route("/version", get(get_dashboard_version))
         .route("/ws/mqtt", get(ws::ws_mqtt_handler))
         .route("/healthz", get(|| async { "OK" }))
-        // Built-in MCP endpoint (MC-01). The handler runs its own API
-        // key check and refuses dashboard tokens, so it stays public
-        // here and never passes the management auth layer.
-        .route("/mcp", post(crate::mcp::post_mcp))
+        // MCP endpoint (MC-01, MC-02): outside the auth middleware
+        // on purpose. The handler runs its own API key check and refuses
+        // dashboard tokens, so it never passes the management auth layer.
+        // A missing key answers 401 with the management error shape and
+        // a disabled endpoint answers 404. Tool calls re-enter the router
+        // below, so key scopes and the viewer rule apply through the same
+        // middleware. The default body cap stays off here: the handler
+        // enforces the 8 MiB tool limit itself.
+        .route(
+            "/mcp",
+            post(crate::mcp::post_mcp).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         // Public alias of `GET /api/v5/status` for load balancers. It needs no token.
         .route("/status", get(v5::status::get_status))
         .nest("/api/v5", v5::public_router())
@@ -2467,6 +2477,7 @@ mod tests {
         tokens: Arc<crate::v5::auth::ApiTokens>,
         alarms: Arc<crate::v5::alarms::AlarmStore>,
         license: Arc<crate::v5::license::LicenseState>,
+        mcp: Arc<crate::mcp::McpStore>,
         edge_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<BrokerFrame>>>,
     }
 
@@ -2509,6 +2520,7 @@ mod tests {
                 tokens: api_state.tokens.clone(),
                 alarms: api_state.alarms.clone(),
                 license: api_state.license.clone(),
+                mcp: api_state.mcp.clone(),
                 edge_rx: Arc::new(tokio::sync::Mutex::new(edge_rx)),
             };
             let app = router(api_state);
@@ -20678,5 +20690,630 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         }
         let encoder = tar.into_inner().expect("tar closes");
         encoder.finish().expect("gzip closes")
+    }
+
+    /// Send one JSON-RPC message to `/mcp` with an `Authorization` value.
+    async fn mcp_rpc(server: &TestServer, authorization: &str, payload: Value) -> (u16, Value) {
+        server
+            .send_with_authorization("POST", "/mcp", Some(payload), Some(authorization))
+            .await
+    }
+
+    /// The MCP tool catalog covers every router operation: each row of
+    /// the build-time route table is a tool or an exclusion, each
+    /// exclusion names a real row, and tool names are unique snake
+    /// case. Prints the tool and exclusion counts.
+    #[test]
+    fn mcp_tool_catalog_covers_every_route() {
+        use crate::mcp::catalog;
+
+        let catalog = catalog::build_catalog();
+        let mut tools = 0usize;
+        let mut excluded = 0usize;
+        for row in catalog::MCP_ROUTE_TABLE {
+            match catalog::find_exclusion(row.method, row.path) {
+                Some(_) => excluded += 1,
+                None => {
+                    let tool = catalog::tool_by_name(&catalog, row.tool)
+                        .unwrap_or_else(|| panic!("no tool for {} {}", row.method, row.path));
+                    assert_eq!(tool.method, row.method);
+                    assert_eq!(tool.path, row.path);
+                    tools += 1;
+                }
+            }
+        }
+        // No stale exclusions: each names a real router row.
+        for exclusion in catalog::EXCLUSIONS {
+            assert!(
+                catalog::MCP_ROUTE_TABLE
+                    .iter()
+                    .any(|row| row.method == exclusion.method && row.path == exclusion.path),
+                "stale exclusion {} {}",
+                exclusion.method,
+                exclusion.path
+            );
+        }
+        // Tool names are unique stable snake case.
+        let mut names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), catalog.len(), "tool names are unique");
+        for tool in &catalog {
+            assert!(
+                tool.name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "snake-case tool name: {}",
+                tool.name
+            );
+            // Path parameters are required schema fields.
+            let schema = catalog::input_schema_for(tool);
+            let required = schema["required"].as_array().expect("required is a list");
+            for param in crate::mcp::route_scan::path_params(tool.path) {
+                assert!(
+                    required.iter().any(|name| name == &json!(param)),
+                    "tool {} requires {param}",
+                    tool.name
+                );
+            }
+        }
+        // Annotations follow the method and the verb.
+        let api_status = catalog::tool_by_name(&catalog, "get_api_v5_status").expect("status tool");
+        assert!(api_status.read_only);
+        assert!(!api_status.destructive);
+        assert_eq!(api_status.method, "GET");
+        assert_eq!(api_status.path, "/api/v5/status");
+        // `/status` and `/api/v5/status` are two routes with two tools.
+        let alias = catalog::tool_by_name(&catalog, "get_status").expect("alias tool");
+        assert!(alias.read_only);
+        assert!(!alias.destructive);
+        assert_eq!(alias.method, "GET");
+        assert_eq!(alias.path, "/status");
+        for (method, path) in [("GET", "/status"), ("GET", "/api/v5/status")] {
+            assert!(
+                catalog::MCP_ROUTE_TABLE
+                    .iter()
+                    .any(|row| row.method == method && row.path == path),
+                "route row missing: {method} {path}",
+            );
+            assert!(
+                catalog::find_exclusion(method, path).is_none(),
+                "status route is a tool, not an exclusion: {method} {path}",
+            );
+        }
+        let metrics = catalog::tool_by_name(&catalog, "get_api_v5_metrics").expect("metrics tool");
+        assert!(metrics.read_only);
+        let kick =
+            catalog::tool_by_name(&catalog, "post_api_v5_clients_kickout_bulk").expect("kick tool");
+        assert!(kick.destructive);
+        println!("MCP_TOOLS {tools} MCP_EXCLUSIONS {excluded}");
+        // Every catalog entry covers a route row: no extra tool hides
+        // beside the table.
+        assert_eq!(catalog.len(), tools);
+        // The table is never empty: an empty scan must fail, not pass.
+        assert!(!catalog::MCP_ROUTE_TABLE.is_empty());
+        // Known operations survive any scanner change.
+        for name in [
+            "get_status",
+            "get_api_v5_status",
+            "get_api_v5_metrics",
+            "post_api_v5_publish",
+            "delete_api_v5_rules_by_id",
+            "get_api_v1_nodes",
+            "post_api_v5_rules",
+        ] {
+            assert!(
+                catalog::tool_by_name(&catalog, name).is_some(),
+                "known tool missing: {name}",
+            );
+        }
+    }
+
+    /// `initialize`, `tools/list` and `tools/call get_api_v5_status`
+    /// work over a real socket. Missing, wrong and dashboard credentials
+    /// are refused with 401 and no JSON-RPC body.
+    #[tokio::test]
+    async fn mcp_initialize_lists_and_calls_over_a_real_socket() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (key_id, secret) = make_key(&server, &token, json!({"name": "mcp-agent"})).await;
+        let bearer = format!("Bearer {secret}");
+        let basic = basic_authorization(&key_id, &secret);
+
+        // No key: 401 with the management error shape.
+        let (status, body) = server
+            .send_with_authorization(
+                "POST",
+                "/mcp",
+                Some(json!({"jsonrpc": "2.0", "method": "ping", "id": 1})),
+                None,
+            )
+            .await;
+        assert_eq!(status, 401);
+        assert_eq!(body["code"], json!("UNAUTHORIZED"));
+
+        // Wrong key: 401.
+        let (status, _) = server
+            .send_with_authorization(
+                "POST",
+                "/mcp",
+                Some(json!({"jsonrpc": "2.0", "method": "ping", "id": 1})),
+                Some("Bearer wrong-secret"),
+            )
+            .await;
+        assert_eq!(status, 401);
+
+        // Dashboard login token: 401. Agents use API keys.
+        let (status, _) = mcp_rpc(
+            &server,
+            &format!("Bearer {token}"),
+            json!({"jsonrpc": "2.0", "method": "ping", "id": 1}),
+        )
+        .await;
+        assert_eq!(status, 401);
+
+        // Unknown method: JSON-RPC -32601.
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "nope", "id": 2}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["error"]["code"], json!(-32601));
+
+        // Initialize negotiates the asked version.
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26"}, "id": 3}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"]["protocolVersion"], json!("2025-03-26"));
+        assert_eq!(body["result"]["serverInfo"]["name"], json!("indramqtt-mcp"));
+
+        // tools/list holds the status tools with annotations.
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/list", "id": 4}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let tools = body["result"]["tools"].as_array().expect("tools is a list");
+        let status_tool = tools
+            .iter()
+            .find(|tool| tool["name"] == json!("get_api_v5_status"))
+            .expect("get_api_v5_status is listed");
+        assert_eq!(status_tool["annotations"]["readOnlyHint"], json!(true));
+        assert!(
+            tools.iter().any(|tool| tool["name"] == json!("get_status")),
+            "alias tool is listed",
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == json!("get_api_v5_metrics")),
+            "catalog tools are listed",
+        );
+
+        // tools/call get_api_v5_status answers exactly as HTTP.
+        let (http_status, http_body) = server.get_auth("/api/v5/status?format=json", &token).await;
+        assert_eq!(http_status, 200);
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "get_api_v5_status",
+                    "arguments": {"query": {"format": "json"}}}, "id": 5}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body["result"].get("isError").is_none(),
+            "status succeeds: {body}"
+        );
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        let answer: Value = serde_json::from_str(text).expect("JSON text");
+        assert_eq!(answer, http_body);
+
+        // Basic key credentials work too.
+        let (status, _) = mcp_rpc(
+            &server,
+            &basic,
+            json!({"jsonrpc": "2.0", "method": "ping", "id": 6}),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // A notification answers 202 with no body.
+        let (status, _) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+        assert_eq!(status, 202);
+    }
+
+    /// A batch array answers one JSON-RPC array with one entry per
+    /// request that has an id. An empty batch gets 400. Proves the
+    /// batch path over a real socket.
+    #[tokio::test]
+    async fn mcp_batch_array_answers_each_request() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (_key_id, secret) = make_key(&server, &token, json!({"name": "mcp-batch"})).await;
+        let bearer = format!("Bearer {secret}");
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!([
+                {"jsonrpc": "2.0", "method": "ping", "id": 1},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "method": "ping", "id": 2},
+            ]),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let answers = body.as_array().expect("batch answer is a list");
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0]["id"], json!(1));
+        assert_eq!(answers[1]["id"], json!(2));
+        let (status, _) = mcp_rpc(&server, &bearer, json!([])).await;
+        assert_eq!(status, 400);
+    }
+
+    /// A key without the `monitoring` scope gets 403 on `/mcp`.
+    /// Proves the entry scope gate over a real socket: the same key
+    /// still calls the paths its own scope allows over HTTP.
+    #[tokio::test]
+    async fn mcp_key_without_monitoring_scope_gets_403() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (_key_id, secret) = make_key(
+            &server,
+            &token,
+            json!({"name": "mcp-audit", "scopes": ["audit"]}),
+        )
+        .await;
+        let (status, body) = mcp_rpc(
+            &server,
+            &format!("Bearer {secret}"),
+            json!({"jsonrpc": "2.0", "method": "ping", "id": 1}),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert_eq!(body["code"], json!("FORBIDDEN"));
+        // The same key still calls its own scope over HTTP.
+        let (status, _) = server.get_auth("/api/v5/audit", &secret).await;
+        assert_eq!(status, 200);
+    }
+
+    /// One GET tool, one POST tool with a body and one DELETE tool
+    /// answer through `/mcp` exactly as through HTTP.
+    #[tokio::test]
+    async fn mcp_tools_match_http_for_get_post_delete() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (key_id, secret) = make_key(&server, &token, json!({"name": "mcp-parity"})).await;
+        let bearer = format!("Bearer {secret}");
+
+        // GET: stable settings read, identical bodies.
+        let (http_status, http_body) = server
+            .get_basic("/api/v5/license/setting", &key_id, &secret)
+            .await;
+        assert_eq!(http_status, 200);
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "get_api_v5_license_setting", "arguments": {}}, "id": 1}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body["result"].get("isError").is_none(),
+            "GET succeeds: {body}"
+        );
+        let text = body["result"]["content"][0]["text"].as_str().expect("text");
+        let mcp_body: Value = serde_json::from_str(text).expect("JSON text");
+        assert_eq!(mcp_body, http_body);
+
+        // POST with a body: stateless rule test, identical bodies.
+        let probe = json!({
+            "sql": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 0",
+            "topic": "sensors/kitchen",
+            "payload": {"temperature": 72.5},
+        });
+        let (http_status, http_body) = server
+            .post_auth("/api/v5/rule_test", probe.clone(), &token)
+            .await;
+        assert_eq!(http_status, 200);
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "post_api_v5_rule_test", "arguments": {"body": probe}}, "id": 2}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let text = body["result"]["content"][0]["text"].as_str().expect("text");
+        let mcp_body: Value = serde_json::from_str(text).expect("JSON text");
+        assert_eq!(mcp_body, http_body);
+        assert_eq!(mcp_body["matched"], json!(true));
+
+        // DELETE of a missing rule: 404 on both sides.
+        let (http_status, http_body) = server
+            .delete_auth("/api/v5/rules/no-such-rule-mcp", &token)
+            .await;
+        assert_eq!(http_status, 404);
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "delete_api_v5_rules_by_id",
+                    "arguments": {"id": "no-such-rule-mcp"}}, "id": 3}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"]["isError"], json!(true));
+        let text = body["result"]["content"][0]["text"].as_str().expect("text");
+        let code = http_body["code"].as_str().unwrap_or_default();
+        assert!(
+            !code.is_empty() && text.contains(code),
+            "MCP error carries the API code: {text}",
+        );
+
+        // Real round trip: create over HTTP, delete over MCP, gone over HTTP.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"name": "mcp-del", "sql": "SELECT * FROM \"mc02/del\"",
+                    "actions": [{"function": "console"}]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "create: {created}");
+        let rule_id = created["id"].as_str().expect("rule id").to_string();
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "delete_api_v5_rules_by_id",
+                    "arguments": {"id": rule_id}}, "id": 4}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body["result"].get("isError").is_none(),
+            "delete succeeds: {body}"
+        );
+        let (status, _) = server
+            .get_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 404);
+    }
+
+    /// A publish through `/mcp` fires a rule through the broker: the
+    /// rule metrics move. Proves the tools drive broker state, not a
+    /// store.
+    #[tokio::test]
+    async fn mcp_publish_through_broker_fires_a_rule() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (_key_id, secret) = make_key(&server, &token, json!({"name": "mcp-broker"})).await;
+        let bearer = format!("Bearer {secret}");
+
+        // Create the rule through MCP.
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "post_api_v5_rules", "arguments": {"body": {
+                    "name": "mcp-fire",
+                    "sql": "SELECT * FROM \"mc02/fire\"",
+                    "actions": [{"function": "console"}],
+                }}}, "id": 1}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body["result"].get("isError").is_none(),
+            "create succeeds: {body}"
+        );
+        let text = body["result"]["content"][0]["text"].as_str().expect("text");
+        let created: Value = serde_json::from_str(text).expect("JSON text");
+        let rule_id = created["id"].as_str().expect("rule id").to_string();
+
+        // Publish through MCP: the management publish path dispatches
+        // ingress through the rule engine.
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "post_api_v5_publish", "arguments": {"body": {
+                    "topic": "mc02/fire", "payload": "{\"k\": 1}", "qos": 0,
+                }}}, "id": 2}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body["result"].get("isError").is_none(),
+            "publish succeeds: {body}"
+        );
+
+        // The rule saw the publish through the broker.
+        let (status, metrics) = server
+            .get_auth(&format!("/api/v5/rules/{rule_id}/metrics"), &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["matched"], json!(1));
+    }
+
+    /// `mcp.enabled = false` in `indra.toml` disables `POST /mcp`
+    /// through the socket. The test resolves the file with the
+    /// production layer loader and applies it with the same call boot
+    /// uses. `INDRA_MCP__ENABLED=true` wins over the file.
+    #[tokio::test]
+    async fn mcp_enabled_from_indra_toml_answers_404_through_socket() {
+        // A file value of false disables the endpoint.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-mcp-enabled-{nanos}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(dir.join("indra.toml"), "[mcp]\nenabled = false\n")
+            .expect("write indra.toml");
+        let layered = broker_config::layers::load_layered_with_env(
+            &dir,
+            &[],
+            &broker_config::layers::CliOverrides::default(),
+        )
+        .expect("layers load");
+        assert!(!layered.config().mcp.enabled);
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (_key_id, secret) = make_key(&server, &token, json!({"name": "mcp-file"})).await;
+        // Boot applies the resolved section with this call.
+        let mcp = layered.config().mcp.clone();
+        state.mcp.apply(mcp.enabled, mcp.read_only);
+        let (status, body) = mcp_rpc(
+            &server,
+            &format!("Bearer {secret}"),
+            json!({"jsonrpc": "2.0", "method": "ping", "id": 1}),
+        )
+        .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // An environment value of true enables the endpoint again.
+        let layered_env = broker_config::layers::load_layered_with_env(
+            &dir,
+            &[("INDRA_MCP__ENABLED".to_string(), "true".to_string())],
+            &broker_config::layers::CliOverrides::default(),
+        )
+        .expect("env layers load");
+        assert!(layered_env.config().mcp.enabled);
+        let mcp = layered_env.config().mcp.clone();
+        state.mcp.apply(mcp.enabled, mcp.read_only);
+        let (status, _) = mcp_rpc(
+            &server,
+            &format!("Bearer {secret}"),
+            json!({"jsonrpc": "2.0", "method": "ping", "id": 2}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `mcp.read_only = true` in `indra.toml` keeps reads and refuses
+    /// writes through the socket. `INDRA_MCP__READ_ONLY=false` lifts it.
+    #[tokio::test]
+    async fn mcp_read_only_from_indra_toml_refuses_writes_through_socket() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "indramqtt-mcp-readonly-{nanos}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(dir.join("indra.toml"), "[mcp]\nread_only = true\n")
+            .expect("write indra.toml");
+        let layered = broker_config::layers::load_layered_with_env(
+            &dir,
+            &[],
+            &broker_config::layers::CliOverrides::default(),
+        )
+        .expect("layers load");
+        assert!(layered.config().mcp.read_only);
+        // The schema default allows writes.
+        assert!(!broker_config::schema::McpConf::default().read_only);
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (_key_id, secret) = make_key(&server, &token, json!({"name": "mcp-ro"})).await;
+        let bearer = format!("Bearer {secret}");
+        let mcp = layered.config().mcp.clone();
+        state.mcp.apply(mcp.enabled, mcp.read_only);
+        // A GET tool still succeeds.
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "get_api_v5_license_setting",
+                    "arguments": {}}, "id": 1}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body["result"].get("isError").is_none(),
+            "read succeeds: {body}"
+        );
+        // A POST tool is refused with the API forbidden code.
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "post_api_v5_rule_test", "arguments": {"body": {
+                    "sql": "SELECT * FROM \"mc02/ro\"",
+                    "topic": "mc02/ro",
+                    "payload": {"k": 1},
+                }}}, "id": 2}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"]["isError"], json!(true));
+        let text = body["result"]["content"][0]["text"].as_str().expect("text");
+        assert!(
+            text.contains("FORBIDDEN"),
+            "refusal carries the API code: {text}",
+        );
+        // A DELETE tool is refused too.
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "delete_api_v5_rules_by_id",
+                    "arguments": {"id": "no-such-rule-mcp-ro"}}, "id": 3}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["result"]["isError"], json!(true));
+        // An environment value of false lifts the restriction.
+        let layered_env = broker_config::layers::load_layered_with_env(
+            &dir,
+            &[("INDRA_MCP__READ_ONLY".to_string(), "false".to_string())],
+            &broker_config::layers::CliOverrides::default(),
+        )
+        .expect("env layers load");
+        assert!(!layered_env.config().mcp.read_only);
+        let mcp = layered_env.config().mcp.clone();
+        state.mcp.apply(mcp.enabled, mcp.read_only);
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "post_api_v5_rule_test", "arguments": {"body": {
+                    "sql": "SELECT * FROM \"mc02/ro\"",
+                    "topic": "mc02/ro",
+                    "payload": {"k": 1},
+                }}}, "id": 4}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body["result"].get("isError").is_none(),
+            "write succeeds again: {body}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

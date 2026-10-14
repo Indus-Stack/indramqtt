@@ -23,6 +23,9 @@ broker-storage = { workspace = true }
 broker-cluster = { workspace = true }
 broker-gateway = { workspace = true }
 bytes = { workspace = true }
+# In-process dispatch of MCP tool calls through the axum router
+# (`tower::ServiceExt::oneshot`). MIT. No socket to self.
+tower = { version = "0.5", features = ["util"] }
 reqwest = { workspace = true }
 regex = "1"
 serde = { workspace = true }
