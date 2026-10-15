@@ -1891,7 +1891,7 @@ async fn build_connector(
                     .validate()
                     .map_err(|e| format!("invalid pulsar config: {e}"))?;
                 let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::TcpPulsarTransport::new(&config)
+                    broker_connectors_enterprise::DriverPulsarTransport::new(&config)
                         .map_err(|e| format!("invalid pulsar transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::PulsarSink::new(config, transport)

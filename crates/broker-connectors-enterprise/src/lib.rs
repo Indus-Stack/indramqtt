@@ -235,8 +235,8 @@ pub use oracle::{
 };
 pub use pulsar::{
     crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url,
-    CapturedProduce, DecodedMetadata, MemoryPulsarTransport, PulsarAuth, PulsarConnector,
-    PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport,
+    CapturedProduce, DecodedMetadata, DriverPulsarTransport, MemoryPulsarTransport, PulsarAuth,
+    PulsarConnector, PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport,
     TcpPulsarTransport,
 };
 pub use redshift::{

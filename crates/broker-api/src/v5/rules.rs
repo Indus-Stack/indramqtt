@@ -3308,7 +3308,7 @@ pub(crate) async fn register_live_sink(
                 timeout_ms,
             };
             if let Ok(transport) =
-                broker_connectors_enterprise::pulsar::TcpPulsarTransport::new(&config)
+                broker_connectors_enterprise::pulsar::DriverPulsarTransport::new(&config)
             {
                 let transport = Arc::new(transport);
                 if let Ok(sink) =
