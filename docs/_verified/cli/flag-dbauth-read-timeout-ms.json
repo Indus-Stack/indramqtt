@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-dbauth-read-timeout-ms",
+  "match": "--dbauth-read-timeout-ms",
+  "output": "      --dbauth-read-timeout-ms <DBAUTH_READ_TIMEOUT_MS>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

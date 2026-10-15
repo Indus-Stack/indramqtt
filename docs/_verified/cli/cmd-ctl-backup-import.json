@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "backup",
+    "--help"
+  ],
+  "item": "cmd-ctl-backup-import",
+  "match": "import",
+  "output": "Backup: export a versioned config snapshot, import one back\n  import  Import a snapshot file through the config reload path. Destructive on the target node: requires `--yes` or an interactive confirm",
+  "output_bytes": 476,
+  "returncode": 0,
+  "verified": true
+}

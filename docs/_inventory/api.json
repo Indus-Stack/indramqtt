@@ -1,0 +1,283 @@
+{
+  "operations": [
+    {
+      "method": "get",
+      "operation_id": "listAcls",
+      "path": "/api/v1/auth/acls",
+      "summary": "List ordered ACL rules",
+      "tags": [
+        "Authentication & ACL"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "createAcl",
+      "path": "/api/v1/auth/acls",
+      "summary": "Add new ACL rule",
+      "tags": [
+        "Authentication & ACL"
+      ]
+    },
+    {
+      "method": "delete",
+      "operation_id": "deleteAcl",
+      "path": "/api/v1/auth/acls/{id}",
+      "summary": "Delete one ACL rule by index",
+      "tags": [
+        "Authentication & ACL"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "listUsers",
+      "path": "/api/v1/auth/users",
+      "summary": "List all configured users and quotas",
+      "tags": [
+        "Authentication & ACL"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "createUser",
+      "path": "/api/v1/auth/users",
+      "summary": "Create or update user credentials and quotas",
+      "tags": [
+        "Authentication & ACL"
+      ]
+    },
+    {
+      "method": "delete",
+      "operation_id": "deleteUser",
+      "path": "/api/v1/auth/users/{username}",
+      "summary": "Delete one user",
+      "tags": [
+        "Authentication & ACL"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "getVerifyStats",
+      "path": "/api/v1/auth/verify_stats",
+      "summary": "Show password verification counters",
+      "tags": [
+        "Authentication & ACL"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "listClients",
+      "path": "/api/v1/clients",
+      "summary": "List active client sessions",
+      "tags": [
+        "Clients & Sessions"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "getClientDetail",
+      "path": "/api/v1/clients/{id}",
+      "summary": "Get detailed client session information",
+      "tags": [
+        "Clients & Sessions"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "diffConfig",
+      "path": "/api/v1/config/diff",
+      "summary": "Show the diff a reload would apply",
+      "tags": [
+        "Configuration"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "explainConfig",
+      "path": "/api/v1/config/explain",
+      "summary": "Explain one setting value and its source layer",
+      "tags": [
+        "Configuration"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "listConfigHistory",
+      "path": "/api/v1/config/history",
+      "summary": "List configuration versions newest first",
+      "tags": [
+        "Configuration"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "getConfigHistoryVersion",
+      "path": "/api/v1/config/history/{id}",
+      "summary": "Get one configuration version",
+      "tags": [
+        "Configuration"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "restoreConfigHistoryVersion",
+      "path": "/api/v1/config/history/{id}/restore",
+      "summary": "Restore one configuration version",
+      "tags": [
+        "Configuration"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "reloadConfig",
+      "path": "/api/v1/config/reload",
+      "summary": "Apply a candidate configuration snapshot",
+      "tags": [
+        "Configuration"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "validateConfig",
+      "path": "/api/v1/config/validate",
+      "summary": "Validate a candidate configuration snapshot",
+      "tags": [
+        "Configuration"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "listConnectors",
+      "path": "/api/v1/connectors",
+      "summary": "List registered data connectors",
+      "tags": [
+        "Data Connectors"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "createConnector",
+      "path": "/api/v1/connectors",
+      "summary": "Register new data connector",
+      "tags": [
+        "Data Connectors"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "installLicence",
+      "path": "/api/v1/licence/install",
+      "summary": "Install a licence token",
+      "tags": [
+        "Licence"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "getLicenceRequest",
+      "path": "/api/v1/licence/request",
+      "summary": "Show the installation licence request",
+      "tags": [
+        "Licence"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "getLicenceStatus",
+      "path": "/api/v1/licence/status",
+      "summary": "Show licence status",
+      "tags": [
+        "Licence"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "getMetrics",
+      "path": "/api/v1/metrics",
+      "summary": "Get broker metrics",
+      "tags": [
+        "Observability"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "getNodes",
+      "path": "/api/v1/nodes",
+      "summary": "Get cluster node status and metrics",
+      "tags": [
+        "Cluster & Nodes"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "listRules",
+      "path": "/api/v1/rules",
+      "summary": "List all streaming SQL rules",
+      "tags": [
+        "Rule Engine"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "createRule",
+      "path": "/api/v1/rules",
+      "summary": "Create new streaming SQL rule",
+      "tags": [
+        "Rule Engine"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "listFunctions",
+      "path": "/api/v1/rules/functions",
+      "summary": "List catalog of analytical SQL functions",
+      "tags": [
+        "Rule Engine"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "listRuleSources",
+      "path": "/api/v1/rules/sources",
+      "summary": "List available rule event sources",
+      "tags": [
+        "Rule Engine"
+      ]
+    },
+    {
+      "method": "post",
+      "operation_id": "testRule",
+      "path": "/api/v1/rules/test",
+      "summary": "Test streaming SQL query against mock payload",
+      "tags": [
+        "Rule Engine"
+      ]
+    },
+    {
+      "method": "delete",
+      "operation_id": "deleteRule",
+      "path": "/api/v1/rules/{id}",
+      "summary": "Delete rule by ID",
+      "tags": [
+        "Rule Engine"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "getRule",
+      "path": "/api/v1/rules/{id}",
+      "summary": "Get rule by ID",
+      "tags": [
+        "Rule Engine"
+      ]
+    },
+    {
+      "method": "get",
+      "operation_id": "healthCheck",
+      "path": "/healthz",
+      "summary": "Node health check",
+      "tags": [
+        "Cluster & Nodes"
+      ]
+    }
+  ]
+}

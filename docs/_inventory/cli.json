@@ -1,0 +1,643 @@
+{
+  "binaries": [
+    {
+      "flags": [
+        {
+          "default": "127.0.0.1:1883",
+          "effect": "Bind the plaintext MQTT listener.",
+          "flag": "-b, --bind",
+          "kind": "string",
+          "setting": "listeners.tcp.bind"
+        },
+        {
+          "default": "127.0.0.1:18083",
+          "effect": "Bind the management API. Empty disables it.",
+          "flag": "--api-bind",
+          "kind": "string",
+          "setting": "listeners.api.bind"
+        },
+        {
+          "default": "./data",
+          "effect": "Hold kernel state. Create it on boot when missing.",
+          "flag": "--data-dir",
+          "kind": "string",
+          "setting": "node.data_dir"
+        },
+        {
+          "default": "/etc/indramqtt",
+          "effect": "Locate indra.toml and conf.d.",
+          "flag": "--config-dir",
+          "kind": "string",
+          "setting": "none (bootstrap locator)"
+        },
+        {
+          "default": "indra-node-1",
+          "effect": "Set the node identity.",
+          "flag": "--node-id",
+          "kind": "string",
+          "setting": "node.id"
+        },
+        {
+          "default": "false",
+          "effect": "Accept anonymous clients while no users exist.",
+          "flag": "--allow-anonymous",
+          "kind": "flag",
+          "setting": "auth.allow_anonymous"
+        },
+        {
+          "default": "1000",
+          "effect": "Bound the QoS 0 backlog of each subscriber.",
+          "flag": "--qos0-backlog",
+          "kind": "integer",
+          "setting": "session.max_qos0_backlog"
+        },
+        {
+          "default": "100",
+          "effect": "Bound the QoS 1 inflight window.",
+          "flag": "--qos1-inflight-window",
+          "kind": "optional integer",
+          "setting": "session.max_qos1_inflight"
+        },
+        {
+          "default": "1000",
+          "effect": "Bound the QoS 1 spill past the window.",
+          "flag": "--qos1-spill",
+          "kind": "optional integer",
+          "setting": "session.max_qos1_spill"
+        },
+        {
+          "default": "10",
+          "effect": "Advertise the alias maximum in CONNACK.",
+          "flag": "--topic-alias-maximum",
+          "kind": "optional integer",
+          "setting": "session.topic_alias_maximum"
+        },
+        {
+          "default": "1048576",
+          "effect": "Limit the largest MQTT packet in bytes.",
+          "flag": "--max-packet-size",
+          "kind": "optional integer",
+          "setting": "session.max_packet_size"
+        },
+        {
+          "default": "10",
+          "effect": "Set the monitor sampling interval.",
+          "flag": "--monitor-sample-secs",
+          "kind": "integer",
+          "setting": "observability.monitor_sample_secs"
+        },
+        {
+          "default": "unset",
+          "effect": "Join a cluster through seed nodes.",
+          "flag": "--cluster-seeds",
+          "kind": "optional string",
+          "setting": "cluster.seed_nodes"
+        },
+        {
+          "default": "127.0.0.1:19883",
+          "effect": "Bind cluster discovery.",
+          "flag": "--cluster-bind",
+          "kind": "string",
+          "setting": "cluster.bind"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Listen for the CoAP gateway.",
+          "flag": "--coap-bind",
+          "kind": "string",
+          "setting": "gateway.coap_bind"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Journal publishes to this directory.",
+          "flag": "--stream-dir",
+          "kind": "string",
+          "setting": "persistence.stream_dir"
+        },
+        {
+          "default": "unset",
+          "effect": "Spill rule ingress to this directory.",
+          "flag": "--rule-spill-dir",
+          "kind": "optional string",
+          "setting": "rules_engine.spill_dir"
+        },
+        {
+          "default": "86400",
+          "effect": "Bound delayed deferrals in seconds.",
+          "flag": "--delayed-max-secs",
+          "kind": "integer",
+          "setting": "delayed.max_secs"
+        },
+        {
+          "default": "false",
+          "effect": "Validate the configuration and exit.",
+          "flag": "--check-config",
+          "kind": "flag",
+          "setting": "none (exit after check)"
+        },
+        {
+          "default": "unset",
+          "effect": "Set the commercial license key.",
+          "flag": "--license-key",
+          "kind": "optional string",
+          "setting": "licence.license_key"
+        },
+        {
+          "default": "empty (trust nothing)",
+          "effect": "Trust these signing keys.",
+          "flag": "--license-keys",
+          "kind": "string",
+          "setting": "licence.trusted_keys_path"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Write the licence request and exit.",
+          "flag": "--licence-request-out",
+          "kind": "string",
+          "setting": "licence.request_out"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Install the licence file and exit.",
+          "flag": "--licence-install-file",
+          "kind": "string",
+          "setting": "licence.install_file"
+        },
+        {
+          "default": "30",
+          "effect": "Warn before expiry.",
+          "flag": "--licence-expiry-warn-days",
+          "kind": "integer",
+          "setting": "licence.expiry_warn_days"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Enable LDAP with this server URL.",
+          "flag": "--ldap-url",
+          "kind": "string",
+          "setting": "ldap.server_url"
+        },
+        {
+          "default": "empty",
+          "effect": "Search directory users under this DN.",
+          "flag": "--ldap-base-dn",
+          "kind": "string",
+          "setting": "ldap.base_dn"
+        },
+        {
+          "default": "empty",
+          "effect": "Bind with this service account DN.",
+          "flag": "--ldap-bind-dn",
+          "kind": "string",
+          "setting": "ldap.bind_dn"
+        },
+        {
+          "default": "empty",
+          "effect": "Bind with this service password.",
+          "flag": "--ldap-bind-password",
+          "kind": "string",
+          "setting": "ldap.bind_password"
+        },
+        {
+          "default": "(uid={username})",
+          "effect": "Search users with this filter.",
+          "flag": "--ldap-user-filter",
+          "kind": "string",
+          "setting": "ldap.user_filter"
+        },
+        {
+          "default": "memberOf",
+          "effect": "Read groups from this attribute.",
+          "flag": "--ldap-group-attribute",
+          "kind": "string",
+          "setting": "ldap.group_attribute"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Require this group DN.",
+          "flag": "--ldap-required-group",
+          "kind": "string",
+          "setting": "ldap.required_group"
+        },
+        {
+          "default": "empty (system roots)",
+          "effect": "Trust this CA certificate.",
+          "flag": "--ldap-ca-cert",
+          "kind": "string",
+          "setting": "ldap.ca_cert_path"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Enable Kerberos with this keytab.",
+          "flag": "--kerberos-keytab",
+          "kind": "string",
+          "setting": "kerberos.keytab_path"
+        },
+        {
+          "default": "empty",
+          "effect": "Match this service principal.",
+          "flag": "--kerberos-service-principal",
+          "kind": "string",
+          "setting": "kerberos.service_principal"
+        },
+        {
+          "default": "empty (no check)",
+          "effect": "Check this service realm.",
+          "flag": "--kerberos-realm",
+          "kind": "string",
+          "setting": "kerberos.realm"
+        },
+        {
+          "default": "empty (any)",
+          "effect": "Trust these client realms.",
+          "flag": "--kerberos-allowed-realms",
+          "kind": "string",
+          "setting": "kerberos.allowed_realms"
+        },
+        {
+          "default": "300",
+          "effect": "Allow this clock skew in seconds.",
+          "flag": "--kerberos-clock-skew-secs",
+          "kind": "integer",
+          "setting": "kerberos.clock_skew_secs"
+        },
+        {
+          "default": "empty",
+          "effect": "Map principals to roles.",
+          "flag": "--kerberos-role-map",
+          "kind": "string",
+          "setting": "kerberos.role_map"
+        },
+        {
+          "default": "1024",
+          "effect": "Bound the replay cache.",
+          "flag": "--kerberos-replay-max",
+          "kind": "optional integer",
+          "setting": "kerberos.replay_max_entries"
+        },
+        {
+          "default": "unset (disabled)",
+          "effect": "Verify JWT clients with this endpoint.",
+          "flag": "--jwks-url",
+          "kind": "optional string",
+          "setting": "jwks.url"
+        },
+        {
+          "default": "unset (no check)",
+          "effect": "Check this JWT issuer.",
+          "flag": "--jwks-issuer",
+          "kind": "optional string",
+          "setting": "jwks.issuer"
+        },
+        {
+          "default": "unset (no check)",
+          "effect": "Check this JWT audience.",
+          "flag": "--jwks-audience",
+          "kind": "optional string",
+          "setting": "jwks.audience"
+        },
+        {
+          "default": "300",
+          "effect": "Refresh JWKS keys on this period.",
+          "flag": "--jwks-refresh-period-secs",
+          "kind": "integer",
+          "setting": "jwks.refresh_period_secs"
+        },
+        {
+          "default": "5000",
+          "effect": "Time out one JWKS fetch.",
+          "flag": "--jwks-fetch-timeout-ms",
+          "kind": "integer",
+          "setting": "jwks.fetch_timeout_ms"
+        },
+        {
+          "default": "5000",
+          "effect": "Time out one CONNECT refresh wait.",
+          "flag": "--jwks-refresh-timeout-ms",
+          "kind": "integer",
+          "setting": "jwks.refresh_timeout_ms"
+        },
+        {
+          "default": "32",
+          "effect": "Hold this many JWKS keys.",
+          "flag": "--jwks-cache-max-keys",
+          "kind": "integer",
+          "setting": "jwks.cache_max_keys"
+        },
+        {
+          "default": "300",
+          "effect": "Keep cached JWKS keys this long.",
+          "flag": "--jwks-cache-ttl-secs",
+          "kind": "integer",
+          "setting": "jwks.cache_ttl_secs"
+        },
+        {
+          "default": "60",
+          "effect": "Allow this JWT clock skew.",
+          "flag": "--jwks-clock-skew-secs",
+          "kind": "integer",
+          "setting": "jwks.clock_skew_secs"
+        },
+        {
+          "default": "empty (system roots)",
+          "effect": "Trust this CA for the JWKS endpoint.",
+          "flag": "--jwks-ca-cert",
+          "kind": "string",
+          "setting": "jwks.ca_cert"
+        },
+        {
+          "default": "false",
+          "effect": "Skip TLS checks for the JWKS endpoint.",
+          "flag": "--jwks-insecure-skip-verify",
+          "kind": "flag",
+          "setting": "none (tests only)"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Enable database auth with PostgreSQL.",
+          "flag": "--dbauth-postgres-url",
+          "kind": "string",
+          "setting": "dbauth.postgres_url"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Enable database auth with MySQL.",
+          "flag": "--dbauth-mysql-url",
+          "kind": "string",
+          "setting": "dbauth.mysql_url"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Enable database auth with Redis.",
+          "flag": "--dbauth-redis-url",
+          "kind": "string",
+          "setting": "dbauth.redis_url"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Enable database auth with MongoDB.",
+          "flag": "--dbauth-mongodb-url",
+          "kind": "string",
+          "setting": "dbauth.mongodb_url"
+        },
+        {
+          "default": "8",
+          "effect": "Keep this many database connections.",
+          "flag": "--dbauth-pool-size",
+          "kind": "integer",
+          "setting": "dbauth.pool_size"
+        },
+        {
+          "default": "3000",
+          "effect": "Time out database connects.",
+          "flag": "--dbauth-connect-timeout-ms",
+          "kind": "integer",
+          "setting": "dbauth.connect_timeout_ms"
+        },
+        {
+          "default": "3000",
+          "effect": "Time out database lookups.",
+          "flag": "--dbauth-read-timeout-ms",
+          "kind": "integer",
+          "setting": "dbauth.read_timeout_ms"
+        },
+        {
+          "default": "1024",
+          "effect": "Cache this many database verdicts.",
+          "flag": "--dbauth-cache-size",
+          "kind": "integer",
+          "setting": "dbauth.cache_size"
+        },
+        {
+          "default": "60",
+          "effect": "Keep database verdicts this long.",
+          "flag": "--dbauth-cache-ttl-secs",
+          "kind": "integer",
+          "setting": "dbauth.cache_ttl_secs"
+        },
+        {
+          "default": "empty (disabled)",
+          "effect": "Ask this webhook for verdicts.",
+          "flag": "--webhook-url",
+          "kind": "string",
+          "setting": "webhook.url"
+        },
+        {
+          "default": "8",
+          "effect": "Allow this many webhook requests.",
+          "flag": "--webhook-pool-size",
+          "kind": "integer",
+          "setting": "webhook.pool_size"
+        },
+        {
+          "default": "2000",
+          "effect": "Time out one webhook request.",
+          "flag": "--webhook-timeout-ms",
+          "kind": "integer",
+          "setting": "webhook.timeout_ms"
+        },
+        {
+          "default": "5",
+          "effect": "Open the breaker after these failures.",
+          "flag": "--webhook-breaker-threshold",
+          "kind": "integer",
+          "setting": "webhook.breaker_threshold"
+        },
+        {
+          "default": "30000",
+          "effect": "Retry the webhook after this wait.",
+          "flag": "--webhook-breaker-reset-ms",
+          "kind": "integer",
+          "setting": "webhook.breaker_reset_ms"
+        },
+        {
+          "default": "1024",
+          "effect": "Cache this many webhook verdicts.",
+          "flag": "--webhook-cache-size",
+          "kind": "integer",
+          "setting": "webhook.cache_size"
+        },
+        {
+          "default": "60",
+          "effect": "Keep webhook verdicts this long.",
+          "flag": "--webhook-cache-ttl-secs",
+          "kind": "integer",
+          "setting": "webhook.cache_ttl_secs"
+        },
+        {
+          "default": "false",
+          "effect": "Require a TLS client certificate.",
+          "flag": "--tls-verify-client-cert",
+          "kind": "optional flag",
+          "setting": "listeners.tls.verify_client_cert"
+        },
+        {
+          "default": "false",
+          "effect": "Require a secure WebSocket client certificate.",
+          "flag": "--wss-verify-client-cert",
+          "kind": "optional flag",
+          "setting": "listeners.wss.verify_client_cert"
+        }
+      ],
+      "name": "indramqtt"
+    },
+    {
+      "commands": [
+        {
+          "command": "indra ctl status",
+          "effect": "Show node status."
+        },
+        {
+          "command": "indra ctl clients list",
+          "effect": "List connected clients."
+        },
+        {
+          "command": "indra ctl clients show",
+          "effect": "Show one client."
+        },
+        {
+          "command": "indra ctl clients kick",
+          "effect": "Disconnect one client."
+        },
+        {
+          "command": "indra ctl subscriptions",
+          "effect": "List subscriptions."
+        },
+        {
+          "command": "indra ctl topics",
+          "effect": "List topics."
+        },
+        {
+          "command": "indra ctl publish",
+          "effect": "Publish one message."
+        },
+        {
+          "command": "indra ctl listeners",
+          "effect": "List network listeners."
+        },
+        {
+          "command": "indra ctl rules list",
+          "effect": "List SQL rules."
+        },
+        {
+          "command": "indra ctl rules show",
+          "effect": "Show one rule."
+        },
+        {
+          "command": "indra ctl rules create",
+          "effect": "Create one rule."
+        },
+        {
+          "command": "indra ctl rules delete",
+          "effect": "Delete one rule."
+        },
+        {
+          "command": "indra ctl connectors list",
+          "effect": "List connectors."
+        },
+        {
+          "command": "indra ctl connectors show",
+          "effect": "Show one connector."
+        },
+        {
+          "command": "indra ctl connectors create",
+          "effect": "Create one connector."
+        },
+        {
+          "command": "indra ctl connectors delete",
+          "effect": "Delete one connector."
+        },
+        {
+          "command": "indra ctl users list",
+          "effect": "List users."
+        },
+        {
+          "command": "indra ctl users show",
+          "effect": "Show one user."
+        },
+        {
+          "command": "indra ctl users create",
+          "effect": "Create one user."
+        },
+        {
+          "command": "indra ctl users delete",
+          "effect": "Delete one user."
+        },
+        {
+          "command": "indra ctl tenants list",
+          "effect": "List tenant namespaces."
+        },
+        {
+          "command": "indra ctl tenants show",
+          "effect": "Show one namespace."
+        },
+        {
+          "command": "indra ctl tenants create",
+          "effect": "Create one namespace."
+        },
+        {
+          "command": "indra ctl tenants delete",
+          "effect": "Delete one namespace."
+        },
+        {
+          "command": "indra ctl acls list",
+          "effect": "List ACL rules."
+        },
+        {
+          "command": "indra ctl acls create",
+          "effect": "Add one ACL rule."
+        },
+        {
+          "command": "indra ctl acls delete",
+          "effect": "Delete one ACL rule."
+        },
+        {
+          "command": "indra ctl config validate",
+          "effect": "Validate a configuration file."
+        },
+        {
+          "command": "indra ctl config diff",
+          "effect": "Diff a file against the running configuration."
+        },
+        {
+          "command": "indra ctl config reload",
+          "effect": "Reload a configuration file."
+        },
+        {
+          "command": "indra ctl config explain",
+          "effect": "Explain one setting value."
+        },
+        {
+          "command": "indra ctl config history",
+          "effect": "List configuration versions."
+        },
+        {
+          "command": "indra ctl licence status",
+          "effect": "Show licence status."
+        },
+        {
+          "command": "indra ctl licence request",
+          "effect": "Write a licence request."
+        },
+        {
+          "command": "indra ctl licence install",
+          "effect": "Install a licence file."
+        },
+        {
+          "command": "indra ctl backup export",
+          "effect": "Export a configuration snapshot."
+        },
+        {
+          "command": "indra ctl backup import",
+          "effect": "Import a configuration snapshot."
+        }
+      ],
+      "name": "indra"
+    }
+  ],
+  "live_help": {
+    "binaries": {},
+    "checked": false,
+    "state": "binary-missing"
+  }
+}

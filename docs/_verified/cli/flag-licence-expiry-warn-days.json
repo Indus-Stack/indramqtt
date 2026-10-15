@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-licence-expiry-warn-days",
+  "match": "--licence-expiry-warn-days",
+  "output": "      --licence-expiry-warn-days <LICENCE_EXPIRY_WARN_DAYS>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

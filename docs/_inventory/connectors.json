@@ -1,0 +1,272 @@
+{
+  "connectors": [
+    {
+      "kind": "alloydb",
+      "tier": "community"
+    },
+    {
+      "kind": "aws_iot",
+      "tier": "community"
+    },
+    {
+      "kind": "aws_timestream",
+      "tier": "community"
+    },
+    {
+      "kind": "azure_blob",
+      "tier": "community"
+    },
+    {
+      "kind": "azure_blob_storage",
+      "tier": "community"
+    },
+    {
+      "kind": "azure_event_grid",
+      "tier": "community"
+    },
+    {
+      "kind": "azure_event_hub_producer",
+      "tier": "community"
+    },
+    {
+      "kind": "azure_eventhubs",
+      "tier": "community"
+    },
+    {
+      "kind": "azure_iot",
+      "tier": "community"
+    },
+    {
+      "kind": "bigquery",
+      "tier": "community"
+    },
+    {
+      "kind": "cassandra",
+      "tier": "community"
+    },
+    {
+      "kind": "clickhouse",
+      "tier": "community"
+    },
+    {
+      "kind": "cockroachdb",
+      "tier": "community"
+    },
+    {
+      "kind": "confluent",
+      "tier": "community"
+    },
+    {
+      "kind": "confluent_producer",
+      "tier": "community"
+    },
+    {
+      "kind": "console",
+      "tier": "community"
+    },
+    {
+      "kind": "couchbase",
+      "tier": "community"
+    },
+    {
+      "kind": "databricks",
+      "tier": "community"
+    },
+    {
+      "kind": "datalayers",
+      "tier": "enterprise"
+    },
+    {
+      "kind": "disk_log",
+      "tier": "community"
+    },
+    {
+      "kind": "doris",
+      "tier": "community"
+    },
+    {
+      "kind": "dynamo",
+      "tier": "community"
+    },
+    {
+      "kind": "dynamodb",
+      "tier": "community"
+    },
+    {
+      "kind": "elasticsearch",
+      "tier": "community"
+    },
+    {
+      "kind": "gcp_iot",
+      "tier": "community"
+    },
+    {
+      "kind": "gcp_pubsub",
+      "tier": "community"
+    },
+    {
+      "kind": "gcp_pubsub_consumer",
+      "tier": "community"
+    },
+    {
+      "kind": "gcp_pubsub_producer",
+      "tier": "community"
+    },
+    {
+      "kind": "greptimedb",
+      "tier": "community"
+    },
+    {
+      "kind": "http",
+      "tier": "community"
+    },
+    {
+      "kind": "influxdb",
+      "tier": "community"
+    },
+    {
+      "kind": "iotdb",
+      "tier": "community"
+    },
+    {
+      "kind": "kafka",
+      "tier": "community"
+    },
+    {
+      "kind": "kafka_consumer",
+      "tier": "community"
+    },
+    {
+      "kind": "kafka_producer",
+      "tier": "community"
+    },
+    {
+      "kind": "kinesis",
+      "tier": "community"
+    },
+    {
+      "kind": "mongodb",
+      "tier": "community"
+    },
+    {
+      "kind": "mqtt",
+      "tier": "community"
+    },
+    {
+      "kind": "mqtt_bridge",
+      "tier": "community"
+    },
+    {
+      "kind": "mssql",
+      "tier": "community"
+    },
+    {
+      "kind": "mysql",
+      "tier": "community"
+    },
+    {
+      "kind": "oci_streaming",
+      "tier": "community"
+    },
+    {
+      "kind": "opc_ua",
+      "tier": "community"
+    },
+    {
+      "kind": "opents",
+      "tier": "community"
+    },
+    {
+      "kind": "opentsdb",
+      "tier": "community"
+    },
+    {
+      "kind": "oracle",
+      "tier": "community"
+    },
+    {
+      "kind": "pgsql",
+      "tier": "community"
+    },
+    {
+      "kind": "postgres",
+      "tier": "community"
+    },
+    {
+      "kind": "pulsar",
+      "tier": "community"
+    },
+    {
+      "kind": "rabbitmq",
+      "tier": "community"
+    },
+    {
+      "kind": "redis",
+      "tier": "community"
+    },
+    {
+      "kind": "redshift",
+      "tier": "community"
+    },
+    {
+      "kind": "rocketmq",
+      "tier": "community"
+    },
+    {
+      "kind": "s3",
+      "tier": "community"
+    },
+    {
+      "kind": "s3_tables",
+      "tier": "community"
+    },
+    {
+      "kind": "s3tables",
+      "tier": "community"
+    },
+    {
+      "kind": "snowflake",
+      "tier": "community"
+    },
+    {
+      "kind": "snowflake_streaming",
+      "tier": "community"
+    },
+    {
+      "kind": "sparkplug_b",
+      "tier": "community"
+    },
+    {
+      "kind": "sqlserver",
+      "tier": "community"
+    },
+    {
+      "kind": "tablestore",
+      "tier": "community"
+    },
+    {
+      "kind": "tdengine",
+      "tier": "community"
+    },
+    {
+      "kind": "test",
+      "tier": "community"
+    },
+    {
+      "kind": "timescale",
+      "tier": "community"
+    },
+    {
+      "kind": "timescaledb",
+      "tier": "community"
+    },
+    {
+      "kind": "timestream",
+      "tier": "community"
+    },
+    {
+      "kind": "webhook",
+      "tier": "community"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "cmd-ctl-rules-delete"
+kind = "help-contains"
+binary = "indra"
+args = ["ctl", "rules"]
+match = "delete"

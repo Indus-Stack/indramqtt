@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-delayed-max-secs",
+  "match": "--delayed-max-secs",
+  "output": "      --delayed-max-secs <DELAYED_MAX_SECS>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

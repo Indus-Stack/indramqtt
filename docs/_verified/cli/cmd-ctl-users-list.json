@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "users",
+    "--help"
+  ],
+  "item": "cmd-ctl-users-list",
+  "match": "list",
+  "output": "Authentication users: list, show, create, delete\n  list    List authentication users",
+  "output_bytes": 449,
+  "returncode": 0,
+  "verified": true
+}

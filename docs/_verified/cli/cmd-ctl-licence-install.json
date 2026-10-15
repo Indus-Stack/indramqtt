@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "licence",
+    "--help"
+  ],
+  "item": "cmd-ctl-licence-install",
+  "match": "install",
+  "output": "Licence: current state (bare), request, install\n  request  Show the installation licence request (safe to send to sales)\n  install  Verify and atomically store the licence token. Overwrites the stored licence: requires `--yes` or an interactive confirm. A failed install leaves any previous licence in place",
+  "output_bytes": 528,
+  "returncode": 0,
+  "verified": true
+}

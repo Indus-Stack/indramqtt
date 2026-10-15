@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-config-dir",
+  "match": "--config-dir",
+  "output": "      --config-dir <CONFIG_DIR>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

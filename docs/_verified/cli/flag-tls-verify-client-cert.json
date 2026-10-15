@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-tls-verify-client-cert",
+  "match": "--tls-verify-client-cert",
+  "output": "      --tls-verify-client-cert <TLS_VERIFY_CLIENT_CERT>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-rule-spill-dir",
+  "match": "--rule-spill-dir",
+  "output": "      --rule-spill-dir <RULE_SPILL_DIR>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

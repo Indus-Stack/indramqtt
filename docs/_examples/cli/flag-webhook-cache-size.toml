@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-webhook-cache-size"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--webhook-cache-size"

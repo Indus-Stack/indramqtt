@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-dbauth-pool-size",
+  "match": "--dbauth-pool-size",
+  "output": "      --dbauth-pool-size <DBAUTH_POOL_SIZE>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

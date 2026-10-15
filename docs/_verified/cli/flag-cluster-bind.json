@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-cluster-bind",
+  "match": "--cluster-bind",
+  "output": "      --cluster-bind <CLUSTER_BIND>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

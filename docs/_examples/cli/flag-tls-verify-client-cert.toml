@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-tls-verify-client-cert"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--tls-verify-client-cert"

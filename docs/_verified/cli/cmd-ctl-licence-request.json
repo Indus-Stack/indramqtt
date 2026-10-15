@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "licence",
+    "--help"
+  ],
+  "item": "cmd-ctl-licence-request",
+  "match": "request",
+  "output": "Licence: current state (bare), request, install\n  request  Show the installation licence request (safe to send to sales)",
+  "output_bytes": 528,
+  "returncode": 0,
+  "verified": true
+}

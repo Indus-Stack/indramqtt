@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "cmd-ctl-rules-list"
+kind = "help-contains"
+binary = "indra"
+args = ["ctl", "rules"]
+match = "list"

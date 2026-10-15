@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "cmd-ctl-acls-list"
+kind = "help-contains"
+binary = "indra"
+args = ["ctl", "acls"]
+match = "list"

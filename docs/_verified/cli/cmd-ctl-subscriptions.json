@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "subscriptions",
+    "--help"
+  ],
+  "item": "cmd-ctl-subscriptions",
+  "match": "subscriptions",
+  "output": "Usage: indra ctl subscriptions [OPTIONS]",
+  "output_bytes": 238,
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-ldap-url",
+  "match": "--ldap-url",
+  "output": "      --ldap-url <LDAP_URL>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

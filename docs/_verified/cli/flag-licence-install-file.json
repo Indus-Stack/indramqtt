@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-licence-install-file",
+  "match": "--licence-install-file",
+  "output": "      --licence-install-file <LICENCE_INSTALL_FILE>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

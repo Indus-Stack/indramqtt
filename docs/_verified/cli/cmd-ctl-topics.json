@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "topics",
+    "--help"
+  ],
+  "item": "cmd-ctl-topics",
+  "match": "topics",
+  "output": "Known publish topics\nUsage: indra ctl topics [OPTIONS]",
+  "output_bytes": 227,
+  "returncode": 0,
+  "verified": true
+}

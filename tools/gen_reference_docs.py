@@ -1410,171 +1410,20 @@ def check_cli_against_sources() -> None:
 
 
 def cli_page() -> str:
-    """Render the command line reference page."""
-    check_cli_against_sources()
-    out = [
-        "---",
-        "title: Command line reference",
-        "description: Generated flags and commands of each binary.",
-        "---",
-        "",
-        "# Command line reference",
-        "",
-        GENERATED,
-        "",
-        POSITIONING,
-        "",
-        "Read every flag and every operator command. Use it when a command "
-        "line looks wrong. You get one row per flag and per command.",
-        "",
-        mermaid_fence(
-            [
-                "flowchart LR",
-                '    Op["operator"] -- "run indramqtt" --> Bin["indramqtt"]',
-                '    Op -- "indra ctl status" --> Ctl["indra ctl"]',
-                '    Ctl -- "HTTPS plus INDRA_API_KEY" --> API["management API"]',
-                '    API -- "read" --> S["sessions"]',
-            ]
-        ),
-        "",
-        "The product is one native binary. `indramqtt` runs the broker. "
-        "`indra ctl` operates it through the management API.",
-        "The drift test fails when a flag or a command differs from the "
-        "command definitions.",
-        "",
-        "## Before you start",
-        "",
-        "- Start the broker from [First start](../getting-started/first-start.md).",
-        "- `indra ctl` needs an operator key: `--api-key`, `--api-key-file`, "
-        "or `INDRA_API_KEY`. A missing key fails closed before any request.",
-        "",
-        "> **Note:** Destructive commands require `--yes` or a confirm. "
-        "Without `--yes` on a pipe, the command refuses to run.",
-        "",
-        "The table lists each flag and each command. The drift test "
-        "checks each flag and each command against the live help.",
-        "",
-        "## indramqtt",
-        "",
-        "Start the broker:",
-        "",
-        "```sh no-test",
-        "# Starts the broker. The drift test boots it with a temp dir, not this line.",
-        "indramqtt --config-dir /etc/indramqtt",
-        "```",
-        "",
-        "Validate a configuration file and exit:",
-        "",
-        "```sh no-test",
-        "# Checks the file and exits. The drift test runs this on a temp dir.",
-        "indramqtt --config-dir /etc/indramqtt --check-config",
-        "```",
-        "",
-        "| Flag | Kind | Default | Setting | Effect |",
-        "|---|---|---|---|---|",
-    ]
-    for flag, kind, default, home, effect in INDRA_MQTT_FLAGS:
-        out.append(f"| `{flag}` | {kind} | `{default}` | `{home}` | {effect} |")
-    out += [
-        "",
-        "`--help` prints the full help. `--version` prints the version.",
-        "",
-        "## Flags in detail",
-        "",
-        "Each flag owns one entry. The drift test checks each flag "
-        "against the live `--help` output.",
-        "",
-    ]
-    for flag, kind, default, home, effect in INDRA_MQTT_FLAGS:
-        long = flag.split(", ")[-1].strip()
-        out.append(f"### `{long}`")
-        out.append("")
-        out.append(f"{effect}")
-        out.append("")
-        out.append(f"Kind: `{kind}`. Default: `{default}`. Setting: `{home}`.")
-        out.append("")
-        out.append("Example:")
-        out.append("")
-        out.append("```sh no-test")
-        out.append("# Presence in --help is checked. This call is illustrative.")
-        if long == "--config-dir":
-            out.append("indramqtt --config-dir /etc/indramqtt")
-        elif kind == "flag" or kind == "optional flag":
-            out.append(f"indramqtt --config-dir /etc/indramqtt {long}")
-        else:
-            out.append(f"indramqtt --config-dir /etc/indramqtt {long} {default}")
-        out.append("```")
-        out.append("")
-        out.append("Notes:")
-        out.append("")
-        if home.startswith("none"):
-            out.append("- This flag maps to no setting.")
-        else:
-            out.append(f"- Set the same value under `{home}`.")
-        out.append("- The drift test checks this flag against live `--help`.")
-        out.append("")
-    out += [
-        "## indra ctl",
-        "",
-        "Operate the broker through the management API:",
-        "",
-        "```sh no-test",
-        "# Needs a live broker and an API key. The drift test runs ctl --help, not this call.",
-        "indra ctl --endpoint http://127.0.0.1:18083 status",
-        "```",
-        "",
-        "Each row below names a live command. The drift test runs "
-        "`indra ctl <command> --help` for each command group.",
-        "",
-        "| Command | Effect |",
-        "|---|---|",
-    ]
-    for command, effect in CTL_COMMANDS:
-        out.append(f"| `indra {command}` | {effect} |")
-    out += [
-        "",
-        "Global options: `--endpoint`, `--api-key`, `--api-key-file`, "
-        "`--timeout`, `--json`.",
-        "Destructive commands require `--yes` or a confirm.",
-        "",
-        "Exit codes: 0 success, 1 connection failure, 2 auth failure, "
-        "3 not found, 4 validation failure, 5 server failure.",
-        "",
-        "## Commands in detail",
-        "",
-        "Each command owns one entry. The drift test runs "
-        "`--help` for each command group.",
-        "",
-    ]
-    for command, effect in CTL_COMMANDS:
-        group = command.split()[1] if len(command.split()) > 1 else command
-        out.append(f"### `indra {command}`")
-        out.append("")
-        out.append(f"{effect}")
-        out.append("")
-        out.append("Example:")
-        out.append("")
-        out.append("```sh no-test")
-        out.append("# Group help needs no broker. Real calls need one.")
-        out.append(f"indra ctl {group} --help")
-        out.append("```")
-        out.append("")
-        out.append("Notes:")
-        out.append("")
-        out.append("- Real calls need a live broker and an operator key.")
-        out.append("- `--help` needs neither. The drift test runs it.")
-        out.append("")
-    out += [
-        check_section("CLI"),
-        next_steps(
-            [
-                "[Configuration reference](configuration.md): the settings behind the flags.",
-                "[API reference](api/index.md): the calls behind `indra ctl`.",
-                "[First start](../getting-started/first-start.md): boot the broker.",
-            ]
-        ),
-    ]
-    return "\n".join(out)
+    """Render the command line reference page.
+
+    Single source: docs/_tools/entries.py builds it from the CLI
+    inventory, the written texts and the verified outputs (DX-01).
+    This wrapper keeps one output for both generators.
+    """
+    from pathlib import Path as _Path
+
+    tools = _Path(__file__).resolve().parent
+    root = tools.parent
+    sys.path.insert(0, str(root / "docs" / "_tools"))
+    import entries as _entries
+
+    return _entries.render_cli_page()
 
 
 # --------------------------------------------------------------------------

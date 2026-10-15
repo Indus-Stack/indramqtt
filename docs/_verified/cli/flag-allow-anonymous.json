@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-allow-anonymous",
+  "match": "--allow-anonymous",
+  "output": "      --allow-anonymous",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

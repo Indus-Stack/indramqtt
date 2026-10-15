@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-node-id",
+  "match": "--node-id",
+  "output": "      --node-id <NODE_ID>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

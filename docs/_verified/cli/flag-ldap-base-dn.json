@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-ldap-base-dn",
+  "match": "--ldap-base-dn",
+  "output": "      --ldap-base-dn <LDAP_BASE_DN>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

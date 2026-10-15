@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-webhook-cache-ttl-secs",
+  "match": "--webhook-cache-ttl-secs",
+  "output": "      --webhook-cache-ttl-secs <WEBHOOK_CACHE_TTL_SECS>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "clients",
+    "--help"
+  ],
+  "item": "cmd-ctl-clients-show",
+  "match": "show",
+  "output": "Client sessions: list, show, kick\n  show  Show one client session",
+  "output_bytes": 313,
+  "returncode": 0,
+  "verified": true
+}

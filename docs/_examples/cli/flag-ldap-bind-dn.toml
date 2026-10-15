@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-ldap-bind-dn"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--ldap-bind-dn"

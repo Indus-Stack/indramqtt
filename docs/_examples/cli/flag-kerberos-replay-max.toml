@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-kerberos-replay-max"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--kerberos-replay-max"

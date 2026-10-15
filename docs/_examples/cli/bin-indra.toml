@@ -1,0 +1,6 @@
+[example]
+area = "cli"
+item = "bin-indra"
+kind = "help-ok"
+binary = "indra"
+args = []

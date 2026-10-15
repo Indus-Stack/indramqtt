@@ -18,6 +18,10 @@ name = "docs_examples"
 path = "tests/docs_examples.rs"
 
 [[test]]
+name = "docs_dx01"
+path = "tests/docs_dx01.rs"
+
+[[test]]
 name = "e2e_integration"
 path = "../../tests/e2e_integration.rs"
 

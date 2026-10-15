@@ -1,0 +1,76 @@
+{
+  "metrics": [
+    {
+      "name": "indramqtt_connections_active"
+    },
+    {
+      "name": "indramqtt_dead_mailbox_dropped_total"
+    },
+    {
+      "name": "indramqtt_detached_clean_dropped_total"
+    },
+    {
+      "name": "indramqtt_egress_qos0_shed_total"
+    },
+    {
+      "name": "indramqtt_inflight_dropped_total"
+    },
+    {
+      "name": "indramqtt_inflight_spill_evicted_total"
+    },
+    {
+      "name": "indramqtt_inflight_spill_replayed_total"
+    },
+    {
+      "name": "indramqtt_inflight_spilled_total"
+    },
+    {
+      "name": "indramqtt_messages_dropped_total"
+    },
+    {
+      "name": "indramqtt_messages_forwarded_total"
+    },
+    {
+      "name": "indramqtt_messages_received_total"
+    },
+    {
+      "name": "indramqtt_offline_queue_evicted_total"
+    },
+    {
+      "name": "indramqtt_puback_deferred_released_total"
+    },
+    {
+      "name": "indramqtt_puback_deferred_total"
+    },
+    {
+      "name": "indramqtt_rule_spill_dropped_total"
+    },
+    {
+      "name": "indramqtt_rule_spill_recovered_total"
+    },
+    {
+      "name": "indramqtt_rule_spill_replayed_total"
+    },
+    {
+      "name": "indramqtt_rule_spill_spilled_total"
+    },
+    {
+      "name": "indramqtt_rule_spill_torn_total"
+    },
+    {
+      "name": "indramqtt_rules_executed_total"
+    },
+    {
+      "name": "indramqtt_tenant_mismatch_dropped_total"
+    },
+    {
+      "name": "indramqtt_transport_send_failed_total"
+    },
+    {
+      "name": "indramqtt_transport_sent_total"
+    },
+    {
+      "name": "indramqtt_unknown_conn_dropped_total"
+    }
+  ]
+}

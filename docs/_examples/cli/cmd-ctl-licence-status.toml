@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "cmd-ctl-licence-status"
+kind = "help-contains"
+binary = "indra"
+args = ["ctl", "licence"]
+match = "status"

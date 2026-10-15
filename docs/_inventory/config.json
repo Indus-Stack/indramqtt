@@ -1,0 +1,942 @@
+{
+  "settings": [
+    {
+      "default": "\"indra-node-1\"",
+      "doc": "Unique identifier for this broker node within the cluster.",
+      "path": "node.id",
+      "range": "1..=64 chars, letters/digits/dots/dashes",
+      "type": "string"
+    },
+    {
+      "default": "\"./data\"",
+      "doc": "Directory holding kernel persistent state (state.toml). Created on boot when missing.",
+      "path": "node.data_dir",
+      "range": "non-empty path",
+      "type": "path string"
+    },
+    {
+      "default": "\"127.0.0.1:18883\"",
+      "doc": "Deprecated. Ignored. The kernel serves clients directly.",
+      "path": "node.brokerlink_bind",
+      "range": "any string, ignored",
+      "type": "socket address string"
+    },
+    {
+      "default": "true",
+      "doc": "Whether the plaintext MQTT listener accepts connections.",
+      "path": "listeners.tcp.enabled",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"0.0.0.0:1883\"",
+      "doc": "Bind address for the plaintext MQTT listener.",
+      "path": "listeners.tcp.bind",
+      "range": "valid host:port, port 1..=65535",
+      "type": "socket address string"
+    },
+    {
+      "default": "1000000",
+      "doc": "Maximum concurrent connections on the plaintext MQTT listener.",
+      "path": "listeners.tcp.max_connections",
+      "range": "1..=10000000",
+      "type": "u32"
+    },
+    {
+      "default": "1024",
+      "doc": "Listener accept backlog for the plaintext MQTT listener.",
+      "path": "listeners.tcp.backlog",
+      "range": "1..=65536",
+      "type": "u32"
+    },
+    {
+      "default": "false",
+      "doc": "Deprecated. Ignored. The kernel always serves this listener.",
+      "path": "listeners.tcp.native",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "false",
+      "doc": "Whether the secure TLS MQTT listener accepts connections.",
+      "path": "listeners.tls.enabled",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"0.0.0.0:8883\"",
+      "doc": "Bind address for the secure TLS MQTT listener.",
+      "path": "listeners.tls.bind",
+      "range": "valid host:port, port 1..=65535",
+      "type": "socket address string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Path to the PEM server certificate for the TLS listener.",
+      "path": "listeners.tls.cert_file",
+      "range": "PEM file path; required when TLS is enabled",
+      "type": "path string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Path to the PEM private key for the TLS listener.",
+      "path": "listeners.tls.key_file",
+      "range": "PEM file path; required when TLS is enabled",
+      "type": "path string"
+    },
+    {
+      "default": "false",
+      "doc": "Deprecated. Ignored. The kernel always serves this listener.",
+      "path": "listeners.tls.native",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "false",
+      "doc": "Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.",
+      "path": "listeners.tls.psk_enabled",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.",
+      "path": "listeners.tls.psk_keys_file",
+      "range": "file path; empty means no identities",
+      "type": "path string"
+    },
+    {
+      "default": "false",
+      "doc": "Whether the TLS listener requests and verifies a client certificate.",
+      "path": "listeners.tls.verify_client_cert",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"verify_none\"",
+      "doc": "Client certificate chain check mode of the TLS listener.",
+      "path": "listeners.tls.verify",
+      "range": "verify_none | verify_peer",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "CA file for client certificate checks of the TLS listener.",
+      "path": "listeners.tls.cacertfile",
+      "range": "PEM file path; required when client verification is on",
+      "type": "path string"
+    },
+    {
+      "default": "false",
+      "doc": "Whether the TLS listener refuses a handshake without a certificate.",
+      "path": "listeners.tls.fail_if_no_peer_cert",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Source for the bind username from the client certificate.",
+      "path": "listeners.tls.peer_cert_as_username",
+      "range": "disabled | cn | dn",
+      "type": "string"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Source for the bind client identifier from the client certificate.",
+      "path": "listeners.tls.peer_cert_as_clientid",
+      "range": "disabled | cn | dn",
+      "type": "string"
+    },
+    {
+      "default": "true",
+      "doc": "Whether the MQTT-over-WebSocket listener accepts connections.",
+      "path": "listeners.ws.enabled",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"0.0.0.0:8083\"",
+      "doc": "Bind address for the MQTT-over-WebSocket listener.",
+      "path": "listeners.ws.bind",
+      "range": "valid host:port, port 1..=65535",
+      "type": "socket address string"
+    },
+    {
+      "default": "\"/mqtt\"",
+      "doc": "HTTP path serving MQTT-over-WebSocket traffic.",
+      "path": "listeners.ws.path",
+      "range": "must start with '/'",
+      "type": "string"
+    },
+    {
+      "default": "false",
+      "doc": "Deprecated. Ignored. The kernel always serves this listener.",
+      "path": "listeners.ws.native",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "false",
+      "doc": "Whether the secure WebSocket listener accepts connections.",
+      "path": "listeners.wss.enabled",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"0.0.0.0:8084\"",
+      "doc": "Bind address for the secure WebSocket listener.",
+      "path": "listeners.wss.bind",
+      "range": "valid host:port, port 1..=65535",
+      "type": "socket address string"
+    },
+    {
+      "default": "\"/mqtt\"",
+      "doc": "HTTP path serving secure WebSocket traffic.",
+      "path": "listeners.wss.path",
+      "range": "must start with '/'",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Path to the PEM server certificate for the secure WebSocket listener.",
+      "path": "listeners.wss.cert_file",
+      "range": "PEM file path; required when secure WebSocket is enabled",
+      "type": "path string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Path to the PEM private key for the secure WebSocket listener.",
+      "path": "listeners.wss.key_file",
+      "range": "PEM file path; required when secure WebSocket is enabled",
+      "type": "path string"
+    },
+    {
+      "default": "false",
+      "doc": "Whether the secure WebSocket listener requests and verifies a client certificate.",
+      "path": "listeners.wss.verify_client_cert",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"verify_none\"",
+      "doc": "Client certificate chain check mode of the secure WebSocket listener.",
+      "path": "listeners.wss.verify",
+      "range": "verify_none | verify_peer",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "CA file for client certificate checks of the secure WebSocket listener.",
+      "path": "listeners.wss.cacertfile",
+      "range": "PEM file path; required when client verification is on",
+      "type": "path string"
+    },
+    {
+      "default": "false",
+      "doc": "Whether the secure WebSocket listener refuses a handshake without a certificate.",
+      "path": "listeners.wss.fail_if_no_peer_cert",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Source for the bind username from the client certificate.",
+      "path": "listeners.wss.peer_cert_as_username",
+      "range": "disabled | cn | dn",
+      "type": "string"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Source for the bind client identifier from the client certificate.",
+      "path": "listeners.wss.peer_cert_as_clientid",
+      "range": "disabled | cn | dn",
+      "type": "string"
+    },
+    {
+      "default": "false",
+      "doc": "Deprecated. Ignored. The kernel always serves this listener.",
+      "path": "listeners.wss.native",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "true",
+      "doc": "Whether the management REST API and dashboard serve requests.",
+      "path": "listeners.api.enabled",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"0.0.0.0:18083\"",
+      "doc": "Bind address for the management REST API. Empty disables the API.",
+      "path": "listeners.api.bind",
+      "range": "valid host:port, port 1..=65535; empty disables the API",
+      "type": "socket address string"
+    },
+    {
+      "default": "10000",
+      "doc": "Default max connections per authenticated username (0 = unlimited).",
+      "path": "quotas.default_max_connections",
+      "range": "0..=1000000 (0 = unlimited opt-in)",
+      "type": "u32"
+    },
+    {
+      "default": "0",
+      "doc": "Default max live connections per tenant (0 = unlimited).",
+      "path": "quotas.max_connections_per_tenant",
+      "range": "0..=1000000 (0 = unlimited opt-in)",
+      "type": "u32"
+    },
+    {
+      "default": "0",
+      "doc": "Default max sessions per tenant (0 = unlimited).",
+      "path": "quotas.max_sessions_per_tenant",
+      "range": "0..=100000 (0 = unlimited opt-in)",
+      "type": "u32"
+    },
+    {
+      "default": "0",
+      "doc": "Default max retained topics per tenant (0 = unlimited).",
+      "path": "quotas.max_retained_per_tenant",
+      "range": "0..=100000 (0 = unlimited opt-in)",
+      "type": "u32"
+    },
+    {
+      "default": "50000",
+      "doc": "Default token-bucket publish rate limit in messages per second (0 = unlimited).",
+      "path": "quotas.default_max_publish_rate",
+      "range": "0..=10000000 msg/s (0 = unlimited opt-in)",
+      "type": "u32"
+    },
+    {
+      "default": "2.0",
+      "doc": "Token bucket burst multiplier (allows bursts up to burst times rate).",
+      "path": "quotas.burst_multiplier",
+      "range": "1.0..=10.0",
+      "type": "f64"
+    },
+    {
+      "default": "86400",
+      "doc": "Max session expiry interval in seconds.",
+      "path": "session.max_session_expiry_secs",
+      "range": "0..=2592000 seconds (0 = unlimited opt-in)",
+      "type": "u64"
+    },
+    {
+      "default": "50000",
+      "doc": "Maximum queued offline messages per session.",
+      "path": "session.max_offline_queue",
+      "range": "1..=1000000",
+      "type": "u32"
+    },
+    {
+      "default": "65535",
+      "doc": "Maximum inflight unacknowledged QoS 1 and QoS 2 messages.",
+      "path": "session.max_inflight_messages",
+      "range": "1..=65535",
+      "type": "u32"
+    },
+    {
+      "default": "1000",
+      "doc": "Per-subscriber QoS 0 egress backlog bound; past it the oldest queued QoS 0 frame drops.",
+      "path": "session.max_qos0_backlog",
+      "range": "1..=100000",
+      "type": "usize"
+    },
+    {
+      "default": "1.5",
+      "doc": "Keep-alive grace multiplier before disconnect.",
+      "path": "session.keep_alive_grace",
+      "range": "1.0..=5.0",
+      "type": "f64"
+    },
+    {
+      "default": "\"info\"",
+      "doc": "Logging verbosity for the kernel (trace, debug, info, warn, error).",
+      "path": "logging.level",
+      "range": "trace | debug | info | warn | error",
+      "type": "enum string"
+    },
+    {
+      "default": "65536",
+      "doc": "Ingress ring buffer channel depth for stateful window worker tasks.",
+      "path": "rules_engine.window_channel_depth",
+      "range": "1..=1000000",
+      "type": "u32"
+    },
+    {
+      "default": "\"DropOldest\"",
+      "doc": "Default memory backpressure policy when the rule buffer is full.",
+      "path": "rules_engine.backpressure_policy",
+      "range": "Block | DropNewest | DropOldest | SpillToDisk | RejectPublisher",
+      "type": "enum string"
+    },
+    {
+      "default": "true",
+      "doc": "Whether authentication checks apply to client connects.",
+      "path": "auth.enabled",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"sha256\"",
+      "doc": "Password hashing algorithm for stored credentials.",
+      "path": "auth.password_hash",
+      "range": "sha256 | bcrypt",
+      "type": "enum string"
+    },
+    {
+      "default": "false",
+      "doc": "Whether anonymous connections are accepted while no users are configured.",
+      "path": "auth.allow_anonymous",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "[\"admin\", \"root\"]",
+      "doc": "Superuser usernames bypassing ACL rules.",
+      "path": "auth.superusers",
+      "range": "0..=100 entries",
+      "type": "string list"
+    },
+    {
+      "default": "false",
+      "doc": "Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.",
+      "path": "cluster.enabled",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"127.0.0.1:19883\"",
+      "doc": "Cluster SWIM UDP bind address for peer discovery and membership.",
+      "path": "cluster.bind",
+      "range": "valid host:port, port 1..=65535",
+      "type": "socket address string"
+    },
+    {
+      "default": "\"0.0.0.0:7946\"",
+      "doc": "Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only.",
+      "path": "cluster.gossip_bind",
+      "range": "valid host:port, port 1..=65535",
+      "type": "socket address string"
+    },
+    {
+      "default": "\"0.0.0.0:9092\"",
+      "doc": "Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only.",
+      "path": "cluster.quic_bind",
+      "range": "valid host:port, port 1..=65535",
+      "type": "socket address string"
+    },
+    {
+      "default": "[]",
+      "doc": "Seed node addresses to join an existing cluster.",
+      "path": "cluster.seed_nodes",
+      "range": "0..=64 entries, each host:port",
+      "type": "string list"
+    },
+    {
+      "default": "\"/etc/indramqtt/license.key\"",
+      "doc": "Path to the enterprise cryptographic license key file.",
+      "path": "licence.license_file",
+      "range": "any path; empty means none installed",
+      "type": "path string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Enterprise commercial license key for multi-node clustering.",
+      "path": "licence.license_key",
+      "range": "any string; empty means use stored token or environment",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Trusted licence-signing keys: a JSON file or directory of JSON files.",
+      "path": "licence.trusted_keys_path",
+      "range": "JSON file or directory; empty trusts nothing",
+      "type": "path string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Write the installation licence request to this path and exit.",
+      "path": "licence.request_out",
+      "range": "any path; empty disables request generation",
+      "type": "path string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Install the licence token read from this path and exit.",
+      "path": "licence.install_file",
+      "range": "any path; empty disables licence installation",
+      "type": "path string"
+    },
+    {
+      "default": "30",
+      "doc": "Days before expiry that the approaching-expiry alarm and log warning start.",
+      "path": "licence.expiry_warn_days",
+      "range": "0..=365 days",
+      "type": "u64"
+    },
+    {
+      "default": "\"\"",
+      "doc": "CoAP gateway UDP listen address. Empty disables the gateway.",
+      "path": "gateway.coap_bind",
+      "range": "empty disables the gateway, else valid host:port",
+      "type": "socket address string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Durable stream journal directory. Empty disables journaling.",
+      "path": "persistence.stream_dir",
+      "range": "any directory; empty disables journaling",
+      "type": "path string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Directory server URL for LDAP authentication. Empty disables LDAP.",
+      "path": "ldap.server_url",
+      "range": "empty disables LDAP, else ldap:// or ldaps:// URL",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Base DN under which directory users are searched.",
+      "path": "ldap.base_dn",
+      "range": "any DN; required when LDAP is enabled",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Service account DN used for the initial bind plus search.",
+      "path": "ldap.bind_dn",
+      "range": "any DN",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Service account password for the initial bind.",
+      "path": "ldap.bind_password",
+      "range": "any string",
+      "type": "string"
+    },
+    {
+      "default": "\"(uid={username})\"",
+      "doc": "User search filter with a {username} placeholder, escaped per RFC 4515.",
+      "path": "ldap.user_filter",
+      "range": "must contain {username} when LDAP is enabled",
+      "type": "string"
+    },
+    {
+      "default": "\"memberOf\"",
+      "doc": "User-entry attribute listing directory groups.",
+      "path": "ldap.group_attribute",
+      "range": "non-empty when LDAP is enabled",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Required group DN: the entry must list this DN to connect.",
+      "path": "ldap.required_group",
+      "range": "any DN; empty disables the group check",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Path to a PEM CA certificate for private directories.",
+      "path": "ldap.ca_cert_path",
+      "range": "PEM file path; empty uses system roots",
+      "type": "path string"
+    },
+    {
+      "default": "8",
+      "doc": "Bound on concurrent directory authentications.",
+      "path": "ldap.pool_size",
+      "range": "1..=32",
+      "type": "usize"
+    },
+    {
+      "default": "5000",
+      "doc": "Timeout covering TCP connect plus TLS handshake.",
+      "path": "ldap.connect_timeout_ms",
+      "range": "100..=60000 ms",
+      "type": "u64"
+    },
+    {
+      "default": "5000",
+      "doc": "Timeout covering each directory bind/search round-trip.",
+      "path": "ldap.read_timeout_ms",
+      "range": "100..=60000 ms",
+      "type": "u64"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Keytab file for Kerberos authentication. Empty disables Kerberos.",
+      "path": "kerberos.keytab_path",
+      "range": "keytab v2 file; empty disables Kerberos",
+      "type": "path string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Service principal name held in the keytab.",
+      "path": "kerberos.service_principal",
+      "range": "required when Kerberos is enabled",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Expected service realm. Empty disables the realm check on the service name.",
+      "path": "kerberos.realm",
+      "range": "any realm; empty disables the realm check",
+      "type": "string"
+    },
+    {
+      "default": "[]",
+      "doc": "Trusted client realms. Empty allows any realm that verifies.",
+      "path": "kerberos.allowed_realms",
+      "range": "0..=32 entries",
+      "type": "string list"
+    },
+    {
+      "default": "300",
+      "doc": "Clock-skew allowance in seconds for ticket validity and authenticator timestamps.",
+      "path": "kerberos.clock_skew_secs",
+      "range": "1..=3600 seconds",
+      "type": "u64"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Comma-separated principal=role mappings for verified client principals.",
+      "path": "kerberos.role_map",
+      "range": "comma-separated principal=role pairs; empty leaves every principal at user",
+      "type": "string"
+    },
+    {
+      "default": "1024",
+      "doc": "Replay-cache bound for Kerberos authenticators.",
+      "path": "kerberos.replay_max_entries",
+      "range": "16..=8192",
+      "type": "usize"
+    },
+    {
+      "default": "100",
+      "doc": "Per-session QoS 1 inflight window bound.",
+      "path": "session.max_qos1_inflight",
+      "range": "1..=100000",
+      "type": "usize"
+    },
+    {
+      "default": "1000",
+      "doc": "Per-session QoS 1 spill bound past the window.",
+      "path": "session.max_qos1_spill",
+      "range": "1..=100000",
+      "type": "usize"
+    },
+    {
+      "default": "10",
+      "doc": "Inbound topic-alias maximum advertised in CONNACK.",
+      "path": "session.topic_alias_maximum",
+      "range": "0..=65535",
+      "type": "u16"
+    },
+    {
+      "default": "1048576",
+      "doc": "Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK.",
+      "path": "session.max_packet_size",
+      "range": "1..=268435455",
+      "type": "u32"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Rule ingress spill directory.",
+      "path": "rules_engine.spill_dir",
+      "range": "empty or directory path",
+      "type": "string"
+    },
+    {
+      "default": "86400",
+      "doc": "Upper bound for delayed deferrals in seconds.",
+      "path": "delayed.max_secs",
+      "range": "1..=86400",
+      "type": "u64"
+    },
+    {
+      "default": "10",
+      "doc": "Monitor sampling interval in seconds.",
+      "path": "observability.monitor_sample_secs",
+      "range": "0..=3600",
+      "type": "u64"
+    },
+    {
+      "default": "\"\"",
+      "doc": "JWKS endpoint URL for JWT authentication.",
+      "path": "jwks.url",
+      "range": "empty or https URL",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Expected JWT issuer.",
+      "path": "jwks.issuer",
+      "range": "any string",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Expected JWT audience.",
+      "path": "jwks.audience",
+      "range": "any string",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "PostgreSQL URL for database authentication.",
+      "path": "dbauth.postgres_url",
+      "range": "empty or URL",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "HTTP webhook verdict endpoint.",
+      "path": "webhook.url",
+      "range": "empty or URL",
+      "type": "string"
+    },
+    {
+      "default": "300",
+      "doc": "Seconds between background JWKS refreshes.",
+      "path": "jwks.refresh_period_secs",
+      "range": "1..=86400",
+      "type": "u64"
+    },
+    {
+      "default": "5000",
+      "doc": "Timeout for one JWKS fetch in milliseconds.",
+      "path": "jwks.fetch_timeout_ms",
+      "range": "100..=60000",
+      "type": "u64"
+    },
+    {
+      "default": "5000",
+      "doc": "Longest a CONNECT waits for a JWKS refresh in milliseconds.",
+      "path": "jwks.refresh_timeout_ms",
+      "range": "100..=60000",
+      "type": "u64"
+    },
+    {
+      "default": "32",
+      "doc": "Most JWKS keys held in the cache.",
+      "path": "jwks.cache_max_keys",
+      "range": "1..=256",
+      "type": "usize"
+    },
+    {
+      "default": "300",
+      "doc": "Seconds a cached JWKS key stays valid.",
+      "path": "jwks.cache_ttl_secs",
+      "range": "1..=86400",
+      "type": "u64"
+    },
+    {
+      "default": "60",
+      "doc": "Clock skew tolerated when checking token times, in seconds.",
+      "path": "jwks.clock_skew_secs",
+      "range": "0..=3600",
+      "type": "u64"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Extra CA certificate trusted for the JWKS endpoint.",
+      "path": "jwks.ca_cert",
+      "range": "empty or path to a PEM file",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "MySQL URL for database authentication.",
+      "path": "dbauth.mysql_url",
+      "range": "empty or URL",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "Redis URL for database authentication.",
+      "path": "dbauth.redis_url",
+      "range": "empty or URL",
+      "type": "string"
+    },
+    {
+      "default": "\"\"",
+      "doc": "MongoDB URL for database authentication.",
+      "path": "dbauth.mongodb_url",
+      "range": "empty or URL",
+      "type": "string"
+    },
+    {
+      "default": "8",
+      "doc": "Connections kept per authentication database.",
+      "path": "dbauth.pool_size",
+      "range": "1..=32",
+      "type": "usize"
+    },
+    {
+      "default": "3000",
+      "doc": "Timeout for connecting to an authentication database in milliseconds.",
+      "path": "dbauth.connect_timeout_ms",
+      "range": "100..=60000",
+      "type": "u64"
+    },
+    {
+      "default": "3000",
+      "doc": "Timeout for one authentication lookup in milliseconds.",
+      "path": "dbauth.read_timeout_ms",
+      "range": "100..=60000",
+      "type": "u64"
+    },
+    {
+      "default": "1024",
+      "doc": "Cached database verdicts per source; 0 disables the cache.",
+      "path": "dbauth.cache_size",
+      "range": "0..=100000",
+      "type": "usize"
+    },
+    {
+      "default": "60",
+      "doc": "Seconds a cached database verdict stays valid.",
+      "path": "dbauth.cache_ttl_secs",
+      "range": "0..=3600",
+      "type": "u64"
+    },
+    {
+      "default": "8",
+      "doc": "Concurrent requests allowed to the webhook endpoint.",
+      "path": "webhook.pool_size",
+      "range": "1..=32",
+      "type": "usize"
+    },
+    {
+      "default": "2000",
+      "doc": "Timeout for one webhook request in milliseconds.",
+      "path": "webhook.timeout_ms",
+      "range": "100..=60000",
+      "type": "u64"
+    },
+    {
+      "default": "5",
+      "doc": "Consecutive webhook failures that open the circuit breaker.",
+      "path": "webhook.breaker_threshold",
+      "range": "1..=100",
+      "type": "u32"
+    },
+    {
+      "default": "30000",
+      "doc": "Milliseconds an open circuit breaker waits before retrying the webhook.",
+      "path": "webhook.breaker_reset_ms",
+      "range": "1000..=600000",
+      "type": "u64"
+    },
+    {
+      "default": "1024",
+      "doc": "Cached webhook verdicts; 0 disables the cache.",
+      "path": "webhook.cache_size",
+      "range": "0..=100000",
+      "type": "usize"
+    },
+    {
+      "default": "60",
+      "doc": "Seconds a cached webhook verdict stays valid.",
+      "path": "webhook.cache_ttl_secs",
+      "range": "0..=3600",
+      "type": "u64"
+    },
+    {
+      "default": "true",
+      "doc": "Require credentials on the scrape endpoints.",
+      "path": "prometheus.enable_basic_auth",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"10ms, 100ms, 1s, 5s, 30s\"",
+      "doc": "Latency histogram buckets for the exposition.",
+      "path": "prometheus.latency_buckets",
+      "range": "comma-separated durations",
+      "type": "string"
+    },
+    {
+      "default": "false",
+      "doc": "Stored push intent. The broker runs no push client.",
+      "path": "prometheus.push_gateway.enable",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "\"http://127.0.0.1:9091\"",
+      "doc": "Push target URL for the exposition.",
+      "path": "prometheus.push_gateway.url",
+      "range": "http(s) URL",
+      "type": "string"
+    },
+    {
+      "default": "\"15s\"",
+      "doc": "Push interval for the exposition.",
+      "path": "prometheus.push_gateway.interval",
+      "range": "duration text",
+      "type": "string"
+    },
+    {
+      "default": "\"${name}/instance/${name}~${host}\"",
+      "doc": "Job name template for each push.",
+      "path": "prometheus.push_gateway.job_name",
+      "range": "template text",
+      "type": "string"
+    },
+    {
+      "default": "\"put\"",
+      "doc": "Push method for the exposition.",
+      "path": "prometheus.push_gateway.method",
+      "range": "put | post",
+      "type": "string"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+      "path": "prometheus.collectors.mnesia",
+      "range": "enabled | disabled",
+      "type": "enum string"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+      "path": "prometheus.collectors.vm_dist",
+      "range": "enabled | disabled",
+      "type": "enum string"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+      "path": "prometheus.collectors.vm_memory",
+      "range": "enabled | disabled",
+      "type": "enum string"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+      "path": "prometheus.collectors.vm_msacc",
+      "range": "enabled | disabled",
+      "type": "enum string"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+      "path": "prometheus.collectors.vm_statistics",
+      "range": "enabled | disabled",
+      "type": "enum string"
+    },
+    {
+      "default": "\"disabled\"",
+      "doc": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
+      "path": "prometheus.collectors.vm_system_info",
+      "range": "enabled | disabled",
+      "type": "enum string"
+    }
+  ]
+}

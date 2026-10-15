@@ -467,6 +467,15 @@ fn docs_visuals() {
     let docs = docs.canonicalize().expect("docs dir");
     let mut files = 0usize;
     for page in docs_pages(&docs) {
+        // Skip tool inputs. Fragments under underscore dirs are not pages.
+        if page
+            .strip_prefix(&docs)
+            .unwrap_or(&page)
+            .components()
+            .any(|part| part.as_os_str().to_string_lossy().starts_with('_'))
+        {
+            continue;
+        }
         let text = std::fs::read_to_string(&page)
             .unwrap_or_else(|error| panic!("read {}: {error}", page.display()));
         let name = page

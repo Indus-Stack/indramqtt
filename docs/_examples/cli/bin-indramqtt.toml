@@ -1,0 +1,6 @@
+[example]
+area = "cli"
+item = "bin-indramqtt"
+kind = "help-ok"
+binary = "indramqtt"
+args = []

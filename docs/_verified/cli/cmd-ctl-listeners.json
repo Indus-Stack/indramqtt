@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "listeners",
+    "--help"
+  ],
+  "item": "cmd-ctl-listeners",
+  "match": "listeners",
+  "output": "Configured network listeners\nUsage: indra ctl listeners",
+  "output_bytes": 92,
+  "returncode": 0,
+  "verified": true
+}

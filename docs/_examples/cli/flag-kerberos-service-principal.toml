@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "flag-kerberos-service-principal"
+kind = "help-contains"
+binary = "indramqtt"
+args = []
+match = "--kerberos-service-principal"

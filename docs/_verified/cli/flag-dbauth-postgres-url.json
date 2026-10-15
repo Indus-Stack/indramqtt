@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-dbauth-postgres-url",
+  "match": "--dbauth-postgres-url",
+  "output": "      --dbauth-postgres-url <DBAUTH_POSTGRES_URL>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

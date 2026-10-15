@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "cmd-ctl-connectors-create"
+kind = "help-contains"
+binary = "indra"
+args = ["ctl", "connectors"]
+match = "create"

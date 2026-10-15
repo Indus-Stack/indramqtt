@@ -77,8 +77,8 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/api/rule-engine.md` | 437 | `OK` |
 | `reference/api/rule-engine.md` | 500 | `OK` |
 | `reference/api/rule-engine.md` | 516 | `OK` |
-| `reference/cli.md` | 2030 | `OK` |
-| `reference/cli.md` | 2046 | `OK` |
+| `reference/cli.md` | 2330 | `OK` |
+| `reference/cli.md` | 2346 | `OK` |
 | `reference/configuration.md` | 2339 | `OK` |
 | `reference/configuration.md` | 2355 | `OK` |
 | `reference/index.md` | 41 | `OK` |

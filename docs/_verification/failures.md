@@ -238,3 +238,12 @@ call is missing.
 - Expected: the documented behaviour. Source: the command definitions.
 - Broker gave: not run per item. Presence of each flag and each command group is checked against live `--help` by the drift tests. The run lines are illustrative.
 - Date: 2026-10-13.
+
+## DX-01 command line records (2026-10-15)
+
+The DX-01 verifier runs each CLI example through the real
+binary (`indramqtt --help`, `indra ctl <group> --help`).
+All 107 CLI items verify. No CLI item holds a failure
+record. Each entry of `reference/cli.md` cites its file
+under `docs/_verified/cli/`. Wave DX2 owns the other
+areas. Their counts come from `entries.py --coverage`.

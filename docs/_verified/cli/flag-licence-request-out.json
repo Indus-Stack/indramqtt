@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/work/target/debug/indramqtt",
+    "--help"
+  ],
+  "item": "flag-licence-request-out",
+  "match": "--licence-request-out",
+  "output": "      --licence-request-out <LICENCE_REQUEST_OUT>",
+  "output_bytes": 18819,
+  "returncode": 0,
+  "verified": true
+}

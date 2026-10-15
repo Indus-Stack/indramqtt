@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "config",
+    "--help"
+  ],
+  "item": "cmd-ctl-config-reload",
+  "match": "reload",
+  "output": "Configuration: validate, diff, explain, reload, history\n  reload    Preview the server diff, then apply the snapshot document and report the recorded version",
+  "output_bytes": 684,
+  "returncode": 0,
+  "verified": true
+}

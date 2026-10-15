@@ -1,0 +1,7 @@
+[example]
+area = "cli"
+item = "cmd-ctl-users-list"
+kind = "help-contains"
+binary = "indra"
+args = ["ctl", "users"]
+match = "list"

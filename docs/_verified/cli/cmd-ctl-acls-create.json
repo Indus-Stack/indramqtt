@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/work/target/debug/indra",
+    "ctl",
+    "acls",
+    "--help"
+  ],
+  "item": "cmd-ctl-acls-create",
+  "match": "create",
+  "output": "Per-tenant ACL rules: list, create, delete\n  create  Append one ACL rule (first match wins within the tenant)",
+  "output_bytes": 415,
+  "returncode": 0,
+  "verified": true
+}
