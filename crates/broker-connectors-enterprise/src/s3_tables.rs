@@ -539,9 +539,10 @@ impl S3TablesTransport for MockS3TablesTransport {
     }
 }
 
-/// HTTP transport: `PUT {scheme}://{host}/{key}` with the SigV4
-/// `Authorization` + `x-amz-date` headers (plus the session token when
-/// temporary STS credentials are configured).
+/// HTTP transport: custom endpoints take `PUT {scheme}://{host}/{key}`.
+/// Production takes `PUT https://s3.{region}.amazonaws.com/{warehouse}/{key}`.
+/// Both send SigV4 `Authorization` + `x-amz-date` + `x-amz-content-sha256`
+/// (plus the session token when temporary credentials are set).
 pub struct HttpS3TablesTransport {
     config: S3TablesSinkConfig,
     client: reqwest::Client,
@@ -557,22 +558,214 @@ impl HttpS3TablesTransport {
     }
 }
 
+/// Encode one ARN for use inside a path or query.
+/// Keep letters, digits and `-_.~`. Encode all other bytes.
+fn encode_arn_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// S3 data-plane host for one region.
+/// Control operations use the tables host. Object operations use this host.
+fn s3_data_host(region: &str) -> String {
+    format!("s3.{region}.amazonaws.com")
+}
+
+/// Split `s3://<bucket>[/<prefix>]` into the bucket name.
+/// Return None when the value is not an S3 URI.
+fn warehouse_bucket(warehouse_location: &str) -> Option<String> {
+    warehouse_location
+        .strip_prefix("s3://")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|bucket| !bucket.is_empty())
+        .map(str::to_string)
+}
+
+/// Fetch the table warehouse bucket from the control plane.
+/// Sign GET /get-table with the tables service. Parse warehouseLocation.
+async fn fetch_warehouse_bucket(
+    config: &S3TablesSinkConfig,
+    client: &reqwest::Client,
+) -> Result<String> {
+    let encoded_arn = encode_arn_segment(&config.table_bucket_arn);
+    let query = format!(
+        "name={}&namespace={}&tableBucketARN={encoded_arn}",
+        config.table_name, config.namespace
+    );
+    let host = config.endpoint_host();
+    let millis = now_millis();
+    let date = broker_connectors::amz_date(millis);
+    let mut headers = vec![
+        ("host".to_string(), host.clone()),
+        ("x-amz-date".to_string(), date.clone()),
+    ];
+    if let Some(token) = config.session_token.as_deref() {
+        headers.push(("x-amz-security-token".to_string(), token.to_string()));
+    }
+    let auth = broker_connectors::sigv4_authorization(&broker_connectors::SigV4Signing {
+        method: "GET",
+        canonical_uri: broker_connectors::aws_encode_path("/get-table"),
+        canonical_query: query.clone(),
+        headers,
+        payload_hash: broker_connectors::sha256_hex(b""),
+        access_key_id: &config.access_key_id,
+        secret_access_key: &config.secret_access_key,
+        region: &config.region,
+        service: "s3tables",
+        millis,
+    });
+    let mut request = client
+        .get(format!("https://{host}/get-table?{query}"))
+        .header("x-amz-date", date)
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .timeout(config.timeout());
+    if let Some(token) = &config.session_token {
+        request = request.header("x-amz-security-token", token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ConnectorError::Connection(format!("s3_tables put failed: {e}")))?;
+    let status = response.status();
+    let status_u16 = status.as_u16();
+    let body = response.text().await.unwrap_or_default();
+    if !(200..300).contains(&status_u16) {
+        let snippet: String = body.chars().take(500).collect();
+        let detail = if snippet.trim().is_empty() {
+            format!(
+                "s3_tables {}.{} answered {status}",
+                config.namespace, config.table_name
+            )
+        } else {
+            format!(
+                "s3_tables {}.{} answered {status}: {snippet}",
+                config.namespace, config.table_name
+            )
+        };
+        return match classify_put_status(status_u16) {
+            S3TablesOutcome::Success => Err(ConnectorError::Dispatch(detail)),
+            S3TablesOutcome::Retryable => Err(ConnectorError::Connection(detail)),
+            S3TablesOutcome::Terminal => Err(ConnectorError::Dispatch(detail)),
+        };
+    }
+    let location = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("warehouseLocation")
+                .and_then(|field| field.as_str())
+                .map(str::to_string)
+        });
+    match location.as_deref().and_then(warehouse_bucket) {
+        Some(bucket) => Ok(bucket),
+        None => Err(ConnectorError::Dispatch(format!(
+            "s3_tables {}.{} answered 200 without warehouseLocation: {}",
+            config.namespace,
+            config.table_name,
+            body.chars().take(500).collect::<String>()
+        ))),
+    }
+}
+
 #[async_trait]
 impl S3TablesTransport for HttpS3TablesTransport {
     async fn put_object(&self, put: &S3TablesPut, date: &str, authorization: &str) -> Result<()> {
-        let url = format!(
-            "{}://{}/{}",
-            self.config.endpoint_scheme(),
-            self.config.endpoint_host(),
+        // Custom endpoints keep the loopback path for offline tests.
+        // Production uses the S3 data plane (see below).
+        if self.config.endpoint.is_some() {
+            let url = format!(
+                "{}://{}/{}",
+                self.config.endpoint_scheme(),
+                self.config.endpoint_host(),
+                put.key.trim_start_matches('/')
+            );
+            // Send the payload hash. The signer signs it.
+            let payload_hash = broker_connectors::sha256_hex(&put.body);
+            let mut request = self
+                .client
+                .put(&url)
+                .header("x-amz-date", date)
+                .header(reqwest::header::AUTHORIZATION, authorization)
+                .header("x-amz-content-sha256", payload_hash)
+                .header(reqwest::header::CONTENT_TYPE, put.content_type)
+                .body(put.body.clone());
+            if let Some(encoding) = put.content_encoding {
+                request = request.header(reqwest::header::CONTENT_ENCODING, encoding);
+            }
+            if let Some(token) = &self.config.session_token {
+                request = request.header("x-amz-security-token", token);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| ConnectorError::Connection(format!("s3_tables put failed: {e}")))?;
+            // Read the status first. Then read the body text.
+            // The fault test asserts the server text, so errors carry it.
+            // The snippet bound is 500 chars; error bodies stay small.
+            let status = response.status();
+            let status_u16 = status.as_u16();
+            let body = response.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(500).collect();
+            let detail = if snippet.trim().is_empty() {
+                format!("s3_tables {} answered {status}", put.key)
+            } else {
+                format!("s3_tables {} answered {status}: {snippet}", put.key)
+            };
+            return match classify_put_status(status_u16) {
+                S3TablesOutcome::Success => Ok(()),
+                S3TablesOutcome::Retryable => Err(ConnectorError::Connection(detail)),
+                S3TablesOutcome::Terminal => Err(ConnectorError::Dispatch(detail)),
+            };
+        }
+        // Production path: object operations ride the S3 endpoint.
+        // The tables endpoint answers 404 for PUT /data/*.
+        // Fetch the warehouse bucket, then PUT via S3.
+        // The caller auth covers the tables host, so sign again.
+        let bucket = fetch_warehouse_bucket(&self.config, &self.client).await?;
+        let s3_host = s3_data_host(&self.config.region);
+        let canonical = broker_connectors::aws_encode_path(&format!(
+            "/{bucket}/{}",
             put.key.trim_start_matches('/')
-        );
+        ));
+        let payload_hash = broker_connectors::sha256_hex(&put.body);
+        let millis = now_millis();
+        let s3_date = broker_connectors::amz_date(millis);
+        let mut headers = vec![
+            ("host".to_string(), s3_host.clone()),
+            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            ("x-amz-date".to_string(), s3_date.clone()),
+        ];
+        if let Some(token) = self.config.session_token.as_deref() {
+            headers.push(("x-amz-security-token".to_string(), token.to_string()));
+        }
+        let s3_auth = broker_connectors::sigv4_authorization(&broker_connectors::SigV4Signing {
+            method: "PUT",
+            canonical_uri: canonical.clone(),
+            canonical_query: String::new(),
+            headers,
+            payload_hash: payload_hash.clone(),
+            access_key_id: &self.config.access_key_id,
+            secret_access_key: &self.config.secret_access_key,
+            region: &self.config.region,
+            service: "s3",
+            millis,
+        });
         let mut request = self
             .client
-            .put(&url)
-            .header("x-amz-date", date)
-            .header(reqwest::header::AUTHORIZATION, authorization)
+            .put(format!("https://{s3_host}{canonical}"))
+            .header("x-amz-date", s3_date)
+            .header(reqwest::header::AUTHORIZATION, s3_auth)
+            .header("x-amz-content-sha256", payload_hash)
             .header(reqwest::header::CONTENT_TYPE, put.content_type)
-            .body(put.body.clone());
+            .body(put.body.clone())
+            .timeout(self.config.timeout());
         if let Some(encoding) = put.content_encoding {
             request = request.header(reqwest::header::CONTENT_ENCODING, encoding);
         }
@@ -583,18 +776,22 @@ impl S3TablesTransport for HttpS3TablesTransport {
             .send()
             .await
             .map_err(|e| ConnectorError::Connection(format!("s3_tables put failed: {e}")))?;
-        match classify_put_status(response.status().as_u16()) {
+        // Read the status first. Then read the body text.
+        // The fault test asserts the server text, so errors carry it.
+        // The snippet bound is 500 chars; error bodies stay small.
+        let status = response.status();
+        let status_u16 = status.as_u16();
+        let body = response.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(500).collect();
+        let detail = if snippet.trim().is_empty() {
+            format!("s3_tables {} answered {status}", put.key)
+        } else {
+            format!("s3_tables {} answered {status}: {snippet}", put.key)
+        };
+        match classify_put_status(status_u16) {
             S3TablesOutcome::Success => Ok(()),
-            S3TablesOutcome::Retryable => Err(ConnectorError::Connection(format!(
-                "s3_tables {} answered {}",
-                put.key,
-                response.status()
-            ))),
-            S3TablesOutcome::Terminal => Err(ConnectorError::Dispatch(format!(
-                "s3_tables {} answered {}",
-                put.key,
-                response.status()
-            ))),
+            S3TablesOutcome::Retryable => Err(ConnectorError::Connection(detail)),
+            S3TablesOutcome::Terminal => Err(ConnectorError::Dispatch(detail)),
         }
     }
 }
@@ -1401,5 +1598,677 @@ mod tests {
         assert_eq!(files[0]["path"], puts[0].key);
         assert_eq!(files[0]["record_count"], 1);
         assert_eq!(snapshot["manifest"]["total_records"], 1);
+    }
+
+    fn qual_env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    /// Strict segment encoder for an ARN inside a path.
+    /// It encodes `:` and `/`, so the ARN stays one segment.
+    fn qual_encode_segment(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        for byte in raw.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                out.push(byte as char);
+            } else {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        out
+    }
+
+    /// Inputs for one SigV4 signature.
+    struct QualAuthRequest<'a> {
+        method: &'a str,
+        canonical_uri: &'a str,
+        canonical_query: &'a str,
+        body: &'a [u8],
+        access_key: &'a str,
+        secret_key: &'a str,
+        session_token: Option<&'a str>,
+        region: &'a str,
+        service: &'a str,
+        host: &'a str,
+        millis: i64,
+        content_type: Option<&'a str>,
+    }
+
+    /// Sign one control or data request with the shared SigV4 core.
+    /// Sign host and date.
+    /// Sign content-type when the request sends it.
+    /// Sign the payload hash for the S3 data plane.
+    fn qual_auth(request: &QualAuthRequest<'_>) -> (String, String) {
+        // Normalize the path for signing.
+        // The ARN is already encoded, so `%` becomes `%25`.
+        // This matches the service signer.
+        let canonical_uri = broker_connectors::aws_encode_path(request.canonical_uri);
+        let payload_hash = broker_connectors::sha256_hex(request.body);
+        let date = broker_connectors::amz_date(request.millis);
+        let mut headers = vec![
+            ("host".to_string(), request.host.to_string()),
+            ("x-amz-date".to_string(), date.clone()),
+        ];
+        // The S3 data plane requires the payload hash header.
+        // The control plane works without it.
+        if request.service == "s3" {
+            headers.push(("x-amz-content-sha256".to_string(), payload_hash.clone()));
+        }
+        if let Some(content) = request.content_type {
+            headers.push(("content-type".to_string(), content.to_string()));
+        }
+        if let Some(token) = request.session_token {
+            headers.push(("x-amz-security-token".to_string(), token.to_string()));
+        }
+        let auth = broker_connectors::sigv4_authorization(&broker_connectors::SigV4Signing {
+            method: request.method,
+            canonical_uri,
+            canonical_query: request.canonical_query.to_string(),
+            headers,
+            payload_hash,
+            access_key_id: request.access_key,
+            secret_access_key: request.secret_key,
+            region: request.region,
+            service: request.service,
+            millis: request.millis,
+        });
+        (auth, date)
+    }
+
+    /// Qualification against the real table-bucket service via the
+    /// production [`HttpS3TablesTransport`].
+    ///
+    /// Run with e.g.:
+    /// `S3TABLES_BUCKET_ARN=<bucket arn> S3TABLES_REGION=<region> AWS_ACCESS_KEY_ID=<key> AWS_SECRET_ACCESS_KEY=<secret> \
+    ///  cargo test -p broker-connectors-enterprise --all-features --lib s3_tables::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///
+    /// The pipeline creates an empty table bucket and deletes it plus
+    /// its contents after the run. The test proves the bucket answers,
+    /// creates a namespace and a table, streams 500 events through the
+    /// sink on the production transport, reads every file back through
+    /// an independent client and asserts exactly 500 rows with the
+    /// first and the last payload intact, proves bad credentials fail
+    /// closed with the server text, then deletes what it created.
+    /// It panics when its environment is missing (fail closed, never
+    /// skips). An empty send fails the exact-count assertion.
+    ///
+    /// TODO(parity): the QUAL lines name no variables, so the test
+    /// reads S3TABLES_BUCKET_ARN, S3TABLES_REGION (or AWS_REGION) and
+    /// the standard AWS credential variables. Is this the set the
+    /// qualification runner provides?
+    /// TODO(parity): the service exposes no version API, so the report
+    /// carries the endpoint plus region plus bucket output instead of
+    /// a version string. Is that an acceptable "server version"?
+    /// TODO(parity): key discovery uses the sink snapshot file list
+    /// because table buckets expose no object listing here. Does the
+    /// data plane support a server-side listing to assert against?
+    /// TODO(parity): the connector stores gzip ndjson files, while
+    /// table readers expect Parquet plus Iceberg commits through the
+    /// metadata location. Does the pipeline assert bytes via GET, or
+    /// rows via a query engine?
+    #[tokio::test]
+    #[ignore = "needs a real table-bucket service (see S3TABLES_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        const ROWS: usize = 500;
+
+        let bucket_arn = qual_env("S3TABLES_BUCKET_ARN")
+            .or_else(|| qual_env("S3_TABLES_BUCKET_ARN"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "S3TABLES_BUCKET_ARN must name a real table bucket for qualification; \
+                     failing closed instead of passing vacuously"
+                )
+            });
+        let region = qual_env("S3TABLES_REGION")
+            .or_else(|| qual_env("AWS_REGION"))
+            .or_else(|| qual_env("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "S3TABLES_REGION (or AWS_REGION) must name the bucket region; failing closed"
+                )
+            });
+        let access_key = qual_env("S3TABLES_ACCESS_KEY_ID")
+            .or_else(|| qual_env("AWS_ACCESS_KEY_ID"))
+            .unwrap_or_else(|| {
+                panic!("S3TABLES_ACCESS_KEY_ID or AWS_ACCESS_KEY_ID must be set; failing closed")
+            });
+        let secret_key = qual_env("S3TABLES_SECRET_ACCESS_KEY")
+            .or_else(|| qual_env("AWS_SECRET_ACCESS_KEY"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "S3TABLES_SECRET_ACCESS_KEY or AWS_SECRET_ACCESS_KEY must be set; failing closed"
+                )
+            });
+        let session_token =
+            qual_env("S3TABLES_SESSION_TOKEN").or_else(|| qual_env("AWS_SESSION_TOKEN"));
+        let endpoint_override = qual_env("S3TABLES_ENDPOINT");
+        let namespace = qual_env("S3TABLES_NAMESPACE").unwrap_or_else(|| "qual_lt06".to_string());
+        let table = qual_env("S3TABLES_TABLE")
+            .unwrap_or_else(|| format!("qual_rows_{}", broker_connectors::now_millis()));
+        // Validate names early. The service accepts `[0-9a-z_]*` only.
+        for (label, value) in [("namespace", &namespace), ("table", &table)] {
+            assert!(
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "qual {label} must match [0-9a-z_]*, got {value:?}"
+            );
+        }
+        let parsed = parse_table_bucket_arn(&bucket_arn)
+            .unwrap_or_else(|e| panic!("qual bucket ARN invalid: {e}"));
+        eprintln!("qual bucket: arn={bucket_arn} region={region}");
+
+        let (scheme, host) = match &endpoint_override {
+            Some(custom) => {
+                let scheme = if custom.starts_with("http://") {
+                    "http"
+                } else {
+                    "https"
+                };
+                let host = custom
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_end_matches('/')
+                    .to_string();
+                (scheme.to_string(), host)
+            }
+            None => (
+                "https".to_string(),
+                format!("s3tables.{region}.amazonaws.com"),
+            ),
+        };
+        let service = if endpoint_override.is_some() {
+            "s3"
+        } else {
+            "s3tables"
+        };
+        let http = reqwest::Client::new();
+        let encoded_arn = qual_encode_segment(&bucket_arn);
+
+        // The product check lists table buckets. It proves the real
+        // service answers with its own document, not a constant.
+        let millis = broker_connectors::now_millis();
+        let (auth, date) = qual_auth(&QualAuthRequest {
+            method: "GET",
+            canonical_uri: "/buckets",
+            canonical_query: "maxBuckets=1000",
+            body: b"",
+            access_key: &access_key,
+            secret_key: &secret_key,
+            session_token: session_token.as_deref(),
+            region: &region,
+            service,
+            host: &host,
+            millis,
+            content_type: None,
+        });
+        let mut list_request = http
+            .get(format!("{scheme}://{host}/buckets?maxBuckets=1000"))
+            .header("x-amz-date", date)
+            .header("authorization", auth)
+            .timeout(Duration::from_secs(30));
+        if let Some(token) = &session_token {
+            list_request = list_request.header("x-amz-security-token", token);
+        }
+        let list_response = list_request
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("qual ListTableBuckets failed: {e}"));
+        let list_status = list_response.status().as_u16();
+        let list_body = list_response.text().await.unwrap_or_default();
+        assert_eq!(list_status, 200, "qual ListTableBuckets: {list_body}");
+        assert!(
+            list_body.contains(&parsed.bucket),
+            "qual bucket missing from list: {list_body}"
+        );
+        eprintln!("qual server: scheme={scheme} host={host} region={region} buckets={list_body}");
+
+        // Create the namespace. A 409 means it already exists.
+        // Sign content-type with the request. The service
+        // requires it in the signature.
+        let ns_body = serde_json::json!({"namespace": [&namespace]}).to_string();
+        let ns_path = format!("/namespaces/{encoded_arn}");
+        let millis = broker_connectors::now_millis();
+        let (auth, date) = qual_auth(&QualAuthRequest {
+            method: "PUT",
+            canonical_uri: &ns_path,
+            canonical_query: "",
+            body: ns_body.as_bytes(),
+            access_key: &access_key,
+            secret_key: &secret_key,
+            session_token: session_token.as_deref(),
+            region: &region,
+            service,
+            host: &host,
+            millis,
+            content_type: Some("application/json"),
+        });
+        let mut ns_request = http
+            .put(format!("{scheme}://{host}{ns_path}"))
+            .header("x-amz-date", date)
+            .header("authorization", auth)
+            .header("content-type", "application/json")
+            .body(ns_body)
+            .timeout(Duration::from_secs(30));
+        if let Some(token) = &session_token {
+            ns_request = ns_request.header("x-amz-security-token", token);
+        }
+        let ns_response = ns_request
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("qual CreateNamespace failed: {e}"));
+        let ns_status = ns_response.status().as_u16();
+        let ns_text = ns_response.text().await.unwrap_or_default();
+        assert!(
+            ns_status == 200 || ns_status == 201 || ns_status == 409,
+            "qual CreateNamespace: {ns_status} {ns_text}"
+        );
+        eprintln!("qual namespace: {namespace} status={ns_status}");
+
+        // Create the table. A 409 means it already exists.
+        // Sign content-type with the request. The service
+        // requires it in the signature.
+        let table_body = serde_json::json!({"name": table, "format": "ICEBERG"}).to_string();
+        let table_path = format!("/tables/{encoded_arn}/{namespace}");
+        let millis = broker_connectors::now_millis();
+        let (auth, date) = qual_auth(&QualAuthRequest {
+            method: "PUT",
+            canonical_uri: &table_path,
+            canonical_query: "",
+            body: table_body.as_bytes(),
+            access_key: &access_key,
+            secret_key: &secret_key,
+            session_token: session_token.as_deref(),
+            region: &region,
+            service,
+            host: &host,
+            millis,
+            content_type: Some("application/json"),
+        });
+        let mut table_request = http
+            .put(format!("{scheme}://{host}{table_path}"))
+            .header("x-amz-date", date)
+            .header("authorization", auth)
+            .header("content-type", "application/json")
+            .body(table_body)
+            .timeout(Duration::from_secs(30));
+        if let Some(token) = &session_token {
+            table_request = table_request.header("x-amz-security-token", token);
+        }
+        let table_response = table_request
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("qual CreateTable failed: {e}"));
+        let table_status = table_response.status().as_u16();
+        let table_text = table_response.text().await.unwrap_or_default();
+        assert!(
+            table_status == 200 || table_status == 201 || table_status == 409,
+            "qual CreateTable: {table_status} {table_text}"
+        );
+
+        // The table entry proves the catalog holds it.
+        // GetTable is GET /get-table with query keys.
+        // Keys sort as name, namespace, tableBucketARN.
+        let get_query = format!("name={table}&namespace={namespace}&tableBucketARN={encoded_arn}");
+        let millis = broker_connectors::now_millis();
+        let (auth, date) = qual_auth(&QualAuthRequest {
+            method: "GET",
+            canonical_uri: "/get-table",
+            canonical_query: &get_query,
+            body: b"",
+            access_key: &access_key,
+            secret_key: &secret_key,
+            session_token: session_token.as_deref(),
+            region: &region,
+            service,
+            host: &host,
+            millis,
+            content_type: None,
+        });
+        let mut get_request = http
+            .get(format!("{scheme}://{host}/get-table?{get_query}"))
+            .header("x-amz-date", date)
+            .header("authorization", auth)
+            .timeout(Duration::from_secs(30));
+        if let Some(token) = &session_token {
+            get_request = get_request.header("x-amz-security-token", token);
+        }
+        let get_response = get_request
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("qual GetTable failed: {e}"));
+        let get_status = get_response.status().as_u16();
+        let get_body = get_response.text().await.unwrap_or_default();
+        assert_eq!(get_status, 200, "qual GetTable: {get_body}");
+        eprintln!("qual table: {namespace}.{table} detail={get_body}");
+        // Object operations ride the S3 endpoint. Parse the warehouse bucket.
+        // Control operations stay on the tables host.
+        let warehouse_location = serde_json::from_str::<serde_json::Value>(&get_body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("warehouseLocation")
+                    .and_then(|field| field.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| panic!("qual GetTable has no warehouseLocation: {get_body}"));
+        let warehouse_bucket = warehouse_location
+            .strip_prefix("s3://")
+            .and_then(|rest| rest.split('/').next())
+            .filter(|bucket| !bucket.is_empty())
+            .unwrap_or_else(|| {
+                panic!("qual warehouseLocation is not an S3 URI: {warehouse_location}")
+            })
+            .to_string();
+        let s3_host = format!("s3.{region}.amazonaws.com");
+        let use_s3_data_plane = endpoint_override.is_none();
+        let (data_scheme, data_host, data_service) = if use_s3_data_plane {
+            ("https".to_string(), s3_host, "s3")
+        } else {
+            (scheme.clone(), host.clone(), service)
+        };
+        eprintln!("qual warehouse: location={warehouse_location} bucket={warehouse_bucket}");
+
+        // The sink rides the production transport (no mock).
+        // One batch holds all rows: batch 1000 exceeds 500, so one
+        // flush sends them. The buffer bound is finite (10 000).
+        let config = S3TablesSinkConfig {
+            table_bucket_arn: bucket_arn.clone(),
+            namespace: namespace.clone(),
+            table_name: table.clone(),
+            region: region.clone(),
+            access_key_id: access_key.clone(),
+            secret_access_key: secret_key.clone(),
+            session_token: session_token.clone(),
+            endpoint: endpoint_override.clone(),
+            partition_spec: Vec::new(),
+            target_format: S3TablesFormat::NdjsonCompressed,
+            batch_size: Some(1_000),
+            buffer_capacity: Some(10_000),
+            linger_ms: Some(1_000),
+            timeout_ms: Some(30_000),
+        };
+        config.validate().expect("qual config validates");
+        let transport = Arc::new(
+            HttpS3TablesTransport::new(&config, reqwest::Client::new()).expect("qual transport"),
+        );
+        let sink = S3TablesSink::new(config, transport).expect("qual sink");
+        assert_eq!(sink.kind(), "s3_tables");
+        let topic = Topic::new("sensors/qual").expect("qual topic");
+        for seq in 0..ROWS {
+            let payload = Bytes::from(format!(r#"{{"seq":{seq},"device_id":"dev-{seq:04}"}}"#));
+            sink.send(&topic, &payload, QoS::AtLeastOnce)
+                .await
+                .unwrap_or_else(|e| panic!("qual send seq={seq} failed: {e:?}"));
+        }
+        sink.flush().await.expect("qual flush");
+        assert_eq!(sink.sent_records(), ROWS as u64);
+        assert_eq!(sink.buffered_rows(), 0);
+        let sent_files = sink.sent_files();
+        eprintln!("qual rows sent: records={ROWS} files={sent_files}");
+
+        // Read back through an independent client. The snapshot lists
+        // the committed files; each GET gunzips to its ndjson rows.
+        // An empty send fails here: the count misses 500.
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&sink.last_snapshot.lock()).expect("qual snapshot parses");
+        let files = snapshot["data_files"]
+            .as_array()
+            .unwrap_or_else(|| panic!("qual snapshot has no files: {snapshot}"));
+        assert!(!files.is_empty(), "qual snapshot lists no files");
+        let mut seen: HashSet<i64> = HashSet::new();
+        let mut total = 0usize;
+        for file in files.iter() {
+            let key = file["path"]
+                .as_str()
+                .unwrap_or_else(|| panic!("qual file has no path: {file}"));
+            // Data files live on the S3 data plane in production.
+            // Custom endpoints keep the loopback path.
+            let canonical = if use_s3_data_plane {
+                broker_connectors::aws_encode_path(&format!("/{warehouse_bucket}/{key}"))
+            } else {
+                broker_connectors::aws_encode_path(&format!("/{key}"))
+            };
+            let millis = broker_connectors::now_millis();
+            let (auth, date) = qual_auth(&QualAuthRequest {
+                method: "GET",
+                canonical_uri: &canonical,
+                canonical_query: "",
+                body: b"",
+                access_key: &access_key,
+                secret_key: &secret_key,
+                session_token: session_token.as_deref(),
+                region: &region,
+                service: data_service,
+                host: &data_host,
+                millis,
+                content_type: None,
+            });
+            let mut get = http
+                .get(format!("{data_scheme}://{data_host}{canonical}"))
+                .header("x-amz-date", date)
+                .header("authorization", auth)
+                .header("x-amz-content-sha256", broker_connectors::sha256_hex(b""))
+                .timeout(Duration::from_secs(60));
+            if let Some(token) = &session_token {
+                get = get.header("x-amz-security-token", token);
+            }
+            let response = get
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("qual GET {key} failed: {e}"));
+            let status = response.status().as_u16();
+            let bytes = response
+                .bytes()
+                .await
+                .unwrap_or_else(|e| panic!("qual GET {key} body failed: {e}"));
+            assert_eq!(status, 200, "qual GET {key} status");
+            let mut decoder = GzDecoder::new(&bytes[..]);
+            let mut raw = Vec::new();
+            decoder
+                .read_to_end(&mut raw)
+                .unwrap_or_else(|e| panic!("qual gunzip {key} failed: {e:?}"));
+            let text =
+                String::from_utf8(raw).unwrap_or_else(|e| panic!("qual utf8 {key} failed: {e}"));
+            for line in text.lines() {
+                let row: serde_json::Value = serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("qual ndjson {key} failed: {e}"));
+                let seq = row["payload"]["seq"]
+                    .as_i64()
+                    .unwrap_or_else(|| panic!("qual {key} row lacks payload.seq: {row}"));
+                assert!(
+                    (0..ROWS as i64).contains(&seq),
+                    "qual {key} seq {seq} out of range"
+                );
+                assert!(seen.insert(seq), "qual duplicate seq {seq}");
+                total += 1;
+            }
+        }
+        assert_eq!(total, ROWS, "qual row count: got {total} of {ROWS}");
+        assert_eq!(seen.len(), ROWS, "qual distinct count");
+        for seq in 0..ROWS as i64 {
+            assert!(seen.contains(&seq), "qual missing seq {seq}");
+        }
+        let file_count = files.len();
+        eprintln!("qual rows asserted: count={ROWS} files={file_count}");
+
+        // First and last payloads round-trip intact.
+        let mut first_found = false;
+        let mut last_found = false;
+        for file in files.iter() {
+            let key = file["path"].as_str().expect("qual path");
+            let canonical = if use_s3_data_plane {
+                broker_connectors::aws_encode_path(&format!("/{warehouse_bucket}/{key}"))
+            } else {
+                broker_connectors::aws_encode_path(&format!("/{key}"))
+            };
+            let millis = broker_connectors::now_millis();
+            let (auth, date) = qual_auth(&QualAuthRequest {
+                method: "GET",
+                canonical_uri: &canonical,
+                canonical_query: "",
+                body: b"",
+                access_key: &access_key,
+                secret_key: &secret_key,
+                session_token: session_token.as_deref(),
+                region: &region,
+                service: data_service,
+                host: &data_host,
+                millis,
+                content_type: None,
+            });
+            let mut get = http
+                .get(format!("{data_scheme}://{data_host}{canonical}"))
+                .header("x-amz-date", date)
+                .header("authorization", auth)
+                .header("x-amz-content-sha256", broker_connectors::sha256_hex(b""))
+                .timeout(Duration::from_secs(60));
+            if let Some(token) = &session_token {
+                get = get.header("x-amz-security-token", token);
+            }
+            let bytes = get
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("qual re-GET {key} failed: {e}"))
+                .bytes()
+                .await
+                .unwrap_or_else(|e| panic!("qual re-GET {key} body failed: {e}"));
+            let mut decoder = GzDecoder::new(&bytes[..]);
+            let mut raw = Vec::new();
+            decoder.read_to_end(&mut raw).expect("qual re-gunzip");
+            let text = String::from_utf8(raw).expect("qual re-utf8");
+            for line in text.lines() {
+                if line.contains(r#""seq":0"#) && line.contains("dev-0000") {
+                    first_found = true;
+                }
+                let last = ROWS - 1;
+                if line.contains(&format!(r#""seq":{last}"#))
+                    && line.contains(&format!("dev-{last:04}"))
+                {
+                    last_found = true;
+                }
+            }
+        }
+        assert!(first_found, "qual first row missing");
+        assert!(last_found, "qual last row missing");
+        let last = ROWS - 1;
+        eprintln!("qual first/last asserted: seq=0 seq={last}");
+
+        // Fault: bad credentials fail closed with the server text.
+        let bad_config = S3TablesSinkConfig {
+            table_bucket_arn: bucket_arn.clone(),
+            namespace: namespace.clone(),
+            table_name: table.clone(),
+            region: region.clone(),
+            access_key_id: access_key.clone(),
+            secret_access_key: "invalid-secret-for-qual-fault".to_string(),
+            session_token: None,
+            endpoint: endpoint_override.clone(),
+            partition_spec: Vec::new(),
+            target_format: S3TablesFormat::NdjsonCompressed,
+            batch_size: Some(1_000),
+            buffer_capacity: Some(10_000),
+            linger_ms: Some(1_000),
+            timeout_ms: Some(30_000),
+        };
+        let bad_transport = Arc::new(
+            HttpS3TablesTransport::new(&bad_config, reqwest::Client::new())
+                .expect("qual bad transport"),
+        );
+        let bad_sink = S3TablesSink::new(bad_config, bad_transport).expect("qual bad sink");
+        bad_sink
+            .send(&topic, &Bytes::from(r#"{"seq":-1}"#), QoS::AtLeastOnce)
+            .await
+            .expect("qual bad send buffers");
+        let error = bad_sink
+            .flush()
+            .await
+            .expect_err("bad credentials must fail");
+        let message = match &error {
+            ConnectorError::Connection(text)
+            | ConnectorError::Dispatch(text)
+            | ConnectorError::UnknownConnector(text) => text.clone(),
+        };
+        assert!(
+            message.contains("s3_tables") && message.contains("answered"),
+            "qual fault must carry the server answer, got {message:?}"
+        );
+        eprintln!("qual fault asserted: bad credentials fail closed: {message}");
+
+        // Cleanup what the test created: table, then namespace.
+        // Delete the table. The service removes its data files.
+        // Direct deletes on the maintenance bucket fail.
+        let delete_table_path = format!("/tables/{encoded_arn}/{namespace}/{table}");
+        let millis = broker_connectors::now_millis();
+        let (auth, date) = qual_auth(&QualAuthRequest {
+            method: "DELETE",
+            canonical_uri: &delete_table_path,
+            canonical_query: "",
+            body: b"",
+            access_key: &access_key,
+            secret_key: &secret_key,
+            session_token: session_token.as_deref(),
+            region: &region,
+            service,
+            host: &host,
+            millis,
+            content_type: None,
+        });
+        let mut delete_table = http
+            .delete(format!("{scheme}://{host}{delete_table_path}"))
+            .header("x-amz-date", date)
+            .header("authorization", auth)
+            .timeout(Duration::from_secs(30));
+        if let Some(token) = &session_token {
+            delete_table = delete_table.header("x-amz-security-token", token);
+        }
+        let table_delete = delete_table
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("qual cleanup table failed: {e}"));
+        let table_delete_status = table_delete.status().as_u16();
+        assert!(
+            (200..300).contains(&table_delete_status) || table_delete_status == 404,
+            "qual cleanup table: {table_delete_status}"
+        );
+        let delete_ns_path = format!("/namespaces/{encoded_arn}/{namespace}");
+        let millis = broker_connectors::now_millis();
+        let (auth, date) = qual_auth(&QualAuthRequest {
+            method: "DELETE",
+            canonical_uri: &delete_ns_path,
+            canonical_query: "",
+            body: b"",
+            access_key: &access_key,
+            secret_key: &secret_key,
+            session_token: session_token.as_deref(),
+            region: &region,
+            service,
+            host: &host,
+            millis,
+            content_type: None,
+        });
+        let mut delete_ns = http
+            .delete(format!("{scheme}://{host}{delete_ns_path}"))
+            .header("x-amz-date", date)
+            .header("authorization", auth)
+            .timeout(Duration::from_secs(30));
+        if let Some(token) = &session_token {
+            delete_ns = delete_ns.header("x-amz-security-token", token);
+        }
+        let ns_delete = delete_ns
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("qual cleanup namespace failed: {e}"));
+        let ns_delete_status = ns_delete.status().as_u16();
+        assert!(
+            (200..300).contains(&ns_delete_status) || ns_delete_status == 404,
+            "qual cleanup namespace: {ns_delete_status}"
+        );
+        let removed = files.len();
+        eprintln!("qual cleanup: deleted {removed} files, table {table}, namespace {namespace}");
     }
 }
