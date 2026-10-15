@@ -162,6 +162,12 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # The hand-written `HttpTdengineTransport` stays for token/TLS configs
 # and offline unit tests; production wiring uses
 # `DriverTdengineTransport` below (`reqwest` REST, Basic + plaintext).
+# Oracle Database sink on the maintained `oracle-rs` driver
+# (MIT OR Apache-2.0): pure TNS with native auth and `:1` binds,
+# no client libraries. The `HttpOracleTransport` stays for ORDS
+# configs and offline unit tests only; direct database wiring uses
+# `DriverOracleTransport` below.
+oracle-rs = { version = "0.1" }
 
 [features]
 # Default build holds light sinks only (no vendor SDK).

@@ -229,9 +229,9 @@ pub use opc_ua::{
 };
 pub use oracle::{
     build_merge_sql, classify_ora_error, extract_oracle_row, CapturedOracleExecution,
-    HttpOracleTransport, MockOracleTransport, OraErrorClassification, OracleBindParam,
-    OracleConnector, OracleResponse, OracleRow, OracleSink, OracleSinkConfig, OracleTransport,
-    OracleValue,
+    DriverOracleTransport, HttpOracleTransport, MockOracleTransport, OraErrorClassification,
+    OracleBindParam, OracleConnector, OracleResponse, OracleRow, OracleSink, OracleSinkConfig,
+    OracleTransport, OracleValue,
 };
 pub use pulsar::{
     crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url,
