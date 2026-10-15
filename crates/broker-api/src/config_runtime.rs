@@ -482,9 +482,9 @@ async fn apply_connectors_live(
             pending_live.push(entry.id.clone());
             continue;
         }
-        // A disabled Cargo feature fails closed here: the entry stays
-        // persist-only and the missing feature is logged naming it.
-        if let Err(feature_error) = super::v5::rules::try_register_live_sink(
+        // A refused build fails closed here: the entry stays
+        // persist-only and the error is logged naming it.
+        if let Err(register_error) = super::v5::rules::try_register_live_sink(
             engine,
             &entry.connector_type,
             &entry.id,
@@ -495,7 +495,7 @@ async fn apply_connectors_live(
             tracing::warn!(
                 connector = %entry.id,
                 kind = %entry.connector_type,
-                "{feature_error}"
+                "{register_error}"
             );
             pending_live.push(entry.id.clone());
             continue;

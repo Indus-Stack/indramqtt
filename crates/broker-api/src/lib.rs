@@ -12760,6 +12760,233 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
+    async fn cf05_v5_connector_create_refuses_sink_build_failure() {
+        // CF-05: the v5 create path refuses a connector whose sink
+        // fails to build. Each case runs through HTTP on the live
+        // engine, and the refused entry stays out of the store.
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Datalayers with both auth modes set: the sink refuses the
+        // conflict, so create answers 400 with the sink text.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "cf05-dl-conflict", "type": "datalayers",
+                       "endpoint": "http://127.0.0.1:8360", "database": "factory_db",
+                       "table": "sensor_events", "token": "cf05-token",
+                       "username": "cf05-user", "password": "cf05-pass"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "conflicting auth must fail, got: {body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("auth modes conflict"),
+            "refusal carries the sink text, got: {body}"
+        );
+        assert!(state.engine.connectors().get("cf05-dl-conflict").is_none());
+
+        // Datalayers with a username and no password: the sink refuses
+        // the half pair, so create answers 400 with the sink text.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "cf05-dl-half", "type": "datalayers",
+                       "endpoint": "http://127.0.0.1:8360", "database": "factory_db",
+                       "table": "sensor_events", "username": "cf05-user"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "half auth pair must fail, got: {body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("both username and password"),
+            "refusal carries the sink text, got: {body}"
+        );
+        assert!(state.engine.connectors().get("cf05-dl-half").is_none());
+
+        // GreptimeDB with an empty database: the sink refuses it.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "cf05-greptime-empty", "type": "greptimedb",
+                       "endpoint": "http://127.0.0.1:4000/v1", "database": ""}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "empty database must fail, got: {body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("database"),
+            "refusal carries the sink text, got: {body}"
+        );
+        assert!(state
+            .engine
+            .connectors()
+            .get("cf05-greptime-empty")
+            .is_none());
+
+        // OpenTSDB with an empty metric: the sink refuses it.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "cf05-opentsdb-empty", "type": "opentsdb",
+                       "endpoint": "http://127.0.0.1:4242", "metric": ""}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "empty metric must fail, got: {body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("metric"),
+            "refusal carries the sink text, got: {body}"
+        );
+        assert!(state
+            .engine
+            .connectors()
+            .get("cf05-opentsdb-empty")
+            .is_none());
+
+        // None of the refused entries reached the store.
+        let (status, list) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        let ids: Vec<&str> = list
+            .as_array()
+            .expect("connector list")
+            .iter()
+            .filter_map(|row| {
+                row.get("id")
+                    .or_else(|| row.get("name"))
+                    .and_then(|v| v.as_str())
+            })
+            .collect();
+        for refused in [
+            "cf05-dl-conflict",
+            "cf05-dl-half",
+            "cf05-greptime-empty",
+            "cf05-opentsdb-empty",
+        ] {
+            assert!(!ids.contains(&refused), "{refused} must not be stored");
+        }
+
+        // The native entry answers 400 for the same bad config.
+        let (status, refused) = server
+            .post_auth(
+                "/api/v1/connectors",
+                json!({"id": "cf05-dl-v1", "kind": "datalayers",
+                       "config": {"endpoint": "http://127.0.0.1:8360",
+                                  "database": "factory_db", "table": "sensor_events",
+                                  "auth_token": "cf05-token",
+                                  "username": "cf05-user", "password": "cf05-pass"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "native entry refuses too, got: {refused}");
+
+        // Update path: a valid entry stays, then a conflicting replace
+        // fails and the stored entry keeps its old fields.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "cf05-dl-1", "type": "datalayers",
+                       "endpoint": "http://127.0.0.1:8360", "database": "factory_db",
+                       "table": "sensor_events"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert!(state.engine.connectors().get("cf05-dl-1").is_some());
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/cf05-dl-1",
+                json!({"id": "cf05-dl-1", "type": "datalayers",
+                       "endpoint": "http://127.0.0.1:8360", "database": "factory_db",
+                       "table": "sensor_events", "token": "cf05-token",
+                       "username": "cf05-user", "password": "cf05-pass"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "conflicting replace must fail, got: {body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("auth modes conflict"),
+            "refusal carries the sink text, got: {body}"
+        );
+        let (status, kept) = server
+            .get_auth("/api/v5/connectors/cf05-dl-1", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(kept["database"], json!("factory_db"));
+        assert_eq!(kept["table"], json!("sensor_events"));
+        assert!(state.engine.connectors().get("cf05-dl-1").is_some());
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/cf05-dl-1", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn cf05_v5_connector_valid_but_unreachable_stays_stored() {
+        // CF-05: a valid sink whose server is down still stores. After
+        // a restart the boot probe finds no target, so the entry reads
+        // back disconnected instead of failing the create.
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("cf05-conn-down");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "cf05-dl-down", "type": "datalayers",
+                       "endpoint": "http://127.0.0.1:9", "database": "factory_db",
+                       "table": "sensor_events"}),
+                &token,
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "valid sink stores even when down, got: {created}"
+        );
+        drop(server);
+        drop(registry);
+
+        // Simulate a kernel restart from the same dir.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server
+            .get_auth("/api/v5/connectors/cf05-dl-down", &token)
+            .await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+        assert!(
+            state.engine.connectors().get("cf05-dl-down").is_none(),
+            "no live sink while the target stays down"
+        );
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn rule_metrics_unknown_is_404_and_honest() {
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;

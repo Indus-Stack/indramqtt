@@ -934,17 +934,17 @@ impl ConnectorStore {
                                 .to_string();
                             self.upsert(params.clone());
                             if reachable {
-                                // A disabled Cargo feature fails closed here:
-                                // the entry stays persist-only and the missing
-                                // feature is logged naming it.
-                                if let Err(feature_error) =
+                                // A refused build fails closed here: the
+                                // entry stays persist-only and the error is
+                                // logged naming the connector and its kind.
+                                if let Err(register_error) =
                                     try_register_live_sink(engine, &conn_type, &live_name, &params)
                                         .await
                                 {
                                     tracing::warn!(
                                         connector = %live_name,
                                         kind = %conn_type,
-                                        "{feature_error}"
+                                        "{register_error}"
                                     );
                                 }
                             }
@@ -1257,8 +1257,8 @@ fn connector_node_status(status: &str) -> serde_json::Value {
 /// may fall back to a built-in credential or an invented identity. Returns
 /// the first missing required field's canonical name, or `None` when the
 /// body supplies everything the live-sink builder needs. Callers answer
-/// 400 naming that field; `register_live_sink` itself also fails closed
-/// (returns without registering) so boot replay cannot invent values.
+/// 400 naming that field; `register_live_sink` itself also refuses a
+/// build it cannot complete, so boot replay cannot invent values.
 ///
 /// Only the six connector families that previously carried built-in
 /// credentials or invented identities are gated here. Every other family
@@ -1825,8 +1825,9 @@ fn live_sink_kind(conn_type: &str) -> &str {
 
 /// Checked registration: a kind whose Cargo feature is disabled fails
 /// closed with an error naming the missing feature — never a silent
-/// skip, never a fallback identity. Enabled kinds go through
-/// [`register_live_sink`], the same path `create_connector` uses.
+/// skip, never a fallback identity. A sink or transport that fails to
+/// build fails the same way with its own error text. Enabled kinds go
+/// through [`register_live_sink`], the same path `create_connector` uses.
 pub(crate) async fn try_register_live_sink(
     engine: &broker_rules::RuleEngine,
     conn_type: &str,
@@ -1840,17 +1841,17 @@ pub(crate) async fn try_register_live_sink(
             "connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)"
         ));
     }
-    register_live_sink(engine, runtime, name, body).await;
-    Ok(())
+    register_live_sink(engine, runtime, name, body).await
 }
 
 /// Closed fallback for a kind whose vendor SDK is not compiled in.
-/// Fails closed without registering anything and names the missing feature.
+/// Logs the refusal and returns the error text for the caller.
 #[allow(dead_code)]
-fn refuse_disabled_kind(conn_type: &str, feature: &str) {
+fn refuse_disabled_kind(conn_type: &str, feature: &str) -> String {
     tracing::warn!(
         "connector kind `{conn_type}` needs missing feature `{feature}`; registration refused"
     );
+    format!("connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)")
 }
 
 pub(crate) async fn register_live_sink(
@@ -1858,7 +1859,27 @@ pub(crate) async fn register_live_sink(
     conn_type: &str,
     name: &str,
     body: &serde_json::Value,
-) {
+) -> Result<(), String> {
+    // First build error in this call. Each arm records its failure
+    // through the macro below instead of dropping it, and the tail of
+    // this function refuses with it. Arms that register nothing by
+    // design (no execution path, missing optional target) leave it
+    // empty and stay persist-only.
+    let mut build_error: Option<String> = None;
+    // Build one fallible sink piece. Success yields the value for the
+    // surrounding `if let`; failure records the sink text and yields
+    // `None` so the arm registers nothing.
+    macro_rules! record_sink_error {
+        ($expr:expr) => {
+            match $expr {
+                Ok(built) => Some(built),
+                Err(error) => {
+                    build_error = Some(error.to_string());
+                    None
+                }
+            }
+        };
+    }
     match conn_type {
         // Offline kinds: always live, no network probe. The snapshot keeps
         // the reference form while the sink holds no credential material.
@@ -1882,11 +1903,11 @@ pub(crate) async fn register_live_sink(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             else {
-                return;
+                return Ok(());
             };
             let url = broker_connectors::resolve_field_secret(raw_url);
             if url.trim().is_empty() {
-                return;
+                return Ok(());
             }
             let sink = Arc::new(broker_connectors::HttpWebhookSink::new(
                 url,
@@ -1910,7 +1931,9 @@ pub(crate) async fn register_live_sink(
             } else {
                 format!("redis://:{}@{}", pass, servers)
             };
-            if let Ok(transport) = broker_connectors::redis::DriverRedisTransport::new(&endpoint) {
+            if let Some(transport) = record_sink_error!(
+                broker_connectors::redis::DriverRedisTransport::new(&endpoint)
+            ) {
                 let config = broker_connectors::redis::RedisSinkConfig {
                     endpoint,
                     command: broker_connectors::redis::RedisCommandKind::HSet {
@@ -1918,9 +1941,10 @@ pub(crate) async fn register_live_sink(
                         field_template: "payload".to_string(),
                     },
                 };
-                if let Ok(sink) =
-                    broker_connectors::redis::RedisSink::new(config, Arc::new(transport))
-                {
+                if let Some(sink) = record_sink_error!(broker_connectors::redis::RedisSink::new(
+                    config,
+                    Arc::new(transport)
+                )) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -1989,9 +2013,9 @@ pub(crate) async fn register_live_sink(
             let transport = Arc::new(
                 broker_connectors_enterprise::alloydb::PgDriverAlloydbTransport::new(&config),
             );
-            if let Ok(sink) =
+            if let Some(sink) = record_sink_error!(
                 broker_connectors_enterprise::alloydb::AlloydbSink::new(config, transport)
-            {
+            ) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -2041,10 +2065,13 @@ pub(crate) async fn register_live_sink(
             };
             // Production write path on the maintained `rdkafka` driver;
             // the hand-written TCP framing stays for offline unit tests.
-            if let Ok(transport) = broker_connectors::kafka::RdkafkaKafkaTransport::new(&config) {
-                if let Ok(sink) =
-                    broker_connectors::kafka::KafkaSink::new(config, Arc::new(transport))
-                {
+            if let Some(transport) = record_sink_error!(
+                broker_connectors::kafka::RdkafkaKafkaTransport::new(&config)
+            ) {
+                if let Some(sink) = record_sink_error!(broker_connectors::kafka::KafkaSink::new(
+                    config,
+                    Arc::new(transport)
+                )) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2055,7 +2082,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "kafka"))]
         "kafka" => {
-            refuse_disabled_kind(conn_type, "kafka");
+            return Err(refuse_disabled_kind(conn_type, "kafka"));
         }
         "pgsql" => {
             let server = body
@@ -2075,8 +2102,9 @@ pub(crate) async fn register_live_sink(
                 "postgres://{}:{}@{}/{}",
                 username, password, server, database
             );
-            if let Ok(transport) = broker_connectors::postgres::DriverPgTransport::new(&conn_url, 1)
-            {
+            if let Some(transport) = record_sink_error!(
+                broker_connectors::postgres::DriverPgTransport::new(&conn_url, 1)
+            ) {
                 let config = broker_connectors::postgres::PostgreSqlSinkConfig {
                     connection_url: conn_url,
                     sql_template: "INSERT INTO test_telemetry (clientid, topic, payload, timestamp) VALUES ('rule-engine', $1, $3, 0)".to_string(),
@@ -2084,9 +2112,9 @@ pub(crate) async fn register_live_sink(
                     batch_size: 1,
                     batch_timeout_ms: 10,
                 };
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors::postgres::PostgreSqlSink::new(config, Arc::new(transport))
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2114,8 +2142,9 @@ pub(crate) async fn register_live_sink(
             } else {
                 format!("mysql://{}:{}@{}/{}", username, password, server, database)
             };
-            if let Ok(transport) = broker_connectors::mysql::DriverMySqlTransport::new(&conn_url, 1)
-            {
+            if let Some(transport) = record_sink_error!(
+                broker_connectors::mysql::DriverMySqlTransport::new(&conn_url, 1)
+            ) {
                 let config = broker_connectors::mysql::MySqlSinkConfig {
                     connection_url: conn_url,
                     sql_template:
@@ -2125,9 +2154,10 @@ pub(crate) async fn register_live_sink(
                     batch_size: 1,
                     batch_timeout_ms: 10,
                 };
-                if let Ok(sink) =
-                    broker_connectors::mysql::MySqlSink::new(config, Arc::new(transport))
-                {
+                if let Some(sink) = record_sink_error!(broker_connectors::mysql::MySqlSink::new(
+                    config,
+                    Arc::new(transport)
+                )) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2156,18 +2186,18 @@ pub(crate) async fn register_live_sink(
             } else {
                 format!("amqp://{}:{}@{}/", username, password, endpoint)
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors::rabbitmq::LapinRabbitTransport::new(&full_endpoint)
-            {
+            ) {
                 let config = broker_connectors::rabbitmq::RabbitMqSinkConfig {
                     endpoint: full_endpoint,
                     exchange: "amq.topic".to_string(),
                     routing_key_template: "sensor.${topic}".to_string(),
                     delivery_mode: 1,
                 };
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors::rabbitmq::RabbitMqSink::new(config, Arc::new(transport))
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2178,7 +2208,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "rabbitmq"))]
         "rabbitmq" => {
-            refuse_disabled_kind(conn_type, "rabbitmq");
+            return Err(refuse_disabled_kind(conn_type, "rabbitmq"));
         }
         #[cfg(feature = "clickhouse")]
         "clickhouse" => {
@@ -2225,12 +2255,14 @@ pub(crate) async fn register_live_sink(
                     .to_string(),
                 request_timeout_ms,
             };
-            if let Ok(driver) = broker_connectors::DriverClickHouseTransport::new(&config) {
+            if let Some(driver) =
+                record_sink_error!(broker_connectors::DriverClickHouseTransport::new(&config))
+            {
                 let transport: std::sync::Arc<dyn broker_connectors::ClickHouseTransport> =
                     std::sync::Arc::new(driver);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors::clickhouse::ClickHouseSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2241,7 +2273,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "clickhouse"))]
         "clickhouse" => {
-            refuse_disabled_kind(conn_type, "clickhouse");
+            return Err(refuse_disabled_kind(conn_type, "clickhouse"));
         }
         "mqtt_bridge" | "bridge" => {
             let server = body
@@ -2277,10 +2309,13 @@ pub(crate) async fn register_live_sink(
                 linger_ms: Some(10),
                 protocol: broker_connectors::MqttBridgeProtocol::V311,
             };
-            if let Ok(transport) = broker_connectors::RumqttcMqttBridgeTransport::new(&config) {
-                if let Ok(sink) =
-                    broker_connectors::MqttBridgeSink::new(config, Arc::new(transport))
-                {
+            if let Some(transport) =
+                record_sink_error!(broker_connectors::RumqttcMqttBridgeTransport::new(&config))
+            {
+                if let Some(sink) = record_sink_error!(broker_connectors::MqttBridgeSink::new(
+                    config,
+                    Arc::new(transport)
+                )) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2333,7 +2368,10 @@ pub(crate) async fn register_live_sink(
                 batch_timeout_ms: 100,
                 request_timeout_ms,
             };
-            if let Ok(sink) = broker_connectors::InfluxDbSink::new(config, reqwest::Client::new()) {
+            if let Some(sink) = record_sink_error!(broker_connectors::InfluxDbSink::new(
+                config,
+                reqwest::Client::new()
+            )) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -2381,12 +2419,13 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(3_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::DriverMongoDbTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors_enterprise::MongoDbSink::new(config, transport)
-                {
+                if let Some(sink) = record_sink_error!(
+                    broker_connectors_enterprise::MongoDbSink::new(config, transport)
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2400,7 +2439,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "mongodb"))]
         "mongodb" | "mongo" => {
-            refuse_disabled_kind(conn_type, "mongodb");
+            return Err(refuse_disabled_kind(conn_type, "mongodb"));
         }
         #[cfg(feature = "cassandra")]
         "cassandra" | "scylla" | "scylladb" => {
@@ -2454,13 +2493,13 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::ScyllaCassandraTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::CassandraSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2474,7 +2513,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "cassandra"))]
         "cassandra" | "scylla" | "scylladb" => {
-            refuse_disabled_kind(conn_type, "cassandra");
+            return Err(refuse_disabled_kind(conn_type, "cassandra"));
         }
         "cockroachdb" | "cockroach" => {
             let conn_str = body
@@ -2503,8 +2542,9 @@ pub(crate) async fn register_live_sink(
             };
             let transport =
                 Arc::new(broker_connectors_enterprise::PgDriverCockroachDbTransport::new(&config));
-            if let Ok(sink) = broker_connectors_enterprise::CockroachDbSink::new(config, transport)
-            {
+            if let Some(sink) = record_sink_error!(
+                broker_connectors_enterprise::CockroachDbSink::new(config, transport)
+            ) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -2577,13 +2617,13 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::DriverCouchbaseTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::CouchbaseSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2594,7 +2634,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "couchbase"))]
         "couchbase" => {
-            refuse_disabled_kind(conn_type, "couchbase");
+            return Err(refuse_disabled_kind(conn_type, "couchbase"));
         }
         "mssql" | "sqlserver" => {
             let server = body
@@ -2656,10 +2696,13 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors_enterprise::DriverMssqlTransport::new(&config)
-            {
+            if let Some(transport) = record_sink_error!(
+                broker_connectors_enterprise::DriverMssqlTransport::new(&config)
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors_enterprise::MssqlSink::new(config, transport) {
+                if let Some(sink) = record_sink_error!(
+                    broker_connectors_enterprise::MssqlSink::new(config, transport)
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2709,9 +2752,9 @@ pub(crate) async fn register_live_sink(
             };
             let transport =
                 Arc::new(broker_connectors_enterprise::oracle::HttpOracleTransport::new(&config));
-            if let Ok(sink) =
+            if let Some(sink) = record_sink_error!(
                 broker_connectors_enterprise::oracle::OracleSink::new(config, transport)
-            {
+            ) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -2788,13 +2831,15 @@ pub(crate) async fn register_live_sink(
             // Same production split as the v1 wiring: Basic + plaintext
             // rides the maintained driver, anything else stays on REST.
             if config.use_driver() {
-                if let Ok(transport) =
+                if let Some(transport) = record_sink_error!(
                     broker_connectors_enterprise::tdengine::DriverTdengineTransport::new(&config)
-                {
+                ) {
                     let transport = Arc::new(transport);
-                    if let Ok(sink) =
-                        broker_connectors_enterprise::tdengine::TdengineSink::new(config, transport)
-                    {
+                    if let Some(sink) = record_sink_error!(
+                        broker_connectors_enterprise::tdengine::TdengineSink::new(
+                            config, transport
+                        )
+                    ) {
                         let sink = Arc::new(sink);
                         engine.connectors().register(name, sink.clone());
                         engine
@@ -2802,19 +2847,24 @@ pub(crate) async fn register_live_sink(
                             .register(format!("tdengine:{}", name), sink);
                     }
                 }
-                return;
+                // A failed driver build refuses with the sink text
+                // instead of falling through to the REST path.
+                if let Some(error) = build_error {
+                    return Err(error);
+                }
+                return Ok(());
             }
             let client = reqwest::Client::builder()
                 .timeout(config.timeout())
                 .build()
                 .unwrap_or_default();
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::tdengine::HttpTdengineTransport::new(&config, client)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::tdengine::TdengineSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -2874,8 +2924,9 @@ pub(crate) async fn register_live_sink(
             let transport = Arc::new(broker_connectors::greptimedb::HttpGreptimeDbTransport::new(
                 &config,
             ));
-            if let Ok(sink) = broker_connectors::greptimedb::GreptimeDbSink::new(config, transport)
-            {
+            if let Some(sink) = record_sink_error!(
+                broker_connectors::greptimedb::GreptimeDbSink::new(config, transport)
+            ) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -2940,13 +2991,13 @@ pub(crate) async fn register_live_sink(
                 .timeout(config.timeout())
                 .build()
                 .unwrap_or_default();
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::iotdb::HttpIotDbTransport::new(&config, client)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::iotdb::IotDbSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3021,7 +3072,9 @@ pub(crate) async fn register_live_sink(
             let transport = Arc::new(broker_connectors::opentsdb::NetworkOpenTsdbTransport::new(
                 &config,
             ));
-            if let Ok(sink) = broker_connectors::opentsdb::OpenTsdbSink::new(config, transport) {
+            if let Some(sink) = record_sink_error!(broker_connectors::opentsdb::OpenTsdbSink::new(
+                config, transport
+            )) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -3102,13 +3155,13 @@ pub(crate) async fn register_live_sink(
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default();
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::doris::HttpDorisTransport::new(&config, client)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::doris::DorisSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3178,9 +3231,9 @@ pub(crate) async fn register_live_sink(
             let transport = Arc::new(
                 broker_connectors_enterprise::datalayers::HttpDatalayersTransport::new(&config),
             );
-            if let Ok(sink) =
+            if let Some(sink) = record_sink_error!(
                 broker_connectors_enterprise::datalayers::DatalayersSink::new(config, transport)
-            {
+            ) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -3234,13 +3287,13 @@ pub(crate) async fn register_live_sink(
                 max_retries: 3,
                 request_timeout_ms: timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors::elasticsearch::DriverElasticsearchTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors::elasticsearch::ElasticsearchSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3254,7 +3307,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "elasticsearch"))]
         "elasticsearch" | "opensearch" => {
-            refuse_disabled_kind(conn_type, "elasticsearch");
+            return Err(refuse_disabled_kind(conn_type, "elasticsearch"));
         }
         "pulsar" => {
             let server = body
@@ -3318,13 +3371,13 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::pulsar::TcpPulsarTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::pulsar::PulsarSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3377,13 +3430,13 @@ pub(crate) async fn register_live_sink(
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::rocketmq::TcpRocketMqTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::rocketmq::RocketMqSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3419,7 +3472,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(api_secret) = body
                 .get("api_secret")
@@ -3427,7 +3480,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -3450,12 +3503,14 @@ pub(crate) async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::confluent::RdkafkaConfluentTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors_enterprise::confluent::ConfluentKafkaSink::new(
-                    config, transport,
+                if let Some(sink) = record_sink_error!(
+                    broker_connectors_enterprise::confluent::ConfluentKafkaSink::new(
+                        config, transport,
+                    )
                 ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -3467,7 +3522,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "confluent"))]
         "confluent" => {
-            refuse_disabled_kind(conn_type, "confluent");
+            return Err(refuse_disabled_kind(conn_type, "confluent"));
         }
         "disk_log" | "disk" | "disklog" => {
             let dir = body
@@ -3507,11 +3562,12 @@ pub(crate) async fn register_live_sink(
                 sync_mode: broker_connectors::disk_log::DiskSyncMode::EveryBatch,
                 timeout_ms,
             };
-            if let Ok(writer) = broker_connectors::disk_log::FileDiskLogWriter::open(&config).await
-            {
-                if let Ok(sink) =
+            if let Some(writer) = record_sink_error!(
+                broker_connectors::disk_log::FileDiskLogWriter::open(&config).await
+            ) {
+                if let Some(sink) = record_sink_error!(
                     broker_connectors::disk_log::DiskLogSink::open(config, Arc::new(writer)).await
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3562,13 +3618,13 @@ pub(crate) async fn register_live_sink(
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::opc_ua::TcpOpcUaTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::opc_ua::OpcUaSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3622,14 +3678,14 @@ pub(crate) async fn register_live_sink(
                             client_id.as_deref(),
                         ) {
                             Ok(driver) => Arc::new(driver),
-                            Err(_) => return,
+                            Err(error) => return Err(error.to_string()),
                         }
                     }
-                    None => return,
+                    None => return Ok(()),
                 };
-            if let Ok(sink) =
+            if let Some(sink) = record_sink_error!(
                 broker_connectors_enterprise::sparkplug_b::SparkplugBSink::new(config, transport)
-            {
+            ) {
                 let sink = Arc::new(sink);
                 engine.connectors().register(name, sink.clone());
                 engine
@@ -3687,9 +3743,13 @@ pub(crate) async fn register_live_sink(
                 batch_timeout_ms: 10,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors::s3::SdkS3Transport::new(&config) {
+            if let Some(transport) =
+                record_sink_error!(broker_connectors::s3::SdkS3Transport::new(&config))
+            {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors::s3::S3Sink::new(config, transport) {
+                if let Some(sink) =
+                    record_sink_error!(broker_connectors::s3::S3Sink::new(config, transport))
+                {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3703,7 +3763,7 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "s3"))]
         "s3" | "minio" => {
-            refuse_disabled_kind(conn_type, "s3");
+            return Err(refuse_disabled_kind(conn_type, "s3"));
         }
         "s3_tables" | "s3tables" => {
             let arn = body
@@ -3761,16 +3821,16 @@ pub(crate) async fn register_live_sink(
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::s3_tables::HttpS3TablesTransport::new(
                     &config,
                     reqwest::Client::new(),
                 )
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::s3_tables::S3TablesSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3829,13 +3889,13 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::kinesis::SdkKinesisTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::kinesis::KinesisSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3846,12 +3906,13 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "kinesis"))]
         "kinesis" | "aws_kinesis" => {
-            refuse_disabled_kind(conn_type, "kinesis");
+            return Err(refuse_disabled_kind(conn_type, "kinesis"));
         }
         #[cfg(not(feature = "dynamodb"))]
         "dynamodb" | "dynamo" | "ddb" => {
             // Feature disabled (X1-09): fail closed with no sink; the
             // checked wrapper names the missing feature.
+            return Err(refuse_disabled_kind(conn_type, "dynamodb"));
         }
         #[cfg(feature = "dynamodb")]
         "dynamodb" | "dynamo" | "ddb" => {
@@ -3911,13 +3972,13 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::dynamodb::SdkDynamoDbTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::dynamodb::DynamoDbSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -3986,16 +4047,18 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::timestream::HttpTimestreamTransport::new(
                     &config,
                     reqwest::Client::new(),
                 )
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
-                    broker_connectors_enterprise::timestream::TimestreamSink::new(config, transport)
-                {
+                if let Some(sink) = record_sink_error!(
+                    broker_connectors_enterprise::timestream::TimestreamSink::new(
+                        config, transport
+                    )
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4062,13 +4125,13 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::redshift::SdkRedshiftTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::redshift::RedshiftSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4081,6 +4144,7 @@ pub(crate) async fn register_live_sink(
         "aws_iot" | "aws_iot_core" => {
             // Feature disabled (X1-09): fail closed with no sink; the
             // checked wrapper names the missing feature.
+            return Err(refuse_disabled_kind(conn_type, "aws_iot"));
         }
         #[cfg(feature = "aws_iot")]
         "aws_iot" | "aws_iot_core" => {
@@ -4113,12 +4177,12 @@ pub(crate) async fn register_live_sink(
             let Some(client_cert_pem) =
                 field(&["client_cert_pem", "client_cert", "certificate", "cert_pem"])
             else {
-                return;
+                return Ok(());
             };
             let Some(client_key_pem) =
                 field(&["client_key_pem", "client_key", "private_key", "key_pem"])
             else {
-                return;
+                return Ok(());
             };
             let ca_cert_pem = field(&["ca_cert_pem", "ca_cert", "ca_pem", "certificate_authority"])
                 .unwrap_or_default();
@@ -4157,13 +4221,13 @@ pub(crate) async fn register_live_sink(
                 ca_bundle_pem,
                 alpn_protocols: None,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::aws_iot::TlsAwsIotTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::aws_iot::AwsIotSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4179,6 +4243,7 @@ pub(crate) async fn register_live_sink(
         "azure_blob" | "azure_blob_storage" | "azureblob" | "azblob" => {
             // Feature disabled (X1-09): fail closed with no sink; the
             // checked wrapper names the missing feature.
+            return Err(refuse_disabled_kind(conn_type, "azure_blob"));
         }
         #[cfg(feature = "azure_blob")]
         "azure_blob" | "azure_blob_storage" | "azureblob" | "azblob" => {
@@ -4278,7 +4343,7 @@ pub(crate) async fn register_live_sink(
                         })
                 });
             let Some(auth) = auth else {
-                return;
+                return Ok(());
             };
 
             let config = broker_connectors_enterprise::azure_blob::AzureBlobSinkConfig {
@@ -4294,16 +4359,16 @@ pub(crate) async fn register_live_sink(
                 buffer_capacity: None,
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::azure_blob::HttpAzureBlobTransport::new(
                     &config,
                     reqwest::Client::new(),
                 )
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::azure_blob::AzureBlobSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4319,6 +4384,7 @@ pub(crate) async fn register_live_sink(
         "azure_eventhubs" | "azure_event_hubs" | "azure" | "eventhubs" => {
             // Feature disabled (X1-09): fail closed with no sink; the
             // checked wrapper names the missing feature.
+            return Err(refuse_disabled_kind(conn_type, "azure_eventhubs"));
         }
         #[cfg(feature = "azure_eventhubs")]
         "azure_eventhubs" | "azure_event_hubs" | "azure" | "eventhubs" => {
@@ -4349,7 +4415,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -4373,18 +4439,18 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::azure_eventhubs::HttpAzureEventHubsTransport::new(
                     &config,
                     reqwest::Client::new(),
                 )
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::azure_eventhubs::AzureEventHubsSink::new(
                         config, transport,
                     )
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4400,6 +4466,7 @@ pub(crate) async fn register_live_sink(
         "azure_iot" | "azure_iot_hub" | "azure_iothub" | "iothub" => {
             // Feature disabled (X1-09): fail closed with no sink; the
             // checked wrapper names the missing feature.
+            return Err(refuse_disabled_kind(conn_type, "azure_iot"));
         }
         #[cfg(feature = "azure_iot")]
         "azure_iot" | "azure_iot_hub" | "azure_iothub" | "iothub" => {
@@ -4422,7 +4489,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -4503,13 +4570,13 @@ pub(crate) async fn register_live_sink(
                 ca_bundle_pem,
                 sas_ttl_secs,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::azure_iot::TlsAzureIotTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::azure_iot::AzureIotSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4558,13 +4625,13 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::gcp_pubsub::SdkGcpPubSubTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::gcp_pubsub::GcpPubSubSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4578,12 +4645,13 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(not(feature = "gcp_pubsub"))]
         "gcp_pubsub" | "pubsub" => {
-            refuse_disabled_kind(conn_type, "gcp_pubsub");
+            return Err(refuse_disabled_kind(conn_type, "gcp_pubsub"));
         }
         #[cfg(not(feature = "bigquery"))]
         "bigquery" | "bq" | "gbq" => {
             // Feature disabled: fail closed with no sink; the
             // checked wrapper names the missing feature.
+            return Err(refuse_disabled_kind(conn_type, "bigquery"));
         }
         #[cfg(feature = "bigquery")]
         "bigquery" | "bq" | "gbq" => {
@@ -4668,14 +4736,16 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms,
                 timeout_ms,
             };
-            if let Ok(transport) = broker_connectors_enterprise::bigquery::SdkBigQueryTransport::new(
-                &config,
-                reqwest::Client::new(),
+            if let Some(transport) = record_sink_error!(
+                broker_connectors_enterprise::bigquery::SdkBigQueryTransport::new(
+                    &config,
+                    reqwest::Client::new(),
+                )
             ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::bigquery::BigQuerySink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4688,6 +4758,7 @@ pub(crate) async fn register_live_sink(
         "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
             // Feature disabled: fail closed with no sink; the
             // checked wrapper names the missing feature.
+            return Err(refuse_disabled_kind(conn_type, "gcp_iot"));
         }
         #[cfg(feature = "gcp_iot")]
         "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
@@ -4709,7 +4780,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(cloud_region) = body
                 .get("cloud_region")
@@ -4717,7 +4788,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(registry_id) = body
                 .get("registry_id")
@@ -4725,7 +4796,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(device_id) = body
                 .get("device_id")
@@ -4733,7 +4804,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(private_key_pem) = body
                 .get("private_key_pem")
@@ -4741,7 +4812,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -4779,13 +4850,13 @@ pub(crate) async fn register_live_sink(
                 timeout_ms,
                 ca_bundle_pem,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::gcp_iot::TlsGcpIotTransport::new(&config)
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::gcp_iot::GcpIotSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4808,7 +4879,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(token) = body
                 .get("token")
@@ -4816,21 +4887,21 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(catalog) = body
                 .get("catalog")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(schema) = body
                 .get("schema")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(table) = body
                 .get("table")
@@ -4838,7 +4909,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -4862,16 +4933,18 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::databricks::HttpDatabricksTransport::new(
                     &config,
                     reqwest::Client::new(),
                 )
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
-                    broker_connectors_enterprise::databricks::DatabricksSink::new(config, transport)
-                {
+                if let Some(sink) = record_sink_error!(
+                    broker_connectors_enterprise::databricks::DatabricksSink::new(
+                        config, transport
+                    )
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4892,7 +4965,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(user) = body
                 .get("user")
@@ -4900,21 +4973,21 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(database) = body
                 .get("database")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(schema) = body
                 .get("schema")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(table) = body
                 .get("table")
@@ -4922,7 +4995,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let endpoint = body
                 .get("endpoint")
@@ -4935,7 +5008,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -4961,16 +5034,16 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::snowflake::HttpSnowflakeTransport::new(
                     &config,
                     reqwest::Client::new(),
                 )
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
+                if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::snowflake::SnowflakeSink::new(config, transport)
-                {
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -4990,7 +5063,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             // Fail closed (S1-01): instance, table and both access keys are
             // operator-supplied; the previous test names and keys are removed.
@@ -5000,7 +5073,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(table_name) = body
                 .get("table_name")
@@ -5008,7 +5081,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(access_key_id) = body
                 .get("access_key_id")
@@ -5016,7 +5089,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(access_key_secret) = body
                 .get("access_key_secret")
@@ -5024,7 +5097,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -5057,16 +5130,18 @@ pub(crate) async fn register_live_sink(
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::tablestore::HttpTablestoreTransport::new(
                     &config,
                     reqwest::Client::new(),
                 )
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) =
-                    broker_connectors_enterprise::tablestore::TablestoreSink::new(config, transport)
-                {
+                if let Some(sink) = record_sink_error!(
+                    broker_connectors_enterprise::tablestore::TablestoreSink::new(
+                        config, transport
+                    )
+                ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
                     engine
@@ -5087,7 +5162,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             // Fail closed (S1-01): OCIDs, fingerprint and key are
             // operator-supplied; the previous test OCIDs, test fingerprint
@@ -5097,35 +5172,35 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(stream_id) = body
                 .get("stream_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(tenancy_ocid) = body
                 .get("tenancy_ocid")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(user_ocid) = body
                 .get("user_ocid")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(fingerprint) = body
                 .get("fingerprint")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let Some(private_key_pem) = body
                 .get("private_key_pem")
@@ -5133,7 +5208,7 @@ pub(crate) async fn register_live_sink(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.trim().is_empty())
             else {
-                return;
+                return Ok(());
             };
             let timeout_ms = body
                 .get("timeout_ms")
@@ -5164,15 +5239,17 @@ pub(crate) async fn register_live_sink(
                 max_backoff_ms: Some(2_000),
                 timeout_ms,
             };
-            if let Ok(transport) =
+            if let Some(transport) = record_sink_error!(
                 broker_connectors_enterprise::oci_streaming::HttpOciStreamingTransport::new(
                     &config,
                     reqwest::Client::new(),
                 )
-            {
+            ) {
                 let transport = Arc::new(transport);
-                if let Ok(sink) = broker_connectors_enterprise::oci_streaming::OciStreamingSink::new(
-                    config, transport,
+                if let Some(sink) = record_sink_error!(
+                    broker_connectors_enterprise::oci_streaming::OciStreamingSink::new(
+                        config, transport,
+                    )
                 ) {
                     let sink = Arc::new(sink);
                     engine.connectors().register(name, sink.clone());
@@ -5185,6 +5262,12 @@ pub(crate) async fn register_live_sink(
         }
         _ => {}
     }
+    // A recorded build failure refuses with the sink text. Nothing
+    // registered above when it is set, so the caller stores nothing.
+    if let Some(error) = build_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// `POST /api/v5/connectors` (C07-02): validate the body against the
@@ -5311,16 +5394,17 @@ pub async fn create_connector(
     // reachability probe. A kind with no execution path registers
     // nothing, so it honestly reads back `disconnected` (stored config
     // first, no claimed execution).
-    // A kind whose Cargo feature is off is refused, and the error names
-    // the feature. Nothing is stored for it.
-    if let Err(feature_error) =
+    // A sink that fails to build is refused with the documented error
+    // shape carrying the sink text, and nothing is stored. A valid sink
+    // whose server is down now still builds, so it stores as before.
+    if let Err(register_error) =
         try_register_live_sink(&state.engine, &conn_type, &name, &body).await
     {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "code": "BAD_REQUEST",
-                "message": feature_error,
+                "message": register_error,
             })),
         )
             .into_response();
@@ -5500,14 +5584,25 @@ pub async fn update_connector(
             state.engine.connectors().unregister(&registered);
         }
     }
-    if let Err(feature_error) =
+    if let Err(register_error) =
         try_register_live_sink(&state.engine, &conn_type, &bare, &body).await
     {
+        // The failed replace stores nothing: put the previous live sink
+        // back so the engine still matches the stored entry.
+        let old_kind = stored
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !old_kind.is_empty() {
+            let _ = try_register_live_sink(&state.engine, &old_kind, &bare, &stored).await;
+        }
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "code": "BAD_REQUEST",
-                "message": feature_error,
+                "message": register_error,
             })),
         )
             .into_response();
