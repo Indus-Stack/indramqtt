@@ -3146,6 +3146,15 @@ pub(crate) async fn register_live_sink(
                 .or_else(|| body.get("token"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            // Field names follow the reference specification.
+            let username = body
+                .get("username")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let password = body
+                .get("password")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -3157,6 +3166,8 @@ pub(crate) async fn register_live_sink(
                 database,
                 table,
                 auth_token,
+                username,
+                password,
                 timestamp_field: Some("timestamp".to_string()),
                 tag_columns: vec!["sensor".to_string(), "client_id".to_string()],
                 field_columns: vec!["temperature".to_string()],

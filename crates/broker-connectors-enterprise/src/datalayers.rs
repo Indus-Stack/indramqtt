@@ -1,20 +1,22 @@
 //! Datalayers industrial time-series sink (INDRA-177).
 //!
 //! Industrial edge-to-cloud time-series database sink with batched records,
-//! Bearer token authentication, tag/field segregation, microsecond timestamps,
-//! and HTTP status code classification.
+//! Bearer token or Basic authentication, tag/field segregation,
+//! microsecond timestamps, and HTTP status code classification.
 //!
 //! The write path runs on the maintained `reqwest` driver (the vendor
-//! publishes no maintained Rust driver): `POST {endpoint}/api/v1/write?db={database}`
-//! with `Content-Type: application/json`, an optional
-//! `Authorization: Bearer <token>` header, and a JSON body
-//! `{table, records: [{time, tags, fields}]}` where `time` is
+//! publishes no maintained Rust driver): `POST {endpoint}/write?db={database}&precision=us`
+//! with `Content-Type: text/plain`, an optional
+//! `Authorization: Bearer <token>` or `Authorization: Basic <base64>`
+//! header, and an Influx line protocol body
+//! `{table},<tags> <fields> <time>` where `time` is
 //! microseconds since the Unix epoch. Database management and
 //! query-back for qualification run on the same driver against
-//! `POST {endpoint}/api/v1/sql[?db={database}]` with the same Bearer
+//! `POST {endpoint}/api/v1/sql[?db={database}]` with the same header
 //! (see the open-dialect notes below where the documented dialect is open).
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -42,7 +44,7 @@ fn default_buffer_capacity_10k() -> Option<usize> {
 }
 
 /// Configuration for the Datalayers industrial time-series sink.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatalayersConfig {
     /// Datalayers REST endpoint (e.g. `http://datalayers-node:8360`).
     pub endpoint: String,
@@ -53,6 +55,15 @@ pub struct DatalayersConfig {
     /// Optional Bearer token for authorization.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Optional username for Basic authentication.
+    /// Use the exact field name of the reference specification.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional password for Basic authentication.
+    /// Use the exact field name of the reference specification.
+    /// Never log this value. Never include it in an error.
+    #[serde(default)]
+    pub password: Option<String>,
     /// Optional field source for timestamp (defaults to current wall-clock).
     #[serde(default)]
     pub timestamp_field: Option<String>,
@@ -80,6 +91,29 @@ pub struct DatalayersConfig {
     pub timeout_ms: Option<u64>,
 }
 
+impl std::fmt::Debug for DatalayersConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Show names, not secrets. Redact the token and the password.
+        f.debug_struct("DatalayersConfig")
+            .field("endpoint", &self.endpoint)
+            .field("database", &self.database)
+            .field("table", &self.table)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .field("timestamp_field", &self.timestamp_field)
+            .field("tag_columns", &self.tag_columns)
+            .field("field_columns", &self.field_columns)
+            .field("batch_size", &self.batch_size)
+            .field("buffer_capacity", &self.buffer_capacity)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
+}
+
 impl DatalayersConfig {
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
@@ -101,14 +135,46 @@ impl DatalayersConfig {
                 "datalayers table cannot be empty".into(),
             ));
         }
+        // TODO(parity): the reference specification does not state
+        // whether username without password (or the reverse) is valid;
+        // this code refuses a half-set Basic pair and keeps moving.
+        let has_bearer = self
+            .auth_token
+            .as_ref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let has_user = self.username.as_ref().is_some_and(|u| !u.trim().is_empty());
+        let has_pass = self.password.as_ref().is_some_and(|p| !p.is_empty());
+        if has_bearer && (has_user || has_pass) {
+            return Err(ConnectorError::Dispatch(
+                "datalayers auth modes conflict: set either auth_token or username/password, not both"
+                    .into(),
+            ));
+        }
+        if has_user != has_pass {
+            return Err(ConnectorError::Dispatch(
+                "datalayers basic auth needs both username and password".into(),
+            ));
+        }
         Ok(())
     }
 
     pub fn auth_header_value(&self) -> Option<String> {
-        self.auth_token
+        let bearer = self
+            .auth_token
             .as_ref()
             .map(|t| format!("Bearer {}", t.trim()))
-            .filter(|h| h.len() > "Bearer ".len())
+            .filter(|h| h.len() > "Bearer ".len());
+        if bearer.is_some() {
+            return bearer;
+        }
+        match (&self.username, &self.password) {
+            (Some(user), Some(pass)) if !user.trim().is_empty() && !pass.is_empty() => {
+                let raw = format!("{user}:{pass}");
+                let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+                Some(format!("Basic {encoded}"))
+            }
+            _ => None,
+        }
     }
 
     pub fn effective_batch_size(&self) -> usize {
@@ -122,10 +188,11 @@ impl DatalayersConfig {
         self.buffer_capacity.unwrap_or(10_000).max(1)
     }
 
-    /// Write URL: `{endpoint}/api/v1/write?db={database}`.
+    /// Write URL: `{endpoint}/write?db={database}&precision=us`.
+    /// Precision `us` matches the microsecond timestamps below.
     pub fn write_url(&self) -> String {
         format!(
-            "{}/api/v1/write?db={}",
+            "{}/write?db={}&precision=us",
             self.endpoint.trim_end_matches('/'),
             self.database
         )
@@ -154,11 +221,92 @@ pub struct DatalayersRecord {
     pub fields: HashMap<String, serde_json::Value>,
 }
 
-/// Request body sent to Datalayers `POST /api/v1/write?db={database}`.
+/// Request body sent to Datalayers `POST /write?db={database}&precision=us`.
+/// The struct carries the batch. The transport renders it as line protocol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatalayersWriteRequest {
     pub table: String,
     pub records: Vec<DatalayersRecord>,
+}
+
+/// Escape a measurement name. Escapes commas and spaces.
+fn escape_measurement(name: &str) -> String {
+    name.replace(',', "\\,").replace(' ', "\\ ")
+}
+
+/// Escape a tag key, tag value, or field key. Escapes commas, equals, spaces.
+fn escape_tag_part(part: &str) -> String {
+    part.replace(',', "\\,")
+        .replace('=', "\\=")
+        .replace(' ', "\\ ")
+}
+
+/// Format one field value. Returns `None` for null or empty.
+fn format_field_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+        serde_json::Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                Some(format!("{n}i"))
+            } else {
+                Some(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            Some(format!("\"{escaped}\""))
+        }
+        other => {
+            let raw = serde_json::to_string(other).unwrap_or_default();
+            let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+            Some(format!("\"{escaped}\""))
+        }
+    }
+}
+
+/// Render one record as one line protocol line. Returns `None` without fields.
+fn format_record_line(table: &str, record: &DatalayersRecord) -> Option<String> {
+    // Sort keys. The output stays stable across runs.
+    let mut tags: Vec<(&String, &String)> = record.tags.iter().collect();
+    tags.sort_by(|a, b| a.0.cmp(b.0));
+    let mut fields: Vec<(&String, &serde_json::Value)> = record.fields.iter().collect();
+    fields.sort_by(|a, b| a.0.cmp(b.0));
+    let mut parts: Vec<String> = Vec::new();
+    for (k, v) in &fields {
+        if let Some(formatted) = format_field_value(v) {
+            parts.push(format!("{}={}", escape_tag_part(k), formatted));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut line = escape_measurement(table);
+    for (k, v) in tags {
+        line.push(',');
+        line.push_str(&escape_tag_part(k));
+        line.push('=');
+        line.push_str(&escape_tag_part(v));
+    }
+    line.push(' ');
+    line.push_str(&parts.join(","));
+    line.push(' ');
+    line.push_str(&record.time.to_string());
+    Some(line)
+}
+
+/// Render a batch as line protocol. Skips records without fields.
+pub fn write_request_to_lines(request: &DatalayersWriteRequest) -> String {
+    request
+        .records
+        .iter()
+        .filter_map(|r| format_record_line(&request.table, r))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Extract microseconds timestamp from payload or fallback to wall-clock.
@@ -305,8 +453,8 @@ impl HttpDatalayersTransport {
     }
 
     /// Terminal-vs-retryable mapping. 429 and 5xx retry in-loop;
-    /// 401/403 are terminal (fail closed: a bad Bearer is never
-    /// retried with the same token); every other non-2xx is terminal
+    /// 401/403 are terminal (fail closed: a bad credential is never
+    /// retried with the same value); every other non-2xx is terminal
     /// (schema/table mismatches must not loop).
     fn classify(status: reqwest::StatusCode, body_text: &str) -> Result<()> {
         if status.is_success() {
@@ -317,7 +465,7 @@ impl HttpDatalayersTransport {
             )))
         } else if status.as_u16() == 401 || status.as_u16() == 403 {
             Err(ConnectorError::Dispatch(format!(
-                "datalayers unauthorized {status}: failing closed, rotate the Bearer: {body_text}"
+                "datalayers unauthorized {status}: failing closed, rotate the credential: {body_text}"
             )))
         } else {
             Err(ConnectorError::Dispatch(format!(
@@ -335,12 +483,20 @@ impl HttpDatalayersTransport {
     }
 
     async fn post_write(&self, request: &DatalayersWriteRequest) -> Result<()> {
+        // Render the batch as line protocol. An empty batch fails
+        // closed without a request.
+        let body = write_request_to_lines(request);
+        if body.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "datalayers write batch has no fields".into(),
+            ));
+        }
         let resp = self
             .authed(
                 self.client
                     .post(&self.write_url)
-                    .header(CONTENT_TYPE, "application/json")
-                    .json(request),
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(body),
             )
             .send()
             .await
@@ -670,6 +826,25 @@ mod tests {
             database: "factory_db".to_string(),
             table: "machinery".to_string(),
             auth_token: Some("dl-secret-token-12345".to_string()),
+            username: None,
+            password: None,
+            timestamp_field: Some("custom_ts".to_string()),
+            tag_columns: vec!["line".to_string(), "machine".to_string()],
+            field_columns: vec!["pressure".to_string(), "temperature".to_string()],
+            batch_size: Some(1),
+            buffer_capacity: None,
+            timeout_ms: None,
+        }
+    }
+
+    fn basic_config() -> DatalayersConfig {
+        DatalayersConfig {
+            endpoint: "http://datalayers-node:8360".to_string(),
+            database: "factory_db".to_string(),
+            table: "machinery".to_string(),
+            auth_token: None,
+            username: Some("admin".to_string()),
+            password: Some("public".to_string()),
             timestamp_field: Some("custom_ts".to_string()),
             tag_columns: vec!["line".to_string(), "machine".to_string()],
             field_columns: vec!["pressure".to_string(), "temperature".to_string()],
@@ -687,6 +862,71 @@ mod tests {
             cfg.auth_header_value(),
             Some("Bearer dl-secret-token-12345".to_string())
         );
+    }
+
+    #[test]
+    fn test_basic_auth_header() {
+        // Basic mode sends `Basic base64(user:pass)`.
+        let cfg = basic_config();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(
+            cfg.auth_header_value(),
+            Some("Basic YWRtaW46cHVibGlj".to_string())
+        );
+    }
+
+    #[test]
+    fn test_both_auth_modes_refused() {
+        // Bearer plus Basic at once is a config error, not a silent pick.
+        let mut cfg = sample_config();
+        cfg.username = Some("admin".to_string());
+        cfg.password = Some("public".to_string());
+        let err = cfg.validate().expect_err("both modes must fail");
+        assert!(err.to_string().contains("not both"));
+        assert!(DatalayersSink::new(cfg, Arc::new(MockDatalayersTransport::new())).is_err());
+    }
+
+    #[test]
+    fn test_half_basic_pair_refused() {
+        // A username without a password (or the reverse) fails closed.
+        let mut cfg = basic_config();
+        cfg.password = None;
+        assert!(cfg.validate().is_err());
+        cfg = basic_config();
+        cfg.username = None;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_password_absent_from_debug_and_errors() {
+        // The secret never shows in Debug output or error text.
+        let cfg = basic_config();
+        let shown = format!("{:?}", cfg);
+        assert!(shown.contains("admin"), "username stays visible: {shown}");
+        assert!(
+            !shown.contains("public"),
+            "password leaks in Debug: {shown}"
+        );
+        assert!(shown.contains("[redacted]"));
+        let both = DatalayersConfig {
+            auth_token: Some("tok-9z9z-secret".to_string()),
+            ..basic_config()
+        };
+        let err = both.validate().expect_err("both modes fail");
+        let text = err.to_string();
+        assert!(!text.contains("public"), "password leaks in error: {text}");
+        assert!(
+            !text.contains("tok-9z9z-secret"),
+            "token leaks in error: {text}"
+        );
+        let header = cfg.auth_header_value().expect("basic header");
+        let bad = DatalayersConfig {
+            password: Some("wrong-pass-xyz".to_string()),
+            ..basic_config()
+        };
+        let bad_shown = format!("{:?}", bad);
+        assert!(!bad_shown.contains("wrong-pass-xyz"));
+        let _ = header;
     }
 
     #[test]
@@ -738,7 +978,7 @@ mod tests {
         assert_eq!(cfg.effective_batch_size(), 1);
         assert_eq!(
             cfg.write_url(),
-            "http://datalayers-node:8360/api/v1/write?db=factory_db"
+            "http://datalayers-node:8360/write?db=factory_db&precision=us"
         );
         assert_eq!(
             cfg.sql_url(true),
@@ -934,6 +1174,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeDatalayers {
         good_bearer: StdMutex<String>,
+        good_basic: StdMutex<String>,
         auth_seen: StdMutex<Vec<String>>,
         query_seen: StdMutex<String>,
         bodies: StdMutex<Vec<String>>,
@@ -956,7 +1197,15 @@ mod tests {
             );
             *state.query_seen.lock().unwrap() = uri.query().unwrap_or_default().to_string();
             state.bodies.lock().unwrap().push(body);
-            let good = state.good_bearer.lock().unwrap().clone();
+            let good_bearer = state.good_bearer.lock().unwrap().clone();
+            let good_basic = state.good_basic.lock().unwrap().clone();
+            // The fake verifies the credential it receives.
+            // It accepts only the exact expected header value.
+            let expected = if !good_bearer.is_empty() {
+                good_bearer
+            } else {
+                good_basic
+            };
             let got = state
                 .auth_seen
                 .lock()
@@ -964,7 +1213,7 @@ mod tests {
                 .last()
                 .cloned()
                 .unwrap_or_default();
-            if !good.is_empty() && got != good {
+            if !expected.is_empty() && got != expected {
                 return (
                     StatusCode::UNAUTHORIZED,
                     r#"{"error":"unauthorized"}"#.to_string(),
@@ -981,7 +1230,7 @@ mod tests {
             }
         }
         let app = Router::new()
-            .route("/api/v1/write", post(write_handler))
+            .route("/write", post(write_handler))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -997,6 +1246,25 @@ mod tests {
             database: "qual_db".to_string(),
             table: "machinery".to_string(),
             auth_token: token.map(str::to_string),
+            username: None,
+            password: None,
+            timestamp_field: Some("custom_ts".to_string()),
+            tag_columns: vec!["line".to_string()],
+            field_columns: vec!["pressure".to_string()],
+            batch_size: Some(50),
+            buffer_capacity: None,
+            timeout_ms: Some(5_000),
+        }
+    }
+
+    fn fake_basic_config(endpoint: &str, user: &str, pass: &str) -> DatalayersConfig {
+        DatalayersConfig {
+            endpoint: endpoint.to_string(),
+            database: "qual_db".to_string(),
+            table: "machinery".to_string(),
+            auth_token: None,
+            username: Some(user.to_string()),
+            password: Some(pass.to_string()),
             timestamp_field: Some("custom_ts".to_string()),
             tag_columns: vec!["line".to_string()],
             field_columns: vec!["pressure".to_string()],
@@ -1024,6 +1292,7 @@ mod tests {
             reqwest::Client::new(),
         ));
         assert!(transport.write_url_str().contains("db=qual_db"));
+        assert!(transport.write_url_str().contains("precision=us"));
         let sink = Arc::new(DatalayersSink::new(config, transport).expect("fake sink"));
         assert_eq!(sink.kind(), "datalayers");
         let manager = ConnectorManager::new();
@@ -1052,23 +1321,87 @@ mod tests {
             "write must select the database: {}",
             fake.query_seen.lock().unwrap()
         );
+        assert!(
+            fake.query_seen.lock().unwrap().contains("precision=us"),
+            "write must use microsecond precision: {}",
+            fake.query_seen.lock().unwrap()
+        );
         let bodies = fake.bodies.lock().unwrap();
         assert_eq!(bodies.len(), 1);
-        let doc: serde_json::Value = serde_json::from_str(&bodies[0]).expect("json body");
-        assert_eq!(doc.get("table").and_then(|v| v.as_str()), Some("machinery"));
-        let rec = &doc
-            .get("records")
-            .and_then(|v| v.as_array())
-            .expect("records")[0];
-        assert_eq!(
-            rec.get("time").and_then(|v| v.as_i64()),
-            Some(1726000000000000)
+        let line = bodies[0].trim();
+        assert!(
+            line.starts_with("machinery,"),
+            "line must carry the table: {line}"
         );
-        assert_eq!(
-            rec.get("tags")
-                .and_then(|v| v.get("line"))
-                .and_then(|v| v.as_str()),
-            Some("A1")
+        assert!(line.contains("line=A1"), "line must carry the tag: {line}");
+        assert!(
+            line.contains("pressure=9.5"),
+            "line must carry the field: {line}"
+        );
+        assert!(
+            line.ends_with(" 1726000000000000"),
+            "line must carry microsecond time: {line}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_write_posts_basic_and_json_through_manager() {
+        // Broker path (publish, deliver): ConnectorManager::send ->
+        // Sink::send -> HttpDatalayersTransport POST with Basic auth
+        // and microsecond timestamps against the loopback server.
+        use broker_connectors::ConnectorManager;
+        let probe = fake_basic_config("http://127.0.0.1:9", "qa-user", "s3cret-basic");
+        let expected = probe.auth_header_value().expect("basic header");
+        assert!(expected.starts_with("Basic "));
+        let fake = Arc::new(FakeDatalayers {
+            good_basic: StdMutex::new(expected.clone()),
+            status: StdMutex::new(200),
+            ..Default::default()
+        });
+        let (endpoint, server) = serve_fake(fake.clone()).await;
+        let config = fake_basic_config(&endpoint, "qa-user", "s3cret-basic");
+        assert_eq!(config.auth_header_value(), Some(expected.clone()));
+        let transport = Arc::new(HttpDatalayersTransport::with_client(
+            &config,
+            reqwest::Client::new(),
+        ));
+        assert!(transport.write_url_str().contains("precision=us"));
+        let sink = Arc::new(DatalayersSink::new(config, transport).expect("fake sink"));
+        assert_eq!(sink.kind(), "datalayers");
+        let manager = ConnectorManager::new();
+        manager.register("dl-basic", sink.clone());
+
+        let topic = Topic::new("machinery/lineA").unwrap();
+        manager
+            .send(
+                "dl-basic",
+                &topic,
+                &Bytes::from_static(br#"{"custom_ts": 1726000000, "line": "A1", "pressure": 9.5}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("broker send buffers");
+        sink.flush().await.expect("loopback flush");
+
+        assert_eq!(sink.sent_count(), 1);
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(fake.auth_seen.lock().unwrap().as_slice(), &[expected]);
+        let bodies = fake.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let line = bodies[0].trim();
+        assert!(
+            line.starts_with("machinery,"),
+            "line must carry the table: {line}"
+        );
+        assert!(line.contains("line=A1"), "line must carry the tag: {line}");
+        assert!(
+            line.contains("pressure=9.5"),
+            "line must carry the field: {line}"
+        );
+        assert!(
+            line.ends_with(" 1726000000000000"),
+            "line must carry microsecond time: {line}"
         );
         server.abort();
     }
@@ -1107,6 +1440,43 @@ mod tests {
             err.to_string().contains("unauthorized"),
             "auth failure must surface, got: {err}"
         );
+        assert_eq!(sink.buffered_rows(), 1);
+        assert_eq!(sink.sent_count(), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_401_basic_fails_closed_without_password_leak() {
+        // Wrong Basic password fails closed as Dispatch.
+        // The error text never carries the password.
+        let fake = Arc::new(FakeDatalayers {
+            good_basic: StdMutex::new("Basic YWRtaW46cmlnaHQ=".to_string()),
+            status: StdMutex::new(200),
+            ..Default::default()
+        });
+        let (endpoint, server) = serve_fake(fake.clone()).await;
+        let mut config = fake_basic_config(&endpoint, "admin", "wrong-secret-xyz");
+        config.batch_size = Some(10);
+        let transport = Arc::new(HttpDatalayersTransport::with_client(
+            &config,
+            reqwest::Client::new(),
+        ));
+        let sink = Arc::new(DatalayersSink::new(config, transport).expect("fake sink"));
+        let topic = Topic::new("machinery/lineA").unwrap();
+        sink.send(
+            &topic,
+            &Bytes::from_static(br#"{"pressure": 1.0}"#),
+            QoS::AtLeastOnce,
+        )
+        .await
+        .expect("buffer");
+        let err = sink.flush().await.expect_err("401 must fail");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "401 must be terminal, got {err:?}"
+        );
+        let text = err.to_string();
+        assert!(!text.contains("wrong-secret-xyz"), "password leaks: {text}");
         assert_eq!(sink.buffered_rows(), 1);
         assert_eq!(sink.sent_count(), 0);
         server.abort();
@@ -1215,15 +1585,16 @@ mod tests {
     ///
     /// Run with e.g.:
     /// `DATALAYERS_ENDPOINT=http://127.0.0.1:8361 DATALAYERS_DATABASE=qual_b313 \
-    ///  DATALAYERS_TABLE=qual_points DATALAYERS_TOKEN=secret \
+    ///  DATALAYERS_TABLE=qual_points DATALAYERS_USERNAME=admin DATALAYERS_PASSWORD=public \
     ///  cargo test -p broker-connectors-enterprise --lib datalayers::tests::test_qualify_write_path -- --ignored --nocapture`
     ///
     /// Creates the database, streams 1000 points through the broker
     /// ([`broker_connectors::ConnectorManager`] -> [`DatalayersSink`] on
-    /// [`HttpDatalayersTransport`], Bearer auth, microsecond
+    /// [`HttpDatalayersTransport`], Basic auth, microsecond
     /// timestamps), asserts `SELECT COUNT(*)` query-back equality,
-    /// proves a bad Bearer fails closed as a dispatch error, then
-    /// drops the table.
+    /// proves a bad password fails closed as a dispatch error, then
+    /// drops the table. Bearer mode stays covered by the loopback unit
+    /// test `test_http_write_posts_bearer_and_json_through_manager`.
     #[tokio::test]
     #[ignore = "needs a real server (see DATALAYERS_* env)"]
     async fn test_qualify_write_path() {
@@ -1236,15 +1607,20 @@ mod tests {
         let database = qual_env("DATALAYERS_DATABASE")
             .unwrap_or_else(|| format!("qual_b313_{}", now_millis()));
         let table = qual_env("DATALAYERS_TABLE").unwrap_or_else(|| "qual_points".to_string());
-        let token = qual_env("DATALAYERS_TOKEN").unwrap_or_else(|| {
-            panic!("DATALAYERS_TOKEN must be set for qualification; failing closed")
+        let username = qual_env("DATALAYERS_USERNAME").unwrap_or_else(|| {
+            panic!("DATALAYERS_USERNAME must be set for qualification; failing closed")
+        });
+        let password = qual_env("DATALAYERS_PASSWORD").unwrap_or_else(|| {
+            panic!("DATALAYERS_PASSWORD must be set for qualification; failing closed")
         });
 
         let config = DatalayersConfig {
             endpoint: endpoint.clone(),
             database: database.clone(),
             table: table.clone(),
-            auth_token: Some(token.clone()),
+            auth_token: None,
+            username: Some(username.clone()),
+            password: Some(password.clone()),
             timestamp_field: Some("ts".to_string()),
             tag_columns: vec!["line".to_string()],
             field_columns: vec!["pressure".to_string(), "seq".to_string()],
@@ -1322,9 +1698,9 @@ mod tests {
         );
         eprintln!("qual rows asserted: count=1000 table={table}");
 
-        // Bad Bearer fails closed and terminal (rows kept).
+        // Bad password fails closed and terminal (rows kept).
         let mut bad_config = config.clone();
-        bad_config.auth_token = Some("qual-bad-token".to_string());
+        bad_config.password = Some("qual-bad-password".to_string());
         let bad_transport = Arc::new(HttpDatalayersTransport::with_client(
             &bad_config,
             reqwest::Client::new(),
@@ -1339,24 +1715,13 @@ mod tests {
             )
             .await
             .expect("qual bad buffer");
-        // Only assert the auth failure when the server enforces auth;
-        // open servers answer 200 without a valid Bearer.
-        // TODO(parity): whether a default server requires a Bearer is
-        // open; the fail-closed branch is asserted, the open branch
-        // is logged and still exercises the dispatch path shape.
-        match bad_sink.flush().await {
-            Ok(()) => {
-                eprintln!("qual auth: server answered 200 to a bad Bearer (open server, tolerated)")
-            }
-            Err(e) => {
-                assert!(
-                    matches!(e, ConnectorError::Dispatch(_)),
-                    "bad Bearer must be terminal, got {e:?}"
-                );
-                assert_eq!(bad_sink.buffered_rows(), 1);
-                eprintln!("qual auth failure asserted: bad Bearer is a dispatch error");
-            }
-        }
+        let err = bad_sink.flush().await.expect_err("bad password must fail");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "bad password must be terminal, got {err:?}"
+        );
+        assert_eq!(bad_sink.buffered_rows(), 1);
+        eprintln!("qual auth failure asserted: bad password is a dispatch error");
 
         // Cleanup: drop the table created for this run (best effort;
         // a failure is logged, not hidden).

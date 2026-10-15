@@ -10572,6 +10572,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     database: "telemetry".to_string(),
                     table: "metrics".to_string(),
                     auth_token: Some("secret-bearer-token".to_string()),
+                    username: None,
+                    password: None,
                     timestamp_field: None,
                     tag_columns: vec!["device_id".to_string()],
                     field_columns: vec!["temp".to_string()],
