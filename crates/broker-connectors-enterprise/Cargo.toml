@@ -25,11 +25,12 @@ base64 = { workspace = true }
 flate2 = { workspace = true }
 uuid = { workspace = true }
 jsonwebtoken = { workspace = true }
-rsa = { workspace = true }
+# RSA-SHA256 for the OCI Cavage signature (constant-time via the
+# workspace TLS provider). Licence: ISC AND Apache-2.0, both allowed.
+aws-lc-rs = { version = "1" }
 rand = { workspace = true }
 rustls = { version = "0.23.45" }
 tokio-rustls = { version = "0.26" }
-rustls-pemfile = { version = "1" }
 rustls-pki-types = { version = "1" }
 rustls-native-certs = { version = "0.8" }
 webpki-roots = { version = "0.25" }

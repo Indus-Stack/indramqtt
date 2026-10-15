@@ -12414,34 +12414,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
-        // Runtime-generated test RSA key (never stored, never deployed).
+        // Fixed test RSA key (never stored, never deployed).
         // Test-only fixture; no shipped path can reach it (`#[cfg(test)]` only).
-        // `rsa` 0.9 expects `rand_core` 0.6 while the workspace uses `rand`
-        // 0.10: bridge the two with a thin adapter over the workspace RNG
-        // (a CSPRNG, so marking it `CryptoRng` is sound).
-        struct CompatRng(rand::rngs::ThreadRng);
-        impl rsa::rand_core::RngCore for CompatRng {
-            fn next_u32(&mut self) -> u32 {
-                rand::Rng::next_u32(&mut self.0)
-            }
-            fn next_u64(&mut self) -> u64 {
-                rand::Rng::next_u64(&mut self.0)
-            }
-            fn fill_bytes(&mut self, dest: &mut [u8]) {
-                rand::Rng::fill_bytes(&mut self.0, dest)
-            }
-            fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
-                rand::Rng::fill_bytes(&mut self.0, dest);
-                Ok(())
-            }
-        }
-        impl rsa::rand_core::CryptoRng for CompatRng {}
-        let mut rng = CompatRng(rand::rng());
-        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
-        let test_pem =
-            rsa::pkcs8::EncodePrivateKey::to_pkcs8_pem(&private_key, rsa::pkcs8::LineEnding::LF)
-                .expect("encode test key")
-                .to_string();
+        let test_pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEArN5HvmgO5xgYLzTqq5mIW+ZFEM20TFz5C0bC0hP3mR13f9od\n7PiABrYWbLIwfWftR9+riLY5MOUZiZFioRdAsMBjtNy+E0/wfU/VwN1uqaFi9ww6\nSc2hmqvnDcdnD9H55Zu+2QmhSjD0nLNJczC2ceqYM4Q0nQw4EqbxHkcZ+/0p9uI8\nPFy90G0wSTwBErthZYe6xE5DIkzRThFmwm0l2PPt30tIVP8UssxTYYJggNlIYaMT\n79C3i0Nl7ImUyDexL029qAJfVOVc17Zrv9VACypuSA4QIAVarH0J3lJ3hi+ZHAJR\npiZ6Ex+Z+VPbtAmMczizpa3zt/NDhBj3NHWbVQIDAQABAoIBADbMc8O5Ktg4/Bmi\n1a02C1LOiSBNhRUb99qKQOHlcHy6KZJ+6zOehr8Z47vrNJHcawx4q+C3myOTzGee\njbxxKZGeOz0vKJXoplyi/SiZSSY+wad82dFhfRQR4Dmu9029i1Es8O/OLLHfGPu/\nnc4FKCCudDcIdsE+CVxoTVECywrk7S66ziHFLKZBIaB5pTbX0tsjyhvdrun7rYBN\n/iF97u0DeQi+odntQFtgdkOg1jiz4ffrA3JMjfO+CJGnRy5PmckQv/a5Md06Av4R\nTrsIcDK8G3GB4Phfkans1R5EFS0aQ8ergeiaPPAEeMCF/BXdTA6y+2em/dUOzLPX\nfasTsLUCgYEA4zU7lEFmfeEvuL6cKD+QKJn1rpwXCDSVsPxDE7N6omrwrELVg+7E\nsefWSvHSUk3xDtUmgywoUj+osUtkHMkMjCW4rLGsWKxRPEXSbUHKPP/prn7XA+oL\n70XsKAzG1jZiJMb5QxaEyDO7bnIBKOksh1THz81TL0XilkFrzb5Ewl8CgYEAwsY8\nMQMEXbzFE9t4D7pZ0SOFRBfaoRk7KxCjcve7Hlx5Dw/EC3GpfpKDj7MEQclZ7bfy\nwilOXUg0F564gL0MdeCN2EwsMjnGtVnOpEZt8kiBG36sF+CMTaXlwkveUiyg8m3c\nlxSp3swdJV4O56IYhr1HDch6cUru8/vU+2SmxssCgYEAjRkS3dfbiVLd6vHcUhZf\nNQefjgb7OqpFR7rxAPwVrWWR/rgmlp8h4YWjC7mvLlOe3uI53339sE4+OZQjIMku\nFJ6cWAqiiBLDBBYsPpN7v3QBr86vQowHS1l19c0xcfgl7MbwJtyGKzoNLOJ5m+lq\nMMTSrVbKUPIqa7tG8mc1lisCgYBlq9kLtIl47OrrHKslep8b3rDYBKOpaGRMbJkF\nkG9qv9apmA878g8J9S0bu9TDCnoY7uaXl7xCUUhv8/hXq1dvyNICUHDZnvMtAz4s\n3l7SFCrg0VS/+gUDG1A+BiB9QLKbGeIGM1Eg7edg9CJPo3uuCeunNDlGHllxnslk\nmPu91QKBgQCw2vZ5xhHbkCljOD9Hb+2L2y7ZbSgAnUgyE/vAkmAlZYreP+SyzrPe\n+kTnWrZuCvc0x+G7zv6mv3CIcZM0CHN1hdJa1Y/C3n1s06kJjgwGvgP9h6a/m9al\neIave8nupkT7zrwPbv9MJlWrtqplLBHSMG3dnsKd+iLdEEdhg8GK5Q==\n-----END RSA PRIVATE KEY-----".to_string();
 
         // gcp_iot without a key is 400 naming the field, and registers nothing.
         let (status, body) = server

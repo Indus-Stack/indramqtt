@@ -843,18 +843,17 @@ fn alloydb_extra_ca_pems(config: &AlloydbConfig) -> Result<Vec<String>> {
 }
 
 fn alloydb_certs_from_pem(pem: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let mut reader = std::io::BufReader::new(pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
-        .map_err(|e| ConnectorError::Dispatch(format!("alloydb CA bundle read failed: {e}")))?;
+    use rustls::pki_types::pem::PemObject as _;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| ConnectorError::Dispatch(format!("alloydb CA bundle read failed: {e}")))?;
     if certs.is_empty() {
         return Err(ConnectorError::Dispatch(
             "alloydb CA bundle has no certificate section".into(),
         ));
     }
-    Ok(certs
-        .into_iter()
-        .map(rustls::pki_types::CertificateDer::from)
-        .collect())
+    Ok(certs)
 }
 
 /// Root store for AlloyDB TLS: the OS system trust store plus the

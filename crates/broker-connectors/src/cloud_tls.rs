@@ -61,40 +61,31 @@ pub fn server_name_for_host(host: &str) -> Result<ServerName<'static>> {
 
 /// All certificates in one PEM document.
 pub fn certs_from_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = std::io::BufReader::new(pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
+    use rustls::pki_types::pem::PemObject as _;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| ConnectorError::Dispatch(format!("cloud PEM certificate read failed: {e}")))?;
     if certs.is_empty() {
         return Err(ConnectorError::Dispatch(
             "cloud PEM has no certificate section".to_string(),
         ));
     }
-    Ok(certs.into_iter().map(CertificateDer::from).collect())
+    Ok(certs)
 }
 
 /// First private key in one PEM document (PKCS#8, RSA or SEC1 EC).
 pub fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = std::io::BufReader::new(pem.as_bytes());
-    loop {
-        match rustls_pemfile::read_one(&mut reader)
-            .map_err(|e| ConnectorError::Dispatch(format!("cloud PEM key read failed: {e}")))?
-        {
-            None => break,
-            Some(rustls_pemfile::Item::PKCS8Key(key)) => {
-                return Ok(PrivateKeyDer::Pkcs8(key.into()));
-            }
-            Some(rustls_pemfile::Item::RSAKey(key)) => {
-                return Ok(PrivateKeyDer::Pkcs1(key.into()));
-            }
-            Some(rustls_pemfile::Item::ECKey(key)) => {
-                return Ok(PrivateKeyDer::Sec1(key.into()));
-            }
-            _ => {}
-        }
+    use rustls::pki_types::pem::PemObject as _;
+    let mut keys = PrivateKeyDer::pem_slice_iter(pem.as_bytes());
+    match keys.next() {
+        Some(Ok(key)) => Ok(key),
+        Some(Err(e)) => Err(ConnectorError::Dispatch(format!(
+            "cloud PEM key read failed: {e}"
+        ))),
+        None => Err(ConnectorError::Dispatch(
+            "cloud PEM has no private key section".to_string(),
+        )),
     }
-    Err(ConnectorError::Dispatch(
-        "cloud PEM has no private key section".to_string(),
-    ))
 }
 
 /// Root store: OS system trust store plus one optional extra bundle.

@@ -195,11 +195,15 @@ async fn is_file(path: &std::path::Path) -> bool {
 /// as an X.509 certificate. Fails when no block is present or a block
 /// does not parse.
 fn parse_certificates(pem: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    let blocks =
-        rustls_pemfile::certs(&mut &pem[..]).map_err(|_| "file is not valid PEM".to_string())?;
-    if blocks.is_empty() {
+    use rustls::pki_types::pem::PemObject as _;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "file is not valid PEM".to_string())?;
+    if certs.is_empty() {
         return Err("file holds no certificate".to_string());
     }
+    let blocks: Vec<Vec<u8>> = certs.into_iter().map(|c| c.to_vec()).collect();
     for block in &blocks {
         use x509_parser::prelude::{FromDer, X509Certificate};
         X509Certificate::from_der(block)
@@ -214,19 +218,13 @@ fn parse_certificates(pem: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 /// The broker refuses an encrypted key.
 /// The pair cannot be checked without the password.
 fn parse_private_key(pem: &[u8]) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
-    use rustls::pki_types::PrivateKeyDer;
-    let items =
-        rustls_pemfile::read_all(&mut &pem[..]).map_err(|_| "file is not valid PEM".to_string())?;
-    for item in items {
-        let key = match item {
-            rustls_pemfile::Item::PKCS8Key(der) => PrivateKeyDer::Pkcs8(der.into()),
-            rustls_pemfile::Item::RSAKey(der) => PrivateKeyDer::Pkcs1(der.into()),
-            rustls_pemfile::Item::ECKey(der) => PrivateKeyDer::Sec1(der.into()),
-            _ => continue,
-        };
-        return Ok(key);
+    use rustls::pki_types::pem::PemObject as _;
+    let mut keys = rustls::pki_types::PrivateKeyDer::pem_slice_iter(pem);
+    match keys.next() {
+        Some(Ok(key)) => Ok(key),
+        Some(Err(_)) => Err("file is not valid PEM".to_string()),
+        None => Err("file holds no private key".to_string()),
     }
-    Err("file holds no private key".to_string())
 }
 
 /// True when the private key matches the first certificate of the chain.

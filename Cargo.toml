@@ -54,8 +54,7 @@ pbkdf2 = "0.12"
 base64 = "0.22"
 flate2 = "1.1"
 uuid = { version = "1", features = ["v4"] }
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
-rsa = { version = "0.9", features = ["pem", "sha2"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 rand = "0.10"
 reqwest = { version = "0.12", features = ["json"] }
 axum = { version = "0.7", features = ["macros", "ws"] }

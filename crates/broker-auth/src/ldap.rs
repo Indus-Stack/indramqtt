@@ -597,6 +597,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn directory_yaml_parses_via_maintained_library() {
+        let text = "directory:\n  base_dn: dc=example,dc=com\nentries:\n  - dn: dc=example,dc=com\n    dc: example\n  - dn: uid=alice,ou=users,dc=example,dc=com\n    uid: alice\n    memberOf: cn=mqtt-users,ou=groups,dc=example,dc=com\n";
+        let value: serde_norway::Value =
+            serde_norway::from_str(text).expect("directory YAML parses");
+        assert_eq!(
+            value["directory"]["base_dn"].as_str(),
+            Some("dc=example,dc=com")
+        );
+        let entries = value["entries"].as_sequence().expect("entries list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1]["uid"].as_str(), Some("alice"));
+    }
+
     #[tokio::test]
     async fn empty_config_fails_closed_without_network() {
         let auth = LdapAuthenticator::new(LdapConfig::default());
@@ -635,10 +649,9 @@ mod tests {
             .is_err());
     }
 
-    // Integration tests against a real directory server (yamldap, a
-    // pure-Rust LDAP server speaking the real wire protocol, not a trait
-    // mock). Each test starts its own server on an ephemeral loopback
-    // port with a fixed YAML directory.
+    // Integration tests use the in-tree test directory server. It speaks
+    // the real LDAP wire protocol on loopback and checks each password.
+    // Each test starts its own server with a fixed YAML directory.
 
     #[cfg(test)]
     mod directory {
@@ -696,14 +709,18 @@ entries:
             std::fs::write(path, body).expect("write test directory YAML");
         }
 
-        async fn start_server() -> (yamldap::ServerHandle, String, tempfile::NamedTempFile) {
+        async fn start_server() -> (
+            crate::test_directory_server::ServerHandle,
+            String,
+            tempfile::NamedTempFile,
+        ) {
             let file = tempfile::NamedTempFile::new().expect("temp directory YAML");
             write_directory(file.path());
-            // Hold the file open: yamldap reads it at startup.
+            // Hold the file open: the server reads it at startup.
             let _ = std::io::stderr().flush();
-            let config = yamldap::Config::new(file.path())
+            let config = crate::test_directory_server::Config::new(file.path())
                 .with_bind_address("127.0.0.1:0".parse().expect("loopback"));
-            let server = yamldap::Server::new(config)
+            let server = crate::test_directory_server::Server::new(config)
                 .await
                 .expect("directory starts");
             let handle = server.start().await.expect("directory listens");

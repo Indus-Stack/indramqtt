@@ -35,7 +35,7 @@ use std::sync::Arc;
 /// Shared JWKS fixtures (B5-02): single-sourced in
 /// `crates/broker-auth/src/jwks_test_support.rs` (test-only in both crates),
 /// included here with `#[path]` so there is one copy of the
-/// RSA/`CompatRng`/base64/PEM/server logic without shipping test material
+/// RSA/base64/PEM/server logic without shipping test material
 /// in the production `broker-auth` library.
 #[cfg(test)]
 #[path = "../../broker-auth/src/jwks_test_support.rs"]
@@ -45,6 +45,13 @@ mod jwks_test_support;
 #[cfg(test)]
 mod link_harness;
 mod native;
+/// Test directory server (LDAP). Single-sourced in
+/// `crates/broker-auth/src/test_directory_server.rs` (test-only in both
+/// crates), included here with `#[path]` so there is one copy of the
+/// wire server without shipping test material in any library.
+#[cfg(test)]
+#[path = "../../broker-auth/src/test_directory_server.rs"]
+mod test_directory_server;
 #[cfg(test)]
 use link_harness::{handle_connection, handle_inbound_frame};
 #[cfg(test)]
@@ -18577,8 +18584,8 @@ mod tests {
 
     /// B2-01: directory authentication through the broker CONNECT path.
     ///
-    /// Starts a real directory server (yamldap, speaking the LDAP wire
-    /// protocol) and drives CONNECTs through `apply_bind`, the same entry
+    /// Starts the in-tree test directory server speaking the LDAP wire
+    /// protocol and drives CONNECTs through `apply_bind`, the same entry
     /// point the BrokerLink edge uses. Valid directory binds are accepted,
     /// wrong passwords, unknown users and wrong-group users are refused
     /// with 0x86, anonymous is refused with 0x87 while the directory is
@@ -18595,9 +18602,9 @@ mod tests {
         );
         let dir_file = tempfile::NamedTempFile::new().expect("temp directory YAML");
         std::fs::write(dir_file.path(), dir_yaml).expect("write directory YAML");
-        let directory_config = yamldap::Config::new(dir_file.path())
+        let directory_config = crate::test_directory_server::Config::new(dir_file.path())
             .with_bind_address("127.0.0.1:0".parse().expect("loopback"));
-        let directory = yamldap::Server::new(directory_config)
+        let directory = crate::test_directory_server::Server::new(directory_config)
             .await
             .expect("directory starts");
         let handle = directory.start().await.expect("directory listens");

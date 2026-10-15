@@ -68,7 +68,8 @@ toml = { workspace = true }
 # broker-auth and broker-connectors.
 rustls = { version = "0.23.45" }
 tokio-rustls = { version = "0.26" }
-rustls-pemfile = { version = "1" }
+# Enable std so PEM errors convert to Box. Keeps error texts.
+rustls-pki-types = { version = "1", features = ["std"] }
 # TLS PSK for the native PSK listener path only. The certificate
 # TLS listener keeps rustls. Versions already in the workspace
 # lock file. Licences: Apache-2.0 (openssl), MIT OR Apache-2.0
@@ -137,15 +138,11 @@ full = [
 
 [dev-dependencies]
 flate2 = { workspace = true }
-# TODO(parity): yamldap 0.2.0 is the latest release. It still pulls
-# unsafe-libyaml 0.2.11 through serde_yaml_ng 0.10.0. No fixed release
-# exists upstream. Keep the test server until it moves to a maintained
-# YAML library. The CTO decides the treatment of dev-only findings.
-yamldap = "0.2"
 tempfile = "3"
+serde = { workspace = true }
+serde_norway = "0.9"
 base64 = { workspace = true }
 rand = { workspace = true }
-rsa = { workspace = true }
 jsonwebtoken = { workspace = true }
 ring = "0.17"
 picky-krb = "0.12"

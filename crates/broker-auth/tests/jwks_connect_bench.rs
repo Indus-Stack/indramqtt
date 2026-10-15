@@ -28,7 +28,7 @@
 //! flat: one cached key and no per-iteration allocation beyond the check
 //! itself, so the measured cost is handling, not growth.
 //!
-//! The RSA keygen/HTTPS-server helpers are intentionally inline in this
+//! The RSA key/HTTPS-server helpers are intentionally inline in this
 //! one file (mirroring `crate::jwks_test_support`, which this file cannot
 //! import): the pipeline copies only this file onto the base commit for
 //! the before-numbers, so a shared import would not resolve there.
@@ -53,7 +53,7 @@ const BENCH_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDJTCCAg2gAwIBAgIUH
 #[cfg(feature = "jwks-bench")]
 const BENCH_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC12SKFlWmzrrth\ndtQWe3DC+OyiJaqtepmYe5KHbgqkO66+9/Mz5W5o7Q7nY4wmQMJtkTYZnPuZJANp\nU1F9gbbPgyFBr3nHj4A4EgDR/r3kWuHimWyb3M6cd1IKb9QPVSuQC9/AO7ELu90R\nyxW1cAfTbhjw7n6iDNyiuMPBMHYFMtXo8uc9/AOB2wiS8f3d0TYI1nvTV+zHJ6kZ\nr+EERTHQitguug7EZlFcSzp9WIZ1U7gx98Fn2oUcm9FA0R/VRexyqRE8DkmQhB9s\nvDjFoZxt/UcHxx7jaAPwa0whLdzMAOJPNxut3tJerxqXDvdNbcOAu+7HKnEMW/Mj\n7n3EuGotAgMBAAECggEAIsdSWOYIfzrtz2ggi+Qz3rYo26IEkIUgFw+bKJedJWfc\ntd1KACTjBuI/tXVOeopsJPReumtRmypOFLjAnxZN1kYn+B4NVmNVjGO1EHR98MyI\n4wOgx/Zk9XvEjwZwMjaBzFzZADTqWWomj56dmkPA22j1EC8svOVk1SItHiecisWp\noGSNJ/gDkAx0kK3c5YFobBAZZyP4nIIdpXBiAHypk4DT1cSIHEy4dFN9JVzLP/0k\nmD7jsovLvn4R8a6lSnMvescUoliHqE7kTOTd3OSLiXri+EjfvkS61zyjEB9DL+pH\ni4dVxWUJUBDnWUbNFqhYaJ03pXnXGkRbTlAJfe286QKBgQDdinXuCNHUTzQfDA5C\nkpnXndj1Sl+7f7aKSK1iLzf0Iy9X8AO9gamxNa68b3uY0dSnE1eICkOEqfcM64sI\nhV5wcR0tLER7fAIBkhzZZh3zlvYUn99WSb4QjR7oAUlLT0OSsoFidOaXXiTL1GQR\nndLplurj1mCZIu4KCpgFXNbhTwKBgQDSIiaWV71p0JLNUWjd592VnZdqCbztAsKR\n5ZjUrchJZb23F8aT6LrQFgceaNWvfdNd+AjB71la1y0xfIR9AOSLcprQDrPUBuT1\nYIrPYrunkrhZbvm3N1S3oGtESayzfYbJ6urh2i8JBXqC1s2SCdoFzmojmWHfBHEG\nFohZz4fFwwKBgQDYjEsRzVUtLe5ImsQllp8B/6zet0A0SnXnXXr9CiKrZOkWD+nY\nBzIToeGXF3G8wv4WAfYBZ+bveiOeYW6ZeaQCTM60JR0bhu9/EY9ZgVOtktYe+taX\nxaUfEJIxPXCjSGtIrWuDDbmII+Hby1O1VIuhAH/BDP+HMHl1Hz3RoBn6SQKBgErc\nh8q/72cnO2WSPz3vQO3weuT4GyqE9TRtC4mZb+VWLcRw3/oJy6QedOLMjnQ663Zq\nyxPsZXULe7pJlhnCm6liZu0Aj+hVnHQetNU1Y41LpAmYk7ZGLBRPPmfRp4k6iy6c\nVpmn1WHtZbv/MrV4dQfkhcOw/UEqn+l/VYxJdyFpAoGBAI+8qzjBnHSDUr3uDX7e\n21MBoYGPzGlYwom5zEhNM2xbHvZ6Dt+c5aB308q4Wq88At6eLFtFAaTJwNFEgz/3\n/yp8G6egdnUbScWzpG5qQQ4LiBjjzHrP7Y1LGWMBeDuaD74M2uByICuEyZmJUTTT\n2rpyA7NR3vcZpXi/ZeWghtZb\n-----END PRIVATE KEY-----\n";
 
-/// One RSA-2048 signing key minted at bench start (real RSA, real RS256
+/// One RSA-2048 signing key for the bench (fixed key, real RS256
 /// via `jsonwebtoken`; nothing is mocked).
 /// Tree-only (`jwks-bench`): the base commit has no JWKS types.
 #[cfg(feature = "jwks-bench")]
@@ -64,47 +64,35 @@ struct BenchKey {
     e_b64: String,
 }
 
+/// Fixed test RSA key (openssl-generated, never deployed).
+#[cfg(feature = "jwks-bench")]
+const BENCH_RSA_PKCS1_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEArN5HvmgO5xgYLzTqq5mIW+ZFEM20TFz5C0bC0hP3mR13f9od\n7PiABrYWbLIwfWftR9+riLY5MOUZiZFioRdAsMBjtNy+E0/wfU/VwN1uqaFi9ww6\nSc2hmqvnDcdnD9H55Zu+2QmhSjD0nLNJczC2ceqYM4Q0nQw4EqbxHkcZ+/0p9uI8\nPFy90G0wSTwBErthZYe6xE5DIkzRThFmwm0l2PPt30tIVP8UssxTYYJggNlIYaMT\n79C3i0Nl7ImUyDexL029qAJfVOVc17Zrv9VACypuSA4QIAVarH0J3lJ3hi+ZHAJR\npiZ6Ex+Z+VPbtAmMczizpa3zt/NDhBj3NHWbVQIDAQABAoIBADbMc8O5Ktg4/Bmi\n1a02C1LOiSBNhRUb99qKQOHlcHy6KZJ+6zOehr8Z47vrNJHcawx4q+C3myOTzGee\njbxxKZGeOz0vKJXoplyi/SiZSSY+wad82dFhfRQR4Dmu9029i1Es8O/OLLHfGPu/\nnc4FKCCudDcIdsE+CVxoTVECywrk7S66ziHFLKZBIaB5pTbX0tsjyhvdrun7rYBN\n/iF97u0DeQi+odntQFtgdkOg1jiz4ffrA3JMjfO+CJGnRy5PmckQv/a5Md06Av4R\nTrsIcDK8G3GB4Phfkans1R5EFS0aQ8ergeiaPPAEeMCF/BXdTA6y+2em/dUOzLPX\nfasTsLUCgYEA4zU7lEFmfeEvuL6cKD+QKJn1rpwXCDSVsPxDE7N6omrwrELVg+7E\nsefWSvHSUk3xDtUmgywoUj+osUtkHMkMjCW4rLGsWKxRPEXSbUHKPP/prn7XA+oL\n70XsKAzG1jZiJMb5QxaEyDO7bnIBKOksh1THz81TL0XilkFrzb5Ewl8CgYEAwsY8\nMQMEXbzFE9t4D7pZ0SOFRBfaoRk7KxCjcve7Hlx5Dw/EC3GpfpKDj7MEQclZ7bfy\nwilOXUg0F564gL0MdeCN2EwsMjnGtVnOpEZt8kiBG36sF+CMTaXlwkveUiyg8m3c\nlxSp3swdJV4O56IYhr1HDch6cUru8/vU+2SmxssCgYEAjRkS3dfbiVLd6vHcUhZf\nNQefjgb7OqpFR7rxAPwVrWWR/rgmlp8h4YWjC7mvLlOe3uI53339sE4+OZQjIMku\nFJ6cWAqiiBLDBBYsPpN7v3QBr86vQowHS1l19c0xcfgl7MbwJtyGKzoNLOJ5m+lq\nMMTSrVbKUPIqa7tG8mc1lisCgYBlq9kLtIl47OrrHKslep8b3rDYBKOpaGRMbJkF\nkG9qv9apmA878g8J9S0bu9TDCnoY7uaXl7xCUUhv8/hXq1dvyNICUHDZnvMtAz4s\n3l7SFCrg0VS/+gUDG1A+BiB9QLKbGeIGM1Eg7edg9CJPo3uuCeunNDlGHllxnslk\nmPu91QKBgQCw2vZ5xhHbkCljOD9Hb+2L2y7ZbSgAnUgyE/vAkmAlZYreP+SyzrPe\n+kTnWrZuCvc0x+G7zv6mv3CIcZM0CHN1hdJa1Y/C3n1s06kJjgwGvgP9h6a/m9al\neIave8nupkT7zrwPbv9MJlWrtqplLBHSMG3dnsKd+iLdEEdhg8GK5Q==\n-----END RSA PRIVATE KEY-----";
+/// Modulus of the fixed key (base64url, no pad).
+#[cfg(feature = "jwks-bench")]
+const BENCH_RSA_N_B64: &str = "rN5HvmgO5xgYLzTqq5mIW-ZFEM20TFz5C0bC0hP3mR13f9od7PiABrYWbLIwfWftR9-riLY5MOUZiZFioRdAsMBjtNy-E0_wfU_VwN1uqaFi9ww6Sc2hmqvnDcdnD9H55Zu-2QmhSjD0nLNJczC2ceqYM4Q0nQw4EqbxHkcZ-_0p9uI8PFy90G0wSTwBErthZYe6xE5DIkzRThFmwm0l2PPt30tIVP8UssxTYYJggNlIYaMT79C3i0Nl7ImUyDexL029qAJfVOVc17Zrv9VACypuSA4QIAVarH0J3lJ3hi-ZHAJRpiZ6Ex-Z-VPbtAmMczizpa3zt_NDhBj3NHWbVQ";
+/// Exponent of the fixed key (base64url, no pad).
+#[cfg(feature = "jwks-bench")]
+const BENCH_RSA_E_B64: &str = "AQAB";
+
 #[cfg(feature = "jwks-bench")]
 impl BenchKey {
     fn generate(kid: &str) -> Self {
-        use rsa::pkcs1::EncodeRsaPrivateKey as _;
-        use rsa::traits::PublicKeyParts as _;
-        // `rsa` 0.9 expects `rand_core` 0.6 while the workspace uses `rand`
-        // 0.10: bridge the two with a thin adapter over the workspace RNG
-        // (a CSPRNG, so marking it `CryptoRng` is sound).
-        struct CompatRng(rand::rngs::ThreadRng);
-        impl rsa::rand_core::RngCore for CompatRng {
-            fn next_u32(&mut self) -> u32 {
-                rand::Rng::next_u32(&mut self.0)
-            }
-            fn next_u64(&mut self) -> u64 {
-                rand::Rng::next_u64(&mut self.0)
-            }
-            fn fill_bytes(&mut self, dest: &mut [u8]) {
-                rand::Rng::fill_bytes(&mut self.0, dest)
-            }
-            fn try_fill_bytes(
-                &mut self,
-                dest: &mut [u8],
-            ) -> std::result::Result<(), rsa::rand_core::Error> {
-                rand::Rng::fill_bytes(&mut self.0, dest);
-                Ok(())
-            }
-        }
-        impl rsa::rand_core::CryptoRng for CompatRng {}
-        let mut rng = CompatRng(rand::rng());
-        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA key generates");
-        let public = rsa::RsaPublicKey::from(&private);
-        let der = private
-            .to_pkcs1_der()
-            .expect("private key encodes")
-            .as_bytes()
-            .to_vec();
+        use rustls::pki_types::pem::PemObject as _;
+        let der =
+            match rustls::pki_types::PrivateKeyDer::pem_slice_iter(BENCH_RSA_PKCS1_PEM.as_bytes())
+                .next()
+                .transpose()
+                .expect("static key parses")
+                .expect("static key holds")
+            {
+                rustls::pki_types::PrivateKeyDer::Pkcs1(key) => key.secret_pkcs1_der().to_vec(),
+                _ => panic!("static key is PKCS#1"),
+            };
         Self {
             kid: kid.to_string(),
             private_der: der,
-            n_b64: bench_b64(public.n().to_bytes_be()),
-            e_b64: bench_b64(public.e().to_bytes_be()),
+            n_b64: BENCH_RSA_N_B64.to_string(),
+            e_b64: BENCH_RSA_E_B64.to_string(),
         }
     }
 
@@ -138,36 +126,25 @@ impl BenchKey {
     }
 }
 
-#[cfg(feature = "jwks-bench")]
-fn bench_b64(bytes: Vec<u8>) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
 /// Minimal real HTTPS JWKS server on loopback serving one fixed key set
 /// at `/jwks.json` (real TLS via `tokio-rustls`, real HTTP/1.1 framing).
 /// Tree-only (`jwks-bench`): the base commit has no JWKS types.
 #[cfg(feature = "jwks-bench")]
 async fn start_bench_server(keys: Vec<serde_json::Value>) -> String {
+    use rustls::pki_types::pem::PemObject as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let keys = Arc::new(parking_lot::RwLock::new(keys));
-    let mut cert_reader = std::io::BufReader::new(BENCH_CERT_PEM.as_bytes());
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_reader)
-            .expect("fixture cert reads")
-            .into_iter()
-            .map(rustls::pki_types::CertificateDer::from)
-            .collect();
+        rustls::pki_types::CertificateDer::pem_slice_iter(BENCH_CERT_PEM.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("fixture cert reads");
     assert!(!certs.is_empty(), "fixture holds a certificate");
-    let mut key_reader = std::io::BufReader::new(BENCH_KEY_PEM.as_bytes());
-    let mut private_key = None;
-    while let Some(item) = rustls_pemfile::read_one(&mut key_reader).expect("fixture key reads") {
-        if let rustls_pemfile::Item::PKCS8Key(key) = item {
-            private_key = Some(rustls::pki_types::PrivateKeyDer::Pkcs8(key.into()));
-            break;
-        }
-    }
-    let private_key = private_key.expect("fixture holds a private key");
+    let private_key: rustls::pki_types::PrivateKeyDer<'static> =
+        rustls::pki_types::PrivateKeyDer::pem_slice_iter(BENCH_KEY_PEM.as_bytes())
+            .next()
+            .transpose()
+            .expect("fixture key reads")
+            .expect("fixture holds a private key");
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, private_key)

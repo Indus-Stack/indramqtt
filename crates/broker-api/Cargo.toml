@@ -38,10 +38,10 @@ chrono = { workspace = true }
 tar = "0.4"
 flate2 = { workspace = true }
 # PEM split plus certificate and key checks for the certificate routes.
-# rustls and rustls-pemfile parse the uploads; x509-parser checks each
+# rustls and rustls-pki-types parse the uploads; x509-parser checks each
 # certificate body. All three are MIT or Apache-2.0 or ISC.
 rustls = { version = "0.23" }
-rustls-pemfile = { version = "1" }
+rustls-pki-types = { version = "1" }
 x509-parser = { version = "0.18" }
 
 [features]
@@ -74,6 +74,5 @@ kinesis = ["broker-connectors-enterprise/kinesis"]
 [dev-dependencies]
 broker-connectors = { workspace = true }
 async-trait = { workspace = true }
-rsa = { workspace = true }
 rand = { workspace = true }
 p256 = "0.13"

@@ -375,15 +375,16 @@ fn load_client_roots(
     if cacertfile.trim().is_empty() {
         return Err("client certificate verification needs a CA file (cacertfile)".into());
     }
-    let file = std::fs::File::open(cacertfile)?;
-    let mut reader = std::io::BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)?;
+    use rustls::pki_types::pem::PemObject as _;
+    let pem = std::fs::read(cacertfile)?;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
         return Err(format!("no CA certificate in {cacertfile}").into());
     }
     let mut roots = rustls::RootCertStore::empty();
     for der in certs {
-        roots.add(rustls::pki_types::CertificateDer::from(der))?;
+        roots.add(der)?;
     }
     Ok(roots)
 }
@@ -403,31 +404,23 @@ pub(super) fn load_tls_config(
     key_file: &str,
     client_auth: &TlsClientAuth,
 ) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    use rustls::pki_types::pem::PemObject as _;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     // Install the default provider. The engine enables `ring`.
     // This keeps the verifier builder safe under unification.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let mut cert_reader = std::io::BufReader::new(std::fs::File::open(cert_file)?);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)?
-        .into_iter()
-        .map(CertificateDer::from)
-        .collect();
+    let cert_pem = std::fs::read(cert_file)?;
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(&cert_pem).collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
         return Err(format!("no certificate in {cert_file}").into());
     }
     let key_bytes = std::fs::read(key_file)?;
-    let mut key: Option<PrivateKeyDer<'static>> = None;
-    for item in rustls_pemfile::read_all(&mut key_bytes.as_slice())? {
-        key = match item {
-            rustls_pemfile::Item::PKCS8Key(der) => Some(PrivateKeyDer::Pkcs8(der.into())),
-            rustls_pemfile::Item::RSAKey(der) => Some(PrivateKeyDer::Pkcs1(der.into())),
-            rustls_pemfile::Item::ECKey(der) => Some(PrivateKeyDer::Sec1(der.into())),
-            _ => continue,
-        };
-        break;
-    }
-    let key = key.ok_or_else(|| format!("no private key in {key_file}"))?;
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::pem_slice_iter(&key_bytes)
+        .next()
+        .transpose()?
+        .ok_or_else(|| format!("no private key in {key_file}"))?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?;
@@ -2990,14 +2983,12 @@ mod tests {
     /// The bind check uses this name for tenant rules.
     #[test]
     fn peer_cert_fields_pull_cn_from_real_cert() {
+        use rustls::pki_types::pem::PemObject as _;
         let cert_pem = include_str!("../../broker-connectors-enterprise/testdata/client-cert.pem");
-        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut reader)
-                .expect("fixture reads")
-                .into_iter()
-                .map(rustls::pki_types::CertificateDer::from)
-                .collect();
+            rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("fixture reads");
         assert!(!certs.is_empty());
         let fields = peer_cert_fields(Some(&certs));
         assert_eq!(fields.cn.as_deref(), Some("test-device"));
@@ -3983,14 +3974,12 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../broker-connectors-enterprise/testdata"
         );
+        use rustls::pki_types::pem::PemObject as _;
         let ca_pem = std::fs::read(format!("{base}/ca-cert.pem")).expect("test CA reads");
-        let mut reader = std::io::BufReader::new(ca_pem.as_slice());
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut reader)
-                .expect("test CA parses")
-                .into_iter()
-                .map(rustls::pki_types::CertificateDer::from)
-                .collect();
+            rustls::pki_types::CertificateDer::pem_slice_iter(&ca_pem)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("test CA parses");
         let mut roots = rustls::RootCertStore::empty();
         for cert in certs {
             roots.add(cert).expect("test CA trusts");
@@ -4432,42 +4421,37 @@ mod tests {
 
     /// Trust roots of the K1-05 test CA.
     fn k1_05_roots() -> rustls::RootCertStore {
+        use rustls::pki_types::pem::PemObject as _;
         let pem = std::fs::read(k1_05_file("ca-cert.pem")).expect("test CA reads");
-        let mut reader = std::io::BufReader::new(pem.as_slice());
-        let certs = rustls_pemfile::certs(&mut reader).expect("test CA parses");
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("test CA parses");
         let mut roots = rustls::RootCertStore::empty();
         for der in certs {
-            roots
-                .add(rustls::pki_types::CertificateDer::from(der))
-                .expect("test CA trusts");
+            roots.add(der).expect("test CA trusts");
         }
         roots
     }
 
     /// Private key in a PEM file. Accepts PKCS#8, RSA and SEC1 forms.
     fn k1_05_key(path: &str) -> rustls::pki_types::PrivateKeyDer<'static> {
-        use rustls::pki_types::PrivateKeyDer;
+        use rustls::pki_types::pem::PemObject as _;
         let bytes = std::fs::read(path).expect("test key reads");
-        for item in rustls_pemfile::read_all(&mut bytes.as_slice()).expect("test key parses") {
-            match item {
-                rustls_pemfile::Item::PKCS8Key(der) => return PrivateKeyDer::Pkcs8(der.into()),
-                rustls_pemfile::Item::RSAKey(der) => return PrivateKeyDer::Pkcs1(der.into()),
-                rustls_pemfile::Item::ECKey(der) => return PrivateKeyDer::Sec1(der.into()),
-                _ => continue,
-            }
-        }
-        panic!("no private key in test file");
+        rustls::pki_types::PrivateKeyDer::pem_slice_iter(&bytes)
+            .next()
+            .transpose()
+            .expect("test key parses")
+            .expect("no private key in test file")
     }
 
     /// Certificate chain in a PEM file.
     fn k1_05_chain(path: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+        use rustls::pki_types::pem::PemObject as _;
         let pem = std::fs::read(path).expect("test chain reads");
-        let mut reader = std::io::BufReader::new(pem.as_slice());
-        rustls_pemfile::certs(&mut reader)
+        rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+            .collect::<Result<Vec<_>, _>>()
             .expect("test chain parses")
-            .into_iter()
-            .map(rustls::pki_types::CertificateDer::from)
-            .collect()
     }
 
     /// TLS client config for the K1-05 tests. Trusts the test CA only.

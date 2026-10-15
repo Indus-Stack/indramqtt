@@ -16,6 +16,8 @@ pub mod ldap;
 pub mod node_cache;
 pub mod psk;
 pub mod settings;
+#[cfg(test)]
+pub mod test_directory_server;
 pub mod webhook;
 
 pub use authz_node_cache::{AuthzCacheUpdateError, AuthzNodeCache};

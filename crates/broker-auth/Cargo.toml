@@ -43,20 +43,17 @@ mongodb = { version = "3", default-features = false, features = ["bson-3", "comp
 [dev-dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
-# TODO(parity): yamldap 0.2.0 is the latest release. It still pulls
-# unsafe-libyaml 0.2.11 through serde_yaml_ng 0.10.0. No fixed release
-# exists upstream. Keep the test server until it moves to a maintained
-# YAML library. The CTO decides the treatment of dev-only findings.
-yamldap = "0.2"
 tempfile = "3"
+# Maintained YAML library for test directory values (same API as the
+# rule-engine dependency). Licence: MIT OR Apache-2.0.
+serde_norway = "0.9"
 # Test-only (B5-02 JWKS fixtures and `jwks_connect_bench` HTTPS server):
 # the shared `jwks_test_support` module is `#[cfg(test)]`, and the bench
 # file mirrors it inline, so these never ship in production binaries. All
 # are maintained crates on permissive licences already used in the workspace.
-rsa = { workspace = true }
 rustls = { version = "0.23.45" }
 tokio-rustls = { version = "0.26" }
-rustls-pemfile = { version = "1" }
+rustls-pki-types = { version = "1" }
 
 [features]
 default = ["jwks-bench", "webhook-bench"]
