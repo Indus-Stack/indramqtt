@@ -42,17 +42,12 @@ ignore = true
 [advisories]
 version = 2
 ignore = [
-    "RUSTSEC-2024-0436",
-    "RUSTSEC-2023-0071",
-    "RUSTSEC-2025-0134",
-    "RUSTSEC-2026-0098",
-    "RUSTSEC-2026-0099",
-    "RUSTSEC-2026-0104",
-    "RUSTSEC-2024-0363",
-    "RUSTSEC-2024-0399",
-    "RUSTSEC-2023-0052",
-    "RUSTSEC-2023-0053",
-    "RUSTSEC-2024-0336",
+    # Each entry has no fixed version, or its correction is queued. Remove the
+    # entry when the crate leaves the graph; CI fails on any other advisory.
+    { id = "RUSTSEC-2023-0071", reason = "rsa: Marvin timing attack, no fixed release. Direct dependency of broker-connectors; replacement queued (DEP-02)." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 1.x: unmaintained. Direct dependency of broker-api and broker-connectors; replacement by rustls-pki-types queued (DEP-02)." },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, test-only path through broker-auth; replacement queued (DEP-02)." },
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc-macro, build time only, no code at run time. Comes through the rule-engine dependency." },
 ]
 
 [bans]
