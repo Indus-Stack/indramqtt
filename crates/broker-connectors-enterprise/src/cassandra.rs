@@ -1994,8 +1994,7 @@ mod tests {
     async fn test_qualify_driver_write_path() {
         let contact_points = qual_env("CASSANDRA_CONTACT_POINTS");
         let Some(contact_points) = contact_points else {
-            eprintln!("CASSANDRA_CONTACT_POINTS is empty; skipping qualification");
-            return;
+            panic!("missing CASSANDRA_CONTACT_POINTS; cannot run qualification without a server endpoint");
         };
         let contact_points: Vec<String> = contact_points
             .split(',')
@@ -2003,8 +2002,7 @@ mod tests {
             .filter(|s| !s.is_empty())
             .collect();
         if contact_points.is_empty() {
-            eprintln!("CASSANDRA_CONTACT_POINTS has no entries; skipping qualification");
-            return;
+            panic!("empty CASSANDRA_CONTACT_POINTS; cannot run qualification without a server endpoint");
         }
         let keyspace =
             qual_env("CASSANDRA_KEYSPACE").unwrap_or_else(|| "cassandra_qual_b307".to_string());

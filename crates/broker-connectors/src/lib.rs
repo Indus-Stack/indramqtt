@@ -1341,6 +1341,92 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_live_qualification_never_skips() {
+        // Scan live tests for early exit.
+        // Read source files from both connector crates.
+        // Fail on a bare early exit or on a bypass message.
+        // Require at least 20 live tests.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut dirs = vec![manifest.join("src")];
+        if let Some(root) = manifest.parent() {
+            dirs.push(root.join("broker-connectors-enterprise/src"));
+        }
+        let marker = ["fn test_qual", "ify"].concat();
+        let early = ["ret", "urn;"].concat();
+        let bypass = ["ski", "pp"].concat();
+        let mut count = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for dir in &dirs {
+            let entries = std::fs::read_dir(dir).expect("read connector src");
+            let mut names: Vec<std::path::PathBuf> = Vec::new();
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    names.push(path);
+                }
+            }
+            names.sort();
+            for path in names {
+                let text = std::fs::read_to_string(&path).expect("read source");
+                let lines: Vec<&str> = text.lines().collect();
+                let mut i = 0usize;
+                while i < lines.len() {
+                    let trimmed = lines[i].trim_start();
+                    let head = trimmed.strip_prefix("async ").unwrap_or(trimmed);
+                    if !head.starts_with(&marker) {
+                        i += 1;
+                        continue;
+                    }
+                    let mut j = i;
+                    while j < lines.len() && !lines[j].contains('{') {
+                        j += 1;
+                    }
+                    if j >= lines.len() {
+                        break;
+                    }
+                    let mut depth = 0i32;
+                    let mut started = false;
+                    let mut k = j;
+                    while k < lines.len() {
+                        for ch in lines[k].chars() {
+                            if ch == '{' {
+                                depth += 1;
+                                started = true;
+                            } else if ch == '}' {
+                                depth -= 1;
+                            }
+                        }
+                        if started && depth <= 0 {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    count += 1;
+                    let end = k.min(lines.len().saturating_sub(1));
+                    for (off, &line) in lines.iter().enumerate().take(end + 1).skip(i) {
+                        if line.trim_start().starts_with("//") {
+                            continue;
+                        }
+                        if line.contains(&early) {
+                            bad.push(format!("{}:{} has early exit", path.display(), off + 1));
+                        }
+                        if line.to_lowercase().contains(&bypass) {
+                            bad.push(format!("{}:{} has bypass message", path.display(), off + 1));
+                        }
+                    }
+                    i = k + 1;
+                }
+            }
+        }
+        assert!(count >= 20, "found only {count} live tests, need 20");
+        assert!(
+            bad.is_empty(),
+            "live tests must panic without env: {}",
+            bad.join("; ")
+        );
+    }
 }
 
 /// Upper bound on the action-types catalogue size (spec C06-01).

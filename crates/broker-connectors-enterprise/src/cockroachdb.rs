@@ -2254,10 +2254,9 @@ mod tests {
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             if !version_ok {
-                eprintln!(
-                    "qual skipped: no CockroachDB server at {host}:{port} and no `cockroach` binary to start one"
+                panic!(
+                    "no CockroachDB server at {host}:{port} and no `cockroach` binary; cannot run qualification without a server"
                 );
-                return;
             }
             config.connection_string =
                 format!("postgresql://root@127.0.0.1:{port}/defaultdb?sslmode=disable");
@@ -2288,16 +2287,14 @@ mod tests {
                 _qual_child = Some(child);
             } else {
                 let _ = child.kill();
-                eprintln!("qual skipped: ephemeral CockroachDB server failed to start");
-                return;
+                panic!("ephemeral CockroachDB server failed to start; cannot run qualification without a server");
             }
         }
         let Some(client) = client_opt else {
             if explicit_server {
                 panic!("qual connect failed to explicit COCKROACHDB_HOST server");
             }
-            eprintln!("qual skipped: no CockroachDB server reachable");
-            return;
+            panic!("no CockroachDB server reachable at {host}:{port}; cannot run qualification without a server");
         };
         let server_version: String = client
             .query_one("SELECT version()", &[])

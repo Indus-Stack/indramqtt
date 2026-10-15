@@ -2299,8 +2299,7 @@ mod tests {
         let username = std::env::var("ALLOYDB_USER").unwrap_or_else(|_| "postgres".into());
         let password = std::env::var("ALLOYDB_PASSWORD").unwrap_or_default();
         if password.is_empty() {
-            eprintln!("ALLOYDB_PASSWORD is empty; skipping qualification");
-            return;
+            panic!("missing ALLOYDB_PASSWORD; cannot run qualification without a password");
         }
         let table = std::env::var("ALLOYDB_TABLE").unwrap_or_else(|_| "alloydb_qual_b301".into());
         let use_tls = std::env::var("ALLOYDB_TLS")

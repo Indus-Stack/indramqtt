@@ -18,6 +18,7 @@ use broker_router::{Router, Subscription};
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleAction, RuleEngine};
 use broker_session::{QueuedMessage, SessionManager};
 use bytes::Bytes;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Bound for one socket step. A missing packet fails instead of hanging.
@@ -55,6 +56,9 @@ fn ephemeral_port() -> u16 {
         .port()
 }
 
+/// Counter for kernel boot tags. Parallel boots never share dirs.
+static KERNEL_TAG_SLOT: AtomicU64 = AtomicU64::new(0);
+
 /// Boots one real kernel with the kernel listener on ephemeral ports.
 ///
 /// `extra_toml` appends to `indra.toml` (tenant rules, session limits).
@@ -64,9 +68,36 @@ fn ephemeral_port() -> u16 {
 /// `/healthz` plus the MQTT and WebSocket ports. The child dies with the
 /// test (`kill_on_drop`).
 async fn spawn_kernel(extra_toml: &str) -> Kernel {
+    // Boot up to three times. A parallel boot sometimes takes a probed
+    // port first, and the loser exits during boot. Each attempt uses
+    // fresh ports and fresh dirs. A real boot defect fails each attempt
+    // and still panics.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match try_spawn_kernel(extra_toml).await {
+            Ok(kernel) => return kernel,
+            Err(boot) if boot.exited && attempt < 3 => continue,
+            Err(boot) => panic!("{}", boot.message),
+        }
+    }
+}
+
+/// One kernel boot failure. `exited` marks an early child exit.
+struct BootFailure {
+    exited: bool,
+    message: String,
+}
+
+/// Boots one kernel once. Returns the kernel on success. Returns the
+/// failure on a timeout or an early child exit. The caller retries an
+/// early exit and panics otherwise.
+async fn try_spawn_kernel(extra_toml: &str) -> Result<Kernel, BootFailure> {
+    let slot = KERNEL_TAG_SLOT.fetch_add(1, Ordering::SeqCst);
     let tag = format!(
-        "p6-{}-{}",
+        "p6-{}-{:?}-{}-{slot}",
         std::process::id(),
+        std::thread::current().id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -145,21 +176,31 @@ async fn spawn_kernel(extra_toml: &str) -> Kernel {
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill().await;
-            panic!("kernel never opened API {api_port} and MQTT {mqtt_port}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = std::fs::remove_dir_all(&config_dir);
+            return Err(BootFailure {
+                exited: false,
+                message: format!("kernel never opened API {api_port} and MQTT {mqtt_port}"),
+            });
         }
         if let Ok(Some(status)) = child.try_wait() {
-            panic!("kernel exited during boot: {status}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = std::fs::remove_dir_all(&config_dir);
+            return Err(BootFailure {
+                exited: true,
+                message: format!("kernel exited during boot: {status}"),
+            });
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    Kernel {
+    Ok(Kernel {
         child,
         mqtt_port,
         ws_port,
         api_port,
         scratch,
         config_dir,
-    }
+    })
 }
 
 #[derive(Debug, Default)]

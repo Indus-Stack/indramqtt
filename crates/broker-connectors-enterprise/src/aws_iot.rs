@@ -1884,8 +1884,7 @@ mod tests {
     async fn test_qualify_tls_write_path() {
         let endpoint = qual_env("AWS_IOT_ENDPOINT").unwrap_or_default();
         if endpoint.is_empty() {
-            eprintln!("AWS_IOT_ENDPOINT is empty; skipping qualification");
-            return;
+            panic!("missing AWS_IOT_ENDPOINT; cannot run qualification without a server endpoint");
         }
         let region = qual_env("AWS_IOT_REGION").unwrap_or_else(|| "us-east-1".to_string());
         let client_id =
@@ -1896,10 +1895,9 @@ mod tests {
         let client_cert = qual_pem("AWS_IOT_CLIENT_CERT_PEM", "AWS_IOT_CLIENT_CERT_FILE");
         let client_key = qual_pem("AWS_IOT_CLIENT_KEY_PEM", "AWS_IOT_CLIENT_KEY_FILE");
         let (Some(cert), Some(key)) = (client_cert, client_key) else {
-            eprintln!(
-                "no mTLS material; SigV4 WebSocket path is not built; skipping qualification"
+            panic!(
+                "missing AWS_IOT_CLIENT_CERT_PEM/FILE and AWS_IOT_CLIENT_KEY_PEM/FILE; cannot run qualification without mTLS material"
             );
-            return;
         };
         let auth = AwsIotAuth::Mtls {
             ca_cert_pem: ca_pem.clone(),

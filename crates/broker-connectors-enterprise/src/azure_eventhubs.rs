@@ -1205,15 +1205,13 @@ mod tests {
     async fn test_qualify_rest_write_path() {
         let namespace = qual_env("AZURE_EVENTHUBS_NAMESPACE").unwrap_or_default();
         if namespace.is_empty() {
-            eprintln!("AZURE_EVENTHUBS_NAMESPACE is empty; skipping qualification");
-            return;
+            panic!("missing AZURE_EVENTHUBS_NAMESPACE; cannot run qualification without a server endpoint");
         }
         let hub = qual_env("AZURE_EVENTHUBS_HUB").unwrap_or_default();
         let key_name = qual_env("AZURE_EVENTHUBS_KEY_NAME").unwrap_or_default();
         let key = qual_env("AZURE_EVENTHUBS_KEY").unwrap_or_default();
         if hub.is_empty() || key_name.is_empty() || key.is_empty() {
-            eprintln!("AZURE_EVENTHUBS_HUB/KEY_NAME/KEY missing; skipping qualification");
-            return;
+            panic!("missing AZURE_EVENTHUBS_HUB/KEY_NAME/KEY; cannot run qualification without hub credentials");
         }
         eprintln!("qual server: namespace={namespace} hub={hub} key_name={key_name}");
 

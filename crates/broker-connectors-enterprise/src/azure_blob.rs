@@ -1728,8 +1728,9 @@ mod tests {
 
         let endpoint = qual_env("AZURE_BLOB_ENDPOINT").unwrap_or_default();
         if endpoint.is_empty() {
-            eprintln!("AZURE_BLOB_ENDPOINT is empty; skipping qualification");
-            return;
+            panic!(
+                "missing AZURE_BLOB_ENDPOINT; cannot run qualification without a server endpoint"
+            );
         }
         let account =
             qual_env("AZURE_BLOB_ACCOUNT").unwrap_or_else(|| "devstoreaccount1".to_string());

@@ -1951,8 +1951,9 @@ mod tests {
     async fn test_qualify_tls_write_path() {
         let hub = qual_env("AZURE_IOT_HUB_HOST").unwrap_or_default();
         if hub.is_empty() {
-            eprintln!("AZURE_IOT_HUB_HOST is empty; skipping qualification");
-            return;
+            panic!(
+                "missing AZURE_IOT_HUB_HOST; cannot run qualification without a server endpoint"
+            );
         }
         let device_id =
             qual_env("AZURE_IOT_DEVICE_ID").unwrap_or_else(|| "qual-device-1".to_string());
@@ -1973,8 +1974,7 @@ mod tests {
         } else {
             let key = qual_env("AZURE_IOT_SHARED_KEY").unwrap_or_default();
             if key.is_empty() {
-                eprintln!("no AZURE_IOT_SHARED_KEY/SAS_TOKEN/client certs; skipping");
-                return;
+                panic!("missing AZURE_IOT_SHARED_KEY/SAS_TOKEN/client certs; cannot run qualification without credentials");
             }
             AzureIotAuth::SharedAccessKey {
                 key,
