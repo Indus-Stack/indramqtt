@@ -19,7 +19,17 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `concepts/index.md` | 85 | `hello-docs` |
 | `concepts/listeners.md` | 78 | `ok` |
 | `concepts/listeners.md` | 88 | `hello-listeners` |
-| `connectors/index.md` | 51 | `OK` |
+| `connectors/clickhouse.md` | 84 | `ok` |
+| `connectors/http.md` | 93 | `delivered` |
+| `connectors/index.md` | 127 | `ok` |
+| `connectors/influxdb.md` | 86 | `influxdb` |
+| `connectors/kafka.md` | 83 | `ok` |
+| `connectors/mongodb.md` | 87 | `ok` |
+| `connectors/mqtt-bridge.md` | 91 | `mqtt_bridge` |
+| `connectors/mysql.md` | 79 | `mysql` |
+| `connectors/postgres.md` | 79 | `postgres` |
+| `connectors/redis.md` | 81 | `redis` |
+| `connectors/s3.md` | 88 | `ok` |
 | `getting-started/console.md` | 48 | `200` |
 | `getting-started/first-publish.md` | 49 | `hello-docs` |
 | `getting-started/first-start.md` | 43 | `ok` |
@@ -31,7 +41,8 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `index.md` | 54 | `OK` |
 | `mcp.md` | 43 | `OK` |
 | `migration.md` | 90 | `OK` |
-| `multi-tenancy/index.md` | 65 | `OK` |
+| `multi-tenancy/index.md` | 96 | `isolated` |
+| `multi-tenancy/quotas.md` | 102 | `ok` |
 | `operations/backup.md` | 90 | `ok` |
 | `operations/deployment.md` | 118 | `ok` |
 | `operations/index.md` | 96 | `ok` |
@@ -73,7 +84,11 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/index.md` | 41 | `OK` |
 | `reference/metrics.md` | 118 | `OK` |
 | `reference/metrics.md` | 134 | `OK` |
-| `rules/index.md` | 80 | `OK` |
+| `rules/actions.md` | 64 | `delivered` |
+| `rules/functions.md` | 506 | `ok` |
+| `rules/functions.md` | 531 | `ok` |
+| `rules/index.md` | 64 | `OK` |
+| `rules/sql.md` | 163 | `matched<br>unmatched` |
 | `security/audit-log.md` | 53 | `ok` |
 | `security/audit-log.md` | 65 | `200` |
 | `security/authentication-builtin.md` | 57 | `ok` |
@@ -96,4 +111,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 80 blocks. Each output matches its page.
+The run captured 95 blocks. Each output matches its page.

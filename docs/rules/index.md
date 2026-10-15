@@ -7,58 +7,39 @@ sidebar:
 
 # Rules
 
-A rule runs inside the broker process. It reads a message once at ingress on the node that receives it. It filters with `WHERE`, shapes with `SELECT` and sends the result to a topic or to a connector with `INTO connector("<id>")`.
+A rule reads each message once at ingress. It filters rows with `WHERE`. It shapes rows with `SELECT`. It sends each result to a topic or to a connector.
+
+Use rules when a message must fan out, change shape, or leave the broker. You get SQL over live MQTT traffic with no second process. The complete MQTT platform in one small binary: broker, SQL rules, data connectors and multi-tenancy in a single process.
 
 ```mermaid
-sequenceDiagram
-    participant Pub as Publisher
-    participant Engine as Rule engine
-    participant Out as Topic or connector
-    Pub->>Engine: PUBLISH ingress
-    Engine->>Engine: WHERE filter + SELECT shape
-    Engine->>Out: republish or send
-    Out-->>Pub: result
+flowchart LR
+    Pub["publisher :1883"] -- "PUBLISH" --> Engine["rule engine"]
+    Engine -- "WHERE filter" --> Match["matched rows"]
+    Match -- "SELECT shape" --> Out["republish topic"]
+    Match -- "INTO connector id" --> Conn["connectors"]
+    Conn -- "batch send" --> Ext["external system"]
 ```
 
-## Example
+## Before you start
 
-Send hot readings to the alerts topic:
+- Install the broker from [Install](../getting-started/install.md).
+- Keep ports 1883 and 18083 free.
+- Read [Concepts](../concepts/index.md) for topics and wildcards.
 
-```sql
-SELECT device, temp AS temp_c FROM "factory/+/heat"
-WHERE temp > 80.0
-```
+## In this section
 
-Republish the result to a new topic:
+| Page | What it covers |
+|---|---|
+| [Rule SQL](./sql.md) | `SELECT`, `FROM`, `WHERE`, `FOREACH`, `CASE`, operators, event sources, windows. |
+| [Functions](./functions.md) | Every built-in function by group, with call shape and arity. |
+| [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
 
-```sql
-SELECT device, temp * 1.8 + 32 AS temp_f FROM "factory/+/heat"
-WHERE temp > 40.0
-```
-
-Send the result to a connector:
-
-```sql
-SELECT device, temp FROM "factory/+/heat"
-WHERE temp > 40.0
-INTO connector("kafka-edge")
-```
-
-## Built-in actions
-
-The `republish` action publishes to a fixed topic with a payload template. Manage rules through the management API under `/api/v5/rules`. A rule with an unknown function is refused with 400.
-
-## Windows
-
-Stateful rules group events in time or count windows: `TUMBLINGWINDOW`, `HOPPINGWINDOW`, `SLIDINGWINDOW` and `COUNTWINDOW`. They aggregate with `avg`, `sum`, `count`, `min`, `max`, `stddev` and `percentile`.
-
-## Bounds
-
-The rule engine has a bounded ingress buffer. Set its depth with `rules_engine.window_channel_depth` (default 65536). Set the overflow policy with `rules_engine.backpressure_policy` (default `DropOldest`). Spill overflow to disk with `rules_engine.spill_dir`.
+> [!NOTE]
+> A rule keeps the tenant of its input message. A rule of tenant A never fires for a publish of tenant B. See [Multi-tenancy](../multi-tenancy/index.md).
 
 ## Check that it works
 
-Start the broker with this file. It sets the window channel depth. The health endpoint returns `OK`.
+Start the broker with this file. The health endpoint returns `OK`.
 
 ```toml test
 [node]
@@ -72,6 +53,9 @@ bind = "0.0.0.0:18083"
 
 [logging]
 level = "warn"
+
+[auth]
+allow_anonymous = true
 
 [rules_engine]
 window_channel_depth = 65536
@@ -90,3 +74,9 @@ PY
 ```output
 OK
 ```
+
+## Next steps
+
+- Write the query with [Rule SQL](./sql.md).
+- Shape payloads with [Functions](./functions.md).
+- Send results with [Actions](./actions.md).

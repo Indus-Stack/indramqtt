@@ -1,10 +1,116 @@
-# Verification failures (DOC-02)
+# Verification failures
+
+This file records each docs example that the docs run does not verify end to end. Each record names the item, the exact input, the expected source, what the broker gave, and the date. The CTO turns each record into a correction task.
+
+```mermaid
+flowchart LR
+    Item["documented item"] -- "docs run" --> Verdict["verified or record"]
+    Verdict -- "not run" --> Rec["record below"]
+    Rec -- "later task" --> Fix["correction task"]
+```
 
 ```mermaid
 flowchart LR
     Op["operator"] -- "read record" --> F["failures.md"]
     F -- "file correction task" --> CTO["CTO"]
 ```
+
+## Before you start
+
+- Read the row of the connector in [Connectors](../connectors/index.md).
+- Each record below covers the send path only. Creation validation runs in the docs run.
+- A record is a good result. An unverified claim in a page is not.
+
+## Connector send-path records (DOC-04)
+
+### Kafka send path (2026-10-13)
+
+- Item: `kafka` connector send path.
+- Input: `POST /api/v1/connectors` with `bootstrap_servers` `127.0.0.1:9092`, then a publish through a forwarding rule.
+- Expected from: the Kafka page of this documentation.
+- Broker gave: 201 on creation (or 400 naming the `kafka` feature without the feature build). No record reached a cluster. No cluster ran in the docs run.
+- State: not verified.
+
+### PostgreSQL send path (2026-10-13)
+
+- Item: `postgres` connector send path.
+- Input: `POST /api/v1/connectors` with `connection_url` `postgresql://u:p@127.0.0.1:5432/db`, then a publish through a forwarding rule.
+- Expected from: the PostgreSQL page of this documentation.
+- Broker gave: 201 on creation. No row reached a database. No database ran in the docs run.
+- State: not verified.
+
+### MySQL send path (2026-10-13)
+
+- Item: `mysql` connector send path.
+- Input: `POST /api/v1/connectors` with `connection_url` `mysql://u:p@127.0.0.1:3306/db`, then a publish through a forwarding rule.
+- Expected from: the MySQL page of this documentation.
+- Broker gave: 201 on creation. No row reached a database. No database ran in the docs run.
+- State: not verified.
+
+### MongoDB send path (2026-10-13)
+
+- Item: `mongodb` connector send path.
+- Input: `POST /api/v1/connectors` with `connection_string` `mongodb://u:p@127.0.0.1:27017`, then a publish through a forwarding rule.
+- Expected from: the MongoDB page of this documentation.
+- Broker gave: 201 on creation (or 400 naming the `mongodb` feature without the feature build). No document reached a server. No server ran in the docs run.
+- State: not verified.
+
+### Redis send path (2026-10-13)
+
+- Item: `redis` connector send path.
+- Input: `POST /api/v1/connectors` with `endpoint` `redis://127.0.0.1:6379` and an `xadd` command, then a publish through a forwarding rule.
+- Expected from: the Redis page of this documentation.
+- Broker gave: 201 on creation. No command reached a server. No server ran in the docs run.
+- State: not verified.
+
+### InfluxDB send path (2026-10-13)
+
+- Item: `influxdb` connector send path.
+- Input: `POST /api/v1/connectors` with `endpoint` `http://127.0.0.1:8086`, then a publish through a forwarding rule.
+- Expected from: the InfluxDB page of this documentation.
+- Broker gave: 201 on creation. No point reached a server. No server ran in the docs run.
+- State: not verified.
+
+### ClickHouse send path (2026-10-13)
+
+- Item: `clickhouse` connector send path.
+- Input: `POST /api/v1/connectors` with `endpoint` `http://127.0.0.1:8123`, then a publish through a forwarding rule.
+- Expected from: the ClickHouse page of this documentation.
+- Broker gave: 201 on creation (or 400 naming the `clickhouse` feature without the feature build). No row reached a server. No server ran in the docs run.
+- State: not verified.
+
+### MQTT bridge send path (2026-10-13)
+
+- Item: `mqtt_bridge` connector send path.
+- Input: `POST /api/v1/connectors` with `broker_address` `mqtt://127.0.0.1:1883`, then a publish through a forwarding rule.
+- Expected from: the MQTT bridge page of this documentation.
+- Broker gave: 201 on creation. No message reached a remote broker. No remote broker ran in the docs run.
+- State: not verified.
+
+### S3 send path (2026-10-13)
+
+- Item: `s3` connector send path.
+- Input: `POST /api/v1/connectors` with `endpoint` `http://127.0.0.1:9000`, then a publish through a forwarding rule.
+- Expected from: the S3 page of this documentation.
+- Broker gave: 201 on creation (or 400 naming the `s3` feature without the feature build). No object reached a store. No store ran in the docs run.
+- State: not verified.
+
+## Rule function evaluation records (DOC-04)
+
+### Function call shapes (2026-10-15)
+
+- Item: each `rules/functions.md` call shape except the sample calls.
+- Input: `POST /api/v1/rules/test` with `SELECT <call> FROM "sensors/+"`, topic `sensors/kitchen`, payload `{"temperature": 72.5}`.
+- Expected from: the call shape column of `rules/functions.md` and the `example` field of `builtin_function_metadata`.
+- Broker gave: not run per item. The docs run checks each name against `GET /api/v1/rules/functions` and runs six sample calls (`abs`, `ceil`, `lower`, `upper`, `concat`, `length`). No other call shape ran against the broker.
+- State: not verified.
+
+## Next steps
+
+- Verify one record per correction task with a real server.
+- Flip the matching row in [Connectors](../connectors/index.md) to `tested end to end` when a repository test proves it.
+
+## Management API records (DOC-02)
 
 Each record names one item whose live call did not run. The page
 shows the schema only for these items. The entry carries the
