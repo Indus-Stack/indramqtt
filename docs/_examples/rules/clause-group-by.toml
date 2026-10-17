@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "clause-group-by"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT device, count(temperature) AS n FROM "sensors/+" GROUP BY device'
+topic = "sensors/kitchen"
+payload = '[{"device": "a", "temperature": 70}, {"device": "b", "temperature": 72}]'
+expect_matched = true
+expect_projected = '[{"device": "a", "n": 1}, {"device": "b", "n": 1}]'
+
+[[case]]
+sql = 'SELECT device, count(temperature) AS n FROM "sensors/+" GROUP BY device'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"device": null, "n": 1}'

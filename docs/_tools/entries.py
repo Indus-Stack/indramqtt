@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build doc entries from inventory, text and verified output (DX-01).
+"""Build doc entries from inventory, text and verified output (DX-01, DX2).
 
 Read the inventory (name, signature, types, defaults), the written
 explanation (docs/_text/<area>/<item>.md) and the verified output
@@ -11,6 +11,9 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --write [--area cli]
   python3 docs/_tools/entries.py --check [--area cli]
   python3 docs/_tools/entries.py --coverage [--area cli]
+  python3 docs/_tools/entries.py --write --area rules
+  python3 docs/_tools/entries.py --check --area rules
+  python3 docs/_tools/entries.py --coverage --area rules
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -73,9 +76,12 @@ def read_verified(area, item):
 def failure_recorded(item):
     """Check whether failures.md names this item."""
     try:
-        return f"DX-01 item `{item}`" in FAILURES.read_text(encoding="utf-8")
+        text = FAILURES.read_text(encoding="utf-8")
     except OSError:
         return False
+    return (
+        f"DX-01 item `{item}`" in text or f"DX2-001 item `{item}`" in text
+    )
 
 
 def verified_line(area, item, record):
@@ -308,6 +314,249 @@ def render_cli_page():
     return "\n".join(out)
 
 
+def rules_stem(kind, name):
+    """Map one rules inventory id to its file stem.
+
+    Clauses and operators own short stems (clause-select, op-and).
+    Later waves add function, action and event stems. The rulebook
+    does not decide the shape, so this mapping is the choice:
+    lowercase, spaces to dashes (TODO(parity): keep one shape
+    across every DX2 task).
+    """
+    slug = name.lower().replace(" ", "-")
+    if kind == "clause":
+        return "clause-" + slug
+    if kind == "operator":
+        return "op-" + slug
+    if kind == "function":
+        return "fn-" + slug
+    if kind == "action":
+        return "action-" + slug
+    return "event-" + slug
+
+
+def rules_inventory_ids():
+    """List every rules inventory id with its file stem."""
+    data = json.loads((INVENTORY / "rules.json").read_text(encoding="utf-8"))
+    out = []
+    for clause in data["clauses"]:
+        out.append((f"clause {clause}", rules_stem("clause", clause)))
+    for operator in data["operators"]:
+        out.append((f"operator {operator}", rules_stem("operator", operator)))
+    for row in data["functions"]:
+        out.append((f"function {row['name']}", rules_stem("function", row["name"])))
+    for action in data["actions"]:
+        out.append((f"action {action}", rules_stem("action", action)))
+    for event in data["events"]:
+        name = event if isinstance(event, str) else event.get("name", "")
+        out.append((f"event {name}", rules_stem("event", name)))
+    return out
+
+
+# Display order of the clause and operator entries (DX2-001).
+RULES_CLAUSE_ORDER = ["SELECT", "FROM", "WHERE", "GROUP BY", "HAVING", "LIMIT"]
+RULES_OPERATOR_ORDER = ["AND", "OR", "NOT", "BETWEEN", "IN", "LIKE"]
+
+# One syntax line per DX2-001 stem, taken from the rule front end.
+RULES_SYNTAX = {
+    "clause-select": "`SELECT <expression> [AS <name>], ...` or `SELECT *`",
+    "clause-from": '`FROM <source> [, ...]` where a source is `"topic/filter"`, `"$events/..."` or a bare stream name',
+    "clause-where": "`WHERE <predicate>`",
+    "clause-group-by": "`GROUP BY <expression> [, ...]` or `GROUP BY <window>`",
+    "clause-having": "`HAVING <predicate>` after `GROUP BY`",
+    "clause-limit": "`SELECT ... LIMIT <n>`",
+    "op-and": "`<test> AND <test>`",
+    "op-or": "`<test> OR <test>`",
+    "op-between": "`<value> BETWEEN <low> AND <high>`",
+    "op-in": "`<value> IN (<member> [, ...])`",
+    "op-like": "`<text> LIKE '<pattern>'` with `%` and `_`",
+    "op-not": "`NOT <test>`, `NOT BETWEEN`, `NOT IN`, `NOT LIKE`",
+}
+
+# Extra note lines per DX2-001 stem. Each states an observed limit.
+RULES_NOTES = {
+    "clause-from": [
+        "An event source never matches an MQTT message. The engine drops it before evaluation.",
+    ],
+    "clause-group-by": [
+        "Stateful windows buffer rows in memory. Bound the ingress buffer with `rules_engine.window_channel_depth`.",
+    ],
+    "clause-having": [
+        "The single-message test returns its row without group filtering. The batch run above shows the filter.",
+    ],
+    "clause-limit": [
+        "The test entry returns the single row unchanged, also with `LIMIT 0`. No row trimming was observed through it.",
+    ],
+    "op-like": [
+        "Matching is case-sensitive. A non-text value never matches a pattern.",
+    ],
+    "op-in": [
+        "An empty list matches nothing.",
+    ],
+}
+
+
+def short_json(value):
+    """Render one JSON value on one line for an entry."""
+    return json.dumps(value, sort_keys=True)
+
+
+def render_rules_entry(label, stem):
+    """Render one clause or operator entry from text and verified output."""
+    out = [f"### `{label}`", ""]
+    text = read_text("rules", stem)
+    if text:
+        out.append(text)
+    else:
+        out.append(f"`{label}` names one rule SQL {label.split()[0].lower()}.")
+    out.append("")
+    syntax = RULES_SYNTAX.get(stem)
+    if syntax:
+        out.append(f"Syntax: {syntax}.")
+        out.append("")
+    record = read_verified("rules", stem)
+    if record and record.get("verified"):
+        cases = record.get("cases", [])
+        if cases:
+            first = cases[0]
+            out.append("Example (verified through `POST /api/v1/rules/test`):")
+            out.append("")
+            out.append("```sql no-test")
+            out.append("-- Comment: illustrative query. The verifier runs each case.")
+            out.append(first["sql"])
+            out.append("```")
+            out.append("")
+            out.append(
+                f"Input topic `{first['topic']}`, payload `{short_json(first['payload'])}`. "
+                f"The broker answered `matched: {short_json(first['matched'])}` "
+                f"with `projected: {short_json(first['projected'])}`."
+            )
+            for extra in cases[1:]:
+                if extra["sql"] != first["sql"]:
+                    out.append(
+                        f"Another run with `{extra['sql']}` on topic `{extra['topic']}` "
+                        f"with payload `{short_json(extra['payload'])}` "
+                        f"answered `matched: {short_json(extra['matched'])}`."
+                    )
+                else:
+                    out.append(
+                        f"Another run on topic `{extra['topic']}` "
+                        f"with payload `{short_json(extra['payload'])}` "
+                        f"answered `matched: {short_json(extra['matched'])}`."
+                    )
+            out.append("")
+            out.append(
+                f"Verified: `POST /api/v1/rules/test` exits 0. "
+                f"See `../_verified/rules/{stem}.json`."
+            )
+        else:
+            out.append(
+                f"Verified: `POST /api/v1/rules/test` exits 0. "
+                f"See `../_verified/rules/{stem}.json`."
+            )
+    else:
+        out.append(f"> **{NOT_VERIFIED}")
+    out.append("")
+    out.append("Notes:")
+    out.append("")
+    for note in RULES_NOTES.get(stem, []):
+        out.append(f"- {note}")
+    out.append("- Repeat the check with the same call against a live broker.")
+    out.append("")
+    return out
+
+
+def render_rules_page():
+    """Render the clauses and operators page from the three inputs."""
+    data = json.loads((INVENTORY / "rules.json").read_text(encoding="utf-8"))
+    clauses = list(data["clauses"])
+    operators = list(data["operators"])
+    ordered_clauses = [c for c in RULES_CLAUSE_ORDER if c in clauses]
+    ordered_clauses += sorted(c for c in clauses if c not in RULES_CLAUSE_ORDER)
+    ordered_operators = [o for o in RULES_OPERATOR_ORDER if o in operators]
+    ordered_operators += sorted(o for o in operators if o not in RULES_OPERATOR_ORDER)
+    out = [
+        "---",
+        "title: Rule clauses and operators",
+        "description: Verified entries for each rule SQL clause and operator.",
+        "sidebar:",
+        "  order: 44",
+        "---",
+        "",
+        "# Rule clauses and operators",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A clause shapes what a rule reads, keeps, groups, and returns. "
+        "An operator combines the tests inside `WHERE` and `HAVING`. "
+        "Use this page when a query surprises you. You get one entry "
+        "per clause and per operator, each with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Pub["publisher :1883"] -- "PUBLISH" --> From["FROM source"]',
+                '    From -- "row per message" --> Where["WHERE predicate"]',
+                '    Where -- "matched rows" --> Sel["SELECT projection"]',
+                '    Sel -- "one row" --> Act["republish action"]',
+                '    Sel -- "GROUP BY window" --> Agg["rule engine aggregate"]',
+                '    Agg -- "HAVING filter" --> Act',
+            ]
+        ),
+        "",
+        "Clauses run in a fixed order: `FROM` picks rows, `WHERE` keeps "
+        "rows, `GROUP BY` groups them, `HAVING` keeps groups, `SELECT` "
+        "shapes each result, `LIMIT` requests a row cap.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the full query shape.",
+        "- Send JSON payloads while you learn. Field access reads JSON keys.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Clauses",
+        "",
+        "| Clause | What it does |",
+        "|---|---|",
+    ]
+    for clause in ordered_clauses:
+        stem = rules_stem("clause", clause)
+        text = read_text("rules", stem)
+        first = text.split(".")[0] + "." if text else f"`{clause}` shapes a query."
+        out.append(f"| `{clause}` | {first} |")
+    out += [
+        "",
+        "## Operators",
+        "",
+        "| Operator | What it does |",
+        "|---|---|",
+    ]
+    for operator in ordered_operators:
+        stem = rules_stem("operator", operator)
+        text = read_text("rules", stem)
+        first = text.split(".")[0] + "." if text else f"`{operator}` combines tests."
+        out.append(f"| `{operator}` | {first} |")
+    out += ["", "## Clauses in detail", ""]
+    for clause in ordered_clauses:
+        out += render_rules_entry(f"clause {clause}", rules_stem("clause", clause))
+    out += ["## Operators in detail", ""]
+    for operator in ordered_operators:
+        out += render_rules_entry(
+            f"operator {operator}", rules_stem("operator", operator)
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- Shape payloads with [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -320,13 +569,7 @@ def area_counts(area):
     elif area == "mcp":
         ids = [t["name"] for t in data["tools"]]
     elif area == "rules":
-        ids = (
-            ["fn:" + f["name"] for f in data["functions"]]
-            + ["clause:" + c for c in data["clauses"]]
-            + ["op:" + o for o in data["operators"]]
-            + ["action:" + a for a in data["actions"]]
-            + ["event:" + e for e in data["events"]]
-        )
+        ids = [stem for _, stem in rules_inventory_ids()]
     elif area == "connectors":
         ids = [c["kind"] for c in data["connectors"]]
     elif area == "metrics":
@@ -355,6 +598,21 @@ def coverage(area=""):
         if name == "cli" and missing:
             print(f"coverage: cli misses {missing} items")
             code = 1
+        if name == "rules":
+            claimed_missing = 0
+            for label, stem in rules_inventory_ids():
+                if read_text(name, stem) is None:
+                    continue
+                if read_verified(name, stem):
+                    print(f"item={stem} verified")
+                elif failure_recorded(stem):
+                    print(f"item={stem} failed")
+                else:
+                    print(f"item={stem} missing")
+                    claimed_missing += 1
+            if claimed_missing:
+                print(f"coverage: rules misses {claimed_missing} claimed items")
+                code = 1
     return code
 
 
@@ -368,8 +626,28 @@ def main(argv):
     args = parser.parse_args(argv)
     if args.coverage:
         return coverage("" if args.area == "all" else args.area)
+    if args.area == "rules":
+        fresh = render_rules_page()
+        path = ROOT / "docs" / "rules" / "clauses-operators.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print("drift: docs/rules/clauses-operators.md is missing: run --write")
+                return 1
+            if have != fresh:
+                print("drift: docs/rules/clauses-operators.md differs: run --write")
+                return 1
+            print("entries match: docs/rules/clauses-operators.md")
+            return 0
+        parser.print_help()
+        return 2
     if args.area != "cli":
-        print("wave DX2 owns every area except cli")
+        print("wave DX2 owns every area except cli and rules")
         return 2
     fresh = render_cli_page()
     path = ROOT / "docs" / "reference" / "cli.md"

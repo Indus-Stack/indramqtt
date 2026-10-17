@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 95.0
+      },
+      "projected": {
+        "temperature": 95.0
+      },
+      "sql": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 80.0",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": null,
+      "sql": "SELECT temperature FROM \"sensors/+\" WHERE temperature > 80.0",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "clause-where",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,24 @@
+[example]
+area = "rules"
+item = "op-not"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE NOT temperature > 100'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"temperature": 72.5}'
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE NOT temperature > 100'
+topic = "sensors/kitchen"
+payload = '{"temperature": 150.0}'
+expect_matched = false
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE NOT temperature > 100'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"temperature": null}'

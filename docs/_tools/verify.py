@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run doc examples through the real entry. Capture output (DX-01).
+"""Run doc examples through the real entry. Capture output (DX-01, DX2).
 
 Read definitions from docs/_examples/<area>/<item>.toml.
 The input only names a command, a file plus an action,
@@ -12,6 +12,7 @@ no verified file for a failed item. Never edit an
 example to make it pass. Standard library only.
 Run from the workspace root:
   python3 docs/_tools/verify.py --area cli [--write]
+  python3 docs/_tools/verify.py --area rules [--write]
   python3 docs/_tools/verify.py --all [--write]
 Without --write, check only. It prints items, verified,
 failed. It fails when an item has no verified file and
@@ -21,9 +22,15 @@ import argparse
 import datetime
 import json
 import os
+import secrets
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 try:
@@ -76,9 +83,31 @@ def load_example(path):
         raise SystemExit("need Python 3.11 or newer for tomllib")
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     ex = data.get("example", {})
-    for key in ("area", "item", "kind", "binary", "args"):
+    for key in ("area", "item", "kind"):
         if key not in ex:
             raise SystemExit(f"{path}: example misses {key}")
+    if ex["kind"] == "rule-test":
+        cases = data.get("case", [])
+        if not cases:
+            raise SystemExit(f"{path}: rule-test needs at least one [[case]]")
+        for case in cases:
+            for key in ("sql", "topic", "payload", "expect_matched"):
+                if key not in case:
+                    raise SystemExit(f"{path}: case misses {key}")
+            try:
+                json.loads(case["payload"])
+            except ValueError:
+                raise SystemExit(f"{path}: case payload is not JSON")
+            if "expect_projected" in case:
+                try:
+                    json.loads(case["expect_projected"])
+                except ValueError:
+                    raise SystemExit(f"{path}: expect_projected is not JSON")
+        ex["cases"] = cases
+    else:
+        for key in ("binary", "args"):
+            if key not in ex:
+                raise SystemExit(f"{path}: example misses {key}")
     return ex
 
 
@@ -131,25 +160,216 @@ def verify_one(ex):
     return False, {"item": ex["item"], "error": f"unknown kind {kind}"}
 
 
+def free_port():
+    """Take one free loopback port. The caller binds it right away."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+class RuleBroker:
+    """One built broker for every rule-test example of a run."""
+
+    def __init__(self, binary):
+        self.binary = binary
+        self.key = "dxrule-" + secrets.token_hex(8)
+        self.tmp = tempfile.mkdtemp(prefix="dxrules-")
+        self.proc = None
+        self.api = None
+
+    def start(self):
+        """Boot the broker on free ports. Fail closed when it never answers."""
+        mqtt, tls, ws, wss, api = (free_port() for _ in range(5))
+        cluster, gossip, quic = (free_port() for _ in range(3))
+        cfg = Path(self.tmp) / "cfg"
+        (cfg / "conf.d").mkdir(parents=True)
+        (cfg / "indra.toml").write_text(
+            "[node]\n"
+            'id = "dxrules"\n'
+            "\n"
+            "[listeners.tcp]\n"
+            f'bind = "127.0.0.1:{mqtt}"\n'
+            "\n"
+            "[listeners.api]\n"
+            f'bind = "127.0.0.1:{api}"\n'
+            "\n"
+            "[logging]\n"
+            'level = "warn"\n'
+            "\n"
+            "[auth]\n"
+            "allow_anonymous = true\n",
+            encoding="utf-8",
+        )
+        (cfg / "conf.d" / "99-dxrules.toml").write_text(
+            "[node]\n"
+            f'data_dir = "{Path(self.tmp) / "data"}"\n'
+            "[listeners.tcp]\n"
+            f'bind = "127.0.0.1:{mqtt}"\n'
+            "[listeners.tls]\n"
+            f'bind = "127.0.0.1:{tls}"\n'
+            "[listeners.ws]\n"
+            f'bind = "127.0.0.1:{ws}"\n'
+            "[listeners.wss]\n"
+            f'bind = "127.0.0.1:{wss}"\n'
+            "[listeners.api]\n"
+            f'bind = "127.0.0.1:{api}"\n'
+            "[cluster]\n"
+            f'bind = "127.0.0.1:{cluster}"\n'
+            f'gossip_bind = "127.0.0.1:{gossip}"\n'
+            f'quic_bind = "127.0.0.1:{quic}"\n',
+            encoding="utf-8",
+        )
+        log = open(Path(self.tmp) / "broker.log", "w", encoding="utf-8")  # noqa: PTH123
+        env = dict(os.environ)
+        env["INDRA_API_KEYS"] = self.key
+        self.proc = subprocess.Popen(  # noqa: S603
+            [self.binary, "--config-dir", str(cfg)],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        self.api = api
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                sock = socket.create_connection(("127.0.0.1", api), timeout=2)
+                sock.sendall(b"GET /healthz HTTP/1.0\r\nHost: dxrules\r\n\r\n")
+                body = sock.makefile().read()
+                sock.close()
+                if body.strip().splitlines()[-1] == "OK":
+                    return
+            except OSError:
+                time.sleep(0.2)
+        raise SystemExit("rule broker never answered /healthz")
+
+    def dry_run(self, sql, topic, payload):
+        """Run one rule test call. Return (status, body dict or text)."""
+        data = json.dumps(
+            {"sql_query": sql, "topic": topic, "payload": payload}
+        ).encode()
+        req = urllib.request.Request(  # noqa: S310
+            f"http://127.0.0.1:{self.api}/api/v1/rules/test",
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.key}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:  # noqa: S310
+                return res.status, json.load(res)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()[:500]
+        except OSError as exc:
+            return -1, f"request failed: {exc}"[:300]
+
+    def stop(self):
+        """Stop the broker. Remove its directory."""
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self.proc = None
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+def verify_rule_test(ex, broker):
+    """Run every case of one rule example. Return (ok, record dict)."""
+    if broker is None:
+        return False, {"item": ex["item"], "error": "rule broker is missing"}
+    ran = []
+    for case in ex["cases"]:
+        payload = json.loads(case["payload"])
+        status, body = broker.dry_run(case["sql"], case["topic"], payload)
+        if status != 200 or not isinstance(body, dict):
+            return False, {
+                "item": ex["item"],
+                "error": f"rules/test gave {status}: {body}",
+                "sql": case["sql"],
+            }
+        matched = body.get("matched")
+        if matched != case["expect_matched"]:
+            return False, {
+                "item": ex["item"],
+                "error": (
+                    f"matched is {matched}, "
+                    f"wanted {case['expect_matched']}"
+                ),
+                "sql": case["sql"],
+            }
+        if "expect_projected" in case:
+            want = json.loads(case["expect_projected"])
+            if body.get("projected") != want:
+                return False, {
+                    "item": ex["item"],
+                    "error": (
+                        f"projected is {body.get('projected')}, "
+                        f"wanted {want}"
+                    ),
+                    "sql": case["sql"],
+                }
+        ran.append(
+            {
+                "sql": case["sql"],
+                "topic": case["topic"],
+                "payload": payload,
+                "matched": matched,
+                "projected": body.get("projected"),
+            }
+        )
+    return True, {
+        "item": ex["item"],
+        "request": "POST /api/v1/rules/test",
+        "returncode": 0,
+        "cases": ran,
+    }
+
+
 def failure_recorded(item):
     """Check whether failures.md already names this item."""
     try:
         text = FAILURES.read_text(encoding="utf-8")
     except OSError:
         return False
-    return f"DX-01 item `{item}`" in text
+    return (
+        f"DX-01 item `{item}`" in text or f"DX2-001 item `{item}`" in text
+    )
+
+
+def failure_marker(item):
+    """Name the wave task that owns one failure record."""
+    return "DX2-001" if item.startswith(("clause-", "op-")) else "DX-01"
 
 
 def append_failure(item, ex, record):
     """Add one failure record. Never edit an example."""
     day = datetime.date.today().isoformat()
-    block = (
-        f"\n## DX-01 item `{item}`\n\n"
-        f"- Input: `{ex.get('binary', '')} {' '.join(ex.get('args', []))}`.\n"
-        f"- Expected: exit 0 with `{ex.get('match', 'help text')}` in `--help`.\n"
-        f"- Broker gave: `{record.get('error', record)}`.\n"
-        f"- Date: {day}.\n"
-    )
+    task = failure_marker(item)
+    if ex.get("kind") == "rule-test":
+        inputs = "; ".join(
+            f"rules/test `{c.get('sql', '')}` on `{c.get('topic', '')}`"
+            for c in ex.get("cases", [])
+        )
+        block = (
+            f"\n## {task} item `{item}`\n\n"
+            f"- Input: {inputs}.\n"
+            f"- Expected: the cased match results in the example.\n"
+            f"- Broker gave: `{record.get('error', record)}`.\n"
+            f"- Date: {day}.\n"
+        )
+    else:
+        block = (
+            f"\n## {task} item `{item}`\n\n"
+            f"- Input: `{ex.get('binary', '')} {' '.join(ex.get('args', []))}`.\n"
+            f"- Expected: exit 0 with `{ex.get('match', 'help text')}` in `--help`.\n"
+            f"- Broker gave: `{record.get('error', record)}`.\n"
+            f"- Date: {day}.\n"
+        )
     with FAILURES.open("a", encoding="utf-8") as handle:
         handle.write(block)
 
@@ -161,28 +381,51 @@ def run_area(area, write):
     if not area_dir.is_dir():
         print(f"area {area} has no examples")
         return 1
-    for path in sorted(area_dir.glob("*.toml")):
-        items += 1
-        ex = load_example(path)
-        ok, record = verify_one(ex)
-        target = VERIFIED / area / (path.stem + ".json")
-        if ok:
-            verified += 1
-            if write:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                record["verified"] = True
-                target.write_text(
-                    json.dumps(record, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8",
-                )
-        else:
-            failed += 1
-            if write:
-                if target.is_file():
-                    target.unlink()
-                if not failure_recorded(ex["item"]):
-                    append_failure(ex["item"], ex, record)
-    print(f"area={area} items={items} verified={verified} failed={failed}")
+    broker = None
+    if area == "rules":
+        binary = find_binary("indramqtt")
+        if binary is None:
+            print("area=rules items=0 verified=0 failed=0")
+            print("missing: rule broker binary is missing")
+            return 1
+        broker = RuleBroker(binary)
+        try:
+            broker.start()
+        except SystemExit as exc:
+            print(f"area=rules items=0 verified=0 failed=0\nbroker: {exc}")
+            broker.stop()
+            return 1
+    try:
+        for path in sorted(area_dir.glob("*.toml")):
+            items += 1
+            ex = load_example(path)
+            if ex["kind"] == "rule-test":
+                ok, record = verify_rule_test(ex, broker)
+            else:
+                ok, record = verify_one(ex)
+            target = VERIFIED / area / (path.stem + ".json")
+            if ok:
+                verified += 1
+                if write:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    record["verified"] = True
+                    target.write_text(
+                        json.dumps(record, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+            else:
+                failed += 1
+                if write:
+                    if target.is_file():
+                        target.unlink()
+                    if not failure_recorded(ex["item"]):
+                        append_failure(ex["item"], ex, record)
+                else:
+                    print(f"failed: {ex['item']}: {record.get('error', record)}")
+        print(f"area={area} items={items} verified={verified} failed={failed}")
+    finally:
+        if broker is not None:
+            broker.stop()
     # Fail when an item has neither a verified file nor a record.
     missing = 0
     for path in sorted(area_dir.glob("*.toml")):

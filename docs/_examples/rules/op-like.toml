@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "op-like"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT device FROM \"sensors/+\" WHERE device LIKE 'kit%'"
+topic = "sensors/kitchen"
+payload = '{"device": "kitchen-1"}'
+expect_matched = true
+expect_projected = '{"device": "kitchen-1"}'
+
+[[case]]
+sql = "SELECT device FROM \"sensors/+\" WHERE device LIKE 'KIT%'"
+topic = "sensors/kitchen"
+payload = '{"device": "kitchen-1"}'
+expect_matched = false

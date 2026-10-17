@@ -31,6 +31,7 @@ flowchart LR
 | Page | What it covers |
 |---|---|
 | [Rule SQL](./sql.md) | `SELECT`, `FROM`, `WHERE`, `FOREACH`, `CASE`, operators, event sources, windows. |
+| [Clauses and operators](./clauses-operators.md) | One verified entry per SQL clause and operator. |
 | [Functions](./functions.md) | Every built-in function by group, with call shape and arity. |
 | [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
 

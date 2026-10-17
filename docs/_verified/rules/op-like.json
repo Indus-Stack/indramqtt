@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "device": "kitchen-1"
+      },
+      "projected": {
+        "device": "kitchen-1"
+      },
+      "sql": "SELECT device FROM \"sensors/+\" WHERE device LIKE 'kit%'",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "device": "kitchen-1"
+      },
+      "projected": null,
+      "sql": "SELECT device FROM \"sensors/+\" WHERE device LIKE 'KIT%'",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "op-like",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

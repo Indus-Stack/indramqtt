@@ -191,8 +191,8 @@ fn rewrite_binds(text: &str, binds: Binds) -> String {
 
 /// Wait until the health endpoint answers `OK`.
 /// Wait 30 seconds for boot. Parallel gates load the host.
-/// Slow boot still passes.
-fn wait_for_boot(api_port: u16) {
+/// Slow boot still passes. Return true on success.
+fn wait_for_boot(api_port: u16) -> bool {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", api_port)) {
@@ -203,16 +203,17 @@ fn wait_for_boot(api_port: u16) {
             let mut body = String::new();
             if stream.read_to_string(&mut body).is_ok() && body.lines().last().unwrap_or("") == "OK"
             {
-                return;
+                return true;
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("broker never answered on API port {api_port}");
+    false
 }
 
-/// Start the broker with one page configuration.
-fn start_broker(toml: &str) -> Broker {
+/// Start one broker attempt with fresh ports. Return the broker on success.
+/// Return none when the broker never answers or exits at once.
+fn try_start_broker(toml: &str) -> Option<Broker> {
     let work = tempfile::TempDir::new().expect("temp dir");
     let cfg = work.path().join("cfg");
     std::fs::create_dir_all(cfg.join("conf.d")).expect("config dir");
@@ -278,20 +279,39 @@ fn start_broker(toml: &str) -> Broker {
         .stderr(Stdio::from(errors))
         .spawn()
         .expect("start broker");
-    wait_for_boot(ports[4]);
-    if child.try_wait().expect("poll broker").is_some() {
-        panic!(
-            "broker exited at once; see {}/broker.log",
-            work.path().display()
-        );
+    let api = ports[4];
+    let mqtt = ports[0];
+    if !wait_for_boot(api) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
     }
-    Broker {
+    if child.try_wait().expect("poll broker").is_some() {
+        let _ = child.wait();
+        return None;
+    }
+    Some(Broker {
         child,
         _work: work,
         cfg,
-        mqtt: ports[0],
-        api: ports[4],
+        mqtt,
+        api,
+    })
+}
+
+/// Start the broker with one page configuration.
+/// Take fresh ports on each retry. Parallel tests steal ports.
+/// Retry three times, then fail.
+fn start_broker(toml: &str) -> Broker {
+    for attempt in 1..=3 {
+        if let Some(broker) = try_start_broker(toml) {
+            return broker;
+        }
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
+    panic!("broker never answered on API port after 3 attempts");
 }
 
 /// Run one `sh test` block. Compare with the `output` block after it.

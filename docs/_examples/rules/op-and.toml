@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "op-and"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE temperature > 60 AND temperature < 80'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"temperature": 72.5}'
+
+[[case]]
+sql = 'SELECT temperature FROM "sensors/+" WHERE temperature > 60 AND temperature < 80'
+topic = "sensors/kitchen"
+payload = '{"temperature": 95.0}'
+expect_matched = false

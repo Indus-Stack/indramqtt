@@ -1,0 +1,30 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "temperature": 72.5
+      },
+      "sql": "SELECT temperature FROM \"sensors/+\" LIMIT 10",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temperature": 72.5
+      },
+      "projected": {
+        "temperature": 72.5
+      },
+      "sql": "SELECT temperature FROM \"sensors/+\" LIMIT 0",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "clause-limit",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}
