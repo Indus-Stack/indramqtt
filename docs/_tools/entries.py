@@ -17,6 +17,8 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --write --area rules-functions
   python3 docs/_tools/entries.py --check --area rules-functions
   python3 docs/_tools/entries.py --write --area rules-math-bitwise
+  python3 docs/_tools/entries.py --write --area rules-bits-bytes
+  python3 docs/_tools/entries.py --check --area rules-bits-bytes
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -707,6 +709,37 @@ RULES_MATH_BITWISE_NOTES = {
     ],
 }
 
+# Display order of the DX2-004 function entries (bit and byte).
+RULES_BITS_BYTES_FUNCTIONS = ["bitsize", "bytesize", "subbits"]
+
+# One signature line per DX2-004 stem, taken from the broker code.
+RULES_BITS_BYTES_SYNTAX = {
+    "fn-bitsize": "`bitsize(<b>)`",
+    "fn-bytesize": "`bytesize(<b>)`",
+    "fn-subbits": (
+        "`subbits(<b>, <len>)`, `subbits(<b>, <start>, <len>)`, or "
+        "`subbits(<b>, <start>, <len>, <type>, <signedness>, <endianness>)`"
+    ),
+}
+
+# Extra note lines per DX2-004 stem. Each states an observed limit.
+RULES_BITS_BYTES_NOTES = {
+    "fn-bitsize": [
+        "The measure is the UTF-8 byte length of the string times 8.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-bytesize": [
+        "The measure is the UTF-8 byte length of the string. A multi-byte character counts as more than one byte.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-subbits": [
+        "Bits run most significant first inside each byte. Start is 1-based.",
+        "The type accepts `integer`, `float`, and `bits`. The signedness accepts `signed` and `unsigned`. The endianness accepts `big` and `little`.",
+        "An integer or float slice wider than 64 bits returns null. A `float` slice that is not 32 or 64 bits wide returns null.",
+        "A `bits` slice returns a base64 string of the covered bytes. A wrong argument count returns null.",
+    ],
+}
+
 
 def render_rule_function_entry(name, stem, syntax_map, notes_map, default_line):
     """Render one rule function entry from text and verified output."""
@@ -925,6 +958,82 @@ def render_rules_math_bitwise_page():
     return "\n".join(out) + "\n"
 
 
+def render_rules_bits_bytes_page():
+    """Render the bit and byte function page (DX2-004)."""
+    out = [
+        "---",
+        "title: Rule functions: bit and byte",
+        "description: Verified entries for the bit and byte functions.",
+        "sidebar:",
+        "  order: 47",
+        "---",
+        "",
+        "# Rule functions: bit and byte",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A bit and byte function measures a string or reads bits out of "
+        "it. Use this page when a rule must size a payload field or "
+        "decode a packed field. You get one entry per function, each "
+        "with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Str["string value"] -- "bytesize" --> N["byte count"]',
+                '    Str -- "bitsize" --> B["bit count"]',
+                '    Str -- "subbits start len" --> Slice["integer or base64"]',
+                '    N -- "SELECT AS" --> Sel["result column"]',
+                '    B -- "SELECT AS" --> Sel',
+                '    Slice -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A wrong argument count reads as null. A non-string first "
+        "argument reads as null. A value outside the accepted set of "
+        "an argument reads as null. A null value never stops the rule.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_BITS_BYTES_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` works on a string value."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_BITS_BYTES_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_BITS_BYTES_SYNTAX,
+            RULES_BITS_BYTES_NOTES,
+            "`{name}` works on a string value.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -1059,6 +1168,32 @@ def main(argv):
                 )
                 return 1
             print("entries match: docs/rules/functions-math-bitwise.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-bits-bytes":
+        fresh = render_rules_bits_bytes_page()
+        path = ROOT / "docs" / "rules" / "functions-bits-bytes.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-bits-bytes.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-bits-bytes.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-bits-bytes.md")
             return 0
         parser.print_help()
         return 2

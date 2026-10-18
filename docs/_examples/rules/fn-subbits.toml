@@ -1,0 +1,46 @@
+[example]
+area = "rules"
+item = "fn-subbits"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT subbits('A', 8) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 65}'
+
+[[case]]
+sql = "SELECT subbits('A', 1, 8) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 65}'
+
+[[case]]
+sql = "SELECT subbits('A', 2, 7) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 65}'
+
+[[case]]
+sql = "SELECT subbits('A', 9, 8) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 0}'
+
+[[case]]
+sql = "SELECT subbits('A', 99, 8) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT subbits('AB', 1, 8, 'bits') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "QQ=="}'

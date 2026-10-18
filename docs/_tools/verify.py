@@ -371,6 +371,14 @@ DX2_003_ITEMS = {
 }
 
 
+# Rule function stems owned by DX2-004 (bit and byte).
+DX2_004_ITEMS = {
+    "fn-bitsize",
+    "fn-bytesize",
+    "fn-subbits",
+}
+
+
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
     if item.startswith(("clause-", "op-")):
@@ -379,6 +387,8 @@ def failure_marker(item):
         return "DX2-002"
     if item in DX2_003_ITEMS:
         return "DX2-003"
+    if item in DX2_004_ITEMS:
+        return "DX2-004"
     return "DX-01"
 
 

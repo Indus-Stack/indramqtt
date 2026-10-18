@@ -1,0 +1,32 @@
+[example]
+area = "rules"
+item = "fn-bytesize"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT bytesize('abc') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 3}'
+
+[[case]]
+sql = "SELECT bytesize('é') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 2}'
+
+[[case]]
+sql = "SELECT bytesize('') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 0}'
+
+[[case]]
+sql = 'SELECT bytesize(1) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

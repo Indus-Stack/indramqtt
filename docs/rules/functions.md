@@ -360,9 +360,9 @@ These broker functions read the current message and client. They take no payload
 | `bin2hexstr` | Bytes to hex text. | `bin2hexstr(bytes)` |
 | `hexstr2bin` | Hex text to bytes. | `hexstr2bin('4142')` |
 | `sqlserver_bin2hexstr` | Bytes to SQL Server hex text. | `sqlserver_bin2hexstr(bytes)` |
-| `bitsize` | Bit length of a value. | `bitsize(255)` |
-| `bytesize` | Byte length of a value. | `bytesize('abc')` |
-| `subbits` | Bit slice of a value. | `subbits(255, 0, 4)` |
+| `bitsize` | Bit length of a string. | `bitsize('abc')` |
+| `bytesize` | Byte length of a string. | `bytesize('abc')` |
+| `subbits` | Bit slice of a string. | `subbits('A', 1, 8)` |
 | `bitsl` | Shift bits left. | `bitsl(1, 3)` |
 | `bitsr` | Shift bits right. | `bitsr(8, 2)` |
 | `acosh` | Inverse hyperbolic cosine. | `acosh(1)` |
