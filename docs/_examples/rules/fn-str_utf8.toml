@@ -1,0 +1,32 @@
+[example]
+area = "rules"
+item = "fn-str_utf8"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT str_utf8(7) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "7"}'
+
+[[case]]
+sql = "SELECT str_utf8('héllo') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "héllo"}'
+
+[[case]]
+sql = "SELECT str_utf8(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT str_utf8() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

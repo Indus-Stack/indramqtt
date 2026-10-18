@@ -19,6 +19,8 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --write --area rules-math-bitwise
   python3 docs/_tools/entries.py --write --area rules-bits-bytes
   python3 docs/_tools/entries.py --check --area rules-bits-bytes
+  python3 docs/_tools/entries.py --write --area rules-type-conversion
+  python3 docs/_tools/entries.py --check --area rules-type-conversion
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -740,6 +742,85 @@ RULES_BITS_BYTES_NOTES = {
     ],
 }
 
+# Display order of the DX2-005 function entries (type conversion).
+RULES_TYPE_CONVERSION_FUNCTIONS = [
+    "str",
+    "str_utf8",
+    "str_utf16_le",
+    "bool",
+    "int",
+    "float",
+    "float2str",
+    "map",
+    "bin2hexstr",
+    "hexstr2bin",
+    "sqlserver_bin2hexstr",
+]
+
+# One signature line per DX2-005 stem, taken from the broker code.
+RULES_TYPE_CONVERSION_SYNTAX = {
+    "fn-str": "`str(<v>)`",
+    "fn-str_utf8": "`str_utf8(<v>)`",
+    "fn-str_utf16_le": "`str_utf16_le(<v>)`",
+    "fn-bool": "`bool(<v>)`",
+    "fn-int": "`int(<v>)`",
+    "fn-float": "`float(<v>)` or `float(<v>, <decimals>)`",
+    "fn-float2str": "`float2str(<f>, <precision>)`",
+    "fn-map": "`map(<v>)`",
+    "fn-bin2hexstr": "`bin2hexstr(<b>)` or `bin2hexstr(<b>, <prefix>)`",
+    "fn-hexstr2bin": "`hexstr2bin(<s>)` or `hexstr2bin(<s>, <prefix>)`",
+    "fn-sqlserver_bin2hexstr": "`sqlserver_bin2hexstr(<b>)`",
+}
+
+# Extra note lines per DX2-005 stem. Each states an observed limit.
+RULES_TYPE_CONVERSION_NOTES = {
+    "fn-str": [
+        "A number or a boolean renders as plain text. An array or an object renders as JSON text.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-str_utf8": [
+        "The call is the same as `str(<v>)`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-str_utf16_le": [
+        "The result is base64 text of the UTF-16LE bytes. An empty string reads as `\"\"`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-bool": [
+        "Only `true`/`false`, the numbers `1`/`0`, and the texts `true`, `false`, `1`, `0` convert. Every other value returns null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-int": [
+        "A float truncates toward zero. A numeric text parses. A boolean reads as 1 or 0.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-float": [
+        "The second argument rounds the result to `decimals` places. `decimals` runs from 0 to 20.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-float2str": [
+        "The result holds exactly `precision` decimals. `precision` runs from 0 to 20; a value outside that range returns null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-map": [
+        "JSON text that holds an object, or a list of `[key, value]` pairs, reads as an object. A key that is not a text returns null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-bin2hexstr": [
+        "Each byte becomes two upper-case hex digits. The second argument prepends a prefix.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-hexstr2bin": [
+        "The text must hold hex digit pairs. The decoded bytes must form valid UTF-8 text.",
+        "A missing prefix, an odd length, a non-hex digit, or non-UTF-8 bytes return null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-sqlserver_bin2hexstr": [
+        "It is `bin2hexstr(<b>, '0x')` under another name. An empty string reads as `0x`.",
+        "A wrong argument count returns null.",
+    ],
+}
+
 
 def render_rule_function_entry(name, stem, syntax_map, notes_map, default_line):
     """Render one rule function entry from text and verified output."""
@@ -1034,6 +1115,81 @@ def render_rules_bits_bytes_page():
     return "\n".join(out) + "\n"
 
 
+def render_rules_type_conversion_page():
+    """Render the type conversion function page (DX2-005)."""
+    out = [
+        "---",
+        "title: Rule functions: type conversion",
+        "description: Verified entries for the type conversion functions.",
+        "sidebar:",
+        "  order: 48",
+        "---",
+        "",
+        "# Rule functions: type conversion",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A type conversion function reads one value and returns another "
+        "type. Use this page when a rule must change the type of a "
+        "payload field before it stores or forwards it. You get one "
+        "entry per function, each with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    In["value"] -- "str or float" --> Num["text or number"]',
+                '    M["pair list"] -- "map" --> Obj["object"]',
+                '    Hex["hex text"] -- "hexstr2bin" --> Str["string"]',
+                '    Str -- "bin2hexstr" --> Hex',
+                '    Num -- "SELECT AS" --> Sel["result column"]',
+                '    Obj -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A wrong argument count reads as null. A value the call cannot "
+        "convert reads as null. A null value never stops the rule.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_TYPE_CONVERSION_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` converts a value."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_TYPE_CONVERSION_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_TYPE_CONVERSION_SYNTAX,
+            RULES_TYPE_CONVERSION_NOTES,
+            "`{name}` converts a value to another type.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -1194,6 +1350,32 @@ def main(argv):
                 )
                 return 1
             print("entries match: docs/rules/functions-bits-bytes.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-type-conversion":
+        fresh = render_rules_type_conversion_page()
+        path = ROOT / "docs" / "rules" / "functions-type-conversion.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-type-conversion.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-type-conversion.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-type-conversion.md")
             return 0
         parser.print_help()
         return 2

@@ -379,6 +379,22 @@ DX2_004_ITEMS = {
 }
 
 
+# Rule function stems owned by DX2-005 (type conversion).
+DX2_005_ITEMS = {
+    "fn-bin2hexstr",
+    "fn-bool",
+    "fn-float",
+    "fn-float2str",
+    "fn-hexstr2bin",
+    "fn-int",
+    "fn-map",
+    "fn-sqlserver_bin2hexstr",
+    "fn-str",
+    "fn-str_utf16_le",
+    "fn-str_utf8",
+}
+
+
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
     if item.startswith(("clause-", "op-")):
@@ -389,6 +405,8 @@ def failure_marker(item):
         return "DX2-003"
     if item in DX2_004_ITEMS:
         return "DX2-004"
+    if item in DX2_005_ITEMS:
+        return "DX2-005"
     return "DX-01"
 
 

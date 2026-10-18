@@ -1,0 +1,39 @@
+[example]
+area = "rules"
+item = "fn-str_utf16_le"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT str_utf16_le('A') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "QQA="}'
+
+[[case]]
+sql = "SELECT str_utf16_le('é') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "6QA="}'
+
+[[case]]
+sql = "SELECT str_utf16_le('') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": ""}'
+
+[[case]]
+sql = "SELECT str_utf16_le(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT str_utf16_le() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

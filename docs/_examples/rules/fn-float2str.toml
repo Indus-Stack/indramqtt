@@ -1,0 +1,39 @@
+[example]
+area = "rules"
+item = "fn-float2str"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT float2str(2.567, 2) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "2.57"}'
+
+[[case]]
+sql = "SELECT float2str(42, 3) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "42.000"}'
+
+[[case]]
+sql = "SELECT float2str(2.5, 0) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "2"}'
+
+[[case]]
+sql = "SELECT float2str(1.0, 99) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT float2str() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

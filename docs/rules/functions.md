@@ -315,13 +315,13 @@ These broker functions read the current message and client. They take no payload
 | `div` | Integer division. | `div(7, 2)` |
 | `fmod` | Float remainder. | `fmod(7.5, 2)` |
 | `str` | Value to string. | `str(42)` |
-| `str_utf8` | Bytes to UTF-8 text. | `str_utf8(bytes)` |
-| `str_utf16_le` | Bytes to UTF-16LE text. | `str_utf16_le(bytes)` |
+| `str_utf8` | Value to UTF-8 text. | `str_utf8(7)` |
+| `str_utf16_le` | Value to base64 UTF-16LE text. | `str_utf16_le('A')` |
 | `bool` | Value to boolean. | `bool(1)` |
 | `int` | Value to integer. | `int('42')` |
-| `float` | Value to float. | `float('4.2')` |
-| `float2str` | Float to plain text. | `float2str(4.2)` |
-| `map` | Pairs to an object. | `map('a', 1)` |
+| `float` | Value to float. | `float('2.5')` |
+| `float2str` | Number to fixed-precision text. | `float2str(2.567, 2)` |
+| `map` | JSON text or pair list to an object. | `map('{"a":1}')` |
 | `is_null`, `is_null_var` | Whether the value is null. | `is_null(a)` |
 | `is_not_null`, `is_not_null_var` | Whether the value is not null. | `is_not_null(a)` |
 | `is_str` | Whether the value is text. | `is_str(a)` |
@@ -357,9 +357,9 @@ These broker functions read the current message and client. They take no payload
 | `unescape` | Unescape text escapes. | `unescape('a\\nb')` |
 | `rm_prefix` | Remove a leading prefix. | `rm_prefix('sensors/01', 'sensors/')` |
 | `rtrim` | Strip trailing characters. | `rtrim('ab  ')` |
-| `bin2hexstr` | Bytes to hex text. | `bin2hexstr(bytes)` |
-| `hexstr2bin` | Hex text to bytes. | `hexstr2bin('4142')` |
-| `sqlserver_bin2hexstr` | Bytes to SQL Server hex text. | `sqlserver_bin2hexstr(bytes)` |
+| `bin2hexstr` | String to upper-case hex text. | `bin2hexstr('AB')` |
+| `hexstr2bin` | Hex text to string. | `hexstr2bin('4142')` |
+| `sqlserver_bin2hexstr` | String to `0x` hex text. | `sqlserver_bin2hexstr('AB')` |
 | `bitsize` | Bit length of a string. | `bitsize('abc')` |
 | `bytesize` | Byte length of a string. | `bytesize('abc')` |
 | `subbits` | Bit slice of a string. | `subbits('A', 1, 8)` |
