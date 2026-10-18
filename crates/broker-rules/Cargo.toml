@@ -15,10 +15,10 @@ bytes = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }
 parking_lot = { workspace = true }
-rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "65b53c63b83ded3d15716ba54180f175c4e6a8b8" }
+rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "8fb603153bd53593c5b9949c2b70f5376ec344fa" }
 # Same revision as rekuiper-sql: only the public user-function registry is
 # used (no engine behaviour is changed by this dependency).
-rekuiper-core = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "65b53c63b83ded3d15716ba54180f175c4e6a8b8" }
+rekuiper-core = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "8fb603153bd53593c5b9949c2b70f5376ec344fa" }
 # Pinned to the revision DEP-01 sets (rule engine with sqlx 0.8 and a
 # maintained YAML library); moving to a newer revision is a separate,
 # reviewed task.
