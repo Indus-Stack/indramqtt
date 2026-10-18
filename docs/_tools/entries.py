@@ -14,6 +14,9 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --write --area rules
   python3 docs/_tools/entries.py --check --area rules
   python3 docs/_tools/entries.py --coverage --area rules
+  python3 docs/_tools/entries.py --write --area rules-functions
+  python3 docs/_tools/entries.py --check --area rules-functions
+  python3 docs/_tools/entries.py --write --area rules-math-bitwise
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -668,16 +671,53 @@ def render_rules_page():
     return "\n".join(out) + "\n"
 
 
-def render_rules_function_entry(name, stem):
-    """Render one message context function entry (DX2-002)."""
+# Display order of the DX2-003 function entries (math and bitwise).
+RULES_MATH_BITWISE_FUNCTIONS = ["acosh", "asinh", "atanh", "bitsl", "bitsr"]
+
+# One signature line per DX2-003 stem, taken from the broker code.
+RULES_MATH_BITWISE_SYNTAX = {
+    "fn-acosh": "`acosh(<x>)`",
+    "fn-asinh": "`asinh(<x>)`",
+    "fn-atanh": "`atanh(<x>)`",
+    "fn-bitsl": "`bitsl(<x>, <n>)`",
+    "fn-bitsr": "`bitsr(<x>, <n>)`",
+}
+
+# Extra note lines per DX2-003 stem. Each states an observed limit.
+RULES_MATH_BITWISE_NOTES = {
+    "fn-acosh": [
+        "The function is the inverse of `cosh`. The domain is `x >= 1`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-asinh": [
+        "The domain is every real number.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-atanh": [
+        "The domain is `-1 < x < 1`. The two bounds read as null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-bitsl": [
+        "The shift count runs from 0 to 63. An overflowing shift wraps; it does not read as null.",
+        "A fractional argument truncates toward zero. A wrong argument count returns null.",
+    ],
+    "fn-bitsr": [
+        "The shift keeps the sign. `bitsr(-8, 1)` is -4.",
+        "A shift count outside 0 to 63 reads as null. A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rule_function_entry(name, stem, syntax_map, notes_map, default_line):
+    """Render one rule function entry from text and verified output."""
     out = [f"### `{name}`", ""]
     text = read_text("rules", stem)
     if text:
         out.append(text)
     else:
-        out.append(f"`{name}` reads the current message context.")
+        out.append(default_line.format(name=name))
     out.append("")
-    syntax = RULES_CONTEXT_SYNTAX.get(stem)
+    syntax = syntax_map.get(stem)
     if syntax:
         out.append(f"Signature: {syntax}.")
         out.append("")
@@ -730,7 +770,7 @@ def render_rules_function_entry(name, stem):
     out.append("")
     out.append("Notes:")
     out.append("")
-    for note in RULES_CONTEXT_NOTES.get(stem, []):
+    for note in notes_map.get(stem, []):
         out.append(f"- {note}")
     out.append("- Repeat the check with the same call against a live broker.")
     out.append("")
@@ -795,7 +835,86 @@ def render_rules_functions_page():
         out.append(f"| `{name}` | {first} |")
     out += ["", "## Functions in detail", ""]
     for name in RULES_CONTEXT_FUNCTIONS:
-        out += render_rules_function_entry(name, rules_stem("function", name))
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_CONTEXT_SYNTAX,
+            RULES_CONTEXT_NOTES,
+            "`{name}` reads the current message context.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
+def render_rules_math_bitwise_page():
+    """Render the math and bitwise function page (DX2-003)."""
+    out = [
+        "---",
+        "title: Rule functions: math and bitwise",
+        "description: Verified entries for the math and bitwise functions.",
+        "sidebar:",
+        "  order: 46",
+        "---",
+        "",
+        "# Rule functions: math and bitwise",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A math function computes a numeric value from its arguments. "
+        "A bitwise function shifts the bits of an integer. Use this page "
+        "when a rule must compute a value on the message path. You get one "
+        "entry per function, each with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    In["payload number"] -- "math call" --> Val["float value"]',
+                '    Int["integer"] -- "bitwise shift" --> Bits["integer value"]',
+                '    Val -- "SELECT AS" --> Sel["result column"]',
+                '    Bits -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A wrong argument count reads as null. A value outside the domain "
+        "of the function reads as null. A null value never stops the rule.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_MATH_BITWISE_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` transforms a value."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_MATH_BITWISE_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_MATH_BITWISE_SYNTAX,
+            RULES_MATH_BITWISE_NOTES,
+            "`{name}` transforms a value.",
+        )
     out += [
         "## Next steps",
         "",
@@ -914,6 +1033,32 @@ def main(argv):
                 print("drift: docs/rules/functions-context.md differs: run --write")
                 return 1
             print("entries match: docs/rules/functions-context.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-math-bitwise":
+        fresh = render_rules_math_bitwise_page()
+        path = ROOT / "docs" / "rules" / "functions-math-bitwise.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-math-bitwise.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-math-bitwise.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-math-bitwise.md")
             return 0
         parser.print_help()
         return 2

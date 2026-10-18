@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-acosh"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT acosh(2.0) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 1.3169578969248166}'
+
+[[case]]
+sql = 'SELECT acosh(0.5) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

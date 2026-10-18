@@ -361,12 +361,24 @@ def failure_recorded(item):
     return f"item `{item}`" in text
 
 
+# Rule function stems owned by DX2-003 (math and bitwise).
+DX2_003_ITEMS = {
+    "fn-acosh",
+    "fn-asinh",
+    "fn-atanh",
+    "fn-bitsl",
+    "fn-bitsr",
+}
+
+
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
     if item.startswith(("clause-", "op-")):
         return "DX2-001"
     if item in DX2_002_ITEMS:
         return "DX2-002"
+    if item in DX2_003_ITEMS:
+        return "DX2-003"
     return "DX-01"
 
 

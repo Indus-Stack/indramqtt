@@ -34,6 +34,7 @@ flowchart LR
 | [Clauses and operators](./clauses-operators.md) | One verified entry per SQL clause and operator. |
 | [Functions](./functions.md) | Every built-in function by group, with call shape and arity. |
 | [Message context functions](./functions-context.md) | One verified entry per message context accessor. |
+| [Math and bitwise functions](./functions-math-bitwise.md) | One verified entry per math and bitwise function. |
 | [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
 
 > [!NOTE]

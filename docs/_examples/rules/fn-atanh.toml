@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-atanh"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT atanh(0.5) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 0.5493061443340548}'
+
+[[case]]
+sql = 'SELECT atanh(1.0) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
