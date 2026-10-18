@@ -602,6 +602,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "true",
                 range: "true | false",
                 doc: "Whether the MCP endpoint on the management listener serves tool calls.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "mcp.read_only",
@@ -609,6 +610,7 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 default: "false",
                 range: "true | false",
                 doc: "Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available.",
+            requires_restart: None,
             },
             FieldDoc {
                 path: "gateway.coap_bind",
