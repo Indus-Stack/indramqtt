@@ -79,9 +79,7 @@ def failure_recorded(item):
         text = FAILURES.read_text(encoding="utf-8")
     except OSError:
         return False
-    return (
-        f"DX-01 item `{item}`" in text or f"DX2-001 item `{item}`" in text
-    )
+    return f"item `{item}`" in text
 
 
 def verified_line(area, item, record):
@@ -213,7 +211,7 @@ def render_cli_page():
         if record:
             out.append(verified_line("cli", item, record))
         else:
-            out.append(f"> **{NOT_VERIFIED}")
+            out.append(f"> **{NOT_VERIFIED}**")
         out.append("")
         out.append("Notes:")
         out.append("")
@@ -275,7 +273,7 @@ def render_cli_page():
         if record:
             out.append(verified_line("cli", item, record))
         else:
-            out.append(f"> **{NOT_VERIFIED}")
+            out.append(f"> **{NOT_VERIFIED}**")
         out.append("")
         out.append("Notes:")
         out.append("")
@@ -299,7 +297,7 @@ def render_cli_page():
         if record:
             out.append(verified_line("cli", item, record))
         else:
-            out.append(f"> **{NOT_VERIFIED}")
+            out.append(f"> **{NOT_VERIFIED}**")
         out.append("")
     out.append(gen.check_section("CLI"))
     out.append(
@@ -395,6 +393,119 @@ RULES_NOTES = {
     ],
 }
 
+# Display order of the message context function entries (DX2-002).
+RULES_CONTEXT_FUNCTIONS = [
+    "msgid",
+    "qos",
+    "flags",
+    "flag",
+    "topic",
+    "clientid",
+    "clientip",
+    "peerhost",
+    "username",
+    "payload",
+    "contains_topic",
+    "contains_topic_match",
+    "topic_match",
+    "null",
+    "coalesce_ne",
+    "div",
+    "fmod",
+]
+
+# One syntax line per DX2-002 function stem, taken from the broker code.
+RULES_CONTEXT_SYNTAX = {
+    "fn-msgid": "`msgid()`",
+    "fn-qos": "`qos()`",
+    "fn-flags": "`flags()`",
+    "fn-flag": "`flag('<name>')`",
+    "fn-topic": "`topic()` or `topic(<level>)`",
+    "fn-clientid": "`clientid()`",
+    "fn-clientip": "`clientip()`",
+    "fn-peerhost": "`peerhost()`",
+    "fn-username": "`username()`",
+    "fn-payload": "`payload()` or `payload('<json path>')`",
+    "fn-contains_topic": "`contains_topic(<filters>, <topic> [, <qos>])`",
+    "fn-contains_topic_match": "`contains_topic_match(<filters>, <topic> [, <qos>])`",
+    "fn-topic_match": "`topic_match('<topic>', '<filter>')`",
+    "fn-null": "`null()`",
+    "fn-coalesce_ne": "`coalesce_ne(<value>, ...)`",
+    "fn-div": "`div(<x>, <y>)`",
+    "fn-fmod": "`fmod(<x>, <y>)`",
+}
+
+# Extra note lines per DX2-002 function stem. Each states a limit the code sets.
+RULES_CONTEXT_NOTES = {
+    "fn-msgid": [
+        "The id comes from the message. The SQL studio has no live message, so the sample payload field `id` supplies it.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-qos": [
+        "The value comes from the message. The SQL studio has no live message, so the sample payload field `qos` supplies it.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-flags": [
+        "A message with no flags reads as an empty object `{}`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-flag": [
+        "An absent flag name reads as null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-topic": [
+        "`topic(<level>)` counts levels from 1. A level outside the topic reads as null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-clientid": [
+        "The SQL studio has no live client, so the sample payload field `clientid` supplies the value.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-clientip": [
+        "`clientip()` is an alias of `peerhost()`.",
+        "The SQL studio has no live client, so the sample payload field `peerhost` supplies the value.",
+    ],
+    "fn-peerhost": [
+        "The SQL studio has no live client, so the sample payload field `peerhost` supplies the value.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-username": [
+        "The SQL studio has no live client, so the sample payload field `username` supplies the value.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-payload": [
+        "`payload('<json path>')` reads a dotted path. An absent path reads as null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-contains_topic": [
+        "The list holds exact topic strings, or objects with `topic` and `qos`. A wildcard in the list does not match.",
+        "With the three-argument form the stored `qos` must equal the wanted `qos`.",
+    ],
+    "fn-contains_topic_match": [
+        "The list holds topic filters. A wildcard in the list matches.",
+        "With the three-argument form the stored `qos` must equal the wanted `qos`.",
+    ],
+    "fn-topic_match": [
+        "The first argument is the topic. The second argument is the filter.",
+        "An invalid topic or filter returns null.",
+    ],
+    "fn-null": [
+        "The name `null` is a SQL keyword. The call fails to parse through the SQL studio entry.",
+    ],
+    "fn-coalesce_ne": [
+        "A null argument and an empty string argument are both skipped.",
+        "A call with no argument returns null.",
+    ],
+    "fn-div": [
+        "The result truncates toward zero: `div(-7, 2)` is -3.",
+        "The broker converts an argument to an integer: a decimal loses its fraction, `true` is 1, and `false` is 0. Text must hold an integer or the call returns null.",
+    ],
+    "fn-fmod": [
+        "The result takes the sign of the dividend: `fmod(-7.5, 2)` is -1.5.",
+        "The broker converts an argument to a number: `true` is 1, `false` is 0, and text must hold a number. Other text returns null.",
+    ],
+}
+
 
 def short_json(value):
     """Render one JSON value on one line for an entry."""
@@ -455,7 +566,7 @@ def render_rules_entry(label, stem):
                 f"See `../_verified/rules/{stem}.json`."
             )
     else:
-        out.append(f"> **{NOT_VERIFIED}")
+        out.append(f"> **{NOT_VERIFIED}**")
     out.append("")
     out.append("Notes:")
     out.append("")
@@ -557,6 +668,144 @@ def render_rules_page():
     return "\n".join(out) + "\n"
 
 
+def render_rules_function_entry(name, stem):
+    """Render one message context function entry (DX2-002)."""
+    out = [f"### `{name}`", ""]
+    text = read_text("rules", stem)
+    if text:
+        out.append(text)
+    else:
+        out.append(f"`{name}` reads the current message context.")
+    out.append("")
+    syntax = RULES_CONTEXT_SYNTAX.get(stem)
+    if syntax:
+        out.append(f"Signature: {syntax}.")
+        out.append("")
+    record = read_verified("rules", stem)
+    if record and record.get("verified"):
+        cases = record.get("cases", [])
+        if cases:
+            first = cases[0]
+            out.append("Example (verified through `POST /api/v1/rules/test`):")
+            out.append("")
+            out.append("```sql no-test")
+            out.append("-- Comment: illustrative query. The verifier runs each case.")
+            out.append(first["sql"])
+            out.append("```")
+            out.append("")
+            out.append(
+                f"Input topic `{first['topic']}` and payload "
+                f"`{short_json(first['payload'])}`. The broker answered "
+                f"`matched: {short_json(first['matched'])}` with "
+                f"`projected: {short_json(first['projected'])}`."
+            )
+            for extra in cases[1:]:
+                if extra["sql"] != first["sql"]:
+                    out.append(
+                        f"Another run with `{extra['sql']}` on topic "
+                        f"`{extra['topic']}` with payload "
+                        f"`{short_json(extra['payload'])}` answered "
+                        f"`matched: {short_json(extra['matched'])}` with "
+                        f"`projected: {short_json(extra['projected'])}`."
+                    )
+                else:
+                    out.append(
+                        f"Another run on topic `{extra['topic']}` with payload "
+                        f"`{short_json(extra['payload'])}` answered "
+                        f"`matched: {short_json(extra['matched'])}` with "
+                        f"`projected: {short_json(extra['projected'])}`."
+                    )
+            out.append("")
+            out.append(
+                f"Verified: `POST /api/v1/rules/test` exits 0. "
+                f"See `../_verified/rules/{stem}.json`."
+            )
+        else:
+            out.append(
+                f"Verified: `POST /api/v1/rules/test` exits 0. "
+                f"See `../_verified/rules/{stem}.json`."
+            )
+    else:
+        out.append(f"> **{NOT_VERIFIED}**")
+    out.append("")
+    out.append("Notes:")
+    out.append("")
+    for note in RULES_CONTEXT_NOTES.get(stem, []):
+        out.append(f"- {note}")
+    out.append("- Repeat the check with the same call against a live broker.")
+    out.append("")
+    return out
+
+
+def render_rules_functions_page():
+    """Render the message context function page (DX2-002)."""
+    out = [
+        "---",
+        "title: Rule functions: message context",
+        "description: Verified entries for the message context accessors.",
+        "sidebar:",
+        "  order: 45",
+        "---",
+        "",
+        "# Rule functions: message context",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A message context function reads the message under evaluation. "
+        "It returns the topic, the payload, the QoS, the flags, or the "
+        "client identity. Use this page when a rule must react to the "
+        "message around the payload. You get one entry per function, each "
+        "with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Pub["publisher :1883"] -- "PUBLISH" --> Ctx["message context"]',
+                '    Ctx -- "accessor" --> Fn["topic, qos, payload, clientid"]',
+                '    Fn -- "value" --> Sel["SELECT column"]',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "The accessors take no payload column. They read the message that "
+        "the rule evaluates. A value the message does not carry reads as "
+        "null. The SQL studio has no live message, so a sample payload "
+        "field of the same name supplies the value.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_CONTEXT_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` reads the message."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_CONTEXT_FUNCTIONS:
+        out += render_rules_function_entry(name, rules_stem("function", name))
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -643,6 +892,28 @@ def main(argv):
                 print("drift: docs/rules/clauses-operators.md differs: run --write")
                 return 1
             print("entries match: docs/rules/clauses-operators.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-functions":
+        fresh = render_rules_functions_page()
+        path = ROOT / "docs" / "rules" / "functions-context.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-context.md is missing: run --write"
+                )
+                return 1
+            if have != fresh:
+                print("drift: docs/rules/functions-context.md differs: run --write")
+                return 1
+            print("entries match: docs/rules/functions-context.md")
             return 0
         parser.print_help()
         return 2

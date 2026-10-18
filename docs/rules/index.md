@@ -33,6 +33,7 @@ flowchart LR
 | [Rule SQL](./sql.md) | `SELECT`, `FROM`, `WHERE`, `FOREACH`, `CASE`, operators, event sources, windows. |
 | [Clauses and operators](./clauses-operators.md) | One verified entry per SQL clause and operator. |
 | [Functions](./functions.md) | Every built-in function by group, with call shape and arity. |
+| [Message context functions](./functions-context.md) | One verified entry per message context accessor. |
 | [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
 
 > [!NOTE]

@@ -1,0 +1,26 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "t": "sensors/kitchen"
+      },
+      "sql": "SELECT topic() AS t FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "t": null
+      },
+      "sql": "SELECT topic(9) AS t FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-topic",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

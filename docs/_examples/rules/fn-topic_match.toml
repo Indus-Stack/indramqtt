@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-topic_match"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT topic_match('sensors/kitchen', 'sensors/+') AS c FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"c": true}'
+
+[[case]]
+sql = "SELECT topic_match('sensors/kitchen', 'other/+') AS c FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"c": false}'

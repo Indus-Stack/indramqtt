@@ -330,20 +330,44 @@ def verify_rule_test(ex, broker):
     }
 
 
+# Rule function stems owned by DX2-002 (message context accessors).
+DX2_002_ITEMS = {
+    "fn-msgid",
+    "fn-qos",
+    "fn-flags",
+    "fn-flag",
+    "fn-topic",
+    "fn-clientid",
+    "fn-clientip",
+    "fn-peerhost",
+    "fn-username",
+    "fn-payload",
+    "fn-contains_topic",
+    "fn-contains_topic_match",
+    "fn-topic_match",
+    "fn-null",
+    "fn-coalesce_ne",
+    "fn-div",
+    "fn-fmod",
+}
+
+
 def failure_recorded(item):
     """Check whether failures.md already names this item."""
     try:
         text = FAILURES.read_text(encoding="utf-8")
     except OSError:
         return False
-    return (
-        f"DX-01 item `{item}`" in text or f"DX2-001 item `{item}`" in text
-    )
+    return f"item `{item}`" in text
 
 
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
-    return "DX2-001" if item.startswith(("clause-", "op-")) else "DX-01"
+    if item.startswith(("clause-", "op-")):
+        return "DX2-001"
+    if item in DX2_002_ITEMS:
+        return "DX2-002"
+    return "DX-01"
 
 
 def append_failure(item, ex, record):

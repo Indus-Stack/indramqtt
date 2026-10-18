@@ -247,3 +247,10 @@ All 107 CLI items verify. No CLI item holds a failure
 record. Each entry of `reference/cli.md` cites its file
 under `docs/_verified/cli/`. Wave DX2 owns the other
 areas. Their counts come from `entries.py --coverage`.
+
+## DX2-002 item `fn-null`
+
+- Input: rules/test `SELECT null() AS n FROM "sensors/+"` on `sensors/kitchen`.
+- Expected: the cased match results in the example.
+- Broker gave: `rules/test gave 400: {"error":"invalid sql_query: line 1, column 12: expected keyword FROM"}`.
+- Date: 2026-10-17.

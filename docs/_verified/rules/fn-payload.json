@@ -1,0 +1,32 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "a": 1
+      },
+      "projected": {
+        "p": {
+          "a": 1
+        }
+      },
+      "sql": "SELECT payload() AS p FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "a": 1
+      },
+      "projected": {
+        "p": null
+      },
+      "sql": "SELECT payload('x') AS p FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-payload",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

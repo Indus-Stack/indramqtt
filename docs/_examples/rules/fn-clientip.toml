@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-clientip"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT clientip() AS c FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"peerhost": "10.0.0.9"}'
+expect_matched = true
+expect_projected = '{"c": "10.0.0.9"}'
+
+[[case]]
+sql = 'SELECT clientip() AS c FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{}'
+expect_matched = true
+expect_projected = '{"c": null}'

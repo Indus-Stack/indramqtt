@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "clientid": "dev-01"
+      },
+      "projected": {
+        "c": "dev-01"
+      },
+      "sql": "SELECT clientid() AS c FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {},
+      "projected": {
+        "c": null
+      },
+      "sql": "SELECT clientid() AS c FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-clientid",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}
