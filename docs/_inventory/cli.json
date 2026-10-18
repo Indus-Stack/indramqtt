@@ -638,6 +638,6 @@
   "live_help": {
     "binaries": {},
     "checked": false,
-    "state": "binary-missing"
+    "state": "not-run"
   }
 }

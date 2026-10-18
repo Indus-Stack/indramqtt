@@ -39,7 +39,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `getting-started/install.md` | 66 | `indramqtt 0.1.0` |
 | `getting-started/install.md` | 74 | `indra 0.1.0` |
 | `index.md` | 54 | `OK` |
-| `mcp.md` | 43 | `OK` |
+| `mcp.md` | 314 | `401` |
 | `migration.md` | 90 | `OK` |
 | `multi-tenancy/index.md` | 96 | `isolated` |
 | `multi-tenancy/quotas.md` | 102 | `ok` |
@@ -79,8 +79,8 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/api/rule-engine.md` | 516 | `OK` |
 | `reference/cli.md` | 2330 | `OK` |
 | `reference/cli.md` | 2346 | `OK` |
-| `reference/configuration.md` | 2339 | `OK` |
-| `reference/configuration.md` | 2355 | `OK` |
+| `reference/configuration.md` | 2382 | `OK` |
+| `reference/configuration.md` | 2398 | `OK` |
 | `reference/index.md` | 41 | `OK` |
 | `reference/metrics.md` | 118 | `OK` |
 | `reference/metrics.md` | 134 | `OK` |

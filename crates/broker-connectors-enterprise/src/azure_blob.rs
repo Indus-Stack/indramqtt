@@ -302,7 +302,7 @@ fn endpoint_path_prefix(endpoint: &str) -> String {
         Some(i) => &after_scheme[i..],
         None => "",
     };
-    let path = match path.find(|c| c == '?' || c == '#') {
+    let path = match path.find(['?', '#']) {
         Some(i) => &path[..i],
         None => path,
     };

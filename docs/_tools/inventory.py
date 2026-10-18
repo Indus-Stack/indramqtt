@@ -14,6 +14,7 @@ Standard library only. No network.
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -62,7 +63,14 @@ def build_cli():
     # Run each --help when the binaries exist. The gates build
     # first, so the check sees live help there. A missing binary
     # keeps the source parse as the inventory with a clear state.
-    live = try_live_help()
+    # The live --help run depends on a built binary in ./target, which
+    # exists on some machines and not on others. Run it only on request
+    # (INVENTORY_LIVE_HELP=1), so the committed inventory is the same
+    # everywhere and the drift check does not depend on the machine.
+    if os.environ.get("INVENTORY_LIVE_HELP") == "1":
+        live = try_live_help()
+    else:
+        live = {"binaries": {}, "checked": False, "state": "not-run"}
     return {
         "binaries": [
             {"name": "indramqtt", "flags": flags},

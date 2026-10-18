@@ -660,8 +660,9 @@ const SSO_FLOW_SEGMENTS: [&str; 6] = ["login", "mfa", "running", "oidc", "saml",
 /// new route is closed for keys until it has an entry here.
 pub fn access_for_path(path: &str) -> PathAccess {
     let trimmed = path.trim();
-    // Built-in MCP endpoint (MC-01): a monitoring read while its only
-    // tool reads. Later tasks remap mutating tools to their scopes.
+    // Built-in MCP endpoint: the gate at the door. `post_mcp` also lets a
+    // key with the `publish` scope in, and each tool call then re-enters
+    // the router, so the scope of every operation applies again there.
     if trimmed == "/mcp" {
         return PathAccess::Scope("monitoring");
     }
@@ -702,10 +703,6 @@ pub fn access_for_path(path: &str) -> PathAccess {
     match group.as_str() {
         "status" | "error_codes" => PathAccess::Anonymous,
         "current_user" | "features" => PathAccess::AnyKey,
-        // The agent endpoint multiplexes every operation, so no single
-        // scope fits it. Any key reaches it; the endpoint gates each
-        // tool itself against the key scopes (MC-04).
-        "mcp" => PathAccess::AnyKey,
         "clients" | "clients_v2" | "subscriptions" | "topics" | "sessions_count" | "banned"
         | "queues" | "queue" | "streams" | "stream" => PathAccess::Scope("connections"),
         "publish" => PathAccess::Scope("publish"),

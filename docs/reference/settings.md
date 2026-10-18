@@ -42,6 +42,8 @@ flowchart LR
 | `listeners.tls.cert_file` | string | `` | string | Path to the PEM server certificate for the TLS listener. |
 | `listeners.tls.key_file` | string | `` | string | Path to the PEM private key for the TLS listener. |
 | `listeners.tls.native` | boolean | `false` | boolean | Deprecated. Ignored. The kernel always serves this listener. |
+| `listeners.tls.psk_enabled` | boolean | `false` | boolean | Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate. |
+| `listeners.tls.psk_keys_file` | string | `` | string | Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed. |
 | `listeners.tls.verify_client_cert` | boolean | `false` | boolean | Whether the TLS listener requests and verifies a client certificate. |
 | `listeners.tls.verify` | string | `verify_none` | ["verify_none","verify_peer"] | Client certificate chain check mode of the TLS listener. |
 | `listeners.tls.cacertfile` | string | `` | string | CA file for client certificate checks of the TLS listener. |
@@ -104,7 +106,7 @@ flowchart LR
 |---|---|---|---|---|
 | `rules_engine.window_channel_depth` | integer | `65536` | 1..=1000000 | Ingress ring buffer channel depth for stateful window worker tasks. |
 | `rules_engine.backpressure_policy` | string | `DropOldest` | ["Block","DropNewest","DropOldest","SpillToDisk","RejectPublisher"] | Default memory backpressure policy when the rule buffer is full. |
-| `rules_engine.spill_dir` | string | `` | string | Rule ingress spill directory. Empty keeps memory-only DropOldest; set to a directory to build the rule engine with SpillToDisk backpressure (1 MiB segments, 64 MiB total). |
+| `rules_engine.spill_dir` | string | `` | string | Rule ingress spill directory. |
 
 ## auth
 
@@ -119,10 +121,10 @@ flowchart LR
 
 | Setting | Type | Default | Range | Description |
 |---|---|---|---|---|
-| `cluster.enabled` | boolean | `false` | boolean | Whether multi-node distributed clustering is enabled. |
+| `cluster.enabled` | boolean | `false` | boolean | Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only. |
 | `cluster.bind` | string | `127.0.0.1:19883` | string | Cluster SWIM UDP bind address for peer discovery and membership. |
-| `cluster.gossip_bind` | string | `0.0.0.0:7946` | string | Gossip membership bind address for peer discovery. |
-| `cluster.quic_bind` | string | `0.0.0.0:9092` | string | Multiplexed data plane bind address for inter-broker message routing. |
+| `cluster.gossip_bind` | string | `0.0.0.0:7946` | string | Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only. |
+| `cluster.quic_bind` | string | `0.0.0.0:9092` | string | Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only. |
 | `cluster.seed_nodes` | array | `[]` | array | Seed node addresses to join an existing cluster. |
 
 ## licence
@@ -242,15 +244,15 @@ flowchart LR
 |---|---|---|---|---|
 | `prometheus.enable_basic_auth` | boolean | `true` | boolean | Require credentials on the scrape endpoints. |
 | `prometheus.latency_buckets` | string | `10ms, 100ms, 1s, 5s, 30s` | string | Latency histogram buckets for the exposition. |
-| `prometheus.push_gateway.enable` | boolean | `false` | boolean | Push the exposition to the push target. |
+| `prometheus.push_gateway.enable` | boolean | `false` | boolean | Stored push intent. The broker runs no push client. |
 | `prometheus.push_gateway.url` | string | `http://127.0.0.1:9091` | string | Push target URL for the exposition. |
 | `prometheus.push_gateway.interval` | string | `15s` | string | Push interval for the exposition. |
 | `prometheus.push_gateway.job_name` | string | `${name}/instance/${name}~${host}` | string | Job name template for each push. |
 | `prometheus.push_gateway.method` | string | `put` | ["put","post"] | Push method for the exposition. |
-| `prometheus.collectors.mnesia` | string | `disabled` | ["enabled","disabled"] | Store collector switch for load analysis. |
-| `prometheus.collectors.vm_dist` | string | `disabled` | ["enabled","disabled"] | Distribution collector switch for load analysis. |
-| `prometheus.collectors.vm_memory` | string | `disabled` | ["enabled","disabled"] | Memory collector switch for load analysis. |
-| `prometheus.collectors.vm_msacc` | string | `disabled` | ["enabled","disabled"] | Microstate accounting collector switch for load analysis. |
-| `prometheus.collectors.vm_statistics` | string | `disabled` | ["enabled","disabled"] | Statistics collector switch for load analysis. |
-| `prometheus.collectors.vm_system_info` | string | `disabled` | ["enabled","disabled"] | System information collector switch for load analysis. |
+| `prometheus.collectors.mnesia` | string | `disabled` | ["enabled","disabled"] | Stored collector name. The broker keeps it and shows it. No sampler reads it. |
+| `prometheus.collectors.vm_dist` | string | `disabled` | ["enabled","disabled"] | Stored collector name. The broker keeps it and shows it. No sampler reads it. |
+| `prometheus.collectors.vm_memory` | string | `disabled` | ["enabled","disabled"] | Stored collector name. The broker keeps it and shows it. No sampler reads it. |
+| `prometheus.collectors.vm_msacc` | string | `disabled` | ["enabled","disabled"] | Stored collector name. The broker keeps it and shows it. No sampler reads it. |
+| `prometheus.collectors.vm_statistics` | string | `disabled` | ["enabled","disabled"] | Stored collector name. The broker keeps it and shows it. No sampler reads it. |
+| `prometheus.collectors.vm_system_info` | string | `disabled` | ["enabled","disabled"] | Stored collector name. The broker keeps it and shows it. No sampler reads it. |
 

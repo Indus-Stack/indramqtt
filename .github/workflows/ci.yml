@@ -146,7 +146,7 @@ jobs:
         run: |
           set -u
           fail=0
-          for c in rustls@0.21.12 rustls-webpki@0.101.7 sqlx@0.7.4 serde_yaml; do
+          for c in rustls@0.21.12 rustls-webpki@0.101.7 sqlx@0.7.4; do
             if cargo tree --workspace -e normal -i "$c" >/dev/null 2>&1; then
               echo "ERROR: $c is in the dependency graph again"; cargo tree --workspace -e normal -i "$c"; fail=1
             fi

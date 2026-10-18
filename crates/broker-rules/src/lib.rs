@@ -10066,7 +10066,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     id.to_string(),
                     TopicFilter::new("storage/stream/#").unwrap(),
                     Some(format!(
-                        r#"SELECT client_id, sensor_val, now() AS ts FROM "storage/stream/#" WHERE sensor_val > 100.0 INTO connector("{connector}")"#
+                        r#"SELECT client_id, sensor_val, now_timestamp() AS ts FROM "storage/stream/#" WHERE sensor_val > 100.0 INTO connector("{connector}")"#
                     )),
                     true,
                     vec![],

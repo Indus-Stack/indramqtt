@@ -232,8 +232,34 @@ pub async fn post_mcp(
     State(state): State<ApiState>,
     Query(query): Query<ToolsetQuery>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
+    // The route caps the body at the limit while it is read, so a larger
+    // body never stays in memory. The cut read arrives here as a
+    // rejection and gets the management error shape.
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "code": "PAYLOAD_TOO_LARGE",
+                    "message": "the MCP body passes the 8 MiB limit",
+                })),
+            )
+                .into_response();
+        }
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": format!("the MCP body cannot be read: {rejection}"),
+                })),
+            )
+                .into_response();
+        }
+    };
     if !state.mcp.enabled() {
         return (
             StatusCode::NOT_FOUND,
@@ -1496,6 +1522,40 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name").to_string())
             .collect()
+    }
+
+    /// A body over the 8 MiB limit ends while it is read, before the key
+    /// check: the caller gets 413 and the broker does not hold the body.
+    /// A body at the limit with no key reaches the key check (401).
+    #[tokio::test]
+    async fn oversized_body_without_key_is_refused_while_read() {
+        use tower::ServiceExt as _;
+        let (state, _token) = keyed_state();
+        let over = vec![b' '; MCP_MAX_BODY_BYTES + 1];
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(over))
+            .expect("request builds");
+        let response = crate::router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("router answers");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let at_limit = vec![b' '; MCP_MAX_BODY_BYTES];
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(at_limit))
+            .expect("request builds");
+        let response = crate::router(state)
+            .oneshot(request)
+            .await
+            .expect("router answers");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

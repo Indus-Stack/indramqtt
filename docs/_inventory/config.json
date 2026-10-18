@@ -477,6 +477,20 @@
       "type": "u64"
     },
     {
+      "default": "true",
+      "doc": "Whether the MCP endpoint on the management listener serves tool calls.",
+      "path": "mcp.enabled",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
+      "default": "false",
+      "doc": "Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available.",
+      "path": "mcp.read_only",
+      "range": "true | false",
+      "type": "bool"
+    },
+    {
       "default": "\"\"",
       "doc": "CoAP gateway UDP listen address. Empty disables the gateway.",
       "path": "gateway.coap_bind",

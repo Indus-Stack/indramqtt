@@ -287,7 +287,42 @@ The code holds one exclusion table with a reason for each entry:
 
 ## Next steps
 
-- Read `docs/settings-reference.md` for the `mcp` settings table.
-- Read `docs/configuration.md` for file, fragment and environment layers.
+- Read [Settings reference](./reference/settings.md) for the `mcp` settings table.
+- Read [Configuration](./operations/configuration.md) for file, fragment and environment layers.
 - Query `GET /api/v5/audit?from=mcp` for the call history.
 <!-- screenshot: management dashboard showing the MCP tool list -->
+
+## Check that it works
+
+Start the broker with this file. A call to `/mcp` with no API key gets
+`401`: the endpoint is on, and it refuses a caller that has no key.
+
+```toml test
+[node]
+id = "docs-mcp"
+
+[listeners.tcp]
+bind = "0.0.0.0:1883"
+
+[listeners.api]
+bind = "0.0.0.0:18083"
+
+[logging]
+level = "warn"
+```
+
+```sh test
+python3 - <<'PY'
+import http.client, os
+port = int(os.environ.get("API_PORT", "18083"))
+conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+conn.request("POST", "/mcp", body='{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+             headers={"Content-Type": "application/json"})
+print(conn.getresponse().status)
+PY
+```
+
+```output
+401
+```
+

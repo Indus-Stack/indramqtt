@@ -115,6 +115,9 @@ Each setting owns one entry below with a verified example line. Each example lin
 | `licence.request_out` | path string | `""` | any path; empty disables request generation | Write the installation licence request to this path and exit. |  |
 | `licence.install_file` | path string | `""` | any path; empty disables licence installation | Install the licence token read from this path and exit. |  |
 | `licence.expiry_warn_days` | u64 | `30` | 0..=365 days | Days before expiry that the approaching-expiry alarm and log warning start. |  |
+| **mcp** | | | | | |
+| `mcp.enabled` | bool | `true` | true \| false | Whether the MCP endpoint on the management listener serves tool calls. |  |
+| `mcp.read_only` | bool | `false` | true \| false | Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available. |  |
 | **gateway** | | | | | |
 | `gateway.coap_bind` | socket address string | `""` | empty disables the gateway, else valid host:port | CoAP gateway UDP listen address. Empty disables the gateway. |  |
 | **persistence** | | | | | |
@@ -1328,6 +1331,46 @@ trusted_keys_path = ""
 request_out = ""
 install_file = ""
 expiry_warn_days = 7
+
+```
+
+## `mcp`
+
+Settings of this group.
+
+### `mcp.enabled`
+
+Whether the MCP endpoint on the management listener serves tool calls.
+
+Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
+
+Example: `enabled = true` in the `[mcp]` table of the group file below.
+
+Notes:
+
+- A bad value fails validation. Boot keeps the old file.
+- Related settings sit in the same group file.
+
+### `mcp.read_only`
+
+Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available.
+
+Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example: `read_only = false` in the `[mcp]` table of the group file below.
+
+Notes:
+
+- A bad value fails validation. Boot keeps the old file.
+- Related settings sit in the same group file.
+
+Group file. The docs run boots this file.
+Boot fails on a bad value.
+
+```toml test
+[mcp]
+enabled = true
+read_only = false
 
 ```
 

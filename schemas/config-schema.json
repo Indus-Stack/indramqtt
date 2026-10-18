@@ -47,17 +47,17 @@
         },
         "enabled": {
           "default": false,
-          "description": "Whether multi-node distributed clustering is enabled.",
+          "description": "Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.",
           "type": "boolean"
         },
         "gossip_bind": {
           "default": "0.0.0.0:7946",
-          "description": "Gossip membership bind address for peer discovery.",
+          "description": "Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only.",
           "type": "string"
         },
         "quic_bind": {
           "default": "0.0.0.0:9092",
-          "description": "Multiplexed data plane bind address for inter-broker message routing.",
+          "description": "Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only.",
           "type": "string"
         },
         "seed_nodes": {
@@ -478,6 +478,16 @@
               ],
               "type": "string"
             },
+            "psk_enabled": {
+              "default": false,
+              "description": "Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps certificate handshakes unchanged. On serves PSK suites from the identity store with no certificate.",
+              "type": "boolean"
+            },
+            "psk_keys_file": {
+              "default": "",
+              "description": "Path to the PSK identity file of the kernel TLS listener. Use it only when PSK is on. Empty keeps the store empty, so every handshake fails closed.",
+              "type": "string"
+            },
             "verify": {
               "default": "verify_none",
               "description": "Client certificate chain check mode of the TLS listener.",
@@ -507,15 +517,15 @@
               "description": "Whether the MQTT-over-WebSocket listener accepts connections.",
               "type": "boolean"
             },
-            "path": {
-              "default": "/mqtt",
-              "description": "HTTP path serving MQTT-over-WebSocket traffic.",
-              "type": "string"
-            },
             "native": {
               "default": false,
               "description": "Deprecated. Ignored. The kernel always serves this listener.",
               "type": "boolean"
+            },
+            "path": {
+              "default": "/mqtt",
+              "description": "HTTP path serving MQTT-over-WebSocket traffic.",
+              "type": "string"
             }
           },
           "type": "object"
@@ -527,6 +537,11 @@
               "description": "Bind address for the secure WebSocket listener.",
               "type": "string"
             },
+            "cacertfile": {
+              "default": "",
+              "description": "CA file for client certificate checks of the secure WebSocket listener.",
+              "type": "string"
+            },
             "cert_file": {
               "default": "",
               "description": "Path to the PEM server certificate for the secure WebSocket listener.",
@@ -535,6 +550,11 @@
             "enabled": {
               "default": false,
               "description": "Whether the secure WebSocket listener accepts connections.",
+              "type": "boolean"
+            },
+            "fail_if_no_peer_cert": {
+              "default": false,
+              "description": "Whether the secure WebSocket listener refuses a handshake without a certificate.",
               "type": "boolean"
             },
             "key_file": {
@@ -550,6 +570,35 @@
             "path": {
               "default": "/mqtt",
               "description": "HTTP path serving secure WebSocket traffic.",
+              "type": "string"
+            },
+            "peer_cert_as_clientid": {
+              "default": "disabled",
+              "description": "Source for the bind client identifier from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "peer_cert_as_username": {
+              "default": "disabled",
+              "description": "Source for the bind username from the client certificate.",
+              "enum": [
+                "disabled",
+                "cn",
+                "dn"
+              ],
+              "type": "string"
+            },
+            "verify": {
+              "default": "verify_none",
+              "description": "Client certificate chain check mode of the secure WebSocket listener.",
+              "enum": [
+                "verify_none",
+                "verify_peer"
+              ],
               "type": "string"
             },
             "verify_client_cert": {
@@ -581,7 +630,6 @@
       "type": "object"
     },
     "mcp": {
-      "type": "object",
       "properties": {
         "enabled": {
           "default": true,
@@ -593,7 +641,8 @@
           "description": "Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay available.",
           "type": "boolean"
         }
-      }
+      },
+      "type": "object"
     },
     "node": {
       "properties": {
@@ -643,7 +692,7 @@
           "properties": {
             "mnesia": {
               "default": "disabled",
-              "description": "Store collector switch for load analysis.",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
               "enum": [
                 "enabled",
                 "disabled"
@@ -652,7 +701,7 @@
             },
             "vm_dist": {
               "default": "disabled",
-              "description": "Distribution collector switch for load analysis.",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
               "enum": [
                 "enabled",
                 "disabled"
@@ -661,7 +710,7 @@
             },
             "vm_memory": {
               "default": "disabled",
-              "description": "Memory collector switch for load analysis.",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
               "enum": [
                 "enabled",
                 "disabled"
@@ -670,7 +719,7 @@
             },
             "vm_msacc": {
               "default": "disabled",
-              "description": "Microstate accounting collector switch for load analysis.",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
               "enum": [
                 "enabled",
                 "disabled"
@@ -679,7 +728,7 @@
             },
             "vm_statistics": {
               "default": "disabled",
-              "description": "Statistics collector switch for load analysis.",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
               "enum": [
                 "enabled",
                 "disabled"
@@ -688,7 +737,7 @@
             },
             "vm_system_info": {
               "default": "disabled",
-              "description": "System information collector switch for load analysis.",
+              "description": "Stored collector name. The broker keeps it and shows it. No sampler reads it.",
               "enum": [
                 "enabled",
                 "disabled"
@@ -712,7 +761,7 @@
           "properties": {
             "enable": {
               "default": false,
-              "description": "Push the exposition to the push target.",
+              "description": "Stored push intent. The broker runs no push client.",
               "type": "boolean"
             },
             "interval": {
@@ -808,7 +857,7 @@
         },
         "spill_dir": {
           "default": "",
-          "description": "Rule ingress spill directory. Empty keeps memory-only DropOldest; set to a directory to build the rule engine with SpillToDisk backpressure (1 MiB segments, 64 MiB total).",
+          "description": "Rule ingress spill directory.",
           "type": "string"
         },
         "window_channel_depth": {

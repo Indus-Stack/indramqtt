@@ -4034,7 +4034,7 @@ fn section_diagram_group(section: &str) -> Option<&'static str> {
         }
         "rules_engine" | "delayed" => Some("rules + delayed"),
         "node" | "cluster" | "logging" | "observability" | "prometheus" | "gateway"
-        | "persistence" => Some("node + operate"),
+        | "persistence" | "mcp" => Some("node + operate"),
         _ => None,
     }
 }

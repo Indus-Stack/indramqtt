@@ -842,13 +842,16 @@ pub fn router(state: ApiState) -> Router {
         // A missing key answers 401 with the management error shape and
         // a disabled endpoint answers 404. Tool calls re-enter the router
         // below, so key scopes and the viewer rule apply through the same
-        // middleware. The default body cap stays off here: the handler
-        // enforces the 8 MiB tool limit itself. The `subscribe_collect`
+        // middleware. The 8 MiB tool limit applies while the body is read,
+        // before the key check: a larger body ends with 413 and is never
+        // held in memory. The `subscribe_collect`
         // messaging tool (MC-04) rides the same endpoint and the same
         // key check; its temporary subscription is management-plane only.
         .route(
             "/mcp",
-            post(crate::mcp::post_mcp).layer(axum::extract::DefaultBodyLimit::disable()),
+            post(crate::mcp::post_mcp).layer(axum::extract::DefaultBodyLimit::max(
+                crate::mcp::MCP_MAX_BODY_BYTES,
+            )),
         )
         // Public alias of `GET /api/v5/status` for load balancers. It needs no token.
         .route("/status", get(v5::status::get_status))
