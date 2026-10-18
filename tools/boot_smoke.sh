@@ -741,6 +741,51 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 4a5. The default Session Expiry cap is in operation at boot ---
+# A version 5 client asks for a Session Expiry Interval of 999999
+# seconds. The CONNACK holds the granted interval, capped at the
+# default of 86400 seconds. The operator sees the cap through the
+# socket. No test-only setter runs.
+python3 - "$MQTT_PORT" <<'PY'
+import socket, struct, sys, time
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def connect_with_expiry(sock, client_id, seconds):
+    # Version 5.0, clean start, Keep Alive 60. Property length 5, then
+    # Session Expiry Interval (0x11) as a four byte integer.
+    body = (b"\x00\x04MQTT\x05\x02\x00\x3c" + b"\x05"
+            + bytes([0x11]) + struct.pack(">I", seconds) + field(client_id))
+    sock.sendall(bytes([0x10, len(body)]) + body)
+    sock.settimeout(5)
+    return sock.recv(200)
+def granted_expiry(ack):
+    # 0x20 | remaining | ack flags | reason | property length | props.
+    # The Session Expiry Interval is the first property when sent.
+    if len(ack) < 10 or ack[0] != 0x20 or ack[3] != 0 or ack[5] != 0x11:
+        return None
+    return struct.unpack(">I", ack[6:10])[0]
+sock = wait_port(mqtt_port)
+ack = connect_with_expiry(sock, b"smoke-expiry-default", 999999)
+sock.close()
+report("the default cap of 86400 seconds limits the granted Session Expiry Interval",
+       granted_expiry(ack) == 86400)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 # --- 4a2. WebSocket on the kernel listener carries MQTT ---
 # A WebSocket client and a TCP client connect, subscribe,
 # and exchange a publish in both directions.
@@ -1941,6 +1986,82 @@ else:
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
+
+# --- 12. The operator Session Expiry cap is in operation at boot ---
+# An operator sets session.max_session_expiry_secs to 3600 in
+# indra.toml. A version 5 client that asks for 999999 seconds gets
+# 3600 in the CONNACK. This kernel runs its own config and ports so it
+# does not disturb the checks above.
+read -r SESSION_API_PORT SESSION_MQTT_PORT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/cfg-session" "$ROOT/data-session"
+cat > "$ROOT/cfg-session/indra.toml" <<EOF
+[node]
+id = "boot-smoke-session"
+data_dir = "$ROOT/data-session"
+
+[listeners.tcp]
+bind = "127.0.0.1:$SESSION_MQTT_PORT"
+
+[listeners.api]
+bind = "127.0.0.1:$SESSION_API_PORT"
+
+[session]
+max_session_expiry_secs = 3600
+
+[logging]
+level = "warn"
+EOF
+INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
+    "$KERNEL" --config-dir "$ROOT/cfg-session" > "$ROOT/kernel-session.log" 2>&1 &
+SESSION_KERNEL_PID=$!
+python3 - "$SESSION_MQTT_PORT" <<'PY'
+import socket, struct, sys, time
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(200):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the session-cap kernel listener does not listen")
+def connect_with_expiry(sock, client_id, seconds):
+    body = (b"\x00\x04MQTT\x05\x02\x00\x3c" + b"\x05"
+            + bytes([0x11]) + struct.pack(">I", seconds) + field(client_id))
+    sock.sendall(bytes([0x10, len(body)]) + body)
+    sock.settimeout(5)
+    return sock.recv(200)
+def granted_expiry(ack):
+    if len(ack) < 10 or ack[0] != 0x20 or ack[3] != 0 or ack[5] != 0x11:
+        return None
+    return struct.unpack(">I", ack[6:10])[0]
+sock = wait_port(mqtt_port)
+ack = connect_with_expiry(sock, b"smoke-expiry-configured", 999999)
+sock.close()
+report("session.max_session_expiry_secs from indra.toml limits the granted interval",
+       granted_expiry(ack) == 3600)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+kill "$SESSION_KERNEL_PID" 2>/dev/null
+wait "$SESSION_KERNEL_PID" 2>/dev/null
 
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"

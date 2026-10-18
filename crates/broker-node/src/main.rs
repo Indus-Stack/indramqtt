@@ -5802,8 +5802,10 @@ where
 ///
 /// Meta layout: `PacketId:16be | IdLen:16be | ClientId | N:16be |
 /// (FilterLen:16be | Filter | QoS:8) * N`. Each granted code echoes the
-/// requested QoS; invalid filters and ACL denials are answered with
-/// `0x80` (not authorized) and `0x87` respectively and register nothing.
+/// requested QoS; a denial registers nothing. A version-4 denial answers
+/// `0x80`, the only failure code its wire allows; a version-5 denial
+/// answers the precise reason code (`0x87` not authorized, `0x8F` filter
+/// invalid).
 /// A new entry past the router `MAX_SUBSCRIPTIONS` bound is denied with
 /// `0x97` Quota Exceeded and registers nothing.
 /// `$share/<group>/` prefixes are split before routing, ACL checks,
@@ -5972,13 +5974,18 @@ async fn apply_subscribe(
                     );
                 }
             }
-            // MQTT 5 style "Not Authorized"; registers nothing. With the
-            // stored `deny_action: disconnect` the connection also closes
-            // below with 0x87 after the SubAck is built.
+            // Version-4 peers see 0x80 (the only version-3 failure code);
+            // version-5 peers see 0x87 Not Authorized. Neither registers
+            // anything. With the stored `deny_action: disconnect` the
+            // connection also closes below with 0x87 after the SubAck.
             if shared.auth.authz_deny_disconnects() {
                 authz_disconnect = true;
             }
-            codes.push(V5_SUBACK_NOT_AUTHORIZED);
+            codes.push(if entry.has_options {
+                V5_SUBACK_NOT_AUTHORIZED
+            } else {
+                V5_SUBACK_UNSPECIFIED
+            });
             continue;
         }
         // B5-03: database ACLs for users with no local record (same key
@@ -6023,7 +6030,13 @@ async fn apply_subscribe(
                             );
                         }
                     }
-                    codes.push(V5_SUBACK_NOT_AUTHORIZED);
+                    // The database denial follows the same version split
+                    // as the local denial above.
+                    codes.push(if entry.has_options {
+                        V5_SUBACK_NOT_AUTHORIZED
+                    } else {
+                        V5_SUBACK_UNSPECIFIED
+                    });
                     continue;
                 }
             }
@@ -10741,6 +10754,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .sessions
         .set_max_packet_size(cfg.session.max_packet_size);
+    // Apply the configured session expiry cap before any bind.
+    // One atomic store at boot. CONNECT values above it clamp.
+    // Resolves through the layers (`session.max_session_expiry_secs`).
+    shared
+        .sessions
+        .set_max_session_expiry_secs(cfg.session.max_session_expiry_secs);
     // TM-08: apply the client-certificate switches before any bind.
     // Off by default keeps handshakes unchanged. On denies binds
     // without a certificate on that listener. Connect only.
@@ -12737,6 +12756,82 @@ mod tests {
             "expired session must reconnect with present=false"
         );
         assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn v5_session_expiry_caps_at_configured_maximum() {
+        // Use the live edge path.
+        // Send each v5 bind over TCP.
+        // Read the granted expiry from the socket reply.
+        let shared = Shared::new();
+        assert_eq!(shared.sessions.max_session_expiry_secs(), 86_400);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server_shared = shared.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let owned = server_shared.clone();
+                tokio::spawn(async move {
+                    handle_connection(stream, owned).await.expect("handle");
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+        let io = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let client = FramedTransport::new(io);
+        let meta = encode_bind_meta_v5(V5BindParams {
+            client_id: "v5-expiry-capped",
+            clean_start: true,
+            keepalive: 60,
+            alias_max: 0,
+            session_expiry: 999_999,
+            receive_max: 100,
+            max_packet_size: 0,
+            user_properties: &[],
+        });
+        client
+            .send(bind_frame(71, 1, meta))
+            .await
+            .expect("send bind");
+        let reply = client.recv().await.expect("recv binding");
+        let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0);
+        let v5 = decode_session_binding_v5(&reply.metadata).expect("v5 section present");
+        assert_eq!(v5.granted_expiry, 86_400);
+        let session = shared
+            .sessions
+            .get("v5-expiry-capped")
+            .expect("session stored");
+        assert_eq!(session.session_expiry(), 86_400);
+        // Zero cap opts into no cap.
+        // Large values store verbatim.
+        shared.sessions.set_max_session_expiry_secs(0);
+        let io = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let client = FramedTransport::new(io);
+        let meta = encode_bind_meta_v5(V5BindParams {
+            client_id: "v5-expiry-uncapped",
+            clean_start: true,
+            keepalive: 60,
+            alias_max: 0,
+            session_expiry: 999_999,
+            receive_max: 100,
+            max_packet_size: 0,
+            user_properties: &[],
+        });
+        client
+            .send(bind_frame(72, 1, meta))
+            .await
+            .expect("send bind");
+        let reply = client.recv().await.expect("recv binding");
+        let v5 = decode_session_binding_v5(&reply.metadata).expect("v5 section present");
+        assert_eq!(v5.granted_expiry, 999_999);
+        let session = shared
+            .sessions
+            .get("v5-expiry-uncapped")
+            .expect("session stored");
+        assert_eq!(session.session_expiry(), 999_999);
+        server.abort();
     }
 
     #[test]
@@ -20679,7 +20774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_denied_yields_0x87_without_routing() {
+    async fn subscribe_denied_v4_yields_0x80_without_routing() {
         let shared = test_shared();
         shared
             .auth
@@ -20689,10 +20784,165 @@ mod tests {
         let frame = subscribe_frame(91, 1, encode_subscribe_meta(1, "boxed", &[("t", 0)]));
         let (reply, retained) = apply_subscribe(&frame, &shared).await;
         let reply = reply.expect("suback replies");
-        assert_eq!(&reply.metadata[2..], &[0x87u8]);
+        // [MQTT-3.9.3-2]: a version-3 SUBACK allows only 0, 1, 2 and 0x80.
+        assert_eq!(&reply.metadata[2..], &[0x80u8]);
         assert!(retained.is_empty());
         // Denied subscriptions register nothing.
         assert!(shared.router.matches(&Topic::new("t").unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn subscribe_denied_v5_yields_0x87_without_routing() {
+        let shared = test_shared();
+        shared
+            .auth
+            .add_rule(AclRule::new("boxed5", AclAction::All, "#", false))
+            .expect("memory-only persist cannot fail");
+
+        let opts =
+            broker_router::Subscription::encode_options_byte(QoS::AtMostOnce, false, false, 0);
+        let frame = subscribe_frame(
+            91,
+            1,
+            encode_subscribe_meta_v5(1, "boxed5", &[("t", opts, 0)]),
+        );
+        let (reply, retained) = apply_subscribe(&frame, &shared).await;
+        let reply = reply.expect("suback replies");
+        // Version 5 carries the precise reason code, Not Authorized.
+        assert_eq!(&reply.metadata[2..], &[V5_SUBACK_NOT_AUTHORIZED]);
+        assert!(retained.is_empty());
+        assert!(shared.router.matches(&Topic::new("t").unwrap()).is_empty());
+    }
+
+    /// A version-4 client that the ACL denies reads SUBACK 0x80 from a
+    /// real socket. [MQTT-3.9.3-2] allows only 0, 1, 2 and 0x80 in a
+    /// version-3 SUBACK. The kernel serves its own native listener here.
+    #[tokio::test]
+    async fn subscribe_denied_v4_over_socket_answers_0x80() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        fn remaining_len(mut len: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let mut byte = (len % 128) as u8;
+                len /= 128;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    return out;
+                }
+            }
+        }
+        fn connect_v4(client_id: &str) -> Vec<u8> {
+            let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id.as_bytes());
+            let mut packet = vec![0x10];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        fn subscribe_once(packet_id: u16, filter: &str) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            body.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+            body.extend_from_slice(filter.as_bytes());
+            body.push(0x00);
+            let mut packet = vec![0x82];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        async fn read_packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).await?;
+            let mut packet = vec![first[0]];
+            let mut multiplier = 1usize;
+            let mut remaining = 0usize;
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                packet.push(byte[0]);
+                remaining += ((byte[0] & 0x7F) as usize) * multiplier;
+                multiplier *= 128;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+            }
+            if remaining > 0 {
+                let mut body = vec![0u8; remaining];
+                stream.read_exact(&mut body).await?;
+                packet.extend_from_slice(&body);
+            }
+            Ok(packet)
+        }
+
+        let shared = Shared::new();
+        shared
+            .auth
+            .add_rule(AclRule::new(
+                "denied-over-socket",
+                AclAction::All,
+                "#",
+                false,
+            ))
+            .expect("memory-only persist cannot fail");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let mut listeners = broker_config::schema::ListenersConf::default();
+        listeners.tcp.enabled = true;
+        listeners.tcp.bind = format!("127.0.0.1:{port}");
+        listeners.tls.enabled = false;
+        listeners.ws.enabled = false;
+        listeners.wss.enabled = false;
+        shared.listener_store.reset_from_config(&listeners);
+        let control = std::sync::Arc::new(super::native::NativeListenerController::new(
+            shared.clone(),
+            listeners,
+        ));
+        shared.listener_store.set_controller(control.clone());
+        let row = shared
+            .listener_store
+            .get("tcp:default")
+            .expect("tcp row exists");
+        broker_api::v5::listeners::ListenerController::start_listener(&*control, &row)
+            .expect("listener starts");
+        let mut running = row;
+        running.running = true;
+        shared.listener_store.update(running);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("client dials");
+        client
+            .write_all(&connect_v4("denied-over-socket"))
+            .await
+            .expect("CONNECT sends");
+        let connack =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                .await
+                .expect("CONNACK in time")
+                .expect("CONNACK reads");
+        assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+        client
+            .write_all(&subscribe_once(7, "denied/topic"))
+            .await
+            .expect("SUBSCRIBE sends");
+        let suback =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                .await
+                .expect("SUBACK in time")
+                .expect("SUBACK reads");
+        assert_eq!(suback[0], 0x90);
+        assert_eq!(*suback.last().expect("suback has a code"), 0x80u8);
+        assert!(shared
+            .router
+            .matches(&Topic::new("denied/topic").unwrap())
+            .is_empty());
     }
 
     #[tokio::test]
@@ -20810,7 +21060,9 @@ mod tests {
         );
         let (reply, retained) = apply_subscribe(&sub, &shared).await;
         let reply = reply.expect("subscribe replies");
-        assert_eq!(&reply.metadata[2..], &[0x87u8]);
+        // A version-4 denial answers 0x80; only the wire version 5
+        // carries 0x87.
+        assert_eq!(&reply.metadata[2..], &[0x80u8]);
         assert!(retained.is_empty());
 
         let (meta, payload) = encode_publish_meta("authz/data", 5, 1, false, b"shh");
@@ -20883,7 +21135,9 @@ mod tests {
         );
         let (reply, retained) = apply_subscribe(&sub, &shared).await;
         let reply = reply.expect("subscribe replies");
-        assert_eq!(&reply.metadata[2..], &[0x87u8]);
+        // The refused version-4 SubAck reads 0x80. The close that
+        // follows still carries 0x87 for the disconnect.
+        assert_eq!(&reply.metadata[2..], &[0x80u8]);
         assert!(retained.is_empty());
         let close = rx_sub.try_recv().expect("denied subscribe disconnects");
         assert_eq!(close.header.opcode, OpCode::ConnClose);
@@ -21843,8 +22097,8 @@ mod tests {
         let (reply, _) = apply_subscribe(&sub, &shared).await;
         let reply = reply.expect("subscribe replies");
         assert_eq!(
-            reply.metadata[2], 0x87,
-            "B's cross-tenant subscribe is refused"
+            reply.metadata[2], 0x80,
+            "B's cross-tenant subscribe is refused with the version-4 code"
         );
         // Publish in A: A's subscriber receives it, B never does.
         let (meta, payload) = encode_publish_meta("mt6/data", 0, 0, false, b"from-a");
