@@ -21,6 +21,8 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --check --area rules-bits-bytes
   python3 docs/_tools/entries.py --write --area rules-type-conversion
   python3 docs/_tools/entries.py --check --area rules-type-conversion
+  python3 docs/_tools/entries.py --write --area rules-type-checks
+  python3 docs/_tools/entries.py --check --area rules-type-checks
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -1190,6 +1192,165 @@ def render_rules_type_conversion_page():
     return "\n".join(out) + "\n"
 
 
+# Display order of the DX2-006 function entries (type checks).
+RULES_TYPE_CHECK_FUNCTIONS = [
+    "is_null",
+    "is_null_var",
+    "is_not_null",
+    "is_not_null_var",
+    "is_str",
+    "is_bool",
+    "is_int",
+    "is_float",
+    "is_num",
+    "is_map",
+    "is_array",
+    "is_empty",
+]
+
+# One signature line per DX2-006 stem, taken from the broker code.
+RULES_TYPE_CHECK_SYNTAX = {
+    "fn-is_null": "`is_null(<v>)`",
+    "fn-is_null_var": "`is_null_var(<v>)`",
+    "fn-is_not_null": "`is_not_null(<v>)`",
+    "fn-is_not_null_var": "`is_not_null_var(<v>)`",
+    "fn-is_str": "`is_str(<v>)`",
+    "fn-is_bool": "`is_bool(<v>)`",
+    "fn-is_int": "`is_int(<v>)`",
+    "fn-is_float": "`is_float(<v>)`",
+    "fn-is_num": "`is_num(<v>)`",
+    "fn-is_map": "`is_map(<v>)`",
+    "fn-is_array": "`is_array(<v>)`",
+    "fn-is_empty": "`is_empty(<v>)`",
+}
+
+# Extra note lines per DX2-006 stem. Each states an observed limit.
+RULES_TYPE_CHECK_NOTES = {
+    "fn-is_null": [
+        "An absent payload field reads as null, so the call returns `true` for it.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_null_var": [
+        "The call reads the same as `is_null(<v>)`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_not_null": [
+        "An empty text is not null, so the call returns `true` for it.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_not_null_var": [
+        "The call reads the same as `is_not_null(<v>)`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_str": [
+        "A null value, a number and a boolean each return `false`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_bool": [
+        "Only the booleans `true` and `false` return `true`. The numbers 1 and 0 and the texts `true` and `false` return `false`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_int": [
+        "An integer literal and an integer payload field return `true`. A float such as `3.0` and a numeric text return `false`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_float": [
+        "A float literal and a float payload field return `true`. An integer literal returns `false`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_num": [
+        "An integer and a float return `true`. A numeric text returns `false`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_map": [
+        "A JSON object in the payload returns `true`. JSON text returns `false`; convert it with `map(<v>)` first.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_array": [
+        "A JSON array returns `true`. An object and JSON text return `false`.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-is_empty": [
+        "An empty text, an empty array, an empty object and null each return `true`.",
+        "A number and a boolean never return `true`. A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rules_type_checks_page():
+    """Render the type check function page (DX2-006)."""
+    out = [
+        "---",
+        "title: Rule functions: type checks",
+        "description: Verified entries for the type check functions.",
+        "sidebar:",
+        "  order: 49",
+        "---",
+        "",
+        "# Rule functions: type checks",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A type check function tests one value and returns a boolean. "
+        "Use this page when a rule must branch on the type of a field. "
+        "You get one entry per function, each with a run against the "
+        "broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    In["value"] -- "type check" --> Bool["boolean"]',
+                '    Miss["absent field"] -- "reads null" --> Null["null input"]',
+                '    Null -- "is_null or is_empty" --> Bool',
+                '    Bool -- "WHERE test" --> Keep["kept rows"]',
+                '    Keep -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A type check never stops the rule. It returns a boolean for one "
+        "value. A wrong argument count reads as null. A value that does "
+        "not match the tested type returns `false`, never null.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_TYPE_CHECK_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` tests a value."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_TYPE_CHECK_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_TYPE_CHECK_SYNTAX,
+            RULES_TYPE_CHECK_NOTES,
+            "`{name}` tests the type of a value.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -1376,6 +1537,32 @@ def main(argv):
                 )
                 return 1
             print("entries match: docs/rules/functions-type-conversion.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-type-checks":
+        fresh = render_rules_type_checks_page()
+        path = ROOT / "docs" / "rules" / "functions-type-checks.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-type-checks.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-type-checks.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-type-checks.md")
             return 0
         parser.print_help()
         return 2

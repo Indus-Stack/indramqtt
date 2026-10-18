@@ -1,0 +1,53 @@
+[example]
+area = "rules"
+item = "fn-is_empty"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT is_empty('') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null}'
+expect_matched = true
+expect_projected = '{"v": true}'
+
+[[case]]
+sql = "SELECT is_empty('a') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null}'
+expect_matched = true
+expect_projected = '{"v": false}'
+
+[[case]]
+sql = "SELECT is_empty([]) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null}'
+expect_matched = true
+expect_projected = '{"v": true}'
+
+[[case]]
+sql = "SELECT is_empty({}) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null}'
+expect_matched = true
+expect_projected = '{"v": true}'
+
+[[case]]
+sql = "SELECT is_empty(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null}'
+expect_matched = true
+expect_projected = '{"v": true}'
+
+[[case]]
+sql = "SELECT is_empty(0) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null}'
+expect_matched = true
+expect_projected = '{"v": false}'
+
+[[case]]
+sql = "SELECT is_empty() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null}'
+expect_matched = true
+expect_projected = '{"v": null}'

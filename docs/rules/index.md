@@ -37,6 +37,7 @@ flowchart LR
 | [Math and bitwise functions](./functions-math-bitwise.md) | One verified entry per math and bitwise function. |
 | [Bit and byte functions](./functions-bits-bytes.md) | One verified entry per bit and byte function. |
 | [Type conversion functions](./functions-type-conversion.md) | One verified entry per type conversion function. |
+| [Type check functions](./functions-type-checks.md) | One verified entry per type check function. |
 | [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
 
 > [!NOTE]
