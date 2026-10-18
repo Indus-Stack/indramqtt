@@ -110,6 +110,14 @@ mongodb = { version = "3", default-features = false, features = ["compat-3-0-0",
 # Optional (X1-10): the `gcp_pubsub` module is off unless its feature is
 # enabled, so the default build stays light.
 google-cloud-pubsub = { version = "1", optional = true }
+# Apache Pulsar sink on the maintained `pulsar` driver (MIT OR
+# Apache-2.0): binary protocol plus consumer reads through the
+# driver. The hand-written `TcpPulsarTransport` stays for offline
+# unit tests only; production wiring uses `DriverPulsarTransport`.
+# Reason: `tokio-runtime` only, no `async-std-runtime` (unmaintained).
+# Reason: `protobuf-src` builds `protoc` from source, so the gate
+# needs no system `protoc` binary.
+pulsar = { version = "6", default-features = false, features = ["tokio-runtime", "protobuf-src"] }
 # Error-code mapping for the Pub/Sub driver tests (Apache-2.0).
 # Optional with the driver above for the same reason.
 google-cloud-gax = { version = "1", optional = true }
@@ -142,6 +150,11 @@ prost = { version = "0.13" }
 # unconditionally, which the licence gate rejects, while 0.25 exposes
 # the same RESP/AUTH/SELECT/multiplexed API without it.
 redis = { version = "0.25", default-features = false, features = ["tokio-comp"] }
+# OPC-UA sink on the maintained `async-opcua` driver (MPL-2.0):
+# session connect with username auth plus typed writes and
+# reads. The hand-written `TcpOpcUaTransport` stays for offline
+# unit tests only; production wiring uses `DriverOpcUaTransport`.
+async-opcua = { version = "0.19", default-features = false, features = ["client"] }
 # Microsoft SQL Server sink on the maintained `tiberius` driver
 # (MIT/Apache-2.0): TDS (PRELOGIN, LOGIN7, sp_executesql) with SQL auth
 # and typed params over tokio (`tokio-util` compat). The hand-written
@@ -160,6 +173,12 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # The hand-written `HttpTdengineTransport` stays for token/TLS configs
 # and offline unit tests; production wiring uses
 # `DriverTdengineTransport` below (`reqwest` REST, Basic + plaintext).
+# Oracle Database sink on the maintained `oracle-rs` driver
+# (MIT OR Apache-2.0): pure TNS with native auth and `:1` binds,
+# no client libraries. The `HttpOracleTransport` stays for ORDS
+# configs and offline unit tests only; direct database wiring uses
+# `DriverOracleTransport` below.
+oracle-rs = { version = "0.1" }
 
 [features]
 # Default build holds light sinks only (no vendor SDK).

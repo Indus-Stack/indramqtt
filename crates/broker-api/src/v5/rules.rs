@@ -3372,7 +3372,7 @@ pub(crate) async fn register_live_sink(
                 timeout_ms,
             };
             if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::pulsar::TcpPulsarTransport::new(&config)
+                broker_connectors_enterprise::pulsar::DriverPulsarTransport::new(&config)
             ) {
                 let transport = Arc::new(transport);
                 if let Some(sink) = record_sink_error!(
@@ -3619,7 +3619,7 @@ pub(crate) async fn register_live_sink(
                 timeout_ms,
             };
             if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::opc_ua::TcpOpcUaTransport::new(&config)
+                broker_connectors_enterprise::opc_ua::DriverOpcUaTransport::new(&config)
             ) {
                 let transport = Arc::new(transport);
                 if let Some(sink) = record_sink_error!(

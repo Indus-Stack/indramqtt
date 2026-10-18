@@ -225,21 +225,21 @@ pub use oci_streaming::{
 pub use opc_ua::{
     datetime_from_millis, datetime_to_rfc3339, decode_chunk, decode_data_value, decode_variant,
     encode_chunk, encode_data_value, encode_variant, encode_write_request, notification_to_json,
-    MemoryOpcUaTransport, NodeSubscriptionConfig, OpcUaAuth, OpcUaChannelFrame, OpcUaConnector,
-    OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue, OpcUaSecurityMode,
-    OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus, OpcUaTransport,
-    OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport,
+    DriverOpcUaTransport, MemoryOpcUaTransport, NodeSubscriptionConfig, OpcUaAuth,
+    OpcUaChannelFrame, OpcUaConnector, OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue,
+    OpcUaSecurityMode, OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus,
+    OpcUaTransport, OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport,
 };
 pub use oracle::{
     build_merge_sql, classify_ora_error, extract_oracle_row, CapturedOracleExecution,
-    HttpOracleTransport, MockOracleTransport, OraErrorClassification, OracleBindParam,
-    OracleConnector, OracleResponse, OracleRow, OracleSink, OracleSinkConfig, OracleTransport,
-    OracleValue,
+    DriverOracleTransport, HttpOracleTransport, MockOracleTransport, OraErrorClassification,
+    OracleBindParam, OracleConnector, OracleResponse, OracleRow, OracleSink, OracleSinkConfig,
+    OracleTransport, OracleValue,
 };
 pub use pulsar::{
     crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url,
-    CapturedProduce, DecodedMetadata, MemoryPulsarTransport, PulsarAuth, PulsarConnector,
-    PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport,
+    CapturedProduce, DecodedMetadata, DriverPulsarTransport, MemoryPulsarTransport, PulsarAuth,
+    PulsarConnector, PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport,
     TcpPulsarTransport,
 };
 pub use redshift::{

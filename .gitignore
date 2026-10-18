@@ -28,3 +28,6 @@ Thumbs.db
 /dashboard/
 __pycache__/
 benchmark/suite/__pycache__/
+
+# Broker runtime state (password hashes, private keys, local snapshots)
+/data/

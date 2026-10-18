@@ -182,6 +182,47 @@ fi
     config explain --key node.id 2>/dev/null | grep -q 'boot-smoke'
 check "explain shows the value from indra.toml" $?
 
+# --- 2a. The MCP endpoint answers on the management listener ---
+# A key opens tools/list. No key gives 401. The list holds the status
+# tools (get_api_v5_status, get_status, broker_status, list_toolsets).
+# A disabled endpoint gives 404. Boot reads both from [mcp] in indra.toml.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request, urllib.error
+api, key = sys.argv[1:3]
+def post(body, headers):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api}/mcp", method="POST",
+        headers={"Content-Type": "application/json", **headers},
+        data=json.dumps(body).encode())
+    try:
+        with urllib.request.urlopen(req) as res:
+            return res.status, json.loads(res.read().decode())
+    except urllib.error.HTTPError as err:
+        return err.code, json.loads(err.read().decode())
+status, listed = post({"jsonrpc": "2.0", "method": "tools/list", "id": 1},
+                      {"Authorization": f"Bearer {key}"})
+assert status == 200, f"tools/list: {status}"
+names = [tool["name"] for tool in listed["result"]["tools"]]
+assert "get_api_v5_status" in names, "tools/list holds get_api_v5_status"
+assert "get_status" in names, "tools/list holds get_status"
+assert "broker_status" in names, "tools/list holds broker_status"
+assert "list_toolsets" in names, "tools/list holds list_toolsets"
+status, called = post({"jsonrpc": "2.0", "method": "tools/call",
+                       "params": {"name": "get_api_v5_status",
+                                  "arguments": {"query": {"format": "json"}}},
+                       "id": 2},
+                      {"Authorization": f"Bearer {key}"})
+assert status == 200, f"tools/call: {status}"
+assert "isError" not in called["result"], f"status call works: {called}"
+answer = json.loads(called["result"]["content"][0]["text"])
+assert answer["broker_status"] in ("started", "stopped"), f"status shape: {answer}"
+assert answer["rel_vsn"].startswith("v"), f"version shape: {answer}"
+status, _ = post({"jsonrpc": "2.0", "method": "ping", "id": 3}, {})
+assert status == 401, f"no key: {status}"
+print("the MCP endpoint lists tools for a key and refuses calls with no key")
+PY
+check "the MCP endpoint lists tools for a key and refuses calls with no key" $?
+
 # --- 3. Each setting in the schema is permitted in indra.toml ---
 python3 - "$ROOT" > "$ROOT/all.count" <<'PY'
 import json, os, sys
@@ -532,6 +573,100 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 4f. The built-in MCP endpoint answers on the management listener ---
+# The kernel boots with the default `[mcp]` settings, so the path serves.
+# An operator key calls `initialize`, `tools/list` and `tools/call
+# get_api_v5_status` through the production HTTP entry. The list also
+# holds the messaging tools: the publish operation and
+# `subscribe_collect`. A call with no key and a call with a wrong key
+# get 401. An unknown method gets -32601.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request, urllib.error
+api_port, key = sys.argv[1], sys.argv[2]
+
+def mcp(payload, auth):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}/mcp", data=data, method="POST",
+        headers={"Content-Type": "application/json"})
+    if auth is not None:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode())
+        except ValueError:
+            return e.code, {}
+    except OSError:
+        return 0, {}
+
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+
+good_auth = f"Bearer {key}"
+status, body = mcp({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18",
+                               "capabilities": {},
+                               "clientInfo": {"name": "smoke", "version": "0"}}},
+                   good_auth)
+report("the MCP endpoint answers initialize with a server version",
+       status == 200
+       and body.get("result", {}).get("protocolVersion") == "2025-06-18")
+
+status, body = mcp({"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                    "params": {}},
+                   good_auth)
+tools = body.get("result", {}).get("tools", [])
+report("the MCP tool list holds get_api_v5_status",
+       status == 200
+       and any(tool.get("name") == "get_api_v5_status" for tool in tools)
+       and any(tool.get("name") == "get_status" for tool in tools))
+
+names = [tool.get("name") for tool in tools]
+report("the MCP tool list holds the messaging tools",
+       "post_api_v5_publish" in names and "subscribe_collect" in names)
+
+status, body = mcp({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "get_api_v5_status",
+                               "arguments": {"query": {"format": "json"}}}},
+                   good_auth)
+content = body.get("result", {}).get("content", [])
+text = content[0].get("text", "") if content else ""
+try:
+    detail = json.loads(text)
+except ValueError:
+    detail = {}
+report("the get_api_v5_status tool returns the HTTP status document",
+       status == 200
+       and detail.get("broker_status") in ("started", "stopped")
+       and isinstance(detail.get("rel_vsn"), str)
+       and detail.get("rel_vsn", "").startswith("v"))
+
+status, body = mcp({"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}},
+                   None)
+report("the MCP endpoint refuses a call with no key with 401",
+       status == 401 and body.get("code") == "UNAUTHORIZED"
+       and "jsonrpc" not in body)
+
+status, body = mcp({"jsonrpc": "2.0", "id": 5, "method": "ping", "params": {}},
+                   "Bearer wrong-key-wrong-key")
+report("the MCP endpoint refuses a call with a wrong key with 401",
+       status == 401 and "jsonrpc" not in body)
+
+status, body = mcp({"jsonrpc": "2.0", "id": 6, "method": "nope/method",
+                    "params": {}},
+                   good_auth)
+report("the MCP endpoint answers an unknown method with -32601",
+       status == 200 and body.get("error", {}).get("code") == -32601)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
 # --- 4a. Unsubscribe on the kernel listener keeps the connection ---
 # A client subscribes, gets a message, unsubscribes, gets UNSUBACK,
 # and gets no more messages. It covers MQTT 3.1.1 and MQTT 5.
@@ -602,6 +737,51 @@ v5_pub.sendall(packet(0x30, field(v5_topic) + b"\x00" + b"v5-second"))
 report("an MQTT 5 unsubscribe stops delivery and answers success",
        v5_ready and v5_pub_ok and v5_first_ok and v5_unsuback_ok
        and receive(v5_sub, 1) == b"")
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4a5. The default Session Expiry cap is in operation at boot ---
+# A version 5 client asks for a Session Expiry Interval of 999999
+# seconds. The CONNACK holds the granted interval, capped at the
+# default of 86400 seconds. The operator sees the cap through the
+# socket. No test-only setter runs.
+python3 - "$MQTT_PORT" <<'PY'
+import socket, struct, sys, time
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the kernel listener does not listen")
+def connect_with_expiry(sock, client_id, seconds):
+    # Version 5.0, clean start, Keep Alive 60. Property length 5, then
+    # Session Expiry Interval (0x11) as a four byte integer.
+    body = (b"\x00\x04MQTT\x05\x02\x00\x3c" + b"\x05"
+            + bytes([0x11]) + struct.pack(">I", seconds) + field(client_id))
+    sock.sendall(bytes([0x10, len(body)]) + body)
+    sock.settimeout(5)
+    return sock.recv(200)
+def granted_expiry(ack):
+    # 0x20 | remaining | ack flags | reason | property length | props.
+    # The Session Expiry Interval is the first property when sent.
+    if len(ack) < 10 or ack[0] != 0x20 or ack[3] != 0 or ack[5] != 0x11:
+        return None
+    return struct.unpack(">I", ack[6:10])[0]
+sock = wait_port(mqtt_port)
+ack = connect_with_expiry(sock, b"smoke-expiry-default", 999999)
+sock.close()
+report("the default cap of 86400 seconds limits the granted Session Expiry Interval",
+       granted_expiry(ack) == 86400)
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
@@ -1806,6 +1986,82 @@ else:
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
+
+# --- 12. The operator Session Expiry cap is in operation at boot ---
+# An operator sets session.max_session_expiry_secs to 3600 in
+# indra.toml. A version 5 client that asks for 999999 seconds gets
+# 3600 in the CONNACK. This kernel runs its own config and ports so it
+# does not disturb the checks above.
+read -r SESSION_API_PORT SESSION_MQTT_PORT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/cfg-session" "$ROOT/data-session"
+cat > "$ROOT/cfg-session/indra.toml" <<EOF
+[node]
+id = "boot-smoke-session"
+data_dir = "$ROOT/data-session"
+
+[listeners.tcp]
+bind = "127.0.0.1:$SESSION_MQTT_PORT"
+
+[listeners.api]
+bind = "127.0.0.1:$SESSION_API_PORT"
+
+[session]
+max_session_expiry_secs = 3600
+
+[logging]
+level = "warn"
+EOF
+INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
+    "$KERNEL" --config-dir "$ROOT/cfg-session" > "$ROOT/kernel-session.log" 2>&1 &
+SESSION_KERNEL_PID=$!
+python3 - "$SESSION_MQTT_PORT" <<'PY'
+import socket, struct, sys, time
+mqtt_port = sys.argv[1]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def field(data):
+    return struct.pack(">H", len(data)) + data
+def wait_port(port):
+    for _ in range(200):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the session-cap kernel listener does not listen")
+def connect_with_expiry(sock, client_id, seconds):
+    body = (b"\x00\x04MQTT\x05\x02\x00\x3c" + b"\x05"
+            + bytes([0x11]) + struct.pack(">I", seconds) + field(client_id))
+    sock.sendall(bytes([0x10, len(body)]) + body)
+    sock.settimeout(5)
+    return sock.recv(200)
+def granted_expiry(ack):
+    if len(ack) < 10 or ack[0] != 0x20 or ack[3] != 0 or ack[5] != 0x11:
+        return None
+    return struct.unpack(">I", ack[6:10])[0]
+sock = wait_port(mqtt_port)
+ack = connect_with_expiry(sock, b"smoke-expiry-configured", 999999)
+sock.close()
+report("session.max_session_expiry_secs from indra.toml limits the granted interval",
+       granted_expiry(ack) == 3600)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+kill "$SESSION_KERNEL_PID" 2>/dev/null
+wait "$SESSION_KERNEL_PID" 2>/dev/null
 
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"

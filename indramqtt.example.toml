@@ -265,3 +265,13 @@ allowed_realms = []
 clock_skew_secs = 300
 role_map = ""
 replay_max_entries = 1024
+
+# =============================================================================
+# Built-in MCP Endpoint (Model Context Protocol)
+# =============================================================================
+
+[mcp]
+# Serve POST /mcp on the management listener. A disabled path answers 404.
+enabled = true
+# Refuse mutating tool calls. Read-only mode still serves broker_status.
+read_only = false

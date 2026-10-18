@@ -529,6 +529,13 @@ pub const DEFAULT_SESSION_EXPIRY_SECS: u32 = 0;
 /// [`DEFAULT_SESSION_EXPIRY_SECS`]).
 pub const SESSION_EXPIRY_NEVER: u32 = 0xFFFF_FFFF;
 
+/// Default session expiry cap in seconds: 86400 (one day).
+/// Reason: one day covers durable sessions without pinning state
+/// forever. Schema home is `session.max_session_expiry_secs`.
+/// Configurable per manager via
+/// [`SessionManager::set_max_session_expiry_secs`].
+pub const DEFAULT_MAX_SESSION_EXPIRY_SECS: u64 = 86_400;
+
 /// Documented default client Receive Maximum (X1-02): 65535, the wire
 /// maximum, i.e. no effective cap. Rationale: version-4 clients and v5
 /// CONNECTs without the property announce no flow-control limit, so the
@@ -1902,6 +1909,10 @@ pub struct SessionManager {
     /// Largest MQTT packet in bytes (P2). One relaxed atomic load per
     /// new connection; never touched on the publish fast path.
     max_packet_size: std::sync::atomic::AtomicU32,
+    /// Session expiry cap in seconds (0 means no cap).
+    /// One relaxed atomic load per new connection.
+    /// Never touched on the publish fast path.
+    max_session_expiry_secs: AtomicU64,
     /// Durable backing for every detached offline queue (B4-06, T-93).
     /// `None` (the default) keeps memory-only queues exactly as before.
     /// The kernel installs one store at boot (see
@@ -1981,6 +1992,7 @@ impl SessionManager {
             max_qos1_spill: AtomicUsize::new(max_qos1_spill.max(1)),
             max_topic_alias: AtomicU16::new(DEFAULT_TOPIC_ALIAS_MAXIMUM),
             max_packet_size: std::sync::atomic::AtomicU32::new(DEFAULT_MAX_PACKET_SIZE),
+            max_session_expiry_secs: AtomicU64::new(DEFAULT_MAX_SESSION_EXPIRY_SECS),
             offline_store: RwLock::new(None),
         }
     }
@@ -2188,6 +2200,29 @@ impl SessionManager {
     pub fn set_max_packet_size(&self, max: u32) {
         self.max_packet_size
             .store(max.clamp(1, MAX_PACKET_SIZE_WIRE), Ordering::Relaxed);
+    }
+
+    /// Session expiry cap in seconds (default 86400, 0 means no cap).
+    /// Connect path only. The publish path never reads it.
+    pub fn max_session_expiry_secs(&self) -> u64 {
+        self.max_session_expiry_secs.load(Ordering::Relaxed)
+    }
+
+    /// Override the session expiry cap for connections after this call.
+    /// Zero opts into no cap. One relaxed atomic store. Boot path only.
+    pub fn set_max_session_expiry_secs(&self, max: u64) {
+        self.max_session_expiry_secs.store(max, Ordering::Relaxed);
+    }
+
+    /// Clamp one CONNECT expiry to the cap. Zero cap means no cap.
+    /// Connect path only. Never allocates. Never touches the hot path.
+    pub fn cap_session_expiry(&self, expiry: u32) -> u32 {
+        let max = self.max_session_expiry_secs.load(Ordering::Relaxed);
+        if max == 0 {
+            return expiry;
+        }
+        let capped = (expiry as u64).min(max);
+        capped.min(u32::MAX as u64) as u32
     }
 
     /// Sessions held in one tenant (live plus detached with state).
@@ -2854,6 +2889,9 @@ impl SessionManager {
         receive_max: u16,
         max_packet: u32,
     ) -> (Arc<Session>, bool, Vec<TopicFilter>) {
+        // Cap the CONNECT expiry at the configured maximum.
+        // Zero cap means the operator opts into no cap.
+        let expiry = self.cap_session_expiry(expiry);
         if clean_start {
             let (session, present) = self.get_or_create_in_tenant(tenant, client_id, true);
             debug_assert!(!present);

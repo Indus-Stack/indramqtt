@@ -65,10 +65,10 @@ allow_anonymous = false
 Section names follow the schema. Use `[node]`, `[listeners.tcp]`,
 `[listeners.tls]`, `[listeners.ws]`, `[listeners.wss]`, `[listeners.api]`,
 `[quotas]`, `[session]`, `[logging]`, `[rules_engine]`, `[auth]`,
-`[cluster]`, `[licence]`, `[gateway]`, `[persistence]`, `[ldap]` and
-`[kerberos]`. `[listeners.websocket]` still means `[listeners.ws]`.
-`[rules]` still means `[rules_engine]`. See `docs/reference/settings.md`
-and `indramqtt.example.toml` for every setting.
+`[cluster]`, `[licence]`, `[gateway]`, `[persistence]`, `[ldap]`,
+`[kerberos]` and `[mcp]`. `[listeners.websocket]` still means
+`[listeners.ws]`. `[rules]` still means `[rules_engine]`. See
+`docs/reference/settings.md` and `indramqtt.example.toml` for every setting.
 
 ## Environment: `INDRA_` plus the setting path
 

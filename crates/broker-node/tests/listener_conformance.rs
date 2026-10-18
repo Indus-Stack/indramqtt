@@ -77,93 +77,118 @@ fn tag(name: &str) -> String {
     )
 }
 
+/// Takes four free loopback ports. All four differ.
+/// Parallel tests probe at once. Distinct ports stop self collision.
+fn distinct_ports() -> (u16, u16, u16, u16) {
+    loop {
+        let ports = (
+            ephemeral_port(),
+            ephemeral_port(),
+            ephemeral_port(),
+            ephemeral_port(),
+        );
+        let (a, b, c, d) = ports;
+        if a != b && a != c && a != d && b != c && b != d && c != d {
+            return ports;
+        }
+    }
+}
+
 /// Boots one kernel with the kernel listener on ephemeral ports.
 /// `tcp_max` sets `listeners.tcp.max_connections` when present.
 async fn spawn_kernel(name: &str, tcp_max: Option<u32>) -> Kernel {
-    let tag = tag(name);
-    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}-data"));
-    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
-    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
-    let bl_port = ephemeral_port();
-    let mqtt_port = ephemeral_port();
-    let ws_port = ephemeral_port();
-    let api_port = ephemeral_port();
-    let max_line = tcp_max.map_or(String::new(), |m| format!("max_connections = {m}\n"));
-    std::fs::write(
-        config_dir.join("indra.toml"),
-        format!(
-            "[node]\n\
-             id = \"lc-{tag}\"\n\
-             data_dir = \"{}\"\n\
-             brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
-             \n\
-             [listeners.tcp]\n\
-             bind = \"127.0.0.1:{mqtt_port}\"\n\
-             native = true\n\
-             {max_line}\
-             [listeners.ws]\n\
-             bind = \"127.0.0.1:{ws_port}\"\n\
-             native = true\n\
-             \n\
-             [listeners.api]\n\
-             bind = \"127.0.0.1:{api_port}\"\n\
-             \n\
-             [logging]\n\
-             level = \"warn\"\n",
-            scratch.display(),
-        ),
-    )
-    .expect("write indra.toml");
-    let mut child = tokio::process::Command::new(kernel_binary())
-        .arg("--config-dir")
-        .arg(&config_dir)
-        .arg("--allow-anonymous")
-        .env("INDRA_API_KEYS", API_KEY)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn real kernel");
-    let http = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{api_port}");
-    let deadline = std::time::Instant::now() + BOOT;
-    loop {
-        let up = tokio::time::timeout(
-            Duration::from_secs(2),
-            http.get(format!("{base}/healthz")).send(),
+    // Retry boot when ports collide. A probe frees its port.
+    // Another test sometimes binds it first. Fresh ports fix it.
+    for attempt in 1..=3 {
+        let run_tag = format!("{}-{attempt}", tag(name));
+        let scratch = std::env::temp_dir().join(format!("indramqtt-{run_tag}-data"));
+        let config_dir = std::env::temp_dir().join(format!("indramqtt-{run_tag}-cfg"));
+        std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+        let (bl_port, mqtt_port, ws_port, api_port) = distinct_ports();
+        let max_line = tcp_max.map_or(String::new(), |m| format!("max_connections = {m}\n"));
+        std::fs::write(
+            config_dir.join("indra.toml"),
+            format!(
+                "[node]\n\
+                 id = \"lc-{run_tag}\"\n\
+                 data_dir = \"{}\"\n\
+                 brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
+                 \n\
+                 [listeners.tcp]\n\
+                 bind = \"127.0.0.1:{mqtt_port}\"\n\
+                 native = true\n\
+                 {max_line}\
+                 [listeners.ws]\n\
+                 bind = \"127.0.0.1:{ws_port}\"\n\
+                 native = true\n\
+                 \n\
+                 [listeners.api]\n\
+                 bind = \"127.0.0.1:{api_port}\"\n\
+                 \n\
+                 [logging]\n\
+                 level = \"warn\"\n",
+                scratch.display(),
+            ),
         )
-        .await;
-        if let Ok(Ok(res)) = up {
-            if let Ok(text) = res.text().await {
-                if text == "OK"
-                    && tokio::net::TcpStream::connect(("127.0.0.1", mqtt_port))
-                        .await
-                        .is_ok()
-                    && tokio::net::TcpStream::connect(("127.0.0.1", ws_port))
-                        .await
-                        .is_ok()
-                {
-                    break;
+        .expect("write indra.toml");
+        let mut child = tokio::process::Command::new(kernel_binary())
+            .arg("--config-dir")
+            .arg(&config_dir)
+            .arg("--allow-anonymous")
+            .env("INDRA_API_KEYS", API_KEY)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn real kernel");
+        let http = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{api_port}");
+        let deadline = std::time::Instant::now() + BOOT;
+        loop {
+            let up = tokio::time::timeout(
+                Duration::from_secs(2),
+                http.get(format!("{base}/healthz")).send(),
+            )
+            .await;
+            if let Ok(Ok(res)) = up {
+                if let Ok(text) = res.text().await {
+                    if text == "OK"
+                        && tokio::net::TcpStream::connect(("127.0.0.1", mqtt_port))
+                            .await
+                            .is_ok()
+                        && tokio::net::TcpStream::connect(("127.0.0.1", ws_port))
+                            .await
+                            .is_ok()
+                    {
+                        return Kernel {
+                            child,
+                            mqtt_port,
+                            ws_port,
+                            api_port,
+                            scratch,
+                            config_dir,
+                        };
+                    }
                 }
             }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill().await;
+                panic!("kernel never opened API {api_port} and MQTT {mqtt_port}");
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                // Clean stale dirs. Next attempt uses fresh ports.
+                let _ = child.kill().await;
+                let _ = std::fs::remove_dir_all(&scratch);
+                let _ = std::fs::remove_dir_all(&config_dir);
+                if attempt >= 3 {
+                    panic!("kernel exited during boot: {status}");
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill().await;
-            panic!("kernel never opened API {api_port} and MQTT {mqtt_port}");
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("kernel exited during boot: {status}");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Kernel {
-        child,
-        mqtt_port,
-        ws_port,
-        api_port,
-        scratch,
-        config_dir,
-    }
+    panic!("kernel never started after retries");
 }
 
 /// Opens one TCP connection to the kernel listener.
