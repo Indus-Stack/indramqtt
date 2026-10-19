@@ -415,7 +415,7 @@ pub async fn create_rule(
         Err(broker_rules::RuleEngineError::InvalidRule(message))
             if message.starts_with("duplicate rule id:") =>
         {
-            ApiError::AlreadyExists(message).into_response()
+            ApiError::BadRequest(message).into_response()
         }
         Err(e) => ApiError::BadRequest(format!("Rule creation failed: {e}")).into_response(),
     }

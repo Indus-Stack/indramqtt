@@ -357,7 +357,7 @@ pub async fn test_stored_rule(
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "code": "NOT_FOUND",
+                "code": "RULE_NOT_FOUND",
                 "message": "Rule not found"
             })),
         )
@@ -732,7 +732,7 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::NOT_FOUND);
-            assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+            assert_eq!(body["code"], serde_json::json!("RULE_NOT_FOUND"));
             assert!(body["message"].is_string());
         }
     }

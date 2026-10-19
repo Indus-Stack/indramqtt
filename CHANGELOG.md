@@ -71,6 +71,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Management stores**: the stores keep serving after a lock failure instead of stopping the process.
 
 ### Fixed
+- Rule API errors follow the reference API: duplicate rule creation returns `400 BAD_REQUEST`; a stored-rule test for an absent id returns `404 RULE_NOT_FOUND`. A refused duplicate keeps the existing rule and its stored settings.
 - **Messages that did not arrive in a large fan-out**: the kernel wrote one batch for each wake of a link and then waited. A publish to more subscribers than one batch holds left messages in the queues, and the kernel counted them as delivered. The kernel now writes until the queues are empty.
 
 ---

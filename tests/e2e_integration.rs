@@ -4250,3 +4250,103 @@ async fn mv00_webhook_keeps_projection_bytes_through_mqtt() {
 async fn mv00_legacy_window_wildcard_keeps_payload_order() {
     mv00_window_sql_case("legacy-window", "SELECT *, sum(v) AS total FROM \"mv00/in/legacy-window\" GROUP BY COUNTWINDOW(2) ORDER BY v", &[r#"{"v":1,"b":2,"a":3}"#, r#"{"v":3,"b":4,"a":5}"#], r#"{"v":1,"b":2,"a":3,"total":4}"#).await;
 }
+
+/// A duplicate returns the reference code and keeps the live and stored rule.
+#[tokio::test]
+async fn mv00_api_error_duplicate_create_keeps_live_and_stored_rule() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "duplicate-error";
+    let sql = "SELECT b FROM \"mv00/in/duplicate-error\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, "SELECT a FROM \"mv00/in/duplicate-error\""),
+    )
+    .await;
+    assert_eq!(status, 400, "duplicate: {body}");
+    assert!(body["message"].is_string());
+    let duplicate_code = body["code"].as_str().expect("error code").to_string();
+    for phase in 0..2 {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            "/api/v5/rules/duplicate-error",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["sql"], sql, "duplicate kept the original SQL");
+        let mut subscriber = mv00_connect(&kernel, "mv00-duplicate-sub").await;
+        mv00_subscribe(&mut subscriber).await;
+        let mut publisher = mv00_connect(&kernel, "mv00-duplicate-pub").await;
+        mv00_assert_publish(
+            &mut publisher,
+            &mut subscriber,
+            id,
+            r#"{"a":1,"b":2}"#,
+            &[r#"{"b":2}"#],
+        )
+        .await;
+        drop(publisher);
+        drop(subscriber);
+        if phase == 0 {
+            mv00_restart(&mut kernel).await;
+        }
+    }
+    kernel.finish().await;
+    assert_eq!(duplicate_code, "BAD_REQUEST");
+}
+
+/// An absent stored-rule probe returns the reference code and creates no state.
+#[tokio::test]
+async fn mv00_api_error_missing_probe_keeps_store_empty() {
+    let mut kernel = spawn_kernel("").await;
+    let mut codes = Vec::new();
+    for phase in 0..2 {
+        for sample in [
+            serde_json::json!({"context": {
+                "event_type": "message_publish",
+                "topic": "mv00/in/missing",
+                "payload": r#"{"b":2}"#,
+            }}),
+            serde_json::Value::Null,
+        ] {
+            let (status, body) = mv00_api(
+                &kernel,
+                reqwest::Method::POST,
+                "/api/v5/rules/no-such-rule/test",
+                sample,
+            )
+            .await;
+            assert_eq!(status, 404, "absent rule: {body}");
+            assert!(body["message"].is_string());
+            codes.push(body["code"].as_str().expect("error code").to_string());
+        }
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            "/api/v5/rules",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], serde_json::json!([]));
+        if phase == 0 {
+            mv00_restart(&mut kernel).await;
+        }
+    }
+    kernel.finish().await;
+    assert!(
+        codes.iter().all(|code| code == "RULE_NOT_FOUND"),
+        "absent-rule probe codes: {codes:?}"
+    );
+}

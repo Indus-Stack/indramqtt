@@ -81,6 +81,13 @@ PY
 OK
 ```
 
+## API errors
+
+Creating a rule with an id that already exists returns `400 BAD_REQUEST`.
+The existing rule and its stored settings do not change.
+Testing an absent rule with `POST /api/v5/rules/{id}/test` returns
+`404 RULE_NOT_FOUND`. The test creates no rule.
+
 ## Next steps
 
 - Write the query with [Rule SQL](./sql.md).

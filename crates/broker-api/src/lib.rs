@@ -6821,7 +6821,7 @@ mod tests {
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
 
         // Broker rule path: one publish through `dispatch_ingress` fires
         // the stored rule into the registered sink, never `sink.send`
@@ -16136,7 +16136,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 404);
-        assert_eq!(body["code"], json!("NOT_FOUND"));
+        assert_eq!(body["code"], json!("RULE_NOT_FOUND"));
 
         // Side-effect-free: the stored rule survives, live counters stayed
         // at zero (the probe bumps nothing), and live routing still works
