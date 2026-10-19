@@ -71,7 +71,7 @@ pub struct RuleContext {
     pub qos: Option<u8>,
     pub msg_id: Option<String>,
     pub payload_raw: Option<String>,
-    pub record: HashMap<String, Value>,
+    pub record: serde_json::Map<String, Value>,
     pub rule_id: String,
     /// True for dry-run evaluations (`try_evaluate`, the SQL studio tester):
     /// state-mutating UDFs (`proc_dict_put/del`, `kv_store_put/del`) fail

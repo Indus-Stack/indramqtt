@@ -360,16 +360,14 @@ pub fn dynamodb_attribute(value: &serde_json::Value) -> Result<String> {
             Ok(out)
         }
         serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
             let mut out = String::from("{\"M\":{");
-            for (index, key) in keys.iter().enumerate() {
+            for (index, (key, value)) in map.iter().enumerate() {
                 if index > 0 {
                     out.push(',');
                 }
                 out.push_str(&serde_json::to_string(key).unwrap_or_default());
                 out.push(':');
-                out.push_str(&dynamodb_attribute(&map[*key])?);
+                out.push_str(&dynamodb_attribute(value)?);
             }
             out.push_str("}}");
             Ok(out)
@@ -1247,6 +1245,16 @@ mod tests {
         let transport = Arc::new(MockDynamoDbTransport::new());
         let sink = Arc::new(DynamoDbSink::new(config, transport.clone()).unwrap());
         (sink, transport)
+    }
+
+    #[test]
+    fn mv00_document_members_keep_projection_and_nested_order() {
+        let value =
+            serde_json::from_str(r#"{"b":2,"a":1,"obj":{"z":3,"a":4}}"#).expect("ordered document");
+        assert_eq!(
+            dynamodb_attribute(&value).expect("typed document"),
+            r#"{"M":{"b":{"N":"2"},"a":{"N":"1"},"obj":{"M":{"z":{"N":"3"},"a":{"N":"4"}}}}}"#
+        );
     }
 
     #[test]

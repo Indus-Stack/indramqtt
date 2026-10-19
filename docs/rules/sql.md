@@ -75,6 +75,40 @@ SELECT temperature, device AS device_id FROM "sensors/+"
 | All | `SELECT *` | The full payload object. |
 | Expression | `SELECT temperature * 1.8 + 32 AS temp_f` | The computed value under `temp_f`. |
 
+### Output field order
+
+An explicit projection keeps the written SELECT order after each `AS`
+rename. For input `{"a":1,"b":2,"c":3}`, `SELECT b, a, c` emits
+`{"b":2,"a":1,"c":3}`. `SELECT *` keeps the input object's member order.
+Objects inside a field keep their input order too.
+
+In a mixed list, fields before `*` come first. The wildcard adds the input
+fields in input order. Fields after `*` follow them. A repeated name keeps
+its first position and takes the last value. For input `{"b":2,"a":1}`,
+`SELECT 99 AS a, *` emits `{"a":1,"b":2}`. A missing selected field is
+`null`. A payload key named `topic`, `qos` or `payload` keeps its existing
+value. Wildcard output omits metadata that the engine adds. Select metadata
+by name to place it in the result.
+
+Expressions keep the names that the evaluator assigns. For example,
+`SELECT b + 1, abs(a), c + 2` has keys `kuiper_field_0`, `abs`, then
+`kuiper_field_1`. In `FOREACH ... DO`, fields keep DO order. An unaliased
+expression uses `col_<field index>`, starting at zero. Without DO, each row
+has one `item` key and keeps the order inside that item.
+
+Republish, console, connector forwarding and the HTTP rule tester use the
+same ordered row. The management tool for the rule tester returns that
+same result. A rule update applies the new order. A restart retains it.
+A sink with column mappings uses its configured names. A table sink that
+uses the whole row keeps column names paired with values in projection
+order. Added sink metadata follows the row fields.
+
+Window results keep SELECT order. Group rows keep the order in which the
+groups first appear. Wildcard fields come from the group's first record.
+For rows `{"v":1}` and `{"v":3}`, the duplicate-name contract for
+`SELECT sum(v) AS v, * ... GROUP BY COUNTWINDOW(2)` requires `{"v":1}`:
+the later wildcard supplies the raw first-record value.
+
 A payload that is not a JSON object never matches a SQL rule. Numbers, strings, and arrays match only rules without SQL.
 
 ## WHERE

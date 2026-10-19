@@ -57,7 +57,6 @@ use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use rekuiper_core::SharedMap;
 use rekuiper_core::StreamRecord;
-use std::collections::HashMap;
 
 /// Rule ingress queue capacity default: 1024 events. Reason: today's
 /// memory-only default, so the move changes no memory profile.
@@ -131,9 +130,9 @@ pub fn ingress_to_stream_record(
 ) -> StreamRecord {
     let parsed: Option<serde_json::Value> = serde_json::from_slice(payload).ok();
     let is_object = matches!(parsed, Some(serde_json::Value::Object(_)));
-    let mut data: HashMap<String, serde_json::Value> = match parsed.clone() {
-        Some(serde_json::Value::Object(map)) => map.into_iter().collect(),
-        _ => HashMap::new(),
+    let mut data: serde_json::Map<String, serde_json::Value> = match parsed.clone() {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
     };
     let mut added: Vec<String> = Vec::new();
     if !data.contains_key("payload") {
@@ -175,7 +174,7 @@ pub fn ingress_to_stream_record(
     );
     StreamRecord {
         timestamp: crate::now_ms() as i64,
-        data: SharedMap::new(data),
+        data: SharedMap::new(data.into_iter().collect()),
     }
 }
 
@@ -190,7 +189,7 @@ pub struct FeederRecord {
     /// Real ingress QoS number (0/1/2).
     pub qos: u8,
     /// Evaluation record with transport keys removed.
-    pub record: HashMap<String, serde_json::Value>,
+    pub record: serde_json::Map<String, serde_json::Value>,
     /// Keys the conversion injected (for the `SELECT *` wildcard strip).
     pub injected: Vec<String>,
     /// False when the payload was not a JSON object (nothing to evaluate).
@@ -201,14 +200,14 @@ pub struct FeederRecord {
 /// transport keys are missing or malformed (fail closed: the record is
 /// counted and skipped, never evaluated against a guessed topic).
 pub fn split_stream_record(mut data: SharedMap) -> Option<FeederRecord> {
-    let topic_value = data.remove(RUNTIME_TOPIC_KEY)?;
+    let topic_value = data.shift_remove(RUNTIME_TOPIC_KEY)?;
     let topic_str = topic_value.as_str()?.to_string();
-    let tenant = data.remove(RUNTIME_TENANT_KEY)?.as_str()?.to_string();
+    let tenant = data.shift_remove(RUNTIME_TENANT_KEY)?.as_str()?.to_string();
     let qos = data
-        .remove(RUNTIME_QOS_KEY)?
+        .shift_remove(RUNTIME_QOS_KEY)?
         .as_u64()
         .and_then(|q| u8::try_from(q).ok())?;
-    let (added, has_object) = match data.remove(RUNTIME_ADDED_KEY)? {
+    let (added, has_object) = match data.shift_remove(RUNTIME_ADDED_KEY)? {
         serde_json::Value::Object(mut annotation) => {
             let added = match annotation.remove("added") {
                 Some(serde_json::Value::Array(items)) => {
@@ -233,7 +232,7 @@ pub fn split_stream_record(mut data: SharedMap) -> Option<FeederRecord> {
         tenant,
         topic,
         qos,
-        record: data.into_inner(),
+        record: data.into_inner().into_iter().collect(),
         injected: added,
         has_object,
     })

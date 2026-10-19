@@ -12,7 +12,7 @@ broker-connectors = { workspace = true, optional = true }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 # The same revision as broker-rules. Two revisions make two copies of the types.
-rekuiper-sql = { git = "https://github.com/ankur-paan/rekuiper.git", rev = "8fb603153bd53593c5b9949c2b70f5376ec344fa" }
+rekuiper-sql = { git = "https://github.com/Indus-Stack/rekuiper.git", rev = "afffe8c4154d458410940307c2b96f0495d5c031" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

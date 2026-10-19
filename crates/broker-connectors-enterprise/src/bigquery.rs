@@ -339,30 +339,6 @@ pub struct BigQueryRowEntry {
     pub json: serde_json::Value,
 }
 
-/// Render a JSON value with object keys in sorted order, so the exact
-/// wire assertion holds regardless of Cargo feature unification
-/// (`serde_json/preserve_order` switches objects from sorted `BTreeMap`
-/// to insertion-order `IndexMap`).
-fn sorted_json(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let sorted: std::collections::BTreeMap<&str, serde_json::Value> = map
-                .iter()
-                .map(|(key, val)| (key.as_str(), sorted_json(val)))
-                .collect();
-            let mut ordered = serde_json::Map::with_capacity(sorted.len());
-            for (key, val) in sorted {
-                ordered.insert(key.to_string(), val);
-            }
-            serde_json::Value::Object(ordered)
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(sorted_json).collect())
-        }
-        _ => value.clone(),
-    }
-}
-
 /// Render the `insertAll` JSON body.
 pub fn render_insert_body(
     ignore_unknown: bool,
@@ -382,7 +358,7 @@ pub fn render_insert_body(
         body.push_str("{\"insertId\":");
         body.push_str(&serde_json::to_string(&row.insert_id).unwrap_or_default());
         body.push_str(",\"json\":");
-        body.push_str(&sorted_json(&row.json).to_string());
+        body.push_str(&row.json.to_string());
         body.push('}');
     }
     body.push_str("]}");
@@ -1206,6 +1182,17 @@ mod tests {
         let transport = Arc::new(MockBigQueryTransport::new());
         let sink = Arc::new(BigQuerySink::new(config, transport.clone()).unwrap());
         (sink, transport)
+    }
+
+    #[test]
+    fn mv00_row_json_keeps_projection_and_nested_order() {
+        let row = BigQueryRowEntry {
+            insert_id: "order-1".to_string(),
+            json: serde_json::from_str(r#"{"b":2,"a":1,"obj":{"z":3,"a":4}}"#)
+                .expect("ordered row"),
+        };
+        let bytes = render_insert_body(false, false, &[row]);
+        assert_eq!(bytes, br#"{"kind":"bigquery#tableDataInsertAllRequest","ignoreUnknownValues":false,"skipInvalidRows":false,"rows":[{"insertId":"order-1","json":{"b":2,"a":1,"obj":{"z":3,"a":4}}}]}"#);
     }
 
     #[test]

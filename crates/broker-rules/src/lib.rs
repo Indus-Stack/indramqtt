@@ -1520,7 +1520,7 @@ struct TimedRecord {
     tenant: String,
     topic: Topic,
     qos: QoS,
-    record: HashMap<String, serde_json::Value>,
+    record: serde_json::Map<String, serde_json::Value>,
     injected: Vec<String>,
     std_has_wildcard: bool,
     std_explicit_keys: Vec<String>,
@@ -1569,7 +1569,7 @@ type ParsedStdRule = (
 /// A window record enriched with injected timestamps and projection state.
 type EnrichedWindowRecord = (
     Topic,
-    HashMap<String, serde_json::Value>,
+    serde_json::Map<String, serde_json::Value>,
     Vec<String>,
     bool,
     Vec<String>,
@@ -2823,7 +2823,7 @@ impl RuleEngine {
     /// The `build_record` closure is only called when the flag is set.
     fn fire_event<F>(&self, source: EventSource, build_record: F)
     where
-        F: FnOnce() -> HashMap<String, serde_json::Value>,
+        F: FnOnce() -> serde_json::Map<String, serde_json::Value>,
     {
         if !self.is_event_source_selected(source) {
             return;
@@ -2860,7 +2860,7 @@ impl RuleEngine {
     /// Fire $events/client_connected
     pub fn fire_client_connected(&self, event: ClientConnectedEvent) {
         self.fire_event(EventSource::ClientConnected, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -2894,7 +2894,7 @@ impl RuleEngine {
     /// Fire $events/client_disconnected
     pub fn fire_client_disconnected(&self, event: ClientDisconnectedEvent) {
         self.fire_event(EventSource::ClientDisconnected, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -2922,7 +2922,7 @@ impl RuleEngine {
     /// Fire $events/client_connack
     pub fn fire_client_connack(&self, event: ClientConnackEvent) {
         self.fire_event(EventSource::ClientConnack, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -2948,7 +2948,7 @@ impl RuleEngine {
     /// Fire $events/client_check_authz_complete
     pub fn fire_client_check_authz_complete(&self, event: ClientCheckAuthzCompleteEvent) {
         self.fire_event(EventSource::ClientCheckAuthzComplete, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -2983,7 +2983,7 @@ impl RuleEngine {
     /// Fire $events/session_subscribed
     pub fn fire_session_subscribed(&self, event: SessionSubscribedEvent) {
         self.fire_event(EventSource::SessionSubscribed, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -3012,7 +3012,7 @@ impl RuleEngine {
     /// Fire $events/session_unsubscribed
     pub fn fire_session_unsubscribed(&self, event: SessionUnsubscribedEvent) {
         self.fire_event(EventSource::SessionUnsubscribed, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -3031,7 +3031,7 @@ impl RuleEngine {
     /// Fire $events/message_delivered
     pub fn fire_message_delivered(&self, event: MessageDeliveredEvent) {
         self.fire_event(EventSource::MessageDelivered, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -3062,7 +3062,7 @@ impl RuleEngine {
     /// Fire $events/message_acked
     pub fn fire_message_acked(&self, event: MessageAckedEvent) {
         self.fire_event(EventSource::MessageAcked, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -3089,7 +3089,7 @@ impl RuleEngine {
     /// Fire $events/message_dropped
     pub fn fire_message_dropped(&self, event: MessageDroppedEvent) {
         self.fire_event(EventSource::MessageDropped, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -3116,7 +3116,7 @@ impl RuleEngine {
     /// Fire $events/delivery_dropped
     pub fn fire_delivery_dropped(&self, event: DeliveryDroppedEvent) {
         self.fire_event(EventSource::DeliveryDropped, || {
-            let mut m = HashMap::new();
+            let mut m = serde_json::Map::new();
             m.insert(
                 "clientid".to_string(),
                 serde_json::Value::String(event.client_id),
@@ -3732,7 +3732,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
             }
             let mut record = feeder.record;
             for key in &feeder.injected {
-                record.remove(key);
+                record.shift_remove(key);
             }
             (record, Vec::new())
         } else {
@@ -4553,6 +4553,12 @@ async fn flush_rule_window(
         .into_iter()
         .map(|timed| {
             let mut map = timed.record;
+            let mut injected = timed.injected;
+            for key in ["window_start", "window_end"] {
+                if !map.contains_key(key) {
+                    injected.push(key.to_string());
+                }
+            }
             map.insert(
                 "__window_start__".to_string(),
                 serde_json::Value::from(window_start_ms),
@@ -4572,7 +4578,7 @@ async fn flush_rule_window(
             (
                 timed.topic,
                 map,
-                timed.injected,
+                injected,
                 timed.std_has_wildcard,
                 timed.std_explicit_keys,
             )
@@ -4581,22 +4587,15 @@ async fn flush_rule_window(
     // Window aggregates run over the enriched records; the per-record
     // wildcard state travels along so `SELECT *` strips exactly the injected
     // message keys afterwards (standard front-end projection state).
-    let agg_input: Vec<(Topic, HashMap<String, serde_json::Value>)> = records
-        .iter()
-        .map(|(topic, map, _, _, _)| (topic.clone(), map.clone()))
+    let agg_input = records
+        .into_iter()
+        .map(|(topic, map, injected, _, _)| (topic, map, injected))
         .collect();
-    let first_injected: Vec<String> = records
-        .first()
-        .map(|(_, _, injected, _, _)| injected.clone())
-        .unwrap_or_default();
-    for (topic, mut row) in aggregate_partitioned(stmt, agg_input, rule_id, false) {
-        strip_injected_keys(
-            &mut row,
-            std_has_wildcard,
-            std_explicit_keys,
-            &first_injected,
-        );
-        let object: serde_json::Map<String, serde_json::Value> = row.into_iter().collect();
+    for (topic, mut row, injected) in
+        aggregate_partitioned_with_metadata(stmt, agg_input, rule_id, false)
+    {
+        strip_injected_keys(&mut row, std_has_wildcard, std_explicit_keys, &injected);
+        let object = row;
         let bytes = match serde_json::to_vec(&serde_json::Value::Object(object)) {
             Ok(bytes) => Bytes::from(bytes),
             Err(e) => {
@@ -4636,10 +4635,35 @@ async fn flush_rule_window(
 /// flushing thread last saw.
 pub fn aggregate_partitioned(
     stmt: &SelectStmt,
-    records: Vec<(Topic, HashMap<String, serde_json::Value>)>,
+    records: Vec<(Topic, serde_json::Map<String, serde_json::Value>)>,
     rule_id: &str,
     dry_run: bool,
-) -> Vec<(Topic, HashMap<String, serde_json::Value>)> {
+) -> Vec<(Topic, serde_json::Map<String, serde_json::Value>)> {
+    aggregate_partitioned_with_metadata(
+        stmt,
+        records
+            .into_iter()
+            .map(|(topic, row)| (topic, row, ()))
+            .collect(),
+        rule_id,
+        dry_run,
+    )
+    .into_iter()
+    .map(|(topic, row, ())| (topic, row))
+    .collect()
+}
+
+type AggregateRecord<M> = (Topic, serde_json::Map<String, serde_json::Value>, M);
+type AggregateGroup<M> = (Topic, Vec<serde_json::Map<String, serde_json::Value>>, M);
+
+// Keep each partition's first-record metadata with its result. Wildcard
+// cleanup must retain payload keys that shadow metadata in that partition.
+fn aggregate_partitioned_with_metadata<M: Clone>(
+    stmt: &SelectStmt,
+    records: Vec<AggregateRecord<M>>,
+    rule_id: &str,
+    dry_run: bool,
+) -> Vec<AggregateRecord<M>> {
     if records.is_empty() {
         return Vec::new();
     }
@@ -4648,46 +4672,43 @@ pub fn aggregate_partitioned(
     // topic plus its first record, so context accessors resolve. Dry-run
     // partitions inherit the probe flag so state-mutating UDFs fail closed
     // instead of touching production state.
-    let partition_ctx = |topic: &Topic, first: &HashMap<String, serde_json::Value>| {
-        let object: serde_json::Map<String, serde_json::Value> =
-            first.clone().into_iter().collect();
-        stdlib::RuleContext {
+    let partition_ctx =
+        |topic: &Topic, first: &serde_json::Map<String, serde_json::Value>| stdlib::RuleContext {
             topic: Some(topic.as_str().to_string()),
             record: first.clone(),
-            payload_raw: serde_json::to_string(&serde_json::Value::Object(object)).ok(),
+            payload_raw: serde_json::to_string(first).ok(),
             rule_id: rule_id.to_string(),
             dry_run,
             ..Default::default()
-        }
-    };
+        };
     if stmt.group_by.is_empty() {
         let topic = records[0].0.clone();
-        let maps: Vec<HashMap<String, serde_json::Value>> =
-            records.into_iter().map(|(_, map)| map).collect();
+        let metadata = records[0].2.clone();
+        let maps: Vec<serde_json::Map<String, serde_json::Value>> =
+            records.into_iter().map(|(_, map, _)| map).collect();
         let ctx = partition_ctx(&topic, &maps[0]);
         let _guard = stdlib::RuleContextGuard::enter(ctx);
         return Evaluator::eval_aggregate(stmt, &maps)
-            .map(|row| vec![(topic, row)])
+            .map(|row| vec![(topic, row.into_iter().collect(), metadata)])
             .unwrap_or_default();
     }
     let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, (Topic, Vec<HashMap<String, serde_json::Value>>)> =
-        HashMap::new();
-    for (topic, map) in records {
+    let mut groups: HashMap<String, AggregateGroup<M>> = HashMap::new();
+    for (topic, map, metadata) in records {
         let key = group_key(&stmt.group_by, &map);
         let entry = groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
-            (topic, Vec::new())
+            (topic, Vec::new(), metadata)
         });
         entry.1.push(map);
     }
     let mut out = Vec::new();
     for key in order {
-        let (topic, maps) = groups.remove(&key).expect("group just inserted");
+        let (topic, maps, metadata) = groups.remove(&key).expect("group just inserted");
         let ctx = partition_ctx(&topic, &maps[0]);
         let _guard = stdlib::RuleContextGuard::enter(ctx);
         if let Some(row) = Evaluator::eval_aggregate(stmt, &maps) {
-            out.push((topic, row));
+            out.push((topic, row.into_iter().collect(), metadata));
         }
     }
     out
@@ -4695,7 +4716,10 @@ pub fn aggregate_partitioned(
 
 /// Canonical group key: type-tagged so `1`, `"1"` and `true` never
 /// collide across JSON types.
-fn group_key(exprs: &[rekuiper_sql::Expr], record: &HashMap<String, serde_json::Value>) -> String {
+fn group_key(
+    exprs: &[rekuiper_sql::Expr],
+    record: &serde_json::Map<String, serde_json::Value>,
+) -> String {
     exprs
         .iter()
         .map(|expr| match Evaluator::eval_val(expr, record) {
@@ -4738,13 +4762,38 @@ fn parse_rule_sql(sql: &str) -> Result<ParsedStdRule, RuleEngineError> {
         Err(std_err) => {
             let normalized = normalize_from_target(&rewritten);
             match rekuiper_sql::Parser::new(&normalized).parse_select() {
-                Ok(stmt) => Ok((stmt, None, Vec::new(), false, Vec::new())),
+                Ok(stmt) => {
+                    let (has_wildcard, explicit_keys) = projection_metadata(&stmt);
+                    Ok((stmt, None, Vec::new(), has_wildcard, explicit_keys))
+                }
                 Err(_) => Err(RuleEngineError::InvalidRule(format!(
                     "invalid sql_query: {std_err}"
                 ))),
             }
         }
     }
+}
+
+// Cache output names only for metadata cleanup. The evaluator owns field
+// order and values, including expressions and repeated names.
+fn projection_metadata(stmt: &SelectStmt) -> (bool, Vec<String>) {
+    let mut has_wildcard = false;
+    let mut explicit_keys = Vec::new();
+    let mut branch = Some(stmt);
+    while let Some(stmt) = branch {
+        for (index, field) in stmt.fields.iter().enumerate() {
+            if matches!(
+                field,
+                rekuiper_sql::Expr::Wildcard | rekuiper_sql::Expr::WildcardModified { .. }
+            ) {
+                has_wildcard = true;
+            } else {
+                explicit_keys.push(Evaluator::select_field_name_at(stmt, index));
+            }
+        }
+        branch = stmt.set_op.as_ref().map(|(_, next)| next.as_ref());
+    }
+    (has_wildcard, explicit_keys)
 }
 
 /// True when the ingress topic may execute this standard rule's statement.
@@ -4798,13 +4847,6 @@ fn std_sources_match(sources: &[StdSource], topic: &Topic) -> bool {
     false
 }
 
-/// Message keys injected around evaluation for the standard dialect. Kept
-/// in one place so `SELECT *` can strip exactly these (see
-/// [`strip_injected_keys`]).
-fn std_injected_keys() -> [&'static str; 3] {
-    ["payload", "topic", "qos"]
-}
-
 /// Build the evaluation record for one standard-dialect ingress.
 ///
 /// The raw JSON object keys stay at top level (so pre-front-end field
@@ -4820,11 +4862,12 @@ fn build_std_record(
     topic: &Topic,
     payload: &Bytes,
     qos: QoS,
-) -> (HashMap<String, serde_json::Value>, Vec<String>) {
-    let mut record: HashMap<String, serde_json::Value> = match serde_json::from_slice(payload) {
-        Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
-        _ => HashMap::new(),
-    };
+) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
+    let mut record: serde_json::Map<String, serde_json::Value> =
+        match serde_json::from_slice(payload) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
     let mut injected = Vec::new();
     // `payload` on first use: decoded JSON, else the raw bytes as a string.
     // Bound: the decoded value borrows nothing; no accumulation.
@@ -4854,7 +4897,7 @@ fn build_std_record(
 /// select list (`explicit_keys`: aliases, bare identifiers, dotted leaves)
 /// always survive.
 fn strip_injected_keys(
-    row: &mut HashMap<String, serde_json::Value>,
+    row: &mut serde_json::Map<String, serde_json::Value>,
     has_wildcard: bool,
     explicit_keys: &[String],
     injected: &[String],
@@ -4862,18 +4905,7 @@ fn strip_injected_keys(
     if !has_wildcard {
         return;
     }
-    for key in injected {
-        if !explicit_keys.contains(key) {
-            row.remove(key);
-        }
-    }
-    // Defensive: a future injector adding a key without updating the
-    // injected list must not leak into `SELECT *` either.
-    for key in std_injected_keys() {
-        if !explicit_keys.contains(&key.to_string()) && !injected.contains(&key.to_string()) {
-            row.remove(key);
-        }
-    }
+    row.retain(|key, _| !injected.contains(key) || explicit_keys.contains(key));
 }
 
 /// Output key for one `FOREACH ... DO` field without an `AS` alias: a bare
@@ -4901,8 +4933,8 @@ fn foreach_output_key(expr: &rekuiper_sql::Expr, idx: usize) -> String {
 fn expand_foreach_rows(
     stmt: &SelectStmt,
     plan: &ForeachPlan,
-    base: &HashMap<String, serde_json::Value>,
-) -> Vec<HashMap<String, serde_json::Value>> {
+    base: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
     let array_value = Evaluator::eval_val(&plan.array, base);
     let elements = match array_value {
         serde_json::Value::Array(items) => items,
@@ -4931,14 +4963,14 @@ fn expand_foreach_rows(
         }
         match plan.fields.as_ref() {
             None => {
-                let mut row = HashMap::new();
+                let mut row = serde_json::Map::new();
                 if let Some(item) = extended.get("item") {
                     row.insert("item".to_string(), item.clone());
                 }
                 out.push(row);
             }
             Some(fields) => {
-                let mut row = HashMap::new();
+                let mut row = serde_json::Map::new();
                 for (idx, (expr, alias)) in fields.iter().enumerate() {
                     let value = Evaluator::eval_val(expr, &extended);
                     let key = alias
@@ -5196,33 +5228,21 @@ pub fn try_evaluate(
     if !std_sources_match(&sources, &probe) {
         return Ok((false, None));
     }
-    let is_std = !sources.is_empty() || foreach.is_some() || has_wildcard;
+    let is_std = !sources.is_empty() || foreach.is_some();
     if let Some(plan) = foreach.as_ref() {
         let stmt_ref = stmt.as_ref().expect("foreach always carries a statement");
         match payload {
             serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                let bases: Vec<HashMap<String, serde_json::Value>> = match payload {
+                let bases: Vec<serde_json::Map<String, serde_json::Value>> = match payload {
                     serde_json::Value::Object(map) => {
-                        vec![
-                            build_std_value_record(
-                                &probe,
-                                map.clone().into_iter().collect(),
-                                payload,
-                            )
-                            .0,
-                        ]
+                        vec![build_std_value_record(&probe, map.clone(), payload).0]
                     }
                     serde_json::Value::Array(elements) => elements
                         .iter()
                         .filter_map(|element| match element {
-                            serde_json::Value::Object(map) => Some(
-                                build_std_value_record(
-                                    &probe,
-                                    map.clone().into_iter().collect(),
-                                    element,
-                                )
-                                .0,
-                            ),
+                            serde_json::Value::Object(map) => {
+                                Some(build_std_value_record(&probe, map.clone(), element).0)
+                            }
                             _ => None,
                         })
                         .collect(),
@@ -5231,7 +5251,7 @@ pub fn try_evaluate(
                 let mut rows: Vec<serde_json::Value> = Vec::new();
                 for base in &bases {
                     for row in expand_foreach_rows(stmt_ref, plan, base) {
-                        rows.push(serde_json::Value::Object(row.into_iter().collect()));
+                        rows.push(serde_json::Value::Object(row));
                     }
                 }
                 if rows.is_empty() {
@@ -5243,10 +5263,10 @@ pub fn try_evaluate(
                 return Ok((true, Some(serde_json::Value::Array(rows))));
             }
             _ => {
-                let (base, _) = build_std_value_record(&probe, HashMap::new(), payload);
+                let (base, _) = build_std_value_record(&probe, serde_json::Map::new(), payload);
                 let rows: Vec<serde_json::Value> = expand_foreach_rows(stmt_ref, plan, &base)
                     .into_iter()
-                    .map(|row| serde_json::Value::Object(row.into_iter().collect()))
+                    .map(serde_json::Value::Object)
                     .collect();
                 if rows.is_empty() {
                     return Ok((false, None));
@@ -5259,21 +5279,16 @@ pub fn try_evaluate(
         serde_json::Value::Array(elements) => {
             // Batch dry-run: multi-event aggregation over the object
             // elements (non-objects skipped), one row per group.
-            let records: Vec<(Topic, HashMap<String, serde_json::Value>)> = elements
+            let records: Vec<AggregateRecord<Vec<String>>> = elements
                 .iter()
                 .filter_map(|element| match element {
                     serde_json::Value::Object(map) => {
-                        let record: HashMap<String, serde_json::Value> = if is_std {
-                            build_std_value_record(
-                                &probe,
-                                map.clone().into_iter().collect(),
-                                element,
-                            )
-                            .0
+                        let (record, injected) = if is_std {
+                            build_std_value_record(&probe, map.clone(), element)
                         } else {
-                            map.clone().into_iter().collect()
+                            (map.clone(), Vec::new())
                         };
-                        Some((probe.clone(), record))
+                        Some((probe.clone(), record, injected))
                     }
                     _ => None,
                 })
@@ -5288,14 +5303,10 @@ pub fn try_evaluate(
                 }
                 Some(stmt) => {
                     let rows: Vec<serde_json::Value> =
-                        aggregate_partitioned(&stmt, records, "dry-run", true)
+                        aggregate_partitioned_with_metadata(&stmt, records, "dry-run", true)
                             .into_iter()
-                            .map(|(_, mut row)| {
+                            .map(|(_, mut row, injected)| {
                                 if is_std {
-                                    let injected = std_injected_keys()
-                                        .iter()
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>();
                                     strip_injected_keys(
                                         &mut row,
                                         has_wildcard,
@@ -5303,7 +5314,7 @@ pub fn try_evaluate(
                                         &injected,
                                     );
                                 }
-                                serde_json::Value::Object(row.into_iter().collect())
+                                serde_json::Value::Object(row)
                             })
                             .collect();
                     if rows.is_empty() {
@@ -5316,10 +5327,10 @@ pub fn try_evaluate(
         }
         serde_json::Value::Object(map) => {
             let (record, injected) = if is_std {
-                let base: HashMap<String, serde_json::Value> = map.clone().into_iter().collect();
+                let base: serde_json::Map<String, serde_json::Value> = map.clone();
                 build_std_value_record(&probe, base, payload)
             } else {
-                (map.clone().into_iter().collect(), Vec::new())
+                (map.clone(), Vec::new())
             };
             match stmt {
                 None => Ok((true, Some(payload.clone()))),
@@ -5335,7 +5346,9 @@ pub fn try_evaluate(
                     };
                     let _guard = stdlib::RuleContextGuard::enter(ctx);
                     match Evaluator::eval_select(&stmt, &record) {
-                        Some(mut projected) => {
+                        Some(projected) => {
+                            let mut projected: serde_json::Map<String, serde_json::Value> =
+                                projected.into_iter().collect();
                             if is_std {
                                 strip_injected_keys(
                                     &mut projected,
@@ -5344,8 +5357,7 @@ pub fn try_evaluate(
                                     &injected,
                                 );
                             }
-                            let object: serde_json::Map<String, serde_json::Value> =
-                                projected.into_iter().collect();
+                            let object: serde_json::Map<String, serde_json::Value> = projected;
                             Ok((true, Some(serde_json::Value::Object(object))))
                         }
                         None => Ok((false, None)),
@@ -5357,7 +5369,8 @@ pub fn try_evaluate(
             if !is_std {
                 return Ok((false, None));
             }
-            let (record, injected) = build_std_value_record(&probe, HashMap::new(), payload);
+            let (record, injected) =
+                build_std_value_record(&probe, serde_json::Map::new(), payload);
             match stmt {
                 None => Ok((true, Some(payload.clone()))),
                 Some(stmt) => {
@@ -5372,15 +5385,16 @@ pub fn try_evaluate(
                     };
                     let _guard = stdlib::RuleContextGuard::enter(ctx);
                     match Evaluator::eval_select(&stmt, &record) {
-                        Some(mut projected) => {
+                        Some(projected) => {
+                            let mut projected: serde_json::Map<String, serde_json::Value> =
+                                projected.into_iter().collect();
                             strip_injected_keys(
                                 &mut projected,
                                 has_wildcard,
                                 &explicit_keys,
                                 &injected,
                             );
-                            let object: serde_json::Map<String, serde_json::Value> =
-                                projected.into_iter().collect();
+                            let object: serde_json::Map<String, serde_json::Value> = projected;
                             Ok((true, Some(serde_json::Value::Object(object))))
                         }
                         None => Ok((false, None)),
@@ -5406,7 +5420,10 @@ fn parse_rule_sql_for_tester(sql: &str) -> Result<ParsedStdRule, String> {
         Err(std_err) => {
             let normalized = normalize_from_target(&rewritten);
             match rekuiper_sql::Parser::new(&normalized).parse_select() {
-                Ok(stmt) => Ok((stmt, None, Vec::new(), false, Vec::new())),
+                Ok(stmt) => {
+                    let (has_wildcard, explicit_keys) = projection_metadata(&stmt);
+                    Ok((stmt, None, Vec::new(), has_wildcard, explicit_keys))
+                }
                 Err(_) => Err(format!("invalid sql_query: {std_err}")),
             }
         }
@@ -5420,9 +5437,9 @@ fn parse_rule_sql_for_tester(sql: &str) -> Result<ParsedStdRule, String> {
 /// the keys this call injected (for the wildcard strip).
 fn build_std_value_record(
     topic: &Topic,
-    mut base: HashMap<String, serde_json::Value>,
+    mut base: serde_json::Map<String, serde_json::Value>,
     payload: &serde_json::Value,
-) -> (HashMap<String, serde_json::Value>, Vec<String>) {
+) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
     let mut injected = Vec::new();
     if !base.contains_key("payload") {
         base.insert("payload".to_string(), payload.clone());
@@ -5555,7 +5572,7 @@ fn split_into_connector(sql: &str) -> Result<(String, Option<String>), RuleEngin
 /// Returns every output payload to forward (empty means skip the rule):
 /// a `FOREACH` rule expands to one payload per array element, a plain rule
 /// yields at most one. Pre-front-end rules (empty sources, no `FOREACH`,
-/// no wildcard) run the historical raw-record path unchanged so existing
+/// wildcard or explicit) run the historical raw-record path so existing
 /// rekuiper-dialect rules keep their behaviour and hot-path numbers.
 fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Bytes> {
     if !std_sources_match(&rule.std_sources, topic) {
@@ -5571,7 +5588,7 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
         let rows = expand_foreach_rows(stmt, plan, &base);
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let object: serde_json::Map<String, serde_json::Value> = row.into_iter().collect();
+            let object = row;
             if let Ok(bytes) = serde_json::to_vec(&serde_json::Value::Object(object)) {
                 out.push(Bytes::from(bytes));
             } else {
@@ -5583,7 +5600,7 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
         }
         return out;
     }
-    let is_std = !rule.std_sources.is_empty() || rule.std_has_wildcard;
+    let is_std = !rule.std_sources.is_empty();
     if !is_std {
         return apply_sql(
             &rule.parsed_query,
@@ -5607,15 +5624,16 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
     };
     let _guard = stdlib::RuleContextGuard::enter(ctx);
     match Evaluator::eval_select(stmt, &record) {
-        Some(mut projected) => {
+        Some(projected) => {
+            let mut projected: serde_json::Map<String, serde_json::Value> =
+                projected.into_iter().collect();
             strip_injected_keys(
                 &mut projected,
                 rule.std_has_wildcard,
                 &rule.std_explicit_keys,
                 &injected,
             );
-            let object: serde_json::Map<String, serde_json::Value> =
-                projected.into_iter().collect();
+            let object: serde_json::Map<String, serde_json::Value> = projected;
             match serde_json::to_vec(&serde_json::Value::Object(object)) {
                 Ok(bytes) => vec![Bytes::from(bytes)],
                 Err(e) => {
@@ -5654,8 +5672,8 @@ fn apply_sql(
         None => return Some(payload.clone()),
         Some(stmt) => stmt,
     };
-    let record: HashMap<String, serde_json::Value> = match serde_json::from_slice(payload) {
-        Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
+    let record: serde_json::Map<String, serde_json::Value> = match serde_json::from_slice(payload) {
+        Ok(serde_json::Value::Object(map)) => map,
         _ => {
             tracing::debug!(
                 rule_id = %rule_id,
@@ -5676,7 +5694,7 @@ fn apply_sql(
     let _guard = stdlib::RuleContextGuard::enter(ctx);
     match Evaluator::eval_select(stmt, &record) {
         Some(projected) => {
-            // serde_json::Map is key-sorted: deterministic wire bytes.
+            // Keep the evaluator's projection order in the JSON object.
             let object: serde_json::Map<String, serde_json::Value> =
                 projected.into_iter().collect();
             match serde_json::to_vec(&serde_json::Value::Object(object)) {

@@ -63,7 +63,7 @@ fn window_length_ms(unit: &TimeUnit, length: u64) -> u64 {
 struct TimedRecord {
     arrived_ms: u64,
     topic: Topic,
-    record: HashMap<String, serde_json::Value>,
+    record: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Background aggregation worker for one Enterprise window rule.
@@ -153,10 +153,11 @@ impl WindowExecutor for EnterpriseWindowExecutor {
             Some(stmt) => stmt,
             None => return,
         };
-        let record: HashMap<String, serde_json::Value> = match serde_json::from_slice(payload) {
-            Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
-            _ => return,
-        };
+        let record: serde_json::Map<String, serde_json::Value> =
+            match serde_json::from_slice(payload) {
+                Ok(serde_json::Value::Object(map)) => map,
+                _ => return,
+            };
         let passes = match stmt.where_clause.as_ref() {
             Some(condition) => Evaluator::eval_bool(condition, &record),
             None => true,
@@ -449,7 +450,7 @@ async fn flush_window(
     let Some(engine) = engine.upgrade() else {
         return;
     };
-    let records: Vec<(Topic, HashMap<String, serde_json::Value>)> = batch
+    let records: Vec<(Topic, serde_json::Map<String, serde_json::Value>)> = batch
         .into_iter()
         .map(|timed| {
             let mut map = timed.record;
@@ -473,7 +474,7 @@ async fn flush_window(
         })
         .collect();
     for (topic, row) in aggregate_partitioned(stmt, records, rule_id, false) {
-        let object: serde_json::Map<String, serde_json::Value> = row.into_iter().collect();
+        let object = row;
         let bytes = match serde_json::to_vec(&serde_json::Value::Object(object)) {
             Ok(bytes) => Bytes::from(bytes),
             Err(e) => {

@@ -6625,7 +6625,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rekuiper-conf"
 version = "1.0.0-rc4"
-source = "git+https://github.com/ankur-paan/rekuiper.git?rev=8fb603153bd53593c5b9949c2b70f5376ec344fa#8fb603153bd53593c5b9949c2b70f5376ec344fa"
+source = "git+https://github.com/Indus-Stack/rekuiper.git?rev=afffe8c4154d458410940307c2b96f0495d5c031#afffe8c4154d458410940307c2b96f0495d5c031"
 dependencies = [
  "anyhow",
  "serde",
@@ -6636,11 +6636,12 @@ dependencies = [
 [[package]]
 name = "rekuiper-core"
 version = "1.0.0-rc4"
-source = "git+https://github.com/ankur-paan/rekuiper.git?rev=8fb603153bd53593c5b9949c2b70f5376ec344fa#8fb603153bd53593c5b9949c2b70f5376ec344fa"
+source = "git+https://github.com/Indus-Stack/rekuiper.git?rev=afffe8c4154d458410940307c2b96f0495d5c031#afffe8c4154d458410940307c2b96f0495d5c031"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "indexmap 2.14.2",
  "parking_lot",
  "regex",
  "rekuiper-conf",
@@ -6658,7 +6659,7 @@ dependencies = [
 [[package]]
 name = "rekuiper-sql"
 version = "1.0.0-rc4"
-source = "git+https://github.com/ankur-paan/rekuiper.git?rev=8fb603153bd53593c5b9949c2b70f5376ec344fa#8fb603153bd53593c5b9949c2b70f5376ec344fa"
+source = "git+https://github.com/Indus-Stack/rekuiper.git?rev=afffe8c4154d458410940307c2b96f0495d5c031#afffe8c4154d458410940307c2b96f0495d5c031"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6666,6 +6667,7 @@ dependencies = [
  "chrono-tz",
  "crc32fast",
  "flate2",
+ "indexmap 2.14.2",
  "md-5 0.10.6",
  "parking_lot",
  "rand 0.8.8",
