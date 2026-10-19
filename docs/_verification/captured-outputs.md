@@ -88,7 +88,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `rules/functions.md` | 506 | `ok` |
 | `rules/functions.md` | 531 | `ok` |
 | `rules/index.md` | 70 | `OK` |
-| `rules/sql.md` | 163 | `matched<br>unmatched` |
+| `rules/sql.md` | 197 | `matched<br>unmatched` |
 | `security/audit-log.md` | 53 | `ok` |
 | `security/audit-log.md` | 65 | `200` |
 | `security/authentication-builtin.md` | 57 | `ok` |
