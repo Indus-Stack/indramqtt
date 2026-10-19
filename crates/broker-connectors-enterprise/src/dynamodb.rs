@@ -459,7 +459,6 @@ pub fn build_item_body(
             .unwrap_or(serde_json::Value::String(rendered));
         unpacked.push((name.clone(), value));
     }
-    unpacked.sort_by(|a, b| a.0.cmp(&b.0));
     // Explicit mappings win: last write wins per key.
     let mut merged: Vec<(String, serde_json::Value)> = Vec::new();
     for (key, field) in unpacked {
@@ -1249,6 +1248,21 @@ mod tests {
 
     #[test]
     fn mv00_document_members_keep_projection_and_nested_order() {
+        let mut config = test_config();
+        config.partition_key.template = "device-1".to_string();
+        config.sort_key = None;
+        config.ttl_attribute = None;
+        config.ttl_secs = None;
+        config.attributes_mapping = HashMap::from([
+            ("_payload".to_string(), "${payload}".to_string()),
+            ("a".to_string(), "9".to_string()),
+        ]);
+        let body = build_item_body(&config, "order/in", br#"{"b":2,"a":1}"#, QoS::AtMostOnce, 0)
+            .expect("unpacked row");
+        assert_eq!(
+            body,
+            r#"{"device_id":{"S":"device-1"},"b":{"N":"2"},"a":{"N":"9"}}"#
+        );
         let value =
             serde_json::from_str(r#"{"b":2,"a":1,"obj":{"z":3,"a":4}}"#).expect("ordered document");
         assert_eq!(
