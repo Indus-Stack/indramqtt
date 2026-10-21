@@ -69,9 +69,9 @@ gantt
 - [x] **Relational & Key-Value (10/10)**: PostgreSQL, MySQL, Redis, MongoDB, Microsoft SQL Server, Oracle Database, Apache Cassandra, Couchbase, CockroachDB, Google AlloyDB.
 - [x] **Time-Series & Industrial (9/9)**: TimescaleDB, InfluxDB, TDengine, Apache IoTDB, OpenTSDB, GreptimeDB, Datalayers, Amazon Timestream, Amazon DynamoDB.
 - [x] **Data Analytics & Warehousing (7/7)**: ClickHouse, Snowflake, Databricks, Elasticsearch/OpenSearch, Apache Doris, Google BigQuery, Amazon Redshift.
-- [x] **Object Storage & Lakehouse (4/4)**: Amazon S3, Azure Blob Storage, Alibaba Tablestore, S3 Tables (Apache Iceberg).
+- [x] **Object Storage & Lakehouse (3/3)**: Amazon S3, Azure Blob Storage, Alibaba Tablestore.
 - [x] **Cloud IoT Platforms & Industrial Edge (11/11)**: HTTP Webhook, AWS IoT Core, Azure IoT Hub, Google Cloud IoT, Oracle Cloud (OCI), Amazon Kinesis, Azure Event Hubs, GCP Pub/Sub, Sparkplug B, OPC-UA Bridge, Local Rotating Disk Log.
-- [x] **Embedded Web Dashboard SPA & SQL Studio**: Live management console, metric delta visualizer, 48 connector configuration cards with Enterprise/Community tier badges, and WebSocket console.
+- [x] **Embedded Web Dashboard SPA & SQL Studio**: Live management console, metric delta visualizer, 47 connector configuration cards with Enterprise/Community tier badges, and WebSocket console.
 
 ---
 

@@ -64,7 +64,6 @@ pub mod oracle;
 pub mod pulsar;
 pub mod redshift;
 pub mod rocketmq;
-pub mod s3_tables;
 pub mod snowflake;
 pub mod sparkplug_b;
 pub mod tablestore;
@@ -258,13 +257,6 @@ pub use rocketmq::{
     RocketMqEnvelope, RocketMqEnvelopeMessage, RocketMqMessage, RocketMqOutcome, RocketMqSink,
     RocketMqSinkConfig, RocketMqStatus, RocketMqSystemProperties, RocketMqTransport,
     TcpRocketMqTransport, ENVELOPE_VERSION,
-};
-pub use s3_tables::{
-    apply_partition_transform, classify_put_status as classify_s3tables_status, data_file_path,
-    parse_table_bucket_arn, partition_path, render_snapshot, s3tables_authorization,
-    HttpS3TablesTransport, IcebergPartitionField, IcebergTransform, MockS3TablesTransport,
-    S3TablesConnector, S3TablesFormat, S3TablesOutcome, S3TablesPut, S3TablesSigning, S3TablesSink,
-    S3TablesSinkConfig, S3TablesTransport, SnapshotFile, TableBucketArn,
 };
 pub use snowflake::{
     build_jwt_assertion as build_snowflake_jwt,

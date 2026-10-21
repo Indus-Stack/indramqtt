@@ -891,7 +891,7 @@ impl ConnectorStore {
                 .unwrap_or_else(|poison| poison.into_inner()) = Some(Arc::clone(registry));
             return;
         }
-        if let Err(error) = snapshot.connectors.validate() {
+        if let Err(error) = snapshot.connectors.validate_stored() {
             panic!("invalid stored connectors snapshot: {error}");
         }
         let mut restored = Vec::with_capacity(snapshot.connectors.connectors.len());
@@ -915,8 +915,13 @@ impl ConnectorStore {
                         .expect("connector boot runtime");
                     runtime.block_on(async {
                         for (id, conn_type, mut params) in restored {
-                            let reachable = probe_connector_reachable(&params).await;
-                            let status = connector_status(reachable);
+                            let removed = broker_config::is_removed_connector_type(&conn_type);
+                            let reachable = !removed && probe_connector_reachable(&params).await;
+                            let status = if removed {
+                                "disconnected"
+                            } else {
+                                connector_status(reachable)
+                            };
                             if let Some(obj) = params.as_object_mut() {
                                 obj.insert(
                                     "status".to_string(),
@@ -933,7 +938,7 @@ impl ConnectorStore {
                                 .unwrap_or(&id)
                                 .to_string();
                             self.upsert(params.clone());
-                            if reachable {
+                            if reachable && !removed {
                                 // A refused build fails closed here: the
                                 // entry stays persist-only and the error is
                                 // logged naming the connector and its kind.
@@ -1544,13 +1549,27 @@ fn connector_live_view(
         .or_else(|| body.get("name").and_then(|v| v.as_str()))
         .unwrap_or("");
     let live = engine.connectors().get(id).is_some();
-    let status = connector_status(live);
+    let removed = body
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(broker_config::is_removed_connector_type);
+    let status = if removed {
+        "disconnected"
+    } else {
+        connector_status(live)
+    };
     if let Some(obj) = out.as_object_mut() {
         obj.insert(
             "status".to_string(),
             serde_json::Value::String(status.to_string()),
         );
         obj.insert("node_status".to_string(), connector_node_status(status));
+        if removed {
+            obj.insert(
+                "status_reason".to_string(),
+                serde_json::Value::String(crate::REMOVED_CONNECTOR_MESSAGE.to_string()),
+            );
+        }
     }
     out
 }
@@ -1818,7 +1837,6 @@ fn live_sink_kind(conn_type: &str) -> &str {
         "postgres" => "pgsql",
         "sqlserver" => "mssql",
         "dynamo" => "dynamodb",
-        "s3tables" => "s3_tables",
         _ => conn_type,
     }
 }
@@ -3765,83 +3783,6 @@ pub(crate) async fn register_live_sink(
         "s3" | "minio" => {
             return Err(refuse_disabled_kind(conn_type, "s3"));
         }
-        "s3_tables" | "s3tables" => {
-            let arn = body
-                .get("table_bucket_arn")
-                .or_else(|| body.get("bucket_arn"))
-                .or_else(|| body.get("arn"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("arn:aws:s3tables:us-east-1:123456789012:bucket/telemetry");
-            let namespace = body
-                .get("namespace")
-                .and_then(|v| v.as_str())
-                .unwrap_or("production_iot");
-            let table = body
-                .get("table_name")
-                .or_else(|| body.get("table"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("device_events");
-            let region = body
-                .get("region")
-                .and_then(|v| v.as_str())
-                .unwrap_or("us-east-1");
-            let access_key = body
-                .get("access_key_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("test");
-            let secret_key = body
-                .get("secret_access_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("test");
-            let endpoint = body
-                .get("endpoint")
-                .or_else(|| body.get("url"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let timeout_ms = body
-                .get("timeout_ms")
-                .or_else(|| body.get("timeout"))
-                .or_else(|| body.get("request_timeout_ms"))
-                .and_then(|v| v.as_u64());
-
-            let config = broker_connectors_enterprise::s3_tables::S3TablesSinkConfig {
-                table_bucket_arn: arn.to_string(),
-                namespace: namespace.to_string(),
-                table_name: table.to_string(),
-                region: region.to_string(),
-                access_key_id: access_key.to_string(),
-                secret_access_key: secret_key.to_string(),
-                session_token: None,
-                endpoint,
-                target_format:
-                    broker_connectors_enterprise::s3_tables::S3TablesFormat::NdjsonCompressed,
-                partition_spec: Vec::new(),
-                batch_size: Some(1),
-                buffer_capacity: None,
-                linger_ms: Some(10),
-                timeout_ms,
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::s3_tables::HttpS3TablesTransport::new(
-                    &config,
-                    reqwest::Client::new(),
-                )
-            ) {
-                let transport = Arc::new(transport);
-                if let Some(sink) = record_sink_error!(
-                    broker_connectors_enterprise::s3_tables::S3TablesSink::new(config, transport)
-                ) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("s3_tables:{}", name), sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("s3tables:{}", name), sink);
-                }
-            }
-        }
         #[cfg(feature = "kinesis")]
         "kinesis" | "aws_kinesis" => {
             let stream = body
@@ -5343,8 +5284,11 @@ pub async fn create_connector(
     if conn_type.is_empty() {
         return ApiError::BadRequest("missing required field: type".to_string()).into_response();
     }
+    if let Some(message) = crate::removed_connector_refusal(&conn_type) {
+        return ApiError::AlreadyExists(message.to_string()).into_response();
+    }
     if !broker_config::is_known_connector_type(&conn_type) {
-        return ApiError::BadRequest(format!("unknown connector type: {conn_type}"))
+        return ApiError::AlreadyExists(format!("unknown connector type: {conn_type}"))
             .into_response();
     }
 
@@ -5559,6 +5503,9 @@ pub async fn update_connector(
     if conn_type.is_empty() {
         return ApiError::BadRequest("missing required field: type".to_string()).into_response();
     }
+    if let Some(message) = crate::removed_connector_refusal(&conn_type) {
+        return ApiError::BadRequest(message.to_string()).into_response();
+    }
     if !broker_config::is_known_connector_type(&conn_type) {
         return ApiError::BadRequest(format!("unknown connector type: {conn_type}"))
             .into_response();
@@ -5702,6 +5649,9 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
     if !state.connectors.remove(&bare) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
+    state
+        .alarms
+        .deactivate(&format!("connector_unavailable:{bare}"));
     // The id no longer names anything: drop it from the dispatch
     // snapshot so a later re-create with the same id starts enabled
     // (mirrors the W3-04 action delete path; unknown ids are a no-op).
@@ -6115,7 +6065,7 @@ pub const CONNECTOR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// (the W3-17 kind set from the config registry, the same set
 /// `POST /api/v5/connectors` validates against) and dials where the kind
 /// exposes a network target, reporting success or the failure reason with
-/// the documented `{code, message}` / `{result, status}` shape.
+/// the documented `{code, message}` shape. Success answers 204 with no body.
 /// Management-plane only: runs off the message path (no lock, no
 /// allocation, no state on publish/deliver), performs single-request bounded
 /// work capped by [`CONNECTOR_PROBE_TIMEOUT`], writes to no store, registers
@@ -6125,34 +6075,24 @@ pub const CONNECTOR_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 // The rulebook does not decide the exact per-kind schemas; the current
 // choice validates the kind against the W3-17 registry and dials the
 // exposed network target, storing nothing, until the checker pins it.
-// TODO(parity): is a kind with no network target a success once the kind
-// itself validated, or does the spec require a target for every kind? The
-// rulebook does not decide; the current choice counts kind-only configs as
-// reachable (matching the sibling action/source probes) until the checker
-// pins it.
+fn probe_failed(message: impl ToString) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "code": "TEST_FAILED",
+            "message": message.to_string()
+        })),
+    )
+        .into_response()
+}
+
 pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response {
     let body = match body {
         Some(Json(b)) => b,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "BAD_REQUEST",
-                    "message": "request body is required"
-                })),
-            )
-                .into_response();
-        }
+        None => return probe_failed("request body is required"),
     };
     if !body.is_object() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": "request body must be a JSON object"
-            })),
-        )
-            .into_response();
+        return probe_failed("request body must be a JSON object");
     }
     let kind = body
         .get("type")
@@ -6161,24 +6101,13 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
         .trim()
         .to_string();
     if kind.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": "missing required field: type"
-            })),
-        )
-            .into_response();
+        return probe_failed("missing required field: type");
+    }
+    if let Some(message) = crate::removed_connector_refusal(&kind) {
+        return probe_failed(message);
     }
     if !broker_config::is_known_connector_type(&kind) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": format!("unknown connector type: {kind}")
-            })),
-        )
-            .into_response();
+        return probe_failed(format!("unknown connector type: {kind}"));
     }
     // Runtime probe hook (the W3-17 dial path reused from the connector
     // create path): kinds that expose a network target get one bounded
@@ -6189,38 +6118,12 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
         let dial =
             tokio::time::timeout(CONNECTOR_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
         match dial {
-            Ok(Ok(())) => (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "result": "ok",
-                    "status": "connected",
-                    "message": format!("Target endpoint {} reachable", target)
-                })),
-            )
-                .into_response(),
-            Ok(Err(err)) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "TEST_FAILED",
-                    "message": err
-                })),
-            )
-                .into_response(),
-            Err(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "TEST_FAILED",
-                    "message": format!("Connection to {} timed out after 5s", target)
-                })),
-            )
-                .into_response(),
+            Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Err(err)) => probe_failed(err),
+            Err(_) => probe_failed(format!("Connection to {} timed out after 5s", target)),
         }
     } else {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({ "result": "ok", "status": "connected" })),
-        )
-            .into_response()
+        StatusCode::NO_CONTENT.into_response()
     }
 }
 
@@ -6262,11 +6165,11 @@ fn is_known_probe_action_type(kind: &str) -> bool {
 
 /// Stateless action probe: validates the config against the named kind and
 /// dials where the kind exposes a network target, reporting success or the
-/// failure reason with the documented `{code, message}` / `{result, status}`
-/// shape. Management-plane only: runs off the message path (no lock, no
-/// allocation, no state on publish/deliver), performs single-request bounded
-/// work capped by [`ACTION_PROBE_TIMEOUT`], writes to no store, registers no
-/// runtime, and leaves nothing running after return.
+/// failure reason with the documented `{code, message}` shape. Success
+/// answers 204 with no body. Management-plane only: runs off the message path
+/// (no lock, no allocation, no state on publish/deliver), performs
+/// single-request bounded work capped by [`ACTION_PROBE_TIMEOUT`], writes to
+/// no store, registers no runtime, and leaves nothing running after return.
 // TODO(parity): what per-kind config validation does the probe require
 // beyond the kind being known (required fields per kind, value ranges)?
 // The rulebook does not decide the exact per-kind schemas; the current
@@ -6275,26 +6178,10 @@ fn is_known_probe_action_type(kind: &str) -> bool {
 pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
     let body = match body {
         Some(Json(b)) => b,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "BAD_REQUEST",
-                    "message": "request body is required"
-                })),
-            )
-                .into_response();
-        }
+        None => return probe_failed("request body is required"),
     };
     if !body.is_object() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": "request body must be a JSON object"
-            })),
-        )
-            .into_response();
+        return probe_failed("request body must be a JSON object");
     }
     let kind = body
         .get("type")
@@ -6303,24 +6190,13 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
         .trim()
         .to_string();
     if kind.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": "missing required field: type"
-            })),
-        )
-            .into_response();
+        return probe_failed("missing required field: type");
+    }
+    if let Some(message) = crate::removed_connector_refusal(&kind) {
+        return probe_failed(message);
     }
     if !is_known_probe_action_type(&kind) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": format!("unknown action type: {kind}")
-            })),
-        )
-            .into_response();
+        return probe_failed(format!("unknown action type: {kind}"));
     }
     // Runtime probe hook (the connector dial path reused from the
     // connector create path): kinds that expose a network target get one
@@ -6330,38 +6206,12 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
     if let Some(target) = extract_target_host_port(&body) {
         let dial = tokio::time::timeout(ACTION_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
         match dial {
-            Ok(Ok(())) => (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "result": "ok",
-                    "status": "connected",
-                    "message": format!("Target endpoint {} reachable", target)
-                })),
-            )
-                .into_response(),
-            Ok(Err(err)) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "TEST_FAILED",
-                    "message": err
-                })),
-            )
-                .into_response(),
-            Err(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "TEST_FAILED",
-                    "message": format!("Connection to {} timed out after 5s", target)
-                })),
-            )
-                .into_response(),
+            Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Err(err)) => probe_failed(err),
+            Err(_) => probe_failed(format!("Connection to {} timed out after 5s", target)),
         }
     } else {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({ "result": "ok", "status": "connected" })),
-        )
-            .into_response()
+        StatusCode::NO_CONTENT.into_response()
     }
 }
 
@@ -6397,26 +6247,10 @@ fn is_known_source_type(kind: &str) -> bool {
 pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
     let body = match body {
         Some(Json(b)) => b,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "BAD_REQUEST",
-                    "message": "request body is required"
-                })),
-            )
-                .into_response();
-        }
+        None => return probe_failed("request body is required"),
     };
     if !body.is_object() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": "request body must be a JSON object"
-            })),
-        )
-            .into_response();
+        return probe_failed("request body must be a JSON object");
     }
     let kind = body
         .get("type")
@@ -6425,24 +6259,13 @@ pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
         .trim()
         .to_string();
     if kind.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": "missing required field: type"
-            })),
-        )
-            .into_response();
+        return probe_failed("missing required field: type");
+    }
+    if let Some(message) = crate::removed_connector_refusal(&kind) {
+        return probe_failed(message);
     }
     if !is_known_source_type(&kind) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": format!("unknown source type: {kind}")
-            })),
-        )
-            .into_response();
+        return probe_failed(format!("unknown source type: {kind}"));
     }
     // Runtime probe hook (the W3-23 dial path): kinds that expose a network
     // target get one bounded dial; kinds without one count as reachable once
@@ -6451,22 +6274,8 @@ pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
         let dial = tokio::time::timeout(SOURCE_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
         match dial {
             Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-            Ok(Err(err)) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "TEST_FAILED",
-                    "message": err
-                })),
-            )
-                .into_response(),
-            Err(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "code": "TEST_FAILED",
-                    "message": format!("Connection to {} timed out after 5s", target)
-                })),
-            )
-                .into_response(),
+            Ok(Err(err)) => probe_failed(err),
+            Err(_) => probe_failed(format!("Connection to {} timed out after 5s", target)),
         }
     } else {
         StatusCode::NO_CONTENT.into_response()

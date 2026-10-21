@@ -176,6 +176,9 @@ fn split_source_body(
     if kind.is_empty() {
         return Err("missing required field: type".to_string());
     }
+    if let Some(message) = crate::removed_connector_refusal(&kind) {
+        return Err(message.to_string());
+    }
     if !is_known_source_type(&kind) {
         return Err(format!("unknown source type: {kind}"));
     }
@@ -675,7 +678,7 @@ pub async fn create_source(
 ) -> Response {
     let entry = match split_source_body(&body, None) {
         Ok(entry) => entry,
-        Err(reason) => return ApiError::BadRequest(reason).into_response(),
+        Err(reason) => return ApiError::AlreadyExists(reason).into_response(),
     };
     let id = entry.id.clone();
     let enable = entry.enable;

@@ -54,6 +54,10 @@ The baseline report is `tests/api_conformance/BASELINE.md` with raw rows in `bas
 > [!NOTE]
 > Compatibility covers the documented API surface, not internals. Error text, ordering, and timing can differ. Test each script you move.
 
+## Removed connectors
+
+The S3 Tables connector is removed. New connector, action and source records of type `s3_tables`, `s3tables` or `iceberg` get `400` with `connector type s3_tables is not available in this broker`. Stored records from an earlier version still load and are reported as `disconnected`, with alarms. See [Removed connectors](./reference/removed-connectors.md) for the stored-state behaviour and the delete order.
+
 ## What to check before the switch
 
 | Check | How | Good |

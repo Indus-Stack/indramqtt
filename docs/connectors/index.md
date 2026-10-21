@@ -78,12 +78,14 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | `opc_ua` | out | An OPC UA server. | implemented |
 | `azure_blob` | out | An Azure storage account and container. | implemented |
 | `tablestore` | out | An Alibaba TableStore instance. | implemented, not verified against the live service |
-| `s3_tables` | out | An S3 Tables bucket. | implemented |
 | `confluent` | out | A Kafka cluster with Schema Registry. | implemented |
 | `rocketmq` | out | An Apache RocketMQ broker. | implemented |
 
 > [!NOTE]
 > `disk_log` is `tested end to end` because a repository test writes 5000 rows through a real directory, kills mid-write, and reads the log back. Every other row stays `implemented` until a repository test proves it with a real server. The docs run checks the validation step for each page, not the send path.
+
+> [!NOTE]
+> The S3 Tables connector is removed. A new connector of type `s3_tables`, `s3tables` or `iceberg` gets `400` with `connector type s3_tables is not available in this broker`. A state file from an earlier version still starts and reports the stored connector and action as `disconnected`. See [Removed connectors](../reference/removed-connectors.md) for the stored-state behaviour and the delete order.
 
 > [!WARNING]
 > Heavy vendor SDKs need a feature build. The default build answers 400 and names the missing feature. Build with `--features full` or the named feature (for example `--features kafka`). The container image holds all kinds.

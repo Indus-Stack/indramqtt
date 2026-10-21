@@ -183,8 +183,8 @@ pub fn connector_tier(kind: &str) -> &'static str {
         | "mssql" | "cassandra" | "couchbase" | "tdengine" | "iotdb" | "timestream"
         | "dynamodb" | "snowflake" | "databricks" | "doris" | "bigquery" | "redshift"
         | "oci_streaming" | "aws_iot" | "azure_iot" | "gcp_iot" | "opc_ua" | "azure_blob"
-        | "tablestore" | "s3_tables" | "confluent" | "rocketmq" | "oracle" | "cockroachdb"
-        | "alloydb" | "datalayers" => "enterprise",
+        | "tablestore" | "confluent" | "rocketmq" | "oracle" | "cockroachdb" | "alloydb"
+        | "datalayers" => "enterprise",
         _ => "community",
     }
 }
@@ -896,7 +896,6 @@ mod tests {
             "opc_ua",
             "azure_blob",
             "tablestore",
-            "s3_tables",
             "confluent",
             "rocketmq",
         ] {
@@ -1302,7 +1301,6 @@ mod tests {
             "redshift",
             "rocketmq",
             "s3",
-            "s3_tables",
             "snowflake",
             "sparkplug_b",
             "tablestore",
@@ -1846,14 +1844,6 @@ const ACTION_TYPES_CATALOGUE: &[ActionTypeInfo] = &[
             ("table", "Target table name"),
             ("access_key_id", "Access key ID"),
             ("access_key_secret", "Access key secret"),
-        ],
-    },
-    ActionTypeInfo {
-        kind: "s3_tables",
-        description: "AWS S3 Tables (Iceberg) sink",
-        configuration: &[
-            ("table_bucket_arn", "Table bucket ARN"),
-            ("table_name", "Iceberg table name"),
         ],
     },
     ActionTypeInfo {

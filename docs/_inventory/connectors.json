@@ -217,14 +217,6 @@
       "tier": "community"
     },
     {
-      "kind": "s3_tables",
-      "tier": "community"
-    },
-    {
-      "kind": "s3tables",
-      "tier": "community"
-    },
-    {
       "kind": "snowflake",
       "tier": "community"
     },

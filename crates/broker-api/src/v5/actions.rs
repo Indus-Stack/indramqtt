@@ -80,7 +80,12 @@ pub struct ActionRecord {
 
 impl ActionRecord {
     fn to_json(&self) -> serde_json::Value {
-        let status = super::typed::typed_status(self.enable);
+        let removed = broker_config::is_removed_connector_type(&self.action_type);
+        let status = if removed {
+            "disconnected"
+        } else {
+            super::typed::typed_status(self.enable)
+        };
         let mut obj = serde_json::Map::new();
         obj.insert("id".to_string(), serde_json::Value::String(self.id.clone()));
         obj.insert(
@@ -106,6 +111,12 @@ impl ActionRecord {
             "node_status".to_string(),
             super::typed::typed_node_status(status),
         );
+        if removed {
+            obj.insert(
+                "status_reason".to_string(),
+                serde_json::Value::String(crate::REMOVED_CONNECTOR_MESSAGE.to_string()),
+            );
+        }
         if let Some(extra) = self.params.as_object() {
             for (key, value) in extra {
                 if !obj.contains_key(key) {
@@ -158,6 +169,9 @@ fn split_action_body(
         .to_string();
     if kind.is_empty() {
         return Err("missing required field: type".to_string());
+    }
+    if let Some(message) = crate::removed_connector_refusal(&kind) {
+        return Err(message.to_string());
     }
     if !is_known_action_type(&kind) {
         return Err(format!("unknown action type: {kind}"));
@@ -613,7 +627,7 @@ pub async fn create_action(
 ) -> Response {
     let entry = match split_action_body(&body, None) {
         Ok(entry) => entry,
-        Err(reason) => return ApiError::BadRequest(reason).into_response(),
+        Err(reason) => return ApiError::AlreadyExists(reason).into_response(),
     };
     let id = entry.id.clone();
     let enable = entry.enable;
@@ -674,6 +688,9 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
     if !state.actions.remove(&bare) {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
+    state
+        .alarms
+        .deactivate(&format!("action_unavailable:{bare}"));
     // W3-04: drop the id from the dispatch snapshot so a later re-create
     // with the same id starts enabled.
     state.engine.remove_action(&bare);

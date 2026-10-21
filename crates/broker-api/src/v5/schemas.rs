@@ -726,20 +726,6 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         ),
     );
 
-    // 40. S3 Tables
-    schemas.insert(
-        "connector_s3tables.post_connector".to_string(),
-        obj_schema(
-            json!({
-                "table_bucket_arn": str_prop(""),
-                "namespace": str_prop("default"),
-                "access_key_id": str_prop(""),
-                "secret_access_key": pwd_prop()
-            }),
-            &["name", "table_bucket_arn"],
-        ),
-    );
-
     // 41. Datalayers
     schemas.insert(
         "bridge_datalayers.post_connector".to_string(),

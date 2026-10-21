@@ -54,8 +54,6 @@
     "redshift",
     "rocketmq",
     "s3",
-    "s3_tables",
-    "s3tables",
     "snowflake",
     "snowflake_streaming",
     "sparkplug_b",

@@ -32,6 +32,26 @@ pub use schema::BrokerConfig;
 /// Name of the persistence file inside the state directory.
 pub const STATE_FILE_NAME: &str = "state.toml";
 
+/// Connector kinds this broker removed but an older `state.toml` may still
+/// contain. Boot accepts these records so the operator can read and delete
+/// them; every management write refuses them.
+pub const REMOVED_CONNECTOR_TYPES: &[&str] = &["s3_tables", "s3tables", "iceberg"];
+
+/// Canonical removed kind named by `kind`, if any. The aliases are the
+/// spellings the v1 connector builder accepted for the S3 Tables backend.
+#[must_use]
+pub fn removed_connector_kind(kind: &str) -> Option<&'static str> {
+    REMOVED_CONNECTOR_TYPES
+        .contains(&kind)
+        .then_some("s3_tables")
+}
+
+/// Returns true for a removed connector kind (including its aliases).
+#[must_use]
+pub fn is_removed_connector_type(kind: &str) -> bool {
+    removed_connector_kind(kind).is_some()
+}
+
 /// Connector types the kernel knows how to instantiate.
 ///
 /// Mirrors the sink kinds registered in `broker-connectors` (`kind()`
@@ -81,7 +101,6 @@ pub const KNOWN_CONNECTOR_TYPES: &[&str] = &[
     "redshift",
     "rocketmq",
     "s3",
-    "s3_tables",
     "snowflake",
     "sparkplug_b",
     "tablestore",
@@ -102,7 +121,6 @@ pub const KNOWN_CONNECTOR_TYPES: &[&str] = &[
     "kafka_producer",
     "opents",
     "pgsql",
-    "s3tables",
     "sqlserver",
     "dynamo",
     "timescale",
@@ -164,7 +182,6 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "redshift",
     "rocketmq",
     "s3",
-    "s3_tables",
     "snowflake",
     "sparkplug_b",
     "tablestore",
@@ -184,7 +201,6 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "opents",
     "sqlserver",
     "dynamo",
-    "s3tables",
     "gcp_pubsub_producer",
     "azure_event_hub_producer",
     "azure_blob_storage",
@@ -249,7 +265,6 @@ pub const KNOWN_SOURCE_TYPES: &[&str] = &[
     "redshift",
     "rocketmq",
     "s3",
-    "s3_tables",
     "snowflake",
     "sparkplug_b",
     "tablestore",
@@ -1009,6 +1024,20 @@ pub struct ConnectorsConf {
 impl ConnectorsConf {
     /// Validates ids (non-empty, unique) and connector types (known).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with(false)
+    }
+
+    /// Validates stored records while tolerating kinds this broker removed.
+    ///
+    /// Used only to load and rewrite a state file written by an older
+    /// broker: the removed records stay in place so the operator can still
+    /// read and delete them. Management writes validate with
+    /// [`Self::validate`] and refuse the removed kinds.
+    pub fn validate_stored(&self) -> Result<(), ConfigError> {
+        self.validate_with(true)
+    }
+
+    fn validate_with(&self, allow_removed: bool) -> Result<(), ConfigError> {
         let mut seen = HashSet::with_capacity(self.connectors.len());
         for (index, connector) in self.connectors.iter().enumerate() {
             if connector.id.trim().is_empty() {
@@ -1021,7 +1050,8 @@ impl ConnectorsConf {
                     "connectors.connectors[{index}].connector_type must not be empty (field `connector_type`)"
                 )));
             }
-            if !is_known_connector_type(&connector.connector_type) {
+            let removed = allow_removed && is_removed_connector_type(&connector.connector_type);
+            if !is_known_connector_type(&connector.connector_type) && !removed {
                 return Err(ConfigError::Invalid(format!(
                     "connectors.connectors[{index}].connector_type {:?} is unknown (field `connector_type`)",
                     connector.connector_type
@@ -2188,6 +2218,18 @@ impl ActionsConf {
     /// Validates action ids (non-empty, bounded, unique), kinds (known)
     /// and the registry length cap.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with(false)
+    }
+
+    /// Validates stored records while tolerating kinds this broker removed.
+    ///
+    /// Same scope as [`ConnectorsConf::validate_stored`]: only boot and a
+    /// stored-state rewrite use this; management writes stay strict.
+    pub fn validate_stored(&self) -> Result<(), ConfigError> {
+        self.validate_with(true)
+    }
+
+    fn validate_with(&self, allow_removed: bool) -> Result<(), ConfigError> {
         if self.actions.len() > MAX_ACTIONS {
             return Err(ConfigError::Invalid(format!(
                 "actions.actions holds {} entries, at most {} (field `actions`)",
@@ -2213,7 +2255,8 @@ impl ActionsConf {
                     "actions.actions[{index}].action_type must not be empty (field `action_type`)"
                 )));
             }
-            if !is_known_action_type(&entry.action_type) {
+            let removed = allow_removed && is_removed_connector_type(&entry.action_type);
+            if !is_known_action_type(&entry.action_type) && !removed {
                 return Err(ConfigError::Invalid(format!(
                     "actions.actions[{index}].action_type {:?} is unknown (field `action_type`)",
                     entry.action_type
@@ -2283,6 +2326,18 @@ impl SourcesConf {
     /// Validates source ids (non-empty, bounded, unique), kinds (known)
     /// and the registry length cap.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with(false)
+    }
+
+    /// Validates stored records while tolerating kinds this broker removed.
+    ///
+    /// Only boot and a stored-state rewrite use this; management writes
+    /// stay strict.
+    pub fn validate_stored(&self) -> Result<(), ConfigError> {
+        self.validate_with(true)
+    }
+
+    fn validate_with(&self, allow_removed: bool) -> Result<(), ConfigError> {
         if self.sources.len() > MAX_SOURCES {
             return Err(ConfigError::Invalid(format!(
                 "sources.sources holds {} entries, at most {} (field `sources`)",
@@ -2308,7 +2363,8 @@ impl SourcesConf {
                     "sources.sources[{index}].source_type must not be empty (field `source_type`)"
                 )));
             }
-            if !is_known_source_type(&entry.source_type) {
+            let removed = allow_removed && is_removed_connector_type(&entry.source_type);
+            if !is_known_source_type(&entry.source_type) && !removed {
                 return Err(ConfigError::Invalid(format!(
                     "sources.sources[{index}].source_type {:?} is unknown (field `source_type`)",
                     entry.source_type
@@ -3590,10 +3646,25 @@ pub struct FullSnapshot {
 impl FullSnapshot {
     /// Validates every root. Empty defaults are valid.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with(false)
+    }
+
+    /// Validates a snapshot read from disk, tolerating connector/action/
+    /// source kinds this broker removed. Every other root stays strict, so
+    /// a corrupt file still fails instead of starting half-valid.
+    pub fn validate_stored(&self) -> Result<(), ConfigError> {
+        self.validate_with(true)
+    }
+
+    fn validate_with(&self, allow_removed: bool) -> Result<(), ConfigError> {
         self.admin_users.validate()?;
         self.mqtt_users.validate()?;
         self.rules.validate()?;
-        self.connectors.validate()?;
+        if allow_removed {
+            self.connectors.validate_stored()?;
+        } else {
+            self.connectors.validate()?;
+        }
         self.authn_chain.validate()?;
         self.authn_node_cache.validate()?;
         self.authn_settings.validate()?;
@@ -3602,8 +3673,16 @@ impl FullSnapshot {
         self.authz_sources.validate()?;
         self.api_keys.validate()?;
         self.sso_backends.validate()?;
-        self.actions.validate()?;
-        self.sources.validate()?;
+        if allow_removed {
+            self.actions.validate_stored()?;
+        } else {
+            self.actions.validate()?;
+        }
+        if allow_removed {
+            self.sources.validate_stored()?;
+        } else {
+            self.sources.validate()?;
+        }
         self.rule_engine.validate()?;
         self.transformations.validate()?;
         self.schemas.validate()?;
@@ -3709,10 +3788,33 @@ impl ConfigRegistry {
     /// history loads from `<dir>/config-history.json` when present and is
     /// seeded with the boot snapshot otherwise.
     pub fn load(dir: &Path) -> Result<Self, ConfigError> {
+        Self::load_with(dir, false)
+    }
+
+    /// Loads the registry for broker boot, accepting records written by an
+    /// older broker whose connector kinds were since removed.
+    ///
+    /// This is deliberately separate from [`Self::load`]: an operator
+    /// configuration or restored file that names a removed kind must still
+    /// fail loudly, while an existing `state.toml` must not brick an
+    /// upgrade. Removed records are preserved so the operator can read and
+    /// delete them through the API.
+    pub fn load_for_boot(dir: &Path) -> Result<Self, ConfigError> {
+        Self::load_with(dir, true)
+    }
+
+    fn load_with(dir: &Path, allow_removed: bool) -> Result<Self, ConfigError> {
         let file = state_path(dir);
+        let validate = |snapshot: &FullSnapshot| {
+            if allow_removed {
+                snapshot.validate_stored()
+            } else {
+                snapshot.validate()
+            }
+        };
         let snapshot = if !file.exists() {
             let defaults = FullSnapshot::default();
-            defaults.validate().map_err(|err| ConfigError::Load {
+            validate(&defaults).map_err(|err| ConfigError::Load {
                 file: file.display().to_string(),
                 reason: err.to_string(),
             })?;
@@ -3726,7 +3828,7 @@ impl ConfigRegistry {
                 file: file.display().to_string(),
                 reason: format!("invalid TOML: {err}"),
             })?;
-            parsed.validate().map_err(|err| ConfigError::Load {
+            validate(&parsed).map_err(|err| ConfigError::Load {
                 file: file.display().to_string(),
                 reason: err.to_string(),
             })?;
@@ -3875,7 +3977,7 @@ impl ConfigRegistry {
     /// every applied change is versioned, and persists the history file
     /// alongside `state.toml`.
     pub fn commit_connectors(&self, conf: ConnectorsConf) -> Result<(), ConfigError> {
-        conf.validate()?;
+        conf.validate_stored()?;
         let old = self.snapshot();
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
@@ -4133,7 +4235,7 @@ impl ConfigRegistry {
 
     /// Commits a validated rule-engine action registry.
     pub fn commit_actions(&self, conf: ActionsConf) -> Result<(), ConfigError> {
-        conf.validate()?;
+        conf.validate_stored()?;
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.actions = conf.clone();
@@ -4144,7 +4246,7 @@ impl ConfigRegistry {
 
     /// Commits a validated ingress source registry.
     pub fn commit_sources(&self, conf: SourcesConf) -> Result<(), ConfigError> {
-        conf.validate()?;
+        conf.validate_stored()?;
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
             next.sources = conf.clone();
@@ -4792,6 +4894,56 @@ mod tests {
             leftovers.is_empty(),
             "no temp file may remain, found: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn removed_kinds_load_only_through_the_boot_loader() {
+        let dir = unique_dir("removed-kinds");
+        let mut snapshot = FullSnapshot::default();
+        snapshot.connectors.connectors.push(ConnectorEntry {
+            id: "legacy-s3t".to_string(),
+            connector_type: "s3_tables".to_string(),
+            enable: true,
+            config: "{}".to_string(),
+        });
+        snapshot.actions.actions.push(ActionEntry {
+            id: "legacy-s3t".to_string(),
+            action_type: "s3tables".to_string(),
+            enable: true,
+            config: "{}".to_string(),
+        });
+        std::fs::write(
+            state_path(&dir),
+            toml::to_string(&snapshot).expect("serialise legacy"),
+        )
+        .expect("write legacy state");
+
+        let err = ConfigRegistry::load(&dir).expect_err("strict load must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains(STATE_FILE_NAME),
+            "names the file: {message}"
+        );
+        assert!(
+            message.contains("connector_type"),
+            "names the key: {message}"
+        );
+        assert!(message.contains("s3_tables"), "names the kind: {message}");
+
+        let registry = ConfigRegistry::load_for_boot(&dir).expect("boot accepts legacy");
+        let loaded = registry.snapshot();
+        assert_eq!(loaded.connectors.connectors.len(), 1);
+        assert_eq!(loaded.actions.actions.len(), 1);
+        registry
+            .commit_connectors(loaded.connectors.clone())
+            .expect("stored rewrite keeps the legacy connector");
+        registry
+            .commit_actions(loaded.actions.clone())
+            .expect("stored rewrite keeps the legacy action");
+        registry.save().expect("save rewritten legacy state");
+        let reloaded = ConfigRegistry::load_for_boot(&dir).expect("reload after rewrite");
+        assert_eq!(reloaded.snapshot().connectors.connectors.len(), 1);
+        assert_eq!(reloaded.snapshot().actions.actions.len(), 1);
     }
 
     #[test]

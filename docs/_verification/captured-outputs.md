@@ -21,7 +21,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `concepts/listeners.md` | 88 | `hello-listeners` |
 | `connectors/clickhouse.md` | 84 | `ok` |
 | `connectors/http.md` | 93 | `delivered` |
-| `connectors/index.md` | 127 | `ok` |
+| `connectors/index.md` | 129 | `ok` |
 | `connectors/influxdb.md` | 86 | `influxdb` |
 | `connectors/kafka.md` | 83 | `ok` |
 | `connectors/mongodb.md` | 87 | `ok` |
@@ -40,7 +40,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `getting-started/install.md` | 74 | `indra 0.1.0` |
 | `index.md` | 54 | `OK` |
 | `mcp.md` | 314 | `401` |
-| `migration.md` | 90 | `OK` |
+| `migration.md` | 94 | `OK` |
 | `multi-tenancy/index.md` | 96 | `isolated` |
 | `multi-tenancy/quotas.md` | 102 | `ok` |
 | `operations/backup.md` | 90 | `ok` |

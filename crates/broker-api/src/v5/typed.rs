@@ -26,7 +26,6 @@ pub const SPEC_ACTION_TYPES: &[&str] = &[
     "cassandra",
     "cockroachdb",
     "kinesis",
-    "s3tables",
     "iotdb",
     "mysql",
     "rabbitmq",

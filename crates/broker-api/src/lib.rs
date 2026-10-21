@@ -21,6 +21,17 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::admin_users::AdminUsers;
 use crate::v5::auth::ApiTokens;
 
+/// Exact client error for every spelling of the removed S3 Tables
+/// connector. Nothing is stored and an update leaves the old record
+/// untouched.
+pub(crate) const REMOVED_CONNECTOR_MESSAGE: &str =
+    "connector type s3_tables is not available in this broker";
+
+/// Returns the exact refusal when `kind` names the removed backend.
+pub(crate) fn removed_connector_refusal(kind: &str) -> Option<&'static str> {
+    broker_config::is_removed_connector_type(kind).then_some(REMOVED_CONNECTOR_MESSAGE)
+}
+
 pub mod admin_users;
 pub mod api_auth;
 pub mod api_keys;
@@ -575,7 +586,7 @@ impl ApiState {
         // attribute to the built-in counters and honour the stored
         // enable flag and order without a restart. One `Arc` clone.
         auth.set_authz_sources(Arc::clone(&authz_sources));
-        Self {
+        let state = Self {
             engine,
             sessions,
             router,
@@ -634,7 +645,9 @@ impl ApiState {
             mcp: Arc::new(crate::mcp::McpStore::new()),
             collectors: Arc::new(crate::mcp::CollectRegistry::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
-        }
+        };
+        state.raise_unavailable_stored_kinds();
+        state
     }
 
     /// Standalone state for tests and tools (empty sessions/router).
@@ -743,6 +756,46 @@ impl ApiState {
             mcp: Arc::new(crate::mcp::McpStore::new()),
             collectors: Arc::new(crate::mcp::CollectRegistry::new()),
             ws_conn_counter: Arc::new(AtomicU64::new(1 << 62)),
+        }
+    }
+
+    /// Raise one active alarm per stored connector/action whose kind this
+    /// broker removed. The records stay untouched and readable; the alarms
+    /// make the unavailable state visible without claiming the rule itself
+    /// is broken.
+    fn raise_unavailable_stored_kinds(&self) {
+        let snapshot = self.config.snapshot();
+        for connector in &snapshot.connectors.connectors {
+            if broker_config::is_removed_connector_type(&connector.connector_type) {
+                self.alarms.activate(
+                    &format!("connector_unavailable:{}", connector.id),
+                    &format!(
+                        "connector {:?} uses removed type {:?}; stored configuration preserved but unavailable",
+                        connector.id, connector.connector_type
+                    ),
+                    serde_json::json!({
+                        "kind": "connector",
+                        "id": connector.id,
+                        "type": connector.connector_type,
+                    }),
+                );
+            }
+        }
+        for action in &snapshot.actions.actions {
+            if broker_config::is_removed_connector_type(&action.action_type) {
+                self.alarms.activate(
+                    &format!("action_unavailable:{}", action.id),
+                    &format!(
+                        "action {:?} uses removed type {:?}; stored configuration preserved but unavailable",
+                        action.id, action.action_type
+                    ),
+                    serde_json::json!({
+                        "kind": "action",
+                        "id": action.id,
+                        "type": action.action_type,
+                    }),
+                );
+            }
         }
     }
 
@@ -2045,23 +2098,7 @@ async fn build_connector(
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
             "s3_tables" | "s3tables" | "iceberg" => {
-                let config: broker_connectors_enterprise::S3TablesSinkConfig =
-                    serde_json::from_value(req.config.clone())
-                        .map_err(|e| format!("invalid s3_tables config: {e}"))?;
-                config
-                    .validate()
-                    .map_err(|e| format!("invalid s3_tables config: {e}"))?;
-                let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::HttpS3TablesTransport::new(
-                        &config,
-                        reqwest::Client::new(),
-                    )
-                    .map_err(|e| format!("invalid s3_tables transport: {e}"))?,
-                );
-                let sink = broker_connectors_enterprise::S3TablesSink::new(config, transport)
-                    .map_err(|e| format!("invalid s3_tables sink: {e}"))?;
-                Ok(("s3_tables".to_string(), std::sync::Arc::new(sink)
-                    as std::sync::Arc<dyn broker_connectors::Sink>))
+                Err(crate::REMOVED_CONNECTOR_MESSAGE.to_string())
             }
             #[cfg(feature = "confluent")]
             "confluent" | "confluent_kafka" | "confluent_cloud" => {
@@ -2695,6 +2732,427 @@ mod tests {
             assert_eq!(body["must_change_password"], json!(false));
             body["token"].as_str().expect("login token").to_string()
         }
+    }
+
+    #[tokio::test]
+    async fn removed_s3_tables_kind_is_refused_everywhere_and_stores_nothing() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let message = "connector type s3_tables is not available in this broker";
+
+        for (index, kind) in ["s3_tables", "s3tables", "iceberg"].iter().enumerate() {
+            let id = format!("removed-{index}");
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/connectors",
+                    json!({"id": id, "type": kind, "config": {}}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} connector create");
+            assert_eq!(
+                body["code"],
+                json!("ALREADY_EXISTS"),
+                "{kind} connector create"
+            );
+            assert_eq!(body["message"], json!(message), "{kind} connector create");
+
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/actions",
+                    json!({"id": id, "type": kind, "enable": true}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} action create");
+            assert_eq!(
+                body["code"],
+                json!("ALREADY_EXISTS"),
+                "{kind} action create"
+            );
+            assert_eq!(body["message"], json!(message), "{kind} action create");
+
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/sources",
+                    json!({"id": id, "type": kind, "enable": true}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} source create");
+            assert_eq!(
+                body["code"],
+                json!("ALREADY_EXISTS"),
+                "{kind} source create"
+            );
+            assert_eq!(body["message"], json!(message), "{kind} source create");
+
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/connectors_probe",
+                    json!({"type": kind, "config": {}}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} connector probe");
+            assert_eq!(body["code"], json!("TEST_FAILED"), "{kind} connector probe");
+            assert_eq!(body["message"], json!(message), "{kind} connector probe");
+
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/actions_probe",
+                    json!({"type": kind, "config": {}}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} action probe");
+            assert_eq!(body["code"], json!("TEST_FAILED"), "{kind} action probe");
+            assert_eq!(body["message"], json!(message), "{kind} action probe");
+
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/sources_probe",
+                    json!({"type": kind, "config": {}}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} source probe");
+            assert_eq!(body["code"], json!("TEST_FAILED"), "{kind} source probe");
+            assert_eq!(body["message"], json!(message), "{kind} source probe");
+
+            let (status, body) = server
+                .post_auth(
+                    "/api/v1/connectors",
+                    json!({"id": id, "kind": kind, "config": {}}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} v1 connector create");
+            assert_eq!(body["error"], json!(message), "{kind} v1 connector create");
+        }
+
+        let (status, connectors) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(connectors, json!([]));
+        let (status, actions) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(actions, json!([]));
+        let (status, sources) = server.get_auth("/api/v5/sources", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(sources, json!([]));
+        let (status, schema) = server.get_auth("/schemas/connectors", &token).await;
+        assert_eq!(status, 200);
+        assert!(
+            schema["schema"]
+                .get("connector_s3tables.post_connector")
+                .is_none(),
+            "removed connector schema is not served"
+        );
+        let (status, _) = server
+            .get_auth("/schemas/connector_s3tables.post_connector", &token)
+            .await;
+        assert_eq!(
+            status, 404,
+            "direct request for a removed schema is unknown"
+        );
+        let (status, action_types) = server.get_auth("/api/v5/action_types", &token).await;
+        assert_eq!(status, 200);
+        let action_types = action_types.as_array().expect("action type list");
+        assert!(!action_types
+            .iter()
+            .any(|kind| kind.as_str() == Some("s3tables")));
+        assert!(!action_types
+            .iter()
+            .any(|kind| kind.as_str() == Some("s3_tables")));
+        let (status, source_types) = server.get_auth("/api/v5/source_types", &token).await;
+        assert_eq!(status, 200);
+        let source_types = source_types.as_array().expect("source type list");
+        assert!(!source_types
+            .iter()
+            .any(|kind| kind.as_str() == Some("s3tables")));
+        assert!(!source_types
+            .iter()
+            .any(|kind| kind.as_str() == Some("s3_tables")));
+    }
+
+    #[tokio::test]
+    async fn removed_update_is_refused_and_keeps_the_old_connector_and_action() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let message = "connector type s3_tables is not available in this broker";
+
+        for (index, kind) in ["s3_tables", "s3tables", "iceberg"].iter().enumerate() {
+            let connector_id = format!("keep-conn-{index}");
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/connectors",
+                    json!({"id": connector_id, "type": "console"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201, "{kind} connector seed");
+            let (status, body) = server
+                .put_auth(
+                    &format!("/api/v5/connectors/{connector_id}"),
+                    json!({"id": connector_id, "type": kind}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} connector update");
+            assert_eq!(
+                body["code"],
+                json!("BAD_REQUEST"),
+                "{kind} connector update"
+            );
+            assert_eq!(body["message"], json!(message), "{kind} connector update");
+            let (status, stored) = server
+                .get_auth(&format!("/api/v5/connectors/{connector_id}"), &token)
+                .await;
+            assert_eq!(status, 200, "{kind} connector still readable");
+            assert_eq!(
+                stored["type"],
+                json!("console"),
+                "{kind} connector unchanged"
+            );
+
+            let action_id = format!("keep-act-{index}");
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/actions",
+                    json!({"id": action_id, "type": "console"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201, "{kind} action seed");
+            let (status, body) = server
+                .put_auth(
+                    &format!("/api/v5/actions/{action_id}"),
+                    json!({"id": action_id, "type": kind}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} action update");
+            assert_eq!(body["code"], json!("BAD_REQUEST"), "{kind} action update");
+            assert_eq!(body["message"], json!(message), "{kind} action update");
+            let (status, stored) = server
+                .get_auth(&format!("/api/v5/actions/{action_id}"), &token)
+                .await;
+            assert_eq!(status, 200, "{kind} action still readable");
+            assert_eq!(stored["type"], json!("console"), "{kind} action unchanged");
+
+            let (status, _) = server
+                .delete_auth(&format!("/api/v5/connectors/{connector_id}"), &token)
+                .await;
+            assert_eq!(status, 204, "{kind} connector cleanup");
+            let (status, _) = server
+                .delete_auth(&format!("/api/v5/actions/{action_id}"), &token)
+                .await;
+            assert_eq!(status, 204, "{kind} action cleanup");
+        }
+    }
+
+    struct NoopBrokerSink;
+    #[async_trait::async_trait]
+    impl broker_rules::BrokerSink for NoopBrokerSink {
+        async fn publish(
+            &self,
+            _topic: broker_protocol::Topic,
+            _payload: bytes::Bytes,
+            _qos: broker_protocol::QoS,
+            _retain: bool,
+        ) -> Result<(), broker_rules::RuleEngineError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_s3_tables_state_boots_reports_and_deletes_in_reference_order() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("indra-mv04-legacy-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let legacy = r#"
+[[connectors.connectors]]
+id = "legacy-s3t"
+connector_type = "s3_tables"
+enable = true
+config = '{"table_bucket_arn":"arn:aws:s3tables:us-east-1:123456789012:bucket/telemetry"}'
+
+[[connectors.connectors]]
+id = "legacy-good"
+connector_type = "console"
+enable = true
+config = '{}'
+
+[[actions.actions]]
+id = "legacy-s3t"
+action_type = "s3tables"
+enable = true
+config = '{"connector":"legacy-s3t"}'
+
+[[actions.actions]]
+id = "legacy-good"
+action_type = "console"
+enable = true
+config = '{"connector":"legacy-good"}'
+
+[[rules.rules]]
+id = "legacy-rule"
+name = "legacy rule"
+tenant = "default"
+topic_filter = "legacy/#"
+sql_query = 'SELECT * FROM "legacy/+" INTO connector("legacy-s3t")'
+enabled = true
+
+[[rules.rules.actions]]
+type = "forwardconnector"
+connector_id = "legacy-good"
+"#;
+        std::fs::write(dir.join("state.toml"), legacy).expect("write legacy state");
+
+        let registry =
+            Arc::new(ConfigRegistry::load_for_boot(&dir).expect("legacy state loads for boot"));
+        let (server, state) = TestServer::start_with_registry(registry).await;
+        let token = server.login_as_admin().await;
+        let reason = "connector type s3_tables is not available in this broker";
+
+        let (status, connectors) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        let s3 = connectors
+            .as_array()
+            .expect("connector list")
+            .iter()
+            .find(|row| row["id"] == json!("legacy-s3t"))
+            .expect("legacy connector listed");
+        assert_eq!(s3["status"], json!("disconnected"));
+        assert_eq!(s3["status_reason"], json!(reason));
+        assert!(
+            connectors
+                .as_array()
+                .expect("connector list")
+                .iter()
+                .any(|row| row["id"] == json!("legacy-good")),
+            "working sibling connector stays listed"
+        );
+
+        let (status, actions) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        let action = actions
+            .as_array()
+            .expect("action list")
+            .iter()
+            .find(|row| row["id"] == json!("legacy-s3t"))
+            .expect("legacy action listed");
+        assert_eq!(action["status"], json!("disconnected"));
+        assert_eq!(action["status_reason"], json!(reason));
+
+        let (status, rule) = server.get_auth("/api/v5/rules/legacy-rule", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(rule["enable"], json!(true));
+
+        let (status, alarms) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"connector_unavailable:legacy-s3t"),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"action_unavailable:legacy-s3t"),
+            "{names:?}"
+        );
+
+        let sink: Arc<dyn broker_rules::BrokerSink> = Arc::new(NoopBrokerSink);
+        state
+            .engine
+            .dispatch_ingress(
+                &Topic::new("legacy/device").expect("topic"),
+                &bytes::Bytes::from_static(br#"{"v":1}"#),
+                QoS::AtMostOnce,
+                &sink,
+            )
+            .await;
+
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/legacy-s3t/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["total"], json!(1));
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/legacy-good/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["total"], json!(1));
+        assert_eq!(metrics["metrics"]["success"], json!(1));
+        let (status, metrics) = server
+            .get_auth("/api/v5/rules/legacy-rule/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["actions.failed"], json!(1));
+        assert_eq!(metrics["metrics"]["actions.success"], json!(1));
+
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/legacy-s3t", &token)
+            .await;
+        assert_eq!(status, 400, "connector is still referenced by the rule");
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/legacy-s3t", &token)
+            .await;
+        assert_eq!(status, 400, "action is still referenced by the rule");
+        let (status, _) = server
+            .delete_auth("/api/v5/rules/legacy-rule", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/legacy-s3t", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/legacy-s3t", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/legacy-good", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/legacy-good", &token)
+            .await;
+        assert_eq!(status, 204);
+
+        let (status, alarms) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"connector_unavailable:legacy-s3t"),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"action_unavailable:legacy-s3t"),
+            "{names:?}"
+        );
+
+        let reloaded = ConfigRegistry::load_for_boot(&dir).expect("rewritten state still boots");
+        assert!(reloaded.snapshot().connectors.connectors.is_empty());
+        assert!(reloaded.snapshot().actions.actions.is_empty());
+        assert!(reloaded.snapshot().rules.rules.is_empty());
     }
 
     /// The licence endpoints have the shapes of the reference API and
@@ -8341,7 +8799,7 @@ mod tests {
             )
             .await;
         assert_eq!(status, 400, "unknown kind must be rejected, got: {body}");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
@@ -10719,7 +11177,6 @@ mod tests {
             "value=\"redshift\"",
             "value=\"azure_blob\"",
             "value=\"tablestore\"",
-            "value=\"s3_tables\"",
             "value=\"confluent\"",
             "value=\"rocketmq\"",
             "value=\"oracle\"",
@@ -10730,7 +11187,6 @@ mod tests {
             "value=\"datalayers\"",
             "conn-azblob-account",
             "conn-ots-endpoint",
-            "conn-s3t-arn",
             "conn-cfl-servers",
             "conn-rmq-endpoints",
             "conn-ora-url",
@@ -11946,27 +12402,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 201);
         assert_eq!(created["kind"], json!("tablestore"));
 
-        // S3 Tables sink: validated without touching AWS.
-        let (status, created) = server
-            .post_auth(
-                "/api/v1/connectors",
-                json!({"id": "s3t-1",
-                       "kind": "s3_tables",
-                       "config": {"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/telemetry-bucket",
-                                  "namespace": "production_iot",
-                                  "table_name": "device_events",
-                                  "region": "us-east-1",
-                                  "access_key_id": "AKID",
-                                  "secret_access_key": "secret",
-                                  "partition_spec": [{"source_name": "date", "transform": "day"}],
-                                  "target_format": "ndjsoncompressed",
-                                  "batch_size": 1000}}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 201);
-        assert_eq!(created["kind"], json!("s3_tables"));
-
         // Confluent Cloud sink: validated without opening any socket.
         // X1-10: gated behind Cargo feature `confluent`.
         let (status, created) = server
@@ -12160,7 +12595,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "redis-sink-1",
                 "redshift-1",
                 "rmq-1",
-                "s3t-1",
                 "snowflake-1",
                 "spb-1",
                 "tdengine-1",
@@ -12191,7 +12625,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             ] {
                 assert_eq!(ids.contains(id), enabled, "gated connector {id} presence");
             }
-            let expected = 30
+            let expected = 29
                 + (cfg!(feature = "s3") as usize)
                 + (cfg!(feature = "azure_eventhubs") as usize)
                 + (cfg!(feature = "dynamodb") as usize)
@@ -12372,13 +12806,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                               "access_key_id": "k",
                               "access_key_secret": "s",
                               "primary_keys": []}}),
-            json!({"id": "bad-s3t", "kind": "s3_tables",
-                   "config": {"table_bucket_arn": "arn:aws:s3:::plain",
-                              "namespace": "ns",
-                              "table_name": "t",
-                              "region": "us-east-1",
-                              "access_key_id": "AKID",
-                              "secret_access_key": "secret"}}),
             json!({"id": "bad-confluent", "kind": "confluent",
                    "config": {"bootstrap_servers": [],
                               "api_key": "k",
@@ -12423,9 +12850,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         }
         let (status, body) = server.get_auth("/api/v1/connectors", &token).await;
         assert_eq!(status, 200);
-        // X1-09/X1-10: count follows the enabled gated features (30 always
+        // X1-09/X1-10: count follows the enabled gated features (29 always
         // plus each gated kind when its feature is on).
-        let expected = 30
+        let expected = 29
             + (cfg!(feature = "s3") as usize)
             + (cfg!(feature = "azure_eventhubs") as usize)
             + (cfg!(feature = "dynamodb") as usize)
@@ -13950,7 +14377,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400, "unknown action kind must be 400");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
         // Create one action.
         let (status, body) = server
             .post_auth(
@@ -16302,13 +16729,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400, "unknown source kind must be 400");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("TEST_FAILED"));
         // Malformed body is rejected with the documented error shape.
         let (status, body) = server
             .post_auth("/api/v5/sources_probe", json!({}), &token)
             .await;
         assert_eq!(status, 400, "malformed probe body must be 400");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("TEST_FAILED"));
     }
 
     #[tokio::test]
@@ -16411,7 +16838,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400, "unknown source kind must be 400");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
         // Create one source.
         let (status, body) = server
             .post_auth(
@@ -19605,8 +20032,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth("/api/v5/actions_probe", json!({"type": "console"}), &token)
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["result"], json!("ok"));
+        assert_eq!(status, 204);
+        assert_eq!(body, json!(null));
         let (status, body) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
         assert_eq!(
@@ -19634,13 +20061,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400, "unknown action kind must be 400");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("TEST_FAILED"));
         // Malformed body is rejected with the documented error shape.
         let (status, body) = server
             .post_auth("/api/v5/actions_probe", json!({}), &token)
             .await;
         assert_eq!(status, 400, "malformed probe body must be 400");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("TEST_FAILED"));
         // Probe leaves no state behind even after failures.
         let (status, body) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
@@ -19674,8 +20101,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 &token,
             )
             .await;
-        assert_eq!(status, 200);
-        assert_eq!(body["result"], json!("ok"));
+        assert_eq!(status, 204);
+        assert_eq!(body, json!(null));
         let (status, after) = server.get_auth("/api/v5/connectors", &token).await;
         assert_eq!(status, 200);
         // Other tests add connectors to the same store at the same time,
@@ -19710,7 +20137,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400, "unknown connector kind must be 400");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("TEST_FAILED"));
         assert!(
             body["message"]
                 .as_str()
@@ -19723,7 +20150,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .post_auth("/api/v5/connectors_probe", json!({}), &token)
             .await;
         assert_eq!(status, 400, "malformed probe body must be 400");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("TEST_FAILED"));
         // Probe leaves no state behind even after failures.
         let (status, body) = server.get_auth("/api/v5/connectors", &token).await;
         assert_eq!(status, 200);
@@ -20056,7 +20483,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(bad["code"], json!("BAD_REQUEST"));
+        assert_eq!(bad["code"], json!("ALREADY_EXISTS"));
         let (status, missing) = server
             .get_auth("/api/v5/actions/http:no-such", &token)
             .await;
@@ -20199,7 +20626,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(bad["code"], json!("BAD_REQUEST"));
+        assert_eq!(bad["code"], json!("ALREADY_EXISTS"));
     }
 
     #[tokio::test]

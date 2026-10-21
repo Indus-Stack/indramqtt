@@ -9902,9 +9902,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     /// Sprint 25 studio fanout (INDRA-224): one ingress event routes
-    /// through five streaming SQL `INTO connector(...)` rules and lands
-    /// simultaneously in the Azure Blob, Tablestore, S3 Tables,
-    /// Confluent and RocketMQ mocks. All transports are in-memory.
+    /// through four streaming SQL `INTO connector(...)` rules and lands
+    /// simultaneously in the Azure Blob, Tablestore, Confluent and
+    /// RocketMQ mocks. All transports are in-memory.
     // Needs the `azure_blob` and `confluent` heavy SDKs; runs on feature
     // builds.
     #[cfg(all(feature = "azure_blob", feature = "confluent"))]
@@ -9913,11 +9913,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         use broker_connectors_enterprise::{
             AttributeColumnMapping, AttributeColumnType, AzureBlobAuth, AzureBlobSink,
             AzureBlobSinkConfig, ConfluentKafkaConfig, ConfluentKafkaSink,
-            ConfluentSecurityProtocol, IcebergPartitionField, IcebergTransform,
-            MemoryConfluentTransport, MockAzureBlobTransport, MockRocketMqTransport,
-            MockS3TablesTransport, MockTablestoreTransport, PrimaryKeyMapping, PrimaryKeyType,
-            RocketMqSink, RocketMqSinkConfig, S3TablesSink, S3TablesSinkConfig, SaslMechanism,
-            TablestoreSink, TablestoreSinkConfig,
+            ConfluentSecurityProtocol, MemoryConfluentTransport, MockAzureBlobTransport,
+            MockRocketMqTransport, MockTablestoreTransport, PrimaryKeyMapping, PrimaryKeyType,
+            RocketMqSink, RocketMqSinkConfig, SaslMechanism, TablestoreSink, TablestoreSinkConfig,
         };
 
         let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
@@ -9981,45 +9979,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         );
         engine.connectors().register("ots_store", ots.clone());
 
-        // S3 Tables (auto-flush every row).
-        let tables_transport = Arc::new(MockS3TablesTransport::new());
-        let tables = Arc::new(
-            S3TablesSink::new(
-                S3TablesSinkConfig {
-                    table_bucket_arn:
-                        "arn:aws:s3tables:us-east-1:123456789012:bucket/telemetry-bucket"
-                            .to_string(),
-                    namespace: "production_iot".to_string(),
-                    table_name: "device_events".to_string(),
-                    region: "us-east-1".to_string(),
-                    access_key_id: "AKID".to_string(),
-                    secret_access_key: "secret".to_string(),
-                    session_token: None,
-                    endpoint: None,
-                    partition_spec: vec![
-                        IcebergPartitionField {
-                            source_name: "date".to_string(),
-                            transform: IcebergTransform::Day,
-                        },
-                        IcebergPartitionField {
-                            source_name: "device_id".to_string(),
-                            transform: IcebergTransform::Identity,
-                        },
-                    ],
-                    target_format: broker_connectors_enterprise::S3TablesFormat::NdjsonCompressed,
-                    batch_size: Some(1),
-                    buffer_capacity: None,
-                    linger_ms: Some(10),
-                    timeout_ms: None,
-                },
-                tables_transport.clone(),
-            )
-            .expect("valid sink"),
-        );
-        engine
-            .connectors()
-            .register("iceberg_table", tables.clone());
-
         // Confluent Cloud (auto-flush every row, SASL dummies).
         let confluent_transport = Arc::new(MemoryConfluentTransport::new());
         let confluent = Arc::new(
@@ -10075,7 +10034,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         for (id, connector) in [
             ("blob-rule", "blob_store"),
             ("ots-rule", "ots_store"),
-            ("tables-rule", "iceberg_table"),
             ("confluent-rule", "cloud_kafka"),
             ("rmq-rule", "rocket_producer"),
         ] {
@@ -10126,16 +10084,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             broker_connectors_enterprise::OtsValue::Double(150.0)
         );
 
-        // S3 Tables: one gzip data file on the day/device partition.
-        let files = tables_transport.puts();
-        assert_eq!(files.len(), 1);
-        assert!(
-            files[0].key.contains("device_id=__null__/"),
-            "got {:?}",
-            files[0].key
-        );
-        assert!(files[0].key.ends_with(".data.gz"));
-
         // Confluent: one record on the templated topic, keyed by client.
         let records = confluent_transport.records_flat();
         assert_eq!(records.len(), 1);
@@ -10169,7 +10117,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(blob_transport.puts().len(), 1);
         assert_eq!(ots_transport.captured().len(), 1);
-        assert_eq!(tables_transport.puts().len(), 1);
         assert_eq!(confluent_transport.records_flat().len(), 1);
         assert_eq!(rmq_transport.envelopes().len(), 1);
     }

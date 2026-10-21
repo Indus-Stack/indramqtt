@@ -4656,7 +4656,7 @@ fn load_data_dir_registry(data_dir: &str) -> Result<ConfigRegistry, ConfigError>
         file: data_dir.to_string(),
         reason: format!("cannot create data directory: {err}"),
     })?;
-    ConfigRegistry::load(std::path::Path::new(data_dir))
+    ConfigRegistry::load_for_boot(std::path::Path::new(data_dir))
 }
 
 /// Copy exporter settings set through the startup layers into the
