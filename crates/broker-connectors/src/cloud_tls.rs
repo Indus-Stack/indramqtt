@@ -88,6 +88,15 @@ pub fn private_key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
     }
 }
 
+/// Bundled Mozilla roots. This is the fallback for an empty or
+/// unreadable OS trust store, so loopback and offline tests still
+/// build. The anchor type comes from `rustls-pki-types`.
+fn bundled_root_store() -> RootCertStore {
+    let mut store = RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    store
+}
+
 /// Root store: OS system trust store plus one optional extra bundle.
 /// Falls back to bundled Mozilla roots when the OS store is empty or
 /// unreadable so loopback/offline tests still build.
@@ -101,13 +110,7 @@ pub fn root_store_with(extra_pem: Option<&str>) -> Result<RootCertStore> {
         }
     }
     if loaded == 0 {
-        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-            rustls::pki_types::TrustAnchor {
-                subject: ta.subject.to_vec().into(),
-                subject_public_key_info: ta.spki.to_vec().into(),
-                name_constraints: ta.name_constraints.map(|nc| nc.to_vec().into()),
-            }
-        }));
+        store = bundled_root_store();
     }
     if let Some(pem) = extra_pem {
         if pem.trim().is_empty() {
@@ -374,6 +377,15 @@ pub mod test_certs {
 mod tests {
     use super::*;
 
+    // Shared loopback TLS material, generated once with openssl and
+    // never deployed. The files live with the enterprise crate's tests.
+    const TEST_CA_PEM: &str =
+        include_str!("../../broker-connectors-enterprise/testdata/ca-cert.pem");
+    const TEST_SERVER_CERT_PEM: &str =
+        include_str!("../../broker-connectors-enterprise/testdata/server-cert.pem");
+    const TEST_SERVER_KEY_PEM: &str =
+        include_str!("../../broker-connectors-enterprise/testdata/server-key.pem");
+
     #[test]
     fn test_parse_host_port_defaults_and_errors() {
         assert_eq!(
@@ -417,5 +429,86 @@ mod tests {
             encode_mqtt_connect("device-1", true, 60, Some("user"), Some("pass")).unwrap();
         assert!(with_auth.len() > frame.len());
         assert!(encode_mqtt_connect("", true, 60, None, None).is_err());
+    }
+
+    #[test]
+    fn test_bundled_root_store_is_populated() {
+        let store = bundled_root_store();
+        assert!(!store.is_empty(), "bundled roots must not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_loopback_tls_custom_ca_accepted_then_refused() {
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let server_config =
+            test_certs::server_config(TEST_SERVER_CERT_PEM, TEST_SERVER_KEY_PEM, None)
+                .expect("test server config");
+        let acceptor = TlsAcceptor::from(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            // First connection: the custom CA is trusted, so the
+            // handshake completes and the CONNECT arrives.
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = acceptor.accept(tcp).await.expect("tls accept");
+            let (client_id, _, _) = read_client_connect(&mut tls).await.expect("read CONNECT");
+            assert_eq!(client_id, "root-advisory-check");
+            tls.write_all(&[0x20, 0x02, 0x00, 0x00])
+                .await
+                .expect("CONNACK");
+            // Second connection: the client refuses the chain, so this
+            // accept ends in an alert or a closed socket. Either is fine.
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let _ = acceptor.accept(tcp).await;
+        });
+
+        // Accepted: the test CA rides on top of the bundled roots.
+        let roots = root_store_with(Some(TEST_CA_PEM)).expect("root store");
+        let config = client_config(roots, None, &[]).expect("client config");
+        let mut stream = tls_dial(
+            "127.0.0.1",
+            port,
+            config,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            "root-advisory",
+        )
+        .await
+        .expect("TLS connect with the custom CA");
+        let connect =
+            encode_mqtt_connect("root-advisory-check", true, 30, None, None).expect("CONNECT");
+        mqtt_connect_over_tls(
+            &mut stream,
+            &connect,
+            "root-advisory",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("MQTT CONNECT over TLS");
+        drop(stream);
+
+        // Refused: the same server chain, no custom CA in the store.
+        let roots = root_store_with(None).expect("root store");
+        let config = client_config(roots, None, &[]).expect("client config");
+        let refused = tls_dial(
+            "127.0.0.1",
+            port,
+            config,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            "root-advisory",
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "the chain must be refused without the custom CA"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server done")
+            .expect("server task");
     }
 }
