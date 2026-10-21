@@ -178,7 +178,7 @@ def build_mcp():
     # states the plan. A grep over the API crate proves the absence.
     hits = []
     api = ROOT / "crates" / "broker-api" / "src"
-    for path in api.rglob("*.rs"):
+    for path in sorted(api.rglob("*.rs")):
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
