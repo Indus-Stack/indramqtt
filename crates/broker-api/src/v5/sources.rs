@@ -182,6 +182,11 @@ fn split_source_body(
     if !is_known_source_type(&kind) {
         return Err(format!("unknown source type: {kind}"));
     }
+    // KC-00: a known source kind whose capability state is not `ready` is
+    // refused before anything is stored.
+    if let Some(message) = super::rules::kind_refusal(&kind) {
+        return Err(message);
+    }
     // The path id is authoritative. The caller resolves it to the
     // stored bare id first. A body id that names another source is
     // rejected. A type change through replace stays allowed.
@@ -616,11 +621,8 @@ fn is_known_source_type(kind: &str) -> bool {
 /// rule match in `dispatch_ingress`) with no new lock, allocation or
 /// queue from this route.
 pub async fn list_source_types(Query(_ignored): Query<HashMap<String, String>>) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!(super::typed::SPEC_SOURCE_TYPES)),
-    )
-        .into_response()
+    let names = super::rules::ready_kind_names(super::typed::SPEC_SOURCE_TYPES, |row| row.source);
+    (StatusCode::OK, Json(serde_json::json!(names))).into_response()
 }
 
 /// Map a store persistence failure onto a 500: the in-memory mutation
@@ -676,6 +678,16 @@ pub async fn create_source(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // KC-00: a known source kind that is not `ready` answers
+    // `400 BAD_REQUEST`, never `ALREADY_EXISTS`.
+    if let Some(kind) = body.get("type").and_then(|v| v.as_str()) {
+        let kind = kind.trim();
+        if crate::removed_connector_refusal(kind).is_none() {
+            if let Some(message) = super::rules::kind_refusal(kind) {
+                return ApiError::BadRequest(message).into_response();
+            }
+        }
+    }
     let entry = match split_source_body(&body, None) {
         Ok(entry) => entry,
         Err(reason) => return ApiError::AlreadyExists(reason).into_response(),

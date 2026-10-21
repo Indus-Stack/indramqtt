@@ -80,8 +80,15 @@ pub struct ActionRecord {
 
 impl ActionRecord {
     fn to_json(&self) -> serde_json::Value {
-        let removed = broker_config::is_removed_connector_type(&self.action_type);
-        let status = if removed {
+        // KC-00/D2: a stored action whose kind is removed or not `ready`
+        // reads back `disconnected` with a reason, so an operator can see
+        // and delete it.
+        let reason = if broker_config::is_removed_connector_type(&self.action_type) {
+            Some(crate::REMOVED_CONNECTOR_MESSAGE.to_string())
+        } else {
+            super::rules::kind_refusal(&self.action_type)
+        };
+        let status = if reason.is_some() {
             "disconnected"
         } else {
             super::typed::typed_status(self.enable)
@@ -111,10 +118,10 @@ impl ActionRecord {
             "node_status".to_string(),
             super::typed::typed_node_status(status),
         );
-        if removed {
+        if let Some(reason) = reason {
             obj.insert(
                 "status_reason".to_string(),
-                serde_json::Value::String(crate::REMOVED_CONNECTOR_MESSAGE.to_string()),
+                serde_json::Value::String(reason),
             );
         }
         if let Some(extra) = self.params.as_object() {
@@ -175,6 +182,10 @@ fn split_action_body(
     }
     if !is_known_action_type(&kind) {
         return Err(format!("unknown action type: {kind}"));
+    }
+    // KC-00: a known kind whose capability state is not `ready` is refused.
+    if let Some(message) = super::rules::kind_refusal(&kind) {
+        return Err(message);
     }
     // The path id is authoritative. The caller resolves it to the
     // stored bare id first. A body id that names another action is
@@ -625,6 +636,16 @@ pub async fn create_action(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // KC-00: a known kind that is not `ready` answers `400 BAD_REQUEST`
+    // (not the `ALREADY_EXISTS` used for an unknown type).
+    if let Some(kind) = body.get("type").and_then(|v| v.as_str()) {
+        let kind = kind.trim();
+        if crate::removed_connector_refusal(kind).is_none() {
+            if let Some(message) = super::rules::kind_refusal(kind) {
+                return ApiError::BadRequest(message).into_response();
+            }
+        }
+    }
     let entry = match split_action_body(&body, None) {
         Ok(entry) => entry,
         Err(reason) => return ApiError::AlreadyExists(reason).into_response(),

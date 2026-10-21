@@ -18,10 +18,15 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod capability;
 pub mod layers;
 pub mod runtime;
 pub mod schema;
 pub mod secrets;
+
+pub use capability::{
+    is_kind_ready, is_kind_refused, kind_row, kind_state, KindRow, KindState, KIND_ROWS,
+};
 
 pub use layers::{
     load_layered, load_layered_with_env, CliOverrides, LayeredConfig, DEFAULT_CONFIG_DIR,
@@ -1054,6 +1059,15 @@ impl ConnectorsConf {
             if !is_known_connector_type(&connector.connector_type) && !removed {
                 return Err(ConfigError::Invalid(format!(
                     "connectors.connectors[{index}].connector_type {:?} is unknown (field `connector_type`)",
+                    connector.connector_type
+                )));
+            }
+            // KC-00: a strict load refuses a known kind whose capability
+            // state is not `ready`. The stored-state load tolerates it so
+            // an operator can still read and delete an old record.
+            if !allow_removed && is_kind_refused(&connector.connector_type) {
+                return Err(ConfigError::Invalid(format!(
+                    "connectors.connectors[{index}].connector_type {:?} is not available in this broker (field `connector_type`)",
                     connector.connector_type
                 )));
             }
@@ -2262,6 +2276,12 @@ impl ActionsConf {
                     entry.action_type
                 )));
             }
+            if !allow_removed && is_kind_refused(&entry.action_type) {
+                return Err(ConfigError::Invalid(format!(
+                    "actions.actions[{index}].action_type {:?} is not available in this broker (field `action_type`)",
+                    entry.action_type
+                )));
+            }
             if !seen.insert(entry.id.clone()) {
                 return Err(ConfigError::Invalid(format!(
                     "actions.actions[{index}].id {:?} is duplicated (field `id`)",
@@ -2367,6 +2387,12 @@ impl SourcesConf {
             if !is_known_source_type(&entry.source_type) && !removed {
                 return Err(ConfigError::Invalid(format!(
                     "sources.sources[{index}].source_type {:?} is unknown (field `source_type`)",
+                    entry.source_type
+                )));
+            }
+            if !allow_removed && is_kind_refused(&entry.source_type) {
+                return Err(ConfigError::Invalid(format!(
+                    "sources.sources[{index}].source_type {:?} is not available in this broker (field `source_type`)",
                     entry.source_type
                 )));
             }

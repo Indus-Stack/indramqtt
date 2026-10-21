@@ -916,8 +916,10 @@ impl ConnectorStore {
                     runtime.block_on(async {
                         for (id, conn_type, mut params) in restored {
                             let removed = broker_config::is_removed_connector_type(&conn_type);
-                            let reachable = !removed && probe_connector_reachable(&params).await;
-                            let status = if removed {
+                            let unavailable = removed || kind_refusal(&conn_type).is_some();
+                            let reachable =
+                                !unavailable && probe_connector_reachable(&params).await;
+                            let status = if unavailable {
                                 "disconnected"
                             } else {
                                 connector_status(reachable)
@@ -938,7 +940,7 @@ impl ConnectorStore {
                                 .unwrap_or(&id)
                                 .to_string();
                             self.upsert(params.clone());
-                            if reachable && !removed {
+                            if reachable && !unavailable {
                                 // A refused build fails closed here: the
                                 // entry stays persist-only and the error is
                                 // logged naming the connector and its kind.
@@ -1198,8 +1200,14 @@ impl ConnectorStore {
         }
         for entry in &candidate.connectors {
             let mut doc = connector_store_doc(entry);
-            let reachable = probe_connector_reachable(&doc).await;
-            let status = connector_status(reachable);
+            let unavailable = broker_config::is_removed_connector_type(&entry.connector_type)
+                || kind_refusal(&entry.connector_type).is_some();
+            let reachable = !unavailable && probe_connector_reachable(&doc).await;
+            let status = if unavailable {
+                "disconnected"
+            } else {
+                connector_status(reachable)
+            };
             if let Some(obj) = doc.as_object_mut() {
                 obj.insert(
                     "status".to_string(),
@@ -1549,11 +1557,16 @@ fn connector_live_view(
         .or_else(|| body.get("name").and_then(|v| v.as_str()))
         .unwrap_or("");
     let live = engine.connectors().get(id).is_some();
-    let removed = body
-        .get("type")
-        .and_then(|v| v.as_str())
-        .is_some_and(broker_config::is_removed_connector_type);
-    let status = if removed {
+    // KC-00/D2: a stored record whose kind is removed or not `ready` is
+    // kept and visible but reads back `disconnected` with a reason.
+    let reason = body.get("type").and_then(|v| v.as_str()).and_then(|kind| {
+        if broker_config::is_removed_connector_type(kind) {
+            Some(crate::REMOVED_CONNECTOR_MESSAGE.to_string())
+        } else {
+            kind_refusal(kind)
+        }
+    });
+    let status = if reason.is_some() {
         "disconnected"
     } else {
         connector_status(live)
@@ -1564,10 +1577,10 @@ fn connector_live_view(
             serde_json::Value::String(status.to_string()),
         );
         obj.insert("node_status".to_string(), connector_node_status(status));
-        if removed {
+        if let Some(reason) = reason {
             obj.insert(
                 "status_reason".to_string(),
-                serde_json::Value::String(crate::REMOVED_CONNECTOR_MESSAGE.to_string()),
+                serde_json::Value::String(reason),
             );
         }
     }
@@ -1809,6 +1822,34 @@ pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str
         })
 }
 
+/// KC-00 refusal for a kind whose capability state is not `ready`.
+///
+/// Returns `None` for a ready kind (and for the `test` helper in a test
+/// build); otherwise the exact `400 BAD_REQUEST` message. A kind whose
+/// Cargo feature is not compiled in names the feature, so a disabled
+/// build refuses it the same way everywhere. Unknown names are not the
+/// map's business: the caller answers them before this runs.
+pub(crate) fn kind_refusal(kind: &str) -> Option<String> {
+    match broker_config::kind_state(kind) {
+        Some(broker_config::KindState::Ready) => return None,
+        Some(broker_config::KindState::TestOnly) => {
+            if cfg!(test) {
+                return None;
+            }
+        }
+        Some(_) => {}
+        None => return None,
+    }
+    if let Some(feature) = disabled_connector_feature(kind) {
+        return Some(format!(
+            "connector type {kind} is not available in this broker: feature `{feature}` is not compiled in"
+        ));
+    }
+    Some(format!(
+        "connector type {kind} is not available in this broker"
+    ))
+}
+
 /// Features compiled into this build, from the same table.
 #[cfg(test)]
 pub(crate) fn compiled_connector_features() -> Vec<&'static str> {
@@ -1852,6 +1893,13 @@ pub(crate) async fn try_register_live_sink(
     name: &str,
     body: &serde_json::Value,
 ) -> Result<(), String> {
+    // KC-00: only `ready` kinds register. A kind that is not ready is
+    // refused with the documented message (naming the feature when that
+    // is the reason), so boot replay and a live config apply never dial
+    // an invented target for a pending kind.
+    if let Some(message) = kind_refusal(conn_type) {
+        return Err(message);
+    }
     // Documented names run on the runtime of their base kind.
     let runtime = live_sink_kind(conn_type);
     if let Some(feature) = disabled_connector_feature(runtime) {
@@ -5291,6 +5339,12 @@ pub async fn create_connector(
         return ApiError::AlreadyExists(format!("unknown connector type: {conn_type}"))
             .into_response();
     }
+    // KC-00: a known kind whose capability state is not `ready` is refused
+    // before anything is stored, with the documented message (the feature
+    // is named when it is the reason).
+    if let Some(message) = kind_refusal(&conn_type) {
+        return ApiError::BadRequest(message).into_response();
+    }
 
     // Reject a duplicate id before mutating anything: pushing it into
     // the store would poison every later connector POST/PUT/DELETE, whose
@@ -5509,6 +5563,11 @@ pub async fn update_connector(
     if !broker_config::is_known_connector_type(&conn_type) {
         return ApiError::BadRequest(format!("unknown connector type: {conn_type}"))
             .into_response();
+    }
+    // KC-00: refuse a non-ready kind before the live sink is swapped, so a
+    // refused update keeps the old record and its registration untouched.
+    if let Some(message) = kind_refusal(&conn_type) {
+        return ApiError::BadRequest(message).into_response();
     }
     // Fail closed (S1-01): same required-field gate as create; an update
     // that drops a credential or identity is rejected with the field named.
@@ -6109,6 +6168,10 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
     if !broker_config::is_known_connector_type(&kind) {
         return probe_failed(format!("unknown connector type: {kind}"));
     }
+    // KC-00: a known kind that is not `ready` is refused before any dial.
+    if let Some(message) = kind_refusal(&kind) {
+        return ApiError::BadRequest(message).into_response();
+    }
     // Runtime probe hook (the W3-17 dial path reused from the connector
     // create path): kinds that expose a network target get one bounded
     // dial; kinds without one count as reachable once the kind itself
@@ -6131,18 +6194,38 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
 // Action Probe (W3-07, C06-11)
 // ---------------------------------------------------------------------------
 
+/// KC-00: names to list for a capability, in documented order first and
+/// then any remaining ready kind from the map. A non-ready kind can never
+/// appear.
+pub(crate) fn ready_kind_names(
+    documented: &[&'static str],
+    pick: fn(&broker_config::KindRow) -> bool,
+) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = documented
+        .iter()
+        .copied()
+        .filter(|name| {
+            broker_config::kind_row(name)
+                .is_some_and(|row| row.state == broker_config::KindState::Ready && pick(row))
+        })
+        .collect();
+    for row in broker_config::KIND_ROWS {
+        if row.state == broker_config::KindState::Ready && pick(row) && !out.contains(&row.name) {
+            out.push(row.name);
+        }
+    }
+    out
+}
+
 /// `GET /api/v5/action_types`: names of supported action kinds.
 ///
 /// Returns the bare list of documented names (not paged). A name is
-/// listed only if its runtime exists in this build. Unknown query
+/// listed only if its runtime is `ready` in this build. Unknown query
 /// parameters are ignored. Management-plane only; publish and deliver
 /// never touch it.
 pub async fn get_action_types(Query(_ignored): Query<HashMap<String, String>>) -> Response {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!(super::typed::SPEC_ACTION_TYPES)),
-    )
-        .into_response()
+    let names = ready_kind_names(super::typed::SPEC_ACTION_TYPES, |row| row.action);
+    (StatusCode::OK, Json(serde_json::json!(names))).into_response()
 }
 
 /// Single-request bound for `POST /api/v5/actions_probe`: one TCP dial at
@@ -6197,6 +6280,10 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
     }
     if !is_known_probe_action_type(&kind) {
         return probe_failed(format!("unknown action type: {kind}"));
+    }
+    // KC-00: a known action kind that is not `ready` is refused before any dial.
+    if let Some(message) = kind_refusal(&kind) {
+        return ApiError::BadRequest(message).into_response();
     }
     // Runtime probe hook (the connector dial path reused from the
     // connector create path): kinds that expose a network target get one
@@ -6266,6 +6353,10 @@ pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
     }
     if !is_known_source_type(&kind) {
         return probe_failed(format!("unknown source type: {kind}"));
+    }
+    // KC-00: a known source kind that is not `ready` is refused before any dial.
+    if let Some(message) = kind_refusal(&kind) {
+        return ApiError::BadRequest(message).into_response();
     }
     // Runtime probe hook (the W3-23 dial path): kinds that expose a network
     // target get one bounded dial; kinds without one count as reachable once

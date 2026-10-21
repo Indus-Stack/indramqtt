@@ -18,11 +18,6 @@ use std::sync::LazyLock;
 /// request clones at most one bounded object.
 const MAX_DASHBOARD_OBJECTS: usize = 8;
 
-/// Dashboard form document version served in every named object.
-/// Reason: the documented form version the UI expects; static metadata,
-/// not a measurement, so a constant is correct here.
-const SCHEMA_VERSION: &str = "0.2.0";
-
 // Compile-time guard that the bound above covers the served names
 // (three canonical plus the one alias).
 const DASHBOARD_OBJECT_NAMES: [&str; 3] = ["hotconf", "actions", "connectors"];
@@ -34,6 +29,26 @@ fn str_prop(default: &str) -> Value {
         "type": "string",
         "default": default
     })
+}
+
+/// KC-00: keep only `ready` connector schemas in the served object, so a
+/// pending or refused kind is never offered as a dashboard form. The
+/// kind is read from each schema's `type` default.
+fn ready_connector_schemas(schemas: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(map) = schemas.as_object() {
+        for (name, schema) in map {
+            let kind = schema
+                .get("properties")
+                .and_then(|properties| properties.get("type"))
+                .and_then(|type_prop| type_prop.get("default"))
+                .and_then(|default| default.as_str());
+            if kind.is_some_and(broker_config::is_kind_ready) {
+                out.insert(name.clone(), schema.clone());
+            }
+        }
+    }
+    Value::Object(out)
 }
 
 fn pwd_prop() -> Value {
@@ -864,35 +879,15 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 pub async fn get_schema(Path(name): Path<String>) -> Response {
     // Named dashboard object (C05-10).
     //
-    // Envelope assumption (stated here; the conformance checker confirms):
-    // a single object `{"name", "title", "version", "schema"}`. The route
-    // is not paged and takes no query parameters. This envelope is
-    // deliberately distinct from the UI-form variant the previous handler
-    // served (`{"title", "version", "components": {"schemas": ...}}`):
-    // the new top level carries `name`/`schema` and never `components`,
-    // so a UI-form regression is detectable by shape.
-    // TODO(parity): what is the documented success envelope for
-    // `GET /schemas/{name}` (bare object, `data` wrapper, or another
-    // shape) and which per-object fields beyond `name` are required?
-    // The rulebook does not decide the shape; the current choice serves
-    // the bare named object above until the checker pins it.
+    // The reference documents a 200 body of type string. The string holds
+    // the JSON schema value, not an envelope.
     //
-    // Hot-config alias assumption (stated here): `hotconf` is canonical;
-    // `hot-config` resolves to the same object. No other alias exists;
-    // anything else (including `sources`) is 404.
-    // TODO(parity): is `hotconf` the only documented name for the
-    // hot-config object, or is `hot-config` (or another spelling) the
-    // canonical one? The rulebook does not decide the alias set; the
-    // current choice serves both spellings for the same object until
-    // the checker pins it.
+    // `hotconf` is canonical; `hot-config` resolves to the same value.
+    // Any other name is 404.
     //
-    // Bound (stated here and enforced by construction): at most
-    // `MAX_DASHBOARD_OBJECTS` named objects exist. Reason: the registry
-    // is code-defined and fixed-size, so each response clones at most one
-    // bounded object and management memory cannot grow from this route.
-    // The default is finite (`8` leaves headroom for the three canonical
-    // names plus the alias without an unbounded map); the operator cannot
-    // opt into more because writes are out of scope (read-only route).
+    // Bound: the registry is code-defined (three canonical names plus one
+    // alias). `MAX_DASHBOARD_OBJECTS` is finite and each request clones at
+    // most one bounded object. The route is read-only.
     //
     // Management-plane only: reads a `LazyLock` static, takes no lock,
     // and publish/deliver never touch it.
@@ -911,34 +906,20 @@ pub async fn get_schema(Path(name): Path<String>) -> Response {
                 .into_response();
         }
     };
-    let (title, schema) = match canonical {
-        "hotconf" => (
-            "Hot Conf Schema",
-            // TODO(parity): which per-object fields does the hot-config
-            // object carry? The broker does not track hot-config sections
-            // as live state, so only the served-name list below is
-            // reported (derived from this same registry, not measured).
-            // Anything beyond `sections` is omitted rather than invented.
-            json!({ "sections": ["actions", "connectors", "hotconf"] }),
-        ),
-        "actions" => (
-            "Actions Schema",
-            ACTIONS_SCHEMA["components"]["schemas"].clone(),
-        ),
-        _ => (
-            "Connectors Schema",
-            CONNECTORS_SCHEMA["components"]["schemas"].clone(),
-        ),
+    let schema = match canonical {
+        "hotconf" => {
+            // The broker does not track hot-config sections as live state.
+            // It reports only the served-name list from this registry.
+            json!({ "sections": ["actions", "connectors", "hotconf"] })
+        }
+        "actions" => ACTIONS_SCHEMA["components"]["schemas"].clone(),
+        _ => ready_connector_schemas(&CONNECTORS_SCHEMA["components"]["schemas"]),
     };
+    let body = serde_json::to_string(&schema).expect("schema value serializes");
     (
         StatusCode::OK,
         [("content-type", "application/json")],
-        Json(json!({
-            "name": canonical,
-            "title": title,
-            "version": SCHEMA_VERSION,
-            "schema": schema,
-        })),
+        Json(body),
     )
         .into_response()
 }
@@ -979,32 +960,57 @@ mod tests {
         (status, body)
     }
 
+    fn schema_value(body: &serde_json::Value) -> serde_json::Value {
+        let text = body.as_str().expect("schema body is a JSON string");
+        serde_json::from_str(text).expect("schema string holds JSON")
+    }
+
     #[tokio::test]
-    async fn known_name_returns_named_object_envelope() {
-        // Through the handler (not only the store): known names return
-        // the named-object envelope, never the UI-form variant.
+    async fn known_name_returns_schema_json_string() {
+        // Through the handler (not only the store): known names return the
+        // documented JSON string that holds the schema value.
         for name in ["connectors", "actions", "hotconf"] {
             let (status, body) =
                 response_parts(get_schema(axum::extract::Path(name.to_string())).await).await;
             assert_eq!(status, axum::http::StatusCode::OK, "known name {name}");
-            assert_eq!(body["name"], serde_json::json!(name));
-            assert!(body["title"].is_string(), "title for {name}");
-            assert_eq!(body["version"], serde_json::json!("0.2.0"));
-            assert!(body["schema"].is_object(), "schema object for {name}");
             assert!(
-                body.get("components").is_none(),
-                "must not return the UI-form variant for {name}"
+                body.is_string(),
+                "reference requires a JSON string for {name}, got: {body}"
+            );
+            assert!(
+                schema_value(&body).is_object(),
+                "schema value is an object for {name}"
             );
         }
     }
 
     #[tokio::test]
-    async fn hot_config_alias_resolves_to_hotconf() {
+    async fn schema_body_is_not_the_old_object_envelope() {
+        // Negative test: the old `{name, title, version, schema}` object
+        // must not return.
         let (status, body) =
+            response_parts(get_schema(axum::extract::Path("connectors".to_string())).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            body.is_string(),
+            "reference requires a JSON string, got: {body}"
+        );
+        assert!(
+            body.get("schema").is_none(),
+            "the old object envelope must not return"
+        );
+        assert!(schema_value(&body).is_object());
+    }
+
+    #[tokio::test]
+    async fn hot_config_alias_resolves_to_hotconf() {
+        let (status, alias) =
             response_parts(get_schema(axum::extract::Path("hot-config".to_string())).await).await;
         assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(body["name"], serde_json::json!("hotconf"));
-        assert!(body.get("components").is_none());
+        let (status, canonical) =
+            response_parts(get_schema(axum::extract::Path("hotconf".to_string())).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(alias, canonical, "alias must serve the canonical schema");
     }
 
     #[tokio::test]

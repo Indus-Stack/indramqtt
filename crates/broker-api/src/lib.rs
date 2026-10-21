@@ -760,17 +760,19 @@ impl ApiState {
     }
 
     /// Raise one active alarm per stored connector/action whose kind this
-    /// broker removed. The records stay untouched and readable; the alarms
-    /// make the unavailable state visible without claiming the rule itself
-    /// is broken.
+    /// broker removed or has not made `ready` (KC-00/D2). The records stay
+    /// untouched and readable; the alarms make the unavailable state
+    /// visible without claiming the rule itself is broken.
     fn raise_unavailable_stored_kinds(&self) {
         let snapshot = self.config.snapshot();
         for connector in &snapshot.connectors.connectors {
-            if broker_config::is_removed_connector_type(&connector.connector_type) {
+            if broker_config::is_removed_connector_type(&connector.connector_type)
+                || crate::v5::rules::kind_refusal(&connector.connector_type).is_some()
+            {
                 self.alarms.activate(
                     &format!("connector_unavailable:{}", connector.id),
                     &format!(
-                        "connector {:?} uses removed type {:?}; stored configuration preserved but unavailable",
+                        "connector {:?} uses unavailable type {:?}; stored configuration preserved but unavailable",
                         connector.id, connector.connector_type
                     ),
                     serde_json::json!({
@@ -782,11 +784,13 @@ impl ApiState {
             }
         }
         for action in &snapshot.actions.actions {
-            if broker_config::is_removed_connector_type(&action.action_type) {
+            if broker_config::is_removed_connector_type(&action.action_type)
+                || crate::v5::rules::kind_refusal(&action.action_type).is_some()
+            {
                 self.alarms.activate(
                     &format!("action_unavailable:{}", action.id),
                     &format!(
-                        "action {:?} uses removed type {:?}; stored configuration preserved but unavailable",
+                        "action {:?} uses unavailable type {:?}; stored configuration preserved but unavailable",
                         action.id, action.action_type
                     ),
                     serde_json::json!({
@@ -2599,13 +2603,28 @@ mod tests {
             let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
                 .await
                 .expect("connect test server");
-            stream
-                .write_all(raw.as_bytes())
-                .await
-                .expect("write request");
-            // HTTP/1.0 + Connection: close => the server closes when done.
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.expect("read response");
+            let (mut reader, mut writer) = stream.split();
+            // The server can answer before it reads the whole body. Read and
+            // write at the same time so an early close cannot block the
+            // answer. A reset on the write is only accepted when the server
+            // still sends its response.
+            let write = writer.write_all(raw.as_bytes());
+            let read = async {
+                // HTTP/1.0 + Connection: close => the server closes when done.
+                let mut buf = Vec::new();
+                reader.read_to_end(&mut buf).await.map(|_| buf)
+            };
+            let (write_result, read_result) = tokio::join!(write, read);
+            let buf = read_result.expect("read response");
+            if let Err(error) = write_result {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "write request: {error}"
+                );
+            }
             let text = String::from_utf8(buf).expect("response is UTF-8");
             let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
             let status: u16 = head.lines().next().expect("status line")[9..12]
@@ -2843,10 +2862,14 @@ mod tests {
         assert_eq!(sources, json!([]));
         let (status, schema) = server.get_auth("/schemas/connectors", &token).await;
         assert_eq!(status, 200);
+        let schema: serde_json::Value = serde_json::from_str(
+            schema
+                .as_str()
+                .expect("connector schema body is a JSON string"),
+        )
+        .expect("connector schema string holds JSON");
         assert!(
-            schema["schema"]
-                .get("connector_s3tables.post_connector")
-                .is_none(),
+            schema.get("connector_s3tables.post_connector").is_none(),
             "removed connector schema is not served"
         );
         let (status, _) = server
@@ -19126,9 +19149,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     #[tokio::test]
     async fn ui_schema_unknown_is_404() {
         // Named dashboard objects (C05-10, W2-31): known names return the
-        // named-object envelope, never the UI-form variant; unknown names
-        // are 404 with `{code, message}`. Goes through the broker API
-        // server (authenticated request), not only the store.
+        // documented JSON string that holds the schema value; unknown
+        // names are 404 with `{code, message}`. Goes through the broker
+        // API server (authenticated request), not only the store.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let (status, body) = server.get_auth("/api/v5/schemas/sources", &token).await;
@@ -19140,17 +19163,21 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 .get_auth(&format!("/api/v5/schemas/{name}"), &token)
                 .await;
             assert_eq!(status, 200, "served schema {name} must be 200");
-            assert_eq!(body["name"], json!(name));
-            assert!(body["schema"].is_object());
             assert!(
-                body.get("components").is_none(),
-                "must not return the UI-form variant for {name}"
+                body.is_string(),
+                "served schema {name} must be a JSON string"
             );
+            let schema: serde_json::Value =
+                serde_json::from_str(body.as_str().expect("schema body is a JSON string"))
+                    .expect("schema string holds JSON");
+            assert!(schema.is_object(), "schema value for {name} is an object");
         }
-        // Hot-config alias resolves to the same canonical object.
-        let (status, body) = server.get_auth("/api/v5/schemas/hot-config", &token).await;
+        // Hot-config alias resolves to the same canonical value.
+        let (status, alias) = server.get_auth("/api/v5/schemas/hot-config", &token).await;
         assert_eq!(status, 200);
-        assert_eq!(body["name"], json!("hotconf"));
+        let (status, canonical) = server.get_auth("/api/v5/schemas/hotconf", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(alias, canonical, "alias must serve the canonical schema");
         let (status, body) = server.get_auth("/api/v5/schemas", &token).await;
         assert_eq!(status, 200);
         assert_eq!(body, json!(["hotconf", "actions", "connectors"]));

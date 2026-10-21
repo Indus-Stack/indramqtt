@@ -474,6 +474,13 @@ async fn apply_connectors_live(
                 take_live_sink_alias(engine, &entry.connector_type, &entry.id, &mut undo);
             }
         }
+        // KC-00: a kind whose capability state is not `ready` never goes
+        // live; the stored record stays readable and the id is reported in
+        // `pending_live` without a probe dial.
+        if crate::v5::rules::kind_refusal(&entry.connector_type).is_some() {
+            pending_live.push(entry.id.clone());
+            continue;
+        }
         let Some(params) = resolve_connector_params(entry) else {
             pending_live.push(entry.id.clone());
             continue;
