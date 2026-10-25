@@ -209,8 +209,12 @@ fn parse_rule_actions(
             let Some(found) = state.actions.get_any(id_str) else {
                 return Err(bad(format!("unknown action {id_str:?} (field `actions`)")));
             };
+            // MV-01/SB-03: the fire target of a v5 rule action is the
+            // action's own dispatch key, so delivery crosses to the
+            // action-owned sink registered under that key (one action,
+            // one sink, one key).
             actions.push(broker_rules::RuleAction::ForwardConnector {
-                connector_id: found.id.clone(),
+                connector_id: broker_config::v5_action_sink_key(&found.id),
             });
             continue;
         }
@@ -252,8 +256,10 @@ fn parse_rule_actions(
         let Some(found) = state.actions.get_any(conn_id) else {
             return Err(bad(format!("unknown action {conn_id:?} (field `actions`)")));
         };
+        // MV-01/SB-03: same action-owned dispatch key as the bare
+        // string form above.
         actions.push(broker_rules::RuleAction::ForwardConnector {
-            connector_id: found.id.clone(),
+            connector_id: broker_config::v5_action_sink_key(&found.id),
         });
     }
     Ok(actions)
@@ -872,8 +878,9 @@ impl ConnectorStore {
     /// Attach the registry and replace the contents with its snapshot, in
     /// place on the same instance. Kernel boot path: the shared instance
     /// `serve_api` hands to `ApiState` must observe the persisted
-    /// connectors from the first connection. An empty snapshot keeps
-    /// today's empty behaviour.
+    /// connectors from the first connection, and re-register every live
+    /// sink through the same path `create_connector` uses. An empty
+    /// snapshot keeps today's empty behaviour.
     pub fn seed_from_registry(
         &self,
         registry: &Arc<broker_config::ConfigRegistry>,
@@ -917,8 +924,21 @@ impl ConnectorStore {
                         for (id, conn_type, mut params) in restored {
                             let removed = broker_config::is_removed_connector_type(&conn_type);
                             let unavailable = removed || kind_refusal(&conn_type).is_some();
-                            let reachable =
-                                !unavailable && probe_connector_reachable(&params).await;
+                            // A webhook sink is lazy and registration sends
+                            // no bytes. Do not dial it at boot: a bare TCP
+                            // probe leaves a connection in the target's
+                            // accept queue. Other kinds keep the probe, so a
+                            // target that is down now reads `disconnected`
+                            // and stays persist-only until a send retries.
+                            let has_target = extract_target_host_port(&params).is_some();
+                            let lazy_http = matches!(conn_type.as_str(), "webhook" | "http");
+                            let reachable = if unavailable {
+                                false
+                            } else if lazy_http {
+                                true
+                            } else {
+                                !has_target || probe_connector_reachable(&params).await
+                            };
                             let status = if unavailable {
                                 "disconnected"
                             } else {
@@ -934,22 +954,16 @@ impl ConnectorStore {
                                     connector_node_status(status),
                                 );
                             }
-                            let live_name = params
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(&id)
-                                .to_string();
                             self.upsert(params.clone());
                             if reachable && !unavailable {
                                 // A refused build fails closed here: the
                                 // entry stays persist-only and the error is
                                 // logged naming the connector and its kind.
                                 if let Err(register_error) =
-                                    try_register_live_sink(engine, &conn_type, &live_name, &params)
-                                        .await
+                                    try_register_live_sink(engine, &conn_type, &id, &params).await
                                 {
                                     tracing::warn!(
-                                        connector = %live_name,
+                                        connector = %id,
                                         kind = %conn_type,
                                         "{register_error}"
                                     );
@@ -1090,7 +1104,7 @@ impl ConnectorStore {
 
     /// Insert or replace one document by `id`-or-`name` match. Boot and
     /// reload replay only; request paths use the checked writes above.
-    fn upsert(&self, doc: serde_json::Value) {
+    pub(crate) fn upsert(&self, doc: serde_json::Value) {
         let id = doc
             .get("id")
             .and_then(|v| v.as_str())
@@ -1229,7 +1243,7 @@ impl Default for ConnectorStore {
 /// Map a connector registry failure onto a 500: the in-memory mutation
 /// applied but the commit or atomic save failed, so the loss must never
 /// be silent.
-fn connector_persist_error(error: broker_config::ConfigError) -> Response {
+pub(crate) fn connector_persist_error(error: broker_config::ConfigError) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
@@ -1585,6 +1599,21 @@ fn connector_live_view(
         }
     }
     out
+}
+
+/// Resolve the connector reference an action stores (the bare id or
+/// the `{type}:{name}` key) to the bare connector id plus the stored
+/// document, through the same matching the connector read paths use.
+/// `None` when no stored connector matches.
+pub(crate) fn resolve_action_connector(
+    connectors: &ConnectorStore,
+    reference: &str,
+) -> Option<(String, serde_json::Value)> {
+    let doc = connectors
+        .snapshot()
+        .into_iter()
+        .find(|stored| connector_doc_matches(stored, reference))?;
+    Some((connector_bare_name(&doc), doc))
 }
 
 /// Redact secret references in a connector document for any observable
@@ -5316,6 +5345,16 @@ pub async fn create_connector(
         return ApiError::BadRequest("connector id or name is required".to_string())
             .into_response();
     }
+    // MV-01: `action:` is the reserved dispatch-key prefix of the
+    // action-owned sinks (the fire targets of v5 rules). A connector
+    // id with the prefix would collide with that namespace, so it is
+    // refused here before anything stores.
+    if broker_config::is_v5_action_sink_key(&name) {
+        return ApiError::BadRequest(format!(
+            "connector id {name:?} is reserved: ids starting with `action:` name action sinks (field `id`)"
+        ))
+        .into_response();
+    }
     if name.len() > MAX_CONNECTOR_ID_LEN {
         return ApiError::BadRequest(format!(
             "connector id holds {} chars, at most {MAX_CONNECTOR_ID_LEN} (field `id`)",
@@ -5459,6 +5498,20 @@ pub async fn create_connector(
         return connector_persist_error(error);
     }
 
+    // MV-01: the new connector can resolve actions that stored while
+    // dangling (dangling references keep the action storable, see
+    // `stage_action_sink`): replay every stored action's owned sink from
+    // the stores so a stored action starts delivering the moment its
+    // target connector arrives. Actions whose targets still miss keep
+    // their wiring state and alarm — the replay is observational for
+    // everything it cannot build.
+    crate::v5::action_sinks::rebuild_all_action_sinks(
+        &state.engine,
+        &state.connectors,
+        &state.actions,
+        &state.alarms,
+    );
+
     (StatusCode::CREATED, Json(body)).into_response()
 }
 
@@ -5569,6 +5622,14 @@ pub async fn update_connector(
     if let Some(message) = kind_refusal(&conn_type) {
         return ApiError::BadRequest(message).into_response();
     }
+    // MV-01: `action:` is the reserved action-sink dispatch prefix; a
+    // connector id renamed into it stays refused.
+    if broker_config::is_v5_action_sink_key(&bare) {
+        return ApiError::BadRequest(format!(
+            "connector id {bare:?} is reserved: ids starting with `action:` name action sinks (field `id`)"
+        ))
+        .into_response();
+    }
     // Fail closed (S1-01): same required-field gate as create; an update
     // that drops a credential or identity is rejected with the field named.
     if let Some(missing) = missing_connector_field(&conn_type, &body) {
@@ -5576,6 +5637,40 @@ pub async fn update_connector(
             "missing required field: {missing} for connector type {conn_type}"
         ))
         .into_response();
+    }
+    // MV-01 (R2-04): every dependent action must accept the new
+    // connector settings before anything swaps in. Each action's owned
+    // sink is built here staged (built, never registered): a failure
+    // answers 400 naming the action and the field, keeps every old
+    // sink (the old generation keeps delivering) and leaves the stored
+    // row untouched. On success the staged sinks swap in under the
+    // action dispatch keys below, after the stored update and its
+    // persist.
+    let mut staged_sinks: Vec<(String, Arc<dyn broker_connectors::Sink>)> = Vec::new();
+    let mut staged_ids: Vec<String> = Vec::new();
+    for record in state.actions.snapshot() {
+        if !crate::v5::action_sinks::action_targets_connector(&state.connectors, &record, &bare) {
+            continue;
+        }
+        if !crate::v5::action_sinks::action_owned_kind(&record.action_type) {
+            continue;
+        }
+        match crate::v5::action_sinks::build_action_sink(&record, &body) {
+            Ok(Some(sink)) => {
+                staged_sinks.push((broker_config::v5_action_sink_key(&record.id), sink));
+                staged_ids.push(record.id.clone());
+            }
+            Ok(None) => {
+                staged_ids.push(record.id.clone());
+            }
+            Err(message) => {
+                return ApiError::BadRequest(format!(
+                    "action {:?} cannot use connector {bare:?}: {message}",
+                    record.id
+                ))
+                .into_response();
+            }
+        }
     }
     let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
     // Swap the live sink first: drop every registration for this id
@@ -5586,7 +5681,10 @@ pub async fn update_connector(
     // with no execution path registers nothing and honestly reads back
     // `disconnected`.
     for registered in state.engine.connectors().ids() {
-        if registered == bare || registered.ends_with(&format!(":{bare}")) {
+        if registered == bare
+            || (registered.ends_with(&format!(":{bare}"))
+                && !broker_config::is_v5_action_sink_key(&registered))
+        {
             state.engine.connectors().unregister(&registered);
         }
     }
@@ -5638,10 +5736,29 @@ pub async fn update_connector(
     // W3-19: mirror the flag into the dispatch snapshot (same lock-free
     // path as the enable route below).
     state.engine.set_action_enabled(&bare, enable);
+    // MV-01/R2: the replace can flip the enable flag along with the
+    // settings; the dependent actions' delivery follows it.
+    mirror_dependent_actions(&state, &bare, enable);
     // A persist failure is a 500 (the in-memory replacement stays but the
     // disk save failed); the loss must never be silent.
     if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
+    }
+    // MV-01/R2-04: swap the staged dependent-action sinks in under their
+    // action dispatch keys (staged build → persist → swap, in that
+    // order) and report their wiring live. The actions that staged
+    // nothing keep their state (they never owned a sink for this
+    // connector's new shape).
+    for (key, sink) in staged_sinks {
+        state.engine.connectors().register(key, sink);
+    }
+    for action_id in &staged_ids {
+        state
+            .actions
+            .set_wiring(action_id, crate::v5::actions::ActionWiring::Live);
+        state
+            .alarms
+            .deactivate(&format!("action_build_failed:{action_id}"));
     }
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -5700,7 +5817,10 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
     // actions (the only stores with a connector reference field today)
     // until the checker pins it.
     for registered in state.engine.connectors().ids() {
-        if registered == bare || registered.ends_with(&format!(":{bare}")) {
+        if registered == bare
+            || (registered.ends_with(&format!(":{bare}"))
+                && !broker_config::is_v5_action_sink_key(&registered))
+        {
             state.engine.connectors().unregister(&registered);
         }
     }
@@ -5766,6 +5886,21 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
 // separately? The rulebook does not decide; the current choice shares
 // the W3-04 snapshot (one lookup per forward covers both) until the
 // checker pins it.
+/// MV-01/R2: a connector disable stops every dependent action's
+/// delivery; a connector enable restores them. Each dependent action's
+/// dispatch flag rides `action.enable && connector.enable`. Actions
+/// that target other connectors are untouched.
+fn mirror_dependent_actions(state: &ApiState, bare: &str, enable: bool) {
+    for record in state.actions.snapshot() {
+        if crate::v5::action_sinks::action_targets_connector(&state.connectors, &record, bare) {
+            state.engine.set_action_enabled(
+                &broker_config::v5_action_sink_key(&record.id),
+                record.enable && enable,
+            );
+        }
+    }
+}
+
 pub async fn set_connector_enabled(
     State(state): State<ApiState>,
     Path((id, enable_raw)): Path<(String, String)>,
@@ -5797,6 +5932,17 @@ pub async fn set_connector_enabled(
     // disk save below fails (the store itself keeps the mutation on a
     // persist failure and answers 500, never silently).
     state.engine.set_action_enabled(&bare, enable);
+    // MV-01/R2: the connector's flag rides the action dispatch key as
+    // well as the bare id, so a rule firing under the `action:{id}` key
+    // observes the connector disable/enable (shared snapshot, one
+    // lookup per forward either way).
+    state
+        .engine
+        .set_action_enabled(&broker_config::v5_action_sink_key(&bare), enable);
+    // MV-01/R2: a connector disable stops every dependent action's
+    // delivery; an enable restores them (the flap rides the same
+    // mirror, before persist, after the store flip).
+    mirror_dependent_actions(&state, &bare, enable);
     if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
@@ -5949,6 +6095,15 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     // so a disabled connector costs the same single lookup and never
     // touches the connector store on the fire path.
     state.engine.set_action_enabled(&bare, enable);
+    // MV-01/R2: the connector's flag rides the action dispatch key as
+    // well as the bare id, so a rule firing under the `action:{id}` key
+    // observes the connector start/stop.
+    state
+        .engine
+        .set_action_enabled(&broker_config::v5_action_sink_key(&bare), enable);
+    // MV-01/R2: a connector disable stops every dependent action's
+    // delivery; an enable restores them.
+    mirror_dependent_actions(state, &bare, enable);
     if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }

@@ -4350,3 +4350,1861 @@ async fn mv00_api_error_missing_probe_keeps_store_empty() {
         "absent-rule probe codes: {codes:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MV-01/SB-03: action-owned runtime sinks. One action is one dispatch key
+// (`action:{id}`); the sink builds from the referenced connector's settings
+// plus the action's own parameters, and the fire path crosses to it.
+// ---------------------------------------------------------------------------
+
+/// Accept `expected` HTTP requests on the shared listener and return each
+/// (request path, request body) pair. One serve per POST.
+fn mv01_spawn_http_receiver(
+    listener: Arc<tokio::net::TcpListener>,
+    expected: usize,
+) -> tokio::task::JoinHandle<Vec<(String, Vec<u8>)>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        let mut recorded = Vec::with_capacity(expected);
+        for _ in 0..expected {
+            let (mut socket, _) = listener.accept().await.expect("HTTP request accepted");
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                socket
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("HTTP header byte");
+                request.push(byte[0]);
+                assert!(request.len() <= 16384, "bounded HTTP header");
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8(request).expect("HTTP headers");
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().expect("HTTP length"))
+                })
+                .expect("HTTP content length");
+            assert!(length <= 4096, "bounded body");
+            let mut body = vec![0_u8; length];
+            socket.read_exact(&mut body).await.expect("HTTP body");
+            let path = headers
+                .lines()
+                .next()
+                .expect("request line")
+                .split_whitespace()
+                .nth(1)
+                .expect("request path")
+                .to_string();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("HTTP response");
+            recorded.push((path, body));
+        }
+        recorded
+    })
+}
+
+/// Two actions on one connector each build their own sink and route to
+/// their own parameter shape; a delete stops only the deleted action.
+#[tokio::test]
+async fn mv01_webhook_action_sinks_route_independently_and_stop_on_delete() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-webhook",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    for (id, path) in [("mv01-a", "/a"), ("mv01-b", "/b")] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": id,
+                "type": "webhook",
+                "connector": "mv01-webhook",
+                "parameters": {"path": path},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "action {id} create: {body}");
+        assert_eq!(
+            body["status"], "connected",
+            "action {id} reads live: {body}"
+        );
+        assert!(body["status_reason"].is_null(), "action {id}: {body}");
+    }
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-rule",
+            "sql": "SELECT * FROM \"mv01/in/1\"",
+            "actions": ["mv01-a", "mv01-b"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/1", 0, 0, false, br#"{"k":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let mut paths: Vec<&str> = received.iter().map(|(path, _)| path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        vec!["/a", "/b"],
+        "both action sinks routed: {received:?}"
+    );
+    for (_, body) in &received {
+        assert_eq!(body.as_slice(), &br#"{"k":1}"#[..]);
+    }
+    // A rule that still names the action holds the delete back.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-a",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 400, "referenced action delete: {body}");
+    // Remove the action from the rule, then delete it.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/mv01-rule",
+        serde_json::json!({
+            "sql": "SELECT * FROM \"mv01/in/1\"",
+            "actions": ["mv01-b"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule update: {body}");
+    // Deleting one action stops only that action's delivery.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-a",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete: {body}");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/1", 0, 0, false, br#"{"k":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1, "only the surviving action delivers");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/b");
+    assert_eq!(body.as_slice(), &br#"{"k":2}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-a",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404, "deleted action reads absent: {body}");
+    kernel.finish().await;
+}
+
+/// An action whose connector does not resolve stores `disconnected` with
+/// the named reason and starts delivering once the connector arrives —
+/// creating the connector alone wires it.
+#[tokio::test]
+async fn mv01_http_action_dangling_connector_stores_disconnected_and_recovers() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-late",
+            "type": "http",
+            "connector": "http:mv01-late-link",
+            "parameters": {"path": "/late"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "dangling action stores: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    let reason = body["status_reason"].as_str().expect("status reason");
+    assert!(
+        reason.contains("mv01-late-link"),
+        "reason names the missing connector: {reason}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-late-link",
+            "type": "http",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-late",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["status"], "connected",
+        "the action wired with its connector: {body}"
+    );
+    assert!(body["status_reason"].is_null(), "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-late-rule",
+            "sql": "SELECT * FROM \"mv01/in/late\"",
+            "actions": ["mv01-late"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-late-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/late", 0, 0, false, br#"{"late":true}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/late");
+    assert_eq!(body.as_slice(), &br#"{"late":true}"#[..]);
+    kernel.finish().await;
+}
+
+/// Disabling an action stops its delivery; re-enabling restores it.
+#[tokio::test]
+async fn mv01_webhook_action_disable_stops_delivery_and_toggle_restores() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-onoff",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-onoff-action",
+            "type": "webhook",
+            "connector": "mv01-onoff",
+            "parameters": {"path": "/onoff"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-onoff-rule",
+            "sql": "SELECT * FROM \"mv01/in/onoff\"",
+            "actions": ["mv01-onoff-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-onoff-pub").await;
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/onoff", 0, 0, false, br#"{"e":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/onoff");
+    assert_eq!(body.as_slice(), &br#"{"e":1}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-onoff-action/enable/false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "disable: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-onoff-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    // A silenced receiver: nothing accepts while the action reads off.
+    let watch = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/onoff", 0, 0, false, br#"{"e":2}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !watch.is_finished(),
+        "a disabled action delivered: accept ended the promise"
+    );
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-onoff-action/enable/true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "re-enable");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/onoff", 0, 0, false, br#"{"e":3}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, watch)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/onoff");
+    assert_eq!(body.as_slice(), &br#"{"e":3}"#[..]);
+    kernel.finish().await;
+}
+
+/// A connector update that breaks a dependent action's sink build is
+/// refused with the action and field named; the old sink keeps
+/// delivering and the stored connector stays untouched.
+#[tokio::test]
+async fn mv01_connector_update_dependent_build_failure_refuses_and_keeps_delivery() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-break",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-break-action",
+            "type": "webhook",
+            "connector": "mv01-break",
+            "parameters": {"path": "/break"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-break-rule",
+            "sql": "SELECT * FROM \"mv01/in/break\"",
+            "actions": ["mv01-break-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-break-pub").await;
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/break", 0, 0, false, br#"{"f":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].1.as_slice(), &br#"{"f":1}"#[..]);
+    // The URL only resolves through a file reference the environment
+    // cannot load: the dependent build fails closed and the update is
+    // refused with the action and field named.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-break",
+        serde_json::json!({
+            "name": "mv01-break",
+            "type": "webhook",
+            "url": "file:/nonexistent/indra-mv01-secret",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "dependent build failure refuses: {body}");
+    assert!(body["message"].is_string(), "{body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(
+        message.contains("mv01-break-action") && message.contains("url"),
+        "the refusal names the action and the field: {message}"
+    );
+    // The old generation kept delivering.
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/break", 0, 0, false, br#"{"f":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/break");
+    assert_eq!(body.as_slice(), &br#"{"f":2}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-break-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["status"], "connected",
+        "the refused update kept the wired action live: {body}"
+    );
+    kernel.finish().await;
+}
+
+/// A restart rebuilds the owned sinks from the stored connector settings
+/// plus the stored action parameters and delivery resumes.
+#[tokio::test]
+async fn mv01_webhook_action_sink_survives_restart() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let mut kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-restart",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-restart-action",
+            "type": "webhook",
+            "connector": "mv01-restart",
+            "parameters": {"path": "/after/restart"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-restart-rule",
+            "sql": "SELECT * FROM \"mv01/in/restart\"",
+            "actions": ["mv01-restart-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-restart-pub").await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/restart", 0, 0, false, br#"{"r":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/after/restart");
+    assert_eq!(body.as_slice(), &br#"{"r":1}"#[..]);
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-restart-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "connected", "{body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-restart-pub2").await;
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/restart", 0, 0, false, br#"{"r":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let (path, body) = &received[0];
+    assert_eq!(path, "/after/restart");
+    assert_eq!(body.as_slice(), &br#"{"r":2}"#[..]);
+    kernel.finish().await;
+}
+
+// -- Fake PostgreSQL for the action-owned pgsql sink -----------------------
+
+/// Read one PostgreSQL message (tag plus body) from the fake server stream.
+async fn mv01_pg_read_msg(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let mut header = [0_u8; 5];
+    stream.read_exact(&mut header).await.expect("pg head");
+    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut body = vec![0_u8; len - 4];
+    stream.read_exact(&mut body).await.expect("pg body");
+    (header[0], body)
+}
+
+/// Write one PostgreSQL message to the fake server stream.
+async fn mv01_pg_write_msg(stream: &mut tokio::net::TcpStream, tag: u8, body: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    let mut frame = vec![tag];
+    frame.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    frame.extend_from_slice(body);
+    stream.write_all(&frame).await.expect("pg write");
+}
+
+/// Read the startup parameter block and return the (key, value) pairs.
+async fn mv01_pg_read_startup(stream: &mut tokio::net::TcpStream) -> Vec<(String, String)> {
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0_u8; 4];
+    stream.read_exact(&mut len_buf).await.expect("startup len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0_u8; len - 4];
+    stream.read_exact(&mut body).await.expect("startup body");
+    assert_eq!(
+        &body[..4],
+        &196608_i32.to_be_bytes(),
+        "startup protocol 3.0"
+    );
+    let mut params = Vec::new();
+    let mut parts = body[4..].split(|b| *b == 0);
+    while let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+        if key.is_empty() {
+            break;
+        }
+        params.push((
+            String::from_utf8_lossy(key).into_owned(),
+            String::from_utf8_lossy(value).into_owned(),
+        ));
+    }
+    params
+}
+
+async fn mv01_pg_ready(stream: &mut tokio::net::TcpStream) {
+    mv01_pg_write_msg(stream, b'Z', b"I").await;
+}
+
+/// One captured engine row per statement: the bound statement plus the
+/// rows the sink flushed (each row: topic, QoS, payload).
+type PgCaptured = Arc<Mutex<Vec<(String, Vec<Vec<Vec<u8>>>)>>>;
+
+/// One fake backend: cleartext trust auth, then the two-round extended
+/// protocol the maintained `tokio-postgres` driver runs (an unnamed
+/// prepare with inferred types, then a bind/execute of one engine row),
+/// whose parsed statement and bound values are captured.
+async fn mv01_pg_serve_one(mut stream: tokio::net::TcpStream, captured: PgCaptured) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut probe = [0_u8; 8];
+    stream.read_exact(&mut probe).await.expect("ssl probe");
+    assert_eq!(&probe[4..8], &80877103_i32.to_be_bytes(), "SSLRequest");
+    stream.write_all(b"N").await.expect("ssl deny");
+    let params = mv01_pg_read_startup(&mut stream).await;
+    // The connection settings come from the connector document alone.
+    assert!(params.iter().any(|(k, v)| k == "user" && v == "u"));
+    assert!(params.iter().any(|(k, v)| k == "database" && v == "db"));
+    // Trust authentication, then ready for the prepared statement.
+    mv01_pg_write_msg(&mut stream, b'R', &0_i32.to_be_bytes()).await;
+    mv01_pg_ready(&mut stream).await;
+    // Prepare round: the driver annotates no parameter types, so the
+    // fake infers the three engine columns (topic, qos, payload) as
+    // text and serves an insert-shaped statement with no result rows.
+    let (tag, body) = mv01_pg_read_msg(&mut stream).await;
+    assert_eq!(tag, b'P', "prepare parses the action's statement");
+    let (statement_name, sql) = {
+        let mut cursor = &body[..];
+        let take_cstr = |cur: &mut &[u8]| {
+            let end = cur.iter().position(|&b| b == 0).expect("cstr");
+            let text = String::from_utf8_lossy(&cur[..end]).into_owned();
+            *cur = &cur[end + 1..];
+            text
+        };
+        (take_cstr(&mut cursor), take_cstr(&mut cursor))
+    };
+    mv01_pg_write_msg(&mut stream, b'1', &[]).await;
+    // ParameterDescription: three text parameters (oids 25).
+    let mut types = Vec::new();
+    types.extend_from_slice(&3_u16.to_be_bytes());
+    types.extend_from_slice(&25_i32.to_be_bytes());
+    types.extend_from_slice(&25_i32.to_be_bytes());
+    types.extend_from_slice(&25_i32.to_be_bytes());
+    mv01_pg_write_msg(&mut stream, b't', &types).await;
+    let (tag, _) = mv01_pg_read_msg(&mut stream).await;
+    assert_eq!(tag, b'D', "the driver describes the prepared statement");
+    mv01_pg_write_msg(&mut stream, b'n', &[]).await;
+    mv01_pg_ready(&mut stream).await;
+    // Execute round: the row binds against the prepared statement, all
+    // values in text format.
+    let (tag, body) = mv01_pg_read_msg(&mut stream).await;
+    assert_eq!(tag, b'B', "the driver binds the engine row");
+    let mut rows = Vec::new();
+    let mut cursor = &body[..];
+    let skip_cstr = |cursor: &mut &[u8]| {
+        let end = cursor.iter().position(|&b| b == 0).expect("cstr");
+        *cursor = &cursor[end + 1..];
+    };
+    skip_cstr(&mut cursor);
+    skip_cstr(&mut cursor);
+    let formats = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    cursor = &cursor[2 + formats * 2..];
+    let count = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    cursor = &cursor[2..];
+    let mut row = Vec::new();
+    for _ in 0..count {
+        let len = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+        cursor = &cursor[4..];
+        row.push(cursor[..len as usize].to_vec());
+        cursor = &cursor[len as usize..];
+    }
+    rows.push(row);
+    mv01_pg_write_msg(&mut stream, b'2', &[]).await;
+    let (tag, _) = mv01_pg_read_msg(&mut stream).await;
+    assert_eq!(tag, b'E', "the bound portal executes");
+    mv01_pg_write_msg(&mut stream, b'C', b"INSERT 0 1\0").await;
+    let sync_tag;
+    loop {
+        let (tag, _) = mv01_pg_read_msg(&mut stream).await;
+        if tag == b'E' {
+            continue;
+        }
+        sync_tag = tag;
+        break;
+    }
+    assert_eq!(sync_tag, b'S', "the batch syncs");
+    mv01_pg_ready(&mut stream).await;
+    captured
+        .lock()
+        .expect("capture lock")
+        .push((format!("{statement_name}|{sql}"), rows));
+}
+
+/// Two `pgsql` actions on one connector own separate statement shapes: each
+/// delivers the engine row (topic, QoS, payload) under its own Parameters,
+/// and the per-action counters attribute the fires.
+#[tokio::test]
+async fn mv01_pgsql_action_delivers_engine_rows_to_connector_settings() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured = Arc::new(Mutex::new(Vec::<(String, Vec<Vec<Vec<u8>>>)>::new()));
+    let fake = {
+        let captured = Arc::clone(&captured);
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("pg backend accepted");
+                mv01_pg_serve_one(stream, Arc::clone(&captured)).await;
+            }
+        })
+    };
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    for (suffix, sentinel) in [("a", "MV01-A-SQL"), ("b", "MV01-B-SQL")] {
+        let id = format!("mv01-pg-{suffix}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": id,
+                "type": "pgsql",
+                "connector": "mv01-pg",
+                "parameters": {"sql": format!("{sentinel} INSERT $1, $2, $3")},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "action {id} create: {body}");
+        assert_eq!(body["status"], "connected", "action {id}: {body}");
+        let rule_id = format!("mv01-pg-rule-{suffix}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            serde_json::json!({
+                "id": rule_id,
+                "sql": format!("SELECT * FROM \"mv01/in/{suffix}\""),
+                "actions": [id],
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "rule {rule_id} create: {body}");
+    }
+    // One publish per action fires its own rule; each action's pool dials
+    // the fake backend and flushes its own statement with the engine row.
+    for (suffix, payload) in [("a", &b"{\"v\":1}"[..]), ("b", &b"{\"v\":2}"[..])] {
+        let mut publisher = mv00_connect(&kernel, &format!("mv01-pg-pub-{suffix}")).await;
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv01/in/{suffix}"), 0, 0, false, payload),
+        )
+        .await;
+        drop(publisher);
+    }
+    // The sink flusher outside this test drives both pools; bound the wait.
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let arrived = captured.lock().expect("capture lock").len() == 2;
+        assert!(
+            std::time::Instant::now() < deadline || arrived,
+            "both pgsql actions flushed in time"
+        );
+        if arrived {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    fake.await.expect("pg fake task");
+    let captured = std::sync::Mutex::into_inner(Arc::try_unwrap(captured).expect("sole owner"))
+        .expect("capture lock");
+    // Per-action counters attributed one success each.
+    for suffix in ["a", "b"] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/actions/mv01-pg-{suffix}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "action {suffix} metrics: {body}");
+        assert_eq!(body["metrics"]["success"], serde_json::json!(1), "{body}");
+        assert_eq!(body["metrics"]["failed"], serde_json::json!(0), "{body}");
+    }
+    // Both actions delivered under their own statements with the engine
+    // row (topic, QoS, payload) bound by the sink.
+    assert_eq!(captured.len(), 2);
+    for (statement, rows) in &captured {
+        assert!(rows.len() == 1, "one row per statement: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.len(), 3, "topic, qos, payload bound: {row:?}");
+        assert_eq!(row[1], &b"0"[..]);
+        let (topic, payload) = if statement.contains("MV01-A-SQL") {
+            ("mv01/in/a", "{\"v\":1}".as_bytes())
+        } else if statement.contains("MV01-B-SQL") {
+            ("mv01/in/b", "{\"v\":2}".as_bytes())
+        } else {
+            unreachable!("each connection binds its action's statement: {statement:?}");
+        };
+        assert_eq!(row[0], topic.as_bytes());
+        assert_eq!(row[2], payload);
+    }
+    kernel.finish().await;
+}
+
+/// An action update swaps the statement live (new publishes use it); a
+/// refused update (missing `sql`) answers 400 naming the field and the
+/// old statement keeps delivering.
+#[tokio::test]
+async fn mv01_pgsql_action_update_swaps_statement_and_refusal_keeps_old() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured = Arc::new(Mutex::new(Vec::<(String, Vec<Vec<Vec<u8>>>)>::new()));
+    let fake = {
+        let captured = Arc::clone(&captured);
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.expect("pg backend accepted");
+                mv01_pg_serve_one(stream, Arc::clone(&captured)).await;
+            }
+        })
+    };
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-up",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-up",
+            "type": "pgsql",
+            "connector": "mv01-pg-up",
+            "parameters": {"sql": "MV01-PGUP-V1 INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-up-rule",
+            "sql": "SELECT * FROM \"mv01/in/up\"",
+            "actions": ["mv01-pg-up"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-up-pub").await;
+    // The first publish flushes the created statement.
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/up", 0, 0, false, br#"{"u":1}"#),
+    )
+    .await;
+    // An update that drops `sql` is refused with the field named; the
+    // stored action and the delivering statement are untouched.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-pg-up",
+        serde_json::json!({
+            "name": "mv01-pg-up",
+            "type": "pgsql",
+            "connector": "mv01-pg-up",
+            "parameters": {},
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "missing sql refuses: {body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(
+        message.contains("mv01-pg-up") && message.contains("parameters.sql"),
+        "the refusal names the action and the field: {message}"
+    );
+    // The old generation kept delivering (a fresh backend connection).
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/up", 0, 0, false, br#"{"u":2}"#),
+    )
+    .await;
+    // A full replacement swaps the statement in for the next publish.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-pg-up",
+        serde_json::json!({
+            "name": "mv01-pg-up",
+            "type": "pgsql",
+            "connector": "mv01-pg-up",
+            "parameters": {"sql": "MV01-PGUP-V2 INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "action update: {body}");
+    assert_eq!(body["status"], "connected", "{body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/up", 0, 0, false, br#"{"u":3}"#),
+    )
+    .await;
+    // Bound the wait for all three flushes.
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let arrived = captured.lock().expect("capture lock").len() == 3;
+        assert!(
+            std::time::Instant::now() < deadline || arrived,
+            "all three statements flushed in time"
+        );
+        if arrived {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    fake.await.expect("pg fake task");
+    let captured = std::sync::Mutex::into_inner(Arc::try_unwrap(captured).expect("sole owner"))
+        .expect("capture lock");
+    // Flush order follows connection order: created, refused-update
+    // still old, updated new. The prepared statement carries the
+    // driver's generated name; the sql follows after the separator.
+    let sql_of = |index: usize| -> String {
+        captured[index]
+            .0
+            .split_once('|')
+            .expect("statement capture")
+            .1
+            .to_string()
+    };
+    assert_eq!(sql_of(0), "MV01-PGUP-V1 INSERT $1, $2, $3");
+    assert_eq!(sql_of(1), "MV01-PGUP-V1 INSERT $1, $2, $3");
+    assert_eq!(sql_of(2), "MV01-PGUP-V2 INSERT $1, $2, $3");
+    // Every flush carries the engine row (topic, QoS, payload) bound by
+    // the action to its own publish.
+    let payloads: [&[u8]; 3] = [br#"{"u":1}"#, br#"{"u":2}"#, br#"{"u":3}"#];
+    for (index, expected_payload) in payloads.iter().enumerate() {
+        let rows = &captured[index].1;
+        assert!(rows.len() == 1, "one row per flush: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.len(), 3, "topic, qos, payload bound: {row:?}");
+        assert_eq!(row[0], &b"mv01/in/up"[..]);
+        assert_eq!(row[1], &b"0"[..]);
+        assert_eq!(row[2], *expected_payload);
+    }
+    kernel.finish().await;
+}
+
+/// A connector disable stops every dependent action; enable restores
+/// them. Deleting a connector that an action still uses is refused and
+/// leaves both records in place.
+#[tokio::test]
+async fn mv01_connector_disable_mirrors_dependents_and_delete_guards_references() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-cd",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-cd-action",
+            "type": "webhook",
+            "connector": "mv01-cd",
+            "parameters": {"path": "/cd"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-cd-rule",
+            "sql": "SELECT * FROM \"mv01/in/cd\"",
+            "actions": ["mv01-cd-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-cd-pub").await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/cd", 0, 0, false, br#"{"d":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/cd");
+    assert_eq!(received[0].1.as_slice(), &br#"{"d":1}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-cd/enable/false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "connector disable: {body}");
+    let watch = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/cd", 0, 0, false, br#"{"d":2}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !watch.is_finished(),
+        "a disabled connector still delivered through its dependent action"
+    );
+    watch.abort();
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-cd/enable/true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "connector enable: {body}");
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/cd", 0, 0, false, br#"{"d":3}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/cd");
+    assert_eq!(received[0].1.as_slice(), &br#"{"d":3}"#[..]);
+    // The used connector cannot be deleted while the action points at it.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/mv01-cd",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 400, "used connector delete refuses: {body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(
+        message.contains("mv01-cd-action") && message.contains("action"),
+        "the refusal names the dependent action: {message}"
+    );
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-cd",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "the refused delete keeps the connector");
+    // Detach the rule, then the action and its connector can go.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/mv01-cd-rule",
+        serde_json::json!({
+            "sql": "SELECT * FROM \"mv01/in/cd\"",
+            "actions": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule detach: {body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-cd-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete after detach");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/connectors/mv01-cd",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "connector delete after the action is gone");
+    kernel.finish().await;
+}
+
+/// Publishes continue across an action update: every message reaches
+/// exactly one statement, and a later delete stops the action.
+#[tokio::test]
+async fn mv01_concurrent_publish_update_and_delete_keep_each_message_once() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-conc",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-conc-action",
+            "type": "webhook",
+            "connector": "mv01-conc",
+            "parameters": {"path": "/before"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-conc-rule",
+            "sql": "SELECT * FROM \"mv01/in/conc\"",
+            "actions": ["mv01-conc-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let payloads: Vec<String> = (0..16).map(|index| format!("{{\"n\":{index}}}")).collect();
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), payloads.len());
+    let publisher = mv00_connect(&kernel, "mv01-conc-pub").await;
+    let send_payloads = payloads.clone();
+    let publisher_task = tokio::spawn(async move {
+        let mut publisher = publisher;
+        for payload in send_payloads {
+            send_mqtt(
+                &mut publisher,
+                &sy02_publish311("mv01/in/conc", 0, 0, false, payload.as_bytes()),
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-conc-action",
+        serde_json::json!({
+            "name": "mv01-conc-action",
+            "type": "webhook",
+            "connector": "mv01-conc",
+            "parameters": {"path": "/after"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "action update during publishes: {body}");
+    publisher_task.await.expect("publisher task");
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(
+        received.len(),
+        payloads.len(),
+        "every publish delivered once"
+    );
+    let mut got: Vec<String> = received
+        .iter()
+        .map(|(_, body)| String::from_utf8(body.clone()).expect("payload text"))
+        .collect();
+    let mut want = payloads.clone();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "no publish lost or duplicated across the swap");
+    for (path, _) in &received {
+        assert!(
+            path.as_str() == "/before" || path.as_str() == "/after",
+            "unexpected delivery path {path}"
+        );
+    }
+    // Detach the rule, then delete the action; a later publish is silent.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/mv01-conc-rule",
+        serde_json::json!({
+            "sql": "SELECT * FROM \"mv01/in/conc\"",
+            "actions": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule detach: {body}");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-conc-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete");
+    let (status, _) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-conc-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404, "the deleted action reads absent");
+    let watch = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let mut publisher = mv00_connect(&kernel, "mv01-conc-pub2").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/conc", 0, 0, false, br#"{"n":"gone"}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!watch.is_finished(), "a deleted action still delivered");
+    watch.abort();
+    kernel.finish().await;
+}
+
+/// A persistence failure on an action update keeps the old sink and the
+/// old stored parameters, and answers 500.
+#[tokio::test]
+async fn mv01_action_persist_failure_keeps_the_old_sink_delivering() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-persist",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-persist-action",
+            "type": "webhook",
+            "connector": "mv01-persist",
+            "parameters": {"path": "/persist"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-persist-rule",
+            "sql": "SELECT * FROM \"mv01/in/persist\"",
+            "actions": ["mv01-persist-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-persist-pub").await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/persist", 0, 0, false, br#"{"p":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].1.as_slice(), &br#"{"p":1}"#[..]);
+    // Block the atomic save: the state path becomes a directory, so the
+    // temp-file rename fails for every later persist.
+    let state_path = kernel.scratch.join("state.toml");
+    std::fs::remove_file(&state_path).expect("state file exists after the writes");
+    std::fs::create_dir(&state_path).expect("state path blocks the rename");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-persist-action",
+        serde_json::json!({
+            "name": "mv01-persist-action",
+            "type": "webhook",
+            "connector": "mv01-persist",
+            "parameters": {"path": "/persist-new"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 500, "the persistence failure answers 500: {body}");
+    assert_eq!(body["code"], "INTERNAL_ERROR", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-persist-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["parameters"]["path"], "/persist", "{body}");
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/persist", 0, 0, false, br#"{"p":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/persist");
+    assert_eq!(received[0].1.as_slice(), &br#"{"p":2}"#[..]);
+    kernel.finish().await;
+}
+
+/// One rule mixes an owned `pgsql` action, an owned `webhook` action and
+/// a kind with no owned runtime: both owned sinks deliver and the
+/// refused kind counts one failed fire.
+#[tokio::test]
+async fn mv01_mixed_kind_rule_delivers_owned_actions_and_counts_refused_failure() {
+    let pg_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let pg_address = pg_listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let pg_captured = Arc::clone(&captured);
+    let pg_fake = tokio::spawn(async move {
+        let (stream, _) = pg_listener.accept().await.expect("pg backend accepted");
+        mv01_pg_serve_one(stream, pg_captured).await;
+    });
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-mixed-pg",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", pg_address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "pgsql connector: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-mixed-pg-act",
+            "type": "pgsql",
+            "connector": "mv01-mixed-pg",
+            "parameters": {"sql": "MV01-MIXED INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "pgsql action: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-mixed-wh",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "webhook connector: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-mixed-wh-act",
+            "type": "webhook",
+            "connector": "mv01-mixed-wh",
+            "parameters": {"path": "/mixed"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "webhook action: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-mixed-refused",
+            "type": "mysql",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "unowned kind action stores: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-mixed-rule",
+            "sql": "SELECT * FROM \"mv01/in/mixed\"",
+            "actions": ["mv01-mixed-pg-act", "mv01-mixed-wh-act", "mv01-mixed-refused"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "mixed rule create: {body}");
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let mut publisher = mv00_connect(&kernel, "mv01-mixed-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/mixed", 0, 0, false, br#"{"m":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/mixed");
+    assert_eq!(received[0].1.as_slice(), &br#"{"m":1}"#[..]);
+    tokio::time::timeout(STEP, pg_fake)
+        .await
+        .expect("pgsql delivery in time")
+        .expect("pg fake task");
+    let captured = std::sync::Mutex::into_inner(Arc::try_unwrap(captured).expect("sole owner"))
+        .expect("capture lock");
+    assert_eq!(captured.len(), 1, "the pgsql action delivered once");
+    assert_eq!(captured[0].1.len(), 1, "one engine row");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-mixed-refused/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "refused-kind metrics: {body}");
+    assert_eq!(body["metrics"]["success"], serde_json::json!(0), "{body}");
+    assert_eq!(body["metrics"]["failed"], serde_json::json!(1), "{body}");
+    kernel.finish().await;
+}
+
+/// A stored action whose sink cannot build at boot reports the error state
+/// and raises the build alarm through the production `/alarms` entry.
+#[tokio::test]
+async fn mv01_failed_boot_action_wiring_reports_error_and_alarm() {
+    let mut kernel = spawn_kernel("").await;
+    let secret = kernel.scratch.join("mv01-boot-url");
+    std::fs::write(&secret, "http://127.0.0.1:9").expect("secret file");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-boot-link",
+            "type": "webhook",
+            "url": format!("file:{}", secret.display()),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-boot-fail",
+            "type": "webhook",
+            "connector": "mv01-boot-link",
+            "parameters": {"path": "/boot"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    assert_eq!(body["status"], "connected", "the action built live: {body}");
+    // The secret disappears before the restart, so the boot replay cannot
+    // rebuild the action sink.
+    std::fs::remove_file(&secret).expect("remove the secret");
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-boot-fail",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "the failed action stays readable: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    let reason = body["status_reason"].as_str().expect("status reason");
+    assert!(
+        reason.contains("url"),
+        "the reason names the field: {reason}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/alarms",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "alarms read: {body}");
+    let alarm = body["data"]
+        .as_array()
+        .expect("alarm rows")
+        .iter()
+        .find(|row| row["name"] == "action_build_failed:mv01-boot-fail")
+        .expect("the boot failure raised its alarm");
+    assert!(
+        alarm["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("url")),
+        "the alarm carries the build reason: {alarm}"
+    );
+    kernel.finish().await;
+}
+
+/// A valid webhook server that is down at write time does not refuse the
+/// action; the stored action delivers once the server starts.
+#[tokio::test]
+async fn mv01_down_webhook_server_stores_the_action_and_delivers_when_up() {
+    let reserve = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let address = reserve.local_addr().expect("reserved address");
+    drop(reserve);
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-down",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-down-action",
+            "type": "webhook",
+            "connector": "mv01-down",
+            "parameters": {"path": "/down"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "a down target still stores: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-down-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["parameters"]["path"], "/down", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-down-rule",
+            "sql": "SELECT * FROM \"mv01/in/down\"",
+            "actions": ["mv01-down-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-down-pub").await;
+    // The server is down: the fire fails, but the broker keeps serving.
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/down", 0, 0, false, br#"{"down":1}"#),
+    )
+    .await;
+    // Wait for that failed fire to finish before the server starts, so the
+    // first message cannot arrive at the receiver below.
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        let (_, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            "/api/v5/actions/mv01-down-action/metrics",
+            serde_json::Value::Null,
+        )
+        .await;
+        if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the down-target fire failed in time: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind(address)
+            .await
+            .expect("the server starts on the reserved port"),
+    );
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/down", 0, 0, false, br#"{"down":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/down");
+    assert_eq!(received[0].1.as_slice(), &br#"{"down":2}"#[..]);
+    kernel.finish().await;
+}
+
+/// A v5 action and a v1 connector may share a name; typed and bare v5
+/// action ids resolve to the same sink, and both paths survive a restart.
+#[tokio::test]
+async fn mv01_v5_action_and_v1_connector_share_a_name_and_survive_restart() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let mut kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v1/connectors",
+        serde_json::json!({
+            "id": "shared",
+            "kind": "webhook",
+            "config": {"url": format!("http://{address}/v1"), "batch_size": 1},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "v1 connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-ns-link",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "v5 connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "shared",
+            "type": "webhook",
+            "connector": "mv01-ns-link",
+            "parameters": {"path": "/v5"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "v5 action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v1/rules",
+        serde_json::json!({
+            "name": "mv01-ns-v1",
+            "topic_filter": "mv01/ns/v1",
+            "sql_query": "SELECT * FROM \"mv01/ns/v1\"",
+            "actions": [{"type": "forwardconnector", "connector_id": "shared"}],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "v1 rule create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-ns-typed",
+            "sql": "SELECT * FROM \"mv01/ns/typed\"",
+            "actions": ["webhook:shared"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "typed v5 rule create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-ns-bare",
+            "sql": "SELECT * FROM \"mv01/ns/bare\"",
+            "actions": ["shared"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "bare v5 rule create: {body}");
+    let topics = ["mv01/ns/v1", "mv01/ns/typed", "mv01/ns/bare"];
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), topics.len());
+    let mut publisher = mv00_connect(&kernel, "mv01-ns-pub").await;
+    for topic in topics {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(topic, 0, 0, false, topic.as_bytes()),
+        )
+        .await;
+    }
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let mut paths: Vec<&str> = received.iter().map(|(path, _)| path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        vec!["/v1", "/v5", "/v5"],
+        "same-name v1 connector and v5 action routed separately: {received:?}"
+    );
+    // Restart: the v1 sink registers live again and the v5 action replay
+    // rebuilds under its dispatch key.
+    mv00_restart(&mut kernel).await;
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), topics.len());
+    let mut publisher = mv00_connect(&kernel, "mv01-ns-pub2").await;
+    for topic in topics {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(topic, 0, 0, false, format!("{topic}-restart").as_bytes()),
+        )
+        .await;
+    }
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    let mut paths: Vec<&str> = received.iter().map(|(path, _)| path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        vec!["/v1", "/v5", "/v5"],
+        "delivery resumed for both namespaces after restart: {received:?}"
+    );
+    kernel.finish().await;
+}

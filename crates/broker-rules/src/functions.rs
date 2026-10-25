@@ -358,12 +358,18 @@ fn single_placeholder(text: &str) -> Option<&str> {
 // Projection back to the documented shape.
 // ---------------------------------------------------------------------------
 
-/// Render one stored action in the shape the read routes document: a
-/// string for a stored-action id, an object with `function` for the
-/// built-in functions.
+/// Render one stored action in the shape the documented API reads an
+/// action forward: a string carrying the action id. A v5 action-owned
+/// sink registers under the reserved `action:{id}` dispatch key; reads
+/// strip the prefix back so the API keeps naming the bare action id (a
+/// v1 plain connector id passes through unchanged).
 pub fn action_to_api_json(action: &RuleAction) -> Value {
     match action {
-        RuleAction::ForwardConnector { connector_id } => Value::String(connector_id.clone()),
+        RuleAction::ForwardConnector { connector_id } => Value::String(
+            broker_config::v5_action_sink_id(connector_id)
+                .unwrap_or(connector_id)
+                .to_string(),
+        ),
         RuleAction::Console | RuleAction::Log => serde_json::json!({ "function": "console" }),
         RuleAction::RepublishFn { args } => serde_json::json!({
             "function": "republish",

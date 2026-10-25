@@ -1135,6 +1135,8 @@ mod tests {
             secret: "s".to_string(),
             encoding: HmacEncoding::Hex,
         });
+
+        config.linger_ms = None;
         let (sink, transport) = test_sink(config);
         let topic = Topic::new("t").unwrap();
         for v in [1, 2, 3] {
@@ -1173,6 +1175,8 @@ mod tests {
         let mut config = test_config("http://hook/${topic}");
         config.body_format = HttpBodyFormat::JsonBatchArray;
         config.batch_size = Some(100);
+
+        config.linger_ms = None;
         let (sink, transport) = test_sink(config);
         sink.send(
             &Topic::new("a/1").unwrap(),
@@ -1211,6 +1215,8 @@ mod tests {
         let mut config = test_config("http://127.0.0.1:1/hook");
         config.body_format = HttpBodyFormat::JsonBatchArray;
         config.batch_size = Some(100);
+
+        config.linger_ms = None;
         let (sink, transport) = test_sink(config);
         let topic = Topic::new("t").unwrap();
         for v in [1, 2, 3] {

@@ -220,6 +220,36 @@ pub fn is_known_action_type(kind: &str) -> bool {
     KNOWN_ACTION_TYPES.contains(&kind)
 }
 
+/// Reserved dispatch-key prefix for v5 action-owned sinks (MV-01/ticket
+/// SB-03). A v5 rule action's owned runtime sink registers in the
+/// connector manager under `action:{bare_action_id}` so one action is
+/// one dispatch key (multiple actions per connector stop sharing one
+/// sink, and a fire target never collides with a stored connector id).
+/// Connector ids carrying the prefix are refused at create to keep the
+/// namespace unambiguous.
+pub const V5_ACTION_SINK_PREFIX: &str = "action:";
+
+/// Dispatch key of one action's owned sink: the reserved prefix plus
+/// the bare action id.
+#[must_use]
+pub fn v5_action_sink_key(bare_action_id: &str) -> String {
+    format!("{V5_ACTION_SINK_PREFIX}{bare_action_id}")
+}
+
+/// True when the string is a v5 action sink dispatch key (or a style
+/// collision with one).
+#[must_use]
+pub fn is_v5_action_sink_key(key: &str) -> bool {
+    key.starts_with(V5_ACTION_SINK_PREFIX)
+}
+
+/// Strip the reserved prefix off a dispatch key, yielding the bare
+/// action id the API documents. `None` when the string is not a key.
+#[must_use]
+pub fn v5_action_sink_id(key: &str) -> Option<&str> {
+    key.strip_prefix(V5_ACTION_SINK_PREFIX)
+}
+
 /// Source kinds the kernel can instantiate as ingress.
 ///
 /// Mirrors the source-type registry: every executable action kind plus

@@ -78,16 +78,44 @@ pub struct ActionRecord {
     pub params: serde_json::Value,
 }
 
+/// In-memory build state of one action's owned runtime sink (MV-01).
+/// Never persisted: boot, create, update, enable-flipping config
+/// writes and config reloads always rebuild it from the stored
+/// connector settings plus the stored action parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionWiring {
+    /// The kind owns no runtime here yet (or the build was never
+    /// attempted in this process): no sink, no reason.
+    None,
+    /// The owned sink is built and registered under the action
+    /// dispatch key; delivery for this action flows through it.
+    Live,
+    /// The owned sink could not be built. The message names the action
+    /// and the offending field; the action stays stored, reports
+    /// `disconnected` with the reason and raises
+    /// `action_build_failed:{id}` (no invented status value).
+    Failed(String),
+}
+
 impl ActionRecord {
-    fn to_json(&self) -> serde_json::Value {
+    fn to_json_with(&self, wiring: &ActionWiring) -> serde_json::Value {
         // KC-00/D2: a stored action whose kind is removed or not `ready`
         // reads back `disconnected` with a reason, so an operator can see
         // and delete it.
-        let reason = if broker_config::is_removed_connector_type(&self.action_type) {
+        let mut reason = if broker_config::is_removed_connector_type(&self.action_type) {
             Some(crate::REMOVED_CONNECTOR_MESSAGE.to_string())
         } else {
             super::rules::kind_refusal(&self.action_type)
         };
+        // MV-01/D3: an action-owned sink build failure reports through
+        // `status_reason` (the status reads `disconnected`), never
+        // through a new status value. The kind refusals keep priority:
+        // an unavailable kind is not a build failure.
+        if let ActionWiring::Failed(message) = wiring {
+            if reason.is_none() {
+                reason = Some(message.clone());
+            }
+        }
         let status = if reason.is_some() {
             "disconnected"
         } else {
@@ -263,6 +291,9 @@ pub enum ActionInsertError {
 /// messaging (and publish/deliver never touch this store at all).
 pub struct ActionStore {
     inner: RwLock<HashMap<String, ActionRecord>>,
+    /// Per-action owned-sink build state (MV-01), recomputed by every
+    /// write path that rebuilds sinks and kept memory-only.
+    wiring: RwLock<HashMap<String, ActionWiring>>,
     /// Kernel config registry receiving every mutation (`None` in unit
     /// tests and standalone state, which stay memory-only).
     registry: RwLock<Option<Arc<broker_config::ConfigRegistry>>>,
@@ -276,6 +307,7 @@ impl ActionStore {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            wiring: RwLock::new(HashMap::new()),
             registry: RwLock::new(None),
             save_lock: Mutex::new(()),
         }
@@ -313,6 +345,10 @@ impl ActionStore {
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.wiring
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         map.clear();
         for entry in &conf.actions {
             // Old files store flat fields only. New files store the
@@ -519,6 +555,34 @@ impl ActionStore {
         Some(entry.clone())
     }
 
+    /// Store the owned-sink build state of one action (MV-01). The
+    /// wiring map holds at most one entry per created action and is
+    /// memory-only; a delete leaves no entry behind.
+    pub fn set_wiring(&self, id: &str, wiring: ActionWiring) {
+        if wiring == ActionWiring::None {
+            self.wiring
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(id);
+            return;
+        }
+        self.wiring
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.to_string(), wiring);
+    }
+
+    /// Read one action's owned-sink build state. An unknown id (or one
+    /// that never built anything) reads [`ActionWiring::None`].
+    pub fn wiring_of(&self, id: &str) -> ActionWiring {
+        self.wiring
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .cloned()
+            .unwrap_or(ActionWiring::None)
+    }
+
     /// Export the store as a validated config root: entries sorted by
     /// id so the persisted file is deterministic. Each entry carries
     /// the id, kind, enable flag and the envelope (`connector`,
@@ -620,7 +684,10 @@ fn is_known_action_type(kind: &str) -> bool {
 /// Management-plane only; publish and deliver never touch this store.
 pub async fn list_actions(State(state): State<ApiState>) -> Response {
     let records = state.actions.snapshot();
-    let rows: Vec<serde_json::Value> = records.iter().map(ActionRecord::to_json).collect();
+    let rows: Vec<serde_json::Value> = records
+        .iter()
+        .map(|record| record.to_json_with(&state.actions.wiring_of(&record.id)))
+        .collect();
     (StatusCode::OK, Json(rows)).into_response()
 }
 
@@ -630,7 +697,12 @@ pub async fn list_actions(State(state): State<ApiState>) -> Response {
 /// carries the documented envelope (`type`, `name`, `connector`,
 /// `enable`, `parameters`, `resource_opts`); `parameters` and
 /// `resource_opts` default to `{}` and the rest reads back opaquely.
-/// Answers 201 with the stored shape. Management-plane only; publish
+/// An action kind with an owned runtime (`pgsql`, `webhook`/`http`)
+/// stages its sink from the referenced connector plus these
+/// parameters before anything stores: a build that cannot complete
+/// answers 400 naming the field and stores nothing. Answers 201 with
+/// the stored shape (the owned sink already live under the action's
+/// dispatch key when one built). Management-plane only; publish
 /// and deliver never touch this store.
 pub async fn create_action(
     State(state): State<ApiState>,
@@ -652,20 +724,81 @@ pub async fn create_action(
     };
     let id = entry.id.clone();
     let enable = entry.enable;
+    // MV-01 (R2-03/04): stage the action's owned sink before anything
+    // stores. A sink that cannot be built from the referenced
+    // connector plus these parameters is refused with 400 (naming the
+    // action and the field) and nothing is stored; a registered
+    // lifecycle is never built from invented values. A referenced
+    // connector that does not resolve keeps the action storable (the
+    // accepted conformance contract): the staged wiring reports the
+    // reason and the run reads `disconnected` until the connector
+    // arrives.
+    let staged = match crate::v5::action_sinks::stage_action_sink(&state.connectors, &entry) {
+        Ok(staged) => staged,
+        Err(message) => return ApiError::AlreadyExists(message).into_response(),
+    };
     match state.actions.insert(entry.clone()) {
         Ok(entry) => {
+            let id = entry.id.clone();
+            // MV-01: the engine dispatch key of an action is the
+            // action-owned sink key (`action:{id}`), so the enable
+            // flag and the metric record ride under the key that the
+            // fire path uses.
+            let key = broker_config::v5_action_sink_key(&id);
             // W3-04: mirror the flag into the engine's lock-free dispatch
             // snapshot so rule evaluation observes the create without
-            // taking this store's lock on the message path.
-            state.engine.set_action_enabled(&id, enable);
+            // taking this store's lock on the message path. MV-01/R2:
+            // delivery needs the action's flag AND its connector's, so
+            // a connector born disabled holds the dependent action off
+            // from the first publish.
+            state.engine.set_action_enabled(
+                &key,
+                enable
+                    && crate::v5::action_sinks::action_connector_enable(&state.connectors, &entry),
+            );
             // W3-05: register a zeroed per-action metric record so the next
             // fire attributes through lock-free atomics (management-plane
             // swap; the publish path only loads).
-            state.engine.ensure_action_metrics(&id);
+            state.engine.ensure_action_metrics(&key);
             if let Err(error) = state.actions.persist() {
+                // MV-01/R2: a persistence failure keeps the old
+                // generation. The create had published nothing live
+                // yet, so nothing was delivered; the half-written row
+                // is rolled back instead of outliving its refused
+                // persist, and the engine mirrors reset to absent.
+                state.actions.remove(&id);
+                state.engine.remove_action(&key);
+                state.engine.remove_action_metrics(&key);
                 return action_persist_error(error);
             }
-            (StatusCode::CREATED, Json(entry.to_json())).into_response()
+            // Publish the new runtime generation: register the staged
+            // sink under the action dispatch key (atomic replace;
+            // delivery crosses to it in one store). R2-04 order: staged
+            // build, then persist, then register, then old arcs drained
+            // by the replace itself. A dangling connector reference
+            // reports through the alarm plus the wiring reason; no
+            // sink, no dial.
+            let wiring = staged.wiring;
+            if let Some(sink) = staged.sink {
+                state.engine.connectors().register(key, sink);
+            }
+            if let crate::v5::actions::ActionWiring::Failed(message) = &wiring {
+                state.alarms.activate(
+                    &format!("action_build_failed:{id}"),
+                    message,
+                    serde_json::json!({
+                        "kind": "action",
+                        "id": id,
+                        "type": entry.action_type,
+                    }),
+                );
+            } else {
+                state
+                    .alarms
+                    .deactivate(&format!("action_build_failed:{id}"));
+            }
+            state.actions.set_wiring(&id, wiring.clone());
+            (StatusCode::CREATED, Json(entry.to_json_with(&wiring))).into_response()
         }
         Err(ActionInsertError::Duplicate) => {
             ApiError::AlreadyExists(format!("action {id:?} already exists")).into_response()
@@ -686,11 +819,15 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     };
     let bare = stored.id.clone();
+    // MV-01: the fire dispatch key of this action (rules compiled
+    // after MV-01 carry the key, not the bare id) drops the owned sink
+    // under that key, so a delete stops that action's delivery.
+    let key = broker_config::v5_action_sink_key(&bare);
     // Rule linkage: an action still referenced by a rule cannot be
     // dropped while the reference stands. Rules name their forward
-    // target by connector id, so a rule forwarding to this id holds the
-    // reference; the first such rule is named in the refusal. Both id
-    // forms count as a reference.
+    // target by the action dispatch key, so both the key form and the
+    // older bare/typed forms count as a reference; the first such rule
+    // is named in the refusal.
     if let Some(rule_id) = state.engine.list_rules().iter().find_map(|rule| {
         rule.actions
             .iter()
@@ -698,7 +835,10 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
                 matches!(
                     action,
                     broker_rules::RuleAction::ForwardConnector { connector_id }
-                    if connector_id == &bare || connector_id == &id
+                    if connector_id == &bare
+                        || connector_id == &id
+                        || connector_id == &key
+                        || connector_id == &broker_config::v5_action_sink_key(&id)
                 )
             })
             .then(|| rule.id.clone())
@@ -712,12 +852,20 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
     state
         .alarms
         .deactivate(&format!("action_unavailable:{bare}"));
+    state
+        .alarms
+        .deactivate(&format!("action_build_failed:{bare}"));
+    state.actions.set_wiring(&bare, ActionWiring::None);
+    // MV-01: drop the owned sink under its dispatch key so delivery
+    // stops with the delete (unknown keys are a no-op).
+    state.engine.connectors().unregister(&key);
     // W3-04: drop the id from the dispatch snapshot so a later re-create
     // with the same id starts enabled.
-    state.engine.remove_action(&bare);
+    state.engine.remove_action(&key);
     // W3-05: drop the per-action metric record so the id reads as unknown
-    // (404) until re-created, which starts again at zero.
-    state.engine.remove_action_metrics(&bare);
+    // (404) until re-created, which starts again at zero. The record
+    // rides the MV-01 dispatch key.
+    state.engine.remove_action_metrics(&key);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -735,7 +883,10 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
 /// and deliver never touch this store.
 pub async fn get_action(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     match state.actions.get_any(&id) {
-        Some(entry) => (StatusCode::OK, Json(entry.to_json())).into_response(),
+        Some(entry) => {
+            let wiring = state.actions.wiring_of(&entry.id);
+            (StatusCode::OK, Json(entry.to_json_with(&wiring))).into_response()
+        }
         None => ApiError::NotFound(format!("action {id:?} not found")).into_response(),
     }
 }
@@ -778,23 +929,93 @@ pub async fn update_action(
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     };
     let bare = stored.id.clone();
+    // MV-01/R2: the connector's flag rides along with every dispatch
+    // mirror and with the rollback below. Probed from the OLD record:
+    // the update can move the action to another connector, so the
+    // revert must restore the flag pair the old generation delivered
+    // under.
+    let prior_connector_on =
+        crate::v5::action_sinks::action_connector_enable(&state.connectors, &stored);
     let entry = match split_action_body(&body, Some(&bare)) {
         Ok(entry) => entry,
         Err(reason) => return ApiError::BadRequest(reason).into_response(),
     };
+    // MV-01 (R2-03/04): stage the owned sink built from the NEW entry
+    // (never registered). A build that cannot complete is refused with
+    // 400 naming the action and the field; every old sink keeps
+    // delivering and the stored row is untouched.
+    let staged = match crate::v5::action_sinks::stage_action_sink(&state.connectors, &entry) {
+        Ok(staged) => staged,
+        Err(message) => return ApiError::BadRequest(message).into_response(),
+    };
+    // The dispatch key rides the (unchangeable) bare id; a kind change
+    // never changes the key the engine fires under.
+    let key = broker_config::v5_action_sink_key(&bare);
     if !state.actions.replace(&bare, entry.clone()) {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
     // W3-04: mirror the flag into the dispatch snapshot (same lock-free
-    // path as the enable route below). The engine keys by bare id.
-    state.engine.set_action_enabled(&bare, entry.enable);
+    // path as the enable route below). The engine keys by the MV-01
+    // dispatch key; the connector's flag rides along (MV-01/R2: a
+    // connector disable holds the dependent action off).
+    state.engine.set_action_enabled(
+        &key,
+        entry.enable && crate::v5::action_sinks::action_connector_enable(&state.connectors, &entry),
+    );
     // W3-05: keep the metric record registered across replaces (counters
     // survive a config replace; only delete or reset zeroes them).
-    state.engine.ensure_action_metrics(&bare);
+    state.engine.ensure_action_metrics(&key);
     if let Err(error) = state.actions.persist() {
+        // MV-01/R2: a persistence failure keeps the old generation.
+        // Nothing swapped under the dispatch key yet, so the old sink
+        // (if any) still delivers; the stored row reverts to the
+        // previous snapshot and the delayed engine mirror reverts too.
+        state.actions.replace(&bare, stored.clone());
+        state
+            .engine
+            .set_action_enabled(&key, stored.enable && prior_connector_on);
         return action_persist_error(error);
     }
-    (StatusCode::OK, Json(entry.to_json())).into_response()
+    // Publish the new runtime generation (staged build → persist →
+    // swap under the key, in that order). A kind step away from the
+    // action-owned set drains the prior sink: the key stops claiming
+    // delivery with it. A dangling connector reference reports through
+    // the alarm plus the wiring reason; no sink, no dial.
+    let prior_wiring = state.actions.wiring_of(&bare);
+    let wiring = staged.wiring;
+    match &staged.sink {
+        Some(sink) => {
+            state
+                .engine
+                .connectors()
+                .register(key.clone(), Arc::clone(sink));
+            state
+                .alarms
+                .deactivate(&format!("action_build_failed:{bare}"));
+        }
+        None => {
+            // Drain a prior owned sink only when the previous
+            // generation registered one, so an unrelated entry never
+            // evicts a same-key sink.
+            if prior_wiring == crate::v5::actions::ActionWiring::Live {
+                state.engine.connectors().unregister(&key);
+                state.engine.remove_action(&key);
+            }
+        }
+    }
+    if let crate::v5::actions::ActionWiring::Failed(message) = &wiring {
+        state.alarms.activate(
+            &format!("action_build_failed:{bare}"),
+            message,
+            serde_json::json!({
+                "kind": "action",
+                "id": bare,
+                "type": entry.action_type,
+            }),
+        );
+    }
+    state.actions.set_wiring(&bare, wiring.clone());
+    (StatusCode::OK, Json(entry.to_json_with(&wiring))).into_response()
 }
 
 /// `PUT /api/v5/actions/:id/enable/:enable`: flip one action's enable
@@ -831,6 +1052,11 @@ pub async fn set_action_enabled(
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     };
     let bare = stored.id.clone();
+    // MV-01/R2: the connector's flag rides along with this flip — a
+    // disabled connector holds its dependent action off regardless of
+    // this route. Probed before the store write below while the record
+    // borrow is still valid.
+    let connector_on = crate::v5::action_sinks::action_connector_enable(&state.connectors, &stored);
     let enable = match enable_raw.trim().to_ascii_lowercase().as_str() {
         "true" => true,
         "false" => false,
@@ -844,11 +1070,14 @@ pub async fn set_action_enabled(
     if state.actions.set_enabled(&bare, enable).is_none() {
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     }
-    // Mirror into the dispatch snapshot before persisting: the in-memory
-    // flag is already flipped, so evaluation must observe it even if the
-    // disk save below fails (the store itself keeps the mutation on a
-    // persist failure and answers 500, never silently).
-    state.engine.set_action_enabled(&bare, enable);
+    // MV-01: mirror under the action's dispatch key before persisting: the
+    // in-memory flag is already flipped, so evaluation must observe it
+    // even if the disk save below fails (the store itself keeps the
+    // mutation on a persist failure and answers 500, never silently).
+    state.engine.set_action_enabled(
+        &broker_config::v5_action_sink_key(&bare),
+        enable && connector_on,
+    );
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -893,10 +1122,11 @@ pub async fn get_action_metrics(
     };
     let bare = stored.id.clone();
     // The record is registered on create/boot, but a standalone engine or
-    // a race keeps this fail-closed at zero rather than 500.
+    // a race keeps this fail-closed at zero rather than 500. MV-01: the
+    // metric record rides the action's dispatch key.
     let (total, success, failed) = state
         .engine
-        .action_metrics_snapshot_for(&bare)
+        .action_metrics_snapshot_for(&broker_config::v5_action_sink_key(&bare))
         .unwrap_or((0, 0, 0));
     (
         StatusCode::OK,
@@ -936,12 +1166,13 @@ pub async fn reset_action_metrics(
         return ApiError::NotFound(format!("action {id:?} not found")).into_response();
     };
     let bare = stored.id.clone();
-    if !state.engine.reset_action_metrics(&bare) {
+    let key = broker_config::v5_action_sink_key(&bare);
+    if !state.engine.reset_action_metrics(&key) {
         // The action exists but its record is missing (standalone engine
         // or a boot race): register a zeroed record and report success so
         // the reset is still observable as zeroes on the next read.
-        state.engine.ensure_action_metrics(&bare);
-        state.engine.reset_action_metrics(&bare);
+        state.engine.ensure_action_metrics(&key);
+        state.engine.reset_action_metrics(&key);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1081,8 +1312,10 @@ async fn apply_action_operation(state: &ApiState, id: &str, operation: &str) -> 
     // before `ConnectorManager::send` (see `run_actions` in
     // `crates/broker-rules/src/lib.rs`), so flipping the flag here
     // starts/stops delivery through the connector without touching the
-    // publish path itself.
-    state.engine.set_action_enabled(&bare, enable);
+    // publish path itself. MV-01: the key is the action's dispatch key.
+    state
+        .engine
+        .set_action_enabled(&broker_config::v5_action_sink_key(&bare), enable);
     if let Err(error) = state.actions.persist() {
         return action_persist_error(error);
     }
@@ -1164,7 +1397,7 @@ mod tests {
             params: serde_json::json!({"server": "127.0.0.1:1883"}),
         };
         assert!(store.insert(entry).is_ok());
-        let rendered = store.snapshot()[0].to_json();
+        let rendered = store.snapshot()[0].to_json_with(&store.wiring_of("act-1"));
         assert_eq!(rendered["id"], serde_json::json!("act-1"));
         assert_eq!(rendered["name"], serde_json::json!("act-1"));
         assert_eq!(rendered["type"], serde_json::json!("mqtt"));
@@ -1320,5 +1553,56 @@ mod tests {
         });
         assert!(store.get("a").is_some());
         assert_eq!(store.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn set_wiring_tracks_the_recorded_state_and_clears_on_none() {
+        let store = ActionStore::new();
+        assert_eq!(store.wiring_of("a"), ActionWiring::None);
+        assert!(store.insert(record("a")).is_ok());
+        store.set_wiring("a", ActionWiring::Live);
+        assert_eq!(store.wiring_of("a"), ActionWiring::Live);
+        store.set_wiring("a", ActionWiring::None);
+        assert_eq!(store.wiring_of("a"), ActionWiring::None);
+    }
+
+    #[test]
+    fn wiring_render_reads_status_reason_only_from_the_recorded_state() {
+        let store = ActionStore::new();
+        let mut entry = record("a");
+        entry.action_type = "http".to_string();
+        assert!(store.insert(entry.clone()).is_ok());
+        // A failed build renders `disconnected` with the recorded reason.
+        store.set_wiring("a", ActionWiring::Failed("broken".to_string()));
+        let rendered = store.snapshot()[0].to_json_with(&store.wiring_of("a"));
+        assert_eq!(rendered["status"], serde_json::json!("disconnected"));
+        assert_eq!(rendered["status_reason"], serde_json::json!("broken"));
+        store.set_wiring("a", ActionWiring::None);
+        assert_eq!(store.wiring_of("a"), ActionWiring::None);
+        // A live build renders connected with no reason.
+        store.set_wiring("a", ActionWiring::Live);
+        let rendered = store.snapshot()[0].to_json_with(&store.wiring_of("a"));
+        assert_eq!(rendered["status"], serde_json::json!("connected"));
+        assert!(rendered["status_reason"].is_null());
+        // The kind refusal keeps priority over a recorded reason.
+        let mut removed = record("b");
+        removed.action_type = "s3_tables".to_string();
+        assert!(store.insert(removed).is_ok());
+        store.set_wiring("b", ActionWiring::Failed("broken".to_string()));
+        let rendered: Vec<serde_json::Value> = store
+            .snapshot()
+            .iter()
+            .map(|r| r.to_json_with(&store.wiring_of(&r.id)))
+            .collect();
+        let removed_row = rendered
+            .iter()
+            .find(|row| row["id"] == "b")
+            .expect("removed row");
+        assert_eq!(removed_row["status"], "disconnected");
+        let reason = removed_row["status_reason"].as_str().expect("reason");
+        assert!(
+            !reason.contains("broken"),
+            "the kind refusal wins over the build reason: {reason}"
+        );
     }
 }

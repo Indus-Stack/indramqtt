@@ -1,5 +1,6 @@
 //! v5 REST API compatibility router for IndraMQTT.
 
+pub mod action_sinks;
 pub mod actions;
 pub mod alarms;
 pub mod api_keys;

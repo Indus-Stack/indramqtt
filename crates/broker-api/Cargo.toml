@@ -78,4 +78,4 @@ kinesis = ["broker-connectors-enterprise/kinesis"]
 broker-connectors = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
-p256 = "0.13"
+p256 = "0.14"

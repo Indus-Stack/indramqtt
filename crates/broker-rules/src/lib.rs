@@ -4268,9 +4268,15 @@ async fn run_actions_in_tenant(
                 }
                 // W3-05: attribute the outcome to the per-action record when
                 // one exists (lock-free atomics only; unknown ids move only
-                // the per-rule counters above). One `HashMap` lookup plus
-                // relaxed `fetch_add`s; no lock, no allocation.
-                let per_action = action_metrics.get(connector_id);
+                // the per-rule counters above). A verbatim connector id may
+                // also name a stored action; the per-action record rides the
+                // action's dispatch key (`action:{id}`), so fall back to it
+                // before concluding the id is unknown. One `HashMap` lookup
+                // plus relaxed `fetch_add`s; no lock, no allocation on the
+                // hit path.
+                let per_action = action_metrics.get(connector_id).or_else(|| {
+                    action_metrics.get(&broker_config::v5_action_sink_key(connector_id))
+                });
                 if let Err(e) = connectors
                     .send(connector_id, topic, &payload, qos_cap)
                     .await

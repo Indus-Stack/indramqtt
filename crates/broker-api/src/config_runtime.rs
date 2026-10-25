@@ -235,6 +235,18 @@ async fn apply_candidate(
             // Keep the observable v5 connector list in step with the
             // committed snapshot (reference form, redacted at read time);
             // removals drop, additions/updates upsert.
+            // MV-01/SB-03: bring every stored action's owned sink back
+            // in step with the committed connectors (dependent actions
+            // rebuilt from the applied settings, sinks dropped when the
+            // target connector is gone). Runs after the commit, so the
+            // old generation never half-swaps; a rebuild failure keeps
+            // the previous sink and reports through the alarm.
+            crate::v5::action_sinks::rebuild_all_action_sinks(
+                &state.engine,
+                &state.connectors,
+                &state.actions,
+                &state.alarms,
+            );
             state
                 .connectors
                 .reconcile(&previous.connectors, &candidate.connectors)
@@ -310,6 +322,18 @@ async fn apply_restore(
     apply_zone_live(&state.sessions, &candidate.global_zone);
     match state.config.history_restore(id, actor) {
         Ok(version) => {
+            // MV-01/SB-03: bring every stored action's owned sink back
+            // in step with the committed connectors (dependent actions
+            // rebuilt from the applied settings, sinks dropped when the
+            // target connector is gone). Runs after the commit, so the
+            // old generation never half-swaps; a rebuild failure keeps
+            // the previous sink and reports through the alarm.
+            crate::v5::action_sinks::rebuild_all_action_sinks(
+                &state.engine,
+                &state.connectors,
+                &state.actions,
+                &state.alarms,
+            );
             state
                 .connectors
                 .reconcile(&previous.connectors, &candidate.connectors)

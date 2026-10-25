@@ -1,0 +1,143 @@
+[
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "mv01-dangling",
+      "type": "http",
+      "connector": "webhook:mv01-dangling-link",
+      "parameters": {},
+      "enable": true
+    },
+    "expect_status": 201,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}}
+    ],
+    "cleanup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}}
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "mv01-noref",
+      "type": "http",
+      "parameters": {}
+    },
+    "expect_status": 400,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-noref"}}
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "mv01-pg-nosql",
+      "type": "pgsql",
+      "connector": "postgres:mv01-pg-dangling",
+      "parameters": {}
+    },
+    "expect_status": 400,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-pg-nosql"}}
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "mv01-pgtest",
+      "type": "pgsql",
+      "connector": "postgres:mv01-pg-dangling",
+      "parameters": {"sql": "SELECT $1"}
+    },
+    "expect_status": 201,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-pgtest"}}
+    ],
+    "cleanup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-pgtest"}}
+    ]
+  },
+  {
+    "operation": "GET /actions/{id}",
+    "path_params": {"id": "mv01-dangling"},
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}},
+      {"api": {"method": "POST", "path": "/actions", "body": {
+        "name": "mv01-dangling",
+        "type": "http",
+        "connector": "webhook:mv01-dangling-link",
+        "parameters": {},
+        "enable": true
+      }}}
+    ],
+    "cleanup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}}
+    ]
+  },
+  {
+    "operation": "DELETE /actions/{id}",
+    "path_params": {"id": "mv01-dangling"},
+    "query": {},
+    "body": null,
+    "expect_status": 204,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}},
+      {"api": {"method": "POST", "path": "/actions", "body": {
+        "name": "mv01-dangling",
+        "type": "http",
+        "connector": "webhook:mv01-dangling-link",
+        "parameters": {},
+        "enable": true
+      }}}
+    ],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /actions/{id}",
+    "path_params": {"id": "mv01-dangling"},
+    "query": {},
+    "body": {
+      "name": "mv01-dangling",
+      "type": "http",
+      "connector": "webhook:mv01-moved-link",
+      "parameters": {},
+      "enable": false
+    },
+    "expect_status": 200,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}},
+      {"api": {"method": "POST", "path": "/actions", "body": {
+        "name": "mv01-dangling",
+        "type": "http",
+        "connector": "webhook:mv01-dangling-link",
+        "parameters": {},
+        "enable": true
+      }}}
+    ],
+    "cleanup": [
+      {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}}
+    ]
+  },
+  {
+    "operation": "GET /actions",
+    "path_params": {},
+    "query": {"unknown": "param"},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  }
+]

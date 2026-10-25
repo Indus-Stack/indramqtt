@@ -475,15 +475,20 @@ impl ApiState {
         // (today's empty behaviour: an empty store lists as an empty
         // page).
         let actions = Arc::new(crate::v5::actions::ActionStore::from_registry(&config));
+        // The alarm directory hoisted here so the action-sink boot replay
+        // can raise build failures (W1-16 owns the endpoint).
+        let alarms = Arc::new(crate::v5::alarms::AlarmStore::new());
         // Boot seeding (W3-04): mirror the persisted action enable flags
         // into the engine's lock-free dispatch snapshot so a restart keeps
-        // disabled actions skipped from the first publish. An empty store
-        // is a no-op (today's empty behaviour: nothing disabled).
+        // disabled actions skipped from the first publish. MV-01: every
+        // action rides its own dispatch key (`action:{id}`), the key the
+        // fire path uses. An empty store is a no-op (today's empty
+        // behaviour: nothing disabled).
         {
             let enables: Vec<(String, bool)> = actions
                 .snapshot()
                 .iter()
-                .map(|record| (record.id.clone(), record.enable))
+                .map(|record| (broker_config::v5_action_sink_key(&record.id), record.enable))
                 .collect();
             engine.sync_action_enables(&enables);
         }
@@ -502,14 +507,23 @@ impl ApiState {
         // for every stored action so the first publish after a restart
         // attributes from zero. Metrics are memory-only by design (action
         // config itself persists via W3-02); an empty store is a no-op.
+        // MV-01: records ride the dispatch keys.
         {
             let ids: Vec<String> = actions
                 .snapshot()
                 .iter()
-                .map(|record| record.id.clone())
+                .map(|record| broker_config::v5_action_sink_key(&record.id))
                 .collect();
             engine.sync_action_metrics(&ids);
         }
+        // Boot replay (MV-01/SB-03): rebuild every stored action's owned
+        // runtime sink from the stored connector settings plus the
+        // action's own parameters and register under the action's
+        // dispatch key. A build that cannot complete keeps the action
+        // stored, leaves no runtime sink, raises
+        // `action_build_failed:{id}` and reports `disconnected` with the
+        // reason — never an invented value, nothing dialled.
+        crate::v5::action_sinks::rebuild_all_action_sinks(&engine, &connectors, &actions, &alarms);
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -599,7 +613,7 @@ impl ApiState {
             node_id,
             edge_tx,
             bans: Arc::new(crate::v5::banned::BanStore::new()),
-            alarms: Arc::new(crate::v5::alarms::AlarmStore::new()),
+            alarms,
             monitor: Arc::new(crate::v5::monitor::MonitorHistory::new()),
             stats: Arc::new(StatsStore::new()),
             prometheus: Arc::new(crate::v5::prometheus::PrometheusStore::from_registry(
@@ -1580,6 +1594,35 @@ async fn create_connector(
     match built {
         Ok((kind, sink)) => {
             state.engine.connectors().register(req.id.clone(), sink);
+            // Persist the legacy connector through the same connector
+            // store the boot replay reads, so the v1 path keeps delivery
+            // after a restart. Only a kind the stored snapshot accepts
+            // is persisted; an unready kind keeps its current v1
+            // behaviour and stays memory-only.
+            let persistable = broker_config::is_known_connector_type(&kind)
+                && !broker_config::is_removed_connector_type(&kind)
+                && crate::v5::rules::kind_refusal(&kind).is_none();
+            if persistable {
+                let mut doc = serde_json::Map::new();
+                doc.insert("id".to_string(), serde_json::json!(req.id.clone()));
+                doc.insert("name".to_string(), serde_json::json!(req.id.clone()));
+                doc.insert("type".to_string(), serde_json::json!(kind.clone()));
+                doc.insert("enable".to_string(), serde_json::json!(true));
+                match &req.config {
+                    serde_json::Value::Object(fields) => {
+                        for (key, value) in fields {
+                            doc.entry(key.clone()).or_insert_with(|| value.clone());
+                        }
+                    }
+                    other => {
+                        doc.insert("config".to_string(), other.clone());
+                    }
+                }
+                state.connectors.upsert(serde_json::Value::Object(doc));
+                if let Err(error) = state.connectors.persist() {
+                    return crate::v5::rules::connector_persist_error(error);
+                }
+            }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "id": req.id, "kind": kind })),
@@ -7092,10 +7135,10 @@ connector_id = "legacy-good"
         let counter = std::sync::Arc::new(CountingSink {
             hits: AtomicU64::new(0),
         });
-        state
-            .engine
-            .connectors()
-            .register("w3-14-action", counter.clone());
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("w3-14-action"),
+            counter.clone(),
+        );
         // Re-enable with the action attached so the fire is observable.
         let (status, _) = server
             .put_auth(
@@ -7310,10 +7353,10 @@ connector_id = "legacy-good"
         let counter = std::sync::Arc::new(CountingSink {
             hits: AtomicU64::new(0),
         });
-        state
-            .engine
-            .connectors()
-            .register("w3-13-action", counter.clone());
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("w3-13-action"),
+            counter.clone(),
+        );
         let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
             std::sync::Arc::new(NoopBrokerSink);
         let topic = broker_protocol::Topic::new("w3/13/rules").expect("valid topic");
@@ -14728,10 +14771,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let counter = std::sync::Arc::new(CountingSink {
             hits: AtomicU64::new(0),
         });
-        state
-            .engine
-            .connectors()
-            .register("w3-04-action", counter.clone());
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("w3-04-action"),
+            counter.clone(),
+        );
         let (status, rule_body) = server
             .post_auth(
                 "/api/v5/rules",
@@ -14953,10 +14996,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let counter = std::sync::Arc::new(CountingSink {
             hits: AtomicU64::new(0),
         });
-        state
-            .engine
-            .connectors()
-            .register("w3-19-conn", counter.clone());
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("w3-19-conn"),
+            counter.clone(),
+        );
         let (status, rule_body) = server
             .post_auth(
                 "/api/v5/rules",
@@ -15243,10 +15286,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let counter = std::sync::Arc::new(CountingSink {
             hits: AtomicU64::new(0),
         });
-        state
-            .engine
-            .connectors()
-            .register("w3-20-conn", counter.clone());
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("w3-20-conn"),
+            counter.clone(),
+        );
         let (status, rule_body) = server
             .post_auth(
                 "/api/v5/rules",
@@ -15492,10 +15535,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let counter = std::sync::Arc::new(CountingSink {
             hits: AtomicU64::new(0),
         });
-        state
-            .engine
-            .connectors()
-            .register("w3-22-conn", counter.clone());
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("w3-22-conn"),
+            counter.clone(),
+        );
         let (status, rule_body) = server
             .post_auth(
                 "/api/v5/rules",
@@ -15716,10 +15759,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let counter = std::sync::Arc::new(CountingSink {
             hits: AtomicU64::new(0),
         });
-        state
-            .engine
-            .connectors()
-            .register("w3-06-action", counter.clone());
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("w3-06-action"),
+            counter.clone(),
+        );
         let (status, rule_body) = server
             .post_auth(
                 "/api/v5/rules",
@@ -15946,10 +15989,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let counter = std::sync::Arc::new(CountingSink {
             hits: AtomicU64::new(0),
         });
-        state
-            .engine
-            .connectors()
-            .register("w3-09-action", counter.clone());
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("w3-09-action"),
+            counter.clone(),
+        );
         let (status, rule_body) = server
             .post_auth(
                 "/api/v5/rules",
@@ -16187,14 +16230,15 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         // Bind a rule to the action id and fire it through a real publish.
-        // The counting sink is registered under the action id so the fire
+        // The counting sink is registered under the action's MV-01
+        // dispatch key (the key the rule fire uses) so the fire
         // succeeds; the rule is created through the HTTP router and the
         // publish goes through `dispatch_ingress` (the broker's rule path),
         // never `sink.send` directly.
-        state
-            .engine
-            .connectors()
-            .register("w3-05-action", std::sync::Arc::new(CountingSink));
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("w3-05-action"),
+            std::sync::Arc::new(CountingSink),
+        );
         let (status, rule_body) = server
             .post_auth(
                 "/api/v5/rules",
@@ -20476,6 +20520,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // shape. An unknown type is 400. A duplicate is 400.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
+        // The referenced connector must exist for the owned sink to build
+        // and the action to read `connected`.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "ap05-up", "type": "http", "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "connector create: {status}");
         let body = json!({
             "type": "http",
             "name": "ap05-web",
@@ -20791,10 +20845,10 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let counter = std::sync::Arc::new(CountingSink {
             hits: AtomicU64::new(0),
         });
-        state
-            .engine
-            .connectors()
-            .register("ap05-fire", counter.clone());
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("ap05-fire"),
+            counter.clone(),
+        );
         let (status, _) = server
             .post_auth(
                 "/api/v5/rules",
