@@ -85,6 +85,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/metrics.md` | 118 | `OK` |
 | `reference/metrics.md` | 134 | `OK` |
 | `rules/actions.md` | 64 | `delivered` |
+| `rules/actions.md` | 258 | `matched=2 success=2 reset=0` |
 | `rules/functions.md` | 506 | `ok` |
 | `rules/functions.md` | 531 | `ok` |
 | `rules/index.md` | 70 | `OK` |
@@ -111,4 +112,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 95 blocks. Each output matches its page.
+The run captured 96 blocks. Each output matches its page.

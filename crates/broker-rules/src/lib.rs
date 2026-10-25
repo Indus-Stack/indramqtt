@@ -1111,30 +1111,57 @@ impl ActionCounters {
     }
 }
 
-/// Fixed per-action metric counters for one action id (W3-05, C06-08/09).
+/// Fixed per-action metric counters for one action id (W3-05, C06-08/09,
+/// RO-01).
 ///
 /// One record per action id, created by the management plane when the
-/// action is created and dropped when the action is deleted. All three
-/// fields are lock-free atomics bumped on the rule-fire path; the publish
-/// path pays one `HashMap` lookup plus relaxed `fetch_add`s, no lock, no
-/// per-fire allocation. Text rendering stays in the management handler.
-/// Memory-only by design: a restart rebuilds the map at zero (action config
-/// itself persists elsewhere). The set is fixed (`total`/`success`/`failed`,
-/// default zero); no unbounded history is kept.
-///
-/// An `inflight` gauge is deliberately omitted: the broker hands each fire
-/// to the connector `send` and does not track per-action in-flight depth,
-/// and a constant standing in for it would be worse than a missing field.
-// TODO(parity): Which action counters does the specification require beyond total, success, failed?
+/// action is created and dropped when the action is deleted. The fields
+/// are lock-free atomics. The rule path and the action runtime bump them;
+/// the publish path pays one `HashMap` lookup plus relaxed `fetch_add`s,
+/// no lock and no per-fire allocation. Text rendering stays in the
+/// management handler. Memory-only by design: a restart rebuilds the map at
+/// zero. The set is fixed, so no unbounded history is kept.
 #[derive(Debug, Default)]
 pub struct ActionMetrics {
-    /// Fires attributed to this action id (success plus failure).
+    /// Fires attributed to this action id. Kept for older readers; it
+    /// equals `matched` for an action-owned runtime.
     pub total: AtomicU64,
-    /// Fires whose connector `send` returned success.
+    /// Messages matched to this action.
+    pub matched: AtomicU64,
+    /// Messages that the connector sent without error.
     pub success: AtomicU64,
-    /// Fires whose connector `send` returned an error (unknown connector,
-    /// transport failure, missing sink).
+    /// Messages that the connector refused or failed to send.
     pub failed: AtomicU64,
+    /// Messages dropped for every reason.
+    pub dropped: AtomicU64,
+    /// Messages dropped because the bounded buffer was full.
+    pub dropped_queue_full: AtomicU64,
+    /// Messages dropped because the action target was missing.
+    pub dropped_resource_not_found: AtomicU64,
+    /// Messages dropped because the action or its connector was stopped.
+    pub dropped_resource_stopped: AtomicU64,
+    /// Messages dropped for other reasons, including request expiry.
+    pub dropped_other: AtomicU64,
+    /// Messages queued for delivery.
+    pub queuing: AtomicU64,
+    /// Messages in flight at the connector.
+    pub inflight: AtomicU64,
+}
+
+/// Lock-free snapshot of one action's metric counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActionMetricsSnapshot {
+    pub total: u64,
+    pub matched: u64,
+    pub success: u64,
+    pub failed: u64,
+    pub dropped: u64,
+    pub dropped_queue_full: u64,
+    pub dropped_resource_not_found: u64,
+    pub dropped_resource_stopped: u64,
+    pub dropped_other: u64,
+    pub queuing: u64,
+    pub inflight: u64,
 }
 
 impl ActionMetrics {
@@ -1143,21 +1170,37 @@ impl ActionMetrics {
         Self::default()
     }
 
-    /// Lock-free snapshot of the three counters for management reads.
-    pub fn snapshot(&self) -> (u64, u64, u64) {
-        (
-            self.total.load(Ordering::Relaxed),
-            self.success.load(Ordering::Relaxed),
-            self.failed.load(Ordering::Relaxed),
-        )
+    /// Lock-free snapshot of every counter for management reads.
+    pub fn snapshot(&self) -> ActionMetricsSnapshot {
+        ActionMetricsSnapshot {
+            total: self.total.load(Ordering::Relaxed),
+            matched: self.matched.load(Ordering::Relaxed),
+            success: self.success.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            dropped_queue_full: self.dropped_queue_full.load(Ordering::Relaxed),
+            dropped_resource_not_found: self.dropped_resource_not_found.load(Ordering::Relaxed),
+            dropped_resource_stopped: self.dropped_resource_stopped.load(Ordering::Relaxed),
+            dropped_other: self.dropped_other.load(Ordering::Relaxed),
+            queuing: self.queuing.load(Ordering::Relaxed),
+            inflight: self.inflight.load(Ordering::Relaxed),
+        }
     }
 
-    /// Zero all three counters in place; the record stays registered so the
+    /// Zero every counter in place. The record stays registered, so the
     /// next fire resumes from zero.
     pub fn reset(&self) {
         self.total.store(0, Ordering::Relaxed);
+        self.matched.store(0, Ordering::Relaxed);
         self.success.store(0, Ordering::Relaxed);
         self.failed.store(0, Ordering::Relaxed);
+        self.dropped.store(0, Ordering::Relaxed);
+        self.dropped_queue_full.store(0, Ordering::Relaxed);
+        self.dropped_resource_not_found.store(0, Ordering::Relaxed);
+        self.dropped_resource_stopped.store(0, Ordering::Relaxed);
+        self.dropped_other.store(0, Ordering::Relaxed);
+        self.queuing.store(0, Ordering::Relaxed);
+        self.inflight.store(0, Ordering::Relaxed);
     }
 }
 
@@ -3254,11 +3297,17 @@ impl RuleEngine {
 
     /// Lock-free read of one action's counters for management handlers.
     /// Returns `None` when the id has no record (caller maps to 404).
-    /// One `Arc` clone plus one `HashMap` lookup plus three relaxed
-    /// loads; no lock, no allocation beyond the refcount bump.
-    pub fn action_metrics_snapshot_for(&self, id: &str) -> Option<(u64, u64, u64)> {
+    /// One `Arc` clone plus one `HashMap` lookup plus relaxed loads; no
+    /// lock, no allocation beyond the refcount bump.
+    pub fn action_metrics_snapshot_for(&self, id: &str) -> Option<ActionMetricsSnapshot> {
         let snapshot = self.action_metrics.load_full();
         snapshot.get(id).map(|record| record.snapshot())
+    }
+
+    /// Lock-free handle to one action's metric record. The action runtime
+    /// holds this handle and bumps the counters on its worker path.
+    pub fn action_metrics_record(&self, id: &str) -> Option<Arc<ActionMetrics>> {
+        self.action_metrics.load_full().get(id).cloned()
     }
 
     /// Zero one action's counters in place (W3-05, C06-09). Returns false
@@ -4260,32 +4309,48 @@ async fn run_actions_in_tenant(
                 );
             }
             RuleAction::ForwardConnector { connector_id } => {
-                // W3-04: disabled actions are skipped at fire time via the
-                // dispatch snapshot, never under the store lock. No
-                // counters, no send, no log: the action never fired.
-                if disabled.contains(connector_id) {
-                    continue;
-                }
-                // W3-05: attribute the outcome to the per-action record when
-                // one exists (lock-free atomics only; unknown ids move only
-                // the per-rule counters above). A verbatim connector id may
-                // also name a stored action; the per-action record rides the
-                // action's dispatch key (`action:{id}`), so fall back to it
-                // before concluding the id is unknown. One `HashMap` lookup
-                // plus relaxed `fetch_add`s; no lock, no allocation on the
-                // hit path.
+                // A verbatim connector id may also name a stored action;
+                // the per-action record rides the dispatch key
+                // (`action:{id}`), so fall back to it before concluding the
+                // id is unknown. One `HashMap` lookup and no allocation.
                 let per_action = action_metrics.get(connector_id).or_else(|| {
                     action_metrics.get(&broker_config::v5_action_sink_key(connector_id))
                 });
-                if let Err(e) = connectors
-                    .send(connector_id, topic, &payload, qos_cap)
-                    .await
-                {
+                // W3-04: a disabled action is skipped at fire time. RO-01
+                // records the shed message against the action's dropped
+                // counters, so an operator sees why nothing was sent.
+                if disabled.contains(connector_id) {
+                    if let Some(record) = per_action {
+                        record.matched.fetch_add(1, Ordering::Relaxed);
+                        record.dropped.fetch_add(1, Ordering::Relaxed);
+                        record
+                            .dropped_resource_stopped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                // RO-01: an action-owned runtime counts its own matched,
+                // success, failed and drop outcomes. The rule counters stay
+                // here so rule metrics keep their meaning. A plain
+                // connector forward is counted here as before.
+                let (outcome, owns_metrics) = connectors
+                    .send_with_action_metrics(connector_id, topic, &payload, qos_cap)
+                    .await;
+                if let Err(e) = outcome {
                     counters.total.fetch_add(1, Ordering::Relaxed);
                     counters.failed.fetch_add(1, Ordering::Relaxed);
                     if let Some(record) = per_action {
-                        record.total.fetch_add(1, Ordering::Relaxed);
-                        record.failed.fetch_add(1, Ordering::Relaxed);
+                        if !owns_metrics {
+                            record.total.fetch_add(1, Ordering::Relaxed);
+                            record.matched.fetch_add(1, Ordering::Relaxed);
+                            record.failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if matches!(&e, broker_connectors::ConnectorError::UnknownConnector(_)) {
+                            record.dropped.fetch_add(1, Ordering::Relaxed);
+                            record
+                                .dropped_resource_not_found
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     if let Some(suppressed) =
                         forward_failure_should_log(throttle, rule_id, connector_id, now_ms())
@@ -4302,8 +4367,11 @@ async fn run_actions_in_tenant(
                     counters.total.fetch_add(1, Ordering::Relaxed);
                     counters.success.fetch_add(1, Ordering::Relaxed);
                     if let Some(record) = per_action {
-                        record.total.fetch_add(1, Ordering::Relaxed);
-                        record.success.fetch_add(1, Ordering::Relaxed);
+                        if !owns_metrics {
+                            record.total.fetch_add(1, Ordering::Relaxed);
+                            record.matched.fetch_add(1, Ordering::Relaxed);
+                            record.success.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

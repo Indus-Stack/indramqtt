@@ -99,6 +99,14 @@ pub enum ActionWiring {
 
 impl ActionRecord {
     fn to_json_with(&self, wiring: &ActionWiring) -> serde_json::Value {
+        self.to_json_with_health(wiring, None)
+    }
+
+    fn to_json_with_health(
+        &self,
+        wiring: &ActionWiring,
+        health: Option<&broker_connectors::SinkHealth>,
+    ) -> serde_json::Value {
         // KC-00/D2: a stored action whose kind is removed or not `ready`
         // reads back `disconnected` with a reason, so an operator can see
         // and delete it.
@@ -114,6 +122,20 @@ impl ActionRecord {
         if let ActionWiring::Failed(message) = wiring {
             if reason.is_none() {
                 reason = Some(message.clone());
+            }
+        }
+        // RO-01: a health probe that fails marks the live target
+        // disconnected and reports the probe reason.
+        if reason.is_none() {
+            if let Some(health) = health {
+                if !health.healthy {
+                    reason = Some(
+                        health
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "health check failed".to_string()),
+                    );
+                }
             }
         }
         let status = if reason.is_some() {
@@ -686,9 +708,21 @@ pub async fn list_actions(State(state): State<ApiState>) -> Response {
     let records = state.actions.snapshot();
     let rows: Vec<serde_json::Value> = records
         .iter()
-        .map(|record| record.to_json_with(&state.actions.wiring_of(&record.id)))
+        .map(|record| {
+            let health = action_health(&state, &record.id);
+            record.to_json_with_health(&state.actions.wiring_of(&record.id), health.as_ref())
+        })
         .collect();
     (StatusCode::OK, Json(rows)).into_response()
+}
+
+/// Last health-probe result of one action's registered runtime.
+fn action_health(state: &ApiState, id: &str) -> Option<broker_connectors::SinkHealth> {
+    state
+        .engine
+        .connectors()
+        .get(&broker_config::v5_action_sink_key(id))
+        .and_then(|sink| sink.health())
 }
 
 /// `POST /api/v5/actions`: validate the body against the named action
@@ -780,6 +814,13 @@ pub async fn create_action(
             // sink, no dial.
             let wiring = staged.wiring;
             if let Some(sink) = staged.sink {
+                let sink = crate::v5::action_sinks::wrap_action_runtime(
+                    &state.engine,
+                    &key,
+                    sink,
+                    staged.resource_opts,
+                    staged.health_target,
+                );
                 state.engine.connectors().register(key, sink);
             }
             if let crate::v5::actions::ActionWiring::Failed(message) = &wiring {
@@ -885,7 +926,12 @@ pub async fn get_action(State(state): State<ApiState>, Path(id): Path<String>) -
     match state.actions.get_any(&id) {
         Some(entry) => {
             let wiring = state.actions.wiring_of(&entry.id);
-            (StatusCode::OK, Json(entry.to_json_with(&wiring))).into_response()
+            let health = action_health(&state, &entry.id);
+            (
+                StatusCode::OK,
+                Json(entry.to_json_with_health(&wiring, health.as_ref())),
+            )
+                .into_response()
         }
         None => ApiError::NotFound(format!("action {id:?} not found")).into_response(),
     }
@@ -985,10 +1031,14 @@ pub async fn update_action(
     let wiring = staged.wiring;
     match &staged.sink {
         Some(sink) => {
-            state
-                .engine
-                .connectors()
-                .register(key.clone(), Arc::clone(sink));
+            let sink = crate::v5::action_sinks::wrap_action_runtime(
+                &state.engine,
+                &key,
+                Arc::clone(sink),
+                staged.resource_opts.clone(),
+                staged.health_target.clone(),
+            );
+            state.engine.connectors().register(key.clone(), sink);
             state
                 .alarms
                 .deactivate(&format!("action_build_failed:{bare}"));
@@ -1088,30 +1138,22 @@ pub async fn set_action_enabled(
 /// C06-08).
 ///
 /// A known id returns the live counters attributed on the rule-fire path
-/// (`total` fires, `success` connector sends, `failed` connector errors)
-/// with zero defaults at creation and after a restart. An unknown id
-/// returns 404 with the documented `{code, message}` shape, not an empty
-/// body. The pair is not paged; unknown query parameters are ignored (no
-/// query beyond the ignore sink is extracted). Management-plane only: one
-/// short store read plus lock-free atomic loads; the publish path bumps
-/// the same atomics and never takes this store's lock.
+/// and in the action runtime: `matched`, `success`, `failed`, `dropped`
+/// with its reasons, `queuing` and `inflight`. `total` is kept
+/// for older readers. All counters start at zero at creation and after a
+/// restart. An unknown id returns 404 with the documented `{code,
+/// message}` shape, not an empty body. The pair is not paged; unknown
+/// query parameters are ignored. Management-plane only: one short store
+/// read plus lock-free atomic loads; the publish path bumps the same
+/// atomics and never takes this store's lock.
 ///
-/// The counter set is fixed per action (three atomics, no history), so a
-/// read never grows anything; an `inflight` gauge is omitted because the
-/// broker does not track per-action in-flight depth and a constant would
-/// stand in for a measurement.
-///
-/// Fire-path cost (stated for the delivery-path note): the publish path
-/// holds one `Arc` of the metric map per ingress plus one `HashMap`
-/// lookup and relaxed `fetch_add`s per forward — lock-free atomics only,
-/// no lock, no queue, no per-fire allocation; text rendering stays here
-/// in the handler.
-// TODO(parity): which counter names plus envelope shapes does the documented
-// spec require beyond `total`/`success`/`failed` (rates, node rows,
-// `inflight`, ...)? The rulebook does not decide the exact shape; the
-// current choice reports the honest live subset the fire path attributes
-// (`id` plus `metrics {total, success, failed}`) and omits the rest rather
-// than inventing constants, until the checker pins it.
+/// The counter set is fixed per action, so a read never grows anything.
+/// Rates and aggregated-upload counters are omitted: the broker does not
+/// measure them, and a constant would stand in for a measurement.
+// TODO(parity): does the documented shape require `received` and the rate
+// counters (`rate`, `rate_max`, `rate_last5m`)? The rulebook does not
+// decide. The current choice reports the honest measured subset and omits
+// the rest until the checker pins it.
 pub async fn get_action_metrics(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1124,18 +1166,26 @@ pub async fn get_action_metrics(
     // The record is registered on create/boot, but a standalone engine or
     // a race keeps this fail-closed at zero rather than 500. MV-01: the
     // metric record rides the action's dispatch key.
-    let (total, success, failed) = state
+    let metrics = state
         .engine
         .action_metrics_snapshot_for(&broker_config::v5_action_sink_key(&bare))
-        .unwrap_or((0, 0, 0));
+        .unwrap_or_default();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "id": id,
             "metrics": {
-                "total": total,
-                "success": success,
-                "failed": failed,
+                "total": metrics.total,
+                "matched": metrics.matched,
+                "success": metrics.success,
+                "failed": metrics.failed,
+                "dropped": metrics.dropped,
+                "dropped.queue_full": metrics.dropped_queue_full,
+                "dropped.resource_not_found": metrics.dropped_resource_not_found,
+                "dropped.resource_stopped": metrics.dropped_resource_stopped,
+                "dropped.other": metrics.dropped_other,
+                "queuing": metrics.queuing,
+                "inflight": metrics.inflight,
             },
         })),
     )

@@ -1615,6 +1615,16 @@ impl Sink for PostgreSqlSink {
         Ok(())
     }
 
+    async fn send_batch(&self, items: &[super::SinkBatchItem]) -> super::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        for item in items {
+            self.buffer_row(&item.topic, &item.payload, item.qos);
+        }
+        self.flush().await
+    }
+
     fn kind(&self) -> &'static str {
         "postgres"
     }

@@ -1,0 +1,142 @@
+[
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "ro01-bad-dispatch",
+      "type": "mqtt_bridge",
+      "server": "127.0.0.1:1883",
+      "resource_opts": {"dispatch_strategy": "random"}
+    },
+    "expect_status": 400,
+    "setup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-dispatch"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-dispatch"}}]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "ro01-bad-jitter",
+      "type": "mqtt_bridge",
+      "server": "127.0.0.1:1883",
+      "resource_opts": {"health_check_interval_jitter": "1s"}
+    },
+    "expect_status": 400,
+    "setup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-jitter"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-jitter"}}]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "ro01-bad-timeout",
+      "type": "mqtt_bridge",
+      "server": "127.0.0.1:1883",
+      "resource_opts": {"health_check_timeout": "30s"}
+    },
+    "expect_status": 400,
+    "setup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-timeout"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-timeout"}}]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "ro01-bad-unknown",
+      "type": "mqtt_bridge",
+      "server": "127.0.0.1:1883",
+      "resource_opts": {"no_such_option": 1}
+    },
+    "expect_status": 400,
+    "setup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-unknown"}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/actions/ro01-bad-unknown"}}]
+  },
+  {
+    "operation": "PUT /actions/{id}",
+    "path_params": {"id": "ro01-update-dispatch"},
+    "query": {},
+    "body": {
+      "name": "ro01-update-dispatch",
+      "type": "mqtt_bridge",
+      "server": "127.0.0.1:1883",
+      "resource_opts": {"dispatch_strategy": "random"}
+    },
+    "expect_status": 400,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/ro01-update-dispatch"}},
+      {"api": {"method": "POST", "path": "/actions", "body": {
+        "name": "ro01-update-dispatch",
+        "type": "mqtt_bridge",
+        "server": "127.0.0.1:1883"
+      }}}
+    ],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/actions/ro01-update-dispatch"}}]
+  },
+  {
+    "operation": "PUT /actions/{id}",
+    "path_params": {"id": "ro01-update-jitter"},
+    "query": {},
+    "body": {
+      "name": "ro01-update-jitter",
+      "type": "mqtt_bridge",
+      "server": "127.0.0.1:1883",
+      "resource_opts": {"health_check_interval_jitter": "1s"}
+    },
+    "expect_status": 400,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/ro01-update-jitter"}},
+      {"api": {"method": "POST", "path": "/actions", "body": {
+        "name": "ro01-update-jitter",
+        "type": "mqtt_bridge",
+        "server": "127.0.0.1:1883"
+      }}}
+    ],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/actions/ro01-update-jitter"}}]
+  },
+  {
+    "operation": "PUT /actions/{id}",
+    "path_params": {"id": "ro01-update-timeout"},
+    "query": {},
+    "body": {
+      "name": "ro01-update-timeout",
+      "type": "mqtt_bridge",
+      "server": "127.0.0.1:1883",
+      "resource_opts": {"health_check_timeout": "30s"}
+    },
+    "expect_status": 400,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/ro01-update-timeout"}},
+      {"api": {"method": "POST", "path": "/actions", "body": {
+        "name": "ro01-update-timeout",
+        "type": "mqtt_bridge",
+        "server": "127.0.0.1:1883"
+      }}}
+    ],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/actions/ro01-update-timeout"}}]
+  },
+  {
+    "operation": "PUT /actions/{id}",
+    "path_params": {"id": "ro01-update-unknown"},
+    "query": {},
+    "body": {
+      "name": "ro01-update-unknown",
+      "type": "mqtt_bridge",
+      "server": "127.0.0.1:1883",
+      "resource_opts": {"no_such_option": 1}
+    },
+    "expect_status": 400,
+    "setup": [
+      {"api": {"method": "DELETE", "path": "/actions/ro01-update-unknown"}},
+      {"api": {"method": "POST", "path": "/actions", "body": {
+        "name": "ro01-update-unknown",
+        "type": "mqtt_bridge",
+        "server": "127.0.0.1:1883"
+      }}}
+    ],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/actions/ro01-update-unknown"}}]
+  }
+]

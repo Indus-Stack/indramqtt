@@ -93,7 +93,8 @@ def call(method, path, body=None):
         method=method,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=5) as res:
+    # Password hashing and the config save can take longer on a loaded host.
+    with urllib.request.urlopen(req, timeout=30) as res:
         return res.status
 
 status = call("POST", "/api/v1/auth/users",

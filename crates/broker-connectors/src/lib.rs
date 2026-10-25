@@ -150,10 +150,50 @@ pub enum ConnectorError {
 
 pub type Result<T> = std::result::Result<T, ConnectorError>;
 
+/// One message in a batch handed to a driver.
+#[derive(Debug, Clone)]
+pub struct SinkBatchItem {
+    pub topic: Topic,
+    pub payload: Bytes,
+    pub qos: QoS,
+}
+
+/// Last health-probe result of one sink. `None` from
+/// [`Sink::health`] means the sink runs no probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkHealth {
+    pub healthy: bool,
+    pub reason: Option<String>,
+}
+
 /// Unified outbound boundary: every streaming sink implements `Sink`.
 #[async_trait]
 pub trait Sink: Send + Sync {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()>;
+
+    /// Deliver one batch. The default sends each item in order, so a
+    /// driver that writes one row at a time receives a batch of one at a
+    /// time. A driver with a native batch write overrides this method.
+    async fn send_batch(&self, items: &[SinkBatchItem]) -> Result<()> {
+        for item in items {
+            self.send(&item.topic, &item.payload, item.qos).await?;
+        }
+        Ok(())
+    }
+
+    /// True when the sink counts its own action outcomes. An action-owned
+    /// runtime counts matched, success, failed and dropped, so the rule
+    /// path must not count them a second time.
+    fn owns_action_metrics(&self) -> bool {
+        false
+    }
+
+    /// Last health-probe result, when this sink runs a probe. The
+    /// management read path uses it to report the live target state.
+    fn health(&self) -> Option<SinkHealth> {
+        None
+    }
+
     /// Stable kind name for management display (`webhook`, `console`,
     /// `kafka`, `rabbitmq`, ...).
     fn kind(&self) -> &'static str;
@@ -457,9 +497,26 @@ impl ConnectorManager {
 
     /// Deliver one event through the named connector.
     pub async fn send(&self, id: &str, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
+        self.send_with_action_metrics(id, topic, payload, qos)
+            .await
+            .0
+    }
+
+    /// Deliver one event and report whether the sink counts its own action
+    /// outcomes. One registry lookup serves both answers.
+    pub async fn send_with_action_metrics(
+        &self,
+        id: &str,
+        topic: &Topic,
+        payload: &Bytes,
+        qos: QoS,
+    ) -> (Result<()>, bool) {
         match self.get(id) {
-            Some(sink) => sink.send(topic, payload, qos).await,
-            None => Err(ConnectorError::UnknownConnector(id.to_string())),
+            Some(sink) => {
+                let owns_metrics = sink.owns_action_metrics();
+                (sink.send(topic, payload, qos).await, owns_metrics)
+            }
+            None => (Err(ConnectorError::UnknownConnector(id.to_string())), false),
         }
     }
 }

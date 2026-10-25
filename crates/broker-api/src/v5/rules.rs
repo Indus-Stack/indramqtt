@@ -5655,9 +5655,34 @@ pub async fn update_connector(
         if !crate::v5::action_sinks::action_owned_kind(&record.action_type) {
             continue;
         }
-        match crate::v5::action_sinks::build_action_sink(&record, &body) {
+        let opts = match crate::v5::action_sinks::ActionResourceOpts::parse(
+            &record.id,
+            &record.resource_opts,
+        ) {
+            Ok(opts) => opts,
+            Err(message) => {
+                return ApiError::BadRequest(format!(
+                    "action {:?} cannot use connector {bare:?}: {message}",
+                    record.id
+                ))
+                .into_response();
+            }
+        };
+        match crate::v5::action_sinks::build_action_sink(&record, &body, &opts) {
             Ok(Some(sink)) => {
-                staged_sinks.push((broker_config::v5_action_sink_key(&record.id), sink));
+                let key = broker_config::v5_action_sink_key(&record.id);
+                // R2-04: wrap the rebuilt sink in its resource-option
+                // runtime, as create, update and boot do. A raw sink
+                // would stop applying the action options after this
+                // connector update.
+                let sink = crate::v5::action_sinks::wrap_action_runtime(
+                    &state.engine,
+                    &key,
+                    sink,
+                    opts,
+                    extract_target_host_port(&body),
+                );
+                staged_sinks.push((key, sink));
                 staged_ids.push(record.id.clone());
             }
             Ok(None) => {
@@ -6110,7 +6135,34 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
+/// Resolve one URL-like connector field to a real `http`/`https` network
+/// target. A secret reference (`file:`/`env:`) resolves first, so the
+/// probe never dials the reference string. Any other scheme runs no probe.
+fn http_target_host_port(reference: &str) -> Option<String> {
+    let trimmed = reference.trim();
+    let candidate = if broker_config::secrets::is_secret_ref(trimmed) {
+        let resolved = broker_connectors::resolve_field_secret(trimmed);
+        let resolved = resolved.trim().to_string();
+        if resolved.is_empty() {
+            return None;
+        }
+        resolved
+    } else {
+        trimmed.to_string()
+    };
+    let parsed = reqwest::Url::parse(candidate.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    Some(format!("{}:{}", host, port))
+}
+
+pub(crate) fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
     if let Some(s) = body.get("server").and_then(|v| v.as_str()) {
         let mut clean = s.trim();
         if let Some((_, rest)) = clean.split_once("://") {
@@ -6151,7 +6203,13 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         }
     }
     if let Some(s) = body.get("endpoint").and_then(|v| v.as_str()) {
-        let mut clean = s.trim();
+        let trimmed = s.trim();
+        if broker_config::secrets::is_secret_ref(trimmed) {
+            // The `endpoint` alias resolves like `url`: a secret reference
+            // is never dialled as a fabricated target.
+            return http_target_host_port(trimmed);
+        }
+        let mut clean = trimmed;
         if let Some((_, rest)) = clean.split_once("://") {
             clean = rest;
         }
@@ -6214,11 +6272,10 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
         }
     }
     if let Some(u) = body.get("url").and_then(|v| v.as_str()) {
-        if let Ok(parsed) = reqwest::Url::parse(u) {
-            let host = parsed.host_str().unwrap_or("127.0.0.1");
-            let port = parsed.port_or_known_default().unwrap_or(80);
-            return Some(format!("{}:{}", host, port));
-        }
+        // A secret reference (`file:`/`env:`) never probes a fabricated
+        // loopback target. Resolve it first; probe only a real `http` or
+        // `https` target with a host. Anything else runs no probe.
+        return http_target_host_port(u);
     }
     if let Some(h) = body.get("host").and_then(|v| v.as_str()) {
         let mut clean = h.trim();
@@ -6244,7 +6301,7 @@ fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
     None
 }
 
-async fn check_tcp_reachable(addr: &str) -> Result<(), String> {
+pub(crate) async fn check_tcp_reachable(addr: &str) -> Result<(), String> {
     let target = if addr.contains(':') {
         addr.to_string()
     } else {
