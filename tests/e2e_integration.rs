@@ -4643,8 +4643,8 @@ async fn mv01_http_action_dangling_connector_stores_disconnected_and_recovers() 
         "/api/v5/actions",
         serde_json::json!({
             "name": "mv01-late",
-            "type": "http",
-            "connector": "http:mv01-late-link",
+            "type": "webhook",
+            "connector": "webhook:mv01-late-link",
             "parameters": {"path": "/late"},
         }),
     )
@@ -4662,7 +4662,7 @@ async fn mv01_http_action_dangling_connector_stores_disconnected_and_recovers() 
         "/api/v5/connectors",
         serde_json::json!({
             "name": "mv01-late-link",
-            "type": "http",
+            "type": "webhook",
             "url": format!("http://{address}"),
         }),
     )
@@ -5052,7 +5052,7 @@ async fn ro01_action_runtime_applies_options_through_publish_and_restart() {
         "/api/v5/actions",
         serde_json::json!({
             "name": "ro01-restart-action",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro01-restart",
             "parameters": {"path": "/ro01"},
             "resource_opts": {
@@ -5254,7 +5254,7 @@ async fn ro01_connector_update_keeps_action_options() {
         "/api/v5/actions",
         serde_json::json!({
             "name": "ro01-update-action",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro01-update",
             "parameters": {"path": "/ro01-update"},
             "resource_opts": {
@@ -5453,7 +5453,7 @@ async fn ro01_action_resource_opts_fields_apply_through_publish() {
         "/api/v5/actions",
         serde_json::json!({
             "name": "ro01-f-time",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro01-fields",
             "parameters": {"path": "/f-time"},
             "resource_opts": {
@@ -5524,7 +5524,7 @@ async fn ro01_action_resource_opts_fields_apply_through_publish() {
         "/api/v5/actions",
         serde_json::json!({
             "name": "ro01-f-buf",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro01-fields",
             "parameters": {"path": "/f-buf"},
             "resource_opts": {
@@ -5606,7 +5606,7 @@ async fn ro01_action_resource_opts_fields_apply_through_publish() {
         "/api/v5/actions",
         serde_json::json!({
             "name": "ro01-f-ttl",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro01-fields",
             "parameters": {"path": "/f-ttl"},
             "resource_opts": {
@@ -5681,7 +5681,7 @@ async fn ro01_action_resource_opts_fields_apply_through_publish() {
         "/api/v5/actions",
         serde_json::json!({
             "name": "ro01-f-inflight",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro01-fields",
             "parameters": {"path": "/f-inflight"},
             "resource_opts": {
@@ -5765,7 +5765,7 @@ async fn ro01_action_resource_opts_fields_apply_through_publish() {
         "/api/v5/actions",
         serde_json::json!({
             "name": "ro01-f-sync",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro01-fields",
             "parameters": {"path": "/f-sync"},
             "resource_opts": {
@@ -5829,7 +5829,7 @@ async fn ro01_action_resource_opts_fields_apply_through_publish() {
         "/api/v5/actions",
         serde_json::json!({
             "name": "ro01-f-worker",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro01-fields",
             "parameters": {"path": "/f-worker"},
             "resource_opts": {
@@ -5941,7 +5941,7 @@ async fn ro01_inflight_window_bounds_concurrent_driver_calls_through_publish() {
         "/api/v5/actions",
         serde_json::json!({
             "name": "ro01-inflight-action",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro01-inflight-conn",
             "parameters": {"path": "/inflight"},
             "resource_opts": {
@@ -6213,7 +6213,7 @@ async fn ro01_action_resource_opts_refusals_through_the_api() {
             "/api/v5/actions",
             serde_json::json!({
                 "name": name,
-                "type": "http",
+                "type": "webhook",
                 "connector": "ro01-refusal-hook",
                 "parameters": {"path": "/new"},
                 "resource_opts": opts,
@@ -7153,7 +7153,7 @@ async fn mv01_mixed_kind_rule_delivers_owned_actions_and_counts_refused_failure(
         "/api/v5/actions",
         serde_json::json!({
             "name": "mv01-mixed-refused",
-            "type": "mysql",
+            "type": "console",
         }),
     )
     .await;

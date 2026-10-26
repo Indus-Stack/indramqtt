@@ -253,7 +253,7 @@ The broker does not measure a retry count, so the answer has no `retried` field.
 
 `PUT /api/v5/actions/{id}/metrics/reset` sets every counter to zero. A restart also starts every counter at zero.
 
-This example creates an `http` action with non-default options, sends two rows through a rule, reads the counters and resets them.
+This example creates a `webhook` action with non-default options, sends two rows through a rule, reads the counters and resets them.
 
 ```sh test
 python3 - <<'PY'
@@ -299,7 +299,7 @@ status, _ = call("POST", "/api/v5/connectors", {
     "name": "docs-ro-hook", "type": "webhook", "url": f"http://127.0.0.1:{port}"})
 assert status == 201, status
 status, _ = call("POST", "/api/v5/actions", {
-    "name": "docs-ro-action", "type": "http", "connector": "docs-ro-hook",
+    "name": "docs-ro-action", "type": "webhook", "connector": "docs-ro-hook",
     "parameters": {"path": "/docs"},
     "resource_opts": {
         "batch_size": 2, "batch_time": "1s", "inflight_window": 3,

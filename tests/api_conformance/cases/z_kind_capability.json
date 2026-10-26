@@ -3,25 +3,65 @@
     "operation": "POST /connectors",
     "path_params": {},
     "query": {},
-    "body": {"name": "conf-kc00-ready-conn", "type": "http", "url": "http://127.0.0.1:9", "enable": false},
+    "body": {
+      "name": "conf-kc00-ready-conn",
+      "type": "pgsql",
+      "server": "127.0.0.1:5432",
+      "database": "conf_db",
+      "username": "conf_user",
+      "enable": false
+    },
     "expect_status": 201,
-    "setup": [{"api": {"method": "DELETE", "path": "/connectors/conf-kc00-ready-conn"}}],
-    "cleanup": [{"api": {"method": "DELETE", "path": "/connectors/conf-kc00-ready-conn"}}]
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-kc00-ready-conn"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-kc00-ready-conn"
+        }
+      }
+    ]
   },
   {
     "operation": "POST /actions",
     "path_params": {},
     "query": {},
-    "body": {"name": "conf-kc00-ready-act", "type": "console"},
+    "body": {
+      "name": "conf-kc00-ready-act",
+      "type": "console"
+    },
     "expect_status": 201,
-    "setup": [{"api": {"method": "DELETE", "path": "/actions/conf-kc00-ready-act"}}],
-    "cleanup": [{"api": {"method": "DELETE", "path": "/actions/conf-kc00-ready-act"}}]
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-kc00-ready-act"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-kc00-ready-act"
+        }
+      }
+    ]
   },
   {
     "operation": "POST /connectors_probe",
     "path_params": {},
     "query": {},
-    "body": {"type": "console"},
+    "body": {
+      "type": "console"
+    },
     "expect_status": 204,
     "setup": [],
     "cleanup": []
@@ -30,7 +70,9 @@
     "operation": "POST /actions_probe",
     "path_params": {},
     "query": {},
-    "body": {"type": "console"},
+    "body": {
+      "type": "console"
+    },
     "expect_status": 204,
     "setup": [],
     "cleanup": []
@@ -39,28 +81,73 @@
     "operation": "POST /connectors",
     "path_params": {},
     "query": {},
-    "body": {"name": "conf-kc00-refused-conn", "type": "s3_tables"},
+    "body": {
+      "name": "conf-kc00-refused-conn",
+      "type": "s3_tables"
+    },
     "expect_status": 400,
-    "setup": [{"api": {"method": "DELETE", "path": "/connectors/conf-kc00-refused-conn"}}],
-    "cleanup": [{"api": {"method": "DELETE", "path": "/connectors/conf-kc00-refused-conn"}}]
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-kc00-refused-conn"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-kc00-refused-conn"
+        }
+      }
+    ]
   },
   {
     "operation": "PUT /connectors/{id}",
-    "path_params": {"id": "conf-kc00-refused-upd"},
+    "path_params": {
+      "id": "conf-kc00-refused-upd"
+    },
     "query": {},
-    "body": {"name": "conf-kc00-refused-upd", "type": "s3_tables"},
+    "body": {
+      "name": "conf-kc00-refused-upd",
+      "type": "s3_tables"
+    },
     "expect_status": 400,
     "setup": [
-      {"api": {"method": "DELETE", "path": "/connectors/conf-kc00-refused-upd"}},
-      {"api": {"method": "POST", "path": "/connectors", "body": {"name": "conf-kc00-refused-upd", "type": "console"}}}
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-kc00-refused-upd"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-kc00-refused-upd",
+            "type": "console"
+          }
+        }
+      }
     ],
-    "cleanup": [{"api": {"method": "DELETE", "path": "/connectors/conf-kc00-refused-upd"}}]
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-kc00-refused-upd"
+        }
+      }
+    ]
   },
   {
     "operation": "POST /connectors_probe",
     "path_params": {},
     "query": {},
-    "body": {"type": "s3_tables"},
+    "body": {
+      "type": "s3_tables"
+    },
     "expect_status": 400,
     "setup": [],
     "cleanup": []

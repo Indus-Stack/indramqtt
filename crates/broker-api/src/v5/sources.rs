@@ -678,13 +678,13 @@ pub async fn create_source(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    // KC-00: a known source kind that is not `ready` answers
-    // `400 BAD_REQUEST`, never `ALREADY_EXISTS`.
+    // KC-00: create of a known source kind that is not `ready` keeps the
+    // reference error code for this operation, `ALREADY_EXISTS`.
     if let Some(kind) = body.get("type").and_then(|v| v.as_str()) {
         let kind = kind.trim();
         if crate::removed_connector_refusal(kind).is_none() {
             if let Some(message) = super::rules::kind_refusal(kind) {
-                return ApiError::BadRequest(message).into_response();
+                return ApiError::AlreadyExists(message).into_response();
             }
         }
     }
@@ -1164,7 +1164,7 @@ mod tests {
         SourceEntry {
             id: id.to_string(),
             name: id.to_string(),
-            source_type: "mqtt".to_string(),
+            source_type: "webhook".to_string(),
             enable,
             connector: String::new(),
             parameters: serde_json::json!({}),
@@ -1192,7 +1192,7 @@ mod tests {
         let stopped = store.set_enabled("a", false).expect("known id flips");
         assert!(!stopped.enable);
         assert_eq!(stopped.id, "a");
-        assert_eq!(stopped.source_type, "mqtt");
+        assert_eq!(stopped.source_type, "webhook");
         assert!(!store.get("a").expect("reads back").enable);
         let started = store.set_enabled("a", true).expect("known id flips");
         assert!(started.enable);
@@ -1206,25 +1206,25 @@ mod tests {
         assert!(!store.replace("missing", entry("missing", true)));
         assert!(store.insert(entry("a", true)).is_ok());
         let mut updated = entry("a", false);
-        updated.source_type = "http".to_string();
+        updated.source_type = "webhook".to_string();
         assert!(store.replace("a", updated));
         let found = store.get("a").expect("replaced source reads back");
-        assert_eq!(found.source_type, "http");
+        assert_eq!(found.source_type, "webhook");
         assert!(!found.enable);
         assert_eq!(store.snapshot().len(), 1);
-        assert!(store.replace_any("http:a", entry("a", true)));
+        assert!(store.replace_any("webhook:a", entry("a", true)));
     }
 
     #[test]
     fn key_form_resolves_to_the_bare_row() {
         let store = SourceStore::new();
         assert!(store.insert(entry("a", true)).is_ok());
-        let found = store.get_any("mqtt:a").expect("key form reads back");
+        let found = store.get_any("webhook:a").expect("key form reads back");
         assert_eq!(found.id, "a");
-        assert!(store.contains_any("mqtt:a"));
+        assert!(store.contains_any("webhook:a"));
         assert!(store.get_any("other:a").is_none());
         let rendered = found.to_json();
-        assert_eq!(rendered["type"], serde_json::json!("mqtt"));
+        assert_eq!(rendered["type"], serde_json::json!("webhook"));
         assert_eq!(rendered["connector"], serde_json::json!(""));
         assert!(rendered["parameters"].is_object());
         assert_eq!(rendered["status"], serde_json::json!("connected"));
@@ -1234,9 +1234,9 @@ mod tests {
     fn split_body_accepts_the_documented_envelope() {
         let entry = split_source_body(
             &serde_json::json!({
-                "type": "kafka_consumer",
+                "type": "webhook",
                 "name": "in",
-                "connector": "kafka_consumer:up",
+                "connector": "webhook:up",
                 "parameters": {"topic": "events"},
             }),
             None,
@@ -1267,7 +1267,7 @@ mod tests {
         conf.validate().expect("exported sources must validate");
         assert_eq!(conf.sources.len(), 1);
         assert_eq!(conf.sources[0].id, "src-1");
-        assert_eq!(conf.sources[0].source_type, "mqtt");
+        assert_eq!(conf.sources[0].source_type, "webhook");
     }
 
     #[test]

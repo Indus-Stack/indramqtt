@@ -10565,6 +10565,10 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Arc clone each; management-plane only, never on the delivery path.
     state.licence = shared.licence.clone();
     state.alarms = shared.alarms.clone();
+    // KC-00: `ApiState::new` raised the stored-kind alarms into its own
+    // store before this swap. Raise them again on the shared kernel store
+    // so `GET /alarms` sees them through the production entry.
+    state.raise_unavailable_stored_kinds();
     // Boot replay MV-01: rebuild the stored action sinks on the shared
     // stores after the swaps above. The build and the wiring report then
     // live in the same stores that the routes and alarms read.
@@ -17721,6 +17725,64 @@ mod tests {
         }
 
         api_task.abort();
+    }
+
+    #[tokio::test]
+    async fn stored_pending_kind_alarms_survive_serve_api() {
+        let dir = unique_data_dir();
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let pending = r#"
+[[connectors.connectors]]
+id = "pending-mysql"
+connector_type = "mysql"
+enable = true
+config = '{}'
+
+[[actions.actions]]
+id = "pending-mysql"
+action_type = "mysql"
+enable = true
+config = '{"connector":"pending-mysql"}'
+"#;
+        std::fs::write(dir.join("state.toml"), pending).expect("write pending state");
+
+        let registry =
+            Arc::new(ConfigRegistry::load_for_boot(&dir).expect("pending state loads for boot"));
+        let mut shared = Shared::new();
+        shared.config = registry;
+        shared
+            .connectors
+            .seed_from_registry(&shared.config, &shared.engine);
+        shared.actions.seed_from_registry(&shared.config);
+
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind api");
+        let api_port = api_listener.local_addr().expect("api addr").port();
+        let api_task = tokio::spawn(serve_api(api_listener, shared));
+
+        let token = http_admin_token(api_port).await;
+        let (status, body) =
+            http_request_text(api_port, "GET", "/api/v5/alarms", None, Some(&token)).await;
+        assert_eq!(status, 200);
+        let alarms: serde_json::Value = serde_json::from_str(&body).expect("alarms is JSON");
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"connector_unavailable:pending-mysql"),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"action_unavailable:pending-mysql"),
+            "{names:?}"
+        );
+
+        api_task.abort();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

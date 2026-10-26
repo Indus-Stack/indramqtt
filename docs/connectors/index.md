@@ -9,7 +9,7 @@ sidebar:
 
 A connector sends rule results to an external system. A rule names the connector in `INTO connector("<id>")` or in a `forwardconnector` action. The connector batches sends and retries faults. Each connector holds a bounded queue, so a slow system never stalls publishers.
 
-Use connectors when results must leave the broker. You get one binary with all sinks; the default build holds light sinks only, and the full build holds every kind. The complete MQTT platform in one small binary: broker, SQL rules, data connectors and multi-tenancy in a single process.
+Use connectors when results must leave the broker. You get one binary with all sinks; the default build holds light sinks only, and the full build compiles every kind. A kind that is not ready is still refused in a full build. The complete MQTT platform in one small binary: broker, SQL rules, data connectors and multi-tenancy in a single process.
 
 ```mermaid
 flowchart LR
@@ -88,7 +88,7 @@ Direction `out` means the broker writes to the system. State `implemented` means
 > The S3 Tables connector is removed. A new connector of type `s3_tables`, `s3tables` or `iceberg` gets `400` with `connector type s3_tables is not available in this broker`. A state file from an earlier version still starts and reports the stored connector and action as `disconnected`. See [Removed connectors](../reference/removed-connectors.md) for the stored-state behaviour and the delete order.
 
 > [!WARNING]
-> Heavy vendor SDKs need a feature build. The default build answers 400 and names the missing feature. Build with `--features full` or the named feature (for example `--features kafka`). The container image holds all kinds.
+> Heavy vendor SDKs need a feature build. A kind that is not ready answers 400 and names the kind. Build with `--features full` or the named feature (for example `--features kafka`). The container image compiles all kinds. A pending kind stays refused in every build.
 
 ## Common connectors
 
@@ -107,7 +107,7 @@ Direction `out` means the broker writes to the system. State `implemented` means
 
 ## Check that it works
 
-Ask the broker for its action type names. The list holds the documented names.
+Ask the broker for its action type names. The list holds the documented action kinds that are ready in this build.
 
 ```toml test
 [node]
@@ -136,9 +136,9 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {key}"})
 with urllib.request.urlopen(req, timeout=5) as res:
     names = set(json.load(res))
-for want in ("http", "mqtt", "kafka_producer", "redis", "mysql", "pgsql",
-             "influxdb", "clickhouse", "s3", "mongodb", "disk_log", "dynamo"):
-    assert want in names, want
+assert names == {"pgsql"}, names
+for pending in ("http", "mqtt", "kafka_producer", "redis", "mysql"):
+    assert pending not in names, pending
 print("ok")
 PY
 ```

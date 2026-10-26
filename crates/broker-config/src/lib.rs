@@ -25,7 +25,8 @@ pub mod schema;
 pub mod secrets;
 
 pub use capability::{
-    is_kind_ready, is_kind_refused, kind_row, kind_state, KindRow, KindState, KIND_ROWS,
+    is_kind_ready, is_kind_refused, kind_row, kind_state, row_is_ready, set_test_kinds_enabled,
+    test_kinds_enabled, KindRow, KindState, ACCEPTED_FAMILY_TICKETS, KIND_ROWS,
 };
 
 pub use layers::{
@@ -4491,10 +4492,10 @@ mod tests {
             },
             connectors: ConnectorsConf {
                 connectors: vec![ConnectorEntry {
-                    id: "mysql-main".to_string(),
-                    connector_type: "mysql".to_string(),
+                    id: "pgsql-main".to_string(),
+                    connector_type: "pgsql".to_string(),
                     enable: true,
-                    config: "mysql://root:pw@127.0.0.1:3306/db".to_string(),
+                    config: "postgres://root:pw@127.0.0.1:5432/db".to_string(),
                 }],
             },
             authn_chain: AuthnChainConf::default(),
@@ -5000,6 +5001,67 @@ mod tests {
         let reloaded = ConfigRegistry::load_for_boot(&dir).expect("reload after rewrite");
         assert_eq!(reloaded.snapshot().connectors.connectors.len(), 1);
         assert_eq!(reloaded.snapshot().actions.actions.len(), 1);
+    }
+
+    #[test]
+    fn pending_kinds_load_only_through_the_boot_loader() {
+        let dir = unique_dir("pending-kinds");
+        let mut snapshot = FullSnapshot::default();
+        snapshot.connectors.connectors.push(ConnectorEntry {
+            id: "pending-mysql".to_string(),
+            connector_type: "mysql".to_string(),
+            enable: true,
+            config: "{}".to_string(),
+        });
+        snapshot.actions.actions.push(ActionEntry {
+            id: "pending-mysql".to_string(),
+            action_type: "mysql".to_string(),
+            enable: true,
+            config: "{}".to_string(),
+        });
+        snapshot.sources.sources.push(SourceEntry {
+            id: "pending-mysql".to_string(),
+            source_type: "mysql".to_string(),
+            enable: true,
+            config: "{}".to_string(),
+        });
+        std::fs::write(
+            state_path(&dir),
+            toml::to_string(&snapshot).expect("serialise pending"),
+        )
+        .expect("write pending state");
+
+        let err = ConfigRegistry::load(&dir).expect_err("strict load must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains(STATE_FILE_NAME),
+            "names the file: {message}"
+        );
+        assert!(
+            message.contains("connector_type"),
+            "names the key: {message}"
+        );
+        assert!(message.contains("mysql"), "names the kind: {message}");
+
+        let registry = ConfigRegistry::load_for_boot(&dir).expect("boot accepts pending");
+        let loaded = registry.snapshot();
+        assert_eq!(loaded.connectors.connectors.len(), 1);
+        assert_eq!(loaded.actions.actions.len(), 1);
+        assert_eq!(loaded.sources.sources.len(), 1);
+        registry
+            .commit_connectors(loaded.connectors.clone())
+            .expect("stored rewrite keeps the pending connector");
+        registry
+            .commit_actions(loaded.actions.clone())
+            .expect("stored rewrite keeps the pending action");
+        registry
+            .commit_sources(loaded.sources.clone())
+            .expect("stored rewrite keeps the pending source");
+        registry.save().expect("save rewritten pending state");
+        let reloaded = ConfigRegistry::load_for_boot(&dir).expect("reload after rewrite");
+        assert_eq!(reloaded.snapshot().connectors.connectors.len(), 1);
+        assert_eq!(reloaded.snapshot().actions.actions.len(), 1);
+        assert_eq!(reloaded.snapshot().sources.sources.len(), 1);
     }
 
     #[test]

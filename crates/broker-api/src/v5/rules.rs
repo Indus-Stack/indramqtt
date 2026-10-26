@@ -1854,15 +1854,15 @@ pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str
 /// KC-00 refusal for a kind whose capability state is not `ready`.
 ///
 /// Returns `None` for a ready kind (and for the `test` helper in a test
-/// build); otherwise the exact `400 BAD_REQUEST` message. A kind whose
-/// Cargo feature is not compiled in names the feature, so a disabled
-/// build refuses it the same way everywhere. Unknown names are not the
-/// map's business: the caller answers them before this runs.
+/// build); otherwise the exact refusal message. A kind whose Cargo
+/// feature is not compiled in names the feature, so a disabled build
+/// refuses it the same way everywhere. Unknown names are not the map's
+/// business: the caller answers them before this runs.
 pub(crate) fn kind_refusal(kind: &str) -> Option<String> {
     match broker_config::kind_state(kind) {
         Some(broker_config::KindState::Ready) => return None,
         Some(broker_config::KindState::TestOnly) => {
-            if cfg!(test) {
+            if broker_config::test_kinds_enabled() {
                 return None;
             }
         }
@@ -5378,13 +5378,6 @@ pub async fn create_connector(
         return ApiError::AlreadyExists(format!("unknown connector type: {conn_type}"))
             .into_response();
     }
-    // KC-00: a known kind whose capability state is not `ready` is refused
-    // before anything is stored, with the documented message (the feature
-    // is named when it is the reason).
-    if let Some(message) = kind_refusal(&conn_type) {
-        return ApiError::BadRequest(message).into_response();
-    }
-
     // Reject a duplicate id before mutating anything: pushing it into
     // the store would poison every later connector POST/PUT/DELETE, whose
     // persistence export re-validates the whole store and fails on the
@@ -5423,6 +5416,15 @@ pub async fn create_connector(
             })),
         )
             .into_response();
+    }
+
+    // KC-00: a known kind whose capability state is not `ready` is refused
+    // after its credential fields pass, before anything is stored, with the
+    // documented message (the feature is named when it is the reason).
+    // Create keeps the reference error code for this operation,
+    // `ALREADY_EXISTS`.
+    if let Some(message) = kind_refusal(&conn_type) {
+        return ApiError::AlreadyExists(message).into_response();
     }
 
     // Register the live sink on the create event through the same
@@ -6381,8 +6383,10 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
         return probe_failed(format!("unknown connector type: {kind}"));
     }
     // KC-00: a known kind that is not `ready` is refused before any dial.
+    // The probe keeps the reference error code for this operation,
+    // `TEST_FAILED`.
     if let Some(message) = kind_refusal(&kind) {
-        return ApiError::BadRequest(message).into_response();
+        return probe_failed(message);
     }
     // Runtime probe hook (the W3-17 dial path reused from the connector
     // create path): kinds that expose a network target get one bounded
@@ -6406,27 +6410,21 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
 // Action Probe (W3-07, C06-11)
 // ---------------------------------------------------------------------------
 
-/// KC-00: names to list for a capability, in documented order first and
-/// then any remaining ready kind from the map. A non-ready kind can never
+/// KC-00: documented names to list for a capability, in documented order.
+/// A non-ready kind and a name outside the documented list can never
 /// appear.
 pub(crate) fn ready_kind_names(
     documented: &[&'static str],
     pick: fn(&broker_config::KindRow) -> bool,
 ) -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = documented
+    documented
         .iter()
         .copied()
         .filter(|name| {
             broker_config::kind_row(name)
-                .is_some_and(|row| row.state == broker_config::KindState::Ready && pick(row))
+                .is_some_and(|row| broker_config::row_is_ready(row) && pick(row))
         })
-        .collect();
-    for row in broker_config::KIND_ROWS {
-        if row.state == broker_config::KindState::Ready && pick(row) && !out.contains(&row.name) {
-            out.push(row.name);
-        }
-    }
-    out
+        .collect()
 }
 
 /// `GET /api/v5/action_types`: names of supported action kinds.
@@ -6493,9 +6491,11 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
     if !is_known_probe_action_type(&kind) {
         return probe_failed(format!("unknown action type: {kind}"));
     }
-    // KC-00: a known action kind that is not `ready` is refused before any dial.
+    // KC-00: a known action kind that is not `ready` is refused before any
+    // dial. The probe keeps the reference error code for this operation,
+    // `TEST_FAILED`.
     if let Some(message) = kind_refusal(&kind) {
-        return ApiError::BadRequest(message).into_response();
+        return probe_failed(message);
     }
     // Runtime probe hook (the connector dial path reused from the
     // connector create path): kinds that expose a network target get one
@@ -6566,9 +6566,11 @@ pub async fn probe_source(body: Option<Json<serde_json::Value>>) -> Response {
     if !is_known_source_type(&kind) {
         return probe_failed(format!("unknown source type: {kind}"));
     }
-    // KC-00: a known source kind that is not `ready` is refused before any dial.
+    // KC-00: a known source kind that is not `ready` is refused before any
+    // dial. The probe keeps the reference error code for this operation,
+    // `TEST_FAILED`.
     if let Some(message) = kind_refusal(&kind) {
-        return ApiError::BadRequest(message).into_response();
+        return probe_failed(message);
     }
     // Runtime probe hook (the W3-23 dial path): kinds that expose a network
     // target get one bounded dial; kinds without one count as reachable once

@@ -5,7 +5,7 @@
     "query": {},
     "body": {
       "name": "ro01-bad-dispatch",
-      "type": "mqtt_bridge",
+      "type": "console",
       "server": "127.0.0.1:1883",
       "resource_opts": {"dispatch_strategy": "random"}
     },
@@ -19,7 +19,7 @@
     "query": {},
     "body": {
       "name": "ro01-bad-jitter",
-      "type": "mqtt_bridge",
+      "type": "console",
       "server": "127.0.0.1:1883",
       "resource_opts": {"health_check_interval_jitter": "1s"}
     },
@@ -33,7 +33,7 @@
     "query": {},
     "body": {
       "name": "ro01-bad-timeout",
-      "type": "mqtt_bridge",
+      "type": "console",
       "server": "127.0.0.1:1883",
       "resource_opts": {"health_check_timeout": "30s"}
     },
@@ -47,7 +47,7 @@
     "query": {},
     "body": {
       "name": "ro01-bad-unknown",
-      "type": "mqtt_bridge",
+      "type": "console",
       "server": "127.0.0.1:1883",
       "resource_opts": {"no_such_option": 1}
     },
@@ -61,7 +61,7 @@
     "query": {},
     "body": {
       "name": "ro01-update-dispatch",
-      "type": "mqtt_bridge",
+      "type": "console",
       "server": "127.0.0.1:1883",
       "resource_opts": {"dispatch_strategy": "random"}
     },
@@ -70,7 +70,7 @@
       {"api": {"method": "DELETE", "path": "/actions/ro01-update-dispatch"}},
       {"api": {"method": "POST", "path": "/actions", "body": {
         "name": "ro01-update-dispatch",
-        "type": "mqtt_bridge",
+        "type": "console",
         "server": "127.0.0.1:1883"
       }}}
     ],
@@ -82,7 +82,7 @@
     "query": {},
     "body": {
       "name": "ro01-update-jitter",
-      "type": "mqtt_bridge",
+      "type": "console",
       "server": "127.0.0.1:1883",
       "resource_opts": {"health_check_interval_jitter": "1s"}
     },
@@ -91,7 +91,7 @@
       {"api": {"method": "DELETE", "path": "/actions/ro01-update-jitter"}},
       {"api": {"method": "POST", "path": "/actions", "body": {
         "name": "ro01-update-jitter",
-        "type": "mqtt_bridge",
+        "type": "console",
         "server": "127.0.0.1:1883"
       }}}
     ],
@@ -103,7 +103,7 @@
     "query": {},
     "body": {
       "name": "ro01-update-timeout",
-      "type": "mqtt_bridge",
+      "type": "console",
       "server": "127.0.0.1:1883",
       "resource_opts": {"health_check_timeout": "30s"}
     },
@@ -112,7 +112,7 @@
       {"api": {"method": "DELETE", "path": "/actions/ro01-update-timeout"}},
       {"api": {"method": "POST", "path": "/actions", "body": {
         "name": "ro01-update-timeout",
-        "type": "mqtt_bridge",
+        "type": "console",
         "server": "127.0.0.1:1883"
       }}}
     ],
@@ -124,7 +124,7 @@
     "query": {},
     "body": {
       "name": "ro01-update-unknown",
-      "type": "mqtt_bridge",
+      "type": "console",
       "server": "127.0.0.1:1883",
       "resource_opts": {"no_such_option": 1}
     },
@@ -133,7 +133,7 @@
       {"api": {"method": "DELETE", "path": "/actions/ro01-update-unknown"}},
       {"api": {"method": "POST", "path": "/actions", "body": {
         "name": "ro01-update-unknown",
-        "type": "mqtt_bridge",
+        "type": "console",
         "server": "127.0.0.1:1883"
       }}}
     ],

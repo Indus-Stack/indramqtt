@@ -776,8 +776,9 @@ impl ApiState {
     /// Raise one active alarm per stored connector/action whose kind this
     /// broker removed or has not made `ready` (KC-00/D2). The records stay
     /// untouched and readable; the alarms make the unavailable state
-    /// visible without claiming the rule itself is broken.
-    fn raise_unavailable_stored_kinds(&self) {
+    /// visible without claiming the rule itself is broken. Callers that
+    /// share a kernel alarm store repeat this call after that swap.
+    pub fn raise_unavailable_stored_kinds(&self) {
         let snapshot = self.config.snapshot();
         for connector in &snapshot.connectors.connectors {
             if broker_config::is_removed_connector_type(&connector.connector_type)
@@ -2646,28 +2647,13 @@ mod tests {
             let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
                 .await
                 .expect("connect test server");
-            let (mut reader, mut writer) = stream.split();
-            // The server can answer before it reads the whole body. Read and
-            // write at the same time so an early close cannot block the
-            // answer. A reset on the write is only accepted when the server
-            // still sends its response.
-            let write = writer.write_all(raw.as_bytes());
-            let read = async {
-                // HTTP/1.0 + Connection: close => the server closes when done.
-                let mut buf = Vec::new();
-                reader.read_to_end(&mut buf).await.map(|_| buf)
-            };
-            let (write_result, read_result) = tokio::join!(write, read);
-            let buf = read_result.expect("read response");
-            if let Err(error) = write_result {
-                assert!(
-                    matches!(
-                        error.kind(),
-                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                    ),
-                    "write request: {error}"
-                );
-            }
+            stream
+                .write_all(raw.as_bytes())
+                .await
+                .expect("write request");
+            // HTTP/1.0 + Connection: close => the server closes when done.
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
             let text = String::from_utf8(buf).expect("response is UTF-8");
             let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
             let status: u16 = head.lines().next().expect("status line")[9..12]
@@ -3019,6 +3005,264 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn pending_kind_is_refused_everywhere_and_updates_keep_old_records() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let message = "connector type mysql is not available in this broker";
+
+        // Create of a pending kind stores nothing.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"id": "pending-conn", "type": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "pending connector create");
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert_eq!(body["message"], json!(message));
+
+        // Seed one record of each ready kind.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"id": "pending-keep-conn", "type": "webhook",
+                       "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"id": "pending-keep-action", "type": "console"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/sources",
+                json!({"id": "pending-keep-source", "type": "console"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // Update of each pending kind answers 400 BAD_REQUEST and keeps the
+        // old record.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/pending-keep-conn",
+                json!({"type": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "pending connector update");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["message"], json!(message));
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/pending-keep-conn", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], json!("webhook"));
+        assert_eq!(body["url"], json!("http://127.0.0.1:9"));
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/pending-keep-action",
+                json!({"type": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "pending action update");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["message"], json!(message));
+        let (status, body) = server
+            .get_auth("/api/v5/actions/pending-keep-action", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], json!("console"));
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/sources/pending-keep-source",
+                json!({"type": "mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "pending source update");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["message"], json!(message));
+        let (status, body) = server
+            .get_auth("/api/v5/sources/pending-keep-source", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], json!("console"));
+
+        // Create of a pending action and source also stores nothing.
+        for (path, id) in [
+            ("/api/v5/actions", "pending-action"),
+            ("/api/v5/sources", "pending-source"),
+        ] {
+            let (status, body) = server
+                .post_auth(path, json!({"id": id, "type": "mysql"}), &token)
+                .await;
+            assert_eq!(status, 400, "{path} create");
+            assert_eq!(body["code"], json!("ALREADY_EXISTS"), "{path}");
+            assert_eq!(body["message"], json!(message), "{path}");
+        }
+
+        // Probes of the pending kind answer 400 TEST_FAILED before a dial.
+        for path in [
+            "/api/v5/connectors_probe",
+            "/api/v5/actions_probe",
+            "/api/v5/sources_probe",
+        ] {
+            let (status, body) = server
+                .post_auth(path, json!({"type": "mysql"}), &token)
+                .await;
+            assert_eq!(status, 400, "{path}");
+            assert_eq!(body["code"], json!("TEST_FAILED"), "{path}");
+            assert_eq!(body["message"], json!(message), "{path}");
+        }
+
+        let (status, connectors) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        for row in connectors.as_array().expect("connector list") {
+            assert_ne!(row["type"], json!("mysql"), "pending connector not stored");
+        }
+        let (status, actions) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        for row in actions.as_array().expect("action list") {
+            assert_ne!(row["type"], json!("mysql"), "pending action not stored");
+        }
+        let (status, sources) = server.get_auth("/api/v5/sources", &token).await;
+        assert_eq!(status, 200);
+        for row in sources.as_array().expect("source list") {
+            assert_ne!(row["type"], json!("mysql"), "pending source not stored");
+        }
+
+        let _ = server
+            .delete_auth("/api/v5/sources/pending-keep-source", &token)
+            .await;
+        let _ = server
+            .delete_auth("/api/v5/actions/pending-keep-action", &token)
+            .await;
+        let _ = server
+            .delete_auth("/api/v5/connectors/pending-keep-conn", &token)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_kind_is_available_only_when_the_test_switch_is_on() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        broker_config::set_test_kinds_enabled(false);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "test-kind-off", "type": "test"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "release semantics refuse the test kind");
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+
+        broker_config::set_test_kinds_enabled(true);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "test-kind-on", "type": "test"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "a test build admits the test kind: {body}");
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/test-kind-on", &token)
+            .await;
+        assert_eq!(status, 204);
+        broker_config::set_test_kinds_enabled(false);
+    }
+
+    #[tokio::test]
+    async fn schema_and_type_listings_hide_every_non_ready_kind() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        for path in ["/schemas/connectors", "/schemas/actions"] {
+            let (status, schema) = server.get_auth(path, &token).await;
+            assert_eq!(status, 200, "{path}");
+            let schema: serde_json::Value =
+                serde_json::from_str(schema.as_str().expect("schema body is a JSON string"))
+                    .expect("schema string holds JSON");
+            let rows = schema.as_object().expect("schema object");
+            assert!(!rows.is_empty(), "{path} lists at least one ready kind");
+            let mut kinds = Vec::new();
+            for value in rows.values() {
+                let kind = value
+                    .get("properties")
+                    .and_then(|properties| properties.get("type"))
+                    .and_then(|type_prop| type_prop.get("default"))
+                    .and_then(|default| default.as_str())
+                    .expect("schema names its kind");
+                assert!(
+                    broker_config::is_kind_ready(kind),
+                    "{path} lists non-ready kind {kind}"
+                );
+                kinds.push(kind.to_string());
+            }
+            assert!(
+                kinds.iter().any(|kind| kind.as_str() == "pgsql"),
+                "{path} lists the ready pgsql kind: {kinds:?}"
+            );
+        }
+
+        let (status, action_types) = server.get_auth("/api/v5/action_types", &token).await;
+        assert_eq!(status, 200);
+        let action_kinds: Vec<&str> = action_types
+            .as_array()
+            .expect("action type list")
+            .iter()
+            .map(|kind| kind.as_str().expect("action type is a string"))
+            .collect();
+        for kind in &action_kinds {
+            assert!(
+                broker_config::is_kind_ready(kind),
+                "action_types lists non-ready kind {kind}"
+            );
+        }
+        assert!(
+            action_kinds.contains(&"pgsql"),
+            "action_types lists the documented ready kind pgsql: {action_kinds:?}"
+        );
+
+        let (status, source_types) = server.get_auth("/api/v5/source_types", &token).await;
+        assert_eq!(status, 200);
+        let source_kinds: Vec<&str> = source_types
+            .as_array()
+            .expect("source type list")
+            .iter()
+            .map(|kind| kind.as_str().expect("source type is a string"))
+            .collect();
+        for kind in &source_kinds {
+            assert!(
+                broker_config::is_kind_ready(kind),
+                "source_types lists non-ready kind {kind}"
+            );
+        }
+        // Every documented source kind is pending at the close of KC-00,
+        // so the listing is empty. A later family ticket adds its name.
+        assert!(
+            source_kinds.is_empty(),
+            "source_types lists no pending kind: {source_kinds:?}"
+        );
+    }
+
     struct NoopBrokerSink;
     #[async_trait::async_trait]
     impl broker_rules::BrokerSink for NoopBrokerSink {
@@ -3219,6 +3463,144 @@ connector_id = "legacy-good"
         assert!(reloaded.snapshot().connectors.connectors.is_empty());
         assert!(reloaded.snapshot().actions.actions.is_empty());
         assert!(reloaded.snapshot().rules.rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_kind_state_boots_reports_and_counts_failure() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("indra-kc00-pending-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let pending = r#"
+[[connectors.connectors]]
+id = "pending-mysql"
+connector_type = "mysql"
+enable = true
+config = '{}'
+
+[[connectors.connectors]]
+id = "pending-good"
+connector_type = "console"
+enable = true
+config = '{}'
+
+[[actions.actions]]
+id = "pending-mysql"
+action_type = "mysql"
+enable = true
+config = '{"connector":"pending-mysql"}'
+
+[[actions.actions]]
+id = "pending-good"
+action_type = "console"
+enable = true
+config = '{"connector":"pending-good"}'
+
+[[rules.rules]]
+id = "pending-rule"
+name = "pending rule"
+tenant = "default"
+topic_filter = "pending/#"
+sql_query = 'SELECT * FROM "pending/+" INTO connector("pending-mysql")'
+enabled = true
+
+[[rules.rules.actions]]
+type = "forwardconnector"
+connector_id = "pending-good"
+"#;
+        std::fs::write(dir.join("state.toml"), pending).expect("write pending state");
+
+        let registry =
+            Arc::new(ConfigRegistry::load_for_boot(&dir).expect("pending state loads for boot"));
+        let (server, _state) = TestServer::start_with_registry(registry).await;
+        let token = server.login_as_admin().await;
+        let reason = "connector type mysql is not available in this broker";
+
+        let (status, connectors) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        let pending_connector = connectors
+            .as_array()
+            .expect("connector list")
+            .iter()
+            .find(|row| row["id"] == json!("pending-mysql"))
+            .expect("pending connector kept and listed");
+        assert_eq!(pending_connector["status"], json!("disconnected"));
+        assert_eq!(pending_connector["status_reason"], json!(reason));
+        assert!(
+            connectors
+                .as_array()
+                .expect("connector list")
+                .iter()
+                .any(|row| row["id"] == json!("pending-good")),
+            "working sibling connector stays listed"
+        );
+
+        let (status, actions) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        let pending_action = actions
+            .as_array()
+            .expect("action list")
+            .iter()
+            .find(|row| row["id"] == json!("pending-mysql"))
+            .expect("pending action kept and listed");
+        assert_eq!(pending_action["status"], json!("disconnected"));
+        assert_eq!(pending_action["status_reason"], json!(reason));
+
+        let (status, rule) = server.get_auth("/api/v5/rules/pending-rule", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(rule["enable"], json!(true));
+
+        let (status, alarms) = server.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"connector_unavailable:pending-mysql"),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"action_unavailable:pending-mysql"),
+            "{names:?}"
+        );
+
+        // The management publish entry drives the stored rule.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/publish",
+                json!({"topic": "pending/device", "payload": "{\"v\":1}", "qos": 1}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 202, "no subscriber: accepted for the rule path");
+
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/pending-mysql/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["total"], json!(1));
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/pending-good/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["total"], json!(1));
+        assert_eq!(metrics["metrics"]["success"], json!(1));
+        let (status, metrics) = server
+            .get_auth("/api/v5/rules/pending-rule/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["actions.failed"], json!(1));
+        assert_eq!(metrics["metrics"]["actions.success"], json!(1));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The licence endpoints have the shapes of the reference API and
@@ -7071,7 +7453,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-14-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-14-action", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -7278,7 +7660,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-13-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-13-action", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -8513,11 +8895,11 @@ connector_id = "legacy-good"
         let token = server.login_as_admin().await;
 
         // No `server`/`url` target: no probe runs, status is `connected`
-        // and the create path registers a live `http` sink.
+        // and the create path registers a live `pgsql` sink.
         let (status, created) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w023-http-conn", "type": "http"}),
+                json!({"name": "w023-http-conn", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8584,7 +8966,7 @@ connector_id = "legacy-good"
             let (status, _) = server
                 .post_auth(
                     "/api/v5/connectors",
-                    json!({"name": name, "type": "http"}),
+                    json!({"name": name, "type": "pgsql"}),
                     &token,
                 )
                 .await;
@@ -8673,7 +9055,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "tk03-dup-conn", "type": "http"}),
+                json!({"name": "tk03-dup-conn", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8683,7 +9065,7 @@ connector_id = "legacy-good"
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "tk03-dup-conn", "type": "http"}),
+                json!({"name": "tk03-dup-conn", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8697,7 +9079,7 @@ connector_id = "legacy-good"
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"id": "tk03-dup-conn", "type": "http"}),
+                json!({"id": "tk03-dup-conn", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8711,7 +9093,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "tk03-other-conn", "type": "http"}),
+                json!({"name": "tk03-other-conn", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8722,7 +9104,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .put_auth(
                 "/api/v5/connectors/tk03-dup-conn",
-                json!({"type": "http", "enable": true}),
+                json!({"type": "pgsql", "enable": true}),
                 &token,
             )
             .await;
@@ -8794,13 +9176,13 @@ connector_id = "legacy-good"
         let (status, created) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w317-list-conn", "type": "http"}),
+                json!({"name": "w317-list-conn", "type": "pgsql"}),
                 &token,
             )
             .await;
         assert_eq!(status, 201, "create must succeed, got: {created}");
         assert_eq!(created["id"], json!("w317-list-conn"));
-        assert_eq!(created["type"], json!("http"));
+        assert_eq!(created["type"], json!("pgsql"));
         assert!(created.get("status").and_then(|v| v.as_str()).is_some());
         assert!(created.get("node_status").is_some());
         // Live health linkage: create registered the sink through the
@@ -8839,7 +9221,7 @@ connector_id = "legacy-good"
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w317-list-conn", "type": "http"}),
+                json!({"name": "w317-list-conn", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8848,7 +9230,7 @@ connector_id = "legacy-good"
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"id": "w317-list-conn", "type": "http"}),
+                json!({"id": "w317-list-conn", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8875,7 +9257,7 @@ connector_id = "legacy-good"
             .await;
         assert_eq!(status, 400);
         let (status, _) = server
-            .post_auth("/api/v5/connectors", json!({"type": "http"}), &token)
+            .post_auth("/api/v5/connectors", json!({"type": "pgsql"}), &token)
             .await;
         assert_eq!(status, 400);
 
@@ -8884,7 +9266,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w317-exact", "type": "http"}),
+                json!({"name": "w317-exact", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8914,7 +9296,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w317-guarded", "type": "http"}),
+                json!({"name": "w317-guarded", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8922,7 +9304,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w317-guard-action", "type": "mqtt_bridge",
+                json!({"name": "w317-guard-action", "type": "console",
                        "server": "127.0.0.1:1883", "connector": "w317-guarded"}),
                 &token,
             )
@@ -8962,7 +9344,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w317-fire-conn", "type": "http"}),
+                json!({"name": "w317-fire-conn", "type": "pgsql"}),
                 &token,
             )
             .await;
@@ -8970,7 +9352,7 @@ connector_id = "legacy-good"
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w317-fire-conn", "type": "mqtt_bridge",
+                json!({"name": "w317-fire-conn", "type": "console",
                        "server": "127.0.0.1:1883"}),
                 &token,
             )
@@ -9060,14 +9442,14 @@ connector_id = "legacy-good"
         let (status, created) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w318-detail-conn", "type": "http",
+                json!({"name": "w318-detail-conn", "type": "webhook",
                        "url": "http://127.0.0.1:9"}),
                 &token,
             )
             .await;
         assert_eq!(status, 201, "create must succeed, got: {created}");
         assert_eq!(created["id"], json!("w318-detail-conn"));
-        assert_eq!(created["type"], json!("http"));
+        assert_eq!(created["type"], json!("webhook"));
         assert!(created.get("status").and_then(|v| v.as_str()).is_some());
         assert!(created.get("node_status").is_some());
         // Live linkage: create registered the sink through the same path
@@ -9088,7 +9470,7 @@ connector_id = "legacy-good"
             .await;
         assert_eq!(status, 200, "read hit must succeed, got: {body}");
         assert_eq!(body["id"], json!("w318-detail-conn"));
-        assert_eq!(body["type"], json!("http"));
+        assert_eq!(body["type"], json!("webhook"));
         assert_eq!(body["url"], json!("http://127.0.0.1:9"));
         assert!(body.get("status").and_then(|v| v.as_str()).is_some());
         assert!(body.get("node_status").is_some());
@@ -9131,7 +9513,7 @@ connector_id = "legacy-good"
         let (status, updated) = server
             .put_auth(
                 "/api/v5/connectors/w318-detail-conn",
-                json!({"name": "w318-detail-conn", "type": "http",
+                json!({"name": "w318-detail-conn", "type": "webhook",
                        "url": "http://127.0.0.1:10",
                        "description": "updated by w318"}),
                 &token,
@@ -9151,7 +9533,7 @@ connector_id = "legacy-good"
         let (status, body) = server
             .put_auth(
                 "/api/v5/connectors/w318-no-such",
-                json!({"name": "w318-no-such", "type": "http",
+                json!({"name": "w318-no-such", "type": "webhook",
                        "url": "http://127.0.0.1:9"}),
                 &token,
             )
@@ -9173,7 +9555,7 @@ connector_id = "legacy-good"
             ("missing type", json!({"name": "w318-detail-conn"})),
             (
                 "body id mismatch",
-                json!({"id": "w318-other", "name": "w318-other", "type": "http"}),
+                json!({"id": "w318-other", "name": "w318-other", "type": "webhook"}),
             ),
         ] {
             let (status, body) = server
@@ -12942,528 +13324,208 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn s101_no_default_credentials_rejects_and_accepts() {
+        // S1-01: a connector without its required credential is rejected
+        // with the missing field named, and registers nothing.
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
-        // Fixed test RSA key (never stored, never deployed).
-        // Test-only fixture; no shipped path can reach it (`#[cfg(test)]` only).
-        let test_pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEArN5HvmgO5xgYLzTqq5mIW+ZFEM20TFz5C0bC0hP3mR13f9od\n7PiABrYWbLIwfWftR9+riLY5MOUZiZFioRdAsMBjtNy+E0/wfU/VwN1uqaFi9ww6\nSc2hmqvnDcdnD9H55Zu+2QmhSjD0nLNJczC2ceqYM4Q0nQw4EqbxHkcZ+/0p9uI8\nPFy90G0wSTwBErthZYe6xE5DIkzRThFmwm0l2PPt30tIVP8UssxTYYJggNlIYaMT\n79C3i0Nl7ImUyDexL029qAJfVOVc17Zrv9VACypuSA4QIAVarH0J3lJ3hi+ZHAJR\npiZ6Ex+Z+VPbtAmMczizpa3zt/NDhBj3NHWbVQIDAQABAoIBADbMc8O5Ktg4/Bmi\n1a02C1LOiSBNhRUb99qKQOHlcHy6KZJ+6zOehr8Z47vrNJHcawx4q+C3myOTzGee\njbxxKZGeOz0vKJXoplyi/SiZSSY+wad82dFhfRQR4Dmu9029i1Es8O/OLLHfGPu/\nnc4FKCCudDcIdsE+CVxoTVECywrk7S66ziHFLKZBIaB5pTbX0tsjyhvdrun7rYBN\n/iF97u0DeQi+odntQFtgdkOg1jiz4ffrA3JMjfO+CJGnRy5PmckQv/a5Md06Av4R\nTrsIcDK8G3GB4Phfkans1R5EFS0aQ8ergeiaPPAEeMCF/BXdTA6y+2em/dUOzLPX\nfasTsLUCgYEA4zU7lEFmfeEvuL6cKD+QKJn1rpwXCDSVsPxDE7N6omrwrELVg+7E\nsefWSvHSUk3xDtUmgywoUj+osUtkHMkMjCW4rLGsWKxRPEXSbUHKPP/prn7XA+oL\n70XsKAzG1jZiJMb5QxaEyDO7bnIBKOksh1THz81TL0XilkFrzb5Ewl8CgYEAwsY8\nMQMEXbzFE9t4D7pZ0SOFRBfaoRk7KxCjcve7Hlx5Dw/EC3GpfpKDj7MEQclZ7bfy\nwilOXUg0F564gL0MdeCN2EwsMjnGtVnOpEZt8kiBG36sF+CMTaXlwkveUiyg8m3c\nlxSp3swdJV4O56IYhr1HDch6cUru8/vU+2SmxssCgYEAjRkS3dfbiVLd6vHcUhZf\nNQefjgb7OqpFR7rxAPwVrWWR/rgmlp8h4YWjC7mvLlOe3uI53339sE4+OZQjIMku\nFJ6cWAqiiBLDBBYsPpN7v3QBr86vQowHS1l19c0xcfgl7MbwJtyGKzoNLOJ5m+lq\nMMTSrVbKUPIqa7tG8mc1lisCgYBlq9kLtIl47OrrHKslep8b3rDYBKOpaGRMbJkF\nkG9qv9apmA878g8J9S0bu9TDCnoY7uaXl7xCUUhv8/hXq1dvyNICUHDZnvMtAz4s\n3l7SFCrg0VS/+gUDG1A+BiB9QLKbGeIGM1Eg7edg9CJPo3uuCeunNDlGHllxnslk\nmPu91QKBgQCw2vZ5xhHbkCljOD9Hb+2L2y7ZbSgAnUgyE/vAkmAlZYreP+SyzrPe\n+kTnWrZuCvc0x+G7zv6mv3CIcZM0CHN1hdJa1Y/C3n1s06kJjgwGvgP9h6a/m9al\neIave8nupkT7zrwPbv9MJlWrtqplLBHSMG3dnsKd+iLdEEdhg8GK5Q==\n-----END RSA PRIVATE KEY-----".to_string();
-
-        // gcp_iot without a key is 400 naming the field, and registers nothing.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
+        for (name, body, field) in [
+            (
+                "s101-gcp-no-key",
                 json!({"name": "s101-gcp-no-key", "type": "gcp_iot",
                        "project_id": "e2e-project", "cloud_region": "us-central1",
                        "registry_id": "e2e-registry", "device_id": "e2e-device"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400);
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("private_key_pem"),
-            "missing key must be named, got: {body}"
-        );
-        assert!(state.engine.connectors().get("s101-gcp-no-key").is_none());
-
-        // gcp_iot with a key is 201 and live when the feature is
-        // enabled; X1-09 disabled builds fail closed naming the feature.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "s101-gcp-1", "type": "gcp_iot",
-                       "project_id": "e2e-project", "cloud_region": "us-central1",
-                       "registry_id": "e2e-registry", "device_id": "e2e-device",
-                       "private_key_pem": test_pem}),
-                &token,
-            )
-            .await;
-        if cfg!(feature = "gcp_iot") {
-            assert_eq!(status, 201);
-            assert!(state.engine.connectors().get("s101-gcp-1").is_some());
-        } else {
-            assert_eq!(status, 400);
-            assert!(
-                body["message"].as_str().unwrap_or("").contains("gcp_iot"),
-                "disabled gcp_iot must name the feature, got: {body}"
-            );
-            assert!(state.engine.connectors().get("s101-gcp-1").is_none());
-        }
-
-        // snowflake without a key is 400 naming the field.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
+                "private_key_pem",
+            ),
+            (
+                "s101-snow-no-key",
                 json!({"name": "s101-snow-no-key", "type": "snowflake",
                        "account": "xy12345.us-east-1", "user": "indra_loader",
                        "database": "IOT", "schema": "PUBLIC", "table": "TELEMETRY"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400);
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("private_key_pem"),
-            "missing key must be named, got: {body}"
-        );
-        assert!(state.engine.connectors().get("s101-snow-no-key").is_none());
-
-        // snowflake with a key is 201 and live.
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "s101-snow-1", "type": "snowflake",
-                       "account": "xy12345.us-east-1", "user": "indra_loader",
-                       "database": "IOT", "schema": "PUBLIC", "table": "TELEMETRY",
-                       "private_key_pem": test_pem}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 201);
-        assert!(state.engine.connectors().get("s101-snow-1").is_some());
-
-        // oci without a key is 400 naming the field.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
+                "private_key_pem",
+            ),
+            (
+                "s101-oci-no-key",
                 json!({"name": "s101-oci-no-key", "type": "oci_streaming",
                        "stream_pool_id": "ocid1.streampool.oc1..testpool",
                        "stream_id": "ocid1.stream.oc1..teststream",
                        "tenancy_ocid": "ocid1.tenancy.oc1..test",
                        "user_ocid": "ocid1.user.oc1..test",
                        "fingerprint": "20:3b:97:13:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400);
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("private_key_pem"),
-            "missing key must be named, got: {body}"
-        );
-        assert!(state.engine.connectors().get("s101-oci-no-key").is_none());
-
-        // oci with a key is 201 and live (dummy loopback endpoint so the
-        // reachability probe passes without touching any cloud).
-        let oci_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind dummy");
-        let oci_endpoint = format!(
-            "http://127.0.0.1:{}",
-            oci_listener.local_addr().expect("addr").port()
-        );
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "s101-oci-1", "type": "oci_streaming",
-                       "stream_pool_id": "ocid1.streampool.oc1..testpool",
-                       "stream_id": "ocid1.stream.oc1..teststream",
-                       "tenancy_ocid": "ocid1.tenancy.oc1..test",
-                       "user_ocid": "ocid1.user.oc1..test",
-                       "fingerprint": "20:3b:97:13:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55",
-                       "private_key_pem": test_pem,
-                       "endpoint": oci_endpoint}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 201);
-        assert!(state.engine.connectors().get("s101-oci-1").is_some());
-        drop(oci_listener);
-
-        // databricks without a token is 400 naming the field.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
+                "private_key_pem",
+            ),
+            (
+                "s101-db-no-token",
                 json!({"name": "s101-db-no-token", "type": "databricks",
                        "host": "my-workspace.cloud.databricks.com",
                        "catalog": "main", "schema": "default", "table": "events"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400);
-        assert!(
-            body["message"].as_str().unwrap_or("").contains("token"),
-            "missing token must be named, got: {body}"
-        );
-        assert!(state.engine.connectors().get("s101-db-no-token").is_none());
-
-        // databricks with a token is 201 and live (dummy loopback target so
-        // the reachability probe passes without touching any workspace).
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind dummy");
-        let port = listener.local_addr().expect("addr").port();
-        let host = format!("127.0.0.1:{port}");
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "s101-db-1", "type": "databricks",
-                       "host": host, "token": "dapi-test-token",
-                       "catalog": "main", "schema": "default", "table": "events"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 201);
-        assert!(state.engine.connectors().get("s101-db-1").is_some());
-        drop(listener);
-
-        // tablestore without secrets is 400 naming the field.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
+                "token",
+            ),
+            (
+                "s101-ots-no-key",
                 json!({"name": "s101-ots-no-key", "type": "tablestore",
                        "instance_name": "test-instance-1", "table_name": "sensor_data",
                        "access_key_id": "test-ak-1"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400);
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("access_key_secret"),
-            "missing secret must be named, got: {body}"
-        );
-        assert!(state.engine.connectors().get("s101-ots-no-key").is_none());
-
-        // tablestore with secrets is 201 and live (dummy loopback endpoint
-        // so the reachability probe passes without touching any cloud).
-        let ots_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind dummy");
-        let ots_endpoint = format!(
-            "http://127.0.0.1:{}",
-            ots_listener.local_addr().expect("addr").port()
-        );
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "s101-ots-1", "type": "tablestore",
-                       "instance_name": "test-instance-1", "table_name": "sensor_data",
-                       "access_key_id": "test-ak-1", "access_key_secret": "test-sk-1",
-                       "endpoint": ots_endpoint}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 201);
-        assert!(state.engine.connectors().get("s101-ots-1").is_some());
-        drop(ots_listener);
-
-        // confluent without credentials is 400 naming the field.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
+                "access_key_secret",
+            ),
+            (
+                "s101-conf-no-key",
                 json!({"name": "s101-conf-no-key", "type": "confluent",
                        "bootstrap_servers": "127.0.0.1:9092",
                        "topic": "telemetry-events"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400);
-        assert!(
-            body["message"].as_str().unwrap_or("").contains("api_key"),
-            "missing key must be named, got: {body}"
-        );
-        assert!(state.engine.connectors().get("s101-conf-no-key").is_none());
-
-        // Confluent with credentials is 201 and live when enabled.
-        // Disabled builds fail closed and name the feature.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "s101-conf-1", "type": "confluent",
-                       "bootstrap_servers": "127.0.0.1:9092",
-                       "topic": "telemetry-events",
-                       "api_key": "s101-cc-key",
-                       "api_secret": "s101-cc-secret"}),
-                &token,
-            )
-            .await;
-        if cfg!(feature = "confluent") {
-            assert_eq!(status, 201);
-            assert!(state.engine.connectors().get("s101-conf-1").is_some());
-        } else {
-            assert_eq!(status, 400);
-            assert!(
-                body["message"].as_str().unwrap_or("").contains("confluent"),
-                "disabled confluent must name the feature, got: {body}"
-            );
-            assert!(state.engine.connectors().get("s101-conf-1").is_none());
-        }
-
-        // azure_eventhubs without a key is 400 naming the field.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
+                "api_key",
+            ),
+            (
+                "s101-eh-no-key",
                 json!({"name": "s101-eh-no-key", "type": "azure_eventhubs",
                        "namespace": "s101ns", "event_hub": "s101hub"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400);
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("shared_access_key"),
-            "missing key must be named, got: {body}"
-        );
-        assert!(state.engine.connectors().get("s101-eh-no-key").is_none());
-
-        // azure_eventhubs with a key is 201 and live when enabled;
-        // X1-09 disabled builds fail closed naming the feature.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "s101-eh-1", "type": "azure_eventhubs",
-                       "namespace": "s101ns", "event_hub": "s101hub",
-                       "shared_access_key_name": "SendPolicy",
-                       "shared_access_key": "dGVzdC1rZXktb3BlcmF0b3Itc3VwcGxpZWQ="}),
-                &token,
-            )
-            .await;
-        if cfg!(feature = "azure_eventhubs") {
-            assert_eq!(status, 201);
-            assert!(state.engine.connectors().get("s101-eh-1").is_some());
-        } else {
-            assert_eq!(status, 400);
-            assert!(
-                body["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("azure_eventhubs"),
-                "disabled azure_eventhubs must name the feature, got: {body}"
-            );
-            assert!(state.engine.connectors().get("s101-eh-1").is_none());
-        }
-
-        // azure_iot without a key is 400 naming the field.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
+                "shared_access_key",
+            ),
+            (
+                "s101-aiot-no-key",
                 json!({"name": "s101-aiot-no-key", "type": "azure_iot",
                        "iot_hub_name": "127.0.0.1:8883",
                        "device_id": "s101-device"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400);
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("shared_access_key"),
-            "missing key must be named, got: {body}"
-        );
-        assert!(state.engine.connectors().get("s101-aiot-no-key").is_none());
+                "shared_access_key",
+            ),
+        ] {
+            let (status, body) = server.post_auth("/api/v5/connectors", body, &token).await;
+            assert_eq!(status, 400, "missing credential for {name}: {body}");
+            assert!(
+                body["message"].as_str().unwrap_or("").contains(field),
+                "missing {field} must be named for {name}, got: {body}"
+            );
+            assert!(
+                state.engine.connectors().get(name).is_none(),
+                "{name} registers no sink"
+            );
+        }
 
-        // azure_iot with a key is 201 and live when enabled;
-        // X1-09 disabled builds fail closed naming the feature.
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "s101-aiot-1", "type": "azure_iot",
-                       "iot_hub_name": "127.0.0.1:8883",
-                       "device_id": "s101-device",
-                       "shared_access_key": "dGVzdC1rZXktb3BlcmF0b3Itc3VwcGxpZWQ="}),
+                json!({"name": "s101-ready", "type": "pgsql"}),
                 &token,
             )
             .await;
-        if cfg!(feature = "azure_iot") {
-            assert_eq!(status, 201);
-            assert!(state.engine.connectors().get("s101-aiot-1").is_some());
-        } else {
-            assert_eq!(status, 400);
-            assert!(
-                body["message"].as_str().unwrap_or("").contains("azure_iot"),
-                "disabled azure_iot must name the feature, got: {body}"
-            );
-            assert!(state.engine.connectors().get("s101-aiot-1").is_none());
-        }
+        assert_eq!(status, 201, "ready kind still stores: {body}");
+        assert!(state.engine.connectors().get("s101-ready").is_some());
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/s101-ready", &token)
+            .await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]
     async fn cf05_v5_connector_create_refuses_sink_build_failure() {
-        // CF-05: the v5 create path refuses a connector whose sink
-        // fails to build. Each case runs through HTTP on the live
-        // engine, and the refused entry stays out of the store.
+        // CF-05: the v5 create path refuses a pending kind. The v1 path is
+        // unchanged and still runs each sink builder and refuses its bad
+        // config with the builder text.
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
-        // Datalayers with both auth modes set: the sink refuses the
-        // conflict, so create answers 400 with the sink text.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "cf05-dl-conflict", "type": "datalayers",
-                       "endpoint": "http://127.0.0.1:8360", "database": "factory_db",
-                       "table": "sensor_events", "token": "cf05-token",
-                       "username": "cf05-user", "password": "cf05-pass"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400, "conflicting auth must fail, got: {body}");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("auth modes conflict"),
-            "refusal carries the sink text, got: {body}"
-        );
-        assert!(state.engine.connectors().get("cf05-dl-conflict").is_none());
-
-        // Datalayers with a username and no password: the sink refuses
-        // the half pair, so create answers 400 with the sink text.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "cf05-dl-half", "type": "datalayers",
-                       "endpoint": "http://127.0.0.1:8360", "database": "factory_db",
-                       "table": "sensor_events", "username": "cf05-user"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400, "half auth pair must fail, got: {body}");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("both username and password"),
-            "refusal carries the sink text, got: {body}"
-        );
-        assert!(state.engine.connectors().get("cf05-dl-half").is_none());
-
-        // GreptimeDB with an empty database: the sink refuses it.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "cf05-greptime-empty", "type": "greptimedb",
-                       "endpoint": "http://127.0.0.1:4000/v1", "database": ""}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400, "empty database must fail, got: {body}");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
-        assert!(
-            body["message"].as_str().unwrap_or("").contains("database"),
-            "refusal carries the sink text, got: {body}"
-        );
-        assert!(state
-            .engine
-            .connectors()
-            .get("cf05-greptime-empty")
-            .is_none());
-
-        // OpenTSDB with an empty metric: the sink refuses it.
-        let (status, body) = server
-            .post_auth(
-                "/api/v5/connectors",
-                json!({"name": "cf05-opentsdb-empty", "type": "opentsdb",
-                       "endpoint": "http://127.0.0.1:4242", "metric": ""}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400, "empty metric must fail, got: {body}");
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
-        assert!(
-            body["message"].as_str().unwrap_or("").contains("metric"),
-            "refusal carries the sink text, got: {body}"
-        );
-        assert!(state
-            .engine
-            .connectors()
-            .get("cf05-opentsdb-empty")
-            .is_none());
-
-        // None of the refused entries reached the store.
-        let (status, list) = server.get_auth("/api/v5/connectors", &token).await;
-        assert_eq!(status, 200);
-        let ids: Vec<&str> = list
-            .as_array()
-            .expect("connector list")
-            .iter()
-            .filter_map(|row| {
-                row.get("id")
-                    .or_else(|| row.get("name"))
-                    .and_then(|v| v.as_str())
-            })
-            .collect();
-        for refused in [
-            "cf05-dl-conflict",
-            "cf05-dl-half",
-            "cf05-greptime-empty",
-            "cf05-opentsdb-empty",
+        for (name, kind) in [
+            ("cf05-dl-conflict", "datalayers"),
+            ("cf05-greptime-empty", "greptimedb"),
+            ("cf05-opentsdb-empty", "opentsdb"),
         ] {
-            assert!(!ids.contains(&refused), "{refused} must not be stored");
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/connectors",
+                    json!({"name": name, "type": kind, "endpoint": "http://127.0.0.1:9"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} create must be refused: {body}");
+            assert_eq!(body["code"], json!("ALREADY_EXISTS"), "{kind}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("not available in this broker"),
+                "{kind} refusal names the kind: {body}"
+            );
+            assert!(state.engine.connectors().get(name).is_none());
         }
 
-        // The native entry answers 400 for the same bad config.
-        let (status, refused) = server
-            .post_auth(
-                "/api/v1/connectors",
-                json!({"id": "cf05-dl-v1", "kind": "datalayers",
-                       "config": {"endpoint": "http://127.0.0.1:8360",
-                                  "database": "factory_db", "table": "sensor_events",
-                                  "auth_token": "cf05-token",
-                                  "username": "cf05-user", "password": "cf05-pass"}}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400, "native entry refuses too, got: {refused}");
+        // The native entry still runs each sink builder and refuses its
+        // bad config with the builder text.
+        for (id, kind, config, text) in [
+            (
+                "cf05-dl-conflict",
+                "datalayers",
+                json!({"endpoint": "http://127.0.0.1:8360",
+                       "database": "factory_db", "table": "sensor_events",
+                       "auth_token": "cf05-token",
+                       "username": "cf05-user", "password": "cf05-pass"}),
+                "auth modes conflict",
+            ),
+            (
+                "cf05-dl-half",
+                "datalayers",
+                json!({"endpoint": "http://127.0.0.1:8360",
+                       "database": "factory_db", "table": "sensor_events",
+                       "username": "cf05-user"}),
+                "both username and password",
+            ),
+            (
+                "cf05-greptime-empty",
+                "greptimedb",
+                json!({"endpoint": "http://127.0.0.1:4000/v1", "database": "",
+                       "table_template": "events"}),
+                "database",
+            ),
+            (
+                "cf05-opentsdb-empty",
+                "opentsdb",
+                json!({"endpoint": "http://127.0.0.1:4242",
+                       "metric_template": "", "value_field": "value"}),
+                "metric",
+            ),
+        ] {
+            let (status, refused) = server
+                .post_auth(
+                    "/api/v1/connectors",
+                    json!({"id": id, "kind": kind, "config": config}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{id} builder must refuse, got: {refused}");
+            assert!(
+                refused["error"].as_str().unwrap_or("").contains(text),
+                "{id} refusal carries the sink text, got: {refused}"
+            );
+        }
 
-        // Update path: a valid entry stays, then a conflicting replace
-        // fails and the stored entry keeps its old fields.
+        // A refused update keeps the stored ready record.
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "cf05-dl-1", "type": "datalayers",
-                       "endpoint": "http://127.0.0.1:8360", "database": "factory_db",
-                       "table": "sensor_events"}),
+                json!({"name": "cf05-keep", "type": "webhook", "url": "http://127.0.0.1:9"}),
                 &token,
             )
             .await;
         assert_eq!(status, 201);
-        assert!(state.engine.connectors().get("cf05-dl-1").is_some());
         let (status, body) = server
             .put_auth(
-                "/api/v5/connectors/cf05-dl-1",
-                json!({"id": "cf05-dl-1", "type": "datalayers",
-                       "endpoint": "http://127.0.0.1:8360", "database": "factory_db",
-                       "table": "sensor_events", "token": "cf05-token",
-                       "username": "cf05-user", "password": "cf05-pass"}),
+                "/api/v5/connectors/cf05-keep",
+                json!({"name": "cf05-keep", "type": "datalayers",
+                       "endpoint": "http://127.0.0.1:8360"}),
                 &token,
             )
             .await;
-        assert_eq!(status, 400, "conflicting replace must fail, got: {body}");
+        assert_eq!(status, 400, "pending replace must fail, got: {body}");
         assert_eq!(body["code"], json!("BAD_REQUEST"));
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("auth modes conflict"),
-            "refusal carries the sink text, got: {body}"
-        );
         let (status, kept) = server
-            .get_auth("/api/v5/connectors/cf05-dl-1", &token)
+            .get_auth("/api/v5/connectors/cf05-keep", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(kept["database"], json!("factory_db"));
-        assert_eq!(kept["table"], json!("sensor_events"));
-        assert!(state.engine.connectors().get("cf05-dl-1").is_some());
+        assert_eq!(kept["type"], json!("webhook"));
+        assert_eq!(kept["url"], json!("http://127.0.0.1:9"));
         let (status, _) = server
-            .delete_auth("/api/v5/connectors/cf05-dl-1", &token)
+            .delete_auth("/api/v5/connectors/cf05-keep", &token)
             .await;
         assert_eq!(status, 204);
     }
@@ -13481,8 +13543,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, created) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "cf05-dl-down", "type": "datalayers",
-                       "endpoint": "http://127.0.0.1:9", "database": "factory_db",
+                json!({"name": "cf05-dl-down", "type": "pgsql",
+                       "server": "127.0.0.1:9", "database": "factory_db",
                        "table": "sensor_events"}),
                 &token,
             )
@@ -14448,13 +14510,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-02-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-02-action", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
         assert_eq!(status, 201);
         assert_eq!(body["id"], json!("w3-02-action"));
-        assert_eq!(body["type"], json!("mqtt_bridge"));
+        assert_eq!(body["type"], json!("console"));
         // List shows it with paging metadata.
         let (status, body) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
@@ -14470,7 +14532,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-02-action", "type": "mqtt_bridge"}),
+                json!({"name": "w3-02-action", "type": "console"}),
                 &token,
             )
             .await;
@@ -14506,7 +14568,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "linked-action", "type": "mqtt_bridge"}),
+                json!({"name": "linked-action", "type": "console"}),
                 &token,
             )
             .await;
@@ -14562,7 +14624,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-03-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-03-action", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -14573,7 +14635,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["id"], json!("w3-03-action"));
-        assert_eq!(body["type"], json!("mqtt_bridge"));
+        assert_eq!(body["type"], json!("console"));
         assert_eq!(body["server"], json!("127.0.0.1:1883"));
         // Unknown query parameters are ignored on the single read.
         let (status, _) = server
@@ -14584,26 +14646,26 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .put_auth(
                 "/api/v5/actions/w3-03-action",
-                json!({"type": "kafka", "topic": "events-updated", "enable": false}),
+                json!({"type": "console", "topic": "events-updated", "enable": false}),
                 &token,
             )
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["id"], json!("w3-03-action"));
-        assert_eq!(body["type"], json!("kafka"));
+        assert_eq!(body["type"], json!("console"));
         assert_eq!(body["enable"], json!(false));
         // Read again sees the new values.
         let (status, body) = server
             .get_auth("/api/v5/actions/w3-03-action", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("kafka"));
+        assert_eq!(body["type"], json!("console"));
         assert_eq!(body["topic"], json!("events-updated"));
         // Update of an unknown id is 404 and creates nothing.
         let (status, body) = server
             .put_auth(
                 "/api/v5/actions/no-such-action",
-                json!({"type": "kafka"}),
+                json!({"type": "console"}),
                 &token,
             )
             .await;
@@ -14637,12 +14699,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/actions/w3-03-action", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("kafka"));
+        assert_eq!(body["type"], json!("console"));
         // Mismatched body id is rejected instead of renaming.
         let (status, body) = server
             .put_auth(
                 "/api/v5/actions/w3-03-action",
-                json!({"id": "other-action", "type": "kafka"}),
+                json!({"id": "other-action", "type": "console"}),
                 &token,
             )
             .await;
@@ -14712,7 +14774,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-04-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-04-action", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -14927,7 +14989,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w3-19-conn", "type": "http", "url": "http://127.0.0.1:9"}),
+                json!({"name": "w3-19-conn", "type": "webhook", "url": "http://127.0.0.1:9"}),
                 &token,
             )
             .await;
@@ -14988,7 +15050,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-19-conn", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-19-conn", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -15110,7 +15172,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server_a
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "ap-10-isolated", "type": "http", "url": "http://127.0.0.1:9"}),
+                json!({"name": "ap-10-isolated", "type": "webhook", "url": "http://127.0.0.1:9"}),
                 &token_a,
             )
             .await;
@@ -15215,7 +15277,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w3-20-conn", "type": "http", "url": "http://127.0.0.1:9"}),
+                json!({"name": "w3-20-conn", "type": "webhook", "url": "http://127.0.0.1:9"}),
                 &token,
             )
             .await;
@@ -15278,7 +15340,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-20-conn", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-20-conn", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -15472,7 +15534,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "w3-22-conn", "type": "http", "url": "http://127.0.0.1:9"}),
+                json!({"name": "w3-22-conn", "type": "webhook", "url": "http://127.0.0.1:9"}),
                 &token,
             )
             .await;
@@ -15527,7 +15589,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-22-conn", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-22-conn", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -15698,7 +15760,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-06-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-06-action", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -15936,7 +15998,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-09-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-09-action", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -16104,7 +16166,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "sum-act-a", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "sum-act-a", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -16112,7 +16174,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "sum-act-b", "type": "mqtt_bridge", "server": "127.0.0.1:1883", "enable": false}),
+                json!({"name": "sum-act-b", "type": "console", "server": "127.0.0.1:1883", "enable": false}),
                 &token,
             )
             .await;
@@ -16211,7 +16273,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "w3-05-action", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"name": "w3-05-action", "type": "console", "server": "127.0.0.1:1883"}),
                 &token,
             )
             .await;
@@ -16387,7 +16449,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 201, "webhook connector creates");
         let defaults = json!({
             "name": "ro-default-action",
-            "type": "http",
+            "type": "webhook",
             "connector": "ro-hook",
             "parameters": {"path": "/hook"},
             "resource_opts": {
@@ -16415,7 +16477,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "/api/v5/actions",
                 json!({
                     "name": "ro-refused-action",
-                    "type": "http",
+                    "type": "webhook",
                     "connector": "ro-hook",
                     "parameters": {"path": "/hook"},
                     "resource_opts": {"health_check_interval_jitter": "1s"},
@@ -16441,7 +16503,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "/api/v5/actions",
                 json!({
                     "name": "ro-batch-action",
-                    "type": "http",
+                    "type": "webhook",
                     "connector": "ro-hook",
                     "parameters": {"path": "/hook"},
                     "resource_opts": {
@@ -16586,7 +16648,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "/api/v5/actions",
                 json!({
                     "name": name,
-                    "type": "http",
+                    "type": "webhook",
                     "connector": "ro-refusal-hook",
                     "parameters": {"path": "/new"},
                     "resource_opts": opts,
@@ -16608,7 +16670,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "/api/v5/actions/ro-refusal-action",
                 json!({
                     "name": "ro-refusal-action",
-                    "type": "http",
+                    "type": "webhook",
                     "connector": "ro-refusal-hook",
                     "parameters": {"path": "/new"},
                     "resource_opts": opts,
@@ -16658,7 +16720,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "/api/v5/actions",
                 json!({
                     "name": "ro-refusal-action",
-                    "type": "http",
+                    "type": "webhook",
                     "connector": "ro-refusal-hook",
                     "parameters": {"path": "/old"},
                 }),
@@ -16720,7 +16782,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "/api/v5/actions",
                 json!({
                     "name": "ro-health-action",
-                    "type": "http",
+                    "type": "webhook",
                     "connector": "ro-health-hook",
                     "parameters": {"path": "/health"},
                     "resource_opts": {"health_check_interval": "20ms"},
@@ -16791,7 +16853,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "/api/v5/actions",
                 json!({
                     "name": "ro-endpoint-action",
-                    "type": "http",
+                    "type": "webhook",
                     "connector": "ro-endpoint-hook",
                     "parameters": {"path": "/endpoint"},
                     "resource_opts": {"health_check_interval": "20ms"},
@@ -16868,7 +16930,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-29-source", "type": "mqtt"}),
+                json!({"name": "w3-29-source", "type": "console"}),
                 &token,
             )
             .await;
@@ -17287,7 +17349,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         // reports zeroes (W3-31 restores the source directory, so the
         // absence check reads the live summary, not a 404).
         let (status, _) = server
-            .post_auth("/api/v5/sources_probe", json!({"type": "mqtt"}), &token)
+            .post_auth("/api/v5/sources_probe", json!({"type": "console"}), &token)
             .await;
         assert_eq!(status, 204);
         let (status, body) = server.get_auth("/api/v5/sources_summary", &token).await;
@@ -17301,7 +17363,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/sources_probe",
-                json!({"type": "http", "url": "http://127.0.0.1:9"}),
+                json!({"type": "webhook", "url": "http://127.0.0.1:9"}),
                 &token,
             )
             .await;
@@ -17343,7 +17405,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "sum-src-a", "type": "mqtt"}),
+                json!({"name": "sum-src-a", "type": "console"}),
                 &token,
             )
             .await;
@@ -17351,7 +17413,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "sum-src-b", "type": "http", "enable": false}),
+                json!({"name": "sum-src-b", "type": "console", "enable": false}),
                 &token,
             )
             .await;
@@ -17430,13 +17492,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-26-source", "type": "mqtt"}),
+                json!({"name": "w3-26-source", "type": "console"}),
                 &token,
             )
             .await;
         assert_eq!(status, 201);
         assert_eq!(body["id"], json!("w3-26-source"));
-        assert_eq!(body["type"], json!("mqtt"));
+        assert_eq!(body["type"], json!("console"));
         // List shows it with paging metadata.
         let (status, body) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
@@ -17452,7 +17514,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-26-source", "type": "mqtt"}),
+                json!({"name": "w3-26-source", "type": "console"}),
                 &token,
             )
             .await;
@@ -17497,7 +17559,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-27-source", "type": "mqtt"}),
+                json!({"name": "w3-27-source", "type": "console"}),
                 &token,
             )
             .await;
@@ -17508,7 +17570,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["id"], json!("w3-27-source"));
-        assert_eq!(body["type"], json!("mqtt"));
+        assert_eq!(body["type"], json!("console"));
         assert_eq!(body["enable"], json!(true));
         // Unknown query parameters are ignored on the single read.
         let (status, _) = server
@@ -17519,26 +17581,26 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/w3-27-source",
-                json!({"type": "http", "enable": false}),
+                json!({"type": "console", "enable": false}),
                 &token,
             )
             .await;
         assert_eq!(status, 200);
         assert_eq!(body["id"], json!("w3-27-source"));
-        assert_eq!(body["type"], json!("http"));
+        assert_eq!(body["type"], json!("console"));
         assert_eq!(body["enable"], json!(false));
         // Read again sees the new values.
         let (status, body) = server
             .get_auth("/api/v5/sources/w3-27-source", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("http"));
+        assert_eq!(body["type"], json!("console"));
         assert_eq!(body["enable"], json!(false));
         // Update of an unknown id is 404 and creates nothing.
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/no-such-source",
-                json!({"type": "http"}),
+                json!({"type": "console"}),
                 &token,
             )
             .await;
@@ -17572,12 +17634,12 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/sources/w3-27-source", &token)
             .await;
         assert_eq!(status, 200);
-        assert_eq!(body["type"], json!("http"));
+        assert_eq!(body["type"], json!("console"));
         // Mismatched body id is rejected instead of renaming.
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/w3-27-source",
-                json!({"id": "other-source", "type": "http"}),
+                json!({"id": "other-source", "type": "console"}),
                 &token,
             )
             .await;
@@ -17603,7 +17665,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "restart-src", "type": "mqtt"}),
+                json!({"name": "restart-src", "type": "console"}),
                 &token,
             )
             .await;
@@ -17677,7 +17739,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-23-src", "type": "mqtt"}),
+                json!({"name": "w3-23-src", "type": "console"}),
                 &token,
             )
             .await;
@@ -17811,7 +17873,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-28-src", "type": "mqtt"}),
+                json!({"name": "w3-28-src", "type": "console"}),
                 &token,
             )
             .await;
@@ -17979,7 +18041,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w3-24-src", "type": "mqtt"}),
+                json!({"name": "w3-24-src", "type": "console"}),
                 &token,
             )
             .await;
@@ -20594,7 +20656,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         for (path, body) in [
             (
                 "/api/v5/connectors_probe",
-                json!({"type": "http", "url": "http://127.0.0.1:9"}),
+                json!({"type": "webhook", "url": "http://127.0.0.1:9"}),
             ),
             (
                 "/api/v5/actions_probe",
@@ -20713,7 +20775,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors_probe",
-                json!({"type": "http", "url": "http://127.0.0.1:9"}),
+                json!({"type": "webhook", "url": "http://127.0.0.1:9"}),
                 &token,
             )
             .await;
@@ -20896,16 +20958,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn action_types_lists_documented_names() {
-        // AP-05: GET /action_types returns the documented names as a
-        // bare string array, limited to the runtimes in this build. The
-        // old shape (objects with kind plus configuration) contradicts
-        // the documented array of strings, so the test changed with the
-        // handler. An unknown query parameter is ignored.
-        // Broker-through: the request goes through the served management
-        // API on `ApiState` (the same state the kernel shares in
-        // `crates/broker-node/src/main.rs`, `serve_api`); the list is a
-        // static snapshot read only on this management GET and never
-        // consulted on publish or deliver.
+        // AP-05/KC-00: GET /action_types returns a bare string array of
+        // the kinds that are ready in this build. It never lists a
+        // pending or refused kind.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
@@ -20916,25 +20971,23 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let kinds: std::collections::HashSet<&str> =
             names.iter().filter_map(|e| e.as_str()).collect();
         assert_eq!(kinds.len(), names.len(), "names must be unique strings");
-        // The console order starts with http, mqtt and kafka. Every name
-        // stays inside the documented enum.
-        for expected in ["http", "mqtt", "kafka_producer", "redis", "mysql", "pgsql"] {
-            assert!(kinds.contains(expected), "type list holds '{expected}'");
-        }
-        for missing in [
-            "bigtable",
-            "quasardb",
-            "syskeeper_forwarder",
-            "matrix",
-            "azure_event_grid",
-        ] {
+        assert!(
+            kinds.contains("pgsql"),
+            "type list holds the documented ready kind pgsql"
+        );
+        for pending in ["http", "mqtt", "kafka_producer", "redis", "mysql"] {
             assert!(
-                !kinds.contains(missing),
-                "type list has no '{missing}' without a runtime"
+                !kinds.contains(pending),
+                "type list has no pending '{pending}'"
+            );
+        }
+        for name in &kinds {
+            assert!(
+                broker_config::is_kind_ready(name),
+                "listed kind {name} is ready"
             );
         }
 
-        // Unknown query parameters are ignored, never an error.
         let (status, again) = server
             .get_auth("/api/v5/action_types?unknown=param", &token)
             .await;
@@ -20944,50 +20997,61 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn source_types_lists_documented_names() {
-        // AP-05: GET /source_types returns the documented names as a
-        // bare string array, limited to the runtimes in this build. The
-        // old shape (objects with kind plus configuration) contradicts
-        // the documented array of strings, so the test changed with the
-        // handler. An unknown query parameter is ignored.
-        // Broker-through: the request goes through the served management
-        // API on `ApiState` (the same state the kernel shares in
-        // `crates/broker-node/src/main.rs`, `serve_api`); the list is a
-        // static snapshot read only on this management GET and never
-        // consulted on publish or deliver.
+        // AP-05/KC-00: GET /source_types returns a bare string array of
+        // the kinds that are ready in this build. It never lists a
+        // pending or refused kind.
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
         let (status, body) = server.get_auth("/api/v5/source_types", &token).await;
         assert_eq!(status, 200);
         let entries = body.as_array().expect("type list is an array");
-        assert!(!entries.is_empty(), "type list must not be empty");
         let kinds: std::collections::HashSet<&str> =
             entries.iter().filter_map(|e| e.as_str()).collect();
         assert_eq!(kinds.len(), entries.len(), "names must be unique strings");
-        for expected in ["mqtt", "kafka_consumer", "rabbitmq"] {
-            assert!(kinds.contains(expected), "type list holds '{expected}'");
-        }
-        for wrong in ["test", "azure_event_grid", "no_such_source_kind_xyz"] {
+        // Every documented source kind is pending at the close of KC-00,
+        // so this list is empty. It never shows a name outside the
+        // reference enum.
+        let documented: std::collections::HashSet<&str> = [
+            "mqtt",
+            "kafka_consumer",
+            "gcp_pubsub_consumer",
+            "rabbitmq",
+            "azure_event_grid",
+        ]
+        .into_iter()
+        .collect();
+        for name in &kinds {
             assert!(
-                !kinds.contains(wrong),
-                "type list has no unrunnable '{wrong}'"
+                documented.contains(name),
+                "listed kind {name} is documented"
+            );
+        }
+        for pending in ["mqtt", "kafka_consumer", "http", "rabbitmq"] {
+            assert!(
+                !kinds.contains(pending),
+                "type list has no pending '{pending}'"
+            );
+        }
+        for name in &kinds {
+            assert!(
+                broker_config::is_kind_ready(name),
+                "listed kind {name} is ready"
             );
         }
 
-        // Unknown query parameters are ignored, never an error.
         let (status, again) = server
             .get_auth("/api/v5/source_types?unknown=param", &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(again, body);
 
-        // Every listed kind has a runtime behind it: a source of the
-        // listed `mqtt` kind registers through the broker API (the W3-23
-        // enable-flag runtime), then cleans up.
+        // A ready local source kind creates and deletes through the
+        // broker API.
         let (status, _) = server
             .post_auth(
                 "/api/v5/sources",
-                json!({"name": "w325-probe-src", "type": "mqtt"}),
+                json!({"name": "w325-probe-src", "type": "console"}),
                 &token,
             )
             .await;
@@ -21045,15 +21109,15 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let (status, _) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"name": "ap05-up", "type": "http", "url": "http://127.0.0.1:9"}),
+                json!({"name": "ap05-up", "type": "webhook", "url": "webhook://127.0.0.1:9"}),
                 &token,
             )
             .await;
         assert_eq!(status, 201, "connector create: {status}");
         let body = json!({
-            "type": "http",
+            "type": "webhook",
             "name": "ap05-web",
-            "connector": "http:ap05-up",
+            "connector": "webhook:ap05-up",
             "enable": true,
             "parameters": {"method": "post", "path": "/hook"},
             "resource_opts": {},
@@ -21062,14 +21126,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .post_auth("/api/v5/actions", body.clone(), &token)
             .await;
         assert_eq!(status, 201);
-        assert_eq!(created["type"], json!("http"));
+        assert_eq!(created["type"], json!("webhook"));
         assert_eq!(created["name"], json!("ap05-web"));
-        assert_eq!(created["connector"], json!("http:ap05-up"));
+        assert_eq!(created["connector"], json!("webhook:ap05-up"));
         assert_eq!(created["parameters"]["path"], json!("/hook"));
         assert!(created["resource_opts"].is_object());
         assert_eq!(created["status"], json!("connected"));
         assert!(created["node_status"].is_array());
-        for path in ["/api/v5/actions/ap05-web", "/api/v5/actions/http:ap05-web"] {
+        for path in [
+            "/api/v5/actions/ap05-web",
+            "/api/v5/actions/webhook:ap05-web",
+        ] {
             let (status, read) = server.get_auth(path, &token).await;
             assert_eq!(status, 200, "read through {path}");
             assert_eq!(read, created, "same shape through {path}");
@@ -21086,17 +21153,17 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 400);
         assert_eq!(bad["code"], json!("ALREADY_EXISTS"));
         let (status, missing) = server
-            .get_auth("/api/v5/actions/http:no-such", &token)
+            .get_auth("/api/v5/actions/webhook:no-such", &token)
             .await;
         assert_eq!(status, 404);
         assert_eq!(missing["code"], json!("NOT_FOUND"));
         let (status, updated) = server
             .put_auth(
-                "/api/v5/actions/http:ap05-web",
+                "/api/v5/actions/webhook:ap05-web",
                 json!({
-                    "type": "http",
+                    "type": "webhook",
                     "name": "ap05-web",
-                    "connector": "http:ap05-up",
+                    "connector": "webhook:ap05-up",
                     "enable": false,
                     "parameters": {"method": "post", "path": "/hook2"},
                 }),
@@ -21113,85 +21180,73 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn ap05_mqtt_kafka_actions_typed_round_trip() {
-        // AP-05: the console shapes for mqtt and kafka actions are
-        // accepted and read back unchanged. Old flat bodies still pass.
+        // AP-05/KC-00: mqtt, kafka and mqtt_bridge actions are pending.
+        // Each create is refused with 400 ALREADY_EXISTS and stores
+        // nothing. A ready console action keeps the typed round trip.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        let mqtt = json!({
-            "type": "mqtt",
-            "name": "ap05-mqtt",
-            "connector": "mqtt:ap05-up",
-            "parameters": {"topic": "out/ap05", "qos": 1, "retain": false},
-        });
-        let (status, created) = server.post_auth("/api/v5/actions", mqtt, &token).await;
-        assert_eq!(status, 201);
-        assert_eq!(created["parameters"]["topic"], json!("out/ap05"));
-        let kafka = json!({
-            "type": "kafka_producer",
-            "name": "ap05-kafka",
-            "connector": "kafka_producer:ap05-up",
-            "parameters": {"topic": "events", "message": {"key": "${.clientid}", "value": "${.}"}},
-        });
-        let (status, created) = server.post_auth("/api/v5/actions", kafka, &token).await;
-        assert_eq!(status, 201);
-        assert_eq!(created["type"], json!("kafka_producer"));
-        // The historic alias still passes and reads back as sent.
-        let (status, legacy) = server
+        for (name, kind) in [
+            ("ap05-mqtt", "mqtt"),
+            ("ap05-kafka", "kafka_producer"),
+            ("ap05-legacy", "mqtt_bridge"),
+        ] {
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/actions",
+                    json!({"name": name, "type": kind, "parameters": {"topic": "out/ap05"}}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} action must be refused: {body}");
+            assert_eq!(body["code"], json!("ALREADY_EXISTS"), "{kind}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("not available in this broker"),
+                "{kind} refusal names the kind: {body}"
+            );
+            let (status, _) = server
+                .get_auth(&format!("/api/v5/actions/{name}"), &token)
+                .await;
+            assert_eq!(status, 404, "{kind} action stores nothing");
+        }
+        let (status, created) = server
             .post_auth(
                 "/api/v5/actions",
-                json!({"name": "ap05-legacy", "type": "mqtt_bridge", "server": "127.0.0.1:1883"}),
+                json!({"type": "console", "name": "ap05-console",
+                       "parameters": {"topic": "out/ap05"}}),
                 &token,
             )
             .await;
         assert_eq!(status, 201);
-        assert_eq!(legacy["type"], json!("mqtt_bridge"));
-        assert_eq!(legacy["server"], json!("127.0.0.1:1883"));
-        for id in ["ap05-mqtt", "ap05-kafka", "ap05-legacy"] {
-            let (status, _) = server
-                .delete_auth(&format!("/api/v5/actions/{id}"), &token)
-                .await;
-            assert_eq!(status, 204);
-        }
+        assert_eq!(created["parameters"]["topic"], json!("out/ap05"));
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/ap05-console", &token)
+            .await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]
     async fn ap05_connectors_typed_round_trip() {
-        // AP-05: connector creates for http, mqtt and kafka use the
-        // documented fields and read back through both id forms. The
-        // documented names run on the runtime of their base kind.
+        // AP-05/KC-00: ready kinds (webhook and pgsql) round trip through
+        // both id forms. Pending mqtt and kafka are refused and store
+        // nothing.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        let mut cases = vec![
+        let cases = vec![
             (
-                "ap05-conn-http",
-                json!({"type": "http", "name": "ap05-conn-http", "url": "http://127.0.0.1:9"}),
-                "http:ap05-conn-http",
+                "ap05-conn-webhook",
+                json!({"type": "webhook", "name": "ap05-conn-webhook",
+                       "url": "http://127.0.0.1:9"}),
+                "webhook:ap05-conn-webhook",
             ),
             (
-                "ap05-conn-mqtt",
-                json!({"type": "mqtt", "name": "ap05-conn-mqtt", "server": "127.0.0.1:1883"}),
-                "mqtt:ap05-conn-mqtt",
+                "ap05-conn-pgsql",
+                json!({"type": "pgsql", "name": "ap05-conn-pgsql"}),
+                "pgsql:ap05-conn-pgsql",
             ),
         ];
-
-        let kafka_case = (
-            "ap05-conn-kafka",
-            json!({"type": "kafka_producer", "name": "ap05-conn-kafka", "bootstrap_hosts": "127.0.0.1:9092"}),
-            "kafka_producer:ap05-conn-kafka",
-        );
-        if cfg!(feature = "kafka") {
-            cases.push(kafka_case);
-        } else {
-            // The Kafka runtime is a Cargo feature. A build without it
-            // refuses the create and names the feature.
-            let (_, body, _) = kafka_case;
-            let (status, refused) = server.post_auth("/api/v5/connectors", body, &token).await;
-            assert_eq!(status, 400);
-            assert!(
-                refused.to_string().contains("kafka"),
-                "the refusal names the feature: {refused}"
-            );
-        }
         for (bare, body, key) in cases {
             let (status, created) = server.post_auth("/api/v5/connectors", body, &token).await;
             assert_eq!(status, 201, "create for {bare}");
@@ -21219,6 +21274,27 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 .await;
             assert_eq!(status, 204);
         }
+        for (name, kind) in [
+            ("ap05-conn-mqtt", "mqtt"),
+            ("ap05-conn-kafka", "kafka_producer"),
+        ] {
+            let (status, refused) = server
+                .post_auth(
+                    "/api/v5/connectors",
+                    json!({"type": kind, "name": name}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} connector must be refused");
+            assert!(
+                refused.to_string().contains("not available in this broker"),
+                "the refusal names the kind: {refused}"
+            );
+            let (status, _) = server
+                .get_auth(&format!("/api/v5/connectors/{name}"), &token)
+                .await;
+            assert_eq!(status, 404, "{kind} connector stores nothing");
+        }
         let (status, bad) = server
             .post_auth(
                 "/api/v5/connectors",
@@ -21232,28 +21308,21 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn ap05_sources_typed_round_trip() {
-        // AP-05: source creates for mqtt and kafka_consumer use the
-        // documented envelope and read back through both id forms.
+        // AP-05/KC-00: ready kinds (webhook and pgsql) round trip. Pending
+        // mqtt and kafka_consumer are refused and store nothing.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
         let cases = [
             (
-                "ap05-src-mqtt",
-                json!({
-                    "type": "mqtt",
-                    "name": "ap05-src-mqtt",
-                    "connector": "mqtt:ap05-up",
-                    "parameters": {"topic": "in/ap05"},
-                }),
+                "ap05-src-webhook",
+                json!({"type": "webhook", "name": "ap05-src-webhook",
+                       "connector": "webhook:ap05-up",
+                       "parameters": {"topic": "in/ap05"}}),
             ),
             (
-                "ap05-src-kafka",
-                json!({
-                    "type": "kafka_consumer",
-                    "name": "ap05-src-kafka",
-                    "connector": "kafka_consumer:ap05-up",
-                    "parameters": {"topic": "events"},
-                }),
+                "ap05-src-pgsql",
+                json!({"type": "postgres", "name": "ap05-src-pgsql",
+                       "parameters": {"topic": "in/ap05"}}),
             ),
         ];
         for (bare, body) in cases {
@@ -21270,6 +21339,27 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 .delete_auth(&format!("/api/v5/sources/{bare}"), &token)
                 .await;
             assert_eq!(status, 204);
+        }
+        for (name, kind) in [
+            ("ap05-src-mqtt", "mqtt"),
+            ("ap05-src-kafka", "kafka_consumer"),
+        ] {
+            let (status, refused) = server
+                .post_auth(
+                    "/api/v5/sources",
+                    json!({"type": kind, "name": name}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} source must be refused");
+            assert!(
+                refused.to_string().contains("not available in this broker"),
+                "the refusal names the kind: {refused}"
+            );
+            let (status, _) = server
+                .get_auth(&format!("/api/v5/sources/{name}"), &token)
+                .await;
+            assert_eq!(status, 404, "{kind} source stores nothing");
         }
     }
 
@@ -21353,9 +21443,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .post_auth(
                 "/api/v5/actions",
                 json!({
-                    "type": "http",
+                    "type": "webhook",
                     "name": "ap05-fire",
-                    "connector": "http:ap05-up",
+                    "connector": "webhook:ap05-up",
                     "parameters": {"method": "post", "path": "/hook"},
                 }),
                 &token,

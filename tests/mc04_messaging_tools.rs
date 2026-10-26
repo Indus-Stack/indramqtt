@@ -53,8 +53,37 @@ fn ephemeral_port() -> u16 {
 /// Each listener uses an ephemeral loopback port, so parallel tests
 /// never share a port.
 async fn spawn_kernel(name: &str, extra_toml: &str) -> Kernel {
+    // Boot up to three times. A parallel boot sometimes takes a probed
+    // port first, and the loser exits during boot. Each attempt uses
+    // fresh ports and fresh dirs. A real boot defect fails each attempt
+    // and still panics.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match try_spawn_kernel(name, extra_toml, attempt).await {
+            Ok(kernel) => return kernel,
+            Err(boot) if boot.exited && attempt < 3 => continue,
+            Err(boot) => panic!("{}", boot.message),
+        }
+    }
+}
+
+/// One kernel boot failure. `exited` marks an early child exit.
+struct BootFailure {
+    exited: bool,
+    message: String,
+}
+
+/// Boots one real kernel once. Returns the kernel on success. Returns
+/// the failure on a timeout or an early child exit. The caller retries
+/// an early exit and panics otherwise.
+async fn try_spawn_kernel(
+    name: &str,
+    extra_toml: &str,
+    attempt: u32,
+) -> Result<Kernel, BootFailure> {
     let tag = format!(
-        "mc04-{name}-{}-{}",
+        "mc04-{name}-{}-{}-{attempt}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -131,20 +160,30 @@ async fn spawn_kernel(name: &str, extra_toml: &str) -> Kernel {
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill().await;
-            panic!("kernel never opened API {api_port} and MQTT {mqtt_port}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = std::fs::remove_dir_all(&config_dir);
+            return Err(BootFailure {
+                exited: false,
+                message: format!("kernel never opened API {api_port} and MQTT {mqtt_port}"),
+            });
         }
         if let Ok(Some(status)) = child.try_wait() {
-            panic!("kernel exited during boot: {status}");
+            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = std::fs::remove_dir_all(&config_dir);
+            return Err(BootFailure {
+                exited: true,
+                message: format!("kernel exited during boot: {status}"),
+            });
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Kernel {
+    Ok(Kernel {
         child,
         mqtt_port,
         api_port,
         scratch,
         config_dir,
-    }
+    })
 }
 
 /// Locates the real kernel binary for the spawned-kernel tests.

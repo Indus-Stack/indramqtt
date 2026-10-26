@@ -31,10 +31,10 @@ fn str_prop(default: &str) -> Value {
     })
 }
 
-/// KC-00: keep only `ready` connector schemas in the served object, so a
-/// pending or refused kind is never offered as a dashboard form. The
-/// kind is read from each schema's `type` default.
-fn ready_connector_schemas(schemas: &Value) -> Value {
+/// KC-00: keep only `ready` schemas in the served object, so a pending or
+/// refused kind is never offered as a dashboard form. The kind is read
+/// from each schema's `type` default.
+fn ready_kind_schemas(schemas: &Value) -> Value {
     let mut out = serde_json::Map::new();
     if let Some(map) = schemas.as_object() {
         for (name, schema) in map {
@@ -912,8 +912,8 @@ pub async fn get_schema(Path(name): Path<String>) -> Response {
             // It reports only the served-name list from this registry.
             json!({ "sections": ["actions", "connectors", "hotconf"] })
         }
-        "actions" => ACTIONS_SCHEMA["components"]["schemas"].clone(),
-        _ => ready_connector_schemas(&CONNECTORS_SCHEMA["components"]["schemas"]),
+        "actions" => ready_kind_schemas(&ACTIONS_SCHEMA["components"]["schemas"]),
+        _ => ready_kind_schemas(&CONNECTORS_SCHEMA["components"]["schemas"]),
     };
     let body = serde_json::to_string(&schema).expect("schema value serializes");
     (

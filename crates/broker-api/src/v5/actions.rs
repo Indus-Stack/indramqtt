@@ -742,13 +742,13 @@ pub async fn create_action(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    // KC-00: a known kind that is not `ready` answers `400 BAD_REQUEST`
-    // (not the `ALREADY_EXISTS` used for an unknown type).
+    // KC-00: create of a known kind that is not `ready` keeps the
+    // reference error code for this operation, `ALREADY_EXISTS`.
     if let Some(kind) = body.get("type").and_then(|v| v.as_str()) {
         let kind = kind.trim();
         if crate::removed_connector_refusal(kind).is_none() {
             if let Some(message) = super::rules::kind_refusal(kind) {
-                return ApiError::BadRequest(message).into_response();
+                return ApiError::AlreadyExists(message).into_response();
             }
         }
     }
@@ -1406,7 +1406,7 @@ mod tests {
         ActionRecord {
             id: id.to_string(),
             name: id.to_string(),
-            action_type: "mqtt_bridge".to_string(),
+            action_type: "webhook".to_string(),
             enable: true,
             connector: String::new(),
             parameters: serde_json::json!({}),
@@ -1439,9 +1439,9 @@ mod tests {
         let entry = ActionRecord {
             id: "act-1".to_string(),
             name: "act-1".to_string(),
-            action_type: "mqtt".to_string(),
+            action_type: "webhook".to_string(),
             enable: false,
-            connector: "mqtt:up".to_string(),
+            connector: "webhook:up".to_string(),
             parameters: serde_json::json!({"topic": "out/1"}),
             resource_opts: serde_json::json!({}),
             params: serde_json::json!({"server": "127.0.0.1:1883"}),
@@ -1450,9 +1450,9 @@ mod tests {
         let rendered = store.snapshot()[0].to_json_with(&store.wiring_of("act-1"));
         assert_eq!(rendered["id"], serde_json::json!("act-1"));
         assert_eq!(rendered["name"], serde_json::json!("act-1"));
-        assert_eq!(rendered["type"], serde_json::json!("mqtt"));
+        assert_eq!(rendered["type"], serde_json::json!("webhook"));
         assert_eq!(rendered["enable"], serde_json::json!(false));
-        assert_eq!(rendered["connector"], serde_json::json!("mqtt:up"));
+        assert_eq!(rendered["connector"], serde_json::json!("webhook:up"));
         assert_eq!(
             rendered["parameters"],
             serde_json::json!({"topic": "out/1"})
@@ -1467,9 +1467,9 @@ mod tests {
     fn key_form_resolves_to_the_bare_row() {
         let store = ActionStore::new();
         assert!(store.insert(record("a")).is_ok());
-        let found = store.get_any("mqtt_bridge:a").expect("key form reads back");
+        let found = store.get_any("webhook:a").expect("key form reads back");
         assert_eq!(found.id, "a");
-        assert!(store.contains_any("mqtt_bridge:a"));
+        assert!(store.contains_any("webhook:a"));
         assert!(store.get_any("other:a").is_none());
         assert!(store.get_any("missing").is_none());
     }
@@ -1478,9 +1478,9 @@ mod tests {
     fn split_body_accepts_the_documented_envelope() {
         let entry = split_action_body(
             &serde_json::json!({
-                "type": "http",
+                "type": "webhook",
                 "name": "web",
-                "connector": "http:up",
+                "connector": "webhook:up",
                 "enable": true,
                 "parameters": {"method": "post", "path": "/hook"},
                 "resource_opts": {},
@@ -1489,11 +1489,14 @@ mod tests {
         )
         .expect("documented body parses");
         assert_eq!(entry.id, "web");
-        assert_eq!(entry.connector, "http:up");
+        assert_eq!(entry.connector, "webhook:up");
         assert_eq!(entry.parameters["path"], serde_json::json!("/hook"));
         // The console key form in `id` strips to the bare name.
-        let keyed = split_action_body(&serde_json::json!({"id": "http:web", "type": "http"}), None)
-            .expect("key form parses");
+        let keyed = split_action_body(
+            &serde_json::json!({"id": "webhook:web", "type": "webhook"}),
+            None,
+        )
+        .expect("key form parses");
         assert_eq!(keyed.id, "web");
         // A missing type and an unknown type both fail.
         assert!(split_action_body(&serde_json::json!({"name": "x"}), None).is_err());
@@ -1502,7 +1505,7 @@ mod tests {
         );
         // A non-object `parameters` fails.
         assert!(split_action_body(
-            &serde_json::json!({"name": "x", "type": "http", "parameters": []}),
+            &serde_json::json!({"name": "x", "type": "webhook", "parameters": []}),
             None
         )
         .is_err());
@@ -1516,7 +1519,7 @@ mod tests {
         conf.validate().expect("exported actions must validate");
         assert_eq!(conf.actions.len(), 1);
         assert_eq!(conf.actions[0].id, "act-1");
-        assert_eq!(conf.actions[0].action_type, "mqtt_bridge");
+        assert_eq!(conf.actions[0].action_type, "webhook");
     }
 
     #[test]
@@ -1574,7 +1577,7 @@ mod tests {
         let updated = ActionRecord {
             id: "a".to_string(),
             name: "a".to_string(),
-            action_type: "kafka".to_string(),
+            action_type: "webhook".to_string(),
             enable: false,
             connector: String::new(),
             parameters: serde_json::json!({"topic": "events"}),
@@ -1586,7 +1589,7 @@ mod tests {
         assert_eq!(found, updated);
         assert_eq!(store.snapshot().len(), 1);
         assert!(!store.replace("missing", record("missing")));
-        assert!(store.replace_any("kafka:a", record("a")));
+        assert!(store.replace_any("webhook:a", record("a")));
     }
 
     #[test]
@@ -1620,7 +1623,7 @@ mod tests {
     fn wiring_render_reads_status_reason_only_from_the_recorded_state() {
         let store = ActionStore::new();
         let mut entry = record("a");
-        entry.action_type = "http".to_string();
+        entry.action_type = "webhook".to_string();
         assert!(store.insert(entry.clone()).is_ok());
         // A failed build renders `disconnected` with the recorded reason.
         store.set_wiring("a", ActionWiring::Failed("broken".to_string()));

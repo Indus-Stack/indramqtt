@@ -191,6 +191,15 @@ async fn spawn_kernel(name: &str) -> Kernel {
                  bind = \"127.0.0.1:{mqtt_port}\"\n\
                  native = true\n\
                  \n\
+                 [listeners.ws]\n\
+                 enabled = false\n\
+                 \n\
+                 [listeners.tls]\n\
+                 enabled = false\n\
+                 \n\
+                 [listeners.wss]\n\
+                 enabled = false\n\
+                 \n\
                  [listeners.api]\n\
                  bind = \"127.0.0.1:{api_port}\"\n\
                  \n\

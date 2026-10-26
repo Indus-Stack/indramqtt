@@ -5,7 +5,7 @@
     "query": {},
     "body": {
       "name": "mv01-dangling",
-      "type": "http",
+      "type": "webhook",
       "connector": "webhook:mv01-dangling-link",
       "parameters": {},
       "enable": true
@@ -24,7 +24,7 @@
     "query": {},
     "body": {
       "name": "mv01-noref",
-      "type": "http",
+      "type": "webhook",
       "parameters": {}
     },
     "expect_status": 400,
@@ -77,7 +77,7 @@
       {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}},
       {"api": {"method": "POST", "path": "/actions", "body": {
         "name": "mv01-dangling",
-        "type": "http",
+        "type": "webhook",
         "connector": "webhook:mv01-dangling-link",
         "parameters": {},
         "enable": true
@@ -97,7 +97,7 @@
       {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}},
       {"api": {"method": "POST", "path": "/actions", "body": {
         "name": "mv01-dangling",
-        "type": "http",
+        "type": "webhook",
         "connector": "webhook:mv01-dangling-link",
         "parameters": {},
         "enable": true
@@ -111,7 +111,7 @@
     "query": {},
     "body": {
       "name": "mv01-dangling",
-      "type": "http",
+      "type": "webhook",
       "connector": "webhook:mv01-moved-link",
       "parameters": {},
       "enable": false
@@ -121,7 +121,7 @@
       {"api": {"method": "DELETE", "path": "/actions/mv01-dangling"}},
       {"api": {"method": "POST", "path": "/actions", "body": {
         "name": "mv01-dangling",
-        "type": "http",
+        "type": "webhook",
         "connector": "webhook:mv01-dangling-link",
         "parameters": {},
         "enable": true
