@@ -145,25 +145,120 @@ pub enum OraErrorClassification {
     Unknown,
 }
 
+/// Typed Oracle error kind for the MV-13b contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OraErrorKind {
+    /// Lost session or listener fault. Retry with backoff.
+    Connection,
+    /// Bad user, password, lock or expiry. Never retry.
+    Authentication,
+    /// Row fails a rule (unique, null, check, key). Never retry.
+    Constraint,
+    /// Wrong name or text (identifier, table, command). Never retry.
+    Syntax,
+    /// Work timed out (connect, cancel, inbound). Retry with backoff.
+    Timeout,
+    /// Driver fault with no ORA code (I/O, socket). Retry with backoff.
+    Transport,
+    /// Code is absent or not in the table. Never retry.
+    Unknown,
+}
+
+/// True when the kind retries (connection, timeout, transport).
+/// Others fail closed as terminal errors.
+pub fn ora_error_is_retryable(kind: OraErrorKind) -> bool {
+    matches!(
+        kind,
+        OraErrorKind::Connection | OraErrorKind::Timeout | OraErrorKind::Transport
+    )
+}
+
+/// Map one numeric ORA code to its kind.
+/// Codes come from the database message, not from text search.
+pub fn classify_ora_code(code: u32) -> OraErrorKind {
+    match code {
+        // ORA-00000 carries no detail and closes the session.
+        // Retry it; the probe reports the real cause.
+        0 => OraErrorKind::Connection,
+        // Deadlock: the batch conflicts and a retry wins.
+        60 => OraErrorKind::Connection,
+        // Unique constraint fails the row itself.
+        1 => OraErrorKind::Constraint,
+        // Null or precision fails the row itself.
+        1400 | 1407 | 1438 | 12899 => OraErrorKind::Constraint,
+        // Check or key fails the row itself.
+        2290..=2292 => OraErrorKind::Constraint,
+        // Bad login or locked account fails the credential.
+        1017 | 1005 | 28000 | 28001 | 28009 => OraErrorKind::Authentication,
+        // Startup or shutdown is transient and a retry wins.
+        1033 | 1089 => OraErrorKind::Connection,
+        // Cancel or limit hit the time budget, so retry.
+        1013 | 2049 | 3136 | 12170 => OraErrorKind::Timeout,
+        // Bad name or bad text fails the statement.
+        904 | 911 | 933 | 923 | 942 => OraErrorKind::Syntax,
+        // Lost session or listener fault; redial wins.
+        3113 | 3114 | 3135 | 12154 | 12505 | 12514 | 12541 | 12545 => OraErrorKind::Connection,
+        _ => OraErrorKind::Unknown,
+    }
+}
+
+/// Read the first `ORA-<digits>` code from text.
+/// Return `None` when no digits follow the tag.
+pub fn parse_ora_code(text: &str) -> Option<u32> {
+    let upper = text.to_ascii_uppercase();
+    let mut rest = upper.as_str();
+    while let Some(pos) = rest.find("ORA-") {
+        let after = &rest[pos + 4..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            // Codes fit in five digits; longer text keeps its prefix.
+            let trimmed = if digits.len() > 5 {
+                &digits[..5]
+            } else {
+                &digits
+            };
+            if let Ok(code) = trimmed.parse::<u32>() {
+                return Some(code);
+            }
+        }
+        rest = after;
+    }
+    None
+}
+
+/// Classify a driver error by its typed variant and code.
+/// This path never searches message text.
+pub fn classify_oracle_driver_error(error: &oracle_rs::Error) -> OraErrorKind {
+    match error {
+        oracle_rs::Error::AuthenticationFailed(_)
+        | oracle_rs::Error::InvalidCredentials
+        | oracle_rs::Error::UnsupportedVerifierType(_) => OraErrorKind::Authentication,
+        oracle_rs::Error::ConnectionTimeout(_) => OraErrorKind::Timeout,
+        oracle_rs::Error::ConnectionRefused { .. }
+        | oracle_rs::Error::ConnectionRedirected { .. }
+        | oracle_rs::Error::ConnectionRedirect(_)
+        | oracle_rs::Error::ConnectionClosed
+        | oracle_rs::Error::ConnectionClosedByServer(_)
+        | oracle_rs::Error::ConnectionNotReady
+        | oracle_rs::Error::CursorClosed
+        | oracle_rs::Error::InvalidCursor(_)
+        | oracle_rs::Error::Io(_) => OraErrorKind::Transport,
+        oracle_rs::Error::InvalidServiceName { .. } | oracle_rs::Error::InvalidSid { .. } => {
+            OraErrorKind::Connection
+        }
+        oracle_rs::Error::OracleError { code, .. } | oracle_rs::Error::ServerError { code, .. } => {
+            classify_ora_code(*code)
+        }
+        _ => OraErrorKind::Unknown,
+    }
+}
+
 /// Classify an Oracle error code (e.g. "ORA-00060").
 pub fn classify_ora_error(error_code_or_msg: &str) -> OraErrorClassification {
-    let text = error_code_or_msg.to_ascii_uppercase();
-    if text.contains("ORA-00060")
-        || text.contains("ORA-01033")
-        || text.contains("ORA-03113")
-        || text.contains("ORA-03114")
-        || text.contains("ORA-01089")
-    {
-        OraErrorClassification::Retryable
-    } else if text.contains("ORA-00942")
-        || text.contains("ORA-01017")
-        || text.contains("ORA-00904")
-        || text.contains("ORA-00911")
-        || text.contains("ORA-00001")
-    {
-        OraErrorClassification::Terminal
-    } else {
-        OraErrorClassification::Unknown
+    match parse_ora_code(error_code_or_msg).map(classify_ora_code) {
+        Some(kind) if ora_error_is_retryable(kind) => OraErrorClassification::Retryable,
+        Some(_) => OraErrorClassification::Terminal,
+        None => OraErrorClassification::Unknown,
     }
 }
 
@@ -382,69 +477,19 @@ fn oracle_value_to_driver(value: &OracleValue) -> oracle_rs::Value {
 }
 
 /// Map a driver error onto the retry contract.
-/// Retryable ORA codes become `Connection`.
-/// Terminal ORA codes become `Dispatch` with the server text.
-/// Auth failures become `Dispatch`: the sink denies access.
-/// Other failures become `Connection`: the sink retries them.
+/// Retry kinds become `Connection`; the sink retries them.
+/// Other kinds become `Dispatch`; the sink stops.
+/// The match uses the typed variant and code only.
 fn map_oracle_driver_error(error: oracle_rs::Error) -> ConnectorError {
-    if matches!(
-        &error,
-        oracle_rs::Error::AuthenticationFailed(_) | oracle_rs::Error::InvalidCredentials
-    ) {
-        return ConnectorError::Dispatch(format!("oracle refused: {error}"));
-    }
-    // Map numeric codes directly.
-    // Some paths report `ServerError` without the `ORA-` prefix.
-    // Keep the server text in the message.
-    if let oracle_rs::Error::OracleError { code, .. } = &error {
-        match *code {
-            60 | 1033 | 3113 | 3114 | 1089 => {
-                return ConnectorError::Connection(format!("oracle transient: {error}"));
-            }
-            942 | 1017 | 904 | 911 | 1 => {
-                return ConnectorError::Dispatch(format!("oracle refused: {error}"));
-            }
-            _ => {}
+    let kind = classify_oracle_driver_error(&error);
+    if ora_error_is_retryable(kind) {
+        // Keep the server text in the message.
+        if matches!(kind, OraErrorKind::Transport) {
+            return ConnectorError::Connection(format!("oracle driver: {error}"));
         }
+        return ConnectorError::Connection(format!("oracle transient: {error}"));
     }
-    if let oracle_rs::Error::ServerError { code, .. } = &error {
-        match *code {
-            60 | 1033 | 3113 | 3114 | 1089 => {
-                return ConnectorError::Connection(format!("oracle transient: {error}"));
-            }
-            942 | 1017 | 904 | 911 | 1 => {
-                return ConnectorError::Dispatch(format!("oracle refused: {error}"));
-            }
-            _ => {}
-        }
-    }
-    let text = error.to_string();
-    if text.contains("ORA-00000") {
-        // ORA-00000 carries no detail and closes the connection.
-        // Retry it. The probe reports the real cause.
-        return ConnectorError::Connection(format!("oracle transient: {text}"));
-    }
-    match classify_ora_error(&text) {
-        OraErrorClassification::Retryable => {
-            ConnectorError::Connection(format!("oracle transient: {text}"))
-        }
-        OraErrorClassification::Terminal => {
-            ConnectorError::Dispatch(format!("oracle refused: {text}"))
-        }
-        OraErrorClassification::Unknown => {
-            let lower = text.to_ascii_lowercase();
-            if text.contains("ORA-")
-                || text.contains("942")
-                || lower.contains("does not exist")
-                || lower.contains("doesn't exist")
-                || lower.contains("doesnt exist")
-            {
-                ConnectorError::Dispatch(format!("oracle refused: {text}"))
-            } else {
-                ConnectorError::Connection(format!("oracle driver: {text}"))
-            }
-        }
-    }
+    ConnectorError::Dispatch(format!("oracle refused: {error}"))
 }
 
 /// Production transport on the maintained driver: real TNS with
@@ -581,11 +626,11 @@ impl DriverOracleTransport {
             .await
             .ok()?
             .err()?;
+        let kind = classify_oracle_driver_error(&select_error);
         let select_text = select_error.to_string();
         let mapped = map_oracle_driver_error(select_error);
         if let ConnectorError::Dispatch(message) = &mapped {
-            let lower = message.to_ascii_lowercase();
-            if message.contains("ORA-00942") || lower.contains("does not exist") {
+            if matches!(kind, OraErrorKind::Syntax) && parse_ora_code(message) == Some(942) {
                 return Some(mapped);
             }
         }
@@ -1111,6 +1156,236 @@ mod tests {
             classify_ora_error("Some random error"),
             OraErrorClassification::Unknown
         );
+    }
+
+    #[test]
+    fn test_typed_connection_errors_retry() {
+        // Each case uses the driver error type, not text.
+        let cases = [
+            oracle_rs::Error::oracle(3113, "end-of-file"),
+            oracle_rs::Error::oracle(3114, "not connected"),
+            oracle_rs::Error::ServerError {
+                code: 3135,
+                message: "lost contact".into(),
+            },
+            oracle_rs::Error::InvalidServiceName {
+                service_name: Some("FREEPDB1".into()),
+                message: Some("listener fault".into()),
+            },
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Connection,
+                "must be connection: {error:?}"
+            );
+            assert!(
+                ora_error_is_retryable(classify_oracle_driver_error(&error)),
+                "connection must retry: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "connection maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_authentication_errors_terminal() {
+        let cases = [
+            oracle_rs::Error::oracle(1017, "bad password"),
+            oracle_rs::Error::oracle(28000, "locked"),
+            oracle_rs::Error::AuthenticationFailed("denied".into()),
+            oracle_rs::Error::InvalidCredentials,
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Authentication,
+                "must be auth: {error:?}"
+            );
+            assert!(
+                !ora_error_is_retryable(classify_oracle_driver_error(&error)),
+                "auth must not retry: {error:?}"
+            );
+            assert!(
+                matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+                "auth maps to terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_constraint_errors_terminal() {
+        // ServerError without ORA prefix still maps by code.
+        // The old text path retried it; the typed path stops.
+        let cases = [
+            oracle_rs::Error::oracle(1, "unique"),
+            oracle_rs::Error::oracle(1400, "null"),
+            oracle_rs::Error::oracle(2291, "parent"),
+            oracle_rs::Error::ServerError {
+                code: 1,
+                message: "unique".into(),
+            },
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Constraint,
+                "must be constraint: {error:?}"
+            );
+            assert!(
+                matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+                "constraint maps to terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_syntax_errors_terminal() {
+        let cases = [
+            oracle_rs::Error::oracle(904, "identifier"),
+            oracle_rs::Error::oracle(942, "table"),
+            oracle_rs::Error::ServerError {
+                code: 942,
+                message: "missing".into(),
+            },
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Syntax,
+                "must be syntax: {error:?}"
+            );
+            assert!(
+                matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+                "syntax maps to terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_timeout_errors_retry() {
+        let cases = [
+            oracle_rs::Error::oracle(12170, "connect timeout"),
+            oracle_rs::Error::oracle(1013, "cancel"),
+            oracle_rs::Error::ConnectionTimeout(Duration::from_secs(1)),
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Timeout,
+                "must be timeout: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "timeout maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_transport_errors_retry() {
+        // Non-Oracle faults carry no ORA code and retry.
+        let cases = [
+            oracle_rs::Error::ConnectionClosed,
+            oracle_rs::Error::ConnectionRefused {
+                error_code: None,
+                message: None,
+            },
+            oracle_rs::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Transport,
+                "must be transport: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "transport maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ora_code_unparsable_and_unknown_terminal() {
+        // No digits after the tag means no code.
+        assert_eq!(parse_ora_code("ORA-ABCDE"), None);
+        assert_eq!(parse_ora_code("no code here"), None);
+        assert_eq!(
+            classify_ora_error("ORA-ABCDE: bad tag"),
+            OraErrorClassification::Unknown
+        );
+        // Unknown numeric codes fail closed without retry.
+        assert_eq!(classify_ora_code(99999), OraErrorKind::Unknown);
+        assert!(!ora_error_is_retryable(OraErrorKind::Unknown));
+        let error = oracle_rs::Error::oracle(99999, "future code");
+        assert!(
+            matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+            "unknown code maps to terminal"
+        );
+    }
+
+    #[test]
+    fn test_typed_ora_00000_retries() {
+        // Zero carries no detail and closes the session.
+        let error = oracle_rs::Error::oracle(0, "normal");
+        assert_eq!(
+            classify_oracle_driver_error(&error),
+            OraErrorKind::Connection
+        );
+        assert!(matches!(
+            map_oracle_driver_error(error),
+            ConnectorError::Connection(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_terminal_state_after_retries() {
+        // Two transient faults, then success: the end state commits.
+        let transport = Arc::new(MockOracleTransport::with_transient_failures(2, "ORA-00060"));
+        let mut cfg = sample_config();
+        cfg.batch_size = Some(10);
+        let sink = OracleSink::new(cfg, transport.clone()).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+        let payload = Bytes::from_static(br#"{"device_id": "dev-90", "temp": 70.0}"#);
+        sink.send(&topic, &payload, QoS::AtLeastOnce)
+            .await
+            .expect("buffer row");
+        let first = sink.flush().await;
+        assert!(matches!(first, Err(ConnectorError::Connection(_))));
+        *sink.backoff.lock() = BackoffState::default();
+        let second = sink.flush().await;
+        assert!(matches!(second, Err(ConnectorError::Connection(_))));
+        *sink.backoff.lock() = BackoffState::default();
+        sink.flush().await.expect("retry commits");
+        assert_eq!(sink.sent_count(), 1);
+        assert_eq!(sink.buffered_rows(), 0);
+        // Terminal fault stops at once with one execution.
+        let bad = Arc::new(MockOracleTransport::with_transient_failures(1, "ORA-00001"));
+        let mut bad_cfg = sample_config();
+        bad_cfg.batch_size = Some(10);
+        let bad_sink = OracleSink::new(bad_cfg, bad.clone()).expect("valid sink");
+        bad_sink
+            .send(&topic, &payload, QoS::AtLeastOnce)
+            .await
+            .expect("buffer row");
+        let refused = bad_sink.flush().await;
+        assert!(matches!(refused, Err(ConnectorError::Dispatch(_))));
+        assert_eq!(bad.executions.lock().len(), 1);
     }
 
     #[test]

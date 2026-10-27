@@ -230,10 +230,11 @@ pub use opc_ua::{
     OpcUaTransport, OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport,
 };
 pub use oracle::{
-    build_merge_sql, classify_ora_error, extract_oracle_row, CapturedOracleExecution,
+    build_merge_sql, classify_ora_code, classify_ora_error, classify_oracle_driver_error,
+    extract_oracle_row, ora_error_is_retryable, parse_ora_code, CapturedOracleExecution,
     DriverOracleTransport, HttpOracleTransport, MockOracleTransport, OraErrorClassification,
-    OracleBindParam, OracleConnector, OracleResponse, OracleRow, OracleSink, OracleSinkConfig,
-    OracleTransport, OracleValue,
+    OraErrorKind, OracleBindParam, OracleConnector, OracleResponse, OracleRow, OracleSink,
+    OracleSinkConfig, OracleTransport, OracleValue,
 };
 pub use pulsar::{
     crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url,
