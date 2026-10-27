@@ -2649,10 +2649,15 @@ mod tests {
             let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
                 .await
                 .expect("connect test server");
-            stream
-                .write_all(raw.as_bytes())
-                .await
-                .expect("write request");
+            // The server answers 413 and closes the connection during a large upload.
+            // A broken pipe means the answer waits in the read buffer.
+            if let Err(error) = stream.write_all(raw.as_bytes()).await {
+                assert!(
+                    error.kind() == std::io::ErrorKind::BrokenPipe
+                        || error.kind() == std::io::ErrorKind::ConnectionReset,
+                    "write request: {error}"
+                );
+            }
             // HTTP/1.0 + Connection: close => the server closes when done.
             let mut buf = Vec::new();
             stream.read_to_end(&mut buf).await.expect("read response");
