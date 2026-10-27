@@ -4023,6 +4023,50 @@ async fn mv00_window_bounds_keep_select_positions_through_mqtt() {
     }
 }
 
+/// Window rules emit for plain payloads, as stateless rules do.
+#[tokio::test]
+async fn sb23_window_plain_payload_emits_through_mqtt() {
+    let id = "sb23-plain";
+    let kernel = spawn_kernel("").await;
+    let sql = format!("SELECT * FROM \"mv00/in/{id}\" GROUP BY COUNTWINDOW(1)");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, &sql),
+    )
+    .await;
+    assert_eq!(status, 201, "window create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "sb23-plain-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "sb23-plain-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, b"hello"),
+    )
+    .await;
+    let (head, body) = tokio::time::timeout(STEP, recv_mqtt(&mut subscriber))
+        .await
+        .expect("window output in time");
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    let output: serde_json::Value = serde_json::from_slice(&message.payload).expect("window JSON");
+    assert_eq!(output, serde_json::json!({}), "plain yields empty row");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "metrics read: {body}");
+    assert_eq!(body["metrics"]["matched"], 1, "{body}");
+    assert_eq!(body["metrics"]["passed"], 1, "{body}");
+    assert_eq!(body["metrics"]["actions.total"], 1, "{body}");
+    kernel.finish().await;
+}
+
 /// Group rows keep first-seen order and each group's payload metadata keys.
 #[tokio::test]
 async fn mv00_group_windows_keep_order_and_payload_shadows() {

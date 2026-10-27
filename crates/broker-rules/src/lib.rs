@@ -1628,6 +1628,9 @@ struct RuleTaskConfig {
     window: WindowDef,
     std_has_wildcard: bool,
     std_explicit_keys: Vec<String>,
+    /// Failed counter of the owning rule. The eval loop bumps it once
+    /// per non-empty batch that yields no row.
+    failed: Arc<AtomicU64>,
 }
 
 /// Configuration for a rule-task bus feeder: what the feeder needs to turn
@@ -1645,6 +1648,9 @@ struct RuleFeederConfig {
     feed_tx: mpsc::Sender<TimedRecord>,
     bus_rx: StreamReceiver,
     counters: Arc<RuleCounters>,
+    /// Failed counter of the owning rule. The feeder bumps it once per
+    /// ingress that cannot enter the window buffer.
+    failed: Arc<AtomicU64>,
 }
 
 /// The runtime sink bridge: [`runtime::RuleOutputSink`] over the broker's
@@ -1662,11 +1668,17 @@ struct BrokerRuleSink {
     flush_ctx: Arc<FlushContext>,
     counters: ActionCounters,
     task_counters: Arc<RuleCounters>,
+    /// Passed counter of the owning rule. Each emitted row bumps it once,
+    /// so window outputs count exactly like inline outputs.
+    passed: Arc<AtomicU64>,
 }
 
 #[async_trait]
 impl runtime::RuleOutputSink for BrokerRuleSink {
     async fn emit(&self, topic: Topic, payload: Bytes, qos_cap: QoS) {
+        // Count the row first, as the inline path counts a projected
+        // row before it runs actions. Action outcomes count separately.
+        self.passed.fetch_add(1, Ordering::Relaxed);
         let sink = self.flush_ctx.broker_sink.read().clone();
         // W3-04: window-flush emits honour the same lock-free snapshot as
         // the inline path (one `Arc` clone per flush, not per message).
@@ -2127,6 +2139,9 @@ impl RuleEngine {
             );
             return;
         };
+        // Count the row as passed, as the inline path counts a projected
+        // row. Action outcomes count inside the shared runner.
+        rule.passed_cnt.fetch_add(1, Ordering::Relaxed);
         let sink = self.broker_sink();
         let disabled = self.flush_ctx.action_disabled.load_full();
         let action_metrics = self.flush_ctx.action_metrics.load_full();
@@ -3696,6 +3711,7 @@ impl RuleEngine {
             feed_tx: feed_tx.clone(),
             bus_rx,
             counters: counters.clone(),
+            failed: rule.failed_cnt.clone(),
         };
         let eval_config = RuleTaskConfig {
             rule_id: rule.id.clone(),
@@ -3705,6 +3721,7 @@ impl RuleEngine {
             window,
             std_has_wildcard: rule.std_has_wildcard,
             std_explicit_keys: rule.std_explicit_keys.clone(),
+            failed: rule.failed_cnt.clone(),
         };
         let bridge = BrokerRuleSink {
             rule_id: rule.id.clone(),
@@ -3713,6 +3730,7 @@ impl RuleEngine {
             flush_ctx: self.flush_ctx.clone(),
             counters: ActionCounters::from_rule(rule),
             task_counters: counters.clone(),
+            passed: rule.passed_cnt.clone(),
         };
         let task = RuleTask {
             eval: handle.spawn(rule_task_loop(eval_config)),
@@ -3745,6 +3763,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
         feed_tx,
         mut bus_rx,
         counters,
+        failed,
     } = config;
     let stmt = match parsed_query.as_ref() {
         Some(stmt) => stmt,
@@ -3770,13 +3789,13 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
         // pre-front-end rules see the raw object keys only, standard rules
         // see the enriched message record so window aggregates see
         // `payload`/`topic`/`qos`. Standard-dialect `FOREACH` expansion
-        // never fires on MQTT ingress; a non-object payload carries no
-        // top-level object to aggregate, so both skip (fail closed).
+        // never fires on MQTT ingress.
         let (record, injected) = if std_sources.is_empty() && !has_foreach {
             // A non-object payload carries no top-level object to
-            // aggregate, so skip (fail closed), exactly like the old
-            // non-object early return. An empty object still proceeds.
+            // aggregate, so skip (fail closed), as the inline path
+            // skips it. An empty object still proceeds.
             if !feeder.has_object {
+                failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let mut record = feeder.record;
@@ -3786,11 +3805,15 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
             (record, Vec::new())
         } else {
             if has_foreach {
+                failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if !feeder.has_object && feeder.record.len() <= feeder.injected.len() {
-                continue;
-            }
+            // Standard rules accept any payload, as the inline path
+            // does. The enriched record holds `payload`/`topic`/`qos`,
+            // so `SELECT *` yields the payload fields when present
+            // and an empty row otherwise. Never drop here for shape.
+            // TODO(parity): What does the reference return for `SELECT *`
+            // with a plain payload in a window: empty row or no row?
             (feeder.record, feeder.injected)
         };
         stdlib::ensure_stdlib_registered();
@@ -3813,6 +3836,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
             None => true,
         };
         if !passes {
+            failed.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         // Carry the ingress QoS into the window buffer so flush delivery
@@ -3834,6 +3858,7 @@ async fn rule_feeder_loop(config: RuleFeederConfig) {
             .is_err()
         {
             counters.inc_dropped(1);
+            failed.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 rule_id = %rule_id,
                 "rule-task feed full; ingress record dropped"
@@ -4394,6 +4419,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
         window,
         std_has_wildcard,
         std_explicit_keys,
+        failed,
     } = config;
     match window {
         WindowDef::TumblingTime { unit, length } => {
@@ -4407,7 +4433,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                     _ = ticker.tick() => {
                         let end = now_ms();
                         let batch = std::mem::take(&mut buffer);
-                        flush_rule_window(&rule_id, &stmt, batch, window_start, end, &sink_tx, std_has_wildcard, &std_explicit_keys).await;
+                        flush_rule_window(&rule_id, &stmt, batch, window_start, end, &sink_tx, std_has_wildcard, &std_explicit_keys, &failed).await;
                         window_start = end;
                     }
                     rec = feed_rx.recv() => {
@@ -4447,6 +4473,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                         &sink_tx,
                         std_has_wildcard,
                         &std_explicit_keys,
+                        &failed,
                     )
                     .await;
                     since_flush = 0;
@@ -4486,6 +4513,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                             &sink_tx,
                             std_has_wildcard,
                             &std_explicit_keys,
+                            &failed,
                         )
                         .await;
                     }
@@ -4523,6 +4551,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                     &sink_tx,
                     std_has_wildcard,
                     &std_explicit_keys,
+                    &failed,
                 )
                 .await;
             }
@@ -4550,7 +4579,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                         let end = now_ms();
                         let start = session_start.unwrap_or(end);
                         let batch = std::mem::take(&mut buffer);
-                        flush_rule_window(&rule_id, &stmt, batch, start, end, &sink_tx, std_has_wildcard, &std_explicit_keys).await;
+                        flush_rule_window(&rule_id, &stmt, batch, start, end, &sink_tx, std_has_wildcard, &std_explicit_keys, &failed).await;
                         session_start = None;
                         last_arrival = None;
                     }
@@ -4569,7 +4598,7 @@ async fn rule_task_loop(config: RuleTaskConfig) {
                                 last_arrival = Some(now);
                                 if now.saturating_sub(start) >= max_duration_ms {
                                     let batch = std::mem::take(&mut buffer);
-                                    flush_rule_window(&rule_id, &stmt, batch, start, now, &sink_tx, std_has_wildcard, &std_explicit_keys).await;
+                                    flush_rule_window(&rule_id, &stmt, batch, start, now, &sink_tx, std_has_wildcard, &std_explicit_keys, &failed).await;
                                     session_start = None;
                                     last_arrival = None;
                                 }
@@ -4606,9 +4635,10 @@ async fn flush_rule_window(
     sink_tx: &mpsc::Sender<SinkRow>,
     std_has_wildcard: bool,
     std_explicit_keys: &[String],
-) {
+    failed: &Arc<AtomicU64>,
+) -> usize {
     if batch.is_empty() {
-        return;
+        return 0;
     }
     // One task serves one tenant: the feeder drops other tenants, so
     // the batch carries one tenant. Flush output fans out in it.
@@ -4665,6 +4695,7 @@ async fn flush_rule_window(
         .into_iter()
         .map(|(topic, map, injected, _, _)| (topic, map, injected))
         .collect();
+    let mut rows_out = 0usize;
     for (topic, mut row, injected) in
         aggregate_partitioned_with_metadata(stmt, agg_input, rule_id, false)
     {
@@ -4691,9 +4722,17 @@ async fn flush_rule_window(
             .await
             .is_err()
         {
-            return;
+            return rows_out;
         }
+        rows_out += 1;
     }
+    // A non-empty batch that yields no row means the window filtered
+    // everything out. Count it as failed, as the inline path counts
+    // an ingress with no output.
+    if rows_out == 0 {
+        failed.fetch_add(1, Ordering::Relaxed);
+    }
+    rows_out
 }
 
 /// Partition records by `GROUP BY` expressions and evaluate one
