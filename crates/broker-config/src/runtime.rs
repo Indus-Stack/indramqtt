@@ -241,6 +241,12 @@ pub fn validate_whole(snapshot: &FullSnapshot) -> Result<(), ConfigError> {
     if let Err(err) = snapshot.connectors.validate() {
         problems.push(err.to_string());
     }
+    if let Err(err) = snapshot.actions.validate() {
+        problems.push(err.to_string());
+    }
+    if let Err(err) = snapshot.sources.validate() {
+        problems.push(err.to_string());
+    }
     let known: HashSet<&str> = snapshot
         .connectors
         .connectors

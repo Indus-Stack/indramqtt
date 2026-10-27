@@ -4030,10 +4030,51 @@ impl ConfigRegistry {
 
     /// Commits a validated connectors root.
     ///
+    /// Validates strictly: a removed or not-ready kind is refused even
+    /// when the file already holds one. Only boot and the stored rewrite
+    /// below accept already-stored records.
+    ///
     /// Records a version in the history (actor `api`, naming the root) so
     /// every applied change is versioned, and persists the history file
     /// alongside `state.toml`.
     pub fn commit_connectors(&self, conf: ConnectorsConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        let old = self.snapshot();
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.connectors = conf.clone();
+            next
+        });
+        let next = self.snapshot();
+        self.history.record("api", "commit connectors", &old, &next);
+        self.save_history_file()?;
+        Ok(())
+    }
+
+    /// Rewrites the stored connectors root, keeping already-stored
+    /// unavailable records.
+    ///
+    /// Only boot follow-up writes and store rewrites use this. Every
+    /// removed or not-ready kind must already sit in the snapshot with
+    /// the same id and type. It refuses other kinds with the strict
+    /// error. New writes use [`Self::commit_connectors`].
+    pub fn commit_connectors_stored(&self, conf: ConnectorsConf) -> Result<(), ConfigError> {
+        let current = self.snapshot();
+        for (index, entry) in conf.connectors.iter().enumerate() {
+            if is_removed_connector_type(&entry.connector_type)
+                || is_kind_refused(&entry.connector_type)
+            {
+                let already = current.connectors.connectors.iter().any(|stored| {
+                    stored.id == entry.id && stored.connector_type == entry.connector_type
+                });
+                if !already {
+                    return Err(ConfigError::Invalid(format!(
+                        "connectors.connectors[{index}].connector_type {:?} is not available in this broker (field `connector_type`)",
+                        entry.connector_type
+                    )));
+                }
+            }
+        }
         conf.validate_stored()?;
         let old = self.snapshot();
         self.current.rcu(|snapshot| {
@@ -4291,7 +4332,42 @@ impl ConfigRegistry {
     }
 
     /// Commits a validated rule-engine action registry.
+    ///
+    /// Validates strictly: a removed or not-ready kind is refused. Only
+    /// the stored rewrite below keeps already-stored records.
     pub fn commit_actions(&self, conf: ActionsConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.actions = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Rewrites the stored action registry, keeping already-stored
+    /// unavailable records.
+    ///
+    /// Every removed or not-ready kind must already sit in the snapshot
+    /// with the same id and type. It refuses other kinds with the strict
+    /// error. New writes use [`Self::commit_actions`].
+    pub fn commit_actions_stored(&self, conf: ActionsConf) -> Result<(), ConfigError> {
+        let current = self.snapshot();
+        for (index, entry) in conf.actions.iter().enumerate() {
+            if is_removed_connector_type(&entry.action_type) || is_kind_refused(&entry.action_type)
+            {
+                let already =
+                    current.actions.actions.iter().any(|stored| {
+                        stored.id == entry.id && stored.action_type == entry.action_type
+                    });
+                if !already {
+                    return Err(ConfigError::Invalid(format!(
+                        "actions.actions[{index}].action_type {:?} is not available in this broker (field `action_type`)",
+                        entry.action_type
+                    )));
+                }
+            }
+        }
         conf.validate_stored()?;
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
@@ -4302,7 +4378,42 @@ impl ConfigRegistry {
     }
 
     /// Commits a validated ingress source registry.
+    ///
+    /// Validates strictly: a removed or not-ready kind is refused. Only
+    /// the stored rewrite below keeps already-stored records.
     pub fn commit_sources(&self, conf: SourcesConf) -> Result<(), ConfigError> {
+        conf.validate()?;
+        self.current.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.sources = conf.clone();
+            next
+        });
+        Ok(())
+    }
+
+    /// Rewrites the stored source registry, keeping already-stored
+    /// unavailable records.
+    ///
+    /// Every removed or not-ready kind must already sit in the snapshot
+    /// with the same id and type. It refuses other kinds with the strict
+    /// error. New writes use [`Self::commit_sources`].
+    pub fn commit_sources_stored(&self, conf: SourcesConf) -> Result<(), ConfigError> {
+        let current = self.snapshot();
+        for (index, entry) in conf.sources.iter().enumerate() {
+            if is_removed_connector_type(&entry.source_type) || is_kind_refused(&entry.source_type)
+            {
+                let already =
+                    current.sources.sources.iter().any(|stored| {
+                        stored.id == entry.id && stored.source_type == entry.source_type
+                    });
+                if !already {
+                    return Err(ConfigError::Invalid(format!(
+                        "sources.sources[{index}].source_type {:?} is not available in this broker (field `source_type`)",
+                        entry.source_type
+                    )));
+                }
+            }
+        }
         conf.validate_stored()?;
         self.current.rcu(|snapshot| {
             let mut next = (**snapshot).clone();
@@ -4991,12 +5102,41 @@ mod tests {
         let loaded = registry.snapshot();
         assert_eq!(loaded.connectors.connectors.len(), 1);
         assert_eq!(loaded.actions.actions.len(), 1);
-        registry
+        let strict_err = registry
             .commit_connectors(loaded.connectors.clone())
+            .expect_err("strict commit must refuse the legacy connector");
+        assert!(
+            strict_err.to_string().contains("s3_tables"),
+            "strict error names the kind: {strict_err}"
+        );
+        let strict_err = registry
+            .commit_actions(loaded.actions.clone())
+            .expect_err("strict commit must refuse the legacy action");
+        assert!(
+            strict_err.to_string().contains("s3tables"),
+            "strict error names the kind: {strict_err}"
+        );
+        registry
+            .commit_connectors_stored(loaded.connectors.clone())
             .expect("stored rewrite keeps the legacy connector");
         registry
-            .commit_actions(loaded.actions.clone())
+            .commit_actions_stored(loaded.actions.clone())
             .expect("stored rewrite keeps the legacy action");
+        let fresh = ConnectorsConf {
+            connectors: vec![ConnectorEntry {
+                id: "new-s3t".to_string(),
+                connector_type: "s3_tables".to_string(),
+                enable: true,
+                config: "{}".to_string(),
+            }],
+        };
+        let stored_err = registry
+            .commit_connectors_stored(fresh)
+            .expect_err("stored rewrite must refuse a new removed kind");
+        assert!(
+            stored_err.to_string().contains("s3_tables"),
+            "stored rewrite names the kind: {stored_err}"
+        );
         registry.save().expect("save rewritten legacy state");
         let reloaded = ConfigRegistry::load_for_boot(&dir).expect("reload after rewrite");
         assert_eq!(reloaded.snapshot().connectors.connectors.len(), 1);
@@ -5050,12 +5190,21 @@ mod tests {
         assert_eq!(loaded.sources.sources.len(), 1);
         registry
             .commit_connectors(loaded.connectors.clone())
-            .expect("stored rewrite keeps the pending connector");
+            .expect_err("strict commit must refuse the pending connector");
         registry
             .commit_actions(loaded.actions.clone())
-            .expect("stored rewrite keeps the pending action");
+            .expect_err("strict commit must refuse the pending action");
         registry
             .commit_sources(loaded.sources.clone())
+            .expect_err("strict commit must refuse the pending source");
+        registry
+            .commit_connectors_stored(loaded.connectors.clone())
+            .expect("stored rewrite keeps the pending connector");
+        registry
+            .commit_actions_stored(loaded.actions.clone())
+            .expect("stored rewrite keeps the pending action");
+        registry
+            .commit_sources_stored(loaded.sources.clone())
             .expect("stored rewrite keeps the pending source");
         registry.save().expect("save rewritten pending state");
         let reloaded = ConfigRegistry::load_for_boot(&dir).expect("reload after rewrite");

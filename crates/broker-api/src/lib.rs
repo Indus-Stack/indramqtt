@@ -2577,6 +2577,7 @@ mod tests {
         alarms: Arc<crate::v5::alarms::AlarmStore>,
         license: Arc<crate::v5::license::LicenseState>,
         mcp: Arc<crate::mcp::McpStore>,
+        config: Arc<ConfigRegistry>,
         edge_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<BrokerFrame>>>,
     }
 
@@ -2620,6 +2621,7 @@ mod tests {
                 alarms: api_state.alarms.clone(),
                 license: api_state.license.clone(),
                 mcp: api_state.mcp.clone(),
+                config: Arc::clone(&api_state.config),
                 edge_rx: Arc::new(tokio::sync::Mutex::new(edge_rx)),
             };
             let app = router(api_state);
@@ -3003,6 +3005,103 @@ mod tests {
                 .await;
             assert_eq!(status, 204, "{kind} action cleanup");
         }
+    }
+
+    #[tokio::test]
+    async fn strict_registry_commit_refuses_removed_kind_through_reload() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        // A reload that carries a removed connector is refused.
+        let mut candidate = state.config.snapshot().as_ref().clone();
+        candidate
+            .connectors
+            .connectors
+            .push(broker_config::ConnectorEntry {
+                id: "reload-s3t".to_string(),
+                connector_type: "s3_tables".to_string(),
+                enable: true,
+                config: "{}".to_string(),
+            });
+        let (status, body) = server
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": candidate, "actor": "sb22", "summary": "refuse s3"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "reload with removed connector: {body}");
+        let error = body["error"].as_str().unwrap_or("");
+        assert!(error.contains("s3_tables"), "error names kind: {error}");
+        // A reload that carries a removed action is refused.
+        let mut candidate = state.config.snapshot().as_ref().clone();
+        candidate.actions.actions.push(broker_config::ActionEntry {
+            id: "reload-s3t".to_string(),
+            action_type: "s3tables".to_string(),
+            enable: true,
+            config: "{}".to_string(),
+        });
+        let (status, body) = server
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": candidate, "actor": "sb22", "summary": "refuse s3"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "reload with removed action: {body}");
+        // A reload that carries a removed source is refused.
+        let mut candidate = state.config.snapshot().as_ref().clone();
+        candidate.sources.sources.push(broker_config::SourceEntry {
+            id: "reload-s3t".to_string(),
+            source_type: "s3_tables".to_string(),
+            enable: true,
+            config: "{}".to_string(),
+        });
+        let (status, body) = server
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": candidate, "actor": "sb22", "summary": "refuse s3"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "reload with removed source: {body}");
+        // The generic commit for each root is also strict.
+        let bad_connectors = broker_config::ConnectorsConf {
+            connectors: vec![broker_config::ConnectorEntry {
+                id: "commit-s3t".to_string(),
+                connector_type: "s3_tables".to_string(),
+                enable: true,
+                config: "{}".to_string(),
+            }],
+        };
+        let err = state
+            .config
+            .commit(broker_config::ConfigRoot::Connectors(bad_connectors))
+            .expect_err("commit must refuse removed connector");
+        assert!(err.to_string().contains("s3_tables"), "got: {err}");
+        let bad_actions = broker_config::ActionsConf {
+            actions: vec![broker_config::ActionEntry {
+                id: "commit-s3t".to_string(),
+                action_type: "s3_tables".to_string(),
+                enable: true,
+                config: "{}".to_string(),
+            }],
+        };
+        let err = state
+            .config
+            .commit(broker_config::ConfigRoot::Actions(bad_actions))
+            .expect_err("commit must refuse removed action");
+        assert!(err.to_string().contains("s3_tables"), "got: {err}");
+        // Nothing is stored.
+        let (status, connectors) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(connectors, json!([]));
+        let (status, actions) = server.get_auth("/api/v5/actions", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(actions, json!([]));
+        let (status, sources) = server.get_auth("/api/v5/sources", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(sources, json!([]));
     }
 
     #[tokio::test]

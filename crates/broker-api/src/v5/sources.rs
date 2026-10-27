@@ -556,7 +556,9 @@ impl SourceStore {
     /// save failure surfaces so callers answer 500 and the loss is
     /// never silent (the in-memory mutation stays: commit precedes the
     /// atomic save). Stores without a registry (unit tests, standalone
-    /// state) are memory-only and persist as a no-op.
+    /// state) are memory-only and persist as a no-op. Uses the stored
+    /// rewrite so already-stored unavailable records stay readable
+    /// while a new removed kind is still refused.
     fn persist(&self) -> Result<(), broker_config::ConfigError> {
         let registry = self
             .registry
@@ -571,7 +573,7 @@ impl SourceStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let conf = self.export_conf();
-        registry.commit_sources(conf)?;
+        registry.commit_sources_stored(conf)?;
         registry.save()?;
         Ok(())
     }

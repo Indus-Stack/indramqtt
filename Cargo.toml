@@ -91,3 +91,9 @@ codegen-units = 1
 # connection, and the other connections continue. With "abort", one
 # panic stops the broker for all clients.
 panic = "unwind"
+
+# Use zstd 0.14 for the vendored rule engine parser.
+# The pinned release requires zstd 0.13, which has open advisories.
+# The vendored copy keeps the same bulk API.
+[patch."https://github.com/Indus-Stack/rekuiper.git"]
+rekuiper-sql = { path = "vendor/rekuiper-sql" }

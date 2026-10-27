@@ -1168,9 +1168,14 @@ impl ConnectorStore {
         }
     }
 
-    /// Commit the exported root and atomically save it. A no-op without
-    /// a registry; any commit or save failure surfaces so callers answer
-    /// 500 and the loss is never silent.
+    /// Commit the exported root and atomically save it.
+    ///
+    /// A no-op without a registry. Any commit or save failure surfaces
+    /// so callers answer 500 and the loss is never silent.
+    ///
+    /// It uses the stored rewrite. Already-stored unavailable records
+    /// stay readable. It still refuses a new removed kind. Create and
+    /// update handlers refuse the kind before the store mutates.
     pub(crate) fn persist(&self) -> Result<(), broker_config::ConfigError> {
         let registry = self
             .registry
@@ -1185,7 +1190,7 @@ impl ConnectorStore {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let conf = self.export_conf();
-        registry.commit_connectors(conf)?;
+        registry.commit_connectors_stored(conf)?;
         registry.save()?;
         Ok(())
     }
