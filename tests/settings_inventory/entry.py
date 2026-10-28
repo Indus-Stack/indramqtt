@@ -537,23 +537,44 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(status, 201)
         return rule["id"]
 
-    # // AZ-01 inventory: current behaviour; owner AZ-02
     def test_anonymous_flag_and_password_algorithm(self):
         b = self.boot(anonymous=False)
+        # `auth.allow_anonymous = false` refuses an anonymous CONNECT even
+        # while the user store is empty: the flag is applied before the
+        # session is created (3.1.1 return code 5).
         _, ack = b.connect("anonymous-flag")
-        self.assertEqual(ack, "0000")
+        self.assertEqual(ack, "0005", "anonymous must be refused with the flag off")
+        # Version 5.0 refuses with reason code 0x87 Not authorized.
+        sock = socket.create_connection(("127.0.0.1", b.mqtt), timeout=10)
+        try:
+            sock.sendall(frame(16, b"\x00\x04MQTT\x05\x02\x00\x3c\x00" + word("anonymous-v5")))
+            head, ack = packet(sock)
+            self.assertEqual(head, 32, "the kernel answers a refused v5 CONNECT")
+            # CONNACK body: [session_present, reason_code, property_length, ...].
+            self.assertEqual(ack[1], 0x87, "v5 anonymous CONNECT is refused with 0x87")
+        finally:
+            sock.close()
         b.stop()
         b.start()
         _, ack = b.connect("anonymous-after-restart")
-        self.assertEqual(ack, "0000")
+        self.assertEqual(ack, "0005", "anonymous is still refused after a restart")
         status, _ = b.http("POST", "/api/v1/auth/users",
                            {"username": "audituser", "password": b.password})
         self.assertEqual(status, 201)
         state = tomllib.loads((b.data / "state.toml").read_text())
         verifier = state["mqtt_users"]["users"][0]["password_hash"]
-        self.assertTrue(verifier.startswith("$argon2id$"), "algorithm only; no verifier output")
+        self.assertTrue(verifier.startswith("$2b$"), "algorithm only; no verifier output")
         _, ack = b.connect("anonymous-with-users")
         self.assertEqual(ack, "0005")
+        # Unsupported algorithm fails the start, fail closed.
+        b.stop()
+        bad = (b.cfg / "indra.toml").read_text().replace(
+            'password_hash="bcrypt"', 'password_hash="argon2id"')
+        (b.cfg / "indra.toml").write_text(bad)
+        with self.assertRaises(AssertionError) as ctx:
+            b.start()
+        self.assertIn("not supported", str(ctx.exception))
+        b.child = None
 
     # // AZ-01 inventory: current behaviour; owner MV-09a
     def test_disabled_auth_and_superuser_are_not_applied(self):
@@ -591,8 +612,7 @@ class InventoryEntry(unittest.TestCase):
         _, fourth = b.connect("fourth", True)
         self.assertEqual(fourth, "0003")
 
-    # // AZ-01 inventory: current behaviour; owner AZ-02
-    def test_failed_authorization_save_changes_live_policy_then_reverts(self):
+    def test_failed_authorization_save_keeps_live_policy(self):
         b = self.boot()
         status, _ = b.http("POST", "/api/v1/auth/acls",
                            {"client_pattern": "other", "action": "all",
@@ -610,22 +630,32 @@ class InventoryEntry(unittest.TestCase):
         saved = b.base / "saved-data"
         b.data.rename(saved)
         try:
+            # A failed persist keeps the old live decision: nothing is
+            # applied, the old state stays enforced (D2).
             status, _ = b.http("PUT", "/api/v5/authorization/settings",
                                {"no_match": "allow", "deny_action": "ignore"})
             self.assertEqual(status, 500)
             status, current = b.http("GET", "/api/v5/authorization/settings")
             self.assertEqual(status, 200)
-            self.assertEqual(current["no_match"], "allow")
-            self.assertEqual(b.subscribe(sock, "inventory/failed"), "00")
+            self.assertEqual(current["no_match"], "deny")
+            self.assertEqual(b.subscribe(sock, "inventory/failed"), "80")
         finally:
             self.assertFalse(b.data.exists())
             saved.rename(b.data)
+        # A later successful save must not commit the refused value.
+        status, _ = b.http("POST", "/api/v1/auth/users",
+                           {"username": "after-failed-save", "password": b.password})
+        self.assertEqual(status, 201)
+        state = tomllib.loads((b.data / "state.toml").read_text())
+        self.assertEqual(state["authz_settings"]["no_match"], "deny")
         b.stop()
         b.start()
         status, current = b.http("GET", "/api/v5/authorization/settings")
         self.assertEqual(status, 200)
         self.assertEqual(current["no_match"], "deny")
-        sock, _ = b.connect("policy-after-restart")
+        # Use an authenticated CONNECT. Anonymous fails when users exist.
+        sock, ack = b.connect("policy-after-restart", True, username="after-failed-save")
+        self.assertEqual(ack, "0000")
         self.assertEqual(b.subscribe(sock, "inventory/failed"), "80")
 
     # // AZ-01 inventory: current behaviour; owner MV-10
@@ -674,12 +704,51 @@ class InventoryEntry(unittest.TestCase):
         status, _ = b.http("GET", "/api/v5/metrics", auth=token)
         self.assertEqual(status, 200)
 
-    # // AZ-01 inventory: current behaviour; owner AZ-02
-    def test_unsupported_authorization_source_falls_through_after_restart(self):
+    def test_unsupported_authorization_source_is_refused_and_denies(self):
+        # A source kind this build does not evaluate is refused at create:
+        # 400 naming the kind, nothing stored, the old state stays active.
+        b = self.boot()
+        status, _ = b.http("POST", "/api/v5/authorization/sources",
+                           {"type": "http", "enable": True,
+                            "config": "{\"url\":\"http://127.0.0.1:1/inventory\"}"})
+        self.assertEqual(status, 400, "an unsupported source kind is refused")
+        status, sources = b.http("GET", "/api/v5/authorization/sources")
+        self.assertEqual(status, 200)
+        self.assertEqual([s["type"] for s in sources["sources"]], ["built_in_database"])
+        # An update of the same kind is refused the same way.
+        status, _ = b.http("PUT", "/api/v5/authorization/sources/built_in_database",
+                           {"enable": True})
+        self.assertEqual(status, 204, "the built-in source still updates")
+        status, _ = b.http("PUT", "/api/v5/authorization/sources/http",
+                           {"enable": True})
+        self.assertEqual(status, 400, "an unsupported source update is refused")
+
+        # Old stored state: an unsupported source in the stored order
+        # denies every decision that would reach it; no fall-through to a
+        # later allow. The record stays, an alarm is raised, and the
+        # operator can still delete it through the API while MQTT access
+        # stays denied (D2).
         receiver = HttpReceiver(b'{"result":"deny"}')
         self.addCleanup(receiver.close)
-        b = self.boot()
         source_config = opaque_security_fields(receiver.url)
+        config = (b.cfg / "indra.toml").read_text()
+        config += (
+            "[[authz_sources.sources]]\n"
+            "type = \"http\"\n"
+            "enable = true\n"
+            "config = " + json.dumps(
+                json.dumps(source_config)) + "\n"
+            "[[authz_sources.sources]]\n"
+            "type = \"built_in_database\"\n"
+            "enable = true\n"
+        )
+        (b.cfg / "indra.toml").write_text(config)
+        b.stop()
+        b.start()
+        # The empty built-in rule table must not bypass the unsupported
+        # source: the decision reaches it and is denied (D2).
+        empty_sock, _ = b.connect("unsupported-empty-rules")
+        self.assertEqual(b.subscribe(empty_sock, "inventory/empty"), "80")
         status, _ = b.http("POST", "/api/v1/auth/acls",
                            {"client_pattern": "other", "action": "all",
                             "topic_pattern": "other/#", "allow": True})
@@ -687,18 +756,17 @@ class InventoryEntry(unittest.TestCase):
         status, _ = b.http("PUT", "/api/v5/authorization/settings",
                            {"no_match": "allow", "deny_action": "ignore"})
         self.assertEqual(status, 200)
-        status, _ = b.http("POST", "/api/v5/authorization/sources",
-                           {"type": "http", "enable": True, **source_config})
-        self.assertEqual(status, 204)
-        status, _ = b.http("PUT", "/api/v5/authorization/sources/order",
-                           [{"type": "http"}, {"type": "built_in_database"}])
-        self.assertEqual(status, 204)
         status, sources = b.http("GET", "/api/v5/authorization/sources")
         self.assertEqual(status, 200)
         self.assertEqual(sources["sources"][0]["type"], "http")
         self.assert_fields_kept(sources["sources"][0], source_config)
+        status, alarms = b.http("GET", "/api/v5/alarms")
+        self.assertEqual(status, 200)
+        self.assertIn("unsupported_authorization_source",
+                      [alarm["name"] for alarm in alarms["data"]])
         sock, _ = b.connect("unsupported-chain")
-        self.assertEqual(b.subscribe(sock, "inventory/source"), "00")
+        # The decision reaches the unsupported source first: deny, no call.
+        self.assertEqual(b.subscribe(sock, "inventory/source"), "80")
         with self.assertRaises(queue.Empty):
             receiver.requests.get(timeout=0.2)
         before = (b.data / "state.toml").read_bytes()
@@ -706,13 +774,89 @@ class InventoryEntry(unittest.TestCase):
         b.start()
         self.assertTrue((b.data / "state.toml").read_bytes() == before, "source state changed at restart")
         sock, _ = b.connect("unsupported-chain-restart")
-        self.assertEqual(b.subscribe(sock, "inventory/source"), "00")
+        self.assertEqual(b.subscribe(sock, "inventory/source"), "80")
         with self.assertRaises(queue.Empty):
             receiver.requests.get(timeout=0.2)
-        status, sources = b.http("GET", "/api/v5/authorization/sources")
-        self.assertEqual(status, 200)
-        self.assertEqual(sources["sources"][0]["type"], "http")
-        self.assert_fields_kept(sources["sources"][0], source_config)
+        # Chain cases: with the built-in source first, its allow rule
+        # decides (an earlier supported source stands) and a no-match
+        # decision that reaches the later unsupported source is denied.
+        config = (b.cfg / "indra.toml").read_text()
+        config = config.replace(
+            "[[authz_sources.sources]]\n"
+            "type = \"http\"\n"
+            "enable = true\n"
+            "config = " + json.dumps(json.dumps(source_config)) + "\n"
+            "[[authz_sources.sources]]\n"
+            "type = \"built_in_database\"\n"
+            "enable = true\n",
+            "[[authz_sources.sources]]\n"
+            "type = \"built_in_database\"\n"
+            "enable = true\n"
+            "[[authz_sources.sources]]\n"
+            "type = \"http\"\n"
+            "enable = true\n"
+            "config = " + json.dumps(json.dumps(source_config)) + "\n",
+        )
+        (b.cfg / "indra.toml").write_text(config)
+        b.stop()
+        b.start()
+        sock, _ = b.connect("other")
+        self.assertEqual(b.subscribe(sock, "other/#"), "00")
+        self.assertEqual(b.subscribe(sock, "inventory/source2"), "80")
+        with self.assertRaises(queue.Empty):
+            receiver.requests.get(timeout=0.2)
+        # Operator recovery: delete the unsupported source while access
+        # stays denied; afterwards the built-in allow rule decides again.
+        status, _ = b.http("DELETE", "/api/v5/authorization/sources/http")
+        self.assertEqual(status, 204)
+        self.assertEqual(b.subscribe(sock, "inventory/recovered"), "00")
+        with self.assertRaises(queue.Empty):
+            receiver.requests.get(timeout=0.2)
+        # Unknown kinds fail with NOT_FOUND, not the refusal.
+        status, _ = b.http("PUT", "/api/v5/authorization/sources/no-such-kind",
+                            {"enable": True})
+        self.assertEqual(status, 404)
+        status, _ = b.http("POST", "/api/v5/authorization/sources",
+                            {"type": "no-such-kind", "enable": True})
+        self.assertEqual(status, 404)
+        # Publish follows the same chain: the allow rule matches.
+        psub, _ = b.connect("chain-pub-sub")
+        self.assertEqual(b.subscribe(psub, "other/#"), "00")
+        ppub, _ = b.connect("chain-pub")
+        publish(b, ppub, "other/hello", b"hi")
+        self.assertEqual(packet(psub), (0x30, word("other/hello") + b"hi"))
+        dsub, _ = b.connect("chain-deny-sub")
+        self.assertEqual(b.subscribe(dsub, "inventory/denied"), "00")
+        # Two tenants stay apart on the chain path.
+        b.stop()
+        tcfg = (b.cfg / "indra.toml").read_text()
+        tcfg += ('[[tenants.rules]]\nlistener="*"\nattribute="tenant"\n'
+                 'expression="${username}"\n')
+        (b.cfg / "indra.toml").write_text(tcfg)
+        b.start()
+        self.assertEqual(b.http("POST", "/api/v5/mt/ns/alice")[0], 204)
+        self.assertEqual(b.http("POST", "/api/v5/mt/ns/bob")[0], 204)
+        self.assertEqual(b.http("POST", "/api/v1/auth/users?tenant=alice",
+                                {"username": "alice", "password": b.password})[0], 201)
+        self.assertEqual(b.http("POST", "/api/v1/auth/users?tenant=bob",
+                                {"username": "bob", "password": b.password})[0], 201)
+        self.assertEqual(b.http("POST", "/api/v1/auth/acls?tenant=alice",
+                                {"client_pattern": "*", "action": "all",
+                                 "topic_pattern": "inventory/shared", "allow": True})[0], 201)
+        asock, ack = b.connect("shared-tenant-client", True, username="alice")
+        self.assertEqual(ack, "0000")
+        bsock, ack = b.connect("shared-tenant-client", True, username="bob")
+        self.assertEqual(ack, "0000")
+        self.assertEqual(b.subscribe(asock, "inventory/shared"), "00")
+        self.assertEqual(b.subscribe(bsock, "inventory/shared"), "80")
+        apub, ack = b.connect("shared-tenant-pub", True, username="alice")
+        self.assertEqual(ack, "0000")
+        publish(b, apub, "inventory/shared", b"apart")
+        self.assertEqual(packet(asock), (0x30, word("inventory/shared") + b"apart"))
+        bsock.settimeout(0.3)
+        with self.assertRaises(TimeoutError):
+            packet(bsock)
+        bsock.settimeout(10)
 
     # // AZ-01 inventory: current behaviour; owner MV-09a
     def test_authentication_cache_ttl_and_memory_are_stored_only(self):
@@ -749,34 +893,234 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(current["node_cache"], options["node_cache"])
 
-    # // AZ-01 inventory: current behaviour; owner AZ-02
-    def test_authorization_cache_policy_does_not_limit_recorded_decisions(self):
+    def test_authorization_cache_policy_applies_and_invalidates(self):
         b = self.boot()
-        cache = {"enable": True, "cache_ttl": "1ms", "cleanup_interval": "1ms",
-                 "stat_update_interval": "1ms", "max_count": 1, "max_memory": "1B"}
-        status, _ = b.http("PUT", "/api/v5/authorization/node_cache", cache)
+        status, _ = b.http(
+            "POST", "/api/v5/authorization/sources/built_in_database/rules/all",
+            {"rules": [{"topic": "inventory/cache/#", "permission": "allow", "action": "all"},
+                        {"topic": "inventory/pub/#", "permission": "allow", "action": "all"},
+                        {"topic": "inventory/will/#", "permission": "allow", "action": "all"},
+                        {"topic": "inventory/delayed-inner", "permission": "allow", "action": "all"},
+                        {"topic": "inventory/excluded/#", "permission": "allow", "action": "all"}]})
         self.assertEqual(status, 204)
-        settings = {"no_match": "allow", "deny_action": "ignore",
-                    "cache": {"enable": True, "max_size": 1, "ttl": "1ms", "excludes": ["inventory/#"]},
-                    "include_mountpoint": True, "ignore_backend_failures": True}
+        settings = {"no_match": "deny", "deny_action": "ignore",
+                    "cache": {"enable": True, "max_size": 32, "ttl": "1m", "excludes": []}}
         status, _ = b.http("PUT", "/api/v5/authorization/settings", settings)
         self.assertEqual(status, 200)
+        status, current = b.http("GET", "/api/v5/authorization/settings")
+        self.assertEqual(status, 200)
+        self.assertEqual(current["no_match"], "deny")
+        self.assertEqual(current["deny_action"], "ignore")
+        self.assertEqual(current["cache"]["enable"], True)
+        self.assertEqual(current["cache"]["ttl"], "1m")
+        self.assertEqual(current["cache"]["excludes"], [])
         sock, _ = b.connect("cache-policy")
-        for topic in ["inventory/cache/one", "inventory/cache/one", "inventory/cache/two"]:
-            self.assertEqual(b.subscribe(sock, topic), "00")
-        time.sleep(0.1)
-        status, stats = b.http("GET", "/api/v5/authorization/node_cache/status")
+        self.assertEqual(b.subscribe(sock, "inventory/cache/one"), "00")
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
         self.assertEqual(status, 200)
-        self.assertEqual(stats["metrics"]["count"], 2)
-        self.assertEqual(stats["metrics"]["max_count"], 1)
-        status, current = b.http("GET", "/api/v5/authorization/node_cache")
+        self.assertTrue(any(entry["topic"] == "inventory/cache/one"
+                            and entry["result"] == "allow" for entry in cached),
+                        "the allowed decision is cached on the client")
+        self.assertEqual(b.subscribe(sock, "inventory/other"), "80")
+        # Publish QoS 0 through the socket reaches the subscriber.
+        sub, _ = b.connect("cache-sub")
+        self.assertEqual(b.subscribe(sub, "inventory/pub/zero"), "00")
+        pub, _ = b.connect("cache-pub")
+        publish(b, pub, "inventory/pub/zero", b"zero")
+        self.assertEqual(packet(sub), (0x30, word("inventory/pub/zero") + b"zero"))
+        status, cached = b.http("GET", "/api/v5/clients/cache-pub/authorization/cache")
         self.assertEqual(status, 200)
-        self.assertEqual(current, cache)
+        self.assertTrue(any(entry["topic"] == "inventory/pub/zero"
+                            and entry["result"] == "allow" for entry in cached),
+                        "the publish decision is cached")
+        # Publish QoS 1 through the socket acks and delivers.
+        self.assertEqual(b.subscribe(sub, "inventory/pub/one", qos=1), "01")
+        pub.sendall(frame(0x32, word("inventory/pub/one") + b"\x00\x0a" + b"one"))
+        self.assertEqual(packet(pub), (0x40, b"\x00\x0a"))
+        head, body = packet(sub)
+        self.assertEqual(head, 0x32)
+        sub.sendall(frame(0x40, body[len(word("inventory/pub/one")):len(word("inventory/pub/one")) + 2]))
+        # Publish QoS 2 through the socket completes the handshake.
+        self.assertEqual(b.subscribe(sub, "inventory/pub/two"), "00")
+        pub.sendall(frame(0x34, word("inventory/pub/two") + b"\x00\x0b" + b"two"))
+        self.assertEqual(packet(pub), (0x50, b"\x00\x0b"))
+        pub.sendall(frame(0x62, b"\x00\x0b"))
+        self.assertEqual(packet(pub), (0x70, b"\x00\x0b"))
+        self.assertEqual(packet(sub), (0x30, word("inventory/pub/two") + b"two"))
+        # Version 5 publish through the socket delivers.
+        v5pub = socket.create_connection(("127.0.0.1", b.mqtt), timeout=10)
+        b.sockets.append(v5pub)
+        v5pub.sendall(frame(16, b"\x00\x04MQTT\x05\x02\x00\x3c\x00" + word("cache-v5-pub")))
+        head, ack = packet(v5pub)
+        self.assertEqual(head, 32)
+        v5sub, props = b.connect_v5("cache-v5-sub")
+        v5sub.sendall(frame(0x82, b"\x00\x02\x00" + word("inventory/pub/v5") + b"\x00"))
+        head, body = packet(v5sub)
+        self.assertEqual(head, 0x90)
+        self.assertEqual(body[-1], 0x00)
+        v5pub.sendall(frame(0x30, word("inventory/pub/v5") + b"\x00" + b"v5hello"))
+        head, body = packet(v5sub)
+        self.assertIn(head, (0x30, 0x31, 0x32, 0x33))
+        # Version 3.1.1 and version 5 connects both work here.
+        _, ack = b.connect("cache-v4-again")
+        self.assertEqual(ack, "0000")
+        # Delayed publish authorizes the inner topic and delivers.
+        status, delayed_cfg = b.http("GET", "/api/v5/mqtt/delayed")
+        self.assertEqual(status, 200)
+        self.assertEqual(b.http("PUT", "/api/v5/mqtt/delayed",
+                                {"enable": True, "max_delayed_messages": 100})[0], 200)
+        dsub, _ = b.connect("cache-delayed-sub")
+        self.assertEqual(b.subscribe(dsub, "inventory/delayed-inner"), "00")
+        publish(b, pub, "$delayed/1/inventory/delayed-inner", b"later")
+        head, body = packet(dsub)
+        self.assertEqual(head, 0x30)
+        self.assertEqual(body, word("inventory/delayed-inner") + b"later")
+        # Will authorizes the will topic and delivers on drop.
+        wsub, _ = b.connect("cache-will-sub")
+        self.assertEqual(b.subscribe(wsub, "inventory/will/one"), "00")
+        wpayload = b"gone"
+        wsock = socket.create_connection(("127.0.0.1", b.mqtt), timeout=10)
+        b.sockets.append(wsock)
+        wflags = 0x02 | 0x04
+        wbody = (b"\x00\x04MQTT\x04" + bytes([wflags]) + struct.pack("!H", 60)
+                 + word("cache-will-pub") + word("inventory/will/one") + word(wpayload))
+        wsock.sendall(frame(16, wbody))
+        self.assertEqual(packet(wsock), (32, b"\x00\x00"))
+        wsock.shutdown(socket.SHUT_RDWR)
+        wsock.close()
+        head, body = packet(wsub)
+        self.assertEqual(head, 0x30)
+        self.assertEqual(body, word("inventory/will/one") + wpayload)
+        # TTL bounds staleness: a short TTL expires the entry.
+        settings["cache"]["ttl"] = "1s"
+        status, _ = b.http("PUT", "/api/v5/authorization/settings", settings)
+        self.assertEqual(status, 200)
+        self.assertEqual(b.subscribe(sock, "inventory/cache/ttl-one"), "00")
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(entry["topic"] == "inventory/cache/ttl-one" for entry in cached))
+        time.sleep(1.3)
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertFalse(any(entry["topic"] == "inventory/cache/ttl-one" for entry in cached),
+                         "the TTL expired the entry")
+        self.assertEqual(b.subscribe(sock, "inventory/cache/ttl-one"), "00")
+        settings["cache"]["ttl"] = "1m"
+        status, _ = b.http("PUT", "/api/v5/authorization/settings", settings)
+        self.assertEqual(status, 200)
+        # Max size bounds the per-client cache: oldest goes first.
+        settings["cache"]["max_size"] = 1
+        status, _ = b.http("PUT", "/api/v5/authorization/settings", settings)
+        self.assertEqual(status, 200)
+        self.assertEqual(b.subscribe(sock, "inventory/cache/a"), "00")
+        self.assertEqual(b.subscribe(sock, "inventory/cache/b"), "00")
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(cached[0]["topic"], "inventory/cache/b")
+        settings["cache"]["max_size"] = 32
+        status, _ = b.http("PUT", "/api/v5/authorization/settings", settings)
+        self.assertEqual(status, 200)
+        # Excludes skip caching for listed topics.
+        settings["cache"]["excludes"] = ["inventory/excluded/#"]
+        status, _ = b.http("PUT", "/api/v5/authorization/settings", settings)
+        self.assertEqual(status, 200)
+        self.assertEqual(b.subscribe(sock, "inventory/excluded/one"), "00")
+        self.assertEqual(b.subscribe(sock, "inventory/cache/kept"), "00")
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertFalse(any(entry["topic"] == "inventory/excluded/one" for entry in cached))
+        self.assertTrue(any(entry["topic"] == "inventory/cache/kept" for entry in cached))
+        settings["cache"]["excludes"] = []
+        status, _ = b.http("PUT", "/api/v5/authorization/settings", settings)
+        self.assertEqual(status, 200)
+        # A rule change invalidates the cached decision: the next
+        # operation uses the new policy, no stale allow.
+        status, _ = b.http(
+            "POST", "/api/v5/authorization/sources/built_in_database/rules/all",
+            {"rules": [{"topic": "inventory/other", "permission": "allow",
+                        "action": "subscribe"}]})
+        self.assertEqual(status, 204)
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(cached, [], "the rule change invalidated the cache")
+        self.assertEqual(b.subscribe(sock, "inventory/cache/one"), "80")
+        self.assertEqual(b.subscribe(sock, "inventory/other"), "00")
+        # A legacy ACL write invalidates the cache too: a cached allow
+        # ends after the legacy rule is deleted (AZ-02).
+        status, _ = b.http(
+            "POST", "/api/v1/auth/acls",
+            {"client_pattern": "*", "action": "subscribe",
+             "topic_pattern": "inventory/legacy/#", "allow": True})
+        self.assertEqual(status, 201)
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(cached, [], "the legacy ACL create invalidated the cache")
+        self.assertEqual(b.subscribe(sock, "inventory/legacy/one"), "00")
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(entry["topic"] == "inventory/legacy/one"
+                            and entry["result"] == "allow" for entry in cached),
+                        "the legacy allow is cached")
+        status, acls = b.http("GET", "/api/v1/auth/acls")
+        self.assertEqual(status, 200)
+        legacy = next(index for index, acl in enumerate(acls)
+                      if acl["topic_pattern"] == "inventory/legacy/#")
+        status, _ = b.http("DELETE", f"/api/v1/auth/acls/{legacy}")
+        self.assertEqual(status, 204)
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(cached, [], "the legacy ACL delete invalidated the cache")
+        self.assertEqual(b.subscribe(sock, "inventory/legacy/one"), "80")
+        # A source change invalidates: same enable still clears.
+        status, _ = b.http("PUT", "/api/v5/authorization/sources/built_in_database",
+                            {"enable": True})
+        self.assertEqual(status, 204)
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(cached, [], "the source change invalidated the cache")
+        # A user change invalidates: a new user clears entries.
+        status, _ = b.http("POST", "/api/v1/auth/users",
+                            {"username": "cacheuser", "password": b.password})
+        self.assertEqual(status, 201)
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(cached, [], "the user change invalidated the cache")
+        # A client rule change invalidates: a new rule clears entries.
+        self.assertEqual(b.subscribe(sock, "inventory/other"), "00")
+        status, _ = b.http("POST", "/api/v5/authorization/sources/built_in_database/rules/clients",
+                            {"clientid": "cache-policy", "topic": "inventory/other",
+                             "permission": "allow", "action": "subscribe"})
+        self.assertEqual(status, 204)
+        status, cached = b.http("GET", "/api/v5/clients/cache-policy/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(cached, [], "the client change invalidated the cache")
+        # Existing session uses the new policy on its next operation.
+        status, _ = b.http(
+            "POST", "/api/v5/authorization/sources/built_in_database/rules/all",
+            {"rules": [{"topic": "inventory/other", "permission": "deny",
+                        "action": "subscribe"},
+                       {"topic": "inventory/pub/zero", "permission": "allow",
+                        "action": "publish"}]})
+        self.assertEqual(status, 204)
+        self.assertEqual(b.subscribe(sock, "inventory/other"), "80")
+        publish(b, pub, "inventory/pub/zero", b"after-change")
+        self.assertEqual(packet(sub), (0x30, word("inventory/pub/zero") + b"after-change"))
+        # Cache disabled stays a stored and reported policy; decisions are
+        # still enforced.
+        settings["cache"]["enable"] = False
+        status, _ = b.http("PUT", "/api/v5/authorization/settings", settings)
+        self.assertEqual(status, 200)
+        status, current = b.http("GET", "/api/v5/authorization/settings")
+        self.assertEqual(status, 200)
+        self.assertEqual(current["cache"]["enable"], False)
+        self.assertEqual(b.subscribe(sock, "inventory/other"), "80")
         b.stop()
         b.start()
-        status, current = b.http("GET", "/api/v5/authorization/node_cache")
+        status, current = b.http("GET", "/api/v5/authorization/settings")
         self.assertEqual(status, 200)
-        self.assertEqual(current, cache)
+        self.assertEqual(current["no_match"], "deny")
+        self.assertEqual(current["cache"]["enable"], False)
 
     # // AZ-01 inventory: current behaviour; owner MV-11c
     def test_retainer_expiry_and_disc_settings_do_not_preserve_retained_message(self):
@@ -1205,8 +1549,7 @@ class InventoryEntry(unittest.TestCase):
         _, ack = b.connect("future-banned")
         self.assertEqual(ack, "0000")
 
-    # // AZ-01 inventory: current behaviour; owner AZ-02
-    def test_auto_subscribe_bypasses_the_same_topic_acl(self):
+    def test_auto_subscribe_respects_the_same_topic_acl(self):
         b = self.boot()
         status, _ = b.http("POST", "/api/v1/auth/acls",
                            {"client_pattern": "allowed-publisher", "action": "publish",
@@ -1219,11 +1562,26 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(status, 200)
         sub, ack = b.connect("denied-subscriber")
         self.assertEqual(ack, "0000")
+        # The ACL does not grant subscribe: the auto-subscribe is refused
+        # and not applied, so the publish reaches no socket.
         self.assertEqual(b.subscribe(sub, "inventory/protected"), "80")
         publish(b, pub, "inventory/protected", b"protected payload")
-        head, body = packet(sub)
+        sub.settimeout(0.3)
+        with self.assertRaises(TimeoutError):
+            packet(sub)
+        sub.settimeout(10)
+        # Grant subscribe to the same client: the next bind applies the
+        # auto-subscribe and delivery reaches the socket.
+        status, _ = b.http("POST", "/api/v1/auth/acls",
+                           {"client_pattern": "denied-subscriber", "action": "subscribe",
+                            "topic_pattern": "inventory/protected", "allow": True})
+        self.assertEqual(status, 201)
+        sub2, ack = b.connect("denied-subscriber")
+        self.assertEqual(ack, "0000")
+        publish(b, pub, "inventory/protected", b"allowed payload")
+        head, body = packet(sub2)
         self.assertEqual(head, 0x30)
-        self.assertEqual(body, word("inventory/protected") + b"protected payload")
+        self.assertEqual(body, word("inventory/protected") + b"allowed payload")
         b.stop()
         b.start()
         status, current = b.http("GET", "/api/v5/mqtt/auto_subscribe")
@@ -1762,7 +2120,8 @@ class InventoryEntry(unittest.TestCase):
             except Exception as error:
                 errors.append(type(error).__name__)
 
-        workers = [threading.Thread(target=connect, args=(index,)) for index in range(3)]
+        workers = [threading.Thread(target=connect, args=(index,), daemon=True)
+                   for index in range(3)]
         for worker in workers:
             worker.start()
         ready.set()

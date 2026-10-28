@@ -50,101 +50,115 @@ fn ephemeral_port() -> u16 {
 /// Boots one real kernel on ephemeral ports. `extra_toml` appends to
 /// `indra.toml` (the `[mcp]` section of the read-only and disabled
 /// tests). Anonymous MQTT is allowed; the operator key guards the API.
-/// Each listener uses an ephemeral loopback port, so parallel tests
-/// never share a port.
+/// Each listener uses an ephemeral loopback port.
+///
+/// Boot up to three times. A parallel boot sometimes takes a probed
+/// port first, and the loser exits during boot. Each attempt uses
+/// fresh ports and fresh dirs. A real boot defect fails each attempt
+/// and still panics.
 async fn spawn_kernel(name: &str, extra_toml: &str) -> Kernel {
-    let tag = format!(
-        "mc04-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}-data"));
-    let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
-    std::fs::create_dir_all(&config_dir).expect("create temp config dir");
-    let bl_port = ephemeral_port();
-    let mqtt_port = ephemeral_port();
-    let ws_port = ephemeral_port();
-    let api_port = ephemeral_port();
-    std::fs::write(
-        config_dir.join("indra.toml"),
-        format!(
-            "[node]\n\
-             id = \"mc04-{tag}\"\n\
-             data_dir = \"{}\"\n\
-             brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
-             \n\
-             [listeners.tcp]\n\
-             bind = \"127.0.0.1:{mqtt_port}\"\n\
-             \n\
-             [listeners.tls]\n\
-             enabled = false\n\
-             \n\
-             [listeners.ws]\n\
-             bind = \"127.0.0.1:{ws_port}\"\n\
-             \n\
-             [listeners.wss]\n\
-             enabled = false\n\
-             \n\
-             [listeners.api]\n\
-             bind = \"127.0.0.1:{api_port}\"\n\
-             \n\
-             [logging]\n\
-             level = \"warn\"\n\
-             \n\
-             {extra_toml}",
-            scratch.display(),
-        ),
-    )
-    .expect("write indra.toml");
-    let mut child = tokio::process::Command::new(kernel_binary())
-        .arg("--config-dir")
-        .arg(&config_dir)
-        .arg("--allow-anonymous")
-        .env("INDRA_API_KEYS", API_KEY)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn real kernel");
-    let http = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{api_port}");
-    let deadline = std::time::Instant::now() + BOOT;
-    loop {
-        let up = tokio::time::timeout(
-            Duration::from_secs(2),
-            http.get(format!("{base}/healthz")).send(),
+    for attempt in 1..=3 {
+        let tag = format!(
+            "mc04-{name}-{}-{}-{attempt}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}-data"));
+        let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+        std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+        let bl_port = ephemeral_port();
+        let mqtt_port = ephemeral_port();
+        let ws_port = ephemeral_port();
+        let api_port = ephemeral_port();
+        std::fs::write(
+            config_dir.join("indra.toml"),
+            format!(
+                "[node]\n\
+                 id = \"mc04-{tag}\"\n\
+                 data_dir = \"{}\"\n\
+                 brokerlink_bind = \"127.0.0.1:{bl_port}\"\n\
+                 \n\
+                 [listeners.tcp]\n\
+                 bind = \"127.0.0.1:{mqtt_port}\"\n\
+                 \n\
+                 [listeners.tls]\n\
+                 enabled = false\n\
+                 \n\
+                 [listeners.ws]\n\
+                 bind = \"127.0.0.1:{ws_port}\"\n\
+                 \n\
+                 [listeners.wss]\n\
+                 enabled = false\n\
+                 \n\
+                 [listeners.api]\n\
+                 bind = \"127.0.0.1:{api_port}\"\n\
+                 \n\
+                 [logging]\n\
+                 level = \"warn\"\n\
+                 \n\
+                 {extra_toml}",
+                scratch.display(),
+            ),
         )
-        .await;
-        if let Ok(Ok(res)) = up {
-            if let Ok(text) = res.text().await {
-                if text == "OK"
-                    && tokio::net::TcpStream::connect(("127.0.0.1", mqtt_port))
-                        .await
-                        .is_ok()
-                {
-                    break;
+        .expect("write indra.toml");
+        let mut child = tokio::process::Command::new(kernel_binary())
+            .arg("--config-dir")
+            .arg(&config_dir)
+            .arg("--allow-anonymous")
+            .env("INDRA_API_KEYS", API_KEY)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn real kernel");
+        let http = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{api_port}");
+        let deadline = std::time::Instant::now() + BOOT;
+        loop {
+            let up = tokio::time::timeout(
+                Duration::from_secs(2),
+                http.get(format!("{base}/healthz")).send(),
+            )
+            .await;
+            if let Ok(Ok(res)) = up {
+                if let Ok(text) = res.text().await {
+                    if text == "OK"
+                        && tokio::net::TcpStream::connect(("127.0.0.1", mqtt_port))
+                            .await
+                            .is_ok()
+                    {
+                        return Kernel {
+                            child,
+                            mqtt_port,
+                            api_port,
+                            scratch,
+                            config_dir,
+                        };
+                    }
                 }
             }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill().await;
+                let _ = std::fs::remove_dir_all(&scratch);
+                let _ = std::fs::remove_dir_all(&config_dir);
+                panic!("kernel never opened API {api_port} and MQTT {mqtt_port}");
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                let _ = child.kill().await;
+                let _ = std::fs::remove_dir_all(&scratch);
+                let _ = std::fs::remove_dir_all(&config_dir);
+                if attempt >= 3 {
+                    panic!("kernel exited during boot: {status}");
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill().await;
-            panic!("kernel never opened API {api_port} and MQTT {mqtt_port}");
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("kernel exited during boot: {status}");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Kernel {
-        child,
-        mqtt_port,
-        api_port,
-        scratch,
-        config_dir,
-    }
+    panic!("kernel did not boot after three attempts");
 }
 
 /// Locates the real kernel binary for the spawned-kernel tests.

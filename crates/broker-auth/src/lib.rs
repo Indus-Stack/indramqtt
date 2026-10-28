@@ -890,20 +890,27 @@ impl MemoryAuth {
             .is_none_or(|registry| registry.built_in_available())
     }
 
+    /// True when no enabled source other than the built-in database is in
+    /// the stored chain. Unlinked state counts as the built-in only. This
+    /// gate keeps the empty-default-tenant fast path safe: an unsupported
+    /// source must not be bypassed when the built-in rule table is empty
+    /// (D2). One lock-free snapshot load of at most
+    /// [`broker_config::MAX_AUTHZ_SOURCES`] entries.
+    fn chain_has_no_unsupported_source(&self) -> bool {
+        self.authz_sources.load().as_deref().is_none_or(|registry| {
+            registry
+                .snapshot()
+                .iter()
+                .all(|entry| !entry.enable || entry.source_type == "built_in_database")
+        })
+    }
+
     /// Attribute one built-in verdict to the shared registry counters.
     /// Unlinked state applies nothing. One short read lock to clone the
     /// counter `Arc` plus lock-free atomic adds; unknown types apply
     /// nothing and never accumulate.
     fn record_authz_verdict(&self, allowed: bool) {
         if let Some(registry) = self.authz_sources.load().as_deref() {
-            registry.record_built_in(allowed);
-        }
-    }
-
-    /// Attributes one built-in verdict through an already loaded source
-    /// link. Lock-free: see [`AuthzSourceRegistry::record_built_in`].
-    fn record_verdict(sources: Option<&AuthzSourceRegistry>, allowed: bool) {
-        if let Some(registry) = sources {
             registry.record_built_in(allowed);
         }
     }
@@ -2512,16 +2519,6 @@ impl MemoryAuth {
         self.persist()
             .map_err(|e| ClientRuleError::Persist(e.to_string()))
     }
-
-    fn check(
-        &self,
-        client_id: &str,
-        action: AclAction,
-        matches_rule: impl Fn(&AclRule) -> bool,
-    ) -> bool {
-        let tenants = self.tenants.read();
-        self.check_in_tenant(&tenants, DEFAULT_TENANT_ID, client_id, action, matches_rule)
-    }
 }
 
 #[async_trait]
@@ -2918,56 +2915,90 @@ async fn migrate_legacy_hash_gated_in_tenant(
 #[async_trait]
 impl Authorizer for MemoryAuth {
     async fn authorize_publish(&self, client_id: &str, topic: &Topic) -> Result<()> {
-        // Stored order and enable flags gate the built-in table: a
-        // disabled or removed built-in source denies fail closed and
-        // counts the denial on the shared registry. Otherwise the
-        // verdict attributes to the built-in counters.
-        if !self.built_in_live() {
-            self.record_authz_verdict(false);
-            return Err(AuthError::PublishDenied(format!(
-                "{client_id} cannot publish"
-            )));
-        }
-        // Default-tenant shim through the shared first-match-wins helper
-        // so single-tenant installs behave exactly as before (same
-        // open-when-empty; unmatched follows the stored `no_match`).
-        if self.check(client_id, AclAction::Publish, |rule| {
-            rule.topic_matches(topic)
-        }) {
-            self.record_authz_verdict(true);
-            Ok(())
-        } else {
-            self.record_authz_verdict(false);
-            Err(AuthError::PublishDenied(format!(
-                "{client_id} cannot publish"
-            )))
-        }
+        // Default-tenant shim: the same chain and source order as the
+        // tenant path. Single-tenant installs behave as before.
+        self.authorize_publish_in_tenant(DEFAULT_TENANT_ID, client_id, topic)
+            .await
     }
 
     async fn authorize_subscribe(&self, client_id: &str, filter: &TopicFilter) -> Result<()> {
-        // Same stored order and enable gate as publish (see above).
-        if !self.built_in_live() {
-            self.record_authz_verdict(false);
-            return Err(AuthError::SubscribeDenied(format!(
-                "{client_id} cannot subscribe"
-            )));
-        }
-        // Same default-tenant shim as publish (see above).
-        if self.check(client_id, AclAction::Subscribe, |rule| {
-            rule.filter_covered(filter)
-        }) {
-            self.record_authz_verdict(true);
-            Ok(())
-        } else {
-            self.record_authz_verdict(false);
-            Err(AuthError::SubscribeDenied(format!(
-                "{client_id} cannot subscribe"
-            )))
-        }
+        // Default-tenant shim: the same chain and source order as the
+        // tenant path. Single-tenant installs behave as before.
+        self.authorize_subscribe_in_tenant(DEFAULT_TENANT_ID, client_id, filter)
+            .await
     }
 }
 
 impl MemoryAuth {
+    /// Find the first built-in rule for one decision without fallback.
+    ///
+    /// It returns the matching rule's allow flag, or None when no rule
+    /// matches. It never applies the stored `no_match` setting: a miss
+    /// abstains so a later source in the chain still decides.
+    fn built_in_rule_decision(
+        tenants: &HashMap<String, TenantState>,
+        key: &str,
+        client_id: &str,
+        action: AclAction,
+        matches_rule: &impl Fn(&AclRule) -> bool,
+    ) -> Option<bool> {
+        let state = tenants.get(tenant_key(key))?;
+        for rule in state.rules.iter() {
+            if rule.client_matches(client_id) && rule.action.covers(action) && matches_rule(rule) {
+                return Some(rule.allow);
+            }
+        }
+        None
+    }
+
+    /// Evaluate the stored authorization source order for one decision (D2).
+    ///
+    /// The first enabled source that does not abstain decides.
+    /// A source other than `built_in_database` denies the decision.
+    /// The chain never falls through such a deny.
+    /// The built-in database uses its first matching rule.
+    /// It abstains when no rule matches.
+    /// An abstain leaves the decision to a later source.
+    /// When all abstain, `no_match` decides.
+    /// With no linked registry the caller keeps current behaviour.
+    fn source_chain_verdict(
+        &self,
+        tenants: &HashMap<String, TenantState>,
+        key: &str,
+        client_id: &str,
+        action: AclAction,
+        matches_rule: impl Fn(&AclRule) -> bool,
+    ) -> Option<bool> {
+        let loaded = self.authz_sources.load();
+        let sources = loaded.as_deref()?;
+        let snap = sources.snapshot();
+        let mut built_in_enabled = false;
+        for entry in snap.iter() {
+            if !entry.enable {
+                continue;
+            }
+            if entry.source_type == "built_in_database" {
+                built_in_enabled = true;
+                if let Some(decision) =
+                    Self::built_in_rule_decision(tenants, key, client_id, action, &matches_rule)
+                {
+                    return Some(decision);
+                }
+                // No matching rule: abstain, a later source decides.
+                continue;
+            }
+            // D2: an enabled source this build does not evaluate denies the
+            // decision that reaches it; never fall through to a later allow.
+            sources.record_deny(&entry.source_type);
+            return Some(false);
+        }
+        if !built_in_enabled {
+            self.record_authz_verdict(false);
+            return Some(false);
+        }
+        None
+    }
+
     /// Authorize one publish in one tenant (MT-06): a rule in one tenant
     /// never grants publish in another. The default tenant with no rules
     /// stays open; a non-default tenant with no rules (or an unknown or
@@ -2989,49 +3020,61 @@ impl MemoryAuth {
         // and the settings with lock-free loads. It counts verdicts
         // with atomic adds. With no rule in the default tenant it
         // skips the tenant lock as well.
-        let sources = self.authz_sources.load();
-        let sources = sources.as_deref();
         if !is_default_tenant(key) && !is_valid_tenant_id(key) {
             self.deny_closed_tenant(key, client_id, "invalid tenant id at authorize_publish");
-            Self::record_verdict(sources, false);
+            self.record_authz_verdict(false);
             return Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )));
         }
-        // Stored order and enable gate first: a disabled or removed
-        // built-in source denies fail closed in every tenant and counts
-        // the denial on the shared registry.
-        if !sources.is_none_or(|registry| registry.built_in_available()) {
-            Self::record_verdict(sources, false);
+        // Stored order and enable gate: a disabled or removed built-in
+        // source denies fail closed in every tenant.
+        let built_in_enabled = self.built_in_live();
+        if !built_in_enabled {
+            self.record_authz_verdict(false);
             return Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )));
         }
-        // An empty default tenant allows the publish: no lock, no scan.
-        // Otherwise one short guard covers the tenant lookup plus the rule
-        // scan; closed-ness is derived from the same guard so the deny
-        // path takes no second tenant lock. Only an unmatched scan takes
-        // one lock-free settings load for the `no_match` value.
-        let (allowed, closed) = if is_default_tenant(key)
+        // An empty store keeps today's open broker: no lock, no scan.
+        // The fast path also needs a chain with no unsupported source.
+        if is_default_tenant(key)
             && self
                 .default_rules_empty
                 .load(std::sync::atomic::Ordering::Acquire)
+            && self.chain_has_no_unsupported_source()
         {
-            (true, false)
-        } else {
-            let tenants = self.tenants.read();
-            let closed = match tenants.get(key) {
-                None => !is_default_tenant(key),
-                Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
-            };
-            let allowed =
-                self.check_in_tenant(&tenants, key, client_id, AclAction::Publish, |rule| {
-                    rule.topic_matches(topic)
-                });
-            (allowed, closed)
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
+        // One short guard covers the tenant lookup, the rule scan and the
+        // source-order walk; closed-ness is derived from the same guard so
+        // the deny path takes no second tenant lock. Only an unmatched
+        // scan takes one lock-free settings load for the `no_match`
+        // value.
+        let tenants = self.tenants.read();
+        let closed = match tenants.get(key) {
+            None => !is_default_tenant(key),
+            Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
         };
+        // D2: walk the stored source order. An enabled source this build
+        // does not evaluate denies the decision that reaches it; the
+        // built-in database's first matching rule decides; an all-abstain
+        // chain falls to the stored `no_match` setting.
+        let allowed =
+            match self.source_chain_verdict(&tenants, key, client_id, AclAction::Publish, |rule| {
+                rule.topic_matches(topic)
+            }) {
+                Some(decision) => decision,
+                None => {
+                    self.check_in_tenant(&tenants, key, client_id, AclAction::Publish, |rule| {
+                        rule.topic_matches(topic)
+                    })
+                }
+            };
+        drop(tenants);
         if allowed {
-            Self::record_verdict(sources, true);
+            self.record_authz_verdict(true);
             Ok(())
         } else {
             // Count only genuinely closed tenants (unknown or a
@@ -3041,7 +3084,7 @@ impl MemoryAuth {
             if closed {
                 self.deny_closed_tenant(key, client_id, "closed tenant at authorize_publish");
             }
-            Self::record_verdict(sources, false);
+            self.record_authz_verdict(false);
             Err(AuthError::PublishDenied(format!(
                 "{client_id} cannot publish"
             )))
@@ -3065,27 +3108,53 @@ impl MemoryAuth {
                 "{client_id} cannot subscribe"
             )));
         }
-        // Same stored order and enable gate as the publish path.
-        if !self.built_in_live() {
+        // Stored order and enable gate: a disabled or removed built-in
+        // source denies fail closed in every tenant.
+        let built_in_enabled = self.built_in_live();
+        if !built_in_enabled {
             self.record_authz_verdict(false);
             return Err(AuthError::SubscribeDenied(format!(
                 "{client_id} cannot subscribe"
             )));
         }
-        // Same single-guard discipline as the publish path: only an
-        // unmatched scan takes the lock-free settings load.
-        let (allowed, closed) = {
-            let tenants = self.tenants.read();
-            let closed = match tenants.get(key) {
-                None => !is_default_tenant(key),
-                Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
-            };
-            let allowed =
-                self.check_in_tenant(&tenants, key, client_id, AclAction::Subscribe, |rule| {
-                    rule.filter_covered(&filter)
-                });
-            (allowed, closed)
+        // An empty store keeps today's open broker: no lock, no scan.
+        // The fast path also needs a chain with no unsupported source.
+        if is_default_tenant(key)
+            && self
+                .default_rules_empty
+                .load(std::sync::atomic::Ordering::Acquire)
+            && self.chain_has_no_unsupported_source()
+        {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
+        // One short guard covers the tenant lookup, the rule scan and the
+        // source-order walk; closed-ness is derived from the same guard so
+        // the deny path takes no second tenant lock. Only an unmatched
+        // scan takes one lock-free settings load for the `no_match`
+        // value.
+        let tenants = self.tenants.read();
+        let closed = match tenants.get(key) {
+            None => !is_default_tenant(key),
+            Some(state) => !is_default_tenant(key) && state.rules.is_empty(),
         };
+        // D2: walk the stored source order. An enabled source this build
+        // does not evaluate denies the decision that reaches it; the
+        // built-in database's first matching rule decides; an all-abstain
+        // chain falls to the stored `no_match` setting.
+        let allowed = match self.source_chain_verdict(
+            &tenants,
+            key,
+            client_id,
+            AclAction::Subscribe,
+            |rule| rule.filter_covered(&filter),
+        ) {
+            Some(decision) => decision,
+            None => self.check_in_tenant(&tenants, key, client_id, AclAction::Subscribe, |rule| {
+                rule.filter_covered(&filter)
+            }),
+        };
+        drop(tenants);
         if allowed {
             self.record_authz_verdict(true);
             Ok(())

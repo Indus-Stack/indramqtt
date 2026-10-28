@@ -1442,8 +1442,7 @@ fn default_authz_settings_include_mountpoint() -> bool {
 
 /// Decision-cache half of the global authorization settings: the enabled
 /// flag, entry cap, TTL and topic-pattern exclusions. Stored, validated
-/// and reported; enforcement on the authorize path lands with the rule
-/// tables (decision evaluation is a sibling task, never this one).
+/// and reported; enforced on the publish, subscribe and will paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthzSettingsCacheConf {
@@ -1588,7 +1587,10 @@ fn validate_settings_bytesize(field: &str, text: &str) -> Result<(), ConfigError
     }
 }
 
-fn parse_settings_duration_to_ms(text: &str) -> Option<u64> {
+/// Parse a settings duration (`1ms`, `5s`, `1m`, `1h`, `1d`) to millis.
+/// Returns `None` for an invalid duration. Used by the authorize path
+/// to enforce the cached verdict TTL without a new dependency.
+pub fn parse_settings_duration_to_ms(text: &str) -> Option<u64> {
     let lower = text.trim().to_ascii_lowercase().replace(' ', "");
     if lower.is_empty() {
         return None;

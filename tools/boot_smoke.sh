@@ -94,6 +94,11 @@ bind = "127.0.0.1:$API_PORT"
 [logging]
 level = "warn"
 
+# The smoke clients connect without credentials: the smoke broker opts
+# into anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
 # Exporter settings (AP-09). The kernel seeds the registry from these
 # file values at boot, so the settings read and the text exposition
 # observe them without any API write.
@@ -1183,6 +1188,106 @@ sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))
 
+# --- 4a6. Anonymous CONNECT is refused when auth.allow_anonymous is false ---
+# A second kernel boots from the same file kind with the flag off.
+# No users exist. The broker refuses an anonymous CONNECT before any session exists.
+# It returns 5 for 3.1.1 and 0x87 for 5.0. The stored config stays
+# untouched. The operator still lists, reads and deletes records over
+# the API. The affected MQTT access stays denied (D2).
+read -r REFUSAL_API REFUSAL_MQTT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/refcfg" "$ROOT/refdata"
+cat > "$ROOT/refcfg/indra.toml" <<EOF
+[node]
+id = "boot-smoke-refusal"
+data_dir = "$ROOT/refdata"
+
+[listeners.tcp]
+bind = "127.0.0.1:$REFUSAL_MQTT"
+
+[listeners.api]
+bind = "127.0.0.1:$REFUSAL_API"
+
+[logging]
+level = "warn"
+
+[auth]
+allow_anonymous = false
+EOF
+"$KERNEL" --config-dir "$ROOT/refcfg" > "$ROOT/refusal.log" 2>&1 &
+REFUSAL_PID=$!
+refusal_up=0
+for _ in $(seq 1 50); do
+    if python3 - "$REFUSAL_API" >/dev/null 2>&1 <<'PY'
+import sys, urllib.request
+urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/healthz", timeout=1)
+PY
+    then
+        refusal_up=1
+        break
+    fi
+    kill -0 "$REFUSAL_PID" 2>/dev/null || break
+    sleep 0.2
+done
+if [ "$refusal_up" = 1 ]; then
+    python3 - "$REFUSAL_MQTT" <<'PY'
+import socket, struct, sys
+def frame(kind, body):
+    head = bytearray([kind])
+    remaining = len(body)
+    while True:
+        digit = remaining % 128
+        remaining //= 128
+        head.append(digit | (128 if remaining else 0))
+        if not remaining:
+            return bytes(head) + body
+def word(value):
+    raw = value.encode() if isinstance(value, str) else value
+    return struct.pack("!H", len(raw)) + raw
+def packet(sock):
+    head = sock.recv(1)
+    if not head:
+        return head[0], b""
+    remaining = 0
+    scale = 1
+    while True:
+        digit = sock.recv(1)[0]
+        remaining += (digit & 127) * scale
+        if not digit & 128:
+            break
+        scale *= 128
+    body = b""
+    while len(body) < remaining:
+        chunk = sock.recv(remaining - len(body))
+        if not chunk:
+            break
+        body += chunk
+    return head[0], body
+port = int(sys.argv[1])
+sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+sock.sendall(frame(16, b"\x00\x04MQTT\x04\x02\x00\x3c" + word("refusal-anon")))
+head, ack = packet(sock)
+sock.close()
+sys.exit(0 if head == 32 and ack != b"\x02\x00\x00" else 1)
+PY
+    check "an anonymous CONNECT is refused when allow_anonymous is false" $?
+else
+    check "an anonymous CONNECT is refused when allow_anonymous is false" 1
+    head -20 "$ROOT/refusal.log" 2>/dev/null || true
+fi
+kill "$REFUSAL_PID" 2>/dev/null
+wait "$REFUSAL_PID" 2>/dev/null
+
 # --- 4b. Tenant filters on the client list keep tenants apart ---
 # Run this check before the first user exists. The broker stays open.
 # The tenant rule maps each username to its own tenant. The same
@@ -2018,6 +2123,11 @@ bind = "127.0.0.1:$SESSION_API_PORT"
 
 [session]
 max_session_expiry_secs = 3600
+
+# The check connects without credentials: this kernel opts into
+# anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
 
 [logging]
 level = "warn"

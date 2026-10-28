@@ -1235,6 +1235,9 @@ pub async fn change_user_password(
         &username,
         bearer_token_from_credentials(&headers).as_deref(),
     );
+    // A changed password invalidates cached authorization decisions so the
+    // next operation is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1365,6 +1368,9 @@ pub async fn create_authn_user(
         }
         return mqtt_persist_error(error);
     }
+    // A changed user invalidates cached authorization decisions so the
+    // next operation is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -1508,6 +1514,9 @@ pub async fn update_authn_user(
         }
         return mqtt_persist_error(error);
     }
+    // A changed password invalidates cached authorization decisions so
+    // the next operation is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1567,7 +1576,12 @@ pub async fn delete_authn_user(
         .into_response();
     }
     match state.auth.remove_user(&user_id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // A removed user invalidates cached authorization decisions
+            // so the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => ApiError::NotFound(format!("user {user_id:?} not found")).into_response(),
         Err(error) => mqtt_persist_error(error),
     }
@@ -1626,17 +1640,22 @@ pub async fn import_authn_users(
         .map(|(user_id, password)| (user_id, password.into_bytes()))
         .collect();
     match state.auth.import_users(batch) {
-        Ok(summary) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "total": summary.total,
-                "success": summary.success,
-                "override": 0,
-                "skipped": 0,
-                "failed": 0,
-            })),
-        )
-            .into_response(),
+        Ok(summary) => {
+            // Imported users invalidate cached authorization decisions so
+            // the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "total": summary.total,
+                    "success": summary.success,
+                    "override": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                })),
+            )
+                .into_response()
+        }
         Err(ImportUsersError::Malformed(msg) | ImportUsersError::TooMany(msg)) => {
             ApiError::BadRequest(msg).into_response()
         }
@@ -1781,6 +1800,9 @@ pub async fn create_authz_rule(
     {
         return mqtt_persist_error(error);
     }
+    // A changed rule invalidates cached decisions so the next operation
+    // is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     StatusCode::CREATED.into_response()
 }
 
@@ -1795,7 +1817,12 @@ pub async fn delete_authz_rule(
             .into_response();
     }
     match state.auth.remove_rule(index) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // A changed rule invalidates cached decisions so the next
+            // operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => mqtt_persist_error(error),
     }

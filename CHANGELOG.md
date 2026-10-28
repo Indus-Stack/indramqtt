@@ -69,6 +69,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **PSK handshake**: an unknown identity gets a stand-in key from the per-boot server secret, so it fails with the same alert as a wrong key on TLS 1.2 and TLS 1.3. Session tickets are off, so every handshake runs the lookup. The verified identity is the username of the bind.
 - **WebSocket limits**: the upgrade head is limited to 8 KiB with the connect time limit. At most one pong waits for the next flush, and a ping flood with no MQTT byte closes the connection. The library write buffer is 8 KiB.
 - **Management stores**: the stores keep serving after a lock failure instead of stopping the process.
+- **Authorization settings applied**: `no_match` decides publish, subscribe and will. `deny_action` ignores or disconnects on denial. Disconnect uses the version-correct reason code. `auth.allow_anonymous = false` refuses anonymous CONNECT. Refusal uses 3.1.1 code 5 and 5.0 code 0x87. `auth.password_hash` selects the hash for new credentials.
+- **Authorization cache applied**: the cache policy is enforced on publish, subscribe and will. `enable` selects caching. `max_size` bounds entries per client. `ttl` bounds staleness. `excludes` skips listed topics. Rule, source, user and client changes clear entries.
+- **Authorization sources refused**: the broker answers 400 for unevaluated kinds. The error names the kind. Nothing is stored. The old state stays active.
+- **Old stored sources deny**: a stored source from an older version stays unchanged. It denies each decision that would reach it. It raises an alarm that names the source. The API keeps read and delete paths open.
+- **Failed settings write keeps the old state**: a refused or failed `PUT /authorization/settings` validates before the live value changes. The save precedes the live swap. A failed save leaves the live and the stored decision unchanged.
 
 ### Fixed
 - Rule API errors follow the reference API: duplicate rule creation returns `400 BAD_REQUEST`; a stored-rule test for an absent id returns `404 RULE_NOT_FOUND`. A refused duplicate keeps the existing rule and its stored settings.

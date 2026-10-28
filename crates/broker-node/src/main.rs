@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use broker_auth::{
     AuthnChain, AuthnSettingsStore, AuthzNodeCache, AuthzSettingsStore, AuthzSourceRegistry,
     DbAuthSet, DbAuthSetConfig, JwksAuthenticator, JwksConfig, KerberosAuthenticator,
-    KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth, NodeAuthCache, WebhookAuth,
-    WebhookConfig,
+    KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth, NodeAuthCache, PasswordAlgorithm,
+    PasswordHashPolicy, WebhookAuth, WebhookConfig,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
@@ -1427,7 +1427,12 @@ async fn apply_bind_request_inner(
                 || jwks_enabled
                 || db_configured
                 || shared.webhook.is_some()
+                || !shared.allow_anonymous
             {
+                // `auth.allow_anonymous = false` refuses an anonymous CONNECT
+                // even while the user store is empty: the flag is applied
+                // before the session is created, with the version-correct
+                // code (3.1.1: return code 5, 5.0: reason code 0x87).
                 shared.metrics.inc_auth_failures();
                 // W2-08: anonymous refusal is a failed verdict on the
                 // first enabled built-in entry when one exists.
@@ -2378,7 +2383,12 @@ fn is_binding_accepted(reply: &BrokerFrame) -> bool {
 /// bad template can never fail a connect; the stored templates themselves
 /// are validated at the management write, so skips only cover
 /// placeholder edge cases.
-fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>, conn_id: u64) {
+async fn apply_auto_subscribe(
+    shared: &Shared,
+    client_id: &str,
+    username: Option<&str>,
+    conn_id: u64,
+) {
     let entries = shared.auto_subscribe.list();
     if entries.is_empty() {
         return;
@@ -2396,6 +2406,17 @@ fn apply_auto_subscribe(shared: &Shared, client_id: &str, username: Option<&str>
             continue;
         };
         let Ok(qos) = QoS::try_from(entry.qos) else {
+            continue;
+        };
+        // AZ-02: an automatic subscription follows the same subscribe
+        // ACL as a manual one. A denied entry registers nothing, so a
+        // denied client receives nothing through auto-subscribe (D2).
+        if shared
+            .auth
+            .authorize_subscribe_in_tenant(&tenant, client_id, &filter)
+            .await
+            .is_err()
+        {
             continue;
         };
         // B4-08 bound: a full subscription table denies the entry fail
@@ -4742,6 +4763,31 @@ fn apply_prometheus_file_settings(
     Ok(())
 }
 
+/// Copy authorization sources set through the startup layers into the
+/// config registry.
+///
+/// The file home replaces the stored source order only when a startup
+/// layer sets `authz_sources.sources`; a later boot without the key keeps
+/// the stored order. Boot-time only: one snapshot clone plus at most one
+/// commit and one save.
+fn apply_authz_sources_file_settings(
+    layered: &LayeredConfig,
+    registry: &ConfigRegistry,
+) -> Result<(), ConfigError> {
+    const PATH: &str = "authz_sources.sources";
+    if !layered.provenance().contains_key(PATH) {
+        return Ok(());
+    }
+    let next = layered.config().authz_sources.clone();
+    if next == registry.snapshot().authz_sources {
+        return Ok(());
+    }
+    next.validate()?;
+    registry.commit_authz_sources(next)?;
+    registry.save()?;
+    Ok(())
+}
+
 /// Resolve the startup configuration through the typed-schema layers
 /// (SY-02): schema defaults, `indra.toml`, `conf.d/*.toml`,
 /// `INDRA_*` environment, then explicitly passed flags. Main's defaults
@@ -5603,7 +5649,8 @@ where
                             &req.client_id,
                             req.username.as_deref(),
                             frame.header.conn_id,
-                        );
+                        )
+                        .await;
                     }
                 }
                 let replayed = match native_bind {
@@ -5940,19 +5987,43 @@ async fn apply_subscribe(
         // Tenant scope (MT-06): authorisation runs in the subscriber's
         // own tenant resolved above, so a rule in one tenant never
         // grants subscribe in another. Same single-guard discipline as
-        // the publish path.
-        if shared
-            .auth
-            .authorize_subscribe_in_tenant(&tenant, &client_id, &filter)
-            .await
-            .is_err()
-        {
+        // the publish path. The stored cache policy is consulted first.
+        let cached_subscribe = owner.as_ref().and_then(|session| {
+            cached_authz_lookup(
+                shared,
+                session,
+                "subscribe",
+                filter.as_str(),
+                qos_raw,
+                false,
+            )
+        });
+        let local_denied = match cached_subscribe {
+            Some(allow) => !allow,
+            None => shared
+                .auth
+                .authorize_subscribe_in_tenant(&tenant, &client_id, &filter)
+                .await
+                .is_err(),
+        };
+        if local_denied {
             // Per-client decision cache (W2-01): record the denial on the
             // owning tenant's session so the management read observes it.
             // One bounded per-session insert on the subscribe
             // authorization event only; delivery never touches this lock.
-            if let Some(session) = owner.as_ref() {
-                session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, false);
+            // A cache hit needs no new insert.
+            if cached_subscribe.is_none() {
+                if let Some(session) = owner.as_ref() {
+                    record_authz_under_policy(
+                        shared,
+                        session,
+                        "subscribe",
+                        filter.as_str(),
+                        qos_raw,
+                        false,
+                        false,
+                    );
+                }
             }
             // Fire $events/client_check_authz_complete.
             // Rules belong to the default tenant, so another tenant fires
@@ -5999,52 +6070,68 @@ async fn apply_subscribe(
         // rule as the publish path: session username, else client id).
         // The username rides the owning tenant's session resolved above,
         // never a default-tenant namesake. A database outage fails closed
-        // like a local denial.
-        if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-            let username = owner.as_ref().and_then(|s| s.username.read().clone());
-            // Tenant scope (MT-06): the probe and the lookup run in the
-            // subscriber's own tenant (deferred: only the built-in table
-            // holds per-tenant state).
-            let is_local = username
-                .as_deref()
-                .is_some_and(|u| shared.auth.has_user_in_tenant(&tenant, u));
-            if !is_local {
-                let key = username.as_deref().unwrap_or(&client_id);
-                if db
-                    .authorize_subscribe_in_tenant(&tenant, key, &filter)
-                    .await
-                    .is_err()
-                {
-                    if shared.engine.is_event_source_selected(
-                        broker_rules::EventSource::ClientCheckAuthzComplete,
-                    ) && is_default_tenant(&tenant)
+        // like a local denial. A cached allow skips this leg.
+        if cached_subscribe != Some(true) {
+            if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+                let username = owner.as_ref().and_then(|s| s.username.read().clone());
+                // Tenant scope (MT-06): the probe and the lookup run in the
+                // subscriber's own tenant (deferred: only the built-in table
+                // holds per-tenant state).
+                let is_local = username
+                    .as_deref()
+                    .is_some_and(|u| shared.auth.has_user_in_tenant(&tenant, u));
+                if !is_local {
+                    let key = username.as_deref().unwrap_or(&client_id);
+                    if db
+                        .authorize_subscribe_in_tenant(&tenant, key, &filter)
+                        .await
+                        .is_err()
                     {
-                        if let Some(session) = owner.as_ref() {
-                            let username = session.username.read().clone();
-                            let peerhost = session.peerhost.read().clone();
-                            shared.engine.fire_client_check_authz_complete(
-                                broker_rules::ClientCheckAuthzCompleteEvent {
-                                    client_id: client_id.clone(),
-                                    username,
-                                    peerhost,
-                                    action: "subscribe".to_string(),
-                                    topic: filter.as_str().to_string(),
-                                    qos: qos_raw,
-                                    retain: None,
-                                    allow: false,
-                                    source: "database".to_string(),
-                                },
-                            );
+                        if shared.engine.is_event_source_selected(
+                            broker_rules::EventSource::ClientCheckAuthzComplete,
+                        ) && is_default_tenant(&tenant)
+                        {
+                            if let Some(session) = owner.as_ref() {
+                                let username = session.username.read().clone();
+                                let peerhost = session.peerhost.read().clone();
+                                shared.engine.fire_client_check_authz_complete(
+                                    broker_rules::ClientCheckAuthzCompleteEvent {
+                                        client_id: client_id.clone(),
+                                        username,
+                                        peerhost,
+                                        action: "subscribe".to_string(),
+                                        topic: filter.as_str().to_string(),
+                                        qos: qos_raw,
+                                        retain: None,
+                                        allow: false,
+                                        source: "database".to_string(),
+                                    },
+                                );
+                            }
                         }
+                        // The database denial follows the same version split
+                        // as the local denial above. Record it under the cache
+                        // policy so the next operation reuses it until TTL.
+                        if cached_subscribe.is_none() {
+                            if let Some(session) = owner.as_ref() {
+                                record_authz_under_policy(
+                                    shared,
+                                    session,
+                                    "subscribe",
+                                    filter.as_str(),
+                                    qos_raw,
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
+                        codes.push(if entry.has_options {
+                            V5_SUBACK_NOT_AUTHORIZED
+                        } else {
+                            V5_SUBACK_UNSPECIFIED
+                        });
+                        continue;
                     }
-                    // The database denial follows the same version split
-                    // as the local denial above.
-                    codes.push(if entry.has_options {
-                        V5_SUBACK_NOT_AUTHORIZED
-                    } else {
-                        V5_SUBACK_UNSPECIFIED
-                    });
-                    continue;
                 }
             }
         }
@@ -6087,9 +6174,19 @@ async fn apply_subscribe(
         // Same bounded per-session insert, same event; delivery never
         // touches this lock. Recorded only after the router accepts the
         // entry so a quota denial records nothing and changes no session
-        // state.
-        if let Some(session) = owner.as_ref() {
-            session.record_authz_decision("subscribe", filter.as_str(), qos_raw, false, true);
+        // state. A cache hit needs no new insert.
+        if cached_subscribe.is_none() {
+            if let Some(session) = owner.as_ref() {
+                record_authz_under_policy(
+                    shared,
+                    session,
+                    "subscribe",
+                    filter.as_str(),
+                    qos_raw,
+                    false,
+                    true,
+                );
+            }
         }
         // Mirror the grant with its full v5 options on the owning
         // tenant's session for observability (the router stays the
@@ -6841,28 +6938,44 @@ async fn apply_publish(
             username.as_deref(),
             peerhost.as_deref(),
         ) {
-            let ack = match qos {
-                QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
-                QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-                QoS::AtMostOnce => None,
-            };
+            let protocol_version = publisher_session
+                .as_ref()
+                .map_or(4, |session| session.protocol_version());
+            let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x87);
             return (ack, Vec::new());
         }
         // Tenant scope (MT-06): authorisation runs in the publisher's
         // own tenant resolved above, so a rule in one tenant never
         // grants publish in another. One short guard with no new lock
-        // and no allocation on the single-tenant fast path.
-        let allowed = shared
-            .auth
-            .authorize_publish_in_tenant(tenant, &publisher, topic)
-            .await
-            .is_ok();
+        // and no allocation on the single-tenant fast path. The stored
+        // cache policy is consulted first.
+        let cached_publish = publisher_session.as_ref().and_then(|session| {
+            cached_authz_lookup(shared, session, "publish", topic.as_str(), qos_raw, retain)
+        });
+        let allowed = match cached_publish {
+            Some(allow) => allow,
+            None => shared
+                .auth
+                .authorize_publish_in_tenant(tenant, &publisher, topic)
+                .await
+                .is_ok(),
+        };
         // Per-client decision cache (W2-01): record the publish decision
         // so the management read observes edge publishers. One bounded
         // per-session insert on the publish authorization event only;
-        // delivery never touches this lock.
-        if let Some(session) = publisher_session.as_ref() {
-            session.record_authz_decision("publish", topic.as_str(), qos_raw, retain, allowed);
+        // delivery never touches this lock. A cache hit needs no insert.
+        if cached_publish.is_none() {
+            if let Some(session) = publisher_session.as_ref() {
+                record_authz_under_policy(
+                    shared,
+                    session,
+                    "publish",
+                    topic.as_str(),
+                    qos_raw,
+                    retain,
+                    allowed,
+                );
+            }
         }
         if !allowed {
             // Fire the authz event. Rules belong to the default tenant.
@@ -6886,11 +6999,10 @@ async fn apply_publish(
                     },
                 );
             }
-            let ack = match qos {
-                QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
-                QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-                QoS::AtMostOnce => None,
-            };
+            let protocol_version = publisher_session
+                .as_ref()
+                .map_or(4, |session| session.protocol_version());
+            let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x87);
             // AP-11: a denied publish with the stored `deny_action:
             // disconnect` closes the connection with 0x87 after the ack
             // above is built, so the publisher still observes its ack.
@@ -6911,45 +7023,59 @@ async fn apply_publish(
         // fan-out locks. The database leg is bounded: one short cache lock
         // plus one small key allocation on a hit, one semaphore permit
         // (pool_size bound, default 8) plus one DB round-trip consulting at
-        // most MAX_ACL_ROWS rows on a miss.
-        if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
-            // Tenant scope (MT-06): the local-user probe and the database
-            // lookup both run in the publisher's own tenant (deferred:
-            // only the built-in table holds per-tenant state).
-            let is_local = username
-                .as_deref()
-                .is_some_and(|u| shared.auth.has_user_in_tenant(tenant, u));
-            if !is_local {
-                let key = username.as_deref().unwrap_or(&publisher);
-                if db
-                    .authorize_publish_in_tenant(tenant, key, topic)
-                    .await
-                    .is_err()
-                {
-                    if shared.engine.is_event_source_selected(
-                        broker_rules::EventSource::ClientCheckAuthzComplete,
-                    ) && is_default_tenant(tenant)
+        // most MAX_ACL_ROWS rows on a miss. A cached allow skips this leg.
+        if cached_publish != Some(true) {
+            if let Some(db) = shared.db_auth.as_ref().filter(|d| d.is_configured()) {
+                // Tenant scope (MT-06): the local-user probe and the database
+                // lookup both run in the publisher's own tenant (deferred:
+                // only the built-in table holds per-tenant state).
+                let is_local = username
+                    .as_deref()
+                    .is_some_and(|u| shared.auth.has_user_in_tenant(tenant, u));
+                if !is_local {
+                    let key = username.as_deref().unwrap_or(&publisher);
+                    if db
+                        .authorize_publish_in_tenant(tenant, key, topic)
+                        .await
+                        .is_err()
                     {
-                        shared.engine.fire_client_check_authz_complete(
-                            broker_rules::ClientCheckAuthzCompleteEvent {
-                                client_id: publisher.clone(),
-                                username: username.clone(),
-                                peerhost: peerhost.clone(),
-                                action: "publish".to_string(),
-                                topic: topic.to_string(),
-                                qos: qos_raw,
-                                retain: Some(retain),
-                                allow: false,
-                                source: "database".to_string(),
-                            },
-                        );
+                        if shared.engine.is_event_source_selected(
+                            broker_rules::EventSource::ClientCheckAuthzComplete,
+                        ) && is_default_tenant(tenant)
+                        {
+                            shared.engine.fire_client_check_authz_complete(
+                                broker_rules::ClientCheckAuthzCompleteEvent {
+                                    client_id: publisher.clone(),
+                                    username: username.clone(),
+                                    peerhost: peerhost.clone(),
+                                    action: "publish".to_string(),
+                                    topic: topic.to_string(),
+                                    qos: qos_raw,
+                                    retain: Some(retain),
+                                    allow: false,
+                                    source: "database".to_string(),
+                                },
+                            );
+                        }
+                        let protocol_version = publisher_session
+                            .as_ref()
+                            .map_or(4, |session| session.protocol_version());
+                        let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x87);
+                        if cached_publish.is_none() {
+                            if let Some(session) = publisher_session.as_ref() {
+                                record_authz_under_policy(
+                                    shared,
+                                    session,
+                                    "publish",
+                                    topic.as_str(),
+                                    qos_raw,
+                                    retain,
+                                    false,
+                                );
+                            }
+                        }
+                        return (ack, Vec::new());
                     }
-                    let ack = match qos {
-                        QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
-                        QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-                        QoS::AtMostOnce => None,
-                    };
-                    return (ack, Vec::new());
                 }
             }
         }
@@ -6973,40 +7099,54 @@ async fn apply_publish(
         // does not decide those paths; gateway (CoAP) and cluster forwards
         // carry no MQTT credential context, so they keep the local ACL
         // rather than inventing a publish context for them.
-        if let Some(webhook) = shared.webhook.as_ref() {
-            // Tenant scope (MT-06): the verdict carries the publisher's
-            // own tenant (deferred: only the built-in table holds
-            // per-tenant state).
-            if webhook
-                .authorize_publish_in_tenant(tenant, &publisher, topic)
-                .await
-                .is_err()
-            {
-                if shared
-                    .engine
-                    .is_event_source_selected(broker_rules::EventSource::ClientCheckAuthzComplete)
-                    && is_default_tenant(tenant)
+        // A cached allow skips this leg.
+        if cached_publish != Some(true) {
+            if let Some(webhook) = shared.webhook.as_ref() {
+                // Tenant scope (MT-06): the verdict carries the publisher's
+                // own tenant (deferred: only the built-in table holds
+                // per-tenant state).
+                if webhook
+                    .authorize_publish_in_tenant(tenant, &publisher, topic)
+                    .await
+                    .is_err()
                 {
-                    shared.engine.fire_client_check_authz_complete(
-                        broker_rules::ClientCheckAuthzCompleteEvent {
-                            client_id: publisher.clone(),
-                            username,
-                            peerhost,
-                            action: "publish".to_string(),
-                            topic: topic.to_string(),
-                            qos: qos_raw,
-                            retain: Some(retain),
-                            allow: false,
-                            source: "webhook".to_string(),
-                        },
-                    );
+                    if shared.engine.is_event_source_selected(
+                        broker_rules::EventSource::ClientCheckAuthzComplete,
+                    ) && is_default_tenant(tenant)
+                    {
+                        shared.engine.fire_client_check_authz_complete(
+                            broker_rules::ClientCheckAuthzCompleteEvent {
+                                client_id: publisher.clone(),
+                                username,
+                                peerhost,
+                                action: "publish".to_string(),
+                                topic: topic.to_string(),
+                                qos: qos_raw,
+                                retain: Some(retain),
+                                allow: false,
+                                source: "webhook".to_string(),
+                            },
+                        );
+                    }
+                    let protocol_version = publisher_session
+                        .as_ref()
+                        .map_or(4, |session| session.protocol_version());
+                    let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x87);
+                    if cached_publish.is_none() {
+                        if let Some(session) = publisher_session.as_ref() {
+                            record_authz_under_policy(
+                                shared,
+                                session,
+                                "publish",
+                                topic.as_str(),
+                                qos_raw,
+                                retain,
+                                false,
+                            );
+                        }
+                    }
+                    return (ack, Vec::new());
                 }
-                let ack = match qos {
-                    QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x87),
-                    QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-                    QoS::AtMostOnce => None,
-                };
-                return (ack, Vec::new());
             }
         }
         // Fire the allowed-publish authz event. Rules belong to the
@@ -7063,7 +7203,7 @@ async fn apply_publish(
     // Rate policing (INDRA-128): token bucket per publishing client,
     // configured per user. Over quota the message dies here — QoS 0 is
     // dropped and counted, QoS 1 gets its PubAck stamped 0x97, QoS 2
-    // completes its handshake with PUBREC but stores nothing.
+    // gets its PubRec stamped 0x97 and stores nothing.
     if !check_publish_quota(frame, shared).await {
         shared.metrics.inc_messages_dropped();
         shared.metrics.inc_overload_dropped();
@@ -7093,11 +7233,10 @@ async fn apply_publish(
                     reason: "quota_exceeded".to_string(),
                 });
         }
-        let ack = match qos {
-            QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, 0x97),
-            QoS::ExactlyOnce => qos2_reply(OpCode::PubRecOut, frame, packet_id),
-            QoS::AtMostOnce => None,
-        };
+        let protocol_version = publisher_session
+            .as_ref()
+            .map_or(4, |session| session.protocol_version());
+        let ack = denied_publish_ack(frame, packet_id, qos, protocol_version, 0x97);
         return (ack, Vec::new());
     }
 
@@ -8887,6 +9026,32 @@ async fn check_publish_quota(frame: &BrokerFrame, shared: &Shared) -> bool {
     )
 }
 
+/// Build the acknowledgement for a denied QoS 1 or QoS 2 publish.
+/// Version 5 carries `reason_code` on the ack. Version 3.1.1 has no ack
+/// reason code, so the reason stays 0 and the edge sends the short form.
+fn denied_publish_ack(
+    frame: &BrokerFrame,
+    packet_id: u16,
+    qos: QoS,
+    protocol_version: u8,
+    reason_code: u8,
+) -> Option<BrokerFrame> {
+    match qos {
+        QoS::AtLeastOnce => pub_ack_reply(frame, packet_id, reason_code),
+        QoS::ExactlyOnce => qos2_reply_with_reason(
+            OpCode::PubRecOut,
+            frame,
+            packet_id,
+            if protocol_version == 5 {
+                reason_code
+            } else {
+                0
+            },
+        ),
+        QoS::AtMostOnce => None,
+    }
+}
+
 /// Build one `PubAckOut` reply mirroring the request identity.
 fn pub_ack_reply(frame: &BrokerFrame, packet_id: u16, return_code: u8) -> Option<BrokerFrame> {
     let mut meta = Vec::with_capacity(3);
@@ -9437,24 +9602,39 @@ async fn apply_disconnect(frame: &BrokerFrame, shared: &Shared) -> Vec<(u64, Bro
     ) {
         return Vec::new();
     }
-    // Per-client decision cache (W2-01): record the will-publish decision
-    // like any other publish from this client. Same bounded per-session
-    // insert; delivery never touches this lock.
+    // Per-client decision cache (W2-01): consult and record the
+    // will-publish decision like any other publish from this client.
+    // Same bounded per-session insert; delivery never touches this lock.
     // Tenant scope (MT-06): the will authorises in its own tenant (the
     // session's tenant captured above), like any other publish from this
     // client. Disconnect events only; never on the hot path.
-    let will_allowed = shared
-        .auth
-        .authorize_publish_in_tenant(&tenant, &client_id, &will.topic)
-        .await
-        .is_ok();
-    session.record_authz_decision(
+    let cached_will = cached_authz_lookup(
+        shared,
+        &session,
         "publish",
         will.topic.as_str(),
         u8::from(will.qos),
         will.retain,
-        will_allowed,
     );
+    let will_allowed = match cached_will {
+        Some(allow) => allow,
+        None => shared
+            .auth
+            .authorize_publish_in_tenant(&tenant, &client_id, &will.topic)
+            .await
+            .is_ok(),
+    };
+    if cached_will.is_none() {
+        record_authz_under_policy(
+            shared,
+            &session,
+            "publish",
+            will.topic.as_str(),
+            u8::from(will.qos),
+            will.retain,
+            will_allowed,
+        );
+    }
     if !will_allowed {
         return Vec::new();
     }
@@ -10037,6 +10217,63 @@ fn order_alias_disconnect(shared: &Shared, conn_id: u64) {
 /// Order a DISCONNECT for one denied publish or subscribe (AP-11, stored
 /// `deny_action: disconnect`).
 ///
+/// Look up a cached authorization verdict for one operation.
+/// Returns `None` when caching is off, the topic is excluded, the TTL
+/// does not parse, or no fresh entry exists. Reads the stored cache
+/// policy (`enable`, `max_size`, `ttl`, `excludes`) with one lock-free
+/// load. One short per-session lock for the lookup only.
+fn cached_authz_lookup(
+    shared: &Shared,
+    session: &broker_session::Session,
+    action: &str,
+    topic: &str,
+    qos: u8,
+    retain: bool,
+) -> Option<bool> {
+    // The webhook keeps its own TTL. Skip the session cache for
+    // publishes while the webhook is on, so the broker asks again.
+    if action == "publish" && shared.webhook.is_some() {
+        return None;
+    }
+    let snap = shared.authz_settings.snapshot();
+    if !snap.cache.enable {
+        return None;
+    }
+    if broker_session::Session::authz_topic_excluded(topic, &snap.cache.excludes) {
+        return None;
+    }
+    let ttl_ms = broker_config::parse_settings_duration_to_ms(&snap.cache.ttl)?;
+    session.cached_authz_verdict(action, topic, qos, retain, ttl_ms)
+}
+
+/// Record one authorization verdict under the stored cache policy.
+/// Skips excluded topics and a disabled cache. Trims the per-client
+/// cache to the stored `max_size`. One bounded per-session insert.
+fn record_authz_under_policy(
+    shared: &Shared,
+    session: &broker_session::Session,
+    action: &str,
+    topic: &str,
+    qos: u8,
+    retain: bool,
+    allow: bool,
+) {
+    // Do not store publishes while the webhook is on. The broker
+    // asks the webhook again after its TTL ends.
+    if action == "publish" && shared.webhook.is_some() {
+        return;
+    }
+    let snap = shared.authz_settings.snapshot();
+    if !snap.cache.enable {
+        return;
+    }
+    if broker_session::Session::authz_topic_excluded(topic, &snap.cache.excludes) {
+        return;
+    }
+    session.record_authz_decision(action, topic, qos, retain, allow);
+    session.trim_authz_cache_to(snap.cache.max_size);
+}
+
 /// Best-effort and idempotent like [`order_alias_disconnect`]: routes a
 /// `ConnClose` frame carrying 0x87 so the edge closes the socket (a
 /// version-5 edge sends DISCONNECT 0x87 first), then detaches the session
@@ -10498,6 +10735,13 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Seeding already ran inside `ApiState::new`; sharing replaces that
     // fresh instance with the kernel's so no second copy diverges.
     state.authz_sources = shared.authz_sources.clone();
+    // Link the rule table to the shared registry again. `ApiState::new`
+    // linked its own instance; without this link a management delete,
+    // reorder or update reaches the API copy only, not the authorize
+    // path. One `Arc` clone at boot.
+    shared
+        .auth
+        .set_authz_sources(Arc::clone(&shared.authz_sources));
     // Share the management API key directory (W2-25) so validated
     // management mints and revocations are visible to reads without a
     // restart. One `Arc` clone; management-plane only, never on the
@@ -10826,6 +11070,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // exposition observe them from boot. Only keys a layer set move;
     // runtime changes through `PUT /prometheus` keep every other key.
     apply_prometheus_file_settings(&layered, &shared.config)?;
+    // Authorization sources (AZ-02): when a startup layer sets the source
+    // list, persist it before the boot replay reads the registry. A file
+    // or environment list replaces the stored order; an absent key keeps
+    // the stored state, so operator recovery is not undone at boot.
+    apply_authz_sources_file_settings(&layered, &shared.config)?;
     // Delayed publishes (B4-03): apply the configured delay bound, point
     // the wheel at the kernel data dir, reload pending entries, then
     // start the single driver task. Torn or expired rows are discarded
@@ -10891,6 +11140,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .auth
         .seed_from_registry(&shared.config)
         .map_err(|e| format!("seeding MQTT users from the config registry failed: {e}"))?;
+    // Authentication hashing policy: apply the configured algorithm
+    // (auth.password_hash: sha256 or bcrypt) to credentials created or
+    // changed from now on. Existing verifiers keep verifying. An algorithm
+    // this build does not support fails the start, fail closed.
+    let algorithm = match cfg.auth.password_hash.as_str() {
+        "sha256" => PasswordAlgorithm::Sha256Legacy,
+        "bcrypt" => PasswordAlgorithm::Bcrypt,
+        algorithm => {
+            return Err(format!(
+                "auth.password_hash {algorithm:?} is not supported by this broker"
+            )
+            .into());
+        }
+    };
+    let policy = PasswordHashPolicy {
+        default_algorithm: algorithm,
+        ..Default::default()
+    };
+    shared.auth.set_policy(policy);
     // Authenticator chain (W2-02): seed the shared chain in place (the
     // same instance `serve_api` shares with `ApiState`), so the CONNECT
     // consult enforces the persisted chain from the first connection.
@@ -10929,6 +11197,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // management reads observe the persisted sources from the first
     // connection. Defaults yield the built-in database source.
     shared.authz_sources.seed_from_registry(&shared.config);
+    // D2: a stored source this build does not evaluate must never weaken
+    // access. Keep the unchanged record. The operator sees and removes it.
+    // Deny each decision that reaches it. Raise a named alarm. Log it.
+    for source in shared.authz_sources.snapshot().iter() {
+        if source.source_type == "built_in_database" {
+            continue;
+        }
+        let source_type = &source.source_type;
+        tracing::warn!(source_type, "authorization source {source_type} is not evaluated by this broker version: access it guards is denied; the stored record is unchanged");
+        shared.alarms.activate_in_tenant(
+            broker_session::tenant::DEFAULT_TENANT_ID,
+            "unsupported_authorization_source",
+            &format!(
+                "authorization source {source_type} is not available in this broker; access it guards is denied"
+            ),
+            serde_json::json!({"source_type": source.source_type}),
+        );
+    }
     // Link the shared registry into the shared rule table (AP-06):
     // publish/subscribe verdicts attribute to the built-in counters and
     // honour the stored enable flag and order. One `Arc` clone.
@@ -11765,7 +12051,7 @@ mod tests {
         }
 
         use tokio::io::AsyncWriteExt as _;
-        let shared = Shared::new();
+        let shared = test_shared();
         // One free loopback port for the test listener.
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
         let port = probe.local_addr().expect("probe addr").port();
@@ -12372,7 +12658,9 @@ mod tests {
     }
 
     fn test_shared() -> Shared {
-        Shared::new()
+        let mut shared = Shared::new();
+        shared.allow_anonymous = true;
+        shared
     }
 
     #[test]
@@ -12770,7 +13058,7 @@ mod tests {
         // Use the live edge path.
         // Send each v5 bind over TCP.
         // Read the granted expiry from the socket reply.
-        let shared = Shared::new();
+        let shared = test_shared();
         assert_eq!(shared.sessions.max_session_expiry_secs(), 86_400);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -13211,7 +13499,7 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            handle_connection(stream, Shared::new())
+            handle_connection(stream, test_shared())
                 .await
                 .expect("handle");
         });
@@ -16400,7 +16688,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_then_publish_routes_to_subscriber_transport() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
 
@@ -16475,7 +16763,8 @@ mod tests {
     async fn rule_republish_reaches_alert_subscriber() {
         use broker_rules::RuleAction;
 
-        let shared = Shared::new();
+        let mut shared = Shared::new();
+        shared.allow_anonymous = true;
         // Ingress rule: anything under sensors/+ is republished to
         // alerts/critical. No MQTT loopback involved: delivery flows
         // engine -> in-memory sink -> subscriber mailbox.
@@ -16564,7 +16853,7 @@ mod tests {
     async fn rule_sql_transforms_payload_end_to_end() {
         use broker_rules::RuleAction;
 
-        let shared = Shared::new();
+        let shared = test_shared();
         // Streaming SQL rule: project only `temperature` out of raw
         // payloads. The secret field must never reach subscribers.
         shared
@@ -16666,7 +16955,8 @@ mod tests {
 
     #[tokio::test]
     async fn retained_message_delivered_to_late_subscriber() {
-        let shared = Shared::new();
+        let mut shared = Shared::new();
+        shared.allow_anonymous = true;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
@@ -16758,7 +17048,7 @@ mod tests {
             }
         }
 
-        let shared = Shared::new();
+        let shared = test_shared();
         // Two stored transforms append in chain order through the
         // production store plus the engine snapshot (the same path the
         // management handlers drive).
@@ -16847,7 +17137,7 @@ mod tests {
         use broker_api::v5::transformations::{TransformOperation, TransformRecord};
         use broker_rules::RuleAction;
 
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .transformations
             .insert(TransformRecord {
@@ -16965,7 +17255,7 @@ mod tests {
     async fn transform_metrics_move_on_real_publish_and_reset() {
         use broker_api::v5::transformations::{TransformOperation, TransformRecord};
 
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .transformations
             .insert(TransformRecord {
@@ -17048,7 +17338,7 @@ mod tests {
 
     #[tokio::test]
     async fn offline_queue_replays_on_durable_reconnect() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
@@ -17493,8 +17783,10 @@ mod tests {
         ChannelRoutingPlane::link(&plane1, &plane2);
 
         let mut shared1 = Shared::new();
+        shared1.allow_anonymous = true;
         shared1.cluster = Some(plane1.clone() as Arc<dyn RoutingPlane>);
         let mut shared2 = Shared::new();
+        shared2.allow_anonymous = true;
         shared2.cluster = Some(plane2.clone() as Arc<dyn RoutingPlane>);
 
         // One link-harness listener per node. The production
@@ -17716,7 +18008,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_metrics_reflect_edge_traffic() {
-        let shared = Shared::new();
+        let shared = test_shared();
 
         // Management API on an ephemeral port, sharing node state.
         let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -17779,7 +18071,7 @@ mod tests {
         // sample the live counters the way the timer does, then read the
         // shared ring through the management API. A store-only test would
         // prove only the store; this one proves the kernel drives it.
-        let shared = Shared::new();
+        let shared = test_shared();
 
         // Management API on an ephemeral port, sharing node state
         // (including the monitor ring via `serve_api`).
@@ -18463,7 +18755,7 @@ mod tests {
         // output with no threshold assert; counts are CI sample sizes, not
         // SLOs. Per-message bound: one delivery per publish, no new
         // buffering beyond the existing mailbox.
-        let shared = Shared::new();
+        let shared = test_shared();
         // FX-02 default is enabled; force the disabled BEFORE explicitly.
         shared.slow_subs_settings.set_enabled(false);
         let bind = bind_frame(71, 1, encode_bind_meta("q1-slow-time", false, 60));
@@ -18586,6 +18878,21 @@ mod tests {
         let reply = apply_bind(&frame, &shared).await.expect("bind replies");
         let (_, _, rc) = decode_session_binding_meta(&reply.metadata);
         assert_eq!(rc, 0);
+    }
+
+    #[tokio::test]
+    async fn bind_auth_rejects_anonymous_when_allow_flag_is_false() {
+        // Fail closed: the flag refuses an anonymous CONNECT while the
+        // user store is empty.
+        let mut shared = test_shared();
+        shared.allow_anonymous = false;
+
+        let frame = bind_frame(84, 1, encode_bind_meta("dev-f", true, 60));
+        let reply = apply_bind(&frame, &shared).await.expect("bind replies");
+        let (_, present, rc) = decode_session_binding_meta(&reply.metadata);
+        assert_eq!(rc, 0x87, "anonymous bind must yield return code 0x87");
+        assert!(!present);
+        assert!(shared.sessions.get("dev-f").is_none());
     }
 
     #[tokio::test]
@@ -20885,7 +21192,7 @@ mod tests {
             Ok(packet)
         }
 
-        let shared = Shared::new();
+        let shared = test_shared();
         shared
             .auth
             .add_rule(AclRule::new(
@@ -20974,6 +21281,146 @@ mod tests {
         let ack = ack.expect("QoS 1 denied publish still gets a PubAck");
         assert_eq!(&ack.metadata[..], &[0x00, 0x05, 0x87u8]);
         assert!(deliveries.is_empty(), "denied publish must not fan out");
+    }
+
+    /// A denied QoS 2 publish reads the version-correct PUBREC from a real
+    /// socket. Version 5 carries reason 0x87 (Not authorized). Version
+    /// 3.1.1 has no PUBREC reason code, so the short form is correct.
+    #[tokio::test]
+    async fn denied_qos2_publish_pubrec_reason_matches_version_over_socket() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        fn remaining_len(mut len: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let mut byte = (len % 128) as u8;
+                len /= 128;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    return out;
+                }
+            }
+        }
+        fn connect(level: u8, client_id: &str) -> Vec<u8> {
+            let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', level, 0x02, 0x00, 0x3C];
+            if level == 5 {
+                body.push(0x00);
+            }
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id.as_bytes());
+            let mut packet = vec![0x10];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        fn publish_qos2(level: u8, topic: &str, packet_id: u16) -> Vec<u8> {
+            let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+            body.extend_from_slice(topic.as_bytes());
+            body.extend_from_slice(&packet_id.to_be_bytes());
+            if level == 5 {
+                body.push(0x00);
+            }
+            let mut packet = vec![0x34];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        async fn read_packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).await?;
+            let mut packet = vec![first[0]];
+            let mut multiplier = 1usize;
+            let mut remaining = 0usize;
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                packet.push(byte[0]);
+                remaining += ((byte[0] & 0x7F) as usize) * multiplier;
+                multiplier *= 128;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+            }
+            if remaining > 0 {
+                let mut body = vec![0u8; remaining];
+                stream.read_exact(&mut body).await?;
+                packet.extend_from_slice(&body);
+            }
+            Ok(packet)
+        }
+
+        let shared = test_shared();
+        shared
+            .auth
+            .add_rule(AclRule::new("*", AclAction::Publish, "#", false))
+            .expect("memory-only persist cannot fail");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let mut listeners = broker_config::schema::ListenersConf::default();
+        listeners.tcp.enabled = true;
+        listeners.tcp.bind = format!("127.0.0.1:{port}");
+        listeners.tls.enabled = false;
+        listeners.ws.enabled = false;
+        listeners.wss.enabled = false;
+        shared.listener_store.reset_from_config(&listeners);
+        let control = std::sync::Arc::new(super::native::NativeListenerController::new(
+            shared.clone(),
+            listeners,
+        ));
+        shared.listener_store.set_controller(control.clone());
+        let row = shared
+            .listener_store
+            .get("tcp:default")
+            .expect("tcp row exists");
+        broker_api::v5::listeners::ListenerController::start_listener(&*control, &row)
+            .expect("listener starts");
+        let mut running = row;
+        running.running = true;
+        shared.listener_store.update(running);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        for (level, client_id, packet_id, expected) in [
+            (
+                4u8,
+                "denied-qos2-v4",
+                0x11u16,
+                vec![0x50u8, 0x02, 0x00, 0x11],
+            ),
+            (
+                5u8,
+                "denied-qos2-v5",
+                0x12u16,
+                vec![0x50u8, 0x03, 0x00, 0x12, 0x87],
+            ),
+        ] {
+            let mut client = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("client dials");
+            client
+                .write_all(&connect(level, client_id))
+                .await
+                .expect("CONNECT sends");
+            let connack =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                    .await
+                    .expect("CONNACK in time")
+                    .expect("CONNACK reads");
+            assert_eq!(connack[0], 0x20, "CONNACK for protocol level {level}");
+            client
+                .write_all(&publish_qos2(level, "denied/topic", packet_id))
+                .await
+                .expect("PUBLISH sends");
+            let pubrec =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                    .await
+                    .expect("PUBREC in time")
+                    .expect("PUBREC reads");
+            assert_eq!(pubrec, expected, "PUBREC for protocol level {level}");
+        }
     }
 
     /// Write the authorization settings through the shared store: the
@@ -23541,7 +23988,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_subscriptions_balance_across_workers() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {
@@ -23688,7 +24135,7 @@ mod tests {
                 .expect("write hook response");
         });
 
-        let shared = Shared::new();
+        let shared = test_shared();
         // Rule projects telemetry and forwards to the webhook sink: no
         // MQTT subscribers are involved at all.
         let sink = Arc::new(HttpWebhookSink::new(
@@ -23992,7 +24439,8 @@ mod tests {
 
     #[tokio::test]
     async fn delayed_publish_end_to_end_over_tcp() {
-        let shared = Shared::new();
+        let mut shared = Shared::new();
+        shared.allow_anonymous = true;
         shared.spawn_delayed_driver();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -24326,7 +24774,7 @@ mod tests {
         let bind = bind_frame(501, 1, encode_bind_meta("w139-fresh", true, 60));
         let reply = apply_bind(&bind, &shared).await.expect("bind replies");
         assert!(is_binding_accepted(&reply));
-        apply_auto_subscribe(&shared, "w139-fresh", None, 501);
+        apply_auto_subscribe(&shared, "w139-fresh", None, 501).await;
 
         // Session mirror and router both hold the new subscription.
         let session = shared.sessions.get("w139-fresh").expect("session row");
@@ -24359,7 +24807,7 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let bind = bind_frame(502, 1, encode_bind_meta("w139-ph", true, 60));
         apply_bind(&bind, &shared).await.expect("bind replies");
-        apply_auto_subscribe(&shared, "w139-ph", None, 502);
+        apply_auto_subscribe(&shared, "w139-ph", None, 502).await;
         assert!(
             shared
                 .sessions
@@ -24415,7 +24863,7 @@ mod tests {
 
         let (session, _) = shared.sessions.get_or_create("quota-auto", true);
         *session.conn_id.write() = Some(9091);
-        apply_auto_subscribe(&shared, "quota-auto", None, 9091);
+        apply_auto_subscribe(&shared, "quota-auto", None, 9091).await;
 
         assert!(
             session
@@ -24665,7 +25113,7 @@ mod tests {
     /// before PUBREL.
     #[tokio::test]
     async fn qos2_end_to_end_exactly_once() {
-        let shared = Shared::new();
+        let shared = test_shared();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {

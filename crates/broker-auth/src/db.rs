@@ -46,8 +46,7 @@
 //!
 //! Drivers (all maintained, all permissive licences):
 //! - `tokio-postgres` 0.7 (MIT): PostgreSQL wire protocol.
-//! - `mysql_async` 0.35 (MIT/Apache-2.0): MySQL wire protocol including
-//!   the default server auth plugin.
+//! - `mysql_async` 0.36 minimal-rust (MIT/Apache-2.0): MySQL wire protocol.
 //! - `redis` 0.27 (MIT, `tokio-comp`): RESP.
 //! - `mongodb` 3 (Apache-2.0): OP_MSG plus SCRAM.
 //!   No SQL, RESP frame or document is hand-rolled and no password hash is

@@ -42,10 +42,8 @@
 // with 204 (mirroring the sibling clears) until the checker pins it.
 // TODO(parity): is the duplicate scope (clientid, topic, action), and is
 // an unknown client id on delete a NOT_FOUND or a CLIENTID_NOT_FOUND?
-// The rulebook does not decide either; the current choice rejects the
-// same client, topic and action as ALREADY_EXISTS and answers unknown
-// ids with NOT_FOUND (mirroring the sibling authz 404s) until the
-// checker pins it.
+// The rulebook does not decide either. The current choice rejects a
+// duplicate create as BAD_REQUEST. It answers unknown ids with NOT_FOUND.
 // Shape note: the detail envelope carries the key (`clientid` or
 // `username`) plus `rules`. The replace body carries `rules`, with an
 // optional key that must match the path.
@@ -121,7 +119,7 @@ pub async fn list_client_rules(State(state): State<ApiState>, params: PageParams
 /// `POST /authorization/sources/built_in_database/rules/clients`: add one
 /// client-scoped rule. Returns 204 with no body, as the reference API
 /// documents. Malformed bodies fail with `BAD_REQUEST`; a rule for the same client id and
-/// topic scope fails with `ALREADY_EXISTS` instead of merging; a full
+/// topic scope fails with `BAD_REQUEST` instead of merging; a full
 /// table fails with `BAD_REQUEST`.
 ///
 /// The write persists across a restart through the config registry (the
@@ -140,9 +138,14 @@ pub async fn create_client_rule(State(state): State<ApiState>, body: Bytes) -> R
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.add_client_rule(rule) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A new client permission invalidates cached authorization
+            // decisions so the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ClientRuleError::Duplicate) => {
-            ApiError::AlreadyExists("client rule already exists".to_string()).into_response()
+            ApiError::BadRequest("client rule already exists".to_string()).into_response()
         }
         Err(ClientRuleError::Full) => {
             ApiError::BadRequest("client rule table is full".to_string()).into_response()
@@ -246,7 +249,12 @@ pub async fn delete_client_rules(
     Path(clientid): Path<String>,
 ) -> Response {
     match state.auth.remove_client_rules(&clientid) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // Removed client permissions invalidate cached authorization
+            // decisions so the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => ApiError::NotFound(format!(
             "client authorization rules for {clientid:?} not found"
         ))
@@ -358,7 +366,13 @@ pub async fn replace_client_rules(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.replace_client_rules(&clientid, rules) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A replaced client permission set invalidates cached
+            // authorization decisions so the next operation is
+            // re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ClientRuleError::Duplicate) => {
             ApiError::AlreadyExists("client rule already exists".to_string()).into_response()
         }
@@ -495,7 +509,7 @@ pub async fn list_user_rules(State(state): State<ApiState>, params: PageParams) 
 /// `POST /authorization/sources/built_in_database/rules/users`: add one
 /// user-scoped rule. Returns 204 with no body, as the reference API
 /// documents. Malformed bodies fail with `BAD_REQUEST`; a rule for the same username and
-/// topic scope fails with `ALREADY_EXISTS` instead of merging; a full
+/// topic scope fails with `BAD_REQUEST` instead of merging; a full
 /// table fails with `BAD_REQUEST`.
 ///
 /// The write persists across a restart through the config registry (the
@@ -517,9 +531,14 @@ pub async fn create_user_rule(State(state): State<ApiState>, body: Bytes) -> Res
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.add_user_rule(rule) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A new user permission invalidates cached authorization
+            // decisions so the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ClientRuleError::Duplicate) => {
-            ApiError::AlreadyExists("user rule already exists".to_string()).into_response()
+            ApiError::BadRequest("user rule already exists".to_string()).into_response()
         }
         Err(ClientRuleError::Full) => {
             ApiError::BadRequest("user rule table is full".to_string()).into_response()
@@ -663,7 +682,12 @@ pub async fn delete_user_rules(
     Path(username): Path<String>,
 ) -> Response {
     match state.auth.remove_user_rules(&username) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // Removed user permissions invalidate cached authorization
+            // decisions so the next operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => ApiError::NotFound(format!(
             "user authorization rules for {username:?} not found"
         ))
@@ -726,7 +750,13 @@ pub async fn replace_user_rules(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.auth.replace_user_rules(&username, rules) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A replaced user permission set invalidates cached
+            // authorization decisions so the next operation is
+            // re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ClientRuleError::Duplicate) => {
             ApiError::AlreadyExists("user rule already exists".to_string()).into_response()
         }
@@ -957,7 +987,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
+        assert_eq!(duplicate["code"], serde_json::json!("BAD_REQUEST"));
         assert!(duplicate["message"].is_string());
         let (status, listed, _) =
             parts(list_client_rules(State(state.clone()), params(1, 100)).await).await;
@@ -1493,7 +1523,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
+        assert_eq!(duplicate["code"], serde_json::json!("BAD_REQUEST"));
         assert!(duplicate["message"].is_string());
         let (status, detail, _) = get_user_detail(&state, "w221-u").await;
         assert_eq!(status, StatusCode::OK);

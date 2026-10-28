@@ -354,10 +354,12 @@ pub fn apply_transform_steps(
                     Ok(next) => cur_topic = next,
                     Err(_) => {
                         // Fail closed: an invalid rewritten topic never
-                        // fans out. `ignore` keeps the previous topic
-                        // and continues; `drop` and `disconnect` shed
-                        // the message.
-                        // TODO(parity): Does disconnect close the connection or shed only the message?
+                        // fans out. `ignore` keeps the previous topic and
+                        // continues; `drop` and `disconnect` shed the
+                        // message. A transform step sheds the message; it
+                        // cannot close the connection itself - the session
+                        // closes a connection on its own bind path, never
+                        // from a transform step.
                         if step.failure_action == "ignore" {
                             continue;
                         }
@@ -417,9 +419,12 @@ pub fn apply_transform_steps_with_metrics(
                     Ok(next) => cur_topic = next,
                     Err(_) => {
                         // Fail closed: an invalid rewritten topic never
-                        // fans out. `ignore` keeps the previous topic
-                        // and continues; `drop` and `disconnect` shed
-                        // the message.
+                        // fans out. `ignore` keeps the previous topic and
+                        // continues; `drop` and `disconnect` shed the
+                        // message. A transform step sheds the message; it
+                        // cannot close the connection itself - the session
+                        // closes a connection on its own bind path, never
+                        // from a transform step.
                         if step.failure_action == "ignore" {
                             continue;
                         }

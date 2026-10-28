@@ -548,24 +548,30 @@ impl AdminUsers {
         if !is_strong_password(new_password) {
             return Err(AdminUserError::WeakPassword);
         }
+        // Read the current verifier under a short read lock.
+        // Derive outside the lock so a slow hash never blocks readers.
+        let (salt, iterations, stored_key) = {
+            let users = self.users.read().unwrap();
+            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
+            (user.salt.clone(), user.iterations, user.stored_key)
+        };
+        let (candidate_stored, _) = derive_keys(new_password.as_bytes(), &salt, iterations);
+        if constant_time_eq(&candidate_stored, &stored_key) {
+            return Err(AdminUserError::SameAsOld);
+        }
+        // Derive the new verifier outside the lock.
+        // The write lock covers only the map update.
+        let mut new_salt = [0u8; SALT_LEN];
+        rand::rng().fill_bytes(&mut new_salt);
+        let (new_stored, new_server) = derive_keys(new_password.as_bytes(), &new_salt, ITERATIONS);
         {
             let mut users = self.users.write().unwrap();
-            let user = users.get(username).ok_or(AdminUserError::NotFound)?;
-            let (candidate_stored, _) =
-                derive_keys(new_password.as_bytes(), &user.salt, user.iterations);
-            if constant_time_eq(&candidate_stored, &user.stored_key) {
-                return Err(AdminUserError::SameAsOld);
-            }
-            let mut salt = [0u8; SALT_LEN];
-            rand::rng().fill_bytes(&mut salt);
-            let (stored_key, server_key) = derive_keys(new_password.as_bytes(), &salt, ITERATIONS);
-            if let Some(user) = users.get_mut(username) {
-                user.salt = salt.to_vec();
-                user.iterations = ITERATIONS;
-                user.stored_key = stored_key;
-                user.server_key = server_key;
-                user.must_change_password = false;
-            }
+            let user = users.get_mut(username).ok_or(AdminUserError::NotFound)?;
+            user.salt = new_salt.to_vec();
+            user.iterations = ITERATIONS;
+            user.stored_key = new_stored;
+            user.server_key = new_server;
+            user.must_change_password = false;
         }
         self.persist()
     }

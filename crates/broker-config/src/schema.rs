@@ -15,7 +15,7 @@
 //! with its owner; this task only defines, validates and documents them.
 
 pub use crate::ConfigError;
-use crate::PrometheusConf;
+use crate::{AuthzSourcesConf, PrometheusConf};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -2040,7 +2040,7 @@ impl AuthPolicyConf {
             return Err(invalid(
                 "auth.password_hash",
                 &self.password_hash,
-                "must be one of sha256, bcrypt",
+                "is not supported by this broker: must be one of sha256, bcrypt",
             ));
         }
         if self.superusers.len() > 100 {
@@ -2598,6 +2598,11 @@ pub struct BrokerConfig {
     /// managed through the management API.
     #[serde(default)]
     pub prometheus: PrometheusConf,
+    /// Authorization source registry from the file layer. When a layer
+    /// sets it, boot persists the list before the registry replay; an
+    /// absent key keeps the stored order.
+    #[serde(default)]
+    pub authz_sources: AuthzSourcesConf,
 }
 
 /// Delayed-publish scheduler bounds.
@@ -2971,6 +2976,7 @@ impl BrokerConfig {
         self.webhook.validate()?;
         self.mcp.validate()?;
         self.prometheus.validate()?;
+        self.authz_sources.validate()?;
         Ok(())
     }
 

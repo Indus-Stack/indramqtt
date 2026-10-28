@@ -196,6 +196,7 @@ fn known_prefixes() -> HashSet<String> {
     prefixes.insert("rules".to_string());
     prefixes.insert("listeners.websocket".to_string());
     prefixes.insert("tenants".to_string());
+    prefixes.insert("authz_sources".to_string());
     prefixes
 }
 
@@ -1208,8 +1209,11 @@ fn check_table(
                 }
                 check_table(nested, file, kinds, prefixes, full)?;
             }
-            toml::Value::Array(_) if dotted.starts_with("tenants") => {
-                // Array-of-tables (e.g. `[[tenants.rules]]`) is validated by
+            toml::Value::Array(_)
+                if dotted.starts_with("tenants") || dotted == "authz_sources.sources" =>
+            {
+                // Array-of-tables (e.g. `[[tenants.rules]]`,
+                // `[[authz_sources.sources]]`) is validated by
                 // `BrokerConfig::validate`, not the layer kind checker.
             }
             leaf => {

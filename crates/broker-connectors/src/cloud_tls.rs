@@ -103,9 +103,12 @@ pub fn root_store_with(extra_pem: Option<&str>) -> Result<RootCertStore> {
     if loaded == 0 {
         store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
             rustls::pki_types::TrustAnchor {
-                subject: ta.subject.to_vec().into(),
-                subject_public_key_info: ta.spki.to_vec().into(),
-                name_constraints: ta.name_constraints.map(|nc| nc.to_vec().into()),
+                subject: ta.subject.as_ref().to_vec().into(),
+                subject_public_key_info: ta.subject_public_key_info.as_ref().to_vec().into(),
+                name_constraints: ta
+                    .name_constraints
+                    .as_ref()
+                    .map(|nc| nc.as_ref().to_vec().into()),
             }
         }));
     }

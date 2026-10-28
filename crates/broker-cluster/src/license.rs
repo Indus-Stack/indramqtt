@@ -866,11 +866,10 @@ impl ClusterIdentity {
             if scalar.iter().all(|b| *b == 0) {
                 continue;
             }
-            let field =
-                p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&scalar);
+            let field = p256::FieldBytes::from(scalar);
             if let Ok(signing) = SigningKey::from_bytes(&field) {
                 let verifying = VerifyingKey::from(&signing);
-                let compressed = verifying.to_encoded_point(true);
+                let compressed = verifying.to_sec1_point(true);
                 let public_key_hex = encode_hex(compressed.as_bytes());
                 let identity = Self::identity_for_public(compressed.as_bytes());
                 return Self {
@@ -1266,8 +1265,7 @@ mod tests {
         if seed == 0 {
             bytes[31] = 1;
         }
-        let field_bytes =
-            p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
+        let field_bytes = p256::FieldBytes::from(bytes);
         SigningKey::from_bytes(&field_bytes).expect("test seed is a valid scalar")
     }
 
@@ -1593,7 +1591,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch dir");
         for (name, key, kid) in [("a.json", &a, "key-a"), ("b.json", &b, "key-b")] {
             let verifying = VerifyingKey::from(key);
-            let point = verifying.to_encoded_point(false);
+            let point = verifying.to_sec1_point(false);
             let hex: String = point
                 .as_bytes()
                 .iter()
@@ -1622,7 +1620,7 @@ mod b2_04_tests {
         if seed == 0 {
             bytes[31] = 1;
         }
-        let field = p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
+        let field = p256::FieldBytes::from(bytes);
         SigningKey::from_bytes(&field).expect("test seed is a valid scalar")
     }
 
@@ -2066,7 +2064,7 @@ mod b2_04_b {
     fn b2_04_install_during_trial_moves_to_valid() {
         use p256::ecdsa::signature::Signer;
         let bytes = [0xC9u8; 32];
-        let field = p256::elliptic_curve::generic_array::GenericArray::clone_from_slice(&bytes);
+        let field = p256::FieldBytes::from(bytes);
         let signing = SigningKey::from_bytes(&field).expect("seed");
         let mut trusted = TrustedKeys::new();
         trusted.insert("key-c9".to_string(), VerifyingKey::from(&signing));

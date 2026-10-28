@@ -1328,6 +1328,9 @@ async fn create_user(
     // Quotas always render as an object (all-null when unset) so GET
     // and POST share one shape.
     let stored = state.auth.get_quotas_in_tenant(&tenant, &req.username);
+    // A changed user invalidates cached authorization decisions so the
+    // next operation is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     (
         StatusCode::CREATED,
         Json(serde_json::json!({ "username": req.username, "quotas": stored })),
@@ -1404,6 +1407,9 @@ async fn create_acl(
     ) {
         return persist_error(error);
     }
+    // A changed rule invalidates cached decisions so the next operation
+    // is re-authorized (AZ-02).
+    state.sessions.clear_all_authz_caches();
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -1445,7 +1451,12 @@ async fn delete_acl(
         Err(response) => return *response,
     };
     match state.auth.remove_rule_in_tenant(&tenant, id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // A changed rule invalidates cached decisions so the next
+            // operation is re-authorized (AZ-02).
+            state.sessions.clear_all_authz_caches();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => persist_error(error),
     }
@@ -2487,6 +2498,7 @@ mod tests {
         router: Arc<SubscriptionRouter>,
         metrics: Arc<Metrics>,
         auth: Arc<MemoryAuth>,
+        authz_sources: Arc<broker_auth::AuthzSourceRegistry>,
         admin_users: Arc<crate::admin_users::AdminUsers>,
         tokens: Arc<crate::v5::auth::ApiTokens>,
         alarms: Arc<crate::v5::alarms::AlarmStore>,
@@ -2530,6 +2542,7 @@ mod tests {
                 router: sub_router.clone(),
                 metrics: metrics.clone(),
                 auth: auth.clone(),
+                authz_sources: api_state.authz_sources.clone(),
                 admin_users: api_state.admin_users.clone(),
                 tokens: api_state.tokens.clone(),
                 alarms: api_state.alarms.clone(),
@@ -8731,11 +8744,12 @@ mod tests {
     async fn authz_sources_list_create_clear_round_trip() {
         // Source registry plus list/create routes and the built-in
         // catch-all clear (W2-17, C04-08..C04-10) through the broker:
-        // default list holds only the built-in source, create registers
-        // one stored-only source, duplicates are rejected, and the
-        // catch-all empties the built-in rule table. Before this task
-        // every route here was missing (bare 404).
-        let (server, _state) = TestServer::start().await;
+        // default list holds only the built-in source, an unavailable
+        // fresh kind is refused, an older stored source still lists,
+        // duplicates are rejected, and the catch-all empties the
+        // built-in rule table. Before this task every route here was
+        // missing (bare 404).
+        let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
 
         // Default registry: only the built-in database source, empty
@@ -8749,17 +8763,28 @@ mod tests {
             json!([{"type": "built_in_database", "enable": true}])
         );
 
-        // Register one stored-only source; only the built-in executes,
-        // the new entry is stored and reported without a live claim.
-        let (status, created) = server
+        // A source kind this build does not evaluate is refused before
+        // anything is stored (AZ-02).
+        let (status, refused) = server
             .post_auth(
                 "/api/v5/authorization/sources",
                 json!({"type": "file", "config": {"path": "/etc/authz/rules.conf"}}),
                 &token,
             )
             .await;
-        assert_eq!(status, 204);
-        assert!(created.is_null(), "create returns no body, got: {created}");
+        assert_eq!(status, 400);
+        assert_eq!(refused["code"], json!("BAD_REQUEST"));
+
+        // An older stored source still lists and reports without a live
+        // claim; seed it directly to model the recovered state.
+        state
+            .authz_sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: json!({"path": "/etc/authz/rules.conf"}),
+            })
+            .expect("seed the stored source");
 
         // List again: the entry is present in stored order.
         let (status, body) = server
@@ -8788,7 +8813,7 @@ mod tests {
             status, 400,
             "duplicate source must be rejected, got: {body}"
         );
-        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
 
         // Unknown source types are 404 with the documented shape.
         let (status, body) = server
@@ -8834,16 +8859,18 @@ mod tests {
         // dir in a fresh server, and read the sources back.
         let dir = unique_data_dir("authz-sources");
         let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
-        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
-        let token = server.login_as_admin().await;
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/authorization/sources",
-                json!({"type": "redis"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 204);
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        state
+            .authz_sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "redis".to_string(),
+                enable: true,
+                config: Value::Null,
+            })
+            .expect("seed the stored source");
+        // Side effect: login_as_admin persists the admin password change
+        // through the registry so the reload below can authenticate.
+        server.login_as_admin().await;
         drop(server);
         drop(registry);
         let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
@@ -8949,16 +8976,17 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body["rules"].as_array().expect("rules array").len(), 2);
 
-        // Register a second source, then a bad order naming an unknown
-        // type is rejected and the stored order is unchanged.
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/authorization/sources",
-                json!({"type": "file"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 204);
+        // An older stored source is seeded directly, then a bad order
+        // naming an unknown type is rejected and the stored order is
+        // unchanged.
+        state
+            .authz_sources
+            .insert(broker_auth::AuthzSourceEntry {
+                source_type: "file".to_string(),
+                enable: true,
+                config: Value::Null,
+            })
+            .expect("seed the stored source");
         let (status, body) = server
             .put_auth(
                 "/api/v5/authorization/sources/order",
@@ -21915,7 +21943,8 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// the handler. A 9 MiB call gets 413. Both go through a socket.
+    /// A 3 MiB call reaches the handler. A call just over 8 MiB gets 413.
+    /// Both go through a socket.
     #[tokio::test]
     async fn mcp_body_cap_is_eight_mebibytes() {
         let (server, _state) = TestServer::start().await;
@@ -21935,8 +21964,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 200);
         assert!(body["result"].is_object(), "ping answers: {body}");
 
-        // A 9 MiB envelope is refused with 413.
-        let huge_pad = "p".repeat(9 * 1024 * 1024);
+        // A body exactly one byte over 8 MiB is refused with 413. The
+        // fixed overhead keeps the serialized body at the boundary so
+        // the socket write finishes before the server refuses it.
+        let empty = json!({"jsonrpc": "2.0", "method": "ping",
+            "params": {"pad": ""}, "id": 2});
+        let overhead = serde_json::to_vec(&empty).expect("encode body").len();
+        let huge_pad = "p".repeat(crate::mcp::MCP_MAX_BODY_BYTES + 1 - overhead);
         let (status, body) = mcp_rpc(
             &server,
             &bearer,

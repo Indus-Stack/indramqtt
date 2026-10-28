@@ -320,20 +320,19 @@ impl AuthzSourceRegistry {
     }
 
     /// Register one source. Fails cleanly on duplicate `type` (caller
-    /// maps to `ALREADY_EXISTS`), a full registry (caller maps to
+    /// maps to `BAD_REQUEST`), a full registry (caller maps to
     /// `BAD_REQUEST`) or an invalid entry (caller maps to `BAD_REQUEST`
     /// or `NOT_FOUND` for an unknown type). Validated all-before-apply:
     /// the candidate root is validated before it can become visible, so
     /// invalid state is never observable. Persists through the registry
-    /// when one is attached; a commit or save failure surfaces as
-    /// [`SourceInsertError::Persist`] and the in-memory update stays
-    /// (commit precedes the atomic save, mirroring the credential
-    /// store).
+    /// when one is attached. Commit and save happen before the live
+    /// snapshot moves. A failed save restores the old stored state, so
+    /// the old policy stays enforced.
     pub fn insert(&self, entry: AuthzSourceEntry) -> Result<AuthzSourceEntry, SourceInsertError> {
         validate_entry(&entry)?;
         let _guard = self.save_lock.lock();
-        let conf = {
-            let mut current = self.inner.write();
+        let (next, conf) = {
+            let current = self.inner.read();
             if current.iter().any(|e| e.source_type == entry.source_type) {
                 return Err(SourceInsertError::Duplicate);
             }
@@ -345,26 +344,19 @@ impl AuthzSourceRegistry {
             let conf = export_conf(&next);
             conf.validate()
                 .map_err(|e| SourceInsertError::Invalid(e.to_string()))?;
-            current.push(entry.clone());
-            self.snapshot.store(Arc::new(current.clone()));
-            // One bounded counter record per source type; a re-created
-            // type after a delete restarts at zero.
-            {
-                let mut counters = self.counters.write();
-                counters
-                    .entry(entry.source_type.clone())
-                    .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
-                self.sync_built_in(&counters);
-            }
-            conf
+            (next, conf)
         };
-        if let Some(registry) = self.registry.read().clone() {
-            registry
-                .commit_authz_sources(conf)
-                .map_err(|e| SourceInsertError::Persist(e.to_string()))?;
-            registry
-                .save()
-                .map_err(|e| SourceInsertError::Persist(e.to_string()))?;
+        self.persist(conf).map_err(SourceInsertError::Persist)?;
+        *self.inner.write() = next.clone();
+        self.snapshot.store(Arc::new(next));
+        // One bounded counter record per source type; a re-created
+        // type after a delete restarts at zero.
+        {
+            let mut counters = self.counters.write();
+            counters
+                .entry(entry.source_type.clone())
+                .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+            self.sync_built_in(&counters);
         }
         Ok(entry)
     }
@@ -403,7 +395,7 @@ impl AuthzSourceRegistry {
             }
         }
         let _guard = self.save_lock.lock();
-        let reordered = {
+        let (reordered, conf) = {
             let current = self.inner.read();
             let unknown: Vec<String> = types
                 .iter()
@@ -440,22 +432,11 @@ impl AuthzSourceRegistry {
             let conf = export_conf(&next);
             conf.validate()
                 .map_err(|e| SourceReorderError::Invalid(e.to_string()))?;
-            next
+            (next, conf)
         };
-        let conf = export_conf(&reordered);
-        {
-            let mut current = self.inner.write();
-            *current = reordered.clone();
-            self.snapshot.store(Arc::new(reordered));
-        }
-        if let Some(registry) = self.registry.read().clone() {
-            registry
-                .commit_authz_sources(conf)
-                .map_err(|e| SourceReorderError::Persist(e.to_string()))?;
-            registry
-                .save()
-                .map_err(|e| SourceReorderError::Persist(e.to_string()))?;
-        }
+        self.persist(conf).map_err(SourceReorderError::Persist)?;
+        *self.inner.write() = reordered.clone();
+        self.snapshot.store(Arc::new(reordered));
         Ok(())
     }
 
@@ -478,8 +459,8 @@ impl AuthzSourceRegistry {
         position: usize,
     ) -> Result<Vec<AuthzSourceEntry>, SourceMoveError> {
         let _guard = self.save_lock.lock();
-        let (reordered, conf, moved) = {
-            let mut current = self.inner.write();
+        let (next, conf) = {
+            let current = self.inner.read();
             let Some(from) = current.iter().position(|e| e.source_type == source_type) else {
                 return Err(SourceMoveError::NotFound);
             };
@@ -493,26 +474,18 @@ impl AuthzSourceRegistry {
             if from == position {
                 return Ok(current.clone());
             }
-            let entry = current.remove(from);
-            current.insert(position, entry);
-            let next = current.clone();
+            let mut next = current.clone();
+            let entry = next.remove(from);
+            next.insert(position, entry);
             let conf = export_conf(&next);
             conf.validate()
                 .map_err(|e| SourceMoveError::Persist(e.to_string()))?;
-            self.snapshot.store(Arc::new(next.clone()));
-            (next, conf, true)
+            (next, conf)
         };
-        if moved {
-            if let Some(registry) = self.registry.read().clone() {
-                registry
-                    .commit_authz_sources(conf)
-                    .map_err(|e| SourceMoveError::Persist(e.to_string()))?;
-                registry
-                    .save()
-                    .map_err(|e| SourceMoveError::Persist(e.to_string()))?;
-            }
-        }
-        Ok(reordered)
+        self.persist(conf).map_err(SourceMoveError::Persist)?;
+        *self.inner.write() = next.clone();
+        self.snapshot.store(Arc::new(next.clone()));
+        Ok(next)
     }
 
     /// Remove the source stored under `type`, returning it.
@@ -529,8 +502,8 @@ impl AuthzSourceRegistry {
     // The broker refuses the delete and keeps authorization closed.
     pub fn remove(&self, source_type: &str) -> Result<AuthzSourceEntry, SourceRemoveError> {
         let _guard = self.save_lock.lock();
-        let (removed, conf) = {
-            let mut current = self.inner.write();
+        let (next, removed, conf) = {
+            let current = self.inner.read();
             let Some(pos) = current.iter().position(|e| e.source_type == source_type) else {
                 return Err(SourceRemoveError::NotFound);
             };
@@ -540,26 +513,20 @@ impl AuthzSourceRegistry {
                         .to_string(),
                 ));
             }
-            let removed = current.remove(pos);
-            let next = current.clone();
+            let mut next = current.clone();
+            let removed = next.remove(pos);
             let conf = export_conf(&next);
             conf.validate()
                 .map_err(|e| SourceRemoveError::Persist(e.to_string()))?;
-            self.snapshot.store(Arc::new(next));
-            {
-                let mut counters = self.counters.write();
-                counters.remove(source_type);
-                self.sync_built_in(&counters);
-            }
-            (removed, conf)
+            (next, removed, conf)
         };
-        if let Some(registry) = self.registry.read().clone() {
-            registry
-                .commit_authz_sources(conf)
-                .map_err(|e| SourceRemoveError::Persist(e.to_string()))?;
-            registry
-                .save()
-                .map_err(|e| SourceRemoveError::Persist(e.to_string()))?;
+        self.persist(conf).map_err(SourceRemoveError::Persist)?;
+        *self.inner.write() = next.clone();
+        self.snapshot.store(Arc::new(next));
+        {
+            let mut counters = self.counters.write();
+            counters.remove(source_type);
+            self.sync_built_in(&counters);
         }
         Ok(removed)
     }
@@ -599,8 +566,8 @@ impl AuthzSourceRegistry {
             SourceInsertError::Persist(msg) => SourceUpdateError::Persist(msg),
         })?;
         let _guard = self.save_lock.lock();
-        let updated = {
-            let mut current = self.inner.write();
+        let (next, conf) = {
+            let current = self.inner.read();
             let Some(pos) = current.iter().position(|e| e.source_type == source_type) else {
                 return Err(SourceUpdateError::NotFound);
             };
@@ -609,29 +576,45 @@ impl AuthzSourceRegistry {
             let conf = export_conf(&next);
             conf.validate()
                 .map_err(|e| SourceUpdateError::Invalid(e.to_string()))?;
-            *current = next.clone();
-            self.snapshot.store(Arc::new(next));
-            // Counters survive config/enable replaces: they are live, not
-            // config. Ensure the record exists for registries seeded
-            // before counters landed.
-            {
-                let mut counters = self.counters.write();
-                counters
-                    .entry(source_type.to_string())
-                    .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
-                self.sync_built_in(&counters);
-            }
-            conf
+            (next, conf)
         };
-        if let Some(registry) = self.registry.read().clone() {
-            registry
-                .commit_authz_sources(updated)
-                .map_err(|e| SourceUpdateError::Persist(e.to_string()))?;
-            registry
-                .save()
-                .map_err(|e| SourceUpdateError::Persist(e.to_string()))?;
+        self.persist(conf).map_err(SourceUpdateError::Persist)?;
+        *self.inner.write() = next.clone();
+        self.snapshot.store(Arc::new(next));
+        // Counters survive config/enable replaces: they are live, not
+        // config. Ensure the record exists for registries seeded
+        // before counters landed.
+        {
+            let mut counters = self.counters.write();
+            counters
+                .entry(source_type.to_string())
+                .or_insert_with(|| Arc::new(AuthzSourceCounters::default()));
+            self.sync_built_in(&counters);
         }
         Ok(entry)
+    }
+
+    /// Commit and save the candidate through the attached registry.
+    /// A failed save restores the old stored snapshot, so the stored and
+    /// enforced state stay unchanged.
+    fn persist(&self, conf: AuthzSourcesConf) -> Result<(), String> {
+        let Some(registry) = self.registry.read().clone() else {
+            return Ok(());
+        };
+        let previous = registry.snapshot().authz_sources.clone();
+        registry
+            .commit_authz_sources(conf)
+            .map_err(|e| e.to_string())?;
+        if let Err(error) = registry.save() {
+            if let Err(restore) = registry.commit_authz_sources(previous) {
+                tracing::error!(
+                    error = %restore,
+                    "cannot restore authorization sources after a failed save"
+                );
+            }
+            return Err(error.to_string());
+        }
+        Ok(())
     }
 
     /// Live counters for one source `type` (`None` when unknown).
@@ -937,6 +920,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn failed_save_keeps_old_stored_and_enforced_source_policy() {
+        let dir = std::env::temp_dir().join(format!(
+            "authz-sources-save-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir exists");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads"));
+        let sources = AuthzSourceRegistry::from_registry(&registry);
+        sources.insert(entry("file")).expect("persist file");
+        let before = stored_order(&sources);
+        let before_snapshot: Vec<_> = sources
+            .snapshot()
+            .iter()
+            .map(|e| e.source_type.clone())
+            .collect();
+
+        // A missing data dir makes the next save fail. The failed insert
+        // must leave the stored and enforced policy unchanged.
+        std::fs::remove_dir_all(&dir).expect("remove data dir");
+        assert!(matches!(
+            sources.insert(entry("http")),
+            Err(SourceInsertError::Persist(_))
+        ));
+        assert_eq!(stored_order(&sources), before);
+        let after_snapshot: Vec<_> = sources
+            .snapshot()
+            .iter()
+            .map(|e| e.source_type.clone())
+            .collect();
+        assert_eq!(after_snapshot, before_snapshot);
+        assert_eq!(
+            registry.snapshot().authz_sources.sources.len(),
+            before.len()
+        );
+
+        // A later successful save keeps the old state, not the refused
+        // entry.
+        std::fs::create_dir_all(&dir).expect("restore data dir");
+        registry.save().expect("later save persists old state");
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("data dir reloads"));
+        let restarted = AuthzSourceRegistry::from_registry(&reloaded);
+        assert_eq!(stored_order(&restarted), before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn order(types: &[&str]) -> Vec<String> {
         types.iter().map(|t| t.to_string()).collect()
     }
@@ -1173,5 +1206,29 @@ mod tests {
         assert_eq!(counts.allow, 2);
         assert_eq!(counts.deny, 1);
         assert_eq!(counts.total, 3);
+    }
+
+    #[tokio::test]
+    async fn unsupported_source_denies_the_console_authorizer_path() {
+        // An enabled source this build does not evaluate denies through
+        // the console `Authorizer` trait path too, never falling through
+        // to a later allow (D2).
+        use crate::{Authorizer, MemoryAuth};
+        use broker_protocol::Topic;
+        let registry = std::sync::Arc::new(AuthzSourceRegistry::new());
+        registry
+            .insert(AuthzSourceEntry {
+                source_type: "http".to_string(),
+                enable: true,
+                config: serde_json::Value::Null,
+            })
+            .expect("legacy source stores");
+        let auth = MemoryAuth::new();
+        auth.set_authz_sources(std::sync::Arc::clone(&registry));
+        let topic = Topic::new("sensors/temp").expect("probe topic parses");
+        assert!(
+            auth.authorize_publish("sensor-1", &topic).await.is_err(),
+            "an unsupported source denies the console path"
+        );
     }
 }

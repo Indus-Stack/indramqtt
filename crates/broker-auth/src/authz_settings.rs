@@ -10,9 +10,11 @@
 //! observe the persisted settings from the first connection. The
 //! authorize path reads the `no_match`/`deny_action` values here
 //! (`MemoryAuth` in `crate::lib`, one lock-free snapshot load per
-//! unmatched or denied message, no clone). The remaining halves (`cache`,
-//! `include_mountpoint`, `ignore_backend_failures`) are stored, validated
-//! and reported only; the authorize path consults none of them.
+//! unmatched or denied message, no clone). The `cache` half is enforced
+//! on the publish, subscribe and will paths in
+//! `crates/broker-node/src/main.rs` (enable, cap, TTL, excludes).
+//! The `include_mountpoint` and `ignore_backend_failures` halves are
+//! stored, validated and reported only.
 //!
 //! Store bounds (both stated here and enforced below):
 //! - exactly one small validated struct (two decision strings, one cache
@@ -33,8 +35,8 @@
 //! `crates/broker-node/tests/authz_decision_bench.rs`.
 // TODO(parity): does the decision cache (`cache` half) share the
 // node-cache entries or stay its own verdict table? The rulebook does
-// not decide the cache wiring; the current choice stores, validates and
-// reports the half while the authorize path consults no verdict cache.
+// not decide the cache wiring; the current choice keeps its own
+// per-client verdict table.
 // TODO(parity): does the documented PUT merge missing fields or reset
 // them to defaults, and does an empty body reset everything or fail? The
 // rulebook does not decide the merge semantics; the current choice fills
@@ -150,14 +152,11 @@ impl AuthzSettingsStore {
 
     /// Replace the stored settings with a candidate.
     ///
-    /// Validate-all-before-apply: the candidate is validated before it
-    /// can become visible, so invalid state is never observable. On
-    /// success the snapshot and the persisted registry move together; the
-    /// in-memory swap precedes the atomic save (mirroring the sibling
-    /// settings stores), so a save failure surfaces as
-    /// [`AuthzSettingsUpdateError::Persist`] while the validated value
-    /// stays. Management-plane only: one short swap per request; publish
-    /// and deliver never touch this store.
+    /// Validate the candidate before it becomes visible.
+    /// Commit and save before the in-memory swap.
+    /// A failed write keeps the old decision (D2).
+    /// Management-plane only.
+    /// Publish and deliver never touch this store.
     pub fn replace(
         &self,
         next: AuthzSettingsConf,
@@ -165,15 +164,25 @@ impl AuthzSettingsStore {
         next.validate()
             .map_err(|e| AuthzSettingsUpdateError::Invalid(e.to_string()))?;
         let _guard = self.save_lock.lock();
-        self.current.store(Arc::new(next.clone()));
         if let Some(registry) = self.registry.read().clone() {
+            let previous = registry.snapshot().authz_settings.clone();
             registry
                 .commit_authz_settings(next.clone())
                 .map_err(|e| AuthzSettingsUpdateError::Persist(e.to_string()))?;
-            registry
-                .save()
-                .map_err(|e| AuthzSettingsUpdateError::Persist(e.to_string()))?;
+            if let Err(error) = registry.save() {
+                // A failed save must not leave the registry changed.
+                // Restore the old snapshot so a later save keeps the old
+                // decision (D2).
+                if let Err(restore) = registry.commit_authz_settings(previous) {
+                    tracing::error!(
+                        error = %restore,
+                        "cannot restore authorization settings after a failed save"
+                    );
+                }
+                return Err(AuthzSettingsUpdateError::Persist(error.to_string()));
+            }
         }
+        self.current.store(Arc::new(next.clone()));
         Ok(next)
     }
 

@@ -153,6 +153,9 @@ fn write_config(
              [logging]\n\
              level = \"warn\"\n\
              \n\
+             [auth]\n\
+             password_hash = \"bcrypt\"\n\
+             \n\
              [[tenants.rules]]\n\
              expression = \"t-storm\"\n",
             scratch.display(),
