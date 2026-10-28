@@ -1,9 +1,23 @@
-"""Check typed inventory coverage; runtime evidence still needs review."""
+"""Check typed inventory coverage and the audit state of each row."""
 import json
 from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[2]
+ENTRY_PREFIXES = ("tests/settings_inventory/entry.py", "tests/e2e_integration.rs")
+NO_EFFECT = (
+    "state.connectors.connectors[type=console].config",
+    "state.connectors.connectors[type=test].config",
+)
+STATES = {"entry evidence", "evidence pending", "no runtime effect"}
+SECRET_SEGMENTS = {
+    "password", "passwd", "secret", "token", "api_key", "apikey", "access_key",
+    "access_key_id", "access_key_secret", "account_key", "accountkey",
+    "private_key", "private_key_pem", "key_pem", "keyfile", "key_password",
+    "acc_key", "auth_token", "client_key", "shared_access_key", "mfa_secret",
+    "key_hash", "bind_password", "password_hash", "session_token", "sas_token",
+    "bearer_token", "secret_key", "secret_access_key", "api_secret",
+}
 
 
 def structs_from(path):
@@ -57,7 +71,8 @@ def check():
     if missing:
         raise AssertionError("typed fields missing from inventory: " + ", ".join(sorted(missing)))
     required = {"field", "store", "reader", "condition", "restart", "expectation", "current",
-                "evidence", "risk", "proposal", "owner", "legacy", "status", "definition", "type"}
+                "evidence", "credential", "risk", "proposal", "owner", "legacy", "status",
+                "definition", "type"}
     for row in rows:
         if required - row.keys():
             raise AssertionError("incomplete row columns: " + row["field"])
@@ -67,12 +82,31 @@ def check():
         if not (re.fullmatch(r"(?:AZ|CX|KC|MV|RO)-[0-9]{2}[a-z]?", owner)
                 or re.fullmatch(r"new: [^;|\n]+", owner)):
             raise AssertionError("field must have one ticket or one new-ticket title: " + row["field"])
-    if ledger["status"] == "complete":
-        unfinished = [row["field"] for row in rows if row["status"] != "reviewed"]
-        if unfinished:
-            raise AssertionError("complete inventory still has unfinished rows: " + ", ".join(unfinished))
+        if owner == "KC-00":
+            raise AssertionError("per-field row must not use the kind-map owner: " + row["field"])
+        state = row["status"]
+        if state not in STATES:
+            raise AssertionError("unknown audit state: " + row["field"] + ": " + state)
+        evidence = row["evidence"]
+        if state == "entry evidence" and not evidence.startswith(ENTRY_PREFIXES):
+            raise AssertionError("entry evidence does not cite an entry test: " + row["field"])
+        if state == "no runtime effect" and not (
+                evidence.startswith("Pure metadata") or row["field"] in NO_EFFECT):
+            raise AssertionError("no-runtime-effect row has no stated reason: " + row["field"])
+        if state == "evidence pending" and evidence.startswith(ENTRY_PREFIXES):
+            raise AssertionError("entry evidence is marked pending: " + row["field"])
+        if row["credential"] == "n/a" and any(
+                part in SECRET_SEGMENTS for part in row["field"].split(".")):
+            raise AssertionError("credential row has no exposure record: " + row["field"])
+    if "state.reload_import.atomicity" not in names:
+        raise AssertionError("the cross-root atomicity row is missing")
+    pending = [row["field"] for row in rows if row["status"] == "evidence pending"]
+    if ledger["status"] == "complete" and pending:
+        raise AssertionError("complete inventory still has pending evidence rows")
+    counts = {state: sum(row["status"] == state for row in rows) for state in sorted(STATES)}
     print(str(len(expected)) + " typed fields covered; " + str(len(rows)) + " total rows.")
-    print("This checks coverage, not runtime correctness or audit completion.")
+    print("Audit state: " + ", ".join(state + "=" + str(count) for state, count in counts.items()))
+    print("This checks coverage and audit state, not runtime correctness.")
 
 
 if __name__ == "__main__":

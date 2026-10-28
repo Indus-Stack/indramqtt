@@ -7,8 +7,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "docs/reference/settings-inventory.json"
 TARGET = ROOT / "docs/reference/unapplied-settings.md"
-KEYS = ["field", "store", "reader", "condition", "restart", "expectation", "current",
-        "evidence", "risk", "proposal", "owner", "legacy", "status"]
+KEYS = ["field", "store", "reader", "condition", "restart", "expectation",
+        "current", "evidence", "credential", "risk", "proposal", "owner",
+        "legacy", "status"]
 
 
 def cell(value):
@@ -21,26 +22,34 @@ def render(ledger):
     if len(set(names)) != len(names):
         raise ValueError("duplicate inventory field")
     counts = Counter(row["status"] for row in rows)
-    if ledger["status"] == "complete":
-        intro = (
-            "This page lists every stored setting. Use it when a setting is "
-            "accepted but its effect is not clear. Each row gives the runtime "
-            "reader, the current behavior, the risk and one owner ticket. This "
-            "audit does not fix any defect.\n\n"
-        )
-        coverage = (
-            str(len(rows)) + " rows. Every row is reviewed and has one owner. "
-            "A complete inventory does not mean that a stored setting works.\n\n"
+    entry = counts["entry evidence"]
+    pending = counts["evidence pending"]
+    no_effect = counts["no runtime effect"]
+    unknown = set(counts) - {"entry evidence", "evidence pending", "no runtime effect"}
+    if unknown:
+        raise ValueError("unknown audit state: " + ", ".join(sorted(unknown)))
+    intro = (
+        "This page lists the stored settings that this audit covers. Use it when a "
+        "setting is accepted but its effect is not clear. Each row gives the runtime "
+        "reader, the current behavior, the risk, the credential exposure and one "
+        "owner ticket. This audit does not fix any defect.\n\n"
+    )
+    coverage = (
+        str(len(rows)) + " rows. " + str(entry) + " rows have entry evidence; "
+        + str(pending) + " are evidence pending; " + str(no_effect)
+        + " have no runtime effect.\n\n"
+    )
+    if pending:
+        coverage += (
+            "An evidence-pending row records current behavior from a source or unit "
+            "test. It is not proof that the stored value is applied through the real "
+            "entry. Its owner must add the entry case or record a no-runtime-effect "
+            "reason.\n\n"
         )
     else:
-        intro = (
-            "This audit is in progress. Pending evidence is not a statement that "
-            "the setting works or that there is no reader. No production defect is "
-            "fixed here.\n\n"
-        )
-        coverage = (
-            str(len(rows)) + " rows. Opaque field expansion and evidence review are "
-            "still in progress.\n\n"
+        coverage += (
+            "Every row has entry evidence or a stated no-runtime-effect reason. "
+            "A complete inventory does not mean that a stored setting works.\n\n"
         )
     text = "# Stored setting audit\n\n" + intro
     text += """```mermaid
@@ -67,6 +76,13 @@ or HTTP. Temporary defect assertions carry an owner marker. A passing case
 records current behavior. Its owner must replace that assertion. Backend
 construction traces and entry evidence are recorded separately.
 
+The credential column records a separate security risk. It records the
+exposure of a password, key or token, and its owner is the row owner. A
+literal connector value is stored as plain text and returned by GET. A
+`file:` or `env:` reference is stored as a reference and redacted on GET.
+Password verifiers and API key hashes are stored as hashes and are not
+returned by GET.
+
 For old unsupported security state, D2 requires a denial at the affected
 source, an alarm, preservation of the raw record and management read/delete.
 A supported earlier decision remains valid. A later allow cannot bypass the
@@ -85,8 +101,10 @@ unsupported source. New unsupported values must be refused before storage.
     for label, prefix in [("Startup fields", "file."), ("Persisted fields", "state."),
                           ("Other accepted fields", "api.")]:
         text += "\n## " + label + "\n\n"
-        text += "| Field / definition | Store | Runtime reader | Build condition | Restart | User expectation | Current behavior | Evidence | Risk | Proposal | Owner | Old state / safe startup | Audit |\n"
-        text += "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        text += ("| Field / definition | Store | Runtime reader | Build condition | "
+                 "Restart | User expectation | Current behavior | Evidence | Credential "
+                 "exposure | Risk | Proposal | Owner | Old state / safe startup | Audit |\n")
+        text += "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
         for row in rows:
             if not row["field"].startswith(prefix):
                 continue
