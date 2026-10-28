@@ -3707,6 +3707,2411 @@ connector_id = "pending-good"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// One captured request of the MV-02b loopback fake.
+    #[derive(Clone)]
+    struct Mv02bCaptured {
+        method: String,
+        path: String,
+        query: String,
+        body: Vec<u8>,
+    }
+
+    /// Minimal HTTP responder for the MV-02b delivery tests: one TCP
+    /// listener that answers every request with a fixed status and body
+    /// and records what arrived. Dropping the fake closes the port, so
+    /// the same test proves delivery, then the down-server case, then
+    /// delivery again after a restart.
+    struct Mv02bFake {
+        port: u16,
+        received: std::sync::Arc<std::sync::Mutex<Vec<Mv02bCaptured>>>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Mv02bFake {
+        fn drop(&mut self) {
+            self._task.abort();
+        }
+    }
+
+    impl Mv02bFake {
+        async fn start(status: u16, body: &'static str) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake");
+            Self::serve(listener, status, body).await
+        }
+
+        /// Bind the same port again after a drop, so the delivers-after-start
+        /// step dials the target the stored connector names.
+        async fn start_on(port: u16, status: u16, body: &'static str) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("rebind fake");
+            Self::serve(listener, status, body).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener, status: u16, body: &'static str) -> Self {
+            let port = listener.local_addr().expect("fake addr").port();
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_received = std::sync::Arc::clone(&received);
+            let reply = body.as_bytes().to_vec();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let received = std::sync::Arc::clone(&task_received);
+                    let reply = reply.clone();
+                    tokio::spawn(async move {
+                        let mut stream = stream;
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) => return,
+                                Ok(n) => {
+                                    head.extend_from_slice(&buf[..n]);
+                                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                    if head.len() > 65536 {
+                                        return;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                        let head_end = head
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4)
+                            .unwrap_or(head.len());
+                        let head_text = String::from_utf8_lossy(&head[..head_end]).to_string();
+                        let mut lines = head_text.lines();
+                        let request_line = lines.next().unwrap_or("").to_string();
+                        let mut content_length = 0usize;
+                        for line in lines {
+                            let lower = line.to_ascii_lowercase();
+                            if let Some(value) = lower.strip_prefix("content-length:") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body_data = head[head_end..].to_vec();
+                        while body_data.len() < content_length {
+                            match stream.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => body_data.extend_from_slice(&buf[..n]),
+                                Err(_) => break,
+                            }
+                        }
+                        body_data.truncate(content_length);
+                        let mut parts = request_line.split_whitespace();
+                        let method = parts.next().unwrap_or("").to_string();
+                        let target = parts.next().unwrap_or("/").to_string();
+                        let (path, query) = match target.split_once('?') {
+                            Some((p, q)) => (p.to_string(), q.to_string()),
+                            None => (target, String::new()),
+                        };
+                        received.lock().expect("fake lock").push(Mv02bCaptured {
+                            method,
+                            path,
+                            query,
+                            body: body_data,
+                        });
+                        let header = format!(
+                            "HTTP/1.1 {status} MV02B\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            reply.len()
+                        );
+                        let mut out = header.into_bytes();
+                        out.extend_from_slice(&reply);
+                        let _ = stream.write_all(&out).await;
+                    });
+                }
+            });
+            Self {
+                port,
+                received,
+                _task: task,
+            }
+        }
+
+        fn requests(&self) -> Vec<Mv02bCaptured> {
+            self.received.lock().expect("fake lock").clone()
+        }
+
+        /// Poll until at least `count` requests arrived (delivery runs
+        /// through the action runtime, so the POST lands after the
+        /// publish answers). Panics with what did arrive.
+        async fn wait_for(&self, count: usize) -> Vec<Mv02bCaptured> {
+            for _ in 0..100 {
+                let got = self.requests();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "fake got {} requests, wanted at least {count}",
+                self.requests().len()
+            );
+        }
+
+        fn body_text(request: &Mv02bCaptured) -> String {
+            String::from_utf8_lossy(&request.body).to_string()
+        }
+    }
+
+    /// Poll one action's metrics until `success` reaches `want`.
+    async fn mv02b_wait_success(server: &TestServer, token: &str, action: &str, want: u64) {
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth(&format!("/api/v5/actions/{action}/metrics"), token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["success"].as_u64().unwrap_or(0) >= want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("action {action} never reached success {want}");
+    }
+
+    /// Publish one JSON event through the management publish entry,
+    /// which drives the stored rule path.
+    async fn mv02b_publish(server: &TestServer, token: &str, topic: &str, payload: &str) {
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/publish",
+                json!({"topic": topic, "payload": payload, "qos": 0}),
+                token,
+            )
+            .await;
+        assert_eq!(status, 202, "publish drives the rule path");
+    }
+
+    #[cfg(feature = "clickhouse")]
+    #[tokio::test]
+    async fn mv02b_clickhouse_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-clickhouse");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "Ok.").await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "clickhouse", "name": "mv02b-ch",
+                       "url": endpoint, "database": "db", "table": "events"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "clickhouse", "name": "mv02b-ch-act",
+                       "connector": "mv02b-ch", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-ch-rule", "name": "mv02b-ch-rule",
+                       "sql": "SELECT * FROM \"mv02b/ch\"", "actions": ["mv02b-ch-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/ch", "{\"v\":1}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].method, "POST");
+        assert_eq!(got[0].path, "/");
+        assert_eq!(
+            got[0].query.replace('+', " "),
+            "query=INSERT INTO db.events FORMAT JSONEachRow",
+            "query: {}",
+            got[0].query
+        );
+        let row: serde_json::Value =
+            serde_json::from_str(Mv02bFake::body_text(&got[0]).trim()).expect("row is JSON");
+        assert_eq!(
+            row,
+            json!({"topic": "mv02b/ch", "qos": 0, "payload": "{\"v\":1}"}),
+            "row: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-ch-act", 1).await;
+
+        // The action override moves the target table.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-ch-act",
+                json!({"type": "clickhouse", "name": "mv02b-ch-act",
+                       "connector": "mv02b-ch", "parameters": {"table": "events2"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02b/ch", "{\"v\":2}").await;
+        let got = fake.wait_for(2).await;
+        assert!(got[1].query.contains("events2"), "query: {}", got[1].query);
+        mv02b_wait_success(&server, &token, "mv02b-ch-act", 2).await;
+
+        // A refused connector update keeps the old delivery.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/mv02b-ch",
+                json!({"type": "clickhouse", "name": "mv02b-ch",
+                       "url": endpoint, "database": "db"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a dropped table refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("table"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/ch", "{\"v\":3}").await;
+        let got = fake.wait_for(3).await;
+        assert!(got[2].query.contains("events2"), "query: {}", got[2].query);
+        mv02b_wait_success(&server, &token, "mv02b-ch-act", 3).await;
+
+        // The server dies: the forward counts one failure.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02b/ch", "{\"v\":4}").await;
+        let (status, _) = server
+            .get_auth("/api/v5/actions/mv02b-ch-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        // The failure may still be in flight; poll for it.
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-ch-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-ch-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server.get_auth("/api/v5/connectors/mv02b-ch", &token).await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes.
+        let fake = Mv02bFake::start_on(port, 200, "Ok.").await;
+        mv02b_publish(&server, &token, "mv02b/ch", "{\"v\":5}").await;
+        let got = fake.wait_for(1).await;
+        assert!(got[0].query.contains("events2"), "query: {}", got[0].query);
+        mv02b_wait_success(&server, &token, "mv02b-ch-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_influxdb_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-influxdb");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(204, "").await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "influxdb", "name": "mv02b-influx",
+                       "server": endpoint, "bucket": "b", "org": "o",
+                       "token": "t", "measurement": "m"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "influxdb", "name": "mv02b-influx-act",
+                       "connector": "mv02b-influx", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-influx-rule", "name": "mv02b-influx-rule",
+                       "sql": "SELECT * FROM \"mv02b/influx\"", "actions": ["mv02b-influx-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/influx", "{\"temp\": 21.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].path, "/api/v2/write");
+        assert!(
+            got[0].query.contains("precision=ms"),
+            "query: {}",
+            got[0].query
+        );
+        assert!(got[0].query.contains("bucket=b"), "query: {}", got[0].query);
+        assert!(
+            Mv02bFake::body_text(&got[0]).starts_with("m,topic=mv02b/influx "),
+            "line: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-influx-act", 1).await;
+
+        // The action override moves the measurement and the precision.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-influx-act",
+                json!({"type": "influxdb", "name": "mv02b-influx-act",
+                       "connector": "mv02b-influx",
+                       "parameters": {"measurement": "m2", "precision": "s"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02b/influx", "{\"temp\": 22.5}").await;
+        let got = fake.wait_for(2).await;
+        assert!(
+            got[1].query.contains("precision=s"),
+            "query: {}",
+            got[1].query
+        );
+        assert!(
+            Mv02bFake::body_text(&got[1]).starts_with("m2,topic=mv02b/influx "),
+            "line: {}",
+            Mv02bFake::body_text(&got[1])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-influx-act", 2).await;
+
+        // A refused connector update keeps the old delivery.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/mv02b-influx",
+                json!({"type": "influxdb", "name": "mv02b-influx",
+                       "server": endpoint, "org": "o", "token": "t", "measurement": "m"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a dropped bucket refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("bucket"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/influx", "{\"temp\": 23.5}").await;
+        let got = fake.wait_for(3).await;
+        assert!(
+            Mv02bFake::body_text(&got[2]).starts_with("m2,topic=mv02b/influx "),
+            "line: {}",
+            Mv02bFake::body_text(&got[2])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-influx-act", 3).await;
+
+        // The server dies: the forward counts one failure.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02b/influx", "{\"temp\": 24.5}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-influx-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-influx-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server
+            .get_auth("/api/v5/connectors/mv02b-influx", &token)
+            .await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes.
+        let fake = Mv02bFake::start_on(port, 204, "").await;
+        mv02b_publish(&server, &token, "mv02b/influx", "{\"temp\": 25.5}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            Mv02bFake::body_text(&got[0]).starts_with("m2,topic=mv02b/influx "),
+            "line: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-influx-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_influxdb_escapes_specials_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-escapes");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(204, "").await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "influxdb", "name": "mv02b-esc",
+                       "server": endpoint, "bucket": "b", "org": "o",
+                       "token": "t", "measurement": "m"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        for (action, topic) in [
+            ("mv02b-esc-act", "mv02b/esc"),
+            ("mv02b-esc-tag-act", "mv02b/a,b c"),
+            ("mv02b-esc-nl-act", "mv02b/nl\nrow"),
+        ] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/actions",
+                    json!({"type": "influxdb", "name": action,
+                           "connector": "mv02b-esc", "parameters": {}}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201);
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/rules",
+                    json!({"id": action, "name": action,
+                           "sql": format!("SELECT * FROM \"{topic}\""),
+                           "actions": [action]}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201);
+        }
+
+        // Quotes, backslashes, spaces and commas in the payload
+        // render as escaped line-protocol field strings.
+        mv02b_publish(
+            &server,
+            &token,
+            "mv02b/esc",
+            "{\"msg\":\"a\\\"b\\\\c d,e\"}",
+        )
+        .await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].method, "POST");
+        assert_eq!(got[0].path, "/api/v2/write");
+        let text = Mv02bFake::body_text(&got[0]);
+        let (head, stamp) = text
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("line: {text}"));
+        assert_eq!(
+            head,
+            "m,topic=mv02b/esc qos=0i,payload=\"{\\\"msg\\\":\\\"a\\\\\\\"b\\\\\\\\c d,e\\\"}\"",
+            "line: {text}"
+        );
+        assert!(
+            stamp.trim_end().bytes().all(|b| b.is_ascii_digit()) && !stamp.trim().is_empty(),
+            "stamp: {text}"
+        );
+        mv02b_wait_success(&server, &token, "mv02b-esc-act", 1).await;
+
+        // Commas and spaces in the topic render as escaped tag values.
+        mv02b_publish(&server, &token, "mv02b/a,b c", "{\"v\":1}").await;
+        let got = fake.wait_for(2).await;
+        let text = Mv02bFake::body_text(&got[1]);
+        let (head, stamp) = text
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("line: {text}"));
+        assert_eq!(
+            head, "m,topic=mv02b/a\\,b\\ c qos=0i,payload=\"{\\\"v\\\":1}\"",
+            "line: {text}"
+        );
+        assert!(
+            stamp.trim_end().bytes().all(|b| b.is_ascii_digit()) && !stamp.trim().is_empty(),
+            "stamp: {text}"
+        );
+        mv02b_wait_success(&server, &token, "mv02b-esc-tag-act", 1).await;
+
+        // Newlines in the payload and the topic stay inside one
+        // line-protocol row: both render as the two characters `\n`.
+        mv02b_publish(
+            &server,
+            &token,
+            "mv02b/nl\nrow",
+            "{\"msg\":\"line1\nline2\"}",
+        )
+        .await;
+        let got = fake.wait_for(3).await;
+        let text = Mv02bFake::body_text(&got[2]);
+        let (head, stamp) = text
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("line: {text}"));
+        assert_eq!(
+            head, "m,topic=mv02b/nl\\nrow qos=0i,payload=\"{\\\"msg\\\":\\\"line1\\nline2\\\"}\"",
+            "line: {text}"
+        );
+        assert!(
+            stamp.trim_end().bytes().all(|b| b.is_ascii_digit()) && !stamp.trim().is_empty(),
+            "stamp: {text}"
+        );
+        mv02b_wait_success(&server, &token, "mv02b-esc-nl-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_tenant_gate_keeps_connector_forwards_in_default_tenant() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-tenant");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(204, "").await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{}", fake.port);
+
+        // A second namespace owns the tenant-B rules below.
+        let (status, _) = server
+            .post_auth("/api/v5/mt/ns/mv02b-tenant", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+
+        // One connector and action per kind. Two kinds ride Cargo
+        // features: without the feature the create refuses closed,
+        // so the tenant gate is proved for them in the full build.
+        let closed = "http://127.0.0.1:9".to_string();
+        let bodies: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "clickhouse",
+                json!({"url": closed, "database": "db", "table": "events"}),
+            ),
+            (
+                "tdengine",
+                json!({"server": "127.0.0.1:9", "database": "db", "stable": "s",
+                                "subtable": "d", "metrics": {"f": "x"}, "tags": {"t": "y"}}),
+            ),
+            (
+                "greptimedb",
+                json!({"server": "127.0.0.1:4001", "database": "db", "table": "events"}),
+            ),
+            (
+                "iotdb",
+                json!({"endpoint": closed, "username": "u", "password": "p",
+                             "device": "root.d", "measurements": ["m"], "types": ["float"]}),
+            ),
+            (
+                "opentsdb",
+                json!({"server": closed, "metric": "m", "value": "v"}),
+            ),
+            (
+                "doris",
+                json!({"server": "127.0.0.1:9", "database": "db", "table": "events"}),
+            ),
+            (
+                "datalayers",
+                json!({"server": "127.0.0.1:8361", "database": "db", "table": "events"}),
+            ),
+            (
+                "influxdb",
+                json!({"server": endpoint, "bucket": "b", "org": "o",
+                                "token": "t", "measurement": "m"}),
+            ),
+            (
+                "timestream",
+                json!({"database": "db", "table": "m", "region": "r",
+                                 "access_key_id": "k", "secret_access_key": "s",
+                                 "measures": {"f": "DOUBLE"}, "endpoint": closed}),
+            ),
+            (
+                "cassandra",
+                json!({"servers": "127.0.0.1:9", "keyspace": "ks", "table": "events"}),
+            ),
+        ];
+        for (kind, mut connector) in bodies {
+            if (kind == "clickhouse" && !cfg!(feature = "clickhouse"))
+                || (kind == "cassandra" && !cfg!(feature = "cassandra"))
+            {
+                continue;
+            }
+            let conn = format!("mv02b-ten-{kind}");
+            let act = format!("mv02b-ten-{kind}-act");
+            let rule = format!("mv02b-ten-{kind}-rule");
+            connector["name"] = json!(conn);
+            connector["type"] = json!(kind);
+            let (status, created) = server
+                .post_auth("/api/v5/connectors", connector, &token)
+                .await;
+            assert_eq!(status, 201, "{kind} connector creates: {created}");
+            let (status, created) = server
+                .post_auth(
+                    "/api/v5/actions",
+                    json!({"type": kind, "name": act, "connector": conn, "parameters": {}}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201, "{kind} action creates: {created}");
+            // A rule outside the default tenant must not forward to
+            // the connector action: the path carries no tenant label.
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/rules",
+                    json!({"id": rule, "name": rule, "sql": "SELECT * FROM \"mv02b/ten\"",
+                           "tenant": "mv02b-tenant", "actions": [act]}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400, "{kind} tenant forward refuses: {body}");
+            assert!(
+                body["message"].as_str().unwrap_or("").contains("tenant"),
+                "{kind} names tenant: {body}"
+            );
+            // Nothing is stored for the refused rule.
+            let (status, _) = server
+                .get_auth(&format!("/api/v5/rules/{rule}"), &token)
+                .await;
+            assert_eq!(status, 404, "{kind} refused rule stores nothing");
+        }
+
+        // The default tenant keeps working: the rule creates, the
+        // publish delivers through the broker to the fake.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-ten-rule", "name": "mv02b-ten-rule",
+                       "sql": "SELECT * FROM \"mv02b/ten\"", "actions": ["mv02b-ten-influxdb-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        mv02b_publish(&server, &token, "mv02b/ten", "{\"temp\": 21.5}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            Mv02bFake::body_text(&got[0]).starts_with("m,topic=mv02b/ten "),
+            "line: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-ten-influxdb-act", 1).await;
+
+        // A move outside the default tenant refuses and keeps the old rule.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/rules/mv02b-ten-rule",
+                json!({"id": "mv02b-ten-rule", "name": "mv02b-ten-rule",
+                       "sql": "SELECT * FROM \"mv02b/ten\"", "tenant": "mv02b-tenant",
+                       "actions": ["mv02b-ten-influxdb-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "move outside default refuses: {body}");
+        let (status, fetched) = server
+            .get_auth("/api/v5/rules/mv02b-ten-rule", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["tenant"], json!("default"));
+        mv02b_publish(&server, &token, "mv02b/ten", "{\"temp\": 22.5}").await;
+        let got = fake.wait_for(2).await;
+        assert!(
+            Mv02bFake::body_text(&got[1]).starts_with("m,topic=mv02b/ten "),
+            "line: {}",
+            Mv02bFake::body_text(&got[1])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-ten-influxdb-act", 2).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_tenant_gate_covers_sql_into_connector_and_update() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth("/api/v5/mt/ns/mv02b-tenant", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+
+        let sql = "SELECT * FROM \"mv02b/sql\" INTO connector(\"mv02b-shared\")";
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-sql-nondefault", "name": "mv02b-sql-nondefault",
+                       "sql": sql, "tenant": "mv02b-tenant", "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "SQL forward outside default refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("tenant"),
+            "{body}"
+        );
+        let (status, _) = server
+            .get_auth("/api/v5/rules/mv02b-sql-nondefault", &token)
+            .await;
+        assert_eq!(status, 404, "the refused SQL rule stores nothing");
+
+        // The default tenant keeps the path: create, then move it.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-sql-default", "name": "mv02b-sql-default",
+                       "sql": "SELECT * FROM \"mv02b/sql\"", "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/rules/mv02b-sql-default",
+                json!({"id": "mv02b-sql-default", "name": "mv02b-sql-default",
+                       "sql": sql, "tenant": "mv02b-tenant", "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "SQL move outside default refuses: {body}");
+        let (status, fetched) = server
+            .get_auth("/api/v5/rules/mv02b-sql-default", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(fetched["tenant"], json!("default"));
+        assert_eq!(fetched["sql"], json!("SELECT * FROM \"mv02b/sql\""));
+    }
+
+    #[tokio::test]
+    async fn mv02b_tenant_gate_covers_v1_create() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth("/api/v5/mt/ns/mv02b-tenant", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+
+        let forward = json!({"name": "mv02b-v1-nondefault",
+            "topic_filter": "mv02b/v1",
+            "sql_query": "SELECT * FROM \"mv02b/v1\"",
+            "actions": [{"type": "forwardconnector", "connector_id": "mv02b-shared"}],
+            "tenant": "mv02b-tenant"});
+        let (status, body) = server
+            .post_auth("/api/v1/rules", forward.clone(), &token)
+            .await;
+        assert_eq!(status, 400, "v1 forward outside default refuses: {body}");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("tenant"),
+            "{body}"
+        );
+        let (status, list) = server.get_auth("/api/v5/rules", &token).await;
+        assert_eq!(status, 200);
+        assert!(
+            !list["data"]
+                .as_array()
+                .expect("rule list")
+                .iter()
+                .any(|rule| rule["name"] == json!("mv02b-v1-nondefault")),
+            "the refused v1 rule stores nothing"
+        );
+
+        let mut allowed = forward;
+        allowed["tenant"] = json!("default");
+        let (status, created) = server.post_auth("/api/v1/rules", allowed, &token).await;
+        assert_eq!(status, 201, "the default tenant keeps the v1 path");
+        let id = created["id"].as_str().expect("v1 rule id");
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn mv02b_tenant_gate_covers_config_reload() {
+        let dir = unique_data_dir("mv02b-tenant-reload");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth("/api/v5/mt/ns/mv02b-tenant", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-reload-keep", "name": "mv02b-reload-keep",
+                       "sql": "SELECT * FROM \"mv02b/reload\"", "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        let mut candidate = state.config.snapshot().as_ref().clone();
+        candidate.rules.rules.push(broker_config::RuleEntry {
+            id: "mv02b-reload-bad".to_string(),
+            name: "mv02b-reload-bad".to_string(),
+            tenant: "mv02b-tenant".to_string(),
+            topic_filter: "mv02b/reload".to_string(),
+            sql_query: Some(
+                "SELECT * FROM \"mv02b/reload\" INTO connector(\"mv02b-shared\")".to_string(),
+            ),
+            enabled: true,
+            actions: Vec::new(),
+        });
+        let (status, body) = server
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": candidate, "actor": "sb07", "summary": "tenant gate"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "reload with a tenant forward refuses: {body}");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("tenant"),
+            "{body}"
+        );
+
+        // The refused reload keeps the live rule and stores no bad one.
+        let (status, _) = server
+            .get_auth("/api/v5/rules/mv02b-reload-keep", &token)
+            .await;
+        assert_eq!(status, 200, "the refused reload keeps the live rules");
+        let (status, _) = server
+            .get_auth("/api/v5/rules/mv02b-reload-bad", &token)
+            .await;
+        assert_eq!(status, 404, "the refused reload stores nothing");
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_tenant_gate_covers_backup_restore() {
+        use base64::Engine as _;
+        let dir = unique_data_dir("mv02b-tenant-restore");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth("/api/v5/mt/ns/mv02b-tenant", json!({}), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-restore-keep", "name": "mv02b-restore-keep",
+                       "sql": "SELECT * FROM \"mv02b/restore\"", "actions": []}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        let file = build_test_backup(
+            "mv02b-tenant-restore",
+            &["rules"],
+            &[(
+                "snapshot/rules.json",
+                json!({"rules": [{
+                    "id": "mv02b-restore-bad",
+                    "name": "mv02b-restore-bad",
+                    "tenant": "mv02b-tenant",
+                    "topic_filter": "mv02b/restore",
+                    "sql_query": "SELECT * FROM \"mv02b/restore\"",
+                    "enabled": true,
+                    "actions": [{"type": "forwardconnector", "connector_id": "mv02b-shared"}]
+                }]}),
+            )],
+        );
+        let content = base64::engine::general_purpose::STANDARD.encode(&file);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/data/files",
+                json!({"filename": "mv02b-tenant-restore.tar.gz", "content": content}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/data/import",
+                json!({"filename": "mv02b-tenant-restore.tar.gz"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 500, "restore with a tenant forward refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("tenant"),
+            "{body}"
+        );
+
+        // The refused restore keeps the live rule and stores no bad one.
+        let (status, _) = server
+            .get_auth("/api/v5/rules/mv02b-restore-keep", &token)
+            .await;
+        assert_eq!(status, 200, "the refused restore keeps the live rules");
+        let (status, _) = server
+            .get_auth("/api/v5/rules/mv02b-restore-bad", &token)
+            .await;
+        assert_eq!(status, 404, "the refused restore stores nothing");
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_greptimedb_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-greptimedb");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "{}").await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "greptimedb", "name": "mv02b-greptime",
+                       "server": endpoint, "database": "public", "table": "events",
+                       "format": "influx", "precision": "us"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "greptime", "name": "mv02b-greptime-act",
+                       "connector": "mv02b-greptime", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "the greptime alias creates");
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-greptime-rule", "name": "mv02b-greptime-rule",
+                       "sql": "SELECT * FROM \"mv02b/greptime\"", "actions": ["mv02b-greptime-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/greptime", "{\"temp\": 21.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].path, "/v1/influxdb/api/v2/write");
+        assert!(
+            got[0].query.contains("db=public") && got[0].query.contains("precision=us"),
+            "query: {}",
+            got[0].query
+        );
+        assert!(
+            Mv02bFake::body_text(&got[0]).contains("events"),
+            "line: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-greptime-act", 1).await;
+
+        // The action override wins over the connector: SQL at
+        // nanosecond precision.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-greptime-act",
+                json!({"type": "greptime", "name": "mv02b-greptime-act",
+                       "connector": "mv02b-greptime",
+                       "parameters": {"format": "sql", "precision": "ns"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02b/greptime", "{\"temp\": 22.5}").await;
+        let got = fake.wait_for(2).await;
+        assert_eq!(got[1].path, "/v1/sql");
+        assert!(
+            got[1].query.contains("db=public"),
+            "query: {}",
+            got[1].query
+        );
+        mv02b_wait_success(&server, &token, "mv02b-greptime-act", 2).await;
+
+        // A refused connector update keeps the old delivery.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/mv02b-greptime",
+                json!({"type": "greptimedb", "name": "mv02b-greptime",
+                       "server": endpoint, "database": "public"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a dropped table refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("table"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/greptime", "{\"temp\": 23.5}").await;
+        let got = fake.wait_for(3).await;
+        assert_eq!(got[2].path, "/v1/sql");
+        assert!(
+            got[2].query.contains("db=public"),
+            "query: {}",
+            got[2].query
+        );
+        mv02b_wait_success(&server, &token, "mv02b-greptime-act", 3).await;
+
+        // The server dies: the forward counts one failure.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02b/greptime", "{\"temp\": 24.5}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-greptime-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-greptime-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server
+            .get_auth("/api/v5/connectors/mv02b-greptime", &token)
+            .await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes.
+        let fake = Mv02bFake::start_on(port, 200, "{}").await;
+        mv02b_publish(&server, &token, "mv02b/greptime", "{\"temp\": 25.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].path, "/v1/sql");
+        assert!(
+            got[0].query.contains("db=public"),
+            "query: {}",
+            got[0].query
+        );
+        mv02b_wait_success(&server, &token, "mv02b-greptime-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_opentsdb_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-opentsdb");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "").await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "opentsdb", "name": "mv02b-opents",
+                       "server": endpoint, "metric": "m", "value": "${payload.temp}"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "opents", "name": "mv02b-opents-act",
+                       "connector": "mv02b-opents", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "the opents alias creates");
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-opents-rule", "name": "mv02b-opents-rule",
+                       "sql": "SELECT * FROM \"mv02b/opents\"", "actions": ["mv02b-opents-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/opents", "{\"temp\": 21.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].path, "/api/put");
+        assert_eq!(got[0].query, "summary", "query: {}", got[0].query);
+        assert!(
+            Mv02bFake::body_text(&got[0]).contains("\"metric\":\"m\""),
+            "points: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        assert!(
+            Mv02bFake::body_text(&got[0]).contains("21.5"),
+            "value: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-opents-act", 1).await;
+
+        // The action override moves the metric.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-opents-act",
+                json!({"type": "opents", "name": "mv02b-opents-act",
+                       "connector": "mv02b-opents", "parameters": {"metric": "m2"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02b/opents", "{\"temp\": 22.5}").await;
+        let got = fake.wait_for(2).await;
+        assert!(
+            Mv02bFake::body_text(&got[1]).contains("\"metric\":\"m2\""),
+            "points: {}",
+            Mv02bFake::body_text(&got[1])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-opents-act", 2).await;
+
+        // A refused connector update keeps the old delivery.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/mv02b-opents",
+                json!({"type": "opentsdb", "name": "mv02b-opents",
+                       "server": endpoint, "value": "${payload.temp}"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a dropped metric refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("metric"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/opents", "{\"temp\": 23.5}").await;
+        let got = fake.wait_for(3).await;
+        assert!(
+            Mv02bFake::body_text(&got[2]).contains("\"metric\":\"m2\""),
+            "points: {}",
+            Mv02bFake::body_text(&got[2])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-opents-act", 3).await;
+
+        // A connector-level `summary: false` drops the `?summary` query.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "opentsdb", "name": "mv02b-opents-nosum",
+                       "server": endpoint, "metric": "m", "value": "v", "summary": false}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "opents", "name": "mv02b-opents-nosum-act",
+                       "connector": "mv02b-opents-nosum", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "the opents alias creates");
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-opents-nosum-rule", "name": "mv02b-opents-nosum-rule",
+                       "sql": "SELECT * FROM \"mv02b/opents-nosum\"",
+                       "actions": ["mv02b-opents-nosum-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        mv02b_publish(&server, &token, "mv02b/opents-nosum", "{\"temp\": 26.5}").await;
+        let got = fake.wait_for(4).await;
+        assert_eq!(got[3].path, "/api/put");
+        assert_eq!(got[3].query, "", "query: {}", got[3].query);
+        mv02b_wait_success(&server, &token, "mv02b-opents-nosum-act", 1).await;
+
+        // The server dies: the forward counts one failure.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02b/opents", "{\"temp\": 24.5}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-opents-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-opents-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server
+            .get_auth("/api/v5/connectors/mv02b-opents", &token)
+            .await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes.
+        let fake = Mv02bFake::start_on(port, 200, "").await;
+        mv02b_publish(&server, &token, "mv02b/opents", "{\"temp\": 25.5}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            Mv02bFake::body_text(&got[0]).contains("\"metric\":\"m2\""),
+            "points: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-opents-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_tdengine_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-tdengine");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "{\"code\":0,\"rows\":1}").await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "tdengine", "name": "mv02b-td",
+                       "server": endpoint, "database": "power", "stable": "meters",
+                       "subtable": "d_one",
+                       "metrics": {"temp": "${payload.temperature}"},
+                       "tags": {"location": "room1"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "tdengine", "name": "mv02b-td-act",
+                       "connector": "mv02b-td", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-td-rule", "name": "mv02b-td-rule",
+                       "sql": "SELECT * FROM \"mv02b/td\"", "actions": ["mv02b-td-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/td", "{\"temperature\": 21.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].method, "POST");
+        assert_eq!(got[0].path, "/rest/sql/power", "path: {}", got[0].path);
+        let text = Mv02bFake::body_text(&got[0]);
+        let prefix = "INSERT INTO d_one USING meters TAGS ('room1') VALUES (";
+        assert!(text.starts_with(prefix), "statement: {text}");
+        let rest = &text[prefix.len()..];
+        let (stamp, tail) = rest
+            .split_once(", 21.5);")
+            .unwrap_or_else(|| panic!("values: {text}"));
+        assert!(
+            !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()),
+            "stamp: {text}"
+        );
+        assert!(tail.trim().is_empty(), "tail: {text}");
+        mv02b_wait_success(&server, &token, "mv02b-td-act", 1).await;
+
+        // The action override moves the sub-table.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-td-act",
+                json!({"type": "tdengine", "name": "mv02b-td-act",
+                       "connector": "mv02b-td", "parameters": {"subtable": "d_two"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02b/td", "{\"temperature\": 22.5}").await;
+        let got = fake.wait_for(2).await;
+        assert!(
+            Mv02bFake::body_text(&got[1]).contains("d_two USING meters"),
+            "insert: {}",
+            Mv02bFake::body_text(&got[1])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-td-act", 2).await;
+
+        // A refused connector update keeps the old delivery.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/mv02b-td",
+                json!({"type": "tdengine", "name": "mv02b-td",
+                       "server": endpoint, "database": "power", "stable": "meters",
+                       "metrics": {"temp": "${payload.temperature}"},
+                       "tags": {"location": "room1"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a dropped subtable refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("subtable"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/td", "{\"temperature\": 23.5}").await;
+        let got = fake.wait_for(3).await;
+        assert!(
+            Mv02bFake::body_text(&got[2]).contains("d_two USING meters"),
+            "insert: {}",
+            Mv02bFake::body_text(&got[2])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-td-act", 3).await;
+
+        // A token connector rides the REST transport: the same row
+        // shape posts to `/{database}` instead of `/rest/sql/{database}`.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "tdengine", "name": "mv02b-td-token",
+                       "server": endpoint, "database": "power", "stable": "meters",
+                       "subtable": "d_token", "metrics": {"temp": "${payload.temperature}"},
+                       "tags": {"location": "room1"}, "token": "tok-1"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "tdengine", "name": "mv02b-td-token-act",
+                       "connector": "mv02b-td-token", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-td-token-rule", "name": "mv02b-td-token-rule",
+                       "sql": "SELECT * FROM \"mv02b/td-token\"",
+                       "actions": ["mv02b-td-token-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        mv02b_publish(&server, &token, "mv02b/td-token", "{\"temperature\": 20.5}").await;
+        let got = fake.wait_for(4).await;
+        assert_eq!(got[3].method, "POST");
+        assert_eq!(got[3].path, "/power", "path: {}", got[3].path);
+        let text = Mv02bFake::body_text(&got[3]);
+        assert!(text.contains("d_token USING meters"), "insert: {text}");
+        mv02b_wait_success(&server, &token, "mv02b-td-token-act", 1).await;
+
+        // The server dies: the forward counts one failure.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02b/td", "{\"temperature\": 24.5}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-td-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-td-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server.get_auth("/api/v5/connectors/mv02b-td", &token).await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes.
+        let fake = Mv02bFake::start_on(port, 200, "{\"code\":0,\"rows\":1}").await;
+        mv02b_publish(&server, &token, "mv02b/td", "{\"temperature\": 25.5}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            Mv02bFake::body_text(&got[0]).contains("d_two USING meters"),
+            "insert: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-td-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_iotdb_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-iotdb");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "{\"code\":200}").await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "iotdb", "name": "mv02b-iot",
+                       "endpoint": endpoint, "username": "root", "password": "root",
+                       "device": "root.factory.d1",
+                       "measurements": ["temperature"], "types": ["float"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "iotdb", "name": "mv02b-iot-act",
+                       "connector": "mv02b-iot", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-iot-rule", "name": "mv02b-iot-rule",
+                       "sql": "SELECT * FROM \"mv02b/iot\"", "actions": ["mv02b-iot-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/iot", "{\"temperature\": 21.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].path, "/rest/v2/insertTablet");
+        assert!(
+            Mv02bFake::body_text(&got[0]).contains("root.factory.d1"),
+            "tablet: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-iot-act", 1).await;
+
+        // The action override moves the device path.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-iot-act",
+                json!({"type": "iotdb", "name": "mv02b-iot-act",
+                       "connector": "mv02b-iot", "parameters": {"device": "root.factory.d2"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02b/iot", "{\"temperature\": 22.5}").await;
+        let got = fake.wait_for(2).await;
+        assert!(
+            Mv02bFake::body_text(&got[1]).contains("root.factory.d2"),
+            "tablet: {}",
+            Mv02bFake::body_text(&got[1])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-iot-act", 2).await;
+
+        // A refused connector update keeps the old delivery.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/mv02b-iot",
+                json!({"type": "iotdb", "name": "mv02b-iot",
+                       "endpoint": endpoint, "username": "root", "password": "root",
+                       "measurements": ["temperature"], "types": ["float"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a dropped device refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("device"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/iot", "{\"temperature\": 23.5}").await;
+        let got = fake.wait_for(3).await;
+        assert!(
+            Mv02bFake::body_text(&got[2]).contains("root.factory.d2"),
+            "tablet: {}",
+            Mv02bFake::body_text(&got[2])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-iot-act", 3).await;
+
+        // The server dies: the forward counts one failure.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02b/iot", "{\"temperature\": 24.5}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-iot-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-iot-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server
+            .get_auth("/api/v5/connectors/mv02b-iot", &token)
+            .await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes.
+        let fake = Mv02bFake::start_on(port, 200, "{\"code\":200}").await;
+        mv02b_publish(&server, &token, "mv02b/iot", "{\"temperature\": 25.5}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            Mv02bFake::body_text(&got[0]).contains("root.factory.d2"),
+            "tablet: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-iot-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_doris_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-doris");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "{\"Status\":\"Success\",\"NumberLoadedRows\":1}").await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "doris", "name": "mv02b-doris",
+                       "server": endpoint, "database": "db", "table": "events"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "doris", "name": "mv02b-doris-act",
+                       "connector": "mv02b-doris", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-doris-rule", "name": "mv02b-doris-rule",
+                       "sql": "SELECT * FROM \"mv02b/doris\"", "actions": ["mv02b-doris-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/doris", "{\"temp\": 21.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].method, "PUT");
+        assert_eq!(got[0].path, "/api/db/events/_stream_load");
+        mv02b_wait_success(&server, &token, "mv02b-doris-act", 1).await;
+
+        // The action override moves the table.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-doris-act",
+                json!({"type": "doris", "name": "mv02b-doris-act",
+                       "connector": "mv02b-doris", "parameters": {"table": "events2"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02b/doris", "{\"temp\": 22.5}").await;
+        let got = fake.wait_for(2).await;
+        assert_eq!(got[1].path, "/api/db/events2/_stream_load");
+        mv02b_wait_success(&server, &token, "mv02b-doris-act", 2).await;
+
+        // A refused action update keeps the old delivery.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-doris-act",
+                json!({"type": "doris", "name": "mv02b-doris-act",
+                       "connector": "mv02b-doris",
+                       "parameters": {"table": "events2", "format": "csv"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a csv format refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("format"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/doris", "{\"temp\": 23.5}").await;
+        let got = fake.wait_for(3).await;
+        assert_eq!(got[2].path, "/api/db/events2/_stream_load");
+        mv02b_wait_success(&server, &token, "mv02b-doris-act", 3).await;
+
+        // The server dies: the forward counts one failure.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02b/doris", "{\"temp\": 24.5}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-doris-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-doris-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server
+            .get_auth("/api/v5/connectors/mv02b-doris", &token)
+            .await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes.
+        let fake =
+            Mv02bFake::start_on(port, 200, "{\"Status\":\"Success\",\"NumberLoadedRows\":1}").await;
+        mv02b_publish(&server, &token, "mv02b/doris", "{\"temp\": 25.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].path, "/api/db/events2/_stream_load");
+        mv02b_wait_success(&server, &token, "mv02b-doris-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_datalayers_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-datalayers");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "").await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "datalayers", "name": "mv02b-dl",
+                       "server": endpoint, "database": "db", "table": "events"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "datalayers", "name": "mv02b-dl-act",
+                       "connector": "mv02b-dl", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-dl-rule", "name": "mv02b-dl-rule",
+                       "sql": "SELECT * FROM \"mv02b/dl\"", "actions": ["mv02b-dl-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/dl", "{\"temp\": 21.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].path, "/write");
+        assert!(
+            got[0].query.contains("precision=us"),
+            "query: {}",
+            got[0].query
+        );
+        assert!(got[0].query.contains("db=db"), "query: {}", got[0].query);
+        assert!(
+            Mv02bFake::body_text(&got[0]).starts_with("events,"),
+            "line: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-dl-act", 1).await;
+
+        // The action override moves the table.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-dl-act",
+                json!({"type": "datalayers", "name": "mv02b-dl-act",
+                       "connector": "mv02b-dl", "parameters": {"table": "events2"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02b/dl", "{\"temp\": 22.5}").await;
+        let got = fake.wait_for(2).await;
+        assert!(
+            Mv02bFake::body_text(&got[1]).starts_with("events2,"),
+            "line: {}",
+            Mv02bFake::body_text(&got[1])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-dl-act", 2).await;
+
+        // A refused connector update keeps the old delivery.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/mv02b-dl",
+                json!({"type": "datalayers", "name": "mv02b-dl",
+                       "server": endpoint, "table": "events2"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a dropped database refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("database"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/dl", "{\"temp\": 23.5}").await;
+        let got = fake.wait_for(3).await;
+        assert!(
+            Mv02bFake::body_text(&got[2]).starts_with("events2,"),
+            "line: {}",
+            Mv02bFake::body_text(&got[2])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-dl-act", 3).await;
+
+        // The server dies: the forward counts one failure.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02b/dl", "{\"temp\": 24.5}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-dl-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-dl-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server.get_auth("/api/v5/connectors/mv02b-dl", &token).await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes.
+        let fake = Mv02bFake::start_on(port, 200, "").await;
+        mv02b_publish(&server, &token, "mv02b/dl", "{\"temp\": 25.5}").await;
+        let got = fake.wait_for(1).await;
+        assert!(
+            Mv02bFake::body_text(&got[0]).starts_with("events2,"),
+            "line: {}",
+            Mv02bFake::body_text(&got[0])
+        );
+        mv02b_wait_success(&server, &token, "mv02b-dl-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_timestream_delivers_updates_and_recovers_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-timestream");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "{}").await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "timestream", "name": "mv02b-ts",
+                       "database": "db", "table": "metrics", "region": "us-east-1",
+                       "endpoint": endpoint, "precision": "us",
+                       "access_key_id": "k", "secret_access_key": "s",
+                       "measures": {"temperature": "DOUBLE"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "aws_timestream", "name": "mv02b-ts-act",
+                       "connector": "mv02b-ts", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "the aws_timestream alias creates");
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-ts-rule", "name": "mv02b-ts-rule",
+                       "sql": "SELECT * FROM \"mv02b/ts\"", "actions": ["mv02b-ts-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/ts", "{\"temperature\": 21.5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].method, "POST");
+        assert_eq!(got[0].path, "/");
+        let write: serde_json::Value =
+            serde_json::from_str(&Mv02bFake::body_text(&got[0])).expect("write is JSON");
+        assert_eq!(write["DatabaseName"], json!("db"), "write: {write}");
+        assert_eq!(write["TableName"], json!("metrics"), "write: {write}");
+        let records = write["Records"].as_array().expect("records: {write}");
+        assert_eq!(records.len(), 1, "write: {write}");
+        assert_eq!(
+            records[0]["Dimensions"],
+            json!([{"Name": "topic", "Value": "mv02b/ts"}]),
+            "write: {write}"
+        );
+        assert_eq!(
+            records[0]["MeasureName"],
+            json!("metrics"),
+            "write: {write}"
+        );
+        assert_eq!(
+            records[0]["MeasureValueType"],
+            json!("MULTI"),
+            "write: {write}"
+        );
+        assert_eq!(
+            records[0]["MeasureValues"],
+            json!([{"Name": "temperature", "Value": "21.5", "Type": "DOUBLE"}]),
+            "write: {write}"
+        );
+        assert_eq!(
+            records[0]["TimeUnit"],
+            json!("MICROSECONDS"),
+            "write: {write}"
+        );
+        assert!(
+            records[0]["Time"]
+                .as_str()
+                .is_some_and(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit())),
+            "write: {write}"
+        );
+        mv02b_wait_success(&server, &token, "mv02b-ts-act", 1).await;
+
+        // The action override moves the table.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-ts-act",
+                json!({"type": "aws_timestream", "name": "mv02b-ts-act",
+                       "connector": "mv02b-ts",
+                       "parameters": {"table": "metrics2", "precision": "ns"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02b/ts", "{\"temperature\": 22.5}").await;
+        let got = fake.wait_for(2).await;
+        let write: serde_json::Value =
+            serde_json::from_str(&Mv02bFake::body_text(&got[1])).expect("write is JSON");
+        assert_eq!(write["TableName"], json!("metrics2"), "write: {write}");
+        assert_eq!(write["Records"][0]["TimeUnit"], json!("NANOSECONDS"));
+        mv02b_wait_success(&server, &token, "mv02b-ts-act", 2).await;
+
+        // A refused connector update keeps the old delivery.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/mv02b-ts",
+                json!({"type": "timestream", "name": "mv02b-ts",
+                       "table": "metrics2", "region": "us-east-1",
+                       "endpoint": endpoint,
+                       "access_key_id": "k", "secret_access_key": "s",
+                       "measures": {"temperature": "DOUBLE"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a dropped database refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("database"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/ts", "{\"temperature\": 23.5}").await;
+        let got = fake.wait_for(3).await;
+        let write: serde_json::Value =
+            serde_json::from_str(&Mv02bFake::body_text(&got[2])).expect("write is JSON");
+        assert_eq!(write["TableName"], json!("metrics2"), "write: {write}");
+        assert_eq!(write["Records"][0]["TimeUnit"], json!("NANOSECONDS"));
+        mv02b_wait_success(&server, &token, "mv02b-ts-act", 3).await;
+
+        // The server dies: the forward counts one failure.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02b/ts", "{\"temperature\": 24.5}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-ts-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-ts-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server.get_auth("/api/v5/connectors/mv02b-ts", &token).await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes.
+        let fake = Mv02bFake::start_on(port, 200, "{}").await;
+        mv02b_publish(&server, &token, "mv02b/ts", "{\"temperature\": 25.5}").await;
+        let got = fake.wait_for(1).await;
+        let write: serde_json::Value =
+            serde_json::from_str(&Mv02bFake::body_text(&got[0])).expect("write is JSON");
+        assert_eq!(write["TableName"], json!("metrics2"), "write: {write}");
+        assert_eq!(write["Records"][0]["TimeUnit"], json!("NANOSECONDS"));
+        mv02b_wait_success(&server, &token, "mv02b-ts-act", 1).await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Cassandra runs on the maintained driver, which needs a real
+    /// server for its topology handshake: the loopback fake cannot
+    /// prove delivery. This test proves the broker path instead (create,
+    /// update, refused update, restart, failed-forward counting); the
+    /// ignored qualification run proves delivery against a real server.
+    #[cfg(feature = "cassandra")]
+    #[tokio::test]
+    async fn mv02b_cassandra_counts_failures_and_keeps_state_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02b-cassandra");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+
+        // A closed port stores (the driver dials lazily at send time).
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "scylla", "name": "mv02b-cass",
+                       "servers": "127.0.0.1:9", "keyspace": "telemetry", "table": "events"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "the scylla alias creates");
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "cql", "name": "mv02b-cass-act",
+                       "connector": "mv02b-cass", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "the cql alias creates");
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02b-cass-rule", "name": "mv02b-cass-rule",
+                       "sql": "SELECT * FROM \"mv02b/cass\"", "actions": ["mv02b-cass-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02b/cass", "{\"device_id\":\"d1\"}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-cass-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-cass-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+
+        // The action override moves the table; delivery still fails
+        // against the closed port.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02b-cass-act",
+                json!({"type": "cql", "name": "mv02b-cass-act",
+                       "connector": "mv02b-cass", "parameters": {"table": "events2"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // A refused connector update keeps the old state: the next
+        // publish still counts a failed forward through the old sink.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/connectors/mv02b-cass",
+                json!({"type": "cassandra", "name": "mv02b-cass",
+                       "servers": "127.0.0.1:9", "table": "events2"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "a dropped keyspace refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("keyspace"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02b/cass", "{\"device_id\":\"d2\"}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02b-cass-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02b-cass-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(2));
+        drop(server);
+        drop(registry);
+
+        // A restart stores the outage: the entry reads disconnected.
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("admin token").to_string();
+        let (status, read) = server
+            .get_auth("/api/v5/connectors/mv02b-cass", &token)
+            .await;
+        assert_eq!(status, 200, "stored entry survives the restart");
+        assert_eq!(read["status"], json!("disconnected"));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02b_connector_shapes_refuse_missing_fields_and_accept_aliases() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Flat bodies with a missing required field refuse naming it.
+        for (kind, body, field) in [
+            ("clickhouse", json!({"database": "db", "table": "t"}), "url"),
+            ("tdengine", json!({"database": "db"}), "server"),
+            (
+                "greptimedb",
+                json!({"server": "127.0.0.1:4001"}),
+                "database",
+            ),
+            (
+                "iotdb",
+                json!({"endpoint": "http://127.0.0.1:6667", "username": "root"}),
+                "password",
+            ),
+            ("opentsdb", json!({"metric": "m", "value": "v"}), "server"),
+            ("doris", json!({"database": "db", "table": "t"}), "server"),
+            (
+                "datalayers",
+                json!({"server": "127.0.0.1:8361"}),
+                "database",
+            ),
+            (
+                "influxdb",
+                json!({"server": "127.0.0.1:8086", "org": "o", "token": "t", "measurement": "m"}),
+                "bucket",
+            ),
+            (
+                "timestream",
+                json!({"table": "m", "region": "r", "access_key_id": "k",
+                       "secret_access_key": "s", "measures": {"f": "DOUBLE"}}),
+                "database",
+            ),
+            (
+                "cassandra",
+                json!({"servers": "127.0.0.1:9", "table": "t"}),
+                "keyspace",
+            ),
+        ] {
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/connectors",
+                    Value::Object(
+                        json!({"type": kind, "name": format!("mv02b-flat-{kind}")})
+                            .as_object()
+                            .unwrap()
+                            .clone()
+                            .into_iter()
+                            .chain(body.as_object().unwrap().clone())
+                            .collect::<serde_json::Map<String, Value>>(),
+                    ),
+                    &token,
+                )
+                .await;
+            if kind == "cassandra" && !cfg!(feature = "cassandra") {
+                assert_eq!(status, 400, "cassandra without the feature refuses");
+                continue;
+            }
+            assert_eq!(status, 400, "{kind} refuses without {field}: {body}");
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+            assert!(
+                body["message"].as_str().unwrap_or("").contains(field),
+                "{kind} names {field}: {body}"
+            );
+        }
+
+        // Every documented alias creates.
+        for (kind, body) in [
+            (
+                "ch",
+                json!({"url": "http://127.0.0.1:9", "database": "db", "table": "t"}),
+            ),
+            (
+                "greptime",
+                json!({"server": "127.0.0.1:4001", "database": "db", "table": "t"}),
+            ),
+            (
+                "opents",
+                json!({"server": "http://127.0.0.1:9", "metric": "m", "value": "v"}),
+            ),
+            (
+                "aws_timestream",
+                json!({"database": "db", "table": "m", "region": "r",
+                       "access_key_id": "k", "secret_access_key": "s",
+                       "measures": {"f": "DOUBLE"}, "endpoint": "http://127.0.0.1:9"}),
+            ),
+            (
+                "scylla",
+                json!({"servers": "127.0.0.1:9", "keyspace": "ks", "table": "t"}),
+            ),
+            (
+                "scylladb",
+                json!({"servers": "127.0.0.1:9", "keyspace": "ks", "table": "t"}),
+            ),
+            (
+                "cql",
+                json!({"servers": "127.0.0.1:9", "keyspace": "ks", "table": "t"}),
+            ),
+        ] {
+            let mut full = body.as_object().unwrap().clone();
+            full.insert("type".to_string(), json!(kind));
+            full.insert("name".to_string(), json!(format!("mv02b-alias-{kind}")));
+            let (status, created) = server
+                .post_auth("/api/v5/connectors", Value::Object(full), &token)
+                .await;
+            if (kind == "scylla" || kind == "scylladb" || kind == "cql")
+                && !cfg!(feature = "cassandra")
+            {
+                assert_eq!(status, 400, "{kind} without the feature refuses");
+                continue;
+            }
+            if kind == "ch" && !cfg!(feature = "clickhouse") {
+                assert_eq!(status, 400, "{kind} without the feature refuses");
+                continue;
+            }
+            assert_eq!(status, 201, "{kind} alias creates: {created}");
+        }
+
+        // Probes against a closed port fail closed with TEST_FAILED.
+        for (kind, body) in [
+            (
+                "clickhouse",
+                json!({"url": "http://127.0.0.1:9", "database": "db", "table": "t"}),
+            ),
+            (
+                "tdengine",
+                json!({"server": "127.0.0.1:9", "database": "db"}),
+            ),
+            (
+                "iotdb",
+                json!({"endpoint": "http://127.0.0.1:9",
+                             "username": "u", "password": "p"}),
+            ),
+            (
+                "timestream",
+                json!({"database": "db", "table": "m", "region": "r",
+                                  "access_key_id": "k", "secret_access_key": "s",
+                                  "measures": {"f": "DOUBLE"},
+                                  "endpoint": "http://127.0.0.1:9"}),
+            ),
+        ] {
+            let mut full = body.as_object().unwrap().clone();
+            full.insert("type".to_string(), json!(kind));
+            let (status, probed) = server
+                .post_auth("/api/v5/connectors_probe", Value::Object(full), &token)
+                .await;
+            assert_eq!(status, 400, "{kind} probe fails closed: {probed}");
+            assert_eq!(probed["code"], json!("TEST_FAILED"));
+        }
+    }
+
     /// The licence endpoints have the shapes of the reference API and
     /// show an open-source licence without a real limit.
     #[tokio::test]
@@ -13531,9 +15936,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         let token = server.login_as_admin().await;
 
         for (name, kind) in [
-            ("cf05-dl-conflict", "datalayers"),
-            ("cf05-greptime-empty", "greptimedb"),
-            ("cf05-opentsdb-empty", "opentsdb"),
+            ("cf05-kafka-pending", "kafka"),
+            ("cf05-mysql-pending", "mysql"),
+            ("cf05-mongo-pending", "mongodb"),
         ] {
             let (status, body) = server
                 .post_auth(

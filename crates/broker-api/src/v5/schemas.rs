@@ -233,14 +233,13 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         obj_schema_with_type(
             "clickhouse",
             json!({
-                "url": str_prop("http://127.0.0.1:8123"),
-                "database": str_prop("default"),
+                "url": str_prop(""),
+                "database": str_prop(""),
+                "table": str_prop(""),
                 "username": str_prop("default"),
-                "password": pwd_prop(),
-                "pool_size": int_prop(8),
-                "ssl": ssl_prop()
+                "password": pwd_prop()
             }),
-            &["name", "url", "database"],
+            &["name", "url", "database", "table"],
         ),
     );
 
@@ -285,15 +284,16 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 10. Cassandra
     schemas.insert(
         "bridge_cassa.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "cassandra",
             json!({
-                "servers": str_prop("127.0.0.1:9042"),
-                "keyspace": str_prop("test"),
+                "servers": str_prop(""),
+                "keyspace": str_prop(""),
+                "table": str_prop(""),
                 "username": str_prop(""),
-                "password": pwd_prop(),
-                "ssl": ssl_prop()
+                "password": pwd_prop()
             }),
-            &["name", "servers", "keyspace"],
+            &["name", "servers", "keyspace", "table"],
         ),
     );
 
@@ -355,15 +355,16 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 15. InfluxDB
     schemas.insert(
         "bridge_influxdb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "influxdb",
             json!({
-                "server": str_prop("http://127.0.0.1:8086"),
-                "version": enum_prop(&["v1", "v2"], "v2"),
-                "org": str_prop(""),
+                "server": str_prop("127.0.0.1:8086"),
                 "bucket": str_prop(""),
-                "token": pwd_prop()
+                "org": str_prop(""),
+                "token": pwd_prop(),
+                "measurement": str_prop("")
             }),
-            &["name", "server"],
+            &["name", "server", "bucket", "org", "token", "measurement"],
         ),
     );
 
@@ -386,41 +387,67 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 17. TDengine
     schemas.insert(
         "tdengine_connector.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "tdengine",
             json!({
-                "server": str_prop("127.0.0.1:6041"),
-                "database": str_prop("db"),
+                "server": str_prop(""),
+                "database": str_prop(""),
+                "stable": str_prop(""),
+                "subtable": str_prop(""),
                 "username": str_prop("root"),
-                "password": pwd_prop()
+                "password": pwd_prop(),
+                "metrics": json!({"type": "object"}),
+                "tags": json!({"type": "object"})
             }),
-            &["name", "server", "database"],
+            &[
+                "name", "server", "database", "stable", "subtable", "metrics", "tags",
+            ],
         ),
     );
 
     // 18. OpenTSDB
     schemas.insert(
         "opents_connector.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "opentsdb",
             json!({
-                "server": str_prop("http://127.0.0.1:4242"),
-                "summary": str_prop("")
+                "server": str_prop(""),
+                "metric": str_prop(""),
+                "value": str_prop("")
             }),
-            &["name", "server"],
+            &["name", "server", "metric", "value"],
         ),
     );
 
     // 19. IoTDB
     schemas.insert(
         "iotdb.post_restapi".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "iotdb",
             json!({
-                "base_url": str_prop("http://127.0.0.1:18080"),
+                "endpoint": str_prop(""),
                 "username": str_prop("root"),
-                "password": pwd_prop()
+                "password": pwd_prop(),
+                "device": str_prop(""),
+                "measurements": json!({"type": "array", "items": {"type": "string"}}),
+                "types": json!({"type": "array", "items": {"type": "string"}})
             }),
-            &["name", "base_url"],
+            &[
+                "name",
+                "endpoint",
+                "username",
+                "password",
+                "device",
+                "measurements",
+                "types",
+            ],
         ),
     );
+    // The driver speaks the REST API only; the thrift forms
+    // below document the reference shape. A thrift-shaped
+    // connector body is refused naming its fields: the builder
+    // needs the REST `endpoint`, `device`, `measurements` and
+    // `types`, which thrift bodies do not carry.
     schemas.insert(
         "iotdb.post_thrift".to_string(),
         obj_schema(
@@ -432,18 +459,31 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             &["name", "server"],
         ),
     );
+    schemas.insert(
+        "iotdb.put_thrift".to_string(),
+        obj_schema(
+            json!({
+                "server": str_prop("127.0.0.1:6667"),
+                "username": str_prop("root"),
+                "password": pwd_prop()
+            }),
+            &["server"],
+        ),
+    );
 
     // 20. GreptimeDB
     schemas.insert(
         "bridge_greptimedb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "greptimedb",
             json!({
-                "server": str_prop("127.0.0.1:4002"),
-                "dbname": str_prop("public"),
+                "server": str_prop("127.0.0.1:4001"),
+                "database": str_prop(""),
+                "table": str_prop(""),
                 "username": str_prop(""),
                 "password": pwd_prop()
             }),
-            &["name", "server", "dbname"],
+            &["name", "database", "table"],
         ),
     );
 
@@ -615,14 +655,16 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 32. Doris
     schemas.insert(
         "connector_doris.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "doris",
             json!({
-                "server": str_prop("127.0.0.1:9030"),
-                "database": str_prop("doris_db"),
+                "server": str_prop(""),
+                "database": str_prop(""),
+                "table": str_prop(""),
                 "username": str_prop("root"),
                 "password": pwd_prop()
             }),
-            &["name", "server", "database"],
+            &["name", "server", "database", "table"],
         ),
     );
 
@@ -643,14 +685,25 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 34. Amazon Timestream
     schemas.insert(
         "connector_aws_timestream.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "timestream",
             json!({
-                "region": str_prop("us-east-1"),
                 "database": str_prop(""),
+                "table": str_prop(""),
+                "region": str_prop(""),
                 "access_key_id": str_prop(""),
-                "secret_access_key": pwd_prop()
+                "secret_access_key": pwd_prop(),
+                "measures": json!({"type": "object"})
             }),
-            &["name", "database"],
+            &[
+                "name",
+                "database",
+                "table",
+                "region",
+                "access_key_id",
+                "secret_access_key",
+                "measures",
+            ],
         ),
     );
 
@@ -744,14 +797,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 41. Datalayers
     schemas.insert(
         "bridge_datalayers.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "datalayers",
             json!({
-                "server": str_prop("127.0.0.1:8360"),
-                "database": str_prop("iot"),
-                "username": str_prop("root"),
-                "password": pwd_prop()
+                "server": str_prop("127.0.0.1:8361"),
+                "database": str_prop(""),
+                "table": str_prop("")
             }),
-            &["name", "server", "database"],
+            &["name", "database", "table"],
         ),
     );
 
@@ -847,10 +900,149 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     }), &["name", "connector", "sql"]));
 
     // ClickHouse action
-    schemas.insert("bridge_clickhouse.post_bridge_v2".to_string(), obj_schema_with_type("clickhouse", json!({
-        "connector": str_prop(""),
-        "sql": str_prop("INSERT INTO telemetry VALUES (${clientid}, ${topic}, ${payload}, now())")
-    }), &["name", "connector", "sql"]));
+    schemas.insert(
+        "bridge_clickhouse.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "clickhouse",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Cassandra action
+    schemas.insert(
+        "bridge_cassa.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "cassandra",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // InfluxDB action
+    schemas.insert(
+        "bridge_influxdb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "influxdb",
+            json!({
+                "connector": str_prop(""),
+                "measurement": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // GreptimeDB action
+    schemas.insert(
+        "bridge_greptimedb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "greptimedb",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop(""),
+                "precision": str_prop("ms"),
+                "format": str_prop("sql")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // TDengine action
+    schemas.insert(
+        "bridge_tdengine.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "tdengine",
+            json!({
+                "connector": str_prop(""),
+                "stable": str_prop(""),
+                "subtable": str_prop(""),
+                "metrics": json!({"type": "object"}),
+                "tags": json!({"type": "object"})
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // IoTDB action
+    schemas.insert(
+        "bridge_iotdb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "iotdb",
+            json!({
+                "connector": str_prop(""),
+                "device": str_prop(""),
+                "measurements": json!({"type": "array", "items": {"type": "string"}}),
+                "types": json!({"type": "array", "items": {"type": "string"}})
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // OpenTSDB action
+    schemas.insert(
+        "bridge_opents.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "opents",
+            json!({
+                "connector": str_prop(""),
+                "metric": str_prop(""),
+                "value": str_prop(""),
+                "tags": json!({"type": "object"}),
+                "summary": bool_prop(true)
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Doris action
+    schemas.insert(
+        "action_doris.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "doris",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop(""),
+                "format": str_prop("json")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Datalayers action
+    schemas.insert(
+        "bridge_datalayers.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "datalayers",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Timestream action
+    schemas.insert(
+        "action_aws_timestream.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "aws_timestream",
+            json!({
+                "connector": str_prop(""),
+                "table": str_prop(""),
+                "measures": json!({"type": "object"}),
+                "measure": str_prop("metrics"),
+                "precision": str_prop("ms"),
+                "dimensions": json!({"type": "object"})
+            }),
+            &["name", "connector"],
+        ),
+    );
 
     // MQTT action
     schemas.insert(

@@ -186,7 +186,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["scylla", "scylladb", "cql"],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -201,7 +201,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["ch"],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -291,7 +291,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -321,7 +321,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -401,7 +401,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["greptime"],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -431,7 +431,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -446,7 +446,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -581,7 +581,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["opents"],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -761,7 +761,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -790,8 +790,8 @@ pub static KIND_ROWS: &[KindRow] = &[
         name: "timescaledb",
         aliases: &["timescale"],
         family: "time-series",
-        owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        owner: "MV-02a",
+        state: KindState::Pending("MV-02a"),
         connector: true,
         action: true,
         source: true,
@@ -806,7 +806,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["aws_timestream"],
         family: "time-series",
         owner: "MV-02b",
-        state: KindState::Pending("MV-02b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -868,7 +868,7 @@ static TEST_KINDS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Family tickets whose kinds the plan accepts as `ready` at the close of
 /// KC-00. Add a ticket only after its family contract is accepted. The
 /// readiness test derives the expected state from this list.
-pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &["MV-01", "KC-00/D9"];
+pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &["MV-01", "KC-00/D9", "MV-02b"];
 
 /// Enable the test-only `test` kind for this process. Test builds call
 /// this; a release build does not.
@@ -1186,6 +1186,16 @@ mod tests {
         assert!(is_kind_ready("webhook"));
         assert!(is_kind_ready("console"));
         assert!(is_kind_ready("logger"));
+        assert!(is_kind_ready("clickhouse"));
+        assert!(is_kind_ready("tdengine"));
+        assert!(is_kind_ready("greptimedb"));
+        assert!(is_kind_ready("iotdb"));
+        assert!(is_kind_ready("opentsdb"));
+        assert!(is_kind_ready("doris"));
+        assert!(is_kind_ready("datalayers"));
+        assert!(is_kind_ready("influxdb"));
+        assert!(is_kind_ready("timestream"));
+        assert!(is_kind_ready("cassandra"));
         assert!(!is_kind_ready("http"));
         assert!(!is_kind_ready("kafka"));
         assert!(!is_kind_ready("mysql"));

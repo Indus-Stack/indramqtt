@@ -217,6 +217,70 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// True when the SQL carries `INTO connector("<id>")`.
+/// The scan skips quoted text and bracket depth.
+/// It reports a valid target only; invalid text returns false.
+fn sql_has_into_connector(sql: &str) -> bool {
+    let chars: Vec<(usize, char)> = sql.char_indices().collect();
+    let total = chars.len();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut i = 0;
+    let mut depth = 0u32;
+    let mut quote: Option<char> = None;
+    while i < total {
+        let (byte, c) = chars[i];
+        if let Some(mark) = quote {
+            if c == mark {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                quote = Some(c);
+                i += 1;
+            }
+            '(' => {
+                depth += 1;
+                i += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => {
+                let is_into = depth == 0
+                    && (c == 'i' || c == 'I')
+                    && sql.len() - byte >= 4
+                    && sql[byte..byte + 4].eq_ignore_ascii_case("into")
+                    && (byte == 0 || !is_word(sql[..byte].chars().next_back().unwrap_or(' ')))
+                    && (byte + 4 >= sql.len()
+                        || !is_word(sql[byte + 4..].chars().next().unwrap_or(' ')));
+                if !is_into {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 4;
+                while j < total && chars[j].1.is_whitespace() {
+                    j += 1;
+                }
+                let start = j;
+                while j < total && (chars[j].1.is_alphanumeric() || chars[j].1 == '_') {
+                    j += 1;
+                }
+                let word: String = chars[start..j].iter().map(|(_, c)| *c).collect();
+                if !word.eq_ignore_ascii_case("connector") {
+                    i += 1;
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Validate a full snapshot across roots.
 ///
 /// Per-root structural checks run first; then cross-root checks (every rule
@@ -261,6 +325,25 @@ pub fn validate_whole(snapshot: &FullSnapshot) -> Result<(), ConfigError> {
                         "rules.rules[{index}].actions[{action_index}].connector_id {connector_id:?} names an unknown connector (field `rules.rules[{index}].actions[{action_index}].connector_id`)"
                     ));
                 }
+            }
+        }
+        // R-TENANT: a connector forward carries no tenant label.
+        // Refuse one outside the default tenant here, so reload
+        // answers 400 before any live owner applies.
+        let tenant = crate::canonical_rule_tenant(&rule.tenant);
+        if tenant != "default" {
+            let explicit = rule
+                .actions
+                .iter()
+                .any(|action| matches!(action, crate::RuleActionEntry::ForwardConnector { .. }));
+            let from_sql = rule
+                .sql_query
+                .as_ref()
+                .is_some_and(|s| sql_has_into_connector(s.as_str()));
+            if explicit || from_sql {
+                problems.push(format!(
+                    "rules.rules[{index}] tenant {tenant:?} cannot forward to connector actions (field `rules.rules[{index}].tenant`)"
+                ));
             }
         }
     }

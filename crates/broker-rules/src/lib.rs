@@ -2339,6 +2339,19 @@ impl RuleEngine {
             }
             None => None,
         };
+        // R-TENANT: a connector forward carries no tenant label. Refuse
+        // one outside the default tenant after the SQL `INTO connector`
+        // desugar, so every create, replace, boot and reload path is
+        // gated at the engine.
+        if tenant != "default"
+            && actions
+                .iter()
+                .any(|action| matches!(action, RuleAction::ForwardConnector { .. }))
+        {
+            return Err(RuleEngineError::InvalidRule(format!(
+                "rule tenant {tenant:?} cannot forward to connector actions"
+            )));
+        }
         let (parsed_query, std_foreach, std_sources, std_has_wildcard, std_explicit_keys) =
             match &stripped_sql {
                 Some(sql) => {
@@ -2489,6 +2502,27 @@ impl RuleEngine {
     fn seed_from_snapshot(&self, conf: &broker_config::RulesConf) -> Result<(), RuleEngineError> {
         conf.validate()
             .map_err(|e| RuleEngineError::InvalidRule(format!("invalid rules snapshot: {e}")))?;
+        // Refuse a non-default forward before the clear, so a rejected
+        // reload or restore keeps the running rules. The per-entry gate
+        // below still covers a direct create or replace.
+        for entry in &conf.rules {
+            let tenant = broker_config::canonical_rule_tenant(&entry.tenant);
+            let explicit = entry.actions.iter().any(|action| {
+                matches!(
+                    action,
+                    broker_config::RuleActionEntry::ForwardConnector { .. }
+                )
+            });
+            let from_sql = match &entry.sql_query {
+                Some(sql) => split_into_connector(sql)?.1.is_some(),
+                None => false,
+            };
+            if tenant != "default" && (explicit || from_sql) {
+                return Err(RuleEngineError::InvalidRule(format!(
+                    "rule tenant {tenant:?} cannot forward to connector actions"
+                )));
+            }
+        }
         for (_, task) in self.rule_tasks.write().drain() {
             *task.status.write() = "stopped".to_string();
             task.eval.abort();
@@ -2740,6 +2774,19 @@ impl RuleEngine {
             }
             None => None,
         };
+        // R-TENANT: a connector forward carries no tenant label. Refuse
+        // one outside the default tenant after the SQL `INTO connector`
+        // desugar, so every create, replace, boot and reload path is
+        // gated at the engine.
+        if tenant != "default"
+            && actions
+                .iter()
+                .any(|action| matches!(action, RuleAction::ForwardConnector { .. }))
+        {
+            return Err(RuleEngineError::InvalidRule(format!(
+                "rule tenant {tenant:?} cannot forward to connector actions"
+            )));
+        }
         let (parsed_query, std_foreach, std_sources, std_has_wildcard, std_explicit_keys) =
             match &stripped_sql {
                 Some(sql) => {
@@ -5746,6 +5793,18 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
                 &rule.std_explicit_keys,
                 &injected,
             );
+            // SELECT * keeps the payload fields only. A non-object
+            // payload leaves no field after the strip, so forward
+            // the raw bytes instead of an empty object.
+            if projected.is_empty()
+                && rule.std_has_wildcard
+                && !matches!(
+                    serde_json::from_slice::<serde_json::Value>(payload),
+                    Ok(serde_json::Value::Object(_))
+                )
+            {
+                return vec![payload.clone()];
+            }
             let object: serde_json::Map<String, serde_json::Value> = projected;
             match serde_json::to_vec(&serde_json::Value::Object(object)) {
                 Ok(bytes) => vec![Bytes::from(bytes)],

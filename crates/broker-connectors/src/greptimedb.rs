@@ -66,7 +66,7 @@ impl GreptimePrecision {
     pub fn as_influx_param(&self) -> &'static str {
         match self {
             Self::Nanosecond => "ns",
-            Self::Microsecond => "u",
+            Self::Microsecond => "us",
             Self::Millisecond => "ms",
             Self::Second => "s",
         }
@@ -1963,7 +1963,7 @@ mod tests {
             1_700_000_000_123_000_000
         );
         assert_eq!(GreptimePrecision::Nanosecond.as_influx_param(), "ns");
-        assert_eq!(GreptimePrecision::Microsecond.as_influx_param(), "u");
+        assert_eq!(GreptimePrecision::Microsecond.as_influx_param(), "us");
         assert_eq!(GreptimePrecision::Millisecond.as_influx_param(), "ms");
         assert_eq!(GreptimePrecision::Second.as_influx_param(), "s");
 

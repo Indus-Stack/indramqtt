@@ -156,6 +156,29 @@ fn resolve_rule_tenant(
     Ok(tenant)
 }
 
+/// R-TENANT: a connector forward carries no tenant label, so a rule
+/// outside the default tenant must not forward to one. Republish and
+/// log actions stay per-tenant and are allowed. Fail closed here at
+/// the entry; the fire path never sees such a rule.
+fn refuse_forward_outside_default_tenant(
+    tenant: &str,
+    actions: &[broker_rules::RuleAction],
+) -> Option<Response> {
+    let forwards = actions
+        .iter()
+        .any(|action| matches!(action, broker_rules::RuleAction::ForwardConnector { .. }));
+    if forwards && tenant != "default" {
+        Some(
+            ApiError::BadRequest(format!(
+                "rule tenant {tenant:?} cannot forward to connector actions (field `actions`)"
+            ))
+            .into_response(),
+        )
+    } else {
+        None
+    }
+}
+
 pub async fn list_rules(State(state): State<ApiState>, params: PageParams) -> Response {
     let data: Vec<_> = state.engine.list_rules().iter().map(rule_to_v5).collect();
 
@@ -384,6 +407,9 @@ pub async fn create_rule(
         Ok(actions) => actions,
         Err(response) => return *response,
     };
+    if let Some(response) = refuse_forward_outside_default_tenant(&tenant, &actions) {
+        return response;
+    }
 
     // Rule-cap bound (management-plane, fail closed): the engine re-checks
     // the same bound after SQL compilation, but this early reject wires the
@@ -661,6 +687,16 @@ pub async fn update_rule(
                 tenant
             }
         };
+        // A move outside the default tenant keeps the stored forwards
+        // when the body names no actions: check the effective set.
+        let effective: &[broker_rules::RuleAction] = if obj.contains_key("actions") {
+            &actions
+        } else {
+            &existing.actions
+        };
+        if let Some(response) = refuse_forward_outside_default_tenant(&tenant, effective) {
+            return response;
+        }
         match state.engine.replace_rule_in_tenant(
             &id,
             tenant,
@@ -1453,10 +1489,193 @@ fn missing_connector_field(conn_type: &str, body: &serde_json::Value) -> Option<
             }
             None
         }
-        // TODO(parity): remaining `register_live_sink` families still invent
-        // operational defaults (endpoints, tables, batch knobs); each needs
-        // the same fail-closed gate once its service documentation is
+        // The MV-02b time-series families carry their own fail-closed
+        // gate (documented defaults only); the remaining families keep
+        // their existing behaviour until their service documentation is
         // checked for real defaults.
+        _ => missing_mv02b_connector_field(conn_type, body),
+    }
+}
+
+/// MV-02b time-series required fields (S1-01): the connector create and
+/// update paths refuse a body that misses one of these with the field
+/// named, and the live-sink arms below repeat the same check so boot
+/// replay cannot invent a target either. Every default applied below
+/// names its source (the reference default or the server default).
+fn missing_mv02b_connector_field(
+    conn_type: &str,
+    body: &serde_json::Value,
+) -> Option<&'static str> {
+    fn present(body: &serde_json::Value, keys: &[&str]) -> bool {
+        keys.iter().any(|k| {
+            body.get(*k)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+        })
+    }
+
+    /// True when one of the keys carries a usable value: a non-blank
+    /// string, a non-empty array or a non-empty object.
+    fn present_any(body: &serde_json::Value, keys: &[&str]) -> bool {
+        keys.iter().any(|k| match body.get(*k) {
+            Some(value) if value.is_string() => {
+                value.as_str().is_some_and(|s| !s.trim().is_empty())
+            }
+            Some(value) if value.is_array() => {
+                value.as_array().is_some_and(|items| !items.is_empty())
+            }
+            Some(value) if value.is_object() => {
+                value.as_object().is_some_and(|map| !map.is_empty())
+            }
+            _ => false,
+        })
+    }
+
+    match conn_type {
+        "clickhouse" | "ch" => {
+            if !present(body, &["url", "endpoint", "server"]) {
+                return Some("url");
+            }
+            if !present(body, &["database"]) {
+                return Some("database");
+            }
+            if !present(body, &["table", "table_template"]) {
+                return Some("table");
+            }
+            None
+        }
+        "tdengine" => {
+            if !present(body, &["server", "url", "endpoint"]) {
+                return Some("server");
+            }
+            if !present(body, &["database"]) {
+                return Some("database");
+            }
+            if !present(body, &["stable", "stable_name", "table"]) {
+                return Some("stable");
+            }
+            if !present(body, &["subtable", "subtable_template"]) {
+                return Some("subtable");
+            }
+            if !present_any(body, &["metrics", "metrics_template"]) {
+                return Some("metrics");
+            }
+            if !present_any(body, &["tags", "tags_template"]) {
+                return Some("tags");
+            }
+            None
+        }
+        "greptimedb" | "greptime" => {
+            if !present(body, &["database", "dbname"]) {
+                return Some("database");
+            }
+            if !present(body, &["table", "table_template"]) {
+                return Some("table");
+            }
+            None
+        }
+        "iotdb" => {
+            if !present(body, &["endpoint", "server", "url", "base_url"]) {
+                return Some("endpoint");
+            }
+            if !present(body, &["username", "user"]) {
+                return Some("username");
+            }
+            if !present(body, &["password"]) {
+                return Some("password");
+            }
+            if !present(body, &["device", "device_path", "device_path_template"]) {
+                return Some("device");
+            }
+            if !present_any(body, &["measurements"]) {
+                return Some("measurements");
+            }
+            if !present_any(body, &["types", "data_types"]) {
+                return Some("types");
+            }
+            None
+        }
+        "opentsdb" | "opents" => {
+            if !present(body, &["server", "endpoint", "url"]) {
+                return Some("server");
+            }
+            if !present(body, &["metric", "metric_template"]) {
+                return Some("metric");
+            }
+            if !present(body, &["value", "value_field"]) {
+                return Some("value");
+            }
+            None
+        }
+        "doris" => {
+            if !present(body, &["server", "fe_host", "host", "endpoint"]) {
+                return Some("server");
+            }
+            if !present(body, &["database"]) {
+                return Some("database");
+            }
+            if !present(body, &["table", "table_template"]) {
+                return Some("table");
+            }
+            None
+        }
+        "datalayers" => {
+            if !present(body, &["database"]) {
+                return Some("database");
+            }
+            if !present(body, &["table", "measurement"]) {
+                return Some("table");
+            }
+            None
+        }
+        "influxdb" => {
+            if !present(body, &["bucket"]) {
+                return Some("bucket");
+            }
+            if !present(body, &["org"]) {
+                return Some("org");
+            }
+            if !present(body, &["token"]) {
+                return Some("token");
+            }
+            if !present(body, &["measurement", "measurement_template"]) {
+                return Some("measurement");
+            }
+            None
+        }
+        "timestream" | "aws_timestream" => {
+            if !present(body, &["database", "database_name", "db"]) {
+                return Some("database");
+            }
+            if !present(body, &["region"]) {
+                return Some("region");
+            }
+            if !present(body, &["access_key_id", "access_key"]) {
+                return Some("access_key_id");
+            }
+            if !present(body, &["secret_access_key", "secret_key"]) {
+                return Some("secret_access_key");
+            }
+            if !present(body, &["table", "table_name"]) {
+                return Some("table");
+            }
+            if !present_any(body, &["measures", "multi_measure_mappings"]) {
+                return Some("measures");
+            }
+            None
+        }
+        "cassandra" | "scylla" | "scylladb" | "cql" => {
+            if !present(body, &["servers", "server", "contact_points"]) {
+                return Some("servers");
+            }
+            if !present(body, &["keyspace"]) {
+                return Some("keyspace");
+            }
+            if !present(body, &["table", "table_template"]) {
+                return Some("table");
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -1907,6 +2126,7 @@ fn live_sink_kind(conn_type: &str) -> &str {
         "gcp_pubsub_producer" | "gcp_pubsub_consumer" => "gcp_pubsub",
         "azure_event_hub_producer" => "azure_eventhubs",
         "aws_timestream" => "timestream",
+        "ch" => "clickhouse",
         "opents" => "opentsdb",
         "snowflake_streaming" => "snowflake",
         "postgres" => "pgsql",
@@ -2311,25 +2531,42 @@ pub(crate) async fn register_live_sink(
             return Err(refuse_disabled_kind(conn_type, "rabbitmq"));
         }
         #[cfg(feature = "clickhouse")]
-        "clickhouse" => {
-            let url = body
+        "clickhouse" | "ch" => {
+            // Fail closed (S1-01): the create and update paths gate
+            // these fields first; the arm repeats the check so boot
+            // replay cannot invent a target either.
+            let Some(raw_url) = body
                 .get("url")
+                .or_else(|| body.get("endpoint"))
+                .or_else(|| body.get("server"))
                 .and_then(|v| v.as_str())
-                .or_else(|| body.get("server").and_then(|v| v.as_str()))
-                .unwrap_or("http://127.0.0.1:8123");
-            let endpoint = if url.starts_with("http://") || url.starts_with("https://") {
-                url.to_string()
-            } else {
-                format!("http://{}", url)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("clickhouse connector is missing required field: url".to_string());
             };
-            let database = body
+            let endpoint = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+                raw_url.to_string()
+            } else {
+                format!("http://{raw_url}")
+            };
+            let Some(database) = body
                 .get("database")
                 .and_then(|v| v.as_str())
-                .unwrap_or("default");
-            let table = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("clickhouse connector is missing required field: database".to_string());
+            };
+            let Some(table) = body
                 .get("table")
+                .or_else(|| body.get("table_template"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("test_mqtt_events");
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("clickhouse connector is missing required field: table".to_string());
+            };
             let request_timeout_ms = body
                 .get("request_timeout_ms")
                 .or_else(|| body.get("timeout_ms"))
@@ -2346,6 +2583,8 @@ pub(crate) async fn register_live_sink(
                     .get("username")
                     .or_else(|| body.get("user"))
                     .and_then(|v| v.as_str())
+                    // Default `default`: the ClickHouse server-side
+                    // default user.
                     .unwrap_or("default")
                     .to_string(),
                 password: body
@@ -2428,30 +2667,66 @@ pub(crate) async fn register_live_sink(
             }
         }
         "influxdb" => {
-            let url = body
-                .get("url")
+            // Fail closed (S1-01): the create and update paths gate
+            // these fields first; the arm repeats the check so boot
+            // replay cannot invent a target either. The server default
+            // is the reference connector default.
+            let raw_server = body
+                .get("server")
+                .or_else(|| body.get("url"))
+                .or_else(|| body.get("endpoint"))
                 .and_then(|v| v.as_str())
-                .or_else(|| body.get("server").and_then(|v| v.as_str()))
-                .unwrap_or("http://127.0.0.1:8086");
-            let endpoint = if url.starts_with("http://") || url.starts_with("https://") {
-                url.to_string()
-            } else {
-                format!("http://{}", url)
-            };
-            let bucket = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("127.0.0.1:8086");
+            let endpoint =
+                if raw_server.starts_with("http://") || raw_server.starts_with("https://") {
+                    raw_server.to_string()
+                } else {
+                    format!("http://{raw_server}")
+                };
+            let Some(bucket) = body
                 .get("bucket")
                 .and_then(|v| v.as_str())
-                .unwrap_or("default");
-            let org = body.get("org").and_then(|v| v.as_str()).unwrap_or("idacs");
-            let token = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("influxdb connector is missing required field: bucket".to_string());
+            };
+            let Some(org) = body
+                .get("org")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("influxdb connector is missing required field: org".to_string());
+            };
+            let Some(token) = body
                 .get("token")
                 .and_then(|v| v.as_str())
-                .unwrap_or("idacs_test_token");
-            let measurement = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("influxdb connector is missing required field: token".to_string());
+            };
+            let Some(measurement) = body
                 .get("measurement")
+                .or_else(|| body.get("measurement_template"))
                 .and_then(|v| v.as_str())
-                .or_else(|| body.get("measurement_template").and_then(|v| v.as_str()))
-                .unwrap_or("mqtt_events");
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("influxdb connector is missing required field: measurement".to_string());
+            };
+            // The sink validates the value; an unknown precision fails
+            // the build with the sink text.
+            let precision = body
+                .get("precision")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("ms")
+                .to_string();
             let request_timeout_ms = body
                 .get("request_timeout_ms")
                 .or_else(|| body.get("timeout_ms"))
@@ -2463,7 +2738,7 @@ pub(crate) async fn register_live_sink(
                 org: org.to_string(),
                 token: token.to_string(),
                 measurement_template: measurement.to_string(),
-                precision: "ms".to_string(),
+                precision,
                 batch_size: 1,
                 batch_timeout_ms: 100,
                 request_timeout_ms,
@@ -2542,47 +2817,101 @@ pub(crate) async fn register_live_sink(
             return Err(refuse_disabled_kind(conn_type, "mongodb"));
         }
         #[cfg(feature = "cassandra")]
-        "cassandra" | "scylla" | "scylladb" => {
-            let server = body
-                .get("server")
+        "cassandra" | "scylla" | "scylladb" | "cql" => {
+            // Fail closed (S1-01): the create and update paths gate
+            // these fields first; the arm repeats the check so boot
+            // replay cannot invent a target either.
+            let Some(raw_servers) = body
+                .get("servers")
+                .or_else(|| body.get("server"))
+                .or_else(|| body.get("contact_points"))
                 .and_then(|v| v.as_str())
-                .or_else(|| body.get("servers").and_then(|v| v.as_str()))
-                .or_else(|| body.get("contact_points").and_then(|v| v.as_str()))
-                .unwrap_or("127.0.0.1:9042");
-            let contact_points: Vec<String> =
-                server.split(',').map(|s| s.trim().to_string()).collect();
-            let keyspace = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("cassandra connector is missing required field: servers".to_string());
+            };
+            let contact_points: Vec<String> = raw_servers
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+            if contact_points.is_empty() {
+                return Err("cassandra connector is missing required field: servers".to_string());
+            }
+            let Some(keyspace) = body
                 .get("keyspace")
                 .and_then(|v| v.as_str())
-                .unwrap_or("idacs");
-            let table = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("cassandra connector is missing required field: keyspace".to_string());
+            };
+            let Some(table) = body
                 .get("table")
+                .or_else(|| body.get("table_template"))
                 .and_then(|v| v.as_str())
-                .or_else(|| body.get("table_template").and_then(|v| v.as_str()))
-                .unwrap_or("sensor_events");
-            let username = body.get("username").and_then(|v| v.as_str());
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("cassandra connector is missing required field: table".to_string());
+            };
+            if !table
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(format!(
+                    "cassandra connector field `table` must match [A-Za-z0-9_]+: {table:?}"
+                ));
+            }
+            let username = body
+                .get("username")
+                .or_else(|| body.get("user"))
+                .and_then(|v| v.as_str());
             let password = body.get("password").and_then(|v| v.as_str());
-            let auth = if let (Some(u), Some(p)) = (username, password) {
-                broker_connectors_enterprise::CassandraAuth::Password {
-                    username: u.to_string(),
-                    password: p.to_string(),
+            let auth = match (username, password) {
+                (Some(username), Some(password)) => {
+                    broker_connectors_enterprise::CassandraAuth::Password {
+                        username: username.to_string(),
+                        password: password.to_string(),
+                    }
                 }
-            } else {
-                broker_connectors_enterprise::CassandraAuth::None
+                (None, None) => broker_connectors_enterprise::CassandraAuth::None,
+                _ => {
+                    return Err(
+                        "cassandra connector fields `username` and `password` must be set together"
+                            .to_string(),
+                    );
+                }
             };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
-            let cql = format!("INSERT INTO {}.{} (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)", keyspace, table);
+            // The CQL text carries `keyspace.table`: the Scylla
+            // transport prepares the statement text as given, so a
+            // bare table never resolves. Both parts are validated
+            // identifiers; one fixed shape per connector.
+            let cql = format!("INSERT INTO {keyspace}.{table} (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)");
+            let partition_key = body
+                .get("partition_key")
+                .or_else(|| body.get("partition_key_template"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("${client_id}")
+                .to_string();
+            // Default `${client_id}`: the client identity routes each
+            // row to its token owner.
             let config = broker_connectors_enterprise::CassandraSinkConfig {
                 contact_points,
                 keyspace: keyspace.to_string(),
                 table_template: table.to_string(),
                 auth,
-                consistency: broker_connectors_enterprise::CqlConsistency::One,
-                partition_key_template: "${client_id}".to_string(),
+                consistency: broker_connectors_enterprise::CqlConsistency::LocalQuorum,
+                partition_key_template: partition_key,
                 cql_statement_template: cql,
                 ttl_secs: None,
                 batch_size: Some(1),
@@ -2607,12 +2936,16 @@ pub(crate) async fn register_live_sink(
                         .register(format!("cassandra:{}", name), sink.clone());
                     engine
                         .connectors()
-                        .register(format!("scylla:{}", name), sink);
+                        .register(format!("scylla:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("scylladb:{}", name), sink.clone());
+                    engine.connectors().register(format!("cql:{}", name), sink);
                 }
             }
         }
         #[cfg(not(feature = "cassandra"))]
-        "cassandra" | "scylla" | "scylladb" => {
+        "cassandra" | "scylla" | "scylladb" | "cql" => {
             return Err(refuse_disabled_kind(conn_type, "cassandra"));
         }
         "cockroachdb" | "cockroach" => {
@@ -2863,60 +3196,134 @@ pub(crate) async fn register_live_sink(
             }
         }
         "tdengine" => {
-            let server = body
+            // Fail closed (S1-01): the create and update paths gate
+            // these fields first; the arm repeats the check so boot
+            // replay cannot invent a target either.
+            let Some(raw_server) = body
                 .get("server")
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
                 .or_else(|| body.get("endpoint"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:6041/rest/sql");
-            let endpoint = if server.starts_with("http://") || server.starts_with("https://") {
-                server.to_string()
-            } else {
-                format!("http://{}", server)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("tdengine connector is missing required field: server".to_string());
             };
-            let database = body
+            let endpoint =
+                if raw_server.starts_with("http://") || raw_server.starts_with("https://") {
+                    raw_server.to_string()
+                } else {
+                    format!("http://{raw_server}")
+                };
+            let Some(database) = body
                 .get("database")
                 .and_then(|v| v.as_str())
-                .unwrap_or("power");
-            let stable = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("tdengine connector is missing required field: database".to_string());
+            };
+            let Some(stable) = body
                 .get("stable_name")
+                .or_else(|| body.get("stable"))
                 .or_else(|| body.get("table"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("meters");
-            let subtable = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("tdengine connector is missing required field: stable".to_string());
+            };
+            let Some(subtable) = body
                 .get("subtable_template")
                 .or_else(|| body.get("subtable"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("d_meters");
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("tdengine connector is missing required field: subtable".to_string());
+            };
             let username = body
                 .get("username")
                 .and_then(|v| v.as_str())
-                .unwrap_or("root");
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
             let password = body
                 .get("password")
                 .and_then(|v| v.as_str())
-                .unwrap_or("taosdata");
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let token = body
+                .get("token")
+                .or_else(|| body.get("auth_token"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            // A half Basic pair cannot authenticate: refuse it. A
+            // token selects token auth and never mixes with Basic.
+            let auth = match (username, password, token) {
+                (Some(username), Some(password), None) => {
+                    broker_connectors_enterprise::tdengine::TdengineAuth::Basic {
+                        username: username.to_string(),
+                        password: password.to_string(),
+                    }
+                }
+                (None, None, Some(token)) => {
+                    broker_connectors_enterprise::tdengine::TdengineAuth::Token {
+                        token: token.to_string(),
+                    }
+                }
+                (None, None, None) => broker_connectors_enterprise::tdengine::TdengineAuth::Basic {
+                    username: "root".to_string(),
+                    password: "taosdata".to_string(),
+                },
+                _ => {
+                    return Err("tdengine connector fields `username` and `password` must be set together, and `token` never mixes with them".to_string());
+                }
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let mut metrics_template = std::collections::HashMap::new();
-            metrics_template.insert("temp".to_string(), "${payload.temperature}".to_string());
-            let mut tags_template = std::collections::HashMap::new();
-            tags_template.insert("location".to_string(), "room1".to_string());
+            // The row shape travels in the connector body for the
+            // legacy connector-level path (the action carries it per
+            // target on the action-owned path). An absent or empty
+            // shape is refused, never invented.
+            let metrics_template = match body
+                .get("metrics")
+                .or_else(|| body.get("metrics_template"))
+                .and_then(|v| v.as_object())
+            {
+                Some(map) if !map.is_empty() && map.values().all(|entry| entry.is_string()) => map
+                    .iter()
+                    .map(|(name, entry)| (name.clone(), entry.as_str().unwrap_or("").to_string()))
+                    .collect::<std::collections::HashMap<String, String>>(),
+                _ => {
+                    return Err("tdengine connector is missing required field: metrics".to_string());
+                }
+            };
+            let tags_template = match body
+                .get("tags")
+                .or_else(|| body.get("tags_template"))
+                .and_then(|v| v.as_object())
+            {
+                Some(map) if !map.is_empty() && map.values().all(|entry| entry.is_string()) => map
+                    .iter()
+                    .map(|(name, entry)| (name.clone(), entry.as_str().unwrap_or("").to_string()))
+                    .collect::<std::collections::HashMap<String, String>>(),
+                _ => {
+                    return Err("tdengine connector is missing required field: tags".to_string());
+                }
+            };
 
             let config = broker_connectors_enterprise::tdengine::TdengineSinkConfig {
                 endpoint,
                 database: database.to_string(),
                 stable_name: stable.to_string(),
                 subtable_template: subtable.to_string(),
-                auth: broker_connectors_enterprise::tdengine::TdengineAuth::Basic {
-                    username: username.to_string(),
-                    password: password.to_string(),
-                },
+                auth,
                 tags_template,
                 metrics_template,
                 batch_size: Some(1),
@@ -2974,49 +3381,113 @@ pub(crate) async fn register_live_sink(
             }
         }
         "greptimedb" | "greptime" => {
-            let server = body
-                .get("endpoint")
-                .or_else(|| body.get("server"))
+            // Fail closed (S1-01): the create and update paths gate
+            // the database and table first; the arm repeats the check
+            // so boot replay cannot invent a target either. The server
+            // default is the reference connector default.
+            // TODO(parity): the reference default (127.0.0.1:4001)
+            // conflicts with its description port (8086). The current
+            // choice applies 4001 and appends 8086 to a bare host
+            // until the checker pins it.
+            let raw_server = body
+                .get("server")
+                .or_else(|| body.get("endpoint"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
+                .or_else(|| body.get("host"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:4000/v1");
-            let endpoint = if server.starts_with("http://") || server.starts_with("https://") {
-                server.to_string()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("127.0.0.1:4001");
+            let endpoint = if raw_server.contains("://") {
+                raw_server.to_string()
+            } else if raw_server.contains(':') {
+                format!("http://{raw_server}")
             } else {
-                format!("http://{}", server)
+                format!("http://{raw_server}:8086")
             };
-            let database = body
+            let Some(database) = body
                 .get("database")
+                .or_else(|| body.get("dbname"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("public");
-            let table = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("greptimedb connector is missing required field: database".to_string());
+            };
+            let Some(table) = body
                 .get("table")
                 .or_else(|| body.get("table_template"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("sensor_events");
-            let username = body.get("username").and_then(|v| v.as_str());
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("greptimedb connector is missing required field: table".to_string());
+            };
+            let username = body
+                .get("username")
+                .or_else(|| body.get("user"))
+                .and_then(|v| v.as_str());
             let password = body.get("password").and_then(|v| v.as_str());
-            let auth = if let (Some(u), Some(p)) = (username, password) {
-                Some(broker_connectors::greptimedb::GreptimeDbAuth {
-                    username: u.to_string(),
-                    password: p.to_string(),
-                })
-            } else {
-                None
+            let auth = match (username, password) {
+                (Some(username), Some(password)) => {
+                    Some(broker_connectors::greptimedb::GreptimeDbAuth {
+                        username: username.to_string(),
+                        password: password.to_string(),
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(
+                        "greptimedb connector fields `username` and `password` must be set together"
+                            .to_string(),
+                    );
+                }
             };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
+            // Connector-level `precision` and `format` apply here as
+            // on the action path; an unknown value is refused.
+            let precision = match body
+                .get("precision")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None | Some("ms") => broker_connectors::greptimedb::GreptimePrecision::Millisecond,
+                Some("ns") => broker_connectors::greptimedb::GreptimePrecision::Nanosecond,
+                Some("us") => broker_connectors::greptimedb::GreptimePrecision::Microsecond,
+                Some("s") => broker_connectors::greptimedb::GreptimePrecision::Second,
+                Some(other) => {
+                    return Err(format!(
+                        "greptimedb connector field `precision` must be one of s, ms, us, ns: {other:?}"
+                    ));
+                }
+            };
+            let format = match body
+                .get("format")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None | Some("sql") => broker_connectors::greptimedb::GreptimeFormat::SqlInsert,
+                Some("influx") => broker_connectors::greptimedb::GreptimeFormat::InfluxLineProtocol,
+                Some(other) => {
+                    return Err(format!(
+                        "greptimedb connector field `format` must be one of sql, influx: {other:?}"
+                    ));
+                }
+            };
             let config = broker_connectors::greptimedb::GreptimeDbConfig {
                 endpoint,
                 database: database.to_string(),
                 auth,
-                format: broker_connectors::greptimedb::GreptimeFormat::SqlInsert,
+                format,
                 table_template: table.to_string(),
-                timestamp_precision: broker_connectors::greptimedb::GreptimePrecision::Millisecond,
+                timestamp_precision: precision,
                 batch_size: Some(1),
                 buffer_capacity: None,
                 timeout_ms,
@@ -3038,31 +3509,48 @@ pub(crate) async fn register_live_sink(
             }
         }
         "iotdb" => {
-            let server = body
+            // Fail closed (S1-01): the create and update paths gate
+            // these fields first; the arm repeats the check so boot
+            // replay cannot invent a target either.
+            let Some(raw_server) = body
                 .get("endpoint")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
+                .or_else(|| body.get("base_url"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:6667/rest/v2");
-            let endpoint = if server.starts_with("http://") || server.starts_with("https://") {
-                server.to_string()
-            } else {
-                format!("http://{}", server)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("iotdb connector is missing required field: endpoint".to_string());
             };
-            let device_path = body
+            let endpoint = crate::v5::action_sinks::iotdb_endpoint(raw_server);
+            let Some(device_path) = body
                 .get("device_path_template")
                 .or_else(|| body.get("device_path"))
+                .or_else(|| body.get("device"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("root.factory.${payload.plant_id}.${client_id}");
-            let username = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("iotdb connector is missing required field: device".to_string());
+            };
+            let Some(username) = body
                 .get("username")
+                .or_else(|| body.get("user"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("root");
-            let password = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("iotdb connector is missing required field: username".to_string());
+            };
+            let Some(password) = body
                 .get("password")
                 .and_then(|v| v.as_str())
-                .unwrap_or("root");
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("iotdb connector is missing required field: password".to_string());
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -3077,8 +3565,69 @@ pub(crate) async fn register_live_sink(
                     password: password.to_string(),
                 },
                 is_aligned: false,
-                measurements: vec!["temperature".to_string()],
-                data_types: vec![broker_connectors_enterprise::iotdb::IotDbDataType::Float],
+                measurements: match body.get("measurements").and_then(|v| v.as_array()) {
+                    Some(items)
+                        if !items.is_empty()
+                            && items.iter().all(|item| {
+                                item.as_str().is_some_and(|s| !s.trim().is_empty())
+                            }) =>
+                    {
+                        items
+                            .iter()
+                            .map(|item| item.as_str().unwrap_or("").trim().to_string())
+                            .collect()
+                    }
+                    _ => {
+                        return Err(
+                            "iotdb connector is missing required field: measurements".to_string()
+                        );
+                    }
+                },
+                data_types: match body
+                    .get("types")
+                    .or_else(|| body.get("data_types"))
+                    .and_then(|v| v.as_array())
+                {
+                    Some(items)
+                        if !items.is_empty()
+                            && items.iter().all(|item| {
+                                item.as_str().is_some_and(|s| !s.trim().is_empty())
+                            }) =>
+                    {
+                        let mut types = Vec::with_capacity(items.len());
+                        for item in items {
+                            let name = item.as_str().unwrap_or("").trim().to_lowercase();
+                            let data_type = match name.as_str() {
+                                "boolean" => {
+                                    broker_connectors_enterprise::iotdb::IotDbDataType::Boolean
+                                }
+                                "int32" => {
+                                    broker_connectors_enterprise::iotdb::IotDbDataType::Int32
+                                }
+                                "int64" => {
+                                    broker_connectors_enterprise::iotdb::IotDbDataType::Int64
+                                }
+                                "float" => {
+                                    broker_connectors_enterprise::iotdb::IotDbDataType::Float
+                                }
+                                "double" => {
+                                    broker_connectors_enterprise::iotdb::IotDbDataType::Double
+                                }
+                                "text" => broker_connectors_enterprise::iotdb::IotDbDataType::Text,
+                                _ => {
+                                    return Err(format!(
+                                        "iotdb connector field `types` entry {name:?} must be one of boolean, int32, int64, float, double, text"
+                                    ));
+                                }
+                            };
+                            types.push(data_type);
+                        }
+                        types
+                    }
+                    _ => {
+                        return Err("iotdb connector is missing required field: types".to_string());
+                    }
+                },
                 batch_size: Some(1),
                 batch_bytes: Some(2_097_152),
                 linger_ms: Some(10),
@@ -3107,31 +3656,51 @@ pub(crate) async fn register_live_sink(
             }
         }
         "opentsdb" => {
-            let server = body
-                .get("endpoint")
-                .or_else(|| body.get("server"))
+            // Fail closed (S1-01): the create and update paths gate
+            // these fields first; the arm repeats the check so boot
+            // replay cannot invent a target either.
+            let Some(raw_server) = body
+                .get("server")
+                .or_else(|| body.get("endpoint"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:4242");
-            let endpoint = if server.starts_with("http://")
-                || server.starts_with("https://")
-                || server.starts_with("telnet://")
-            {
-                server.to_string()
-            } else {
-                format!("http://{}", server)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("opentsdb connector is missing required field: server".to_string());
             };
-            let metric_template = body
-                .get("metric_template")
-                .or_else(|| body.get("metric"))
+            let endpoint = if raw_server.starts_with("http://")
+                || raw_server.starts_with("https://")
+                || raw_server.starts_with("telnet://")
+            {
+                raw_server.to_string()
+            } else {
+                format!("http://{raw_server}")
+            };
+            let protocol = if endpoint.starts_with("telnet://") {
+                broker_connectors::opentsdb::OpenTsdbProtocol::Telnet
+            } else {
+                broker_connectors::opentsdb::OpenTsdbProtocol::Http
+            };
+            let Some(metric_template) = body
+                .get("metric")
+                .or_else(|| body.get("metric_template"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("factory.telemetry");
-            let value_field = body
-                .get("value_field")
-                .or_else(|| body.get("value"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("opentsdb connector is missing required field: metric".to_string());
+            };
+            let Some(value_field) = body
+                .get("value")
+                .or_else(|| body.get("value_field"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("temperature");
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("opentsdb connector is missing required field: value".to_string());
+            };
             let summary = body
                 .get("summary")
                 .and_then(|v| v.as_bool())
@@ -3144,8 +3713,8 @@ pub(crate) async fn register_live_sink(
 
             let mut tag_mappings = std::collections::HashMap::new();
             if let Some(tags) = body
-                .get("tag_mappings")
-                .or_else(|| body.get("tags"))
+                .get("tags")
+                .or_else(|| body.get("tag_mappings"))
                 .and_then(|v| v.as_object())
             {
                 for (k, v) in tags {
@@ -3153,13 +3722,11 @@ pub(crate) async fn register_live_sink(
                         tag_mappings.insert(k.clone(), s.to_string());
                     }
                 }
-            } else {
-                tag_mappings.insert("sensor".to_string(), "${payload.sensor}".to_string());
             }
 
             let config = broker_connectors::opentsdb::OpenTsdbConfig {
                 endpoint,
-                protocol: broker_connectors::opentsdb::OpenTsdbProtocol::Http,
+                protocol,
                 metric_template: metric_template.to_string(),
                 tag_mappings,
                 value_field: value_field.to_string(),
@@ -3179,40 +3746,76 @@ pub(crate) async fn register_live_sink(
                 engine.connectors().register(name, sink.clone());
                 engine
                     .connectors()
-                    .register(format!("opentsdb:{}", name), sink);
+                    .register(format!("opentsdb:{}", name), sink.clone());
+                engine
+                    .connectors()
+                    .register(format!("opents:{}", name), sink);
             }
         }
         "doris" => {
-            let server = body
+            // Fail closed (S1-01): the create and update paths gate
+            // these fields first; the arm repeats the check so boot
+            // replay cannot invent a target either.
+            let Some(raw_server) = body
                 .get("server")
                 .or_else(|| body.get("fe_host"))
                 .or_else(|| body.get("host"))
                 .or_else(|| body.get("endpoint"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("127.0.0.1");
-            let fe_host = server
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("doris connector is missing required field: server".to_string());
+            };
+            let no_scheme = raw_server
                 .trim_start_matches("http://")
-                .trim_start_matches("https://")
-                .split(':')
+                .trim_start_matches("https://");
+            let fe_host = no_scheme
+                .split([':', '/'])
                 .next()
-                .unwrap_or("127.0.0.1")
+                .unwrap_or("")
+                .trim()
                 .to_string();
+            if fe_host.is_empty() {
+                return Err("doris connector is missing required field: server".to_string());
+            }
+            // The port rides in `server` (`host:port`); an explicit
+            // `http_port` (alias `port`) wins, else the server port
+            // applies, else the Doris front-end default HTTP port.
+            let server_port = no_scheme
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .nth(1)
+                .and_then(|port| port.trim().parse::<u16>().ok());
             let http_port = body
                 .get("http_port")
                 .or_else(|| body.get("port"))
                 .and_then(|v| v.as_u64())
-                .unwrap_or(8030) as u16;
-            let database = body
+                .map(|port| port as u16)
+                .or(server_port)
+                .unwrap_or(8030);
+            // Default `8030`: the Doris front-end default HTTP port.
+            let Some(database) = body
                 .get("database")
                 .and_then(|v| v.as_str())
-                .unwrap_or("telemetry")
-                .to_string();
-            let table = body
-                .get("table_template")
-                .or_else(|| body.get("table"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("doris connector is missing required field: database".to_string());
+            };
+            let database = database.to_string();
+            let Some(table) = body
+                .get("table")
+                .or_else(|| body.get("table_template"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("events")
-                .to_string();
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("doris connector is missing required field: table".to_string());
+            };
+            let table = table.to_string();
             let username = body
                 .get("username")
                 .and_then(|v| v.as_str())
@@ -3238,7 +3841,9 @@ pub(crate) async fn register_live_sink(
                 format: broker_connectors_enterprise::doris::DorisFormat::Json,
                 jsonpaths: None,
                 strip_outer_array: true,
-                max_filter_ratio: Some(0.0),
+                // No ratio header: the server default (zero tolerance)
+                // applies.
+                max_filter_ratio: None,
                 batch_size: Some(1),
                 batch_bytes: Some(4_194_304),
                 linger_ms: Some(10),
@@ -3271,29 +3876,44 @@ pub(crate) async fn register_live_sink(
             }
         }
         "datalayers" => {
-            let server = body
-                .get("endpoint")
-                .or_else(|| body.get("server"))
+            // Fail closed (S1-01): the create and update paths gate
+            // these fields first; the arm repeats the check so boot
+            // replay cannot invent a target either. The server default
+            // is the reference connector default.
+            let raw_server = body
+                .get("server")
+                .or_else(|| body.get("endpoint"))
                 .or_else(|| body.get("servers"))
                 .or_else(|| body.get("url"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:8360");
-            let endpoint = if server.starts_with("http://") || server.starts_with("https://") {
-                server.to_string()
-            } else {
-                format!("http://{}", server)
-            };
-            let database = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("127.0.0.1:8361");
+            let endpoint =
+                if raw_server.starts_with("http://") || raw_server.starts_with("https://") {
+                    raw_server.to_string()
+                } else {
+                    format!("http://{raw_server}")
+                };
+            let Some(database) = body
                 .get("database")
                 .and_then(|v| v.as_str())
-                .unwrap_or("factory_db")
-                .to_string();
-            let table = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("datalayers connector is missing required field: database".to_string());
+            };
+            let database = database.to_string();
+            let Some(table) = body
                 .get("table")
                 .or_else(|| body.get("measurement"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("sensor_events")
-                .to_string();
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("datalayers connector is missing required field: table".to_string());
+            };
+            let table = table.to_string();
             let auth_token = body
                 .get("auth_token")
                 .or_else(|| body.get("token"))
@@ -3321,9 +3941,12 @@ pub(crate) async fn register_live_sink(
                 auth_token,
                 username,
                 password,
-                timestamp_field: Some("timestamp".to_string()),
-                tag_columns: vec!["sensor".to_string(), "client_id".to_string()],
-                field_columns: vec!["temperature".to_string()],
+                // Stamps are always microseconds (the wire requirement);
+                // the default column split keeps the `topic` tag and
+                // measures every payload field.
+                timestamp_field: None,
+                tag_columns: Vec::new(),
+                field_columns: Vec::new(),
                 batch_size: Some(1),
                 buffer_capacity: None,
                 timeout_ms,
@@ -4011,43 +4634,126 @@ pub(crate) async fn register_live_sink(
             }
         }
         "timestream" => {
-            let database = body
-                .get("database_name")
-                .or_else(|| body.get("database"))
+            // Fail closed (S1-01): the create and update paths gate
+            // these fields first; the arm repeats the check so boot
+            // replay cannot invent a target either.
+            let Some(database) = body
+                .get("database")
+                .or_else(|| body.get("database_name"))
+                .or_else(|| body.get("db"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("telemetry_db");
-            let table = body
-                .get("table_name")
-                .or_else(|| body.get("table"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("timestream connector is missing required field: database".to_string());
+            };
+            let Some(table) = body
+                .get("table")
+                .or_else(|| body.get("table_name"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("metrics");
-            let region = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("timestream connector is missing required field: table".to_string());
+            };
+            let Some(region) = body
                 .get("region")
                 .and_then(|v| v.as_str())
-                .unwrap_or("us-east-1");
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("timestream connector is missing required field: region".to_string());
+            };
             let endpoint = body
                 .get("endpoint")
                 .or_else(|| body.get("url"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let access_key = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|value| {
+                    if value.starts_with("http://") || value.starts_with("https://") {
+                        value.to_string()
+                    } else {
+                        format!("http://{value}")
+                    }
+                });
+            let Some(access_key) = body
                 .get("access_key_id")
+                .or_else(|| body.get("access_key"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("test");
-            let secret_key = body
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Err(
+                    "timestream connector is missing required field: access_key_id".to_string(),
+                );
+            };
+            let Some(secret_key) = body
                 .get("secret_access_key")
+                .or_else(|| body.get("secret_key"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("test");
+                .filter(|s| !s.is_empty())
+            else {
+                return Err(
+                    "timestream connector is missing required field: secret_access_key".to_string(),
+                );
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
+            // The row shape travels in the connector body for the
+            // legacy connector-level path (the action carries it per
+            // target on the action-owned path). An absent or empty
+            // shape is refused, never invented.
+            let measures = match body
+                .get("measures")
+                .or_else(|| body.get("multi_measure_mappings"))
+                .and_then(|v| v.as_object())
+            {
+                Some(map) if !map.is_empty() && map.values().all(|entry| entry.is_string()) => map
+                    .iter()
+                    .map(|(name, entry)| (name.clone(), entry.as_str().unwrap_or("").to_string()))
+                    .collect::<std::collections::HashMap<String, String>>(),
+                _ => {
+                    return Err(
+                        "timestream connector is missing required field: measures".to_string()
+                    );
+                }
+            };
             let mut dimensions = std::collections::HashMap::new();
-            dimensions.insert("device".to_string(), "${client_id}".to_string());
-            let mut measures = std::collections::HashMap::new();
-            measures.insert("temperature".to_string(), "DOUBLE".to_string());
+            if let Some(map) = body.get("dimensions").and_then(|v| v.as_object()) {
+                for (name, entry) in map {
+                    if let Some(text) = entry.as_str() {
+                        dimensions.insert(name.clone(), text.to_string());
+                    }
+                }
+            }
+            // Connector-level `precision` applies here as on the
+            // action path; an unknown value is refused.
+            let time_unit = match body
+                .get("precision")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None | Some("ms") => {
+                    broker_connectors_enterprise::timestream::TimestreamTimeUnit::Milliseconds
+                }
+                Some("us") => {
+                    broker_connectors_enterprise::timestream::TimestreamTimeUnit::Microseconds
+                }
+                Some("ns") => {
+                    broker_connectors_enterprise::timestream::TimestreamTimeUnit::Nanoseconds
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "timestream connector field `precision` must be one of ms, us, ns: {other:?}"
+                    ));
+                }
+            };
 
             let config = broker_connectors_enterprise::timestream::TimestreamSinkConfig {
                 database_name: database.to_string(),
@@ -4056,10 +4762,20 @@ pub(crate) async fn register_live_sink(
                 endpoint,
                 access_key_id: access_key.to_string(),
                 secret_access_key: secret_key.to_string(),
-                session_token: None,
-                time_unit:
-                    broker_connectors_enterprise::timestream::TimestreamTimeUnit::Milliseconds,
-                measure_name_template: Some("${topic}".to_string()),
+                session_token: body
+                    .get("session_token")
+                    .or_else(|| body.get("token"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                time_unit,
+                measure_name_template: body
+                    .get("measure")
+                    .or_else(|| body.get("measure_name_template"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
                 dimensions,
                 multi_measure_mappings: measures,
                 batch_size: Some(1),
@@ -4086,7 +4802,10 @@ pub(crate) async fn register_live_sink(
                     engine.connectors().register(name, sink.clone());
                     engine
                         .connectors()
-                        .register(format!("timestream:{}", name), sink);
+                        .register(format!("timestream:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("aws_timestream:{}", name), sink);
                 }
             }
         }
@@ -6749,6 +7468,25 @@ mod connector_feature_tests {
     async fn test_disabled_clickhouse_names_feature() {
         expect_disabled("clickhouse", "clickhouse").await;
         expect_disabled("ch", "clickhouse").await;
+    }
+
+    #[cfg(feature = "clickhouse")]
+    #[tokio::test]
+    async fn test_ch_alias_registers_like_clickhouse() {
+        assert_eq!(live_sink_kind("ch"), "clickhouse");
+        let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+        try_register_live_sink(
+            &engine,
+            "ch",
+            "ch-test",
+            &serde_json::json!({"url": "http://127.0.0.1:9", "database": "db", "table": "t"}),
+        )
+        .await
+        .expect("ch must register through the clickhouse arm");
+        assert!(
+            engine.connectors().get("ch-test").is_some(),
+            "ch must leave a live sink"
+        );
     }
 
     #[cfg(not(feature = "elasticsearch"))]

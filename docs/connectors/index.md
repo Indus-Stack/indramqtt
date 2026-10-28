@@ -101,6 +101,14 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | [Redis](./redis.md) | Streams and keys. |
 | [InfluxDB](./influxdb.md) | Metrics. |
 | [ClickHouse](./clickhouse.md) | Analytics rows. |
+| [Cassandra](./cassandra.md) | Wide rows. |
+| [TDengine](./tdengine.md) | Super-table rows. |
+| [IoTDB](./iotdb.md) | Tablet rows. |
+| [Timestream](./timestream.md) | Table records. |
+| [Doris](./doris.md) | Stream loads. |
+| [OpenTSDB](./opentsdb.md) | Data points. |
+| [GreptimeDB](./greptimedb.md) | Table rows. |
+| [Datalayers](./datalayers.md) | Table rows. |
 | [HTTP webhook](./http.md) | Any HTTP receiver. |
 | [MQTT bridge](./mqtt-bridge.md) | A remote broker. |
 | [S3](./s3.md) | Object files. |
@@ -136,7 +144,7 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {key}"})
 with urllib.request.urlopen(req, timeout=5) as res:
     names = set(json.load(res))
-assert names == {"pgsql"}, names
+assert names == {"pgsql", "opents", "tdengine", "datalayers", "clickhouse", "greptimedb", "aws_timestream", "cassandra", "iotdb", "doris", "influxdb"}, names
 for pending in ("http", "mqtt", "kafka_producer", "redis", "mysql"):
     assert pending not in names, pending
 print("ok")

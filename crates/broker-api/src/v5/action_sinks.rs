@@ -8,19 +8,21 @@
 //! two actions on one connector with different statements route
 //! independently and stop sharing one sink.
 //!
-//! Bound (stated here and by construction): `pgsql` and the
-//! `webhook`/`http` pair build their sinks here (the two kinds the
-//! family ticket fully corrects). Every other action kind owns no
-//! runtime yet: it stores opaquely, registers nothing, reads
-//! `disconnected` with a reason, and a fire counts one `failed`
+//! Bound (stated here and by construction): `pgsql`, the
+//! `webhook`/`http` pair and the ten MV-02b time-series kinds build
+//! their sinks here. The ten kinds are `clickhouse`, `tdengine`,
+//! `greptimedb`, `iotdb`, `opentsdb`, `doris`, `datalayers`,
+//! `influxdb`, `timestream` and `cassandra`. Every other action kind
+//! owns no runtime yet. It stores opaquely and registers nothing. It
+//! reads `disconnected` with a reason. A fire counts one `failed`
 //! delivery against its per-action metrics. The kind families accept
 //! the same surface once they plot their data paths (KC-00).
 //!
-//! A build never opens a connection. The `pgsql` transport is lazy (the
-//! first send dials), the `webhook` client is constructed per rule body.
-//! The health worker dials the target on its configured interval.
-//! Persistence failures keep the old generation on every write path that
-//! uses this module.
+//! A build never opens a connection. The transports are lazy (the
+//! first send dials), the `webhook` client is constructed per rule
+//! body. The health worker dials the target on its configured
+//! interval. Persistence failures keep the old generation on every
+//! write path that uses this module.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -387,11 +389,48 @@ fn byte_error(id: &str, key: &str, value: &serde_json::Value) -> String {
     format!("action {id:?} field `resource_opts.{key}` value {value} is not a valid byte size")
 }
 
+/// Canonical runtime kind of one action type: the documented aliases
+/// map to the base kind that executes them (the KC-00 map owns each
+/// alias). Unknown names pass through unchanged; the caller rejects
+/// them before this runs.
+//
+// TODO(parity): should the statement parameters (sql, write_syntax,
+// cql) execute, or stay stored opaquely? The drivers take templates
+// only. The current choice stores them and renders the fixed row
+// shape until the checker pins it.
+pub(crate) fn canonical_action_kind(kind: &str) -> &str {
+    match kind {
+        "aws_timestream" => "timestream",
+        "opents" => "opentsdb",
+        "scylla" | "scylladb" | "cql" => "cassandra",
+        "greptime" => "greptimedb",
+        "ch" => "clickhouse",
+        _ => kind,
+    }
+}
+
 /// True when the action kind builds an owned sink here. The
 /// documented `http` action kind and the historic `webhook` base kind
-/// share one builder; `pgsql` covers `postgres`-filed rows.
+/// share one builder; `pgsql` covers `postgres`-filed rows; each
+/// MV-02b alias (for example `aws_timestream`) runs on the builder of
+/// its canonical kind.
 pub(crate) fn action_owned_kind(kind: &str) -> bool {
-    matches!(kind, "pgsql" | "webhook" | "http")
+    matches!(
+        canonical_action_kind(kind),
+        "pgsql"
+            | "webhook"
+            | "http"
+            | "clickhouse"
+            | "tdengine"
+            | "greptimedb"
+            | "iotdb"
+            | "opentsdb"
+            | "doris"
+            | "datalayers"
+            | "influxdb"
+            | "timestream"
+            | "cassandra"
+    )
 }
 
 /// Every connector reference an action record carries: the documented
@@ -1032,9 +1071,19 @@ pub(crate) fn build_action_sink(
     connector_doc: &serde_json::Value,
     opts: &ActionResourceOpts,
 ) -> Result<Option<Arc<dyn broker_connectors::Sink>>, String> {
-    match record.action_type.as_str() {
+    match canonical_action_kind(record.action_type.as_str()) {
         "pgsql" => build_pgsql_sink(record, connector_doc, opts).map(Some),
         "webhook" | "http" => build_webhook_sink(record, connector_doc).map(Some),
+        "clickhouse" => build_clickhouse_sink(record, connector_doc).map(Some),
+        "influxdb" => build_influxdb_sink(record, connector_doc).map(Some),
+        "greptimedb" => build_greptimedb_sink(record, connector_doc).map(Some),
+        "opentsdb" => build_opentsdb_sink(record, connector_doc).map(Some),
+        "tdengine" => build_tdengine_sink(record, connector_doc).map(Some),
+        "iotdb" => build_iotdb_sink(record, connector_doc).map(Some),
+        "doris" => build_doris_sink(record, connector_doc).map(Some),
+        "datalayers" => build_datalayers_sink(record, connector_doc).map(Some),
+        "timestream" => build_timestream_sink(record, connector_doc).map(Some),
+        "cassandra" => build_cassandra_sink(record, connector_doc).map(Some),
         // Other kinds own no runtime yet: no sink, no registration.
         // Delivery stays refused-by-default (the fire counts one
         // failure) until the kind plots its own data path (KC-00).
@@ -1091,15 +1140,185 @@ fn param_string(record: &ActionRecord, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Check the action-owned required parameters before the connector is
-/// resolved. Thus a dangling connector does not accept an action that
-/// is missing its own required field.
+/// Read one string-list parameter of the action record: each entry is
+/// trimmed, and blank entries are dropped. `None` when absent or blank.
+fn param_string_list(record: &ActionRecord, key: &str) -> Vec<String> {
+    param_value(record, key)
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when the value is a JSON object whose entries are all strings.
+fn is_string_map(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|map| map.values().all(|entry| entry.is_string()))
+}
+
+/// True when the value is a non-empty JSON object of strings.
+fn is_non_empty_string_map(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|map| !map.is_empty() && map.values().all(|entry| entry.is_string()))
+}
+
+/// True when the value is a non-empty JSON array of strings.
+fn is_non_empty_string_list(value: &serde_json::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| !items.is_empty() && items.iter().all(|item| item.is_string()))
+}
+
+/// Read one string-map parameter into owned pairs. Non-string entries
+/// are dropped; the caller validates emptiness first.
+fn param_string_map(record: &ActionRecord, key: &str) -> std::collections::HashMap<String, String> {
+    param_value(record, key)
+        .and_then(|v| v.as_object())
+        .map(|map| {
+            map.iter()
+                .filter_map(|(name, entry)| {
+                    entry.as_str().map(|text| (name.clone(), text.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Check the action-owned value shapes before the connector is
+/// resolved. Presence is checked later against the merged view (the
+/// action parameter, else the connector document), so a dangling
+/// connector still reports the dangling reference first. Thus a
+/// dangling connector does not accept an action that is missing its
+/// own required field.
 fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
     if record.action_type == "pgsql" && param_string(record, "sql").is_none() {
         return Err(format!(
             "action {:?} is missing required field: sql (field `parameters.sql`)",
             record.id
         ));
+    }
+    let bad = |field: &str, detail: String| {
+        format!("action {:?} field `parameters.{field}` {detail}", record.id)
+    };
+    match canonical_action_kind(record.action_type.as_str()) {
+        "influxdb" | "greptimedb" => {
+            if let Some(precision) = param_string(record, "precision") {
+                if !["s", "ms", "us", "ns"].contains(&precision.as_str()) {
+                    return Err(bad(
+                        "precision",
+                        format!("must be one of s, ms, us, ns: {precision:?}"),
+                    ));
+                }
+            }
+            if canonical_action_kind(record.action_type.as_str()) == "greptimedb" {
+                if let Some(format) = param_string(record, "format") {
+                    if !["sql", "influx"].contains(&format.as_str()) {
+                        return Err(bad(
+                            "format",
+                            format!("must be one of sql, influx: {format:?}"),
+                        ));
+                    }
+                }
+            }
+        }
+        "tdengine" => {
+            for field in ["metrics", "tags"] {
+                if let Some(value) = param_value(record, field) {
+                    if !is_non_empty_string_map(value) {
+                        return Err(bad(
+                            field,
+                            "must be a non-empty object of string templates".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        "iotdb" => {
+            for field in ["measurements", "types"] {
+                if let Some(value) = param_value(record, field) {
+                    if !is_non_empty_string_list(value) && !value.is_null() {
+                        return Err(bad(
+                            field,
+                            "must be a non-empty list of strings".to_string(),
+                        ));
+                    }
+                }
+            }
+            let measurements = param_string_list(record, "measurements");
+            let types = param_string_list(record, "types");
+            if !measurements.is_empty() || !types.is_empty() {
+                if measurements.len() != types.len() {
+                    return Err(bad(
+                        "types",
+                        "must hold the same count as `parameters.measurements`".to_string(),
+                    ));
+                }
+                for data_type in &types {
+                    if parse_iotdb_data_type(data_type).is_none() {
+                        return Err(bad(
+                            "types",
+                            format!("entry {data_type:?} must be one of boolean, int32, int64, float, double, text"),
+                        ));
+                    }
+                }
+            }
+        }
+        "doris" => {
+            if let Some(format) = param_string(record, "format") {
+                if format.to_lowercase() != "json" {
+                    return Err(bad(
+                        "format",
+                        "must be `json`: the driver writes JSON stream loads only".to_string(),
+                    ));
+                }
+            }
+        }
+        "timestream" => {
+            if let Some(precision) = param_string(record, "precision") {
+                if !["ms", "us", "ns"].contains(&precision.as_str()) {
+                    return Err(bad(
+                        "precision",
+                        format!("must be one of ms, us, ns: the driver has no second resolution ({precision:?})"),
+                    ));
+                }
+            }
+            if let Some(measures) = param_value(record, "measures") {
+                if !is_non_empty_string_map(measures) && !measures.is_null() {
+                    return Err(bad(
+                        "measures",
+                        "must be a non-empty object of field to measure type".to_string(),
+                    ));
+                }
+            }
+            if let Some(dimensions) = param_value(record, "dimensions") {
+                if !is_string_map(dimensions) && !dimensions.is_null() {
+                    return Err(bad(
+                        "dimensions",
+                        "must be an object of string templates".to_string(),
+                    ));
+                }
+            }
+        }
+        "opentsdb" => {
+            if let Some(tags) = param_value(record, "tags") {
+                if !is_string_map(tags) && !tags.is_null() {
+                    return Err(bad(
+                        "tags",
+                        "must be an object of string templates".to_string(),
+                    ));
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1271,6 +1490,1310 @@ pub(crate) fn build_webhook_sink(
         headers,
         reqwest::Client::new(),
     )))
+}
+
+/// Read one required connector field through its accepted key aliases.
+/// A missing or blank value fails with the connector and field named.
+fn connector_field(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    action_id: &str,
+    keys: &[&str],
+    field: &str,
+) -> Result<String, String> {
+    first_string(connector_doc, keys)
+        .map(|value| value.into_owned())
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: {field} (action {action_id:?})"
+            )
+        })
+}
+
+/// Normalize one HTTP(S) endpoint: a bare `host:port` reads as `http`.
+/// Reason: the reference documents bare `Host[:Port]` entries, while
+/// every driver below needs a URL scheme to dial.
+fn http_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+/// IoTDB REST endpoint: the driver posts `{endpoint}/insertTablet`
+/// and its contract names `http://host:port/rest/v2`. A bare
+/// `host:port` gains the `/rest/v2` base path; an endpoint that
+/// already carries a path is kept (trailing slashes trimmed).
+pub(crate) fn iotdb_endpoint(raw: &str) -> String {
+    let base = http_endpoint(raw).trim_end_matches('/').to_string();
+    let path = base
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split('/')
+        .nth(1)
+        .unwrap_or("");
+    if path.is_empty() {
+        format!("{base}/rest/v2")
+    } else {
+        base
+    }
+}
+
+/// Read the shared request-timeout knob (`timeout_ms`, `timeout`,
+/// `request_timeout_ms`) of one connector document.
+fn connector_timeout_ms(connector_doc: &serde_json::Value) -> Option<u64> {
+    connector_doc
+        .get("timeout_ms")
+        .or_else(|| connector_doc.get("timeout"))
+        .or_else(|| connector_doc.get("request_timeout_ms"))
+        .and_then(|value| value.as_u64())
+}
+
+/// Read one target field from the merged view: the action parameter
+/// first, else the connector document. The connector carries the full
+/// target (so the legacy connector-level path and SQL `INTO` keep
+/// working); the action overrides it per target. A value missing in
+/// both fails with the action and the connector field named.
+fn merged_field(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    action_key: &str,
+    connector_keys: &[&str],
+    field: &str,
+) -> Result<String, String> {
+    if let Some(value) = param_string(record, action_key) {
+        return Ok(value);
+    }
+    first_string(connector_doc, connector_keys)
+        .map(|value| value.into_owned())
+        .ok_or_else(|| {
+            let connector = record.connector.trim();
+            format!(
+                "action {:?} is missing required field: {field} (fields `parameters.{action_key}`, connector `{connector}`)",
+                record.id
+            )
+        })
+}
+
+/// Read one target map from the merged view: the action parameter
+/// first, else the connector document. Non-string entries are
+/// dropped; the caller checks emptiness.
+fn merged_map(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    action_key: &str,
+    connector_keys: &[&str],
+) -> std::collections::HashMap<String, String> {
+    let action_map = param_string_map(record, action_key);
+    if !action_map.is_empty() {
+        return action_map;
+    }
+    for key in connector_keys {
+        if let Some(object) = connector_doc.get(key).and_then(|value| value.as_object()) {
+            let map: std::collections::HashMap<String, String> = object
+                .iter()
+                .filter_map(|(name, entry)| {
+                    entry.as_str().map(|text| (name.clone(), text.to_string()))
+                })
+                .collect();
+            if !map.is_empty() {
+                return map;
+            }
+        }
+    }
+    std::collections::HashMap::new()
+}
+
+/// Read one target list from the merged view: the action parameter
+/// first, else the connector document.
+fn merged_list(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    action_key: &str,
+    connector_keys: &[&str],
+) -> Vec<String> {
+    let action_list = param_string_list(record, action_key);
+    if !action_list.is_empty() {
+        return action_list;
+    }
+    for key in connector_keys {
+        if let Some(items) = connector_doc.get(key).and_then(|value| value.as_array()) {
+            let list: Vec<String> = items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if !list.is_empty() {
+                return list;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Parse one IoTDB column type name (reference `data_type` values).
+fn parse_iotdb_data_type(name: &str) -> Option<broker_connectors_enterprise::iotdb::IotDbDataType> {
+    use broker_connectors_enterprise::iotdb::IotDbDataType;
+    match name.trim().to_lowercase().as_str() {
+        "boolean" => Some(IotDbDataType::Boolean),
+        "int32" => Some(IotDbDataType::Int32),
+        "int64" => Some(IotDbDataType::Int64),
+        "float" => Some(IotDbDataType::Float),
+        "double" => Some(IotDbDataType::Double),
+        "text" => Some(IotDbDataType::Text),
+        _ => None,
+    }
+}
+
+/// Build the action's `clickhouse` sink: the endpoint and database come
+/// from the connector; the action may override the target table.
+///
+/// Values and defaults:
+/// - `url`: the connector's `url` (aliases `endpoint`, `server`),
+///   required; a bare `host:port` reads as `http`.
+/// - `database`: the connector's `database`, required.
+/// - `username`: the connector's `username` (alias `user`); default
+///   `default`, the ClickHouse server-side default user.
+/// - `password`: the connector's `password`; default empty.
+/// - `table`: the connector's target table, required; the action
+///   parameter `table` overrides it per target.
+/// - `format`: the insert format; default `JSONEachRow`, the sink
+///   default row shape.
+/// - The action-owned path posts `JSONEachRow` rows over HTTP: that
+///   wire shape is proved by an in-repo loopback test on every run.
+///   The legacy connector-level path keeps the native row driver,
+///   whose shape the ignored qualification run proves.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+#[cfg(feature = "clickhouse")]
+pub(crate) fn build_clickhouse_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    let connector = record.connector.trim().to_string();
+    let raw_url = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["url", "endpoint", "server"],
+        "url",
+    )?;
+    let database = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["database"],
+        "database",
+    )?;
+    let username = first_string(connector_doc, &["username", "user"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "default".to_string());
+    let password = first_string(connector_doc, &["password"])
+        .map(|value| value.into_owned())
+        .unwrap_or_default();
+    let table = merged_field(
+        record,
+        connector_doc,
+        "table",
+        &["table", "table_template"],
+        "table",
+    )?;
+    let format = param_string(record, "format").unwrap_or_else(|| "JSONEachRow".to_string());
+    let config = broker_connectors::clickhouse::ClickHouseSinkConfig {
+        endpoint: http_endpoint(&raw_url),
+        database,
+        table,
+        format,
+        batch_size: 1,
+        batch_timeout_ms: 10,
+        username,
+        password,
+        request_timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport: std::sync::Arc<dyn broker_connectors::ClickHouseTransport> = std::sync::Arc::new(
+        broker_connectors::clickhouse::HttpClickHouseTransport::new(
+            &config,
+            reqwest::Client::new(),
+        )
+        .map_err(|error| {
+            format!(
+                "action {:?} cannot build its clickhouse transport: {error}",
+                record.id
+            )
+        })?,
+    );
+    let sink =
+        broker_connectors::clickhouse::ClickHouseSink::new(config, transport).map_err(|error| {
+            format!(
+                "action {:?} cannot build its clickhouse sink: {error}",
+                record.id
+            )
+        })?;
+    Ok(Arc::new(sink))
+}
+
+/// The default build compiles the ClickHouse driver out: the kind is
+/// known but the runtime is absent, so the build fails closed naming
+/// the missing feature.
+#[cfg(not(feature = "clickhouse"))]
+pub(crate) fn build_clickhouse_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `clickhouse` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Build the action's `influxdb` sink: the server, org, bucket and token
+/// come from the connector, the measurement from this action.
+///
+/// Values and defaults:
+/// - `server`: the connector's `server` (aliases `url`, `endpoint`);
+///   default `127.0.0.1:8086`, the reference connector default.
+/// - `bucket`, `org`, `token`: the connector's InfluxDB v2 identity,
+///   all required. Only the v2 shape is supported; a v1 or v3 body
+///   misses one of these fields and is refused naming it.
+/// - `measurement`: the connector's measurement template, required;
+///   the action parameter `measurement` overrides it per target.
+/// - `parameters.precision`: one of `s`, `ms`, `us`, `ns`; default
+///   `ms`, the reference action default.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+pub(crate) fn build_influxdb_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    let connector = record.connector.trim().to_string();
+    let raw_server = first_string(connector_doc, &["server", "url", "endpoint"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "127.0.0.1:8086".to_string());
+    let bucket = connector_field(connector_doc, &connector, &record.id, &["bucket"], "bucket")?;
+    let org = connector_field(connector_doc, &connector, &record.id, &["org"], "org")?;
+    let token = connector_field(connector_doc, &connector, &record.id, &["token"], "token")?;
+    let measurement = merged_field(
+        record,
+        connector_doc,
+        "measurement",
+        &["measurement", "measurement_template"],
+        "measurement",
+    )?;
+    let precision = param_string(record, "precision").unwrap_or_else(|| "ms".to_string());
+    let config = broker_connectors::InfluxDbSinkConfig {
+        endpoint: http_endpoint(&raw_server),
+        bucket,
+        org,
+        token,
+        measurement_template: measurement,
+        precision,
+        batch_size: 1,
+        batch_timeout_ms: 10,
+        request_timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let sink =
+        broker_connectors::InfluxDbSink::new(config, reqwest::Client::new()).map_err(|error| {
+            format!(
+                "action {:?} cannot build its influxdb sink: {error}",
+                record.id
+            )
+        })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `greptimedb` sink: the server, database and
+/// credentials come from the connector; the action may override the
+/// table.
+///
+/// Values and defaults:
+/// - `server`: the connector's `server` (aliases `url`, `endpoint`,
+///   `host`); default `127.0.0.1:4001`, the reference connector
+///   default. A bare host without a port dials `:8086`, the
+///   reference description default port.
+/// - `database`: the connector's `database` (alias `dbname`),
+///   required.
+/// - `username`/`password`: the connector's pair; both or neither (a
+///   half pair is refused fail closed, it cannot authenticate).
+/// - `table`: the connector's table template, required; the action
+///   parameter `table` overrides it per target.
+/// - `precision`: one of `s`, `ms`, `us`, `ns`; default `ms`, the
+///   reference action default. The action parameter wins; else the
+///   connector value applies.
+/// - `format`: `sql` or `influx`; default `sql`, the sink default
+///   write shape. The action parameter wins; else the connector
+///   value applies.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+pub(crate) fn build_greptimedb_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors::greptimedb::{
+        GreptimeDbConfig, GreptimeDbSink, GreptimeFormat, GreptimePrecision,
+        HttpGreptimeDbTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let raw_server = first_string(connector_doc, &["server", "url", "endpoint", "host"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "127.0.0.1:4001".to_string());
+    let endpoint = if raw_server.contains("://") {
+        raw_server.clone()
+    } else if raw_server.contains(':') {
+        format!("http://{raw_server}")
+    } else {
+        format!("http://{raw_server}:8086")
+    };
+    let database = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["database", "dbname"],
+        "database",
+    )?;
+    let username =
+        first_string(connector_doc, &["username", "user"]).map(|value| value.into_owned());
+    let password = first_string(connector_doc, &["password"]).map(|value| value.into_owned());
+    let auth = match (username, password) {
+        (Some(username), Some(password)) => {
+            Some(broker_connectors::greptimedb::GreptimeDbAuth { username, password })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(format!(
+                "connector {connector:?} fields `username` and `password` must be set together (action {:?})",
+                record.id
+            ));
+        }
+    };
+    let table = merged_field(
+        record,
+        connector_doc,
+        "table",
+        &["table", "table_template"],
+        "table",
+    )?;
+    let precision = match param_string(record, "precision")
+        .or_else(|| first_string(connector_doc, &["precision"]).map(|value| value.into_owned()))
+        .unwrap_or_else(|| "ms".to_string())
+        .as_str()
+    {
+        "ns" => GreptimePrecision::Nanosecond,
+        "us" => GreptimePrecision::Microsecond,
+        "ms" => GreptimePrecision::Millisecond,
+        "s" => GreptimePrecision::Second,
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.precision` must be one of s, ms, us, ns: {other:?}",
+                record.id
+            ));
+        }
+    };
+    let format = match param_string(record, "format")
+        .or_else(|| first_string(connector_doc, &["format"]).map(|value| value.into_owned()))
+        .unwrap_or_else(|| "sql".to_string())
+        .as_str()
+    {
+        "sql" => GreptimeFormat::SqlInsert,
+        "influx" => GreptimeFormat::InfluxLineProtocol,
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.format` must be one of sql, influx: {other:?}",
+                record.id
+            ));
+        }
+    };
+    let config = GreptimeDbConfig {
+        endpoint,
+        database,
+        auth,
+        format,
+        table_template: table,
+        timestamp_precision: precision,
+        batch_size: Some(1),
+        buffer_capacity: None,
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport = Arc::new(HttpGreptimeDbTransport::new(&config));
+    let sink = GreptimeDbSink::new(config, transport).map_err(|error| {
+        format!(
+            "action {:?} cannot build its greptimedb sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `opentsdb` sink: the endpoint comes from the
+/// connector; the action may override the metric and value field.
+///
+/// Values and defaults:
+/// - `server`: the connector's `server` (aliases `url`, `endpoint`),
+///   required; a `telnet://` scheme selects the telnet wire, `http`
+///   selects the HTTP wire.
+/// - `metric`: the connector's metric template, required; the action
+///   parameter `metric` overrides it per target.
+/// - `value`: the connector's value field, required; the action
+///   parameter `value` overrides it per target.
+/// - `parameters.tags`: this action's tag templates; default empty,
+///   and every point still carries the `topic` tag.
+/// - `summary`: ask for summary counters; default `true`, the
+///   reference default. The action parameter wins; else the
+///   connector value applies.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+pub(crate) fn build_opentsdb_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors::opentsdb::{
+        NetworkOpenTsdbTransport, OpenTsdbCompression, OpenTsdbConfig, OpenTsdbProtocol,
+        OpenTsdbSink,
+    };
+    let connector = record.connector.trim().to_string();
+    let raw_endpoint = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["server", "endpoint", "url"],
+        "server",
+    )?;
+    let protocol = if raw_endpoint.trim_start().starts_with("telnet://") {
+        OpenTsdbProtocol::Telnet
+    } else {
+        OpenTsdbProtocol::Http
+    };
+    let endpoint = match protocol {
+        OpenTsdbProtocol::Telnet => raw_endpoint.trim().to_string(),
+        OpenTsdbProtocol::Http => http_endpoint(&raw_endpoint),
+    };
+    let metric = merged_field(
+        record,
+        connector_doc,
+        "metric",
+        &["metric", "metric_template"],
+        "metric",
+    )?;
+    let value = merged_field(
+        record,
+        connector_doc,
+        "value",
+        &["value", "value_field"],
+        "value",
+    )?;
+    let tags = merged_map(record, connector_doc, "tags", &["tags", "tag_mappings"]);
+    let summary = param_value(record, "summary")
+        .and_then(|value| value.as_bool())
+        .or_else(|| {
+            connector_doc
+                .get("summary")
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(true);
+    let config = OpenTsdbConfig {
+        endpoint,
+        protocol,
+        metric_template: metric,
+        tag_mappings: tags,
+        value_field: value,
+        summary,
+        compression: OpenTsdbCompression::None,
+        batch_size: Some(1),
+        buffer_capacity: None,
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport = Arc::new(NetworkOpenTsdbTransport::new(&config));
+    let sink = OpenTsdbSink::new(config, transport).map_err(|error| {
+        format!(
+            "action {:?} cannot build its opentsdb sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `tdengine` sink: the endpoint and database come
+/// from the connector; the action may override the super-table,
+/// sub-table and row shape.
+///
+/// Values and defaults:
+/// - `server`: the connector's `server` (aliases `url`, `endpoint`),
+///   required; a bare `host:port` reads as `http`.
+/// - `database`: the connector's `database`, required.
+/// - `username`/`password`: default `root`/`taosdata`, the server-side
+///   default credentials.
+/// - `stable`: the connector's super-table, required; the action
+///   parameter `stable` overrides it per target.
+/// - `subtable`: the connector's sub-table template, required; the
+///   action parameter `subtable` overrides it per target.
+/// - `metrics`: the metric column templates (non-empty object),
+///   required in the merged view; the action parameter `metrics`
+///   overrides the connector value.
+/// - `tags`: the tag column templates (non-empty object), required
+///   in the merged view. The driver only writes super-table rows,
+///   which need at least one tag column.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+pub(crate) fn build_tdengine_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::tdengine::{
+        DriverTdengineTransport, HttpTdengineTransport, TdengineAuth, TdengineSink,
+        TdengineSinkConfig,
+    };
+    let connector = record.connector.trim().to_string();
+    let raw_server = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["server", "url", "endpoint"],
+        "server",
+    )?;
+    let database = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["database"],
+        "database",
+    )?;
+    let username =
+        first_string(connector_doc, &["username", "user"]).map(|value| value.into_owned());
+    let password = first_string(connector_doc, &["password"]).map(|value| value.into_owned());
+    let token =
+        first_string(connector_doc, &["token", "auth_token"]).map(|value| value.into_owned());
+    // A half Basic pair cannot authenticate: refuse it. A token
+    // selects token auth and never mixes with Basic. Absent
+    // credentials read the server-side defaults.
+    let auth = match (username, password, token) {
+        (Some(username), Some(password), None) => TdengineAuth::Basic { username, password },
+        (None, None, Some(token)) => TdengineAuth::Token { token },
+        (None, None, None) => TdengineAuth::Basic {
+            username: "root".to_string(),
+            password: "taosdata".to_string(),
+        },
+        _ => {
+            return Err(format!(
+                "connector {connector:?} fields `username` and `password` must be set together, and `token` never mixes with them (action {:?})",
+                record.id
+            ));
+        }
+    };
+    let stable = merged_field(
+        record,
+        connector_doc,
+        "stable",
+        &["stable", "stable_name", "table"],
+        "stable",
+    )?;
+    let subtable = merged_field(
+        record,
+        connector_doc,
+        "subtable",
+        &["subtable", "subtable_template"],
+        "subtable",
+    )?;
+    let metrics = merged_map(
+        record,
+        connector_doc,
+        "metrics",
+        &["metrics", "metrics_template"],
+    );
+    if metrics.is_empty() {
+        return Err(format!(
+            "action {:?} is missing required field: metrics (fields `parameters.metrics`, connector `metrics`)",
+            record.id
+        ));
+    }
+    let tags = merged_map(record, connector_doc, "tags", &["tags", "tags_template"]);
+    if tags.is_empty() {
+        return Err(format!(
+            "action {:?} is missing required field: tags (fields `parameters.tags`, connector `tags`)",
+            record.id
+        ));
+    }
+    let config = TdengineSinkConfig {
+        endpoint: http_endpoint(&raw_server),
+        database,
+        stable_name: stable,
+        subtable_template: subtable,
+        auth,
+        tags_template: tags,
+        metrics_template: metrics,
+        batch_size: Some(1),
+        batch_bytes: Some(1_048_576),
+        linger_ms: Some(10),
+        buffer_capacity: None,
+        max_retries: Some(4),
+        initial_backoff_ms: Some(100),
+        max_backoff_ms: Some(2_000),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    // Same production split as the connector path: Basic credentials
+    // over plaintext HTTP ride the maintained driver, anything else
+    // stays on the REST transport.
+    if config.use_driver() {
+        let transport = DriverTdengineTransport::new(&config).map_err(|error| {
+            format!(
+                "action {:?} cannot build its tdengine transport: {error}",
+                record.id
+            )
+        })?;
+        let sink = TdengineSink::new(config, Arc::new(transport)).map_err(|error| {
+            format!(
+                "action {:?} cannot build its tdengine sink: {error}",
+                record.id
+            )
+        })?;
+        return Ok(Arc::new(sink));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout())
+        .build()
+        .unwrap_or_default();
+    let transport = HttpTdengineTransport::new(&config, client).map_err(|error| {
+        format!(
+            "action {:?} cannot build its tdengine transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = TdengineSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its tdengine sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `iotdb` sink: the endpoint and credentials come
+/// from the connector; the action may override the device path and
+/// tablet columns.
+///
+/// Values and defaults:
+/// - `endpoint`: the connector's `endpoint` (aliases `server`, `url`,
+///   `base_url`), required; a bare `host:port` reads as `http` and
+///   gains the `/rest/v2` base path.
+/// - `username`/`password`: the connector's pair, both required (the
+///   tablet call authenticates every request).
+/// - `device`: the connector's device path template, required; the
+///   action parameter `device` overrides it per target.
+/// - `measurements`: the connector's column names (non-empty list),
+///   required in the merged view.
+/// - `types`: the connector's column types, one per measurement
+///   (`boolean`, `int32`, `int64`, `float`, `double`, `text`),
+///   required in the merged view.
+/// - Rows are never aligned (`is_aligned` false, the reference
+///   default).
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+pub(crate) fn build_iotdb_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::iotdb::{
+        HttpIotDbTransport, IotDbAuth, IotDbDataType, IotDbSink, IotDbSinkConfig,
+    };
+    let connector = record.connector.trim().to_string();
+    let raw_endpoint = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["endpoint", "server", "url", "base_url"],
+        "endpoint",
+    )?;
+    let username = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["username", "user"],
+        "username",
+    )?;
+    let password = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["password"],
+        "password",
+    )?;
+    let device = merged_field(
+        record,
+        connector_doc,
+        "device",
+        &["device", "device_path", "device_path_template"],
+        "device",
+    )?;
+    let measurements = merged_list(record, connector_doc, "measurements", &["measurements"]);
+    if measurements.is_empty() {
+        return Err(format!(
+            "action {:?} is missing required field: measurements (fields `parameters.measurements`, connector `measurements`)",
+            record.id
+        ));
+    }
+    let type_names = merged_list(record, connector_doc, "types", &["types", "data_types"]);
+    let mut data_types: Vec<IotDbDataType> = Vec::with_capacity(type_names.len());
+    for name in &type_names {
+        data_types.push(parse_iotdb_data_type(name).ok_or_else(|| {
+            format!(
+                "action {:?} field `parameters.types` entry {name:?} must be one of boolean, int32, int64, float, double, text",
+                record.id
+            )
+        })?);
+    }
+    if measurements.len() != data_types.len() {
+        return Err(format!(
+            "action {:?} fields `parameters.measurements` and `parameters.types` must hold the same count",
+            record.id
+        ));
+    }
+    let config = IotDbSinkConfig {
+        endpoint: iotdb_endpoint(&raw_endpoint),
+        device_path_template: device,
+        auth: IotDbAuth { username, password },
+        is_aligned: false,
+        measurements,
+        data_types,
+        batch_size: Some(1),
+        batch_bytes: Some(2_097_152),
+        linger_ms: Some(10),
+        max_retries: Some(3),
+        initial_backoff_ms: Some(100),
+        max_backoff_ms: Some(2_000),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout())
+        .build()
+        .unwrap_or_default();
+    let transport = HttpIotDbTransport::new(&config, client).map_err(|error| {
+        format!(
+            "action {:?} cannot build its iotdb transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = IotDbSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its iotdb sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `doris` sink: the front-end, database and
+/// credentials come from the connector; the action may override the
+/// target table.
+///
+/// Values and defaults:
+/// - `server`: the connector's `server` (aliases `fe_host`, `host`,
+///   `endpoint`), required.
+/// - `database`: the connector's `database`, required.
+/// - `username`: default `root`, the reference connector default.
+/// - `password`: the connector's `password`; default empty.
+/// - `table`: the connector's table, required; the action parameter
+///   `table` overrides it per target.
+/// - The driver writes JSON stream loads only; an explicit
+///   non-`json` `parameters.format` is refused.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+pub(crate) fn build_doris_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::doris::{
+        DorisAuth, DorisFormat, DorisSink, DorisSinkConfig, HttpDorisTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let raw_server = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["server", "fe_host", "host", "endpoint"],
+        "server",
+    )?;
+    let no_scheme = raw_server
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let fe_host = no_scheme
+        .split([':', '/'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if fe_host.is_empty() {
+        return Err(format!(
+            "connector {connector:?} is missing required field: server (action {:?})",
+            record.id
+        ));
+    }
+    // The port rides in `server` (`host:port`); an explicit
+    // `http_port` (alias `port`) wins, else the server port
+    // applies, else the Doris front-end default HTTP port.
+    let server_port = no_scheme
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .nth(1)
+        .and_then(|port| port.trim().parse::<u16>().ok());
+    let http_port = connector_doc
+        .get("http_port")
+        .or_else(|| connector_doc.get("port"))
+        .and_then(|value| value.as_u64())
+        .map(|port| port as u16)
+        .or(server_port)
+        .unwrap_or(8030);
+    // Default `8030`: the Doris front-end default HTTP port.
+    let database = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["database"],
+        "database",
+    )?;
+    let username = first_string(connector_doc, &["username", "user"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "root".to_string());
+    let password = first_string(connector_doc, &["password"])
+        .map(|value| value.into_owned())
+        .unwrap_or_default();
+    let table = merged_field(
+        record,
+        connector_doc,
+        "table",
+        &["table", "table_template"],
+        "table",
+    )?;
+    if let Some(format) = param_string(record, "format") {
+        if format.to_lowercase() != "json" {
+            return Err(format!(
+                "action {:?} field `parameters.format` must be `json`: the driver writes JSON stream loads only",
+                record.id
+            ));
+        }
+    }
+    let config = DorisSinkConfig {
+        fe_host,
+        http_port,
+        database,
+        table_template: table,
+        auth: DorisAuth { username, password },
+        format: DorisFormat::Json,
+        jsonpaths: None,
+        strip_outer_array: true,
+        max_filter_ratio: None,
+        batch_size: Some(1),
+        batch_bytes: Some(4_194_304),
+        linger_ms: Some(10),
+        max_retries: Some(3),
+        initial_backoff_ms: Some(100),
+        max_backoff_ms: Some(2_000),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    // No-redirect client: the transport replays auth and the label
+    // itself on the FE-to-BE hop (a stock client strips the
+    // authorization header when the back-end is another origin).
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout())
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
+    let transport = HttpDorisTransport::new(&config, client).map_err(|error| {
+        format!(
+            "action {:?} cannot build its doris transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = DorisSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its doris sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `datalayers` sink: the server, database and
+/// credentials come from the connector; the action may override the
+/// table.
+///
+/// Values and defaults:
+/// - `server`: the connector's `server` (aliases `url`, `endpoint`);
+///   default `127.0.0.1:8361`, the reference connector default.
+/// - `database`: the connector's `database`, required.
+/// - `auth_token` or `username`/`password`: the connector's
+///   credential, at most one mode (both modes, or a half Basic pair,
+///   are refused by the sink).
+/// - `table`: the connector's table, required; the action parameter
+///   `table` overrides it per target.
+/// - Stamps are always microseconds (the wire requirement); tag
+///   columns default to the `topic` tag and every payload field
+///   becomes a measured field.
+// TODO(parity): should datalayers honor a precision parameter, or is
+// the microsecond wire precision fixed? The current choice always
+// stamps microseconds until the checker pins it.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send, so the runtime owns the
+///   batch size.
+pub(crate) fn build_datalayers_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::datalayers::{
+        DatalayersConfig, DatalayersSink, HttpDatalayersTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let raw_server = first_string(connector_doc, &["server", "url", "endpoint"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "127.0.0.1:8361".to_string());
+    let database = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["database"],
+        "database",
+    )?;
+    let auth_token = first_string(connector_doc, &["auth_token", "token"])
+        .map(|value| value.into_owned())
+        .filter(|value| !value.trim().is_empty());
+    let username = first_string(connector_doc, &["username", "user"])
+        .map(|value| value.into_owned())
+        .filter(|value| !value.trim().is_empty());
+    let password = first_string(connector_doc, &["password"]).map(|value| value.into_owned());
+    let table = merged_field(
+        record,
+        connector_doc,
+        "table",
+        &["table", "measurement"],
+        "table",
+    )?;
+    let config = DatalayersConfig {
+        endpoint: http_endpoint(&raw_server),
+        database,
+        table,
+        auth_token,
+        username,
+        password,
+        timestamp_field: None,
+        tag_columns: Vec::new(),
+        field_columns: Vec::new(),
+        batch_size: Some(1),
+        buffer_capacity: None,
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport = Arc::new(HttpDatalayersTransport::new(&config));
+    let sink = DatalayersSink::new(config, transport).map_err(|error| {
+        format!(
+            "action {:?} cannot build its datalayers sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `timestream` sink: the database, region and
+/// credentials come from the connector; the action may override the
+/// table and measures.
+///
+/// Values and defaults:
+/// - `database`: the connector's `database` (alias `database_name`),
+///   required.
+/// - `region`: the connector's `region`, required.
+/// - `access_key_id`/`secret_access_key`: the connector's pair, both
+///   required (every write signs with them). A session token travels
+///   in the connector's `session_token` when present.
+/// - `table`: the connector's table, required; the action parameter
+///   `table` overrides it per target.
+/// - `measures`: the payload-field to measure type map (`DOUBLE`,
+///   `BIGINT`, `BOOLEAN`, `VARCHAR`, `TIMESTAMP`), required in the
+///   merged view.
+/// - `measure`: this action's measure name template; default
+///   `metrics`, the sink default. The action parameter wins; else
+///   the connector value applies.
+/// - `precision`: one of `ms`, `us`, `ns`; default `ms`, the
+///   reference action default. Seconds have no sink resolution and
+///   are refused. The action parameter wins; else the connector
+///   value applies.
+/// - `parameters.dimensions`: this action's extra dimension templates;
+///   default empty, and every record still carries the `topic`
+///   dimension.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+pub(crate) fn build_timestream_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::timestream::{
+        HttpTimestreamTransport, TimestreamSink, TimestreamSinkConfig, TimestreamTimeUnit,
+    };
+    let connector = record.connector.trim().to_string();
+    let database = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["database", "database_name", "db"],
+        "database",
+    )?;
+    let region = connector_field(connector_doc, &connector, &record.id, &["region"], "region")?;
+    let access_key_id = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["access_key_id", "access_key"],
+        "access_key_id",
+    )?;
+    let secret_access_key = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["secret_access_key", "secret_key"],
+        "secret_access_key",
+    )?;
+    let session_token = first_string(connector_doc, &["session_token", "token"])
+        .map(|value| value.into_owned())
+        .filter(|value| !value.is_empty());
+    let endpoint = first_string(connector_doc, &["endpoint", "url"])
+        .map(|value| value.into_owned())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| http_endpoint(&value));
+    let table = merged_field(
+        record,
+        connector_doc,
+        "table",
+        &["table", "table_name"],
+        "table",
+    )?;
+    let measures = merged_map(
+        record,
+        connector_doc,
+        "measures",
+        &["measures", "multi_measure_mappings"],
+    );
+    if measures.is_empty() {
+        return Err(format!(
+            "action {:?} is missing required field: measures (fields `parameters.measures`, connector `measures`)",
+            record.id
+        ));
+    }
+    let measure = param_string(record, "measure").or_else(|| {
+        first_string(connector_doc, &["measure", "measure_name_template"])
+            .map(|value| value.into_owned())
+    });
+    let time_unit = match param_string(record, "precision")
+        .or_else(|| first_string(connector_doc, &["precision"]).map(|value| value.into_owned()))
+        .unwrap_or_else(|| "ms".to_string())
+        .as_str()
+    {
+        "ms" => TimestreamTimeUnit::Milliseconds,
+        "us" => TimestreamTimeUnit::Microseconds,
+        "ns" => TimestreamTimeUnit::Nanoseconds,
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.precision` must be one of ms, us, ns: the driver has no second resolution ({other:?})",
+                record.id
+            ));
+        }
+    };
+    let dimensions = merged_map(record, connector_doc, "dimensions", &["dimensions"]);
+    let config = TimestreamSinkConfig {
+        database_name: database,
+        table_name: table,
+        region,
+        endpoint,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        dimensions,
+        time_unit,
+        measure_name_template: measure,
+        multi_measure_mappings: measures,
+        batch_size: Some(1),
+        batch_bytes: Some(1_048_576),
+        linger_ms: Some(10),
+        max_retries: Some(4),
+        initial_backoff_ms: Some(100),
+        max_backoff_ms: Some(2_500),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport =
+        HttpTimestreamTransport::new(&config, reqwest::Client::new()).map_err(|error| {
+            format!(
+                "action {:?} cannot build its timestream transport: {error}",
+                record.id
+            )
+        })?;
+    let sink = TimestreamSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its timestream sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `cassandra` sink: the seeds, keyspace and
+/// table come from the connector; the action may override the table
+/// and partition key.
+///
+/// Values and defaults:
+/// - `servers`: the connector's `servers` (aliases `server`,
+///   `contact_points`), required; entries are `host` or
+///   `host:port` (default port 9042).
+/// - `keyspace`: the connector's `keyspace`, required.
+/// - `username`/`password`: the connector's pair; both or neither (a
+///   half pair is refused fail closed, it cannot authenticate).
+/// - `table`: the connector's table, required; the action parameter
+///   `table` overrides it per target. The value must match
+///   `[A-Za-z0-9_]+`: the driver binds one fixed CQL shape per action.
+/// - `partition_key`: the token routing template; default
+///   `${client_id}`, the client identity routes each row to its token
+///   owner. The action parameter `partition_key` overrides it.
+/// - Each row binds `(device id, bucket hour, event time, payload)`
+///   with `LOCAL_QUORUM`, the sink default consistency.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with a short linger, so the
+///   runtime owns the batch size and the batch timer.
+#[cfg(feature = "cassandra")]
+pub(crate) fn build_cassandra_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::cassandra::{
+        CassandraAuth, CassandraSink, CassandraSinkConfig, CqlConsistency, ScyllaCassandraTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let raw_servers = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["servers", "server", "contact_points"],
+        "servers",
+    )?;
+    let contact_points: Vec<String> = raw_servers
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    if contact_points.is_empty() {
+        return Err(format!(
+            "connector {connector:?} is missing required field: servers (action {:?})",
+            record.id
+        ));
+    }
+    let keyspace = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["keyspace"],
+        "keyspace",
+    )?;
+    let username =
+        first_string(connector_doc, &["username", "user"]).map(|value| value.into_owned());
+    let password = first_string(connector_doc, &["password"]).map(|value| value.into_owned());
+    let auth = match (username, password) {
+        (Some(username), Some(password)) => CassandraAuth::Password { username, password },
+        (None, None) => CassandraAuth::None,
+        _ => {
+            return Err(format!(
+                "connector {connector:?} fields `username` and `password` must be set together (action {:?})",
+                record.id
+            ));
+        }
+    };
+    let table = merged_field(
+        record,
+        connector_doc,
+        "table",
+        &["table", "table_template"],
+        "table",
+    )?;
+    if !is_cassandra_table(&table) {
+        return Err(format!(
+            "action {:?} field `parameters.table` must match [A-Za-z0-9_]+: {table:?}",
+            record.id
+        ));
+    }
+    let partition_key = param_string(record, "partition_key")
+        .or_else(|| {
+            first_string(connector_doc, &["partition_key", "partition_key_template"])
+                .map(|value| value.into_owned())
+        })
+        .unwrap_or_else(|| "${client_id}".to_string());
+    // Default `${client_id}`: the client identity routes each row to
+    // its token owner.
+    // The CQL text carries `keyspace.table`: the Scylla
+    // transport prepares the statement text as given, so a bare
+    // table never resolves. Both parts are validated identifiers.
+    let cql = format!(
+        "INSERT INTO {keyspace}.{table} (device_id, bucket_hour, event_time, payload) VALUES (?, ?, ?, ?)"
+    );
+    let config = CassandraSinkConfig {
+        contact_points,
+        keyspace,
+        table_template: table,
+        auth,
+        consistency: CqlConsistency::LocalQuorum,
+        partition_key_template: partition_key,
+        cql_statement_template: cql,
+        ttl_secs: None,
+        batch_size: Some(1),
+        batch_bytes: Some(1_048_576),
+        linger_ms: Some(10),
+        max_retries: Some(4),
+        initial_backoff_ms: Some(100),
+        max_backoff_ms: Some(2_000),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport = ScyllaCassandraTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its cassandra transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = CassandraSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its cassandra sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// True when the table value fits the fixed CQL shape (the driver
+/// binds one statement text per action).
+#[cfg(feature = "cassandra")]
+fn is_cassandra_table(table: &str) -> bool {
+    !table.is_empty()
+        && table
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The default build compiles the Cassandra driver out: the kind is
+/// known but the runtime is absent, so the build fails closed naming
+/// the missing feature.
+#[cfg(not(feature = "cassandra"))]
+pub(crate) fn build_cassandra_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `cassandra` (disabled in this build)",
+        record.id
+    ))
 }
 
 /// Bring every stored action's owned runtime sink in step with the
@@ -1600,6 +3123,579 @@ mod tests {
         )
         .expect("a valid connector plus legacy sql builds");
         assert_eq!(sink.kind(), "postgres");
+    }
+
+    #[test]
+    fn canonical_action_kind_maps_every_mv02b_alias() {
+        assert_eq!(canonical_action_kind("aws_timestream"), "timestream");
+        assert_eq!(canonical_action_kind("opents"), "opentsdb");
+        assert_eq!(canonical_action_kind("scylla"), "cassandra");
+        assert_eq!(canonical_action_kind("scylladb"), "cassandra");
+        assert_eq!(canonical_action_kind("cql"), "cassandra");
+        assert_eq!(canonical_action_kind("greptime"), "greptimedb");
+        assert_eq!(canonical_action_kind("ch"), "clickhouse");
+        assert_eq!(canonical_action_kind("timestream"), "timestream");
+        assert_eq!(canonical_action_kind("mqtt_bridge"), "mqtt_bridge");
+    }
+
+    #[test]
+    fn action_owned_kind_covers_the_mv02b_kinds() {
+        for kind in [
+            "pgsql",
+            "webhook",
+            "http",
+            "clickhouse",
+            "tdengine",
+            "greptimedb",
+            "iotdb",
+            "opentsdb",
+            "doris",
+            "datalayers",
+            "influxdb",
+            "timestream",
+            "cassandra",
+            "aws_timestream",
+            "opents",
+            "scylla",
+            "scylladb",
+            "cql",
+            "greptime",
+            "ch",
+        ] {
+            assert!(action_owned_kind(kind), "{kind} owns a runtime");
+        }
+        assert!(!action_owned_kind("mqtt_bridge"));
+        assert!(!action_owned_kind("kafka"));
+    }
+
+    fn mv02b_record(
+        id: &str,
+        action_type: &str,
+        connector: &str,
+        parameters: serde_json::Value,
+    ) -> ActionRecord {
+        ActionRecord {
+            parameters,
+            ..record(id, action_type, connector)
+        }
+    }
+
+    /// Read the shape error of present-but-invalid action parameters.
+    /// Presence is checked against the merged view (action parameter,
+    /// else connector document) by the builders below.
+    fn invalid_action_shape(
+        action_type: &str,
+        connector: &str,
+        parameters: serde_json::Value,
+    ) -> String {
+        let rec = mv02b_record("act", action_type, connector, parameters);
+        required_action_parameters(&rec).expect_err("an invalid action shape refuses")
+    }
+
+    #[cfg(feature = "clickhouse")]
+    #[tokio::test]
+    async fn clickhouse_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "clickhouse",
+            "clickhouse:up",
+            serde_json::json!({"table": "events"}),
+        );
+        let error = build_clickhouse_sink(&rec, &serde_json::json!({"database": "db"}))
+            .err()
+            .expect("a missing url refuses");
+        assert!(error.contains("url"), "{error}");
+        // A table missing in both the action and the connector refuses.
+        let bare = mv02b_record("act", "clickhouse", "clickhouse:up", serde_json::json!({}));
+        let error = build_clickhouse_sink(
+            &bare,
+            &serde_json::json!({"url": "http://127.0.0.1:8123", "database": "db"}),
+        )
+        .err()
+        .expect("a table missing in both refuses");
+        assert!(error.contains("table"), "{error}");
+        // The connector table covers a bare action (merged view).
+        let sink = build_clickhouse_sink(
+            &bare,
+            &serde_json::json!({"url": "http://127.0.0.1:8123", "database": "db", "table": "events"}),
+        )
+        .expect("a connector table covers a bare action");
+        assert_eq!(sink.kind(), "clickhouse");
+        let sink = build_clickhouse_sink(
+            &rec,
+            &serde_json::json!({"url": "http://127.0.0.1:8123", "database": "db"}),
+        )
+        .expect("a full clickhouse pair builds");
+        assert_eq!(sink.kind(), "clickhouse");
+    }
+
+    #[tokio::test]
+    async fn influxdb_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "influxdb",
+            "influxdb:up",
+            serde_json::json!({"measurement": "m"}),
+        );
+        let error = build_influxdb_sink(&rec, &serde_json::json!({"bucket": "b", "org": "o"}))
+            .err()
+            .expect("a missing token refuses");
+        assert!(error.contains("token"), "{error}");
+        let bare = mv02b_record("act", "influxdb", "influxdb:up", serde_json::json!({}));
+        let error = build_influxdb_sink(
+            &bare,
+            &serde_json::json!({"server": "127.0.0.1:8086", "bucket": "b", "org": "o", "token": "t"}),
+        )
+        .err()
+        .expect("a measurement missing in both refuses");
+        assert!(error.contains("measurement"), "{error}");
+        let error = invalid_action_shape(
+            "influxdb",
+            "influxdb:up",
+            serde_json::json!({"measurement": "m", "precision": "fortnight"}),
+        );
+        assert!(error.contains("precision"), "{error}");
+        for precision in ["s", "ms", "us", "ns"] {
+            let rec = mv02b_record(
+                "act",
+                "influxdb",
+                "influxdb:up",
+                serde_json::json!({"measurement": "m", "precision": precision}),
+            );
+            let sink = build_influxdb_sink(
+                &rec,
+                &serde_json::json!({"server": "127.0.0.1:8086", "bucket": "b", "org": "o", "token": "t"}),
+            )
+            .expect("every precision builds");
+            assert_eq!(sink.kind(), "influxdb");
+        }
+    }
+
+    #[tokio::test]
+    async fn greptimedb_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "greptimedb",
+            "greptimedb:up",
+            serde_json::json!({"table": "events"}),
+        );
+        let error = build_greptimedb_sink(&rec, &serde_json::json!({"server": "127.0.0.1:4001"}))
+            .err()
+            .expect("a missing database refuses");
+        assert!(error.contains("database"), "{error}");
+        let bare = mv02b_record("act", "greptimedb", "greptimedb:up", serde_json::json!({}));
+        let error = build_greptimedb_sink(
+            &bare,
+            &serde_json::json!({"server": "127.0.0.1:4001", "database": "db"}),
+        )
+        .err()
+        .expect("a table missing in both refuses");
+        assert!(error.contains("table"), "{error}");
+        let error = invalid_action_shape(
+            "greptimedb",
+            "greptimedb:up",
+            serde_json::json!({"table": "t", "precision": "fortnight"}),
+        );
+        assert!(error.contains("precision"), "{error}");
+        let error = build_greptimedb_sink(
+            &rec,
+            &serde_json::json!({"server": "127.0.0.1:4001", "database": "db", "username": "u"}),
+        )
+        .err()
+        .expect("a half credential pair refuses");
+        assert!(error.contains("username"), "{error}");
+        for (precision, format) in [
+            ("s", "sql"),
+            ("ms", "influx"),
+            ("us", "sql"),
+            ("ns", "influx"),
+        ] {
+            let rec = mv02b_record(
+                "act",
+                "greptime",
+                "greptimedb:up",
+                serde_json::json!({"table": "events", "precision": precision, "format": format}),
+            );
+            let sink = build_greptimedb_sink(
+                &rec,
+                &serde_json::json!({"server": "127.0.0.1:4001", "dbname": "public"}),
+            )
+            .expect("every precision and format builds");
+            assert_eq!(sink.kind(), "greptimedb");
+        }
+    }
+
+    #[tokio::test]
+    async fn opentsdb_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "opentsdb",
+            "opentsdb:up",
+            serde_json::json!({"metric": "m", "value": "${payload.temp}"}),
+        );
+        let error = build_opentsdb_sink(&rec, &serde_json::json!({}))
+            .err()
+            .expect("a missing server refuses");
+        assert!(error.contains("server"), "{error}");
+        let bare = mv02b_record("act", "opentsdb", "opentsdb:up", serde_json::json!({}));
+        let error = build_opentsdb_sink(
+            &bare,
+            &serde_json::json!({"server": "http://127.0.0.1:4242"}),
+        )
+        .err()
+        .expect("a metric missing in both refuses");
+        assert!(error.contains("metric"), "{error}");
+        // The connector metric and value cover a bare action.
+        let sink = build_opentsdb_sink(
+            &bare,
+            &serde_json::json!({"server": "http://127.0.0.1:4242", "metric": "m", "value": "temperature"}),
+        )
+        .expect("connector fields cover a bare action");
+        assert_eq!(sink.kind(), "opentsdb");
+        for endpoint in ["http://127.0.0.1:4242", "telnet://127.0.0.1:4242"] {
+            let sink = build_opentsdb_sink(&rec, &serde_json::json!({"server": endpoint}))
+                .expect("both wire schemes build");
+            assert_eq!(sink.kind(), "opentsdb");
+        }
+    }
+
+    #[tokio::test]
+    async fn tdengine_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "tdengine",
+            "tdengine:up",
+            serde_json::json!({
+                "stable": "meters",
+                "subtable": "d_${client_id}",
+                "metrics": {"temp": "${payload.temperature}"},
+                "tags": {"location": "room1"},
+            }),
+        );
+        let error = build_tdengine_sink(&rec, &serde_json::json!({"database": "power"}))
+            .err()
+            .expect("a missing server refuses");
+        assert!(error.contains("server"), "{error}");
+        let bare = mv02b_record("act", "tdengine", "tdengine:up", serde_json::json!({}));
+        let error = build_tdengine_sink(
+            &bare,
+            &serde_json::json!({"server": "127.0.0.1:6041", "database": "power"}),
+        )
+        .err()
+        .expect("a stable missing in both refuses");
+        assert!(error.contains("stable"), "{error}");
+        let error = invalid_action_shape(
+            "tdengine",
+            "tdengine:up",
+            serde_json::json!({"stable": "s", "subtable": "d", "metrics": {"m": "1"}, "tags": {}}),
+        );
+        assert!(error.contains("tags"), "{error}");
+        let sink = build_tdengine_sink(
+            &rec,
+            &serde_json::json!({"server": "127.0.0.1:6041", "database": "power"}),
+        )
+        .expect("a full tdengine pair builds");
+        assert_eq!(sink.kind(), "tdengine");
+    }
+
+    #[tokio::test]
+    async fn mv02b_connector_level_settings_apply_and_refuse() {
+        // IoTDB: a bare host gains `/rest/v2`; a carried path stays.
+        assert_eq!(
+            iotdb_endpoint("127.0.0.1:6667"),
+            "http://127.0.0.1:6667/rest/v2"
+        );
+        assert_eq!(iotdb_endpoint("http://h:1/rest/v2"), "http://h:1/rest/v2");
+        assert_eq!(iotdb_endpoint("http://h:1/rest/v2/"), "http://h:1/rest/v2");
+        // TDengine: a half Basic pair refuses; a token builds.
+        let rec = mv02b_record("act", "tdengine", "tdengine:up", serde_json::json!({}));
+        let base = serde_json::json!({"server": "127.0.0.1:6041", "database": "power",
+            "stable": "s", "subtable": "d",
+            "metrics": {"m": "1"}, "tags": {"t": "2"}});
+        let mut half = base.clone();
+        half["username"] = serde_json::json!("u");
+        let error = build_tdengine_sink(&rec, &half)
+            .err()
+            .expect("a half credential pair refuses");
+        assert!(error.contains("together"), "{error}");
+        let mut both = base.clone();
+        both["username"] = serde_json::json!("u");
+        both["password"] = serde_json::json!("p");
+        both["token"] = serde_json::json!("tok");
+        let error = build_tdengine_sink(&rec, &both)
+            .err()
+            .expect("a token mixed with Basic refuses");
+        assert!(error.contains("token"), "{error}");
+        let mut token = base.clone();
+        token["token"] = serde_json::json!("tok");
+        let sink = build_tdengine_sink(&rec, &token).expect("a token builds");
+        assert_eq!(sink.kind(), "tdengine");
+        // GreptimeDB: the connector precision and format apply; an
+        // unknown connector value refuses.
+        let grec = mv02b_record("act", "greptimedb", "greptimedb:up", serde_json::json!({}));
+        let error = build_greptimedb_sink(
+            &grec,
+            &serde_json::json!({"server": "127.0.0.1:4001", "database": "db",
+                "table": "t", "precision": "fortnight"}),
+        )
+        .err()
+        .expect("an unknown connector precision refuses");
+        assert!(error.contains("precision"), "{error}");
+        let sink = build_greptimedb_sink(
+            &grec,
+            &serde_json::json!({"server": "127.0.0.1:4001", "database": "db",
+                "table": "t", "precision": "s", "format": "influx"}),
+        )
+        .expect("a connector precision and format builds");
+        assert_eq!(sink.kind(), "greptimedb");
+        // Timestream: the connector precision applies; an unknown
+        // connector value refuses.
+        let trec = mv02b_record("act", "timestream", "timestream:up", serde_json::json!({}));
+        let error = build_timestream_sink(
+            &trec,
+            &serde_json::json!({"database": "db", "table": "m", "region": "r",
+                "access_key_id": "k", "secret_access_key": "s",
+                "measures": {"f": "DOUBLE"}, "precision": "s"}),
+        )
+        .err()
+        .expect("an unknown connector precision refuses");
+        assert!(error.contains("precision"), "{error}");
+        let sink = build_timestream_sink(
+            &trec,
+            &serde_json::json!({"database": "db", "table": "m", "region": "r",
+                "access_key_id": "k", "secret_access_key": "s",
+                "measures": {"f": "DOUBLE"}, "precision": "us"}),
+        )
+        .expect("a connector precision builds");
+        assert_eq!(sink.kind(), "timestream");
+    }
+
+    #[tokio::test]
+    async fn iotdb_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "iotdb",
+            "iotdb:up",
+            serde_json::json!({"device": "root.factory.d1", "measurements": ["temperature"], "types": ["float"]}),
+        );
+        let error = build_iotdb_sink(
+            &rec,
+            &serde_json::json!({"endpoint": "http://127.0.0.1:6667", "username": "root"}),
+        )
+        .err()
+        .expect("a missing password refuses");
+        assert!(error.contains("password"), "{error}");
+        let bare = mv02b_record("act", "iotdb", "iotdb:up", serde_json::json!({}));
+        let error = build_iotdb_sink(
+            &bare,
+            &serde_json::json!({"endpoint": "http://127.0.0.1:6667", "username": "root", "password": "root"}),
+        )
+        .err()
+        .expect("a device missing in both refuses");
+        assert!(error.contains("device"), "{error}");
+        let error = invalid_action_shape(
+            "iotdb",
+            "iotdb:up",
+            serde_json::json!({"device": "root.d", "measurements": ["a", "b"], "types": ["float"]}),
+        );
+        assert!(error.contains("same count"), "{error}");
+        let error = invalid_action_shape(
+            "iotdb",
+            "iotdb:up",
+            serde_json::json!({"device": "root.d", "measurements": ["a"], "types": ["furlong"]}),
+        );
+        assert!(error.contains("types"), "{error}");
+        let sink = build_iotdb_sink(
+            &rec,
+            &serde_json::json!({"endpoint": "http://127.0.0.1:6667", "username": "root", "password": "root"}),
+        )
+        .expect("a full iotdb pair builds");
+        assert_eq!(sink.kind(), "iotdb");
+    }
+
+    #[tokio::test]
+    async fn doris_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "doris",
+            "doris:up",
+            serde_json::json!({"table": "events"}),
+        );
+        let error = build_doris_sink(&rec, &serde_json::json!({"database": "db"}))
+            .err()
+            .expect("a missing server refuses");
+        assert!(error.contains("server"), "{error}");
+        let bare = mv02b_record("act", "doris", "doris:up", serde_json::json!({}));
+        let error = build_doris_sink(
+            &bare,
+            &serde_json::json!({"server": "127.0.0.1", "database": "db"}),
+        )
+        .err()
+        .expect("a table missing in both refuses");
+        assert!(error.contains("table"), "{error}");
+        let error = invalid_action_shape(
+            "doris",
+            "doris:up",
+            serde_json::json!({"table": "t", "format": "csv"}),
+        );
+        assert!(error.contains("format"), "{error}");
+        let sink = build_doris_sink(
+            &rec,
+            &serde_json::json!({"server": "127.0.0.1", "database": "db"}),
+        )
+        .expect("a full doris pair builds");
+        assert_eq!(sink.kind(), "doris");
+    }
+
+    #[tokio::test]
+    async fn datalayers_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "datalayers",
+            "datalayers:up",
+            serde_json::json!({"table": "events"}),
+        );
+        let error = build_datalayers_sink(&rec, &serde_json::json!({"server": "127.0.0.1:8360"}))
+            .err()
+            .expect("a missing database refuses");
+        assert!(error.contains("database"), "{error}");
+        let bare = mv02b_record("act", "datalayers", "datalayers:up", serde_json::json!({}));
+        let error = build_datalayers_sink(
+            &bare,
+            &serde_json::json!({"server": "127.0.0.1:8360", "database": "db"}),
+        )
+        .err()
+        .expect("a table missing in both refuses");
+        assert!(error.contains("table"), "{error}");
+        let error = build_datalayers_sink(
+            &rec,
+            &serde_json::json!({"server": "127.0.0.1:8360", "database": "db", "auth_token": "t", "username": "u"}),
+        )
+        .err()
+        .expect("conflicting auth modes refuse");
+        assert!(error.contains("auth"), "{error}");
+        let sink = build_datalayers_sink(
+            &rec,
+            &serde_json::json!({"server": "127.0.0.1:8360", "database": "db"}),
+        )
+        .expect("a full datalayers pair builds");
+        assert_eq!(sink.kind(), "datalayers");
+    }
+
+    #[tokio::test]
+    async fn timestream_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "timestream",
+            "timestream:up",
+            serde_json::json!({"table": "metrics", "measures": {"temperature": "DOUBLE"}}),
+        );
+        let error = build_timestream_sink(
+            &rec,
+            &serde_json::json!({"database": "db", "region": "us-east-1", "access_key_id": "k"}),
+        )
+        .err()
+        .expect("a missing secret refuses");
+        assert!(error.contains("secret_access_key"), "{error}");
+        let bare = mv02b_record("act", "timestream", "timestream:up", serde_json::json!({}));
+        let full_connector = serde_json::json!({"database": "db", "region": "us-east-1", "access_key_id": "k", "secret_access_key": "s"});
+        let error = build_timestream_sink(&bare, &full_connector)
+            .err()
+            .expect("a table missing in both refuses");
+        assert!(error.contains("table"), "{error}");
+        let error = build_timestream_sink(
+            &mv02b_record(
+                "act",
+                "timestream",
+                "timestream:up",
+                serde_json::json!({"table": "t"}),
+            ),
+            &full_connector,
+        )
+        .err()
+        .expect("measures missing in both refuse");
+        assert!(error.contains("measures"), "{error}");
+        let error = invalid_action_shape(
+            "timestream",
+            "timestream:up",
+            serde_json::json!({"table": "t", "measures": {"m": "DOUBLE"}, "precision": "s"}),
+        );
+        assert!(error.contains("precision"), "{error}");
+        let sink = build_timestream_sink(
+            &rec,
+            &serde_json::json!({"database": "db", "region": "us-east-1", "access_key_id": "k", "secret_access_key": "s"}),
+        )
+        .expect("a full timestream pair builds");
+        assert_eq!(sink.kind(), "timestream");
+    }
+
+    #[cfg(feature = "cassandra")]
+    #[tokio::test]
+    async fn cassandra_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "cassandra",
+            "cassandra:up",
+            serde_json::json!({"table": "events"}),
+        );
+        let error = build_cassandra_sink(&rec, &serde_json::json!({"keyspace": "ks"}))
+            .err()
+            .expect("missing servers refuse");
+        assert!(error.contains("servers"), "{error}");
+        let bare = mv02b_record("act", "scylla", "cassandra:up", serde_json::json!({}));
+        let error = build_cassandra_sink(
+            &bare,
+            &serde_json::json!({"servers": "127.0.0.1:9042", "keyspace": "telemetry"}),
+        )
+        .err()
+        .expect("a table missing in both refuses");
+        assert!(error.contains("table"), "{error}");
+        let invalid = mv02b_record(
+            "act",
+            "cql",
+            "cassandra:up",
+            serde_json::json!({"table": "has space"}),
+        );
+        let error = build_cassandra_sink(
+            &invalid,
+            &serde_json::json!({"servers": "127.0.0.1:9042", "keyspace": "telemetry"}),
+        )
+        .err()
+        .expect("a non-identifier table refuses");
+        assert!(error.contains("table"), "{error}");
+        let sink = build_cassandra_sink(
+            &rec,
+            &serde_json::json!({"servers": "127.0.0.1:9042", "keyspace": "telemetry"}),
+        )
+        .expect("a full cassandra pair builds");
+        assert_eq!(sink.kind(), "cassandra");
+    }
+
+    #[tokio::test]
+    async fn mv02b_stage_builds_the_sink_live_through_the_connector_store() {
+        let connectors = ConnectorStore::new();
+        connectors.upsert(serde_json::json!({
+            "id": "influxdb:up",
+            "name": "up",
+            "type": "influxdb",
+            "server": "127.0.0.1:8086",
+            "bucket": "b",
+            "org": "o",
+            "token": "t",
+        }));
+        let stage = stage_action_sink(
+            &connectors,
+            &mv02b_record(
+                "act",
+                "influxdb",
+                "influxdb:up",
+                serde_json::json!({"measurement": "m"}),
+            ),
+        )
+        .expect("a resolvable influxdb connector stages");
+        assert_eq!(stage.wiring, ActionWiring::Live);
+        let sink = stage.sink.expect("live wiring carries the sink");
+        assert_eq!(sink.kind(), "influxdb");
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};

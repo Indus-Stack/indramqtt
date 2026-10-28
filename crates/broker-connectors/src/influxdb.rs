@@ -123,11 +123,15 @@ fn escape_tag(value: &str) -> String {
         .replace(',', "\\,")
         .replace('=', "\\=")
         .replace(' ', "\\ ")
+        .replace('\n', "\\n")
 }
 
-/// Escape double quotes and backslashes in string field values.
+/// Escape double quotes, backslashes and newlines in string field values.
 fn escape_field_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn timestamp_for(precision: &str) -> i64 {

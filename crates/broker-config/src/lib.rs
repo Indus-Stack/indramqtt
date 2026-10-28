@@ -130,6 +130,13 @@ pub const KNOWN_CONNECTOR_TYPES: &[&str] = &[
     "sqlserver",
     "dynamo",
     "timescale",
+    // MV-02b time-series aliases. The KC-00 map owns each alias; each
+    // maps to the runtime of its base kind.
+    "scylla",
+    "scylladb",
+    "cql",
+    "greptime",
+    "ch",
 ];
 
 /// Returns true for a connector type the kernel can instantiate.
@@ -213,6 +220,13 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "azure_event_grid",
     "aws_timestream",
     "snowflake_streaming",
+    // MV-02b time-series aliases. The KC-00 map owns each alias; each
+    // maps to the runtime of its base kind.
+    "scylla",
+    "scylladb",
+    "cql",
+    "greptime",
+    "ch",
 ];
 
 /// Returns true for an action kind the kernel can execute.

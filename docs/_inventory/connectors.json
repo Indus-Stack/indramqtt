@@ -45,6 +45,10 @@
       "tier": "community"
     },
     {
+      "kind": "ch",
+      "tier": "community"
+    },
+    {
       "kind": "clickhouse",
       "tier": "community"
     },
@@ -66,6 +70,10 @@
     },
     {
       "kind": "couchbase",
+      "tier": "community"
+    },
+    {
+      "kind": "cql",
       "tier": "community"
     },
     {
@@ -110,6 +118,10 @@
     },
     {
       "kind": "gcp_pubsub_producer",
+      "tier": "community"
+    },
+    {
+      "kind": "greptime",
       "tier": "community"
     },
     {
@@ -214,6 +226,14 @@
     },
     {
       "kind": "s3",
+      "tier": "community"
+    },
+    {
+      "kind": "scylla",
+      "tier": "community"
+    },
+    {
+      "kind": "scylladb",
       "tier": "community"
     },
     {

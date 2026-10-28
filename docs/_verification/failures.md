@@ -95,6 +95,70 @@ flowchart LR
 - Broker gave: 201 on creation (or 400 naming the `s3` feature without the feature build). No object reached a store. No store ran in the docs run.
 - State: not verified.
 
+### Cassandra send path (2026-10-27)
+
+- Item: `cassandra` connector send path.
+- Input: `POST /api/v5/connectors` with `servers` `127.0.0.1:9042`, `keyspace` `telemetry`, `table` `mqtt_events`, then a publish through a forwarding rule.
+- Expected from: the Cassandra page of this documentation.
+- Broker gave: 201 on creation (or 400 naming the `cassandra` feature without the feature build). No row reached a server. No server ran in the docs run.
+- State: not verified.
+
+### TDengine send path (2026-10-27)
+
+- Item: `tdengine` connector send path.
+- Input: `POST /api/v5/connectors` with `server` `127.0.0.1:6041`, `database` `power`, `stable` `meters`, then a publish through a forwarding rule.
+- Expected from: the TDengine page of this documentation.
+- Broker gave: 201 on creation. No row reached a server. No server ran in the docs run.
+- State: not verified.
+
+### IoTDB send path (2026-10-27)
+
+- Item: `iotdb` connector send path.
+- Input: `POST /api/v5/connectors` with `endpoint` `127.0.0.1:18080`, `device` `root.factory.d1`, then a publish through a forwarding rule.
+- Expected from: the IoTDB page of this documentation.
+- Broker gave: 201 on creation. No tablet reached a server. No server ran in the docs run.
+- State: not verified.
+
+### Timestream send path (2026-10-27)
+
+- Item: `timestream` connector send path.
+- Input: `POST /api/v5/connectors` with `database` `db`, `table` `metrics`, `region` `us-east-1`, then a publish through a forwarding rule.
+- Expected from: the Timestream page of this documentation.
+- Broker gave: 201 on creation. No write reached AWS. No endpoint ran in the docs run.
+- State: not verified.
+
+### Doris send path (2026-10-27)
+
+- Item: `doris` connector send path.
+- Input: `POST /api/v5/connectors` with `server` `127.0.0.1:8030`, `database` `db`, `table` `events`, then a publish through a forwarding rule.
+- Expected from: the Doris page of this documentation.
+- Broker gave: 201 on creation. No load reached a server. No server ran in the docs run.
+- State: not verified.
+
+### OpenTSDB send path (2026-10-27)
+
+- Item: `opentsdb` connector send path.
+- Input: `POST /api/v5/connectors` with `server` `http://127.0.0.1:4242`, `metric` `m`, then a publish through a forwarding rule.
+- Expected from: the OpenTSDB page of this documentation.
+- Broker gave: 201 on creation. No point reached a server. No server ran in the docs run.
+- State: not verified.
+
+### GreptimeDB send path (2026-10-27)
+
+- Item: `greptimedb` connector send path.
+- Input: `POST /api/v5/connectors` with `server` `127.0.0.1:4001`, `database` `public`, `table` `events`, then a publish through a forwarding rule.
+- Expected from: the GreptimeDB page of this documentation.
+- Broker gave: 201 on creation. No row reached a server. No server ran in the docs run.
+- State: not verified.
+
+### Datalayers send path (2026-10-27)
+
+- Item: `datalayers` connector send path.
+- Input: `POST /api/v5/connectors` with `server` `127.0.0.1:8361`, `database` `db`, `table` `events`, then a publish through a forwarding rule.
+- Expected from: the Datalayers page of this documentation.
+- Broker gave: 201 on creation. No row reached a server. No server ran in the docs run.
+- State: not verified.
+
 ## Rule function evaluation records (DOC-04)
 
 ### Function call shapes (2026-10-15)
