@@ -157,6 +157,26 @@ fn free_port() -> u16 {
     listener.local_addr().expect("port").port()
 }
 
+/// Count of loopback ports for one started broker.
+/// Reason: one port per bind (mqtt, tls, ws, wss, api, cluster, gossip, quic).
+const BROKER_TEST_PORTS: usize = 8;
+
+/// Take distinct free loopback ports for one started broker.
+/// Parallel brokers share the host. A repeated value collides inside
+/// one broker, so repeats are redrawn. No sleep is added.
+fn fresh_ports() -> [u16; BROKER_TEST_PORTS] {
+    let mut ports = [0u16; BROKER_TEST_PORTS];
+    let mut count = 0;
+    while count < BROKER_TEST_PORTS {
+        let port = free_port();
+        if !ports[..count].contains(&port) {
+            ports[count] = port;
+            count += 1;
+        }
+    }
+    ports
+}
+
 /// Free loopback ports for one started broker.
 struct Binds {
     mqtt: u16,
@@ -217,16 +237,7 @@ fn try_start_broker(toml: &str) -> Option<Broker> {
     let work = tempfile::TempDir::new().expect("temp dir");
     let cfg = work.path().join("cfg");
     std::fs::create_dir_all(cfg.join("conf.d")).expect("config dir");
-    let ports = [
-        free_port(),
-        free_port(),
-        free_port(),
-        free_port(),
-        free_port(),
-        free_port(),
-        free_port(),
-        free_port(),
-    ];
+    let ports = fresh_ports();
     std::fs::write(
         cfg.join("indra.toml"),
         rewrite_binds(

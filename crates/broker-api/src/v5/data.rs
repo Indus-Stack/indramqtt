@@ -793,6 +793,7 @@ mod tests {
             mfa_secret: SENTINEL.to_string(),
             mfa_enabled: false,
             mfa_last_step: None,
+            scopes: None,
         });
         snapshot.mqtt_users.users.push(broker_config::MqttUser {
             username: "sensor".to_string(),

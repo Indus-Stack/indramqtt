@@ -785,6 +785,7 @@ mod tests {
                 mfa_secret: Default::default(),
                 mfa_enabled: false,
                 mfa_last_step: Default::default(),
+                scopes: None,
             }],
         };
         bad.mqtt_users = MqttUsersConf {

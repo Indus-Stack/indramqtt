@@ -2572,6 +2572,82 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected() {
     kernel.finish().await;
 }
 
+/// MV-05: the tenant session limit applies at the MQTT entry.
+///
+/// The kernel boots with one tenant rule. A management write sets
+/// `limits.max_sessions` to 1 for one tenant. The first MQTT session
+/// connects. A second client in the same tenant gets CONNACK 0x03.
+/// Another tenant still connects. The test uses real sockets and the
+/// real API, not a store read.
+#[tokio::test]
+async fn mv05_tenant_session_limit_refuses_second_mqtt_session() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let base = format!("http://127.0.0.1:{}", kernel.api_port);
+    let http = reqwest::Client::new();
+
+    let created = tokio::time::timeout(
+        STEP,
+        http.post(format!("{base}/api/v5/mt/ns/t-mv05-lim"))
+            .bearer_auth(API_KEY)
+            .json(&serde_json::json!({}))
+            .send(),
+    )
+    .await
+    .expect("namespace create in time")
+    .expect("namespace create sends");
+    assert_eq!(created.status(), 204, "managed namespace is created");
+
+    let limit = tokio::time::timeout(
+        STEP,
+        http.put(format!("{base}/api/v5/mt/ns/t-mv05-lim/config"))
+            .bearer_auth(API_KEY)
+            .json(&serde_json::json!({"limits": {"max_sessions": 1}}))
+            .send(),
+    )
+    .await
+    .expect("limit write in time")
+    .expect("limit write sends");
+    assert_eq!(limit.status(), 200, "tenant session limit is stored");
+
+    let mut first = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut first,
+        &sy02_connect311("mv05-limit-a", true, 60, Some(("mv05-lim", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut first).await;
+    assert_eq!(head, 0x20, "first session gets CONNACK");
+    let (_, reason) = sy02_parse_connack311(&body);
+    assert_eq!(reason, 0, "first session in the tenant is accepted");
+
+    let mut second = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut second,
+        &sy02_connect311("mv05-limit-b", true, 60, Some(("mv05-lim", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut second).await;
+    assert_eq!(head, 0x20, "second session gets CONNACK");
+    let (_, reason) = sy02_parse_connack311(&body);
+    assert_eq!(
+        reason, 0x03,
+        "the tenant session limit refuses the second session"
+    );
+
+    let mut other = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut other,
+        &sy02_connect311("mv05-limit-c", true, 60, Some(("mv05-other", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut other).await;
+    assert_eq!(head, 0x20, "other tenant gets CONNACK");
+    let (_, reason) = sy02_parse_connack311(&body);
+    assert_eq!(reason, 0, "another tenant still connects");
+
+    kernel.finish().await;
+}
+
 /// TM-09: tenant in client and subscription reads, through real
 /// sockets and the real API.
 ///

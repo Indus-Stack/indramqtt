@@ -749,7 +749,11 @@ async fn call_tool(
             name.to_string(),
         );
     }
-    if !caller_may_call(state, caller, &tool) {
+    let login_only = caller
+        .grant
+        .as_ref()
+        .is_some_and(|grant| key_decision(grant, tool.path) == KeyDecision::LoginOnly);
+    if !caller_may_call(state, caller, &tool) && !login_only {
         return (
             403,
             rpc_error(-32602, "this key may not call this tool"),

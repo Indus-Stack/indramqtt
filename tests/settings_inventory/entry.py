@@ -676,8 +676,8 @@ class InventoryEntry(unittest.TestCase):
                 self.assertIn("unknown setting", probe.stderr)
                 self.assertIn("prometheus." + key, probe.stderr)
 
-    # // AZ-01 inventory: current behaviour; owner MV-05
-    def test_dashboard_scopes_are_discarded_and_do_not_limit_token(self):
+    # MV-05: dashboard user scopes are stored and they limit the token.
+    def test_dashboard_scopes_are_stored_and_limit_token(self):
         b = self.broker
         b.configure()
         seed_admin(b)
@@ -688,16 +688,17 @@ class InventoryEntry(unittest.TestCase):
                                 {"username": "limiteduser", "password": user_password,
                                  "role": "viewer", "scopes": []}, auth=admin)
         self.assertEqual(status, 200)
-        self.assertNotIn("scopes", created)
+        self.assertEqual(created["scopes"], [])
         token = login(b, "limiteduser", user_password)
         status, _ = b.http("GET", "/api/v5/metrics", auth=token)
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 403)
         status, _ = b.http("PUT", "/api/v5/users/limiteduser",
                            {"scopes": ["monitoring"]}, auth=admin)
         self.assertEqual(status, 200)
         status, users = b.http("GET", "/api/v5/users", auth=admin)
         self.assertEqual(status, 200)
-        self.assertTrue(all("scopes" not in user for user in users))
+        row = next(user for user in users if user["username"] == "limiteduser")
+        self.assertEqual(row["scopes"], ["monitoring"])
         b.stop()
         b.start()
         token = login(b, "limiteduser", user_password)

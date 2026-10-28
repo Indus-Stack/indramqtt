@@ -342,6 +342,110 @@ pub enum ConfigError {
     Save { file: String, reason: String },
 }
 
+/// Generic management scopes that a dashboard login user may hold.
+/// These are the same ten names as the API key catalogue.
+pub const GENERIC_USER_SCOPES: [&str; 10] = [
+    "connections",
+    "publish",
+    "data_integration",
+    "access_control",
+    "gateways",
+    "monitoring",
+    "cluster_operations",
+    "system",
+    "audit",
+    "license",
+];
+
+/// Login-only scopes that extend the generic set for dashboard users.
+pub const LOGIN_ONLY_SCOPES: [&str; 4] = [
+    "user_management",
+    "mfa_management",
+    "sso_management",
+    "api_key_management",
+];
+
+/// True when `name` is a scope a dashboard login user may hold.
+#[must_use]
+pub fn is_known_user_scope(name: &str) -> bool {
+    GENERIC_USER_SCOPES.contains(&name) || LOGIN_ONLY_SCOPES.contains(&name)
+}
+
+/// The implicit scopes of a dashboard role.
+/// An administrator holds the generic and login-only scopes. A viewer
+/// holds the generic scopes. An unknown role holds no scope.
+#[must_use]
+pub fn role_default_user_scopes(role: &str) -> Vec<String> {
+    match role {
+        "administrator" => GENERIC_USER_SCOPES
+            .iter()
+            .chain(LOGIN_ONLY_SCOPES.iter())
+            .map(|scope| (*scope).to_string())
+            .collect(),
+        "viewer" => GENERIC_USER_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// True when `role` may hold the explicit scope `name`.
+/// An unknown scope and an unknown role return false.
+#[must_use]
+pub fn role_may_hold_user_scope(role: &str, name: &str) -> bool {
+    if !is_known_user_scope(name) {
+        return false;
+    }
+    match role {
+        "administrator" => true,
+        "viewer" => !matches!(
+            name,
+            "user_management" | "sso_management" | "api_key_management"
+        ),
+        _ => false,
+    }
+}
+
+/// Most scopes accepted on one dashboard user (32 entries).
+/// Reason: the matched API key bound keeps each user row small. The
+/// catalogue holds 14 names, so 32 leaves headroom.
+pub const MAX_USER_SCOPES: usize = MAX_API_KEY_SCOPES;
+
+/// Longest accepted dashboard user scope name (64 bytes).
+/// Reason: the matched API key bound keeps each persisted row small.
+pub const MAX_USER_SCOPE_LEN: usize = MAX_API_KEY_SCOPE_LEN;
+
+/// Validate one explicit dashboard user scope list.
+/// The function refuses too many scopes, a too-long name, an unknown
+/// name, a duplicate and a scope that the role cannot hold.
+pub fn validate_user_scope_list(role: &str, scopes: &[String]) -> Result<(), String> {
+    if scopes.len() > MAX_USER_SCOPES {
+        return Err(format!(
+            "holds {} entries, at most {MAX_USER_SCOPES}",
+            scopes.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(scopes.len());
+    for scope in scopes {
+        if scope.trim().is_empty() || scope.len() > MAX_USER_SCOPE_LEN {
+            return Err(format!("holds an invalid scope name {scope:?}"));
+        }
+        if !is_known_user_scope(scope) {
+            return Err(format!("has unknown scope {scope:?}"));
+        }
+        if !role_may_hold_user_scope(role, scope) {
+            return Err(format!(
+                "has scope {scope:?} that role {role:?} cannot hold"
+            ));
+        }
+        if !seen.insert(scope.as_str()) {
+            return Err(format!("has duplicate scope {scope:?}"));
+        }
+    }
+    Ok(())
+}
+
 /// One dashboard/API administrator.
 ///
 /// `password_hash` holds the SCRAM-SHA-256 verifier written by the
@@ -349,7 +453,8 @@ pub enum ConfigError {
 /// opaque non-empty string. `role` is `administrator` or `viewer`
 /// (missing roles from pre-persistence files load as `viewer`, the least
 /// privilege). `must_change_password` forces a password change on next
-/// login, matching the in-memory store flag.
+/// login, matching the in-memory store flag. `scopes` is the explicit
+/// dashboard user scope list; a missing value means the role default.
 ///
 /// `mfa_secret` holds the TOTP enrolment secret as standard base64 of the
 /// raw bytes (empty = no enrolment; the secret must stay recoverable so
@@ -383,6 +488,10 @@ pub struct AdminUser {
     /// Most recently verified 30 s TOTP counter, for replay rejection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mfa_last_step: Option<u64>,
+    /// Explicit dashboard user scopes. A missing value means the role
+    /// default. An empty list denies each management scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 
 impl Default for AdminUser {
@@ -396,6 +505,7 @@ impl Default for AdminUser {
             mfa_secret: String::new(),
             mfa_enabled: false,
             mfa_last_step: None,
+            scopes: None,
         }
     }
 }
@@ -438,6 +548,13 @@ impl AdminUsersConf {
                     "admin_users.users[{index}].username {:?} is duplicated (field `username`)",
                     user.username
                 )));
+            }
+            if let Some(scopes) = &user.scopes {
+                validate_user_scope_list(&user.role, scopes).map_err(|reason| {
+                    ConfigError::Invalid(format!(
+                        "admin_users.users[{index}].scopes {reason} (field `scopes`)"
+                    ))
+                })?;
             }
             // MFA state: an enabled record must carry a decodable secret;
             // a record with no secret must not claim to be enabled.
@@ -4304,6 +4421,7 @@ mod tests {
                     mfa_secret: String::new(),
                     mfa_enabled: false,
                     mfa_last_step: None,
+                    scopes: None,
                 }],
             },
             mqtt_users: MqttUsersConf {
@@ -4446,6 +4564,7 @@ mod tests {
                 mfa_secret: String::new(),
                 mfa_enabled: false,
                 mfa_last_step: None,
+                scopes: None,
             }],
         };
         let err = conf.validate().expect_err("empty username must fail");
@@ -4453,6 +4572,50 @@ mod tests {
             err.to_string().contains("username"),
             "error must name the field, got: {err}"
         );
+    }
+
+    fn admin_user_with_scopes(role: &str, scopes: Option<Vec<String>>) -> AdminUser {
+        AdminUser {
+            username: "scoped".to_string(),
+            password_hash: "hash".to_string(),
+            role: role.to_string(),
+            description: String::new(),
+            must_change_password: false,
+            mfa_secret: String::new(),
+            mfa_enabled: false,
+            mfa_last_step: None,
+            scopes,
+        }
+    }
+
+    #[test]
+    fn admin_validation_rejects_bad_user_scope_lists() {
+        let duplicate = vec!["monitoring".to_string(), "monitoring".to_string()];
+        let too_long = vec!["x".repeat(MAX_USER_SCOPE_LEN + 1)];
+        let too_many = vec!["monitoring".to_string(); MAX_USER_SCOPES + 1];
+        let forbidden = vec!["user_management".to_string()];
+        for (scopes, role) in [
+            (duplicate, "viewer"),
+            (too_long, "viewer"),
+            (too_many, "viewer"),
+            (forbidden, "viewer"),
+        ] {
+            let conf = AdminUsersConf {
+                users: vec![admin_user_with_scopes(role, Some(scopes))],
+            };
+            let err = conf.validate().expect_err("bad user scopes must fail");
+            assert!(
+                err.to_string().contains("scopes"),
+                "error must name the field, got: {err}"
+            );
+        }
+        let conf = AdminUsersConf {
+            users: vec![admin_user_with_scopes(
+                "viewer",
+                Some(vec!["monitoring".to_string()]),
+            )],
+        };
+        conf.validate().expect("a restricted list is valid");
     }
 
     #[test]
@@ -4845,6 +5008,7 @@ mod tests {
                 mfa_secret: String::new(),
                 mfa_enabled: false,
                 mfa_last_step: None,
+                scopes: None,
             }],
         };
         let after_rules = RulesConf {

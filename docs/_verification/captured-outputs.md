@@ -104,8 +104,8 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/authorization.md` | 78 | `201` |
 | `security/authorization.md` | 111 | `hello-press` |
 | `security/index.md` | 81 | `201` |
-| `security/management-access.md` | 65 | `ok` |
-| `security/management-access.md` | 77 | `200` |
+| `security/management-access.md` | 81 | `ok` |
+| `security/management-access.md` | 93 | `200` |
 | `security/psk.md` | 75 | `ok` |
 | `security/psk.md` | 85 | `OK` |
 | `security/tls.md` | 93 | `ok` |

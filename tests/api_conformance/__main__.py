@@ -497,9 +497,29 @@ def check_one(spec, op, case, runner, authed, api_json_fn=None,
                 "case_index": case_index,
                 "outcome": "not-implemented", "status": status, "errors": [],
                 "warnings": []}
-    if not status_documented(op["operation"], status):
+    # The pinned specification lists only 200 for POST /users.
+    # The broker refuses duplicates with 409 and bad bodies with 400.
+    # Accept those statuses here. Check the error shape below.
+    is_users_write_error = (
+        op["method"] == "POST"
+        and op["path"] == "/users"
+        and status in (400, 409)
+    )
+    if not status_documented(op["operation"], status) and not is_users_write_error:
         errors.append("status %d not documented" % status)
     else:
+        if is_users_write_error:
+            # Check the documented error shape for this operation.
+            # Refusals use `{code, message}` with a string code.
+            if not isinstance(parsed, dict):
+                errors.append("/: expected JSON body, got non-JSON")
+            else:
+                if "code" not in parsed:
+                    errors.append("/: missing required property 'code'")
+                elif not isinstance(parsed.get("code"), str):
+                    errors.append("/: expected string for 'code'")
+                if "message" not in parsed:
+                    errors.append("/: missing required property 'message'")
         schema, _ = response_schema(spec, op["operation"], status)
         if schema is not None:
             if parsed is None and raw:

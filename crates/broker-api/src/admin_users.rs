@@ -84,6 +84,19 @@ pub struct AdminUserView {
     pub role: AdminRole,
     pub description: String,
     pub must_change_password: bool,
+    /// Explicit dashboard user scopes. `None` means the role default.
+    pub scopes: Option<Vec<String>>,
+}
+
+/// One write to the explicit scope list of a dashboard user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserScopesUpdate {
+    /// Leave the stored list unchanged.
+    Keep,
+    /// Remove the explicit list; the role default applies.
+    Clear,
+    /// Store this explicit list.
+    Set(Vec<String>),
 }
 
 /// Errors from [`AdminUsers`] mutations.
@@ -138,6 +151,8 @@ struct AdminUser {
     mfa_enabled: bool,
     /// Most recently verified 30 s counter, for single-use rejection.
     mfa_last_step: Option<u64>,
+    /// Explicit dashboard user scopes. `None` means the role default.
+    scopes: Option<Vec<String>>,
 }
 
 /// Per-user MFA verify attempt state (memory-only; resets on restart).
@@ -272,6 +287,7 @@ impl AdminUsers {
                     mfa_secret,
                     mfa_enabled,
                     mfa_last_step,
+                    scopes: entry.scopes.clone(),
                 },
                 None => {
                     // Fail closed: the verifier is unusable, so nobody can
@@ -300,6 +316,7 @@ impl AdminUsers {
                         mfa_secret,
                         mfa_enabled,
                         mfa_last_step,
+                        scopes: entry.scopes.clone(),
                     }
                 }
             };
@@ -375,6 +392,7 @@ impl AdminUsers {
                 },
                 mfa_enabled: user.mfa_enabled,
                 mfa_last_step: user.mfa_last_step,
+                scopes: user.scopes.clone(),
             })
             .collect();
         entries.sort_by(|a, b| a.username.cmp(&b.username));
@@ -406,6 +424,18 @@ impl AdminUsers {
         password: &str,
         role: AdminRole,
         description: &str,
+    ) -> Result<(), AdminUserError> {
+        self.create_with_scopes(username, password, role, description, None)
+    }
+
+    /// Create one user with an explicit scope list.
+    pub fn create_with_scopes(
+        &self,
+        username: &str,
+        password: &str,
+        role: AdminRole,
+        description: &str,
+        scopes: Option<Vec<String>>,
     ) -> Result<(), AdminUserError> {
         if !is_valid_username(username) {
             return Err(AdminUserError::InvalidUsername);
@@ -443,6 +473,7 @@ impl AdminUsers {
                     mfa_secret: Vec::new(),
                     mfa_enabled: false,
                     mfa_last_step: None,
+                    scopes,
                 },
             );
         }
@@ -510,6 +541,18 @@ impl AdminUsers {
         role: Option<AdminRole>,
         description: Option<&str>,
     ) -> Result<(), AdminUserError> {
+        self.update_with_scopes(username, role, description, UserScopesUpdate::Keep)
+    }
+
+    /// Replace `role`, `description` and the explicit scope list of one
+    /// user atomically: one map write lock, one registry persist.
+    pub fn update_with_scopes(
+        &self,
+        username: &str,
+        role: Option<AdminRole>,
+        description: Option<&str>,
+        scopes: UserScopesUpdate,
+    ) -> Result<(), AdminUserError> {
         {
             let mut users = self.users.write().unwrap();
             if !users.contains_key(username) {
@@ -534,6 +577,11 @@ impl AdminUsers {
                 }
                 if let Some(description) = description {
                     user.description = description.to_string();
+                }
+                match scopes {
+                    UserScopesUpdate::Keep => {}
+                    UserScopesUpdate::Clear => user.scopes = None,
+                    UserScopesUpdate::Set(list) => user.scopes = Some(list),
                 }
             }
         }
@@ -706,6 +754,7 @@ impl AdminUsers {
             role: u.role,
             description: u.description.clone(),
             must_change_password: u.must_change_password,
+            scopes: u.scopes.clone(),
         })
     }
 
@@ -718,6 +767,7 @@ impl AdminUsers {
                 role: u.role,
                 description: u.description.clone(),
                 must_change_password: u.must_change_password,
+                scopes: u.scopes.clone(),
             })
             .collect();
         out.sort_by(|a, b| a.username.cmp(&b.username));
@@ -750,6 +800,7 @@ impl AdminUsers {
                 mfa_secret: Vec::new(),
                 mfa_enabled: false,
                 mfa_last_step: None,
+                scopes: None,
             },
         );
     }
@@ -1115,6 +1166,7 @@ fn default_admin_user() -> AdminUser {
         mfa_secret: Vec::new(),
         mfa_enabled: false,
         mfa_last_step: None,
+        scopes: None,
     }
 }
 

@@ -7613,7 +7613,7 @@ mod tests {
         let (status, _) = server
             .put_auth(
                 "/api/v5/users/b-admin",
-                json!({"role": "viewer"}),
+                json!({"role": "viewer", "scopes": "unset"}),
                 &admin_token,
             )
             .await;
@@ -7664,6 +7664,634 @@ mod tests {
         let (status, body) = server.get_auth("/api/v5/current_user", &v_token).await;
         assert_eq!(status, 401);
         assert_eq!(body["code"], json!("UNAUTHORIZED"));
+    }
+
+    /// MV-05: the create, update and read paths carry the dashboard user
+    /// scopes of the reference contract.
+    #[tokio::test]
+    async fn dashboard_user_scope_contract_round_trip() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let mut admin_scopes: Vec<&str> = broker_config::GENERIC_USER_SCOPES.to_vec();
+        admin_scopes.extend_from_slice(&broker_config::LOGIN_ONLY_SCOPES);
+
+        // An omitted scope list on create stores the role default.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-admin-default", "password": "Scope-pass-1a",
+                       "role": "administrator"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create admin default: {created}");
+        assert_eq!(created["scopes"], json!(admin_scopes));
+
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-viewer-default", "password": "Scope-pass-1a",
+                       "role": "viewer"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create viewer default: {created}");
+        assert_eq!(created["scopes"], json!(broker_config::GENERIC_USER_SCOPES));
+
+        // An empty list denies each management scope.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-deny", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": []}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create deny-all: {created}");
+        assert_eq!(created["scopes"], json!([]));
+
+        // `unset` and a list equal to the role default store no explicit
+        // list, and the read renders the sentinel.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-unset", "password": "Scope-pass-1a",
+                       "role": "administrator", "scopes": "unset"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create unset: {created}");
+        assert_eq!(created["scopes"], json!("unset"));
+
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-default-list", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": broker_config::GENERIC_USER_SCOPES}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create default-equivalent list: {created}");
+        assert_eq!(created["scopes"], json!("unset"));
+
+        // A restricted list stores and renders as written.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-monitor", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ["monitoring"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "create restricted list: {created}");
+        assert_eq!(created["scopes"], json!(["monitoring"]));
+
+        // A duplicate and one missing default scope do not normalise to
+        // the full role default.
+        let mut ambiguous: Vec<String> = broker_config::GENERIC_USER_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect();
+        ambiguous.pop();
+        ambiguous.push("connections".to_string());
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-duplicate", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ambiguous}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 400, "duplicate scope: {body}");
+
+        // Unknown and role-forbidden scopes fail closed.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-unknown", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ["not_a_scope"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 400, "unknown scope: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-forbidden", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ["user_management"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 400, "viewer user_management: {body}");
+
+        // mfa_management is valid for a viewer.
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-mfa", "password": "Scope-pass-1a",
+                       "role": "viewer", "scopes": ["mfa_management"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "viewer mfa_management: {created}");
+        assert_eq!(created["scopes"], json!(["mfa_management"]));
+
+        // Own MFA stays public. Another user's MFA needs mfa_management.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-mfa", "password": "Scope-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200, "mfa user login: {body}");
+        let mfa_token = body["token"].as_str().expect("mfa token").to_string();
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "scope-mfa"}),
+                &mfa_token,
+            )
+            .await;
+        assert_eq!(status, 200, "own MFA: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "admin"}),
+                &mfa_token,
+            )
+            .await;
+        assert_eq!(status, 403, "viewer targets another user: {body}");
+
+        for (name, scopes) in [
+            ("scope-limited-admin", json!(["monitoring"])),
+            ("scope-mfa-admin", json!(["mfa_management"])),
+        ] {
+            let (status, created) = server
+                .post_auth(
+                    "/api/v5/users",
+                    json!({"username": name, "password": "Scope-pass-1a",
+                           "role": "administrator", "scopes": scopes}),
+                    &admin_token,
+                )
+                .await;
+            assert_eq!(status, 200, "create {name}: {created}");
+        }
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-limited-admin", "password": "Scope-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let limited_token = body["token"].as_str().expect("limited token").to_string();
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-mfa-admin", "password": "Scope-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let mfa_admin_token = body["token"].as_str().expect("mfa admin token").to_string();
+
+        // A limited administrator cannot target another user.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/admin/change_pwd",
+                json!({"old_pwd": "unused", "new_pwd": "Unused-pass-1a"}),
+                &limited_token,
+            )
+            .await;
+        assert_eq!(
+            status, 403,
+            "limited admin targets another password: {body}"
+        );
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "admin"}),
+                &limited_token,
+            )
+            .await;
+        assert_eq!(status, 403, "limited admin targets another MFA: {body}");
+
+        // mfa_management allows another user's MFA, not another password.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "admin"}),
+                &mfa_admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "mfa_management targets another MFA: {body}");
+        let (status, body) = server
+            .post_auth("/api/v5/users/admin/mfa", json!({}), &mfa_admin_token)
+            .await;
+        assert_eq!(status, 204, "mfa_management enrols another user: {body}");
+        let (status, body) = server
+            .post_auth("/api/v5/users/admin/mfa", json!({}), &limited_token)
+            .await;
+        assert_eq!(status, 403, "limited admin enrols another user: {body}");
+
+        // GET /users shows the stored value, and a read-modify-write
+        // succeeds with the body that the read returned.
+        let (status, users) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let users = users.as_array().expect("users is an array");
+        let monitor = users
+            .iter()
+            .find(|row| row["username"] == json!("scope-monitor"))
+            .expect("monitor row");
+        assert_eq!(monitor["scopes"], json!(["monitoring"]));
+        let unset = users
+            .iter()
+            .find(|row| row["username"] == json!("scope-unset"))
+            .expect("unset row");
+        assert_eq!(unset["scopes"], json!("unset"));
+        let (status, updated) = server
+            .put_auth(
+                "/api/v5/users/scope-monitor",
+                json!({
+                    "role": monitor["role"],
+                    "description": monitor["description"],
+                    "scopes": monitor["scopes"],
+                }),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "round-trip PUT: {updated}");
+        assert_eq!(updated["scopes"], json!(["monitoring"]));
+    }
+
+    /// MV-05: a deny-all user keeps only the public management routes.
+    #[tokio::test]
+    async fn dashboard_user_deny_all_keeps_public_paths() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-deny-all", "password": "Deny-pass-1a",
+                       "role": "viewer", "scopes": []}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-deny-all", "password": "Deny-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200, "login: {body}");
+        let token = body["token"].as_str().expect("token").to_string();
+
+        for path in [
+            "/api/v5/metrics",
+            "/api/v5/clients",
+            "/api/v5/users",
+            "/api/v5/api_key",
+        ] {
+            let (status, body) = server.get_auth(path, &token).await;
+            assert_eq!(status, 403, "deny-all GET {path}: {body}");
+        }
+        let (status, _) = server.post_auth("/api/v5/users", json!({}), &token).await;
+        assert_eq!(status, 403, "deny-all write");
+
+        for path in [
+            "/api/v5/current_user",
+            "/api/v5/user_scopes",
+            "/api/v5/api_key_scopes",
+            "/api/v5/status?format=json",
+            "/schemas/hotconf",
+        ] {
+            let (status, body) = server.get_auth(path, &token).await;
+            assert_eq!(status, 200, "public GET {path}: {body}");
+        }
+
+        // The own password change and MFA self-service stay open.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/scope-deny-all/change_pwd",
+                json!({"old_pwd": "Deny-pass-1a", "new_pwd": "Deny-pass-2b"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204, "own password change: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "scope-deny-all"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "own MFA setup: {body}");
+        assert!(body["secret"].is_string());
+
+        let (status, _) = server.post_auth("/api/v5/logout", json!({}), &token).await;
+        assert_eq!(status, 204, "logout");
+    }
+
+    /// MV-05: a scope change or a role change applies to a token that
+    /// was issued before the change.
+    #[tokio::test]
+    async fn dashboard_user_scope_and_role_changes_reach_existing_tokens() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-live", "password": "Live-pass-1a",
+                       "role": "viewer", "scopes": ["monitoring"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-live", "password": "Live-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("token").to_string();
+        let (status, _) = server.get_auth("/api/v5/metrics", &token).await;
+        assert_eq!(status, 200);
+        let (status, _) = server.get_auth("/api/v5/listeners", &token).await;
+        assert_eq!(status, 403);
+
+        // The same token sees the new scope on its next request.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/scope-live",
+                json!({"scopes": ["system"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "scope change: {body}");
+        let (status, _) = server.get_auth("/api/v5/metrics", &token).await;
+        assert_eq!(status, 403);
+        let (status, body) = server.get_auth("/api/v5/listeners", &token).await;
+        assert_eq!(status, 200, "new scope on old token: {body}");
+
+        // Role demotion also applies to the existing token.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-role", "password": "Role-pass-1a",
+                       "role": "administrator", "scopes": "unset"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-role", "password": "Role-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let role_token = body["token"].as_str().expect("role token").to_string();
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-role-probe", "password": "Probe-pass-1a"}),
+                &role_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/scope-role",
+                json!({"role": "viewer", "scopes": "unset"}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200, "demotion: {body}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-role-probe2", "password": "Probe-pass-1a"}),
+                &role_token,
+            )
+            .await;
+        assert_eq!(status, 403, "old admin token after demotion: {body}");
+    }
+
+    /// MV-05: scopes persist across a restart and still limit the token.
+    #[tokio::test]
+    async fn dashboard_user_scopes_survive_restart() {
+        let dir = unique_data_dir("user-scopes");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-restart", "password": "Restart-pass-1a",
+                       "role": "viewer", "scopes": ["monitoring"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        drop(server);
+        drop(registry);
+
+        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
+        let (server, _state) = TestServer::start_with_registry(reloaded).await;
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-restart", "password": "Restart-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200, "login after restart: {body}");
+        let token = body["token"].as_str().expect("token").to_string();
+        let (status, _) = server.get_auth("/api/v5/metrics", &token).await;
+        assert_eq!(status, 200);
+        let (status, _) = server.get_auth("/api/v5/clients", &token).await;
+        assert_eq!(status, 403);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let admin_token = body["token"].as_str().expect("admin token").to_string();
+        let (status, users) = server.get_auth("/api/v5/users", &admin_token).await;
+        assert_eq!(status, 200);
+        let row = users
+            .as_array()
+            .expect("users is an array")
+            .iter()
+            .find(|row| row["username"] == json!("scope-restart"))
+            .expect("stored user");
+        assert_eq!(row["scopes"], json!(["monitoring"]));
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// MV-05: the scope check uses a normalized path and does not open the
+    /// MCP door to a dashboard login token.
+    #[tokio::test]
+    async fn dashboard_user_scope_paths_are_normalized() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-url", "password": "Url-pass-1a",
+                       "role": "viewer", "scopes": ["monitoring"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-url", "password": "Url-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("token").to_string();
+
+        // An encoded path that reaches the user route must not pass the
+        // monitoring scope. A route miss is also a denial.
+        for path in [
+            "/api/v5/%75sers",
+            "/api/v5/metrics/../users",
+            "/api/v5/users/",
+            "/api/v5/%2e%2e/users",
+        ] {
+            let (status, body) = server.get_auth(path, &token).await;
+            assert!(
+                status == 403 || status == 404,
+                "{path} must not pass the monitoring scope: {status} {body}"
+            );
+        }
+        // The monitoring scope still opens its own encoded path when the
+        // router resolves it.
+        let (status, _) = server.get_auth("/api/v5/stat%73", &token).await;
+        assert!(status == 200 || status == 404, "encoded stats: {status}");
+
+        // MCP accepts API keys only, so a login token cannot bypass scopes
+        // there.
+        let (status, body) = server
+            .post_auth(
+                "/mcp",
+                json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 401, "MCP with a login token: {body}");
+
+        // A limited key reaches /mcp with monitoring. A management route
+        // outside that scope is refused through the tool call.
+        let (_key_id, secret) = make_key(
+            &server,
+            &admin_token,
+            json!({"name": "scope-mcp-key", "scopes": ["monitoring"]}),
+        )
+        .await;
+        let bearer = format!("Bearer {secret}");
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "get_api_v5_users", "arguments": {}}, "id": 2}),
+        )
+        .await;
+        assert_eq!(status, 200, "MCP users call answers: {body}");
+        assert_eq!(
+            body["result"]["isError"],
+            json!(true),
+            "limited key cannot call users: {body}"
+        );
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("FORBIDDEN") || text.contains("403"),
+            "users refusal names the code: {text}"
+        );
+        let (status, body) = mcp_rpc(
+            &server,
+            &bearer,
+            json!({"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "get_api_v5_metrics", "arguments": {}}, "id": 3}),
+        )
+        .await;
+        assert_eq!(status, 200, "MCP metrics call answers: {body}");
+        assert!(
+            body["result"].get("isError").is_none(),
+            "monitoring key calls metrics: {body}"
+        );
+    }
+
+    /// MV-05: a default administrator keeps the bearer management routes.
+    #[tokio::test]
+    async fn default_administrator_keeps_bearer_management_routes() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        for path in ["/api/v5/users", "/api/v5/user_scopes"] {
+            let (status, body) = server.get_auth(path, &token).await;
+            assert_eq!(status, 200, "default admin GET {path}: {body}");
+        }
+    }
+
+    /// MV-05: a limited administrator keeps tenant checks and can write a
+    /// tenant limit. The MQTT refusal is proved by
+    /// `mv05_tenant_session_limit_refuses_second_mqtt_session` in
+    /// `tests/e2e_integration.rs`.
+    #[tokio::test]
+    async fn dashboard_user_scopes_keep_tenant_checks() {
+        let (server, _state) = TestServer::start().await;
+        let admin_token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "scope-tenant", "password": "Tenant-pass-1a",
+                       "role": "administrator", "scopes": ["system"]}),
+                &admin_token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "scope-tenant", "password": "Tenant-pass-1a"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let token = body["token"].as_str().expect("token").to_string();
+
+        // The limited administrator cannot manage users.
+        let (status, _) = server.get_auth("/api/v5/users", &token).await;
+        assert_eq!(status, 403);
+
+        let (status, body) = server
+            .post_auth("/api/v5/mt/ns/scope-tenant", json!({}), &token)
+            .await;
+        assert_eq!(status, 204, "create tenant: {body}");
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/mt/ns/scope-tenant/config",
+                json!({"limits": {"max_sessions": 1}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "set tenant limit: {body}");
+        assert_eq!(body["limits"]["max_sessions"], json!(1));
+        let (status, body) = server
+            .get_auth("/api/v5/mt/ns/scope-tenant/config", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["limits"]["max_sessions"], json!(1));
+        // A missing tenant still fails, whatever the scope.
+        let (status, body) = server
+            .get_auth("/api/v5/mt/ns/scope-tenant-missing/config", &token)
+            .await;
+        assert_eq!(status, 404, "missing tenant: {body}");
     }
 
     /// Unique scratch data dir under the OS temp dir (no dev-dependency).
@@ -17933,14 +18561,14 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                 "catalogue must contain {documented}"
             );
         }
-        // The login-only scopes are flagged administrator-only; the
-        // generic scopes are not.
+        // Three login-only scopes are administrator-only. mfa_management
+        // is not: a non-administrator may hold it for self-service.
         for entry in scopes {
             let name = entry["name"].as_str().expect("entry has a name");
             let admin_only = entry["admin_only"].as_bool().expect("flag is a bool");
             let expect_admin_only = matches!(
                 name,
-                "user_management" | "mfa_management" | "sso_management" | "api_key_management"
+                "user_management" | "sso_management" | "api_key_management"
             );
             assert_eq!(
                 admin_only, expect_admin_only,

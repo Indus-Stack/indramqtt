@@ -1,0 +1,249 @@
+[
+  {
+    "operation": "POST /users",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "username": "conf-us-admin-default",
+      "password": "ConfProbe123!",
+      "role": "administrator"
+    },
+    "setup": [],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-admin-default"}}],
+    "expect_status": 200,
+    "expect_json": {
+      "/scopes": [
+        "connections",
+        "publish",
+        "data_integration",
+        "access_control",
+        "gateways",
+        "monitoring",
+        "cluster_operations",
+        "system",
+        "audit",
+        "license",
+        "user_management",
+        "mfa_management",
+        "sso_management",
+        "api_key_management"
+      ]
+    }
+  },
+  {
+    "operation": "POST /users",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "username": "conf-us-viewer-default",
+      "password": "ConfProbe123!",
+      "role": "viewer"
+    },
+    "setup": [],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-viewer-default"}}],
+    "expect_status": 200,
+    "expect_json": {
+      "/scopes": [
+        "connections",
+        "publish",
+        "data_integration",
+        "access_control",
+        "gateways",
+        "monitoring",
+        "cluster_operations",
+        "system",
+        "audit",
+        "license"
+      ]
+    }
+  },
+  {
+    "operation": "POST /users",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "username": "conf-us-deny",
+      "password": "ConfProbe123!",
+      "role": "viewer",
+      "scopes": []
+    },
+    "setup": [],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-deny"}}],
+    "expect_status": 200,
+    "expect_json": {"/scopes": []}
+  },
+  {
+    "operation": "POST /users",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "username": "conf-us-unset",
+      "password": "ConfProbe123!",
+      "role": "administrator",
+      "scopes": "unset"
+    },
+    "setup": [],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-unset"}}],
+    "expect_status": 200,
+    "expect_json": {"/scopes": "unset"}
+  },
+  {
+    "operation": "POST /users",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "username": "conf-us-default-list",
+      "password": "ConfProbe123!",
+      "role": "viewer",
+      "scopes": [
+        "connections",
+        "publish",
+        "data_integration",
+        "access_control",
+        "gateways",
+        "monitoring",
+        "cluster_operations",
+        "system",
+        "audit",
+        "license"
+      ]
+    },
+    "setup": [],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-default-list"}}],
+    "expect_status": 200,
+    "expect_json": {"/scopes": "unset"}
+  },
+  {
+    "operation": "POST /users",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "username": "conf-us-monitor",
+      "password": "ConfProbe123!",
+      "role": "viewer",
+      "scopes": ["monitoring"]
+    },
+    "setup": [],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-monitor"}}],
+    "expect_status": 200,
+    "expect_json": {"/scopes": ["monitoring"]}
+  },
+  {
+    "operation": "POST /users",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "username": "conf-us-unknown",
+      "password": "ConfProbe123!",
+      "role": "viewer",
+      "scopes": ["not_a_scope"]
+    },
+    "setup": [],
+    "cleanup": [],
+    "expect_status": 400
+  },
+  {
+    "operation": "POST /users",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "username": "conf-us-forbidden",
+      "password": "ConfProbe123!",
+      "role": "viewer",
+      "scopes": ["user_management"]
+    },
+    "setup": [],
+    "cleanup": [],
+    "expect_status": 400
+  },
+  {
+    "operation": "POST /users",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "username": "conf-us-mfa",
+      "password": "ConfProbe123!",
+      "role": "viewer",
+      "scopes": ["mfa_management"]
+    },
+    "setup": [],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-mfa"}}],
+    "expect_status": 200,
+    "expect_json": {"/scopes": ["mfa_management"]}
+  },
+  {
+    "operation": "PUT /users/{username}",
+    "path_params": {"username": "conf-us-put-deny"},
+    "query": {},
+    "body": {"scopes": []},
+    "setup": [{"api": {"method": "POST", "path": "/users", "body": {"username": "conf-us-put-deny", "password": "ConfProbe123!", "role": "viewer"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-put-deny"}}],
+    "expect_status": 200,
+    "expect_json": {"/scopes": []}
+  },
+  {
+    "operation": "PUT /users/{username}",
+    "path_params": {"username": "conf-us-put-unset"},
+    "query": {},
+    "body": {"scopes": "unset"},
+    "setup": [{"api": {"method": "POST", "path": "/users", "body": {"username": "conf-us-put-unset", "password": "ConfProbe123!", "role": "viewer"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-put-unset"}}],
+    "expect_status": 200,
+    "expect_json": {"/scopes": "unset"}
+  },
+  {
+    "operation": "PUT /users/{username}",
+    "path_params": {"username": "conf-us-put-default"},
+    "query": {},
+    "body": {
+      "scopes": [
+        "connections",
+        "publish",
+        "data_integration",
+        "access_control",
+        "gateways",
+        "monitoring",
+        "cluster_operations",
+        "system",
+        "audit",
+        "license",
+        "user_management",
+        "mfa_management",
+        "sso_management",
+        "api_key_management"
+      ]
+    },
+    "setup": [{"api": {"method": "POST", "path": "/users", "body": {"username": "conf-us-put-default", "password": "ConfProbe123!", "role": "administrator"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-put-default"}}],
+    "expect_status": 200,
+    "expect_json": {"/scopes": "unset"}
+  },
+  {
+    "operation": "PUT /users/{username}",
+    "path_params": {"username": "conf-us-put-monitor"},
+    "query": {},
+    "body": {"scopes": ["monitoring"]},
+    "setup": [{"api": {"method": "POST", "path": "/users", "body": {"username": "conf-us-put-monitor", "password": "ConfProbe123!", "role": "viewer"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-put-monitor"}}],
+    "expect_status": 200,
+    "expect_json": {"/scopes": ["monitoring"]}
+  },
+  {
+    "operation": "PUT /users/{username}",
+    "path_params": {"username": "conf-us-put-forbidden"},
+    "query": {},
+    "body": {"scopes": ["user_management"]},
+    "setup": [{"api": {"method": "POST", "path": "/users", "body": {"username": "conf-us-put-forbidden", "password": "ConfProbe123!", "role": "viewer"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-put-forbidden"}}],
+    "expect_status": 400
+  },
+  {
+    "operation": "PUT /users/{username}",
+    "path_params": {"username": "conf-us-put-unknown"},
+    "query": {},
+    "body": {"scopes": ["not_a_scope"]},
+    "setup": [{"api": {"method": "POST", "path": "/users", "body": {"username": "conf-us-put-unknown", "password": "ConfProbe123!", "role": "viewer"}}}],
+    "cleanup": [{"api": {"method": "DELETE", "path": "/users/conf-us-put-unknown"}}],
+    "expect_status": 400
+  }
+]
