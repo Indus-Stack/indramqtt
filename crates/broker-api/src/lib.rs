@@ -7486,6 +7486,227 @@ mod tests {
         assert_eq!(status, 200);
     }
 
+    /// An administrator resets the password of a different user without
+    /// the old password. The same user must prove the old password. A
+    /// refused update keeps the old password. Old sessions end.
+    #[tokio::test]
+    async fn mv09c_admin_reset_needs_no_old_password_own_change_does() {
+        // MV-09c broker-through test: every step uses the served
+        // management API on `ApiState` (the same state the kernel shares
+        // in `crates/broker-node/src/main.rs`, `serve_api`), not the
+        // store. Management-plane only; publish and deliver never touch
+        // these stores.
+        let (server, _state) = TestServer::start().await;
+        let admin = server.login_as_admin().await;
+
+        // Create one viewer through the router.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "mv09c-reset", "password": "OldSecret1!", "role": "viewer"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // Two live viewer sessions on the login path.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "OldSecret1!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let viewer_old = body["token"].as_str().expect("viewer token").to_string();
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "OldSecret1!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let viewer_other = body["token"].as_str().expect("second token").to_string();
+        assert_ne!(viewer_old, viewer_other);
+
+        // An administrator reset needs no old password.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"new_pwd": "NewSecret2!"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 204, "{body}");
+        assert!(body.is_null());
+
+        // The new password logs in; the old one does not.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "NewSecret2!"}),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let viewer = body["token"].as_str().expect("new token").to_string();
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "OldSecret1!"}),
+            )
+            .await;
+        assert_eq!(status, 401);
+
+        // Both old sessions end: the reset revokes every live token of
+        // the user.
+        let (status, _) = server.get_auth("/api/v5/current_user", &viewer_old).await;
+        assert_eq!(status, 401);
+        let (status, _) = server.get_auth("/api/v5/current_user", &viewer_other).await;
+        assert_eq!(status, 401);
+
+        // An own change without the old password is refused.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"new_pwd": "ThirdSecret3!"}),
+                &viewer,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("ERROR_PWD_NOT_MATCH"));
+
+        // An own change with a wrong old password is refused.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"old_pwd": "Wrong-old-1!", "new_pwd": "ThirdSecret3!"}),
+                &viewer,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("ERROR_PWD_NOT_MATCH"));
+
+        // A weak new password is refused and keeps the old one.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"old_pwd": "NewSecret2!", "new_pwd": "short"}),
+                &viewer,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "NewSecret2!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // A second session of the same user, then an own change with the
+        // old password. The other session ends; the caller keeps working.
+        let (status, body) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "NewSecret2!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+        let viewer_second = body["token"].as_str().expect("second token").to_string();
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/users/mv09c-reset/change_pwd",
+                json!({"old_pwd": "NewSecret2!", "new_pwd": "ThirdSecret3!"}),
+                &viewer,
+            )
+            .await;
+        assert_eq!(status, 204, "{body}");
+        let (status, _) = server
+            .get_auth("/api/v5/current_user", &viewer_second)
+            .await;
+        assert_eq!(status, 401);
+        let (status, _) = server.get_auth("/api/v5/current_user", &viewer).await;
+        assert_eq!(status, 200);
+        let (status, _) = server
+            .post(
+                "/api/v5/login",
+                json!({"username": "mv09c-reset", "password": "ThirdSecret3!"}),
+            )
+            .await;
+        assert_eq!(status, 200);
+    }
+
+    /// The router refuses a wrong MFA code.
+    /// The router refuses a used code.
+    #[tokio::test]
+    async fn mv09c_mfa_verify_refuses_wrong_and_replayed_codes_via_http() {
+        // MV-09c broker-through test: setup runs through the served
+        // management API on `ApiState`. Verify runs through the same API.
+        // The kernel shares this state in `serve_api`. The test avoids
+        // the store. Management-plane only; publish and deliver
+        // never touch these maps. Codes and secrets never reach logs.
+        let (server, _state) = TestServer::start().await;
+        let admin = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/users",
+                json!({"username": "mv09c-mfa", "password": "MfaSecret1!", "role": "viewer"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200);
+
+        // Setup enrols and returns the secret one time.
+        let (status, setup) = server
+            .post_auth(
+                "/api/v5/sso/mfa/setup",
+                json!({"username": "mv09c-mfa"}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200, "{setup}");
+        let secret = crate::mfa_totp::base32_decode(setup["secret"].as_str().expect("secret"))
+            .expect("setup returns base32");
+
+        // A wrong code is refused and does not enable.
+        let step = crate::mfa_totp::totp_counter(crate::mfa_totp::unix_now_secs());
+        let good = crate::mfa_totp::totp_code(&secret, step);
+        let mut wrong = good.clone();
+        wrong.replace_range(0..1, if &good[0..1] == "0" { "1" } else { "0" });
+        assert_ne!(wrong, good);
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/verify",
+                json!({"username": "mv09c-mfa", "code": wrong}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // A correct code enables.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/verify",
+                json!({"username": "mv09c-mfa", "code": good.clone()}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["enabled"], json!(true));
+
+        // The same code cannot be used again.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/sso/mfa/verify",
+                json!({"username": "mv09c-mfa", "code": good}),
+                &admin,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
     #[tokio::test]
     async fn lowercase_bearer_scheme_is_accepted() {
         let (server, _state) = TestServer::start().await;

@@ -1015,7 +1015,9 @@ fn trial_days_remaining(trial_started_at: u64, now_secs: u64) -> Option<u64> {
     let trial_secs = TRIAL_DAYS.saturating_mul(SECS_PER_DAY);
     let elapsed = now_secs.saturating_sub(trial_started_at);
     if elapsed < trial_secs {
-        Some((trial_secs - elapsed) / SECS_PER_DAY)
+        // Count a partial day as one full day.
+        // Two reads in one day return the same value.
+        Some((trial_secs - elapsed).div_ceil(SECS_PER_DAY))
     } else {
         None
     }
@@ -1052,7 +1054,12 @@ pub fn evaluate_installation(
     match verify_token_at_time(token, &identity.identity, trusted, effective) {
         Ok(payload) => {
             if effective <= payload.expires_at {
-                let days_remaining = payload.expires_at.saturating_sub(effective) / SECS_PER_DAY;
+                // Count a partial day as one full day.
+                // Two reads in one day return the same value.
+                let days_remaining = payload
+                    .expires_at
+                    .saturating_sub(effective)
+                    .div_ceil(SECS_PER_DAY);
                 InstallationState::Valid {
                     customer: payload.customer,
                     expires_at: payload.expires_at,
@@ -1065,7 +1072,9 @@ pub fn evaluate_installation(
                 let grace_secs = payload.grace_period_days.saturating_mul(SECS_PER_DAY);
                 let elapsed = effective.saturating_sub(payload.expires_at);
                 if elapsed <= grace_secs {
-                    let days_remaining = grace_secs.saturating_sub(elapsed) / SECS_PER_DAY;
+                    // Count a partial day as one full day.
+                    // Two reads in one day return the same value.
+                    let days_remaining = grace_secs.saturating_sub(elapsed).div_ceil(SECS_PER_DAY);
                     InstallationState::Grace {
                         customer: payload.customer,
                         expires_at: payload.expires_at,

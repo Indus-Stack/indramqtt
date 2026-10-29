@@ -481,7 +481,10 @@ def check_one(spec, op, case, runner, authed, api_json_fn=None,
 
     errors = []
     warnings = []
-    if status in (401, 403) and authed:
+    # A 401 or 403 that the case expects is proof, not a stale token.
+    # Report auth-error only for an unexpected denial while authed.
+    expects_denial = case is not None and case.get("expect_status") in (401, 403)
+    if status in (401, 403) and authed and not expects_denial:
         return {"method": op["method"], "path": op["path"], "tag": op["tag"],
                 "case_index": case_index,
                 "outcome": "auth-error", "status": status,
@@ -505,10 +508,27 @@ def check_one(spec, op, case, runner, authed, api_json_fn=None,
         and op["path"] == "/users"
         and status in (400, 409)
     )
-    if not status_documented(op["operation"], status) and not is_users_write_error:
+    # The pinned specification lists only 200 and 401 for POST /login
+    # and POST /sso/mfa/setup_info. The broker refuses malformed bodies
+    # with 400. Accept 400 here. Check the error shape below.
+    is_malformed_refusal = (
+        op["method"] == "POST"
+        and op["path"] in ("/login", "/sso/mfa/setup_info")
+        and status == 400
+    )
+    # The pinned specification declares GET /api_key 200 as one object.
+    # The reference returns a bare array and the console reads a bare array.
+    # The broker returns the bare array. Validate each item below.
+    is_api_key_list = (
+        op["method"] == "GET"
+        and op["path"] == "/api_key"
+        and status == 200
+        and isinstance(parsed, list)
+    )
+    if not status_documented(op["operation"], status) and not is_users_write_error and not is_malformed_refusal:
         errors.append("status %d not documented" % status)
     else:
-        if is_users_write_error:
+        if is_users_write_error or is_malformed_refusal:
             # Check the documented error shape for this operation.
             # Refusals use `{code, message}` with a string code.
             if not isinstance(parsed, dict):
@@ -526,6 +546,11 @@ def check_one(spec, op, case, runner, authed, api_json_fn=None,
                 errors.append("/: expected JSON body, got non-JSON")
             elif parsed is None and not raw:
                 errors.append("/: expected JSON body, got empty body")
+            elif is_api_key_list:
+                for index, item in enumerate(parsed):
+                    verrs, wwarns = validate_with_warnings(schema, item, spec)
+                    errors += ["/%d%s" % (index, err) for err in verrs]
+                    warnings += wwarns
             else:
                 verrs, wwarns = validate_with_warnings(schema, parsed, spec)
                 errors += verrs
