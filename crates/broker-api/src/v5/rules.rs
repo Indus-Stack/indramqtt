@@ -6528,8 +6528,12 @@ pub async fn update_connector(
     // action dispatch keys (staged build → persist → swap, in that
     // order) and report their wiring live. The actions that staged
     // nothing keep their state (they never owned a sink for this
-    // connector's new shape).
+    // connector's new shape). Rows that still wait in an old runtime
+    // count as stopped drops before the swap.
     for (key, sink) in staged_sinks {
+        if let Some(old) = state.engine.connectors().get(&key) {
+            old.discard_buffered();
+        }
         state.engine.connectors().register(key, sink);
     }
     for action_id in &staged_ids {

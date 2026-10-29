@@ -900,7 +900,11 @@ pub async fn delete_action(State(state): State<ApiState>, Path(id): Path<String>
         .deactivate(&format!("action_build_failed:{bare}"));
     state.actions.set_wiring(&bare, ActionWiring::None);
     // MV-01: drop the owned sink under its dispatch key so delivery
-    // stops with the delete (unknown keys are a no-op).
+    // stops with the delete (unknown keys are a no-op). Rows that still
+    // wait count as stopped drops first.
+    if let Some(old) = state.engine.connectors().get(&key) {
+        old.discard_buffered();
+    }
     state.engine.connectors().unregister(&key);
     // W3-04: drop the id from the dispatch snapshot so a later re-create
     // with the same id starts enabled.
@@ -1040,6 +1044,11 @@ pub async fn update_action(
                 staged.resource_opts.clone(),
                 staged.health_target.clone(),
             );
+            // The old runtime may still hold rows. Count them as stopped
+            // drops before the swap, so none vanishes without a counter.
+            if let Some(old) = state.engine.connectors().get(&key) {
+                old.discard_buffered();
+            }
             state.engine.connectors().register(key.clone(), sink);
             state
                 .alarms
@@ -1050,6 +1059,9 @@ pub async fn update_action(
             // generation registered one, so an unrelated entry never
             // evicts a same-key sink.
             if prior_wiring == crate::v5::actions::ActionWiring::Live {
+                if let Some(old) = state.engine.connectors().get(&key) {
+                    old.discard_buffered();
+                }
                 state.engine.connectors().unregister(&key);
                 state.engine.remove_action(&key);
             }

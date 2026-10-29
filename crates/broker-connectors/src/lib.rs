@@ -194,6 +194,11 @@ pub trait Sink: Send + Sync {
         None
     }
 
+    /// Drop rows that wait in a bounded buffer without delivery. The
+    /// default keeps nothing and counts nothing. An action-owned runtime
+    /// overrides it: it empties its queue and counts each row as dropped.
+    fn discard_buffered(&self) {}
+
     /// Stable kind name for management display (`webhook`, `console`,
     /// `kafka`, `rabbitmq`, ...).
     fn kind(&self) -> &'static str;

@@ -227,12 +227,14 @@ impl ActionResourceOpts {
             ));
         }
         if let Some(ttl) = opts.request_ttl {
-            // Reason: a batch wait longer than half the request TTL would
-            // let a low-rate batch expire before its first send. The
-            // reference caps the wait at half the TTL.
-            let cap = ttl / 2;
-            if opts.batch_time > cap {
-                opts.batch_time = cap;
+            // Reason: a batch wait longer than the request TTL would let a
+            // low-rate batch expire before its first send. Refuse the pair
+            // instead of capping it silently.
+            if opts.batch_time > ttl {
+                return Err(format!(
+                    "action {id:?} field `resource_opts.batch_time` value {:?} exceeds `request_ttl` {:?}: lower `batch_time` or raise `request_ttl`",
+                    opts.batch_time, ttl
+                ));
             }
         }
         Ok(opts)
@@ -496,6 +498,11 @@ struct RuntimeBuffer {
     bytes: usize,
 }
 
+/// Per-row byte overhead counted in `max_buffer_bytes`. Reason: each queued
+/// row holds a topic string, a payload handle, a timestamp and a queue node.
+/// 64 bytes bounds those handles on 64-bit builds.
+const ROW_OVERHEAD_BYTES: usize = 64;
+
 impl RuntimeBuffer {
     fn take(&mut self, count: usize) -> Vec<QueuedMessage> {
         let count = count.min(self.rows.len());
@@ -504,16 +511,32 @@ impl RuntimeBuffer {
             if let Some(row) = self.rows.pop_front() {
                 self.bytes = self
                     .bytes
-                    .saturating_sub(row_size(&row.topic, &row.payload));
+                    .saturating_sub(row_footprint(&row.topic, &row.payload));
                 out.push(row);
             }
         }
         out
     }
+
+    /// Row count waiting in the buffer.
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// True when no row waits in the buffer.
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
 }
 
-fn row_size(topic: &Topic, payload: &Bytes) -> usize {
-    topic.as_str().len().saturating_add(payload.len())
+/// Byte footprint of one queued row: topic bytes plus payload bytes plus
+/// the per-row overhead. The bound counts this total.
+fn row_footprint(topic: &Topic, payload: &Bytes) -> usize {
+    topic
+        .as_str()
+        .len()
+        .saturating_add(payload.len())
+        .saturating_add(ROW_OVERHEAD_BYTES)
 }
 
 /// Decrement a gauge without wrapping. A reset can set the gauge to zero
@@ -578,7 +601,6 @@ struct ActionRuntimeState {
     opts: ActionResourceOpts,
     metrics: Arc<ActionMetrics>,
     buffer: Mutex<RuntimeBuffer>,
-    flush_gate: tokio::sync::Mutex<()>,
     inflight: Arc<tokio::sync::Semaphore>,
     health: ActionHealth,
 }
@@ -608,7 +630,6 @@ impl ActionRuntimeSink {
             opts,
             metrics,
             buffer: Mutex::new(RuntimeBuffer::default()),
-            flush_gate: tokio::sync::Mutex::new(()),
             health: ActionHealth::new(),
         });
         let (wake, receiver) = tokio::sync::mpsc::channel(1);
@@ -655,23 +676,47 @@ async fn run_health_worker(
     }
 }
 
-async fn probe_target(target: &str, timeout: Option<Duration>) -> Result<(), String> {
-    let dial = if target.contains(':') {
-        target.to_string()
+/// Dial target of one action health probe. A bare host reads port 80.
+/// A bare `https://` host reads port 443, the scheme default port. A
+/// value that already carries a port dials as given.
+fn probe_dial_target(target: &str) -> String {
+    let trimmed = target.trim();
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or(rest);
+        if host.contains(':') {
+            host.to_string()
+        } else {
+            format!("{host}:443")
+        }
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        let host = rest.split('/').next().unwrap_or(rest);
+        if host.contains(':') {
+            host.to_string()
+        } else {
+            format!("{host}:80")
+        }
+    } else if trimmed.contains(':') {
+        trimmed.to_string()
     } else {
-        format!("{target}:80")
-    };
+        format!("{trimmed}:80")
+    }
+}
+
+async fn probe_target(target: &str, timeout: Option<Duration>) -> Result<(), String> {
+    // The reason carries no host. The action read path already names the
+    // action and its target, so a repeated host adds no value.
+    let dial = probe_dial_target(target);
     match timeout {
         Some(limit) => {
             match tokio::time::timeout(limit, tokio::net::TcpStream::connect(&dial)).await {
                 Ok(Ok(_)) => Ok(()),
-                Ok(Err(e)) => Err(format!("Connection refused to {dial}: {e}")),
-                Err(_) => Err(format!("health check timed out for {dial}")),
+                Ok(Err(e)) => Err(format!("connection refused: {e}")),
+                Err(_) => Err("health check timed out".to_string()),
             }
         }
         None => match tokio::net::TcpStream::connect(&dial).await {
             Ok(_) => Ok(()),
-            Err(e) => Err(format!("Connection refused to {dial}: {e}")),
+            Err(e) => Err(format!("connection refused: {e}")),
         },
     }
 }
@@ -723,8 +768,14 @@ impl ActionRuntimeState {
                         now.duration_since(row.enqueued) >= self.opts.batch_time
                     });
                 let full = buffer.rows.len() >= self.opts.batch_size;
+                // `batch_size` applies only when `batch_time` is more than
+                // zero. A zero batch time sends each row at once.
                 let take = if stale || full {
-                    buffer.rows.len().min(self.opts.batch_size)
+                    if self.opts.batch_time.is_zero() {
+                        buffer.rows.len().min(1)
+                    } else {
+                        buffer.rows.len().min(self.opts.batch_size)
+                    }
                 } else {
                     0
                 };
@@ -762,11 +813,45 @@ impl ActionRuntimeState {
         }
     }
 
+    /// Remove waiting rows and count them as stopped drops. The replace
+    /// paths call it before they swap the sink, so no row vanishes
+    /// without a counter.
+    fn discard_buffered(&self) {
+        let count = self.take_buffered();
+        if count == 0 {
+            return;
+        }
+        self.metrics.dropped.fetch_add(count, Ordering::Relaxed);
+        self.metrics
+            .dropped_resource_stopped
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Empty the buffer and return the dropped row count. The caller
+    /// counts the rows. The queue gauge drops by the same count.
+    fn take_buffered(&self) -> u64 {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if buffer.is_empty() {
+            return 0;
+        }
+        let count = buffer.len() as u64;
+        buffer.rows.clear();
+        buffer.bytes = 0;
+        sub_saturating(&self.metrics.queuing, count);
+        count
+    }
+
     async fn dispatch_batch(
         self: &Arc<Self>,
         mut batch: Vec<QueuedMessage>,
     ) -> broker_connectors::Result<()> {
-        let _gate = self.flush_gate.lock().await;
+        // No gate spans the driver call. Up to `inflight_window` calls run
+        // at the same time. Each call holds one semaphore permit, so a
+        // window of one still sends one call at a time.
+        //
         // One chunk is one driver call. `worker_pool_size` bounds the rows
         // in one call; `inflight_window` bounds the calls in flight.
         let chunk_size = self.opts.worker_pool_size.max(1);
@@ -878,6 +963,30 @@ impl ActionRuntimeState {
     }
 }
 
+impl Drop for ActionRuntimeState {
+    fn drop(&mut self) {
+        // Backstop: rows that still wait at drop count as dropped. An
+        // explicit discard before a swap empties the queue first, so this
+        // adds nothing on the replace paths.
+        let mut buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if buffer.is_empty() {
+            return;
+        }
+        let count = buffer.len() as u64;
+        buffer.rows.clear();
+        buffer.bytes = 0;
+        drop(buffer);
+        sub_saturating(&self.metrics.queuing, count);
+        self.metrics.dropped.fetch_add(count, Ordering::Relaxed);
+        self.metrics
+            .dropped_other
+            .fetch_add(count, Ordering::Relaxed);
+    }
+}
+
 #[async_trait::async_trait]
 impl Sink for ActionRuntimeSink {
     async fn send(
@@ -887,9 +996,23 @@ impl Sink for ActionRuntimeSink {
         qos: QoS,
     ) -> broker_connectors::Result<()> {
         let now = Instant::now();
-        let size = row_size(topic, payload);
+        let size = row_footprint(topic, payload);
         let mut overflowed = false;
+        let mut expired = false;
+        if size > self.state.opts.max_buffer_bytes {
+            // A row larger than the bound alone never fits. Refuse it and
+            // keep the buffer as it was.
+            overflowed = true;
+        } else if self
+            .state
+            .opts
+            .request_ttl
+            .is_some_and(|ttl| now.elapsed() >= ttl)
         {
+            // The TTL is checked at entry too. Only a zero TTL trips here;
+            // a positive TTL expires while the row waits.
+            expired = true;
+        } else {
             let mut buffer = self
                 .state
                 .buffer
@@ -901,7 +1024,7 @@ impl Sink for ActionRuntimeSink {
                 };
                 buffer.bytes = buffer
                     .bytes
-                    .saturating_sub(row_size(&row.topic, &row.payload));
+                    .saturating_sub(row_footprint(&row.topic, &row.payload));
                 sub_saturating(&self.state.metrics.queuing, 1);
                 self.state.metrics.dropped.fetch_add(1, Ordering::Relaxed);
                 self.state
@@ -909,18 +1032,14 @@ impl Sink for ActionRuntimeSink {
                     .dropped_queue_full
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if buffer.bytes.saturating_add(size) > self.state.opts.max_buffer_bytes {
-                overflowed = true;
-            } else {
-                buffer.bytes = buffer.bytes.saturating_add(size);
-                buffer.rows.push_back(QueuedMessage {
-                    topic: topic.clone(),
-                    payload: payload.clone(),
-                    qos,
-                    enqueued: now,
-                });
-                self.state.metrics.queuing.fetch_add(1, Ordering::Relaxed);
-            }
+            buffer.bytes = buffer.bytes.saturating_add(size);
+            buffer.rows.push_back(QueuedMessage {
+                topic: topic.clone(),
+                payload: payload.clone(),
+                qos,
+                enqueued: now,
+            });
+            self.state.metrics.queuing.fetch_add(1, Ordering::Relaxed);
         }
         self.state.metrics.matched.fetch_add(1, Ordering::Relaxed);
         self.state.metrics.total.fetch_add(1, Ordering::Relaxed);
@@ -929,6 +1048,14 @@ impl Sink for ActionRuntimeSink {
             self.state
                 .metrics
                 .dropped_queue_full
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        if expired {
+            self.state.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .metrics
+                .dropped_other
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -950,6 +1077,10 @@ impl Sink for ActionRuntimeSink {
 
     fn owns_action_metrics(&self) -> bool {
         true
+    }
+
+    fn discard_buffered(&self) {
+        self.state.discard_buffered();
     }
 
     fn health(&self) -> Option<SinkHealth> {
@@ -3484,7 +3615,9 @@ pub fn rebuild_all_action_sinks(
         if !action_owned_kind(&record.action_type) {
             // No runtime for this kind yet (or the kind changed): drop
             // a stale registration so the key stops claiming delivery.
-            if engine.connectors().get(&key).is_some() {
+            // Waiting rows count as stopped drops first.
+            if let Some(old) = engine.connectors().get(&key) {
+                old.discard_buffered();
                 engine.connectors().unregister(&key);
             }
             actions.set_wiring(&record.id, ActionWiring::None);
@@ -3509,6 +3642,11 @@ pub fn rebuild_all_action_sinks(
                         stage.resource_opts,
                         stage.health_target,
                     );
+                    // Boot finds nothing here. A reload or restore swap
+                    // counts the old waiting rows as stopped drops first.
+                    if let Some(old) = engine.connectors().get(&key) {
+                        old.discard_buffered();
+                    }
                     engine.connectors().register(key, sink);
                 }
                 actions.set_wiring(&record.id, ActionWiring::Live);
@@ -3519,9 +3657,11 @@ pub fn rebuild_all_action_sinks(
             }
             ActionWiring::None => {
                 // No runtime for this kind (or the reference dangles
-                // with no resolution): drop a stale registration so
-                // the key stops claiming delivery.
-                if engine.connectors().get(&key).is_some() {
+                // with no resolution): drop a stale registration so the
+                // key stops claiming delivery. Waiting rows count as
+                // stopped drops first.
+                if let Some(old) = engine.connectors().get(&key) {
+                    old.discard_buffered();
                     engine.connectors().unregister(&key);
                 }
                 actions.set_wiring(&record.id, ActionWiring::None);
@@ -3542,7 +3682,8 @@ fn set_failed_wiring(
     message: String,
 ) {
     let key = broker_config::v5_action_sink_key(&record.id);
-    if engine.connectors().get(&key).is_some() {
+    if let Some(old) = engine.connectors().get(&key) {
+        old.discard_buffered();
         engine.connectors().unregister(&key);
     }
     actions.set_wiring(&record.id, ActionWiring::Failed(message.clone()));
@@ -4584,11 +4725,13 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_bounds_the_buffer_and_counts_queue_full_drops() {
+        // One row holds 1 topic byte plus 10 payload bytes plus the
+        // 64-byte per-row overhead, 75 bytes. A 150-byte bound holds two.
         let inner = Arc::new(BatchSink::default());
         let opts = ActionResourceOpts {
             batch_size: 100,
             batch_time: Duration::from_secs(10),
-            max_buffer_bytes: 11,
+            max_buffer_bytes: 150,
             ..ActionResourceOpts::default()
         };
         let (runtime, metrics) = runtime(Arc::clone(&inner), opts);
@@ -4602,14 +4745,227 @@ mod tests {
         }
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.matched, 3);
-        assert_eq!(snapshot.dropped, 2);
-        assert_eq!(snapshot.dropped_queue_full, 2);
-        assert_eq!(snapshot.queuing, 1);
+        assert_eq!(snapshot.dropped, 1);
+        assert_eq!(snapshot.dropped_queue_full, 1);
+        assert_eq!(snapshot.queuing, 2);
         assert!(inner
             .batches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
+        // A row larger than the bound alone is refused. The buffer keeps
+        // its two rows.
+        let big = Bytes::from(vec![b'x'; 200]);
+        runtime
+            .send(&topic, &big, QoS::AtMostOnce)
+            .await
+            .expect("an oversized drop is not an error");
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.matched, 4);
+        assert_eq!(snapshot.dropped, 2);
+        assert_eq!(snapshot.dropped_queue_full, 2);
+        assert_eq!(snapshot.queuing, 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_batch_size_applies_only_when_batch_time_is_positive() {
+        // A zero batch time sends each row at once: two rows give two
+        // driver calls even with `batch_size` 2.
+        let inner = Arc::new(BatchSink::default());
+        let opts = ActionResourceOpts {
+            batch_size: 2,
+            batch_time: Duration::ZERO,
+            ..ActionResourceOpts::default()
+        };
+        let (idle_runtime, _) = runtime(Arc::clone(&inner), opts);
+        let topic = Topic::new("t/size").expect("topic");
+        let payload = Bytes::from_static(b"{}");
+        for _ in 0..2 {
+            idle_runtime
+                .send(&topic, &payload, QoS::AtMostOnce)
+                .await
+                .expect("send joins the buffer");
+        }
+        assert_eq!(
+            inner
+                .batches
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            vec![1, 1]
+        );
+        // A positive batch time groups the rows: two rows give one call.
+        let inner = Arc::new(BatchSink::default());
+        let opts = ActionResourceOpts {
+            batch_size: 2,
+            batch_time: Duration::from_millis(200),
+            ..ActionResourceOpts::default()
+        };
+        let (runtime, metrics) = runtime(Arc::clone(&inner), opts);
+        for _ in 0..2 {
+            runtime
+                .send(&topic, &payload, QoS::AtMostOnce)
+                .await
+                .expect("send joins the buffer");
+        }
+        assert_eq!(
+            inner
+                .batches
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            vec![2]
+        );
+        assert_eq!(metrics.snapshot().success, 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_drops_a_row_older_than_request_ttl() {
+        // The TTL is smaller than the batch time. One row waits past its
+        // TTL, so the send drops it and counts the drop.
+        let inner = Arc::new(BatchSink::default());
+        let opts = ActionResourceOpts {
+            batch_size: 2,
+            batch_time: Duration::from_millis(200),
+            request_ttl: Some(Duration::from_millis(50)),
+            ..ActionResourceOpts::default()
+        };
+        let (runtime, metrics) = runtime(Arc::clone(&inner), opts);
+        let topic = Topic::new("t/ttl").expect("topic");
+        let payload = Bytes::from_static(b"{}");
+        runtime
+            .send(&topic, &payload, QoS::AtMostOnce)
+            .await
+            .expect("send joins the buffer");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while metrics.snapshot().dropped == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.dropped, 1);
+        assert_eq!(snapshot.dropped_other, 1);
+        assert_eq!(snapshot.success, 0);
+        assert!(inner
+            .batches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_runs_inflight_driver_calls_together() {
+        // Ten rows with a 200 ms driver each finish in less than 1 s only
+        // when the driver calls run together.
+        let inner = Arc::new(BatchSink {
+            delay: Duration::from_millis(200),
+            ..BatchSink::default()
+        });
+        let opts = ActionResourceOpts {
+            batch_size: 1,
+            batch_time: Duration::ZERO,
+            inflight_window: 10,
+            worker_pool_size: 1,
+            ..ActionResourceOpts::default()
+        };
+        let (runtime, metrics) = runtime(Arc::clone(&inner), opts);
+        let runtime = Arc::new(runtime);
+        let topic = Topic::new("t/join").expect("topic");
+        let payload = Bytes::from_static(b"{}");
+        let start = Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let runtime = Arc::clone(&runtime);
+            let topic = topic.clone();
+            let payload = payload.clone();
+            tasks.push(tokio::spawn(async move {
+                runtime.send(&topic, &payload, QoS::AtMostOnce).await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("send task runs")
+                .expect("send joins the buffer");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "ten slow calls ran together: {elapsed:?}"
+        );
+        assert!(
+            inner.max_active.load(AtomicOrdering::SeqCst) > 1,
+            "more than one driver call ran at once"
+        );
+        assert_eq!(metrics.snapshot().success, 10);
+    }
+
+    #[tokio::test]
+    async fn runtime_drop_counts_waiting_rows_as_dropped() {
+        // Two rows wait in the buffer. Dropping the runtime counts both
+        // rows as dropped instead of losing them silently.
+        let inner = Arc::new(BatchSink::default());
+        let opts = ActionResourceOpts {
+            batch_size: 100,
+            batch_time: Duration::from_secs(10),
+            ..ActionResourceOpts::default()
+        };
+        let (runtime, metrics) = runtime(Arc::clone(&inner), opts);
+        let topic = Topic::new("t/gone").expect("topic");
+        let payload = Bytes::from_static(b"{}");
+        for _ in 0..2 {
+            runtime
+                .send(&topic, &payload, QoS::AtMostOnce)
+                .await
+                .expect("send joins the buffer");
+        }
+        assert_eq!(metrics.snapshot().queuing, 2);
+        drop(runtime);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.queuing, 0);
+        assert_eq!(snapshot.dropped, 2);
+        assert_eq!(snapshot.dropped_other, 2);
+    }
+
+    #[test]
+    fn resource_opts_refuse_batch_time_larger_than_request_ttl() {
+        let error = ActionResourceOpts::parse(
+            "act",
+            &serde_json::json!({"batch_time": "10s", "request_ttl": "5s"}),
+        )
+        .expect_err("a batch time larger than the TTL is refused");
+        assert!(error.contains("batch_time"), "{error}");
+        ActionResourceOpts::parse(
+            "act",
+            &serde_json::json!({"batch_time": "5s", "request_ttl": "5s"}),
+        )
+        .expect("an equal batch time and TTL parse");
+    }
+
+    #[tokio::test]
+    async fn runtime_health_reason_hides_the_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target");
+        let address = listener.local_addr().expect("target address");
+        drop(listener);
+        let reason = probe_target(&address.to_string(), Some(Duration::from_secs(2)))
+            .await
+            .expect_err("a closed target fails");
+        assert!(
+            !reason.contains(&address.to_string()),
+            "the reason hides the target: {reason}"
+        );
+    }
+
+    #[test]
+    fn probe_dial_target_uses_the_scheme_default_port() {
+        assert_eq!(probe_dial_target("https://example.com"), "example.com:443");
+        assert_eq!(
+            probe_dial_target("https://example.com:8443/path"),
+            "example.com:8443"
+        );
+        assert_eq!(probe_dial_target("http://example.com"), "example.com:80");
+        assert_eq!(probe_dial_target("example.com:1234"), "example.com:1234");
+        assert_eq!(probe_dial_target("example.com"), "example.com:80");
     }
 
     #[tokio::test]

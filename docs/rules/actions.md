@@ -135,13 +135,13 @@ An action of kind `http`, `webhook`, `pgsql`, `clickhouse`, `tdengine`, `greptim
 
 ### `batch_size`
 
-Type: integer. Default: `1`. Minimum: `1`. Maximum rows in one driver batch. A value of `1` sends each row alone.
+Type: integer. Default: `1`. Minimum: `1`. Maximum rows in one driver batch. It applies only when `batch_time` is more than `0ms`. A value of `1` sends each row alone.
 
-Example: `{"batch_size": 2}` sends two rows in one driver call.
+Example: `{"batch_size": 2, "batch_time": "1s"}` sends two rows in one driver call.
 
 ### `batch_time`
 
-Type: duration string. Default: `0ms`. Maximum wait to form a batch. A value of `0ms` flushes after each send. The runtime caps the wait at half of `request_ttl`. The value `infinity` is refused.
+Type: duration string. Default: `0ms`. Maximum wait to form a batch. A value of `0ms` sends each row at once. The runtime sends when the batch is full or when the wait ends, whichever comes first. A `batch_time` larger than `request_ttl` is refused. The value `infinity` is refused.
 
 Example: `{"batch_size": 10, "batch_time": "100ms"}` sends a partial batch after 100 ms.
 
@@ -153,13 +153,13 @@ Example: `{"inflight_window": 4, "worker_pool_size": 2}` sends two chunks of two
 
 ### `max_buffer_bytes`
 
-Type: byte-size string. Default: `256MB`. Maximum queued bytes. A full buffer drops the oldest rows and counts each drop. A value of `0` is refused.
+Type: byte-size string. Default: `256MB`. Maximum queued bytes. The bound counts topic bytes, payload bytes and a fixed per-row overhead. A full buffer drops the oldest rows and counts each drop. A row larger than the bound alone is refused and counted. A value of `0` is refused.
 
 Example: `{"max_buffer_bytes": "32MB"}` bounds one action buffer at 32 MB.
 
 ### `request_ttl`
 
-Type: duration string or `infinity`. Default: `45s`. Maximum time in the buffer before the broker drops the row and counts the drop. `infinity` turns off expiry.
+Type: duration string or `infinity`. Default: `45s`. Maximum time in the buffer. The runtime checks each row when it enters the batch and again before the send. A row older than `request_ttl` is dropped and counted. `infinity` turns off expiry.
 
 Example: `{"request_ttl": "10s"}` drops a row that waits 10 s in the buffer.
 
