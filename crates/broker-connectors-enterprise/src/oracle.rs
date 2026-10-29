@@ -190,14 +190,18 @@ pub fn classify_ora_code(code: u32) -> OraErrorKind {
         2290..=2292 => OraErrorKind::Constraint,
         // Bad login or locked account fails the credential.
         1017 | 1005 | 28000 | 28001 | 28009 => OraErrorKind::Authentication,
-        // Startup or shutdown is transient and a retry wins.
-        1033 | 1089 => OraErrorKind::Connection,
+        // Startup, shutdown or a down instance is transient; a retry wins.
+        // ORA-01034 reports a down instance; redial after boot.
+        1033 | 1034 | 1089 => OraErrorKind::Connection,
         // Cancel or limit hit the time budget, so retry.
         1013 | 2049 | 3136 | 12170 => OraErrorKind::Timeout,
         // Bad name or bad text fails the statement.
         904 | 911 | 933 | 923 | 942 => OraErrorKind::Syntax,
         // Lost session or listener fault; redial wins.
-        3113 | 3114 | 3135 | 12154 | 12505 | 12514 | 12541 | 12545 => OraErrorKind::Connection,
+        // ORA-12537 reports a closed connection; ORA-12543 reports a down host.
+        3113 | 3114 | 3135 | 12154 | 12505 | 12514 | 12537 | 12541 | 12543 | 12545 => {
+            OraErrorKind::Connection
+        }
         _ => OraErrorKind::Unknown,
     }
 }
@@ -228,12 +232,23 @@ pub fn parse_ora_code(text: &str) -> Option<u32> {
 
 /// Classify a driver error by its typed variant and code.
 /// This path never searches message text.
+/// Every variant has an explicit class; there is no catch-all.
+/// Wire faults retry: the frame is cut, not the statement.
+/// Variants with no code and no retry reason fail closed.
 pub fn classify_oracle_driver_error(error: &oracle_rs::Error) -> OraErrorKind {
     match error {
         oracle_rs::Error::AuthenticationFailed(_)
         | oracle_rs::Error::InvalidCredentials
         | oracle_rs::Error::UnsupportedVerifierType(_) => OraErrorKind::Authentication,
         oracle_rs::Error::ConnectionTimeout(_) => OraErrorKind::Timeout,
+        // A cut frame carries no ORA code; the statement itself is fine.
+        // Retry with backoff. Only cut frames retry. Other wire faults
+        // fail closed below: a retry cannot fix them.
+        oracle_rs::Error::Protocol(_)
+        | oracle_rs::Error::ProtocolError(_)
+        | oracle_rs::Error::PacketTooShort { .. }
+        | oracle_rs::Error::UnexpectedPacketType { .. }
+        | oracle_rs::Error::BufferUnderflow { .. } => OraErrorKind::Transport,
         oracle_rs::Error::ConnectionRefused { .. }
         | oracle_rs::Error::ConnectionRedirected { .. }
         | oracle_rs::Error::ConnectionRedirect(_)
@@ -249,7 +264,22 @@ pub fn classify_oracle_driver_error(error: &oracle_rs::Error) -> OraErrorKind {
         oracle_rs::Error::OracleError { code, .. } | oracle_rs::Error::ServerError { code, .. } => {
             classify_ora_code(*code)
         }
-        _ => OraErrorKind::Unknown,
+        // TODO(parity): does any fault with no code deserve a retry?
+        oracle_rs::Error::ProtocolVersionNotSupported(..)
+        | oracle_rs::Error::InvalidPacketType(_)
+        | oracle_rs::Error::InvalidMessageType(_)
+        | oracle_rs::Error::BufferOverflow { .. }
+        | oracle_rs::Error::InvalidLengthIndicator(_)
+        | oracle_rs::Error::InvalidConnectionString(_)
+        | oracle_rs::Error::SqlError(_)
+        | oracle_rs::Error::NoDataFound
+        | oracle_rs::Error::InvalidDataType(_)
+        | oracle_rs::Error::InvalidOracleType(_)
+        | oracle_rs::Error::DataConversionError(_)
+        | oracle_rs::Error::UnexpectedNull
+        | oracle_rs::Error::FeatureNotSupported(_)
+        | oracle_rs::Error::NativeNetworkEncryptionRequired
+        | oracle_rs::Error::Internal(_) => OraErrorKind::Unknown,
     }
 }
 
@@ -626,11 +656,17 @@ impl DriverOracleTransport {
             .await
             .ok()?
             .err()?;
-        let kind = classify_oracle_driver_error(&select_error);
+        // Match the typed server code, not the display text.
+        // A `ServerError` display carries no `ORA-` tag, so text search misses it.
+        let table_missing = matches!(
+            &select_error,
+            oracle_rs::Error::OracleError { code: 942, .. }
+                | oracle_rs::Error::ServerError { code: 942, .. }
+        );
         let select_text = select_error.to_string();
         let mapped = map_oracle_driver_error(select_error);
-        if let ConnectorError::Dispatch(message) = &mapped {
-            if matches!(kind, OraErrorKind::Syntax) && parse_ora_code(message) == Some(942) {
+        if table_missing {
+            if let ConnectorError::Dispatch(_) = &mapped {
                 return Some(mapped);
             }
         }
@@ -1318,6 +1354,162 @@ mod tests {
                 "transport maps to retry"
             );
         }
+    }
+
+    #[test]
+    fn test_typed_wire_errors_retry() {
+        // A cut frame carries no ORA code; the statement itself is fine.
+        // The old match fell through to Unknown; each case fails there.
+        let cases = [
+            oracle_rs::Error::Protocol("connection cut".into()),
+            oracle_rs::Error::ProtocolError("bad TNS frame".into()),
+            oracle_rs::Error::PacketTooShort {
+                expected: 8,
+                actual: 2,
+            },
+            oracle_rs::Error::UnexpectedPacketType {
+                expected: oracle_rs::constants::PacketType::Data,
+                actual: oracle_rs::constants::PacketType::Abort,
+            },
+            oracle_rs::Error::BufferUnderflow {
+                needed: 8,
+                available: 2,
+            },
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Transport,
+                "must be transport: {error:?}"
+            );
+            assert!(
+                ora_error_is_retryable(classify_oracle_driver_error(&error)),
+                "wire fault must retry: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "wire fault maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_instance_and_host_down_retry() {
+        // ORA-01034 reports a down instance; ORA-12537 a closed connection;
+        // ORA-12543 a down host. Each retries. The old table missed them.
+        let cases = [
+            oracle_rs::Error::oracle(1034, "ORACLE not available"),
+            oracle_rs::Error::ServerError {
+                code: 12537,
+                message: "connection closed".into(),
+            },
+            oracle_rs::Error::oracle(12543, "destination host unreachable"),
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Connection,
+                "must be connection: {error:?}"
+            );
+            assert!(
+                ora_error_is_retryable(classify_oracle_driver_error(&error)),
+                "down instance or host must retry: {error:?}"
+            );
+            assert!(
+                matches!(
+                    map_oracle_driver_error(error),
+                    ConnectorError::Connection(_)
+                ),
+                "down instance or host maps to retry"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typed_table_missing_code_without_ora_tag() {
+        // A `ServerError` display carries no `ORA-` tag, so text search misses it.
+        // The probe matches the typed code. Each case uses the typed value.
+        let missing = oracle_rs::Error::ServerError {
+            code: 942,
+            message: "table or view does not exist".into(),
+        };
+        assert_eq!(
+            classify_oracle_driver_error(&missing),
+            OraErrorKind::Syntax,
+            "code 942 must be syntax"
+        );
+        assert_eq!(parse_ora_code(&missing.to_string()), None);
+        assert!(matches!(
+            map_oracle_driver_error(missing),
+            ConnectorError::Dispatch(_)
+        ));
+        let other = oracle_rs::Error::ServerError {
+            code: 1017,
+            message: "bad password".into(),
+        };
+        assert_eq!(
+            classify_oracle_driver_error(&other),
+            OraErrorKind::Authentication
+        );
+    }
+
+    #[test]
+    fn test_typed_coded_less_faults_fail_closed() {
+        // Faults with no code and no retry reason stay terminal.
+        let cases = [
+            oracle_rs::Error::SqlError("bad execute".into()),
+            oracle_rs::Error::NoDataFound,
+            oracle_rs::Error::FeatureNotSupported("tns".into()),
+            oracle_rs::Error::Internal("bug".into()),
+        ];
+        for error in cases {
+            assert_eq!(
+                classify_oracle_driver_error(&error),
+                OraErrorKind::Unknown,
+                "must be unknown: {error:?}"
+            );
+            assert!(
+                matches!(map_oracle_driver_error(error), ConnectorError::Dispatch(_)),
+                "coded-less fault maps to terminal"
+            );
+        }
+    }
+
+    /// Transport that fails each batch with one typed driver error.
+    /// It proves the sink retry contract through `send`, not the classifier.
+    struct TypedFailTransport {
+        make: Box<dyn Fn() -> oracle_rs::Error + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl OracleTransport for TypedFailTransport {
+        async fn execute(
+            &self,
+            _statement: &str,
+            _binds: &[OracleBindParam],
+        ) -> Result<OracleResponse> {
+            Err(map_oracle_driver_error((self.make)()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cut_connection_through_sink_retries() {
+        // A cut connection mid-batch must retry through the sink entry.
+        // The old match read Unknown and returned a terminal error.
+        let transport = Arc::new(TypedFailTransport {
+            make: Box::new(|| oracle_rs::Error::Protocol("connection cut".into())),
+        });
+        let sink = OracleSink::new(sample_config(), transport).expect("valid sink");
+        let topic = Topic::new("sensors/temp").unwrap();
+        let payload = Bytes::from_static(br#"{"device_id": "dev-cut", "temp": 70.0}"#);
+        let result = sink.send(&topic, &payload, QoS::AtLeastOnce).await;
+        assert!(
+            matches!(result, Err(ConnectorError::Connection(_))),
+            "cut connection must retry"
+        );
     }
 
     #[test]
