@@ -1296,12 +1296,16 @@ pub(crate) fn connector_persist_error(error: broker_config::ConfigError) -> Resp
 }
 
 /// Probe the connector target the way boot replay does: entries
-/// without a `server`/`url`/… target never probe and count as reachable;
-/// otherwise a 1.5 s TCP connect decides.
+/// without a `server`/`url`/… target never probe and count as reachable,
+/// except document kinds which fail closed without a target.
+/// Otherwise a 1.5 s TCP connect decides.
 pub(crate) async fn probe_connector_reachable(body: &serde_json::Value) -> bool {
     match extract_target_host_port(body) {
         Some(target) => check_tcp_reachable(&target).await.is_ok(),
-        None => true,
+        None => {
+            let kind = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            !document_kind_needs_target(kind)
+        }
     }
 }
 
@@ -1673,6 +1677,56 @@ fn missing_mv02b_connector_field(
             }
             if !present(body, &["table", "table_template"]) {
                 return Some("table");
+            }
+            None
+        }
+        "mongodb" | "mongo" | "documentdb" => {
+            let nested = body.get("parameters").and_then(|value| value.as_object());
+            let nested_present = |keys: &[&str]| {
+                nested.is_some_and(|map| {
+                    keys.iter().any(|key| {
+                        map.get(*key)
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|text| !text.trim().is_empty())
+                    })
+                })
+            };
+            if !present(body, &["server", "servers", "connection_string"])
+                && !nested_present(&["server", "servers"])
+            {
+                return Some("server");
+            }
+            if !present(body, &["database"]) && !nested_present(&["database"]) {
+                return Some("database");
+            }
+            None
+        }
+        "couchbase" | "couch" | "cb" => {
+            if !present(body, &["server", "servers", "connection_string"]) {
+                return Some("server");
+            }
+            let nested_auth = body.get("auth").and_then(|value| value.as_object());
+            let auth_user = nested_auth.is_some_and(|auth| {
+                auth.get("username")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|text| !text.trim().is_empty())
+            });
+            if !present(body, &["username", "user"]) && !auth_user {
+                return Some("username");
+            }
+            None
+        }
+        "elasticsearch" | "elastic" | "es" | "opensearch" => {
+            let nested = body.get("parameters").and_then(|value| value.as_object());
+            let nested_server = nested.is_some_and(|map| {
+                ["server", "endpoint", "servers", "url"].iter().any(|key| {
+                    map.get(*key)
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|text| !text.trim().is_empty())
+                })
+            });
+            if !present(body, &["server", "endpoint", "servers", "url"]) && !nested_server {
+                return Some("server");
             }
             None
         }
@@ -2132,8 +2186,89 @@ fn live_sink_kind(conn_type: &str) -> &str {
         "postgres" => "pgsql",
         "sqlserver" => "mssql",
         "dynamo" => "dynamodb",
+        "mongo" | "documentdb" => "mongodb",
+        "couch" | "cb" => "couchbase",
+        "elastic" | "es" | "opensearch" => "elasticsearch",
         _ => conn_type,
     }
+}
+
+/// Canonical type of a document-store connector. The KC-00 aliases map to
+/// their base kind. Every other name is unchanged.
+fn canonical_connector_kind(conn_type: &str) -> &str {
+    match conn_type {
+        "mongo" | "documentdb" => "mongodb",
+        "couch" | "cb" => "couchbase",
+        "elastic" | "es" | "opensearch" => "elasticsearch",
+        _ => conn_type,
+    }
+}
+
+/// Write the canonical type and the reference MongoDB `parameters` object
+/// into a connector body. The API accepts top-level fields. A missing value
+/// is never invented.
+fn normalize_connector_document(conn_type: &str, body: &mut serde_json::Value) {
+    fn read(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+        map.get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    }
+
+    let canonical = canonical_connector_kind(conn_type);
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "type".to_string(),
+        serde_json::Value::String(canonical.to_string()),
+    );
+    if canonical != "mongodb" {
+        return;
+    }
+    let nested = obj
+        .get("parameters")
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mongo_type = read(obj, "mongo_type")
+        .or_else(|| read(&nested, "mongo_type"))
+        .unwrap_or_else(|| "single".to_string());
+    let mut parameters = nested;
+    parameters.insert(
+        "mongo_type".to_string(),
+        serde_json::Value::String(mongo_type.clone()),
+    );
+    match mongo_type.as_str() {
+        "rs" => {
+            if let Some(servers) = read(obj, "servers").or_else(|| read(&parameters, "servers")) {
+                parameters.insert("servers".to_string(), serde_json::Value::String(servers));
+            }
+            if let Some(name) =
+                read(obj, "replica_set_name").or_else(|| read(&parameters, "replica_set_name"))
+            {
+                parameters.insert(
+                    "replica_set_name".to_string(),
+                    serde_json::Value::String(name),
+                );
+            }
+        }
+        "sharded" => {
+            if let Some(servers) = read(obj, "servers").or_else(|| read(&parameters, "servers")) {
+                parameters.insert("servers".to_string(), serde_json::Value::String(servers));
+            }
+        }
+        _ => {
+            if let Some(server) = read(obj, "server").or_else(|| read(&parameters, "server")) {
+                parameters.insert("server".to_string(), serde_json::Value::String(server));
+            }
+        }
+    }
+    obj.insert(
+        "parameters".to_string(),
+        serde_json::Value::Object(parameters),
+    );
 }
 
 /// Checked registration: a kind whose Cargo feature is disabled fails
@@ -2755,65 +2890,15 @@ pub(crate) async fn register_live_sink(
             }
         }
         #[cfg(feature = "mongodb")]
-        "mongodb" | "mongo" => {
-            let server = body
-                .get("server")
-                .and_then(|v| v.as_str())
-                .or_else(|| body.get("connection_string").and_then(|v| v.as_str()))
-                .unwrap_or("127.0.0.1:27017");
-            let conn_str =
-                if server.starts_with("mongodb://") || server.starts_with("mongodb+srv://") {
-                    server.to_string()
-                } else {
-                    format!("mongodb://{}", server)
-                };
-            let database = body
-                .get("database")
-                .and_then(|v| v.as_str())
-                .unwrap_or("telemetry");
-            let collection = body
-                .get("collection")
-                .and_then(|v| v.as_str())
-                .or_else(|| body.get("collection_template").and_then(|v| v.as_str()))
-                .unwrap_or("telemetry_${topic}");
-            let timeout_ms = body
-                .get("timeout_ms")
-                .or_else(|| body.get("timeout"))
-                .or_else(|| body.get("request_timeout_ms"))
-                .and_then(|v| v.as_u64());
-            let config = broker_connectors_enterprise::MongoDbSinkConfig {
-                connection_string: conn_str,
-                database: database.to_string(),
-                collection_template: collection.to_string(),
-                operation: broker_connectors_enterprise::MongoOperation::InsertOne,
-                batch_size: Some(1),
-                batch_bytes: Some(4_194_304),
-                linger_ms: Some(10),
-                max_retries: Some(4),
-                initial_backoff_ms: Some(100),
-                max_backoff_ms: Some(3_000),
-                timeout_ms,
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::DriverMongoDbTransport::new(&config)
-            ) {
-                let transport = Arc::new(transport);
-                if let Some(sink) = record_sink_error!(
-                    broker_connectors_enterprise::MongoDbSink::new(config, transport)
-                ) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("mongodb:{}", name), sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("mongo:{}", name), sink);
-                }
-            }
+        "mongodb" | "mongo" | "documentdb" => {
+            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
+            // The connector carries the connection and database only.
+            // The collection and document template belong to the action,
+            // so the connector alone registers no sink and invents no
+            // target.
         }
         #[cfg(not(feature = "mongodb"))]
-        "mongodb" | "mongo" => {
+        "mongodb" | "mongo" | "documentdb" => {
             return Err(refuse_disabled_kind(conn_type, "mongodb"));
         }
         #[cfg(feature = "cassandra")]
@@ -2989,84 +3074,14 @@ pub(crate) async fn register_live_sink(
             }
         }
         #[cfg(feature = "couchbase")]
-        "couchbase" => {
-            let server = body
-                .get("server")
-                .and_then(|v| v.as_str())
-                .or_else(|| body.get("connection_string").and_then(|v| v.as_str()))
-                .unwrap_or("couchbase://127.0.0.1:11210");
-            let conn_str =
-                if server.starts_with("couchbase://") || server.starts_with("couchbases://") {
-                    server.to_string()
-                } else {
-                    format!("couchbase://{}", server)
-                };
-            let bucket = body
-                .get("bucket")
-                .and_then(|v| v.as_str())
-                .unwrap_or("telemetry");
-            let scope = body
-                .get("scope")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let collection = body
-                .get("collection")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let username = body
-                .get("username")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Administrator");
-            let password = body
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("password");
-            let timeout_ms = body
-                .get("timeout_ms")
-                .or_else(|| body.get("timeout"))
-                .or_else(|| body.get("request_timeout_ms"))
-                .and_then(|v| v.as_u64());
-            let config = broker_connectors_enterprise::CouchbaseSinkConfig {
-                connection_string: conn_str,
-                bucket: bucket.to_string(),
-                scope,
-                collection,
-                auth: broker_connectors_enterprise::CouchbaseAuth {
-                    username: username.to_string(),
-                    password: password.to_string(),
-                },
-                doc_id_template: body
-                    .get("doc_id_template")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("${client_id}::${timestamp}")
-                    .to_string(),
-                operation: broker_connectors_enterprise::CouchbaseOperation::Upsert,
-                expiry_secs: None,
-                batch_size: Some(1),
-                batch_bytes: Some(2_097_152),
-                linger_ms: Some(10),
-                max_retries: Some(3),
-                initial_backoff_ms: Some(100),
-                max_backoff_ms: Some(2_000),
-                timeout_ms,
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::DriverCouchbaseTransport::new(&config)
-            ) {
-                let transport = Arc::new(transport);
-                if let Some(sink) = record_sink_error!(
-                    broker_connectors_enterprise::CouchbaseSink::new(config, transport)
-                ) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("couchbase:{}", name), sink);
-                }
-            }
+        "couchbase" | "couch" | "cb" => {
+            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
+            // The connector carries the server and credentials only.
+            // The action owns the SQL++ statement, so the connector alone
+            // registers no sink and invents no keyspace.
         }
         #[cfg(not(feature = "couchbase"))]
-        "couchbase" => {
+        "couchbase" | "couch" | "cb" => {
             return Err(refuse_disabled_kind(conn_type, "couchbase"));
         }
         "mssql" | "sqlserver" => {
@@ -3965,71 +3980,58 @@ pub(crate) async fn register_live_sink(
             }
         }
         #[cfg(feature = "elasticsearch")]
-        "elasticsearch" | "opensearch" => {
-            let server = body
-                .get("endpoint")
-                .or_else(|| body.get("server"))
-                .or_else(|| body.get("servers"))
-                .or_else(|| body.get("url"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:9200");
-            let endpoint = if server.starts_with("http://") || server.starts_with("https://") {
-                server.to_string()
-            } else {
-                format!("http://{}", server)
-            };
-            let index = body
+        "elasticsearch" | "elastic" | "es" | "opensearch" => {
+            crate::v5::action_sinks::validate_connector_io_bounds(body, name, "connector config")?;
+            // The connector carries the endpoint and authentication only.
+            // The action owns the index, id and document, so the connector
+            // alone registers no sink and invents no index. A carried
+            // legacy index template is still validated, so a bad legacy
+            // body cannot store an unusable connector.
+            if let Some(index) = body
                 .get("index_template")
                 .or_else(|| body.get("index"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("sensor_events")
-                .to_string();
-            let username = body.get("username").and_then(|v| v.as_str());
-            let password = body.get("password").and_then(|v| v.as_str());
-            let auth = if let (Some(u), Some(p)) = (username, password) {
-                broker_connectors::elasticsearch::ElasticsearchAuth::Basic {
-                    username: u.to_string(),
-                    password: p.to_string(),
-                }
-            } else {
-                broker_connectors::elasticsearch::ElasticsearchAuth::None
-            };
-            let timeout_ms = body
-                .get("request_timeout_ms")
-                .or_else(|| body.get("timeout_ms"))
-                .or_else(|| body.get("timeout"))
-                .and_then(|v| v.as_u64());
-
-            let config = broker_connectors::elasticsearch::ElasticsearchSinkConfig {
-                endpoint,
-                index_template: index,
-                doc_id_template: None,
-                auth,
-                batch_size: 1,
-                batch_timeout_ms: 10,
-                max_retries: 3,
-                request_timeout_ms: timeout_ms,
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors::elasticsearch::DriverElasticsearchTransport::new(&config)
-            ) {
-                let transport = Arc::new(transport);
-                if let Some(sink) = record_sink_error!(
-                    broker_connectors::elasticsearch::ElasticsearchSink::new(config, transport)
-                ) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("elasticsearch:{}", name), sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("opensearch:{}", name), sink);
-                }
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                let raw_server = body
+                    .get("endpoint")
+                    .or_else(|| body.get("server"))
+                    .or_else(|| body.get("servers"))
+                    .or_else(|| body.get("url"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("127.0.0.1:9200");
+                let endpoint =
+                    if raw_server.starts_with("http://") || raw_server.starts_with("https://") {
+                        raw_server.to_string()
+                    } else {
+                        format!("http://{raw_server}")
+                    };
+                let config = broker_connectors::elasticsearch::ElasticsearchSinkConfig {
+                    endpoint,
+                    index_template: index.to_string(),
+                    doc_id_template: None,
+                    operation: broker_connectors::elasticsearch::ElasticsearchOperation::Index,
+                    doc_template: None,
+                    overwrite: true,
+                    doc_as_upsert: false,
+                    require_alias: false,
+                    routing: None,
+                    auth: broker_connectors::elasticsearch::ElasticsearchAuth::None,
+                    batch_size: 1,
+                    batch_timeout_ms: 10,
+                    max_retries: 2,
+                    request_timeout_ms: None,
+                };
+                config
+                    .validate()
+                    .map_err(|error| format!("invalid elasticsearch config: {error}"))?;
             }
         }
         #[cfg(not(feature = "elasticsearch"))]
-        "elasticsearch" | "opensearch" => {
+        "elasticsearch" | "elastic" | "es" | "opensearch" => {
             return Err(refuse_disabled_kind(conn_type, "elasticsearch"));
         }
         "pulsar" => {
@@ -6141,6 +6143,19 @@ pub async fn create_connector(
         )
             .into_response();
     }
+    // The official document-store drivers own their pools and TLS. An
+    // explicit pool, pipelining or `ssl` value is refused at create,
+    // not stored and ignored.
+    if matches!(
+        crate::v5::action_sinks::canonical_action_kind(&conn_type),
+        "mongodb" | "couchbase" | "elasticsearch"
+    ) {
+        if let Err(message) =
+            crate::v5::action_sinks::validate_connector_io_bounds(&body, &name, "connector create")
+        {
+            return ApiError::BadRequest(message).into_response();
+        }
+    }
 
     // KC-00: a known kind whose capability state is not `ready` is refused
     // after its credential fields pass, before anything is stored, with the
@@ -6194,6 +6209,7 @@ pub async fn create_connector(
         }
         obj.insert("node_status".to_string(), connector_node_status(status_str));
     }
+    normalize_connector_document(&conn_type, &mut body);
 
     // Re-check under the write lock so two concurrent creates for the
     // same id cannot both pass the early check and push a duplicate pair.
@@ -6364,6 +6380,18 @@ pub async fn update_connector(
         ))
         .into_response();
     }
+    // The official document-store drivers own their pools and TLS. An
+    // explicit pool, pipelining or `ssl` value is refused at update.
+    if matches!(
+        crate::v5::action_sinks::canonical_action_kind(&conn_type),
+        "mongodb" | "couchbase" | "elasticsearch"
+    ) {
+        if let Err(message) =
+            crate::v5::action_sinks::validate_connector_io_bounds(&body, &bare, "connector update")
+        {
+            return ApiError::BadRequest(message).into_response();
+        }
+    }
     // MV-01 (R2-04): every dependent action must accept the new
     // connector settings before anything swaps in. Each action's owned
     // sink is built here staged (built, never registered): a failure
@@ -6481,6 +6509,7 @@ pub async fn update_connector(
         );
         obj.insert("node_status".to_string(), connector_node_status(status_str));
     }
+    normalize_connector_document(&conn_type, &mut body);
     if !state.connectors.replace(&bare, body.clone()) {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
@@ -7024,6 +7053,15 @@ pub(crate) fn extract_target_host_port(body: &serde_json::Value) -> Option<Strin
         let port = body.get("port").and_then(|v| v.as_u64()).unwrap_or(1433);
         return Some(format!("{}:{}", host_port, port));
     }
+    // The reference-shaped `parameters` object carries the same target
+    // keys one level down; read them the same way.
+    if let Some(parameters) = body.get("parameters") {
+        if parameters.is_object() {
+            if let Some(target) = extract_target_host_port(parameters) {
+                return Some(target);
+            }
+        }
+    }
     None
 }
 
@@ -7042,6 +7080,328 @@ pub(crate) async fn check_tcp_reachable(addr: &str) -> Result<(), String> {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(format!("Connection refused to {}: {}", target, e)),
         Err(_) => Err(format!("Connection to {} timed out after 1.5s", target)),
+    }
+}
+
+/// True when the kind stores documents through a server target. Such a
+/// kind is never probed without one: a missing target is a failed
+/// probe, never a silent reachable.
+fn document_kind_needs_target(kind: &str) -> bool {
+    matches!(
+        crate::v5::action_sinks::canonical_action_kind(kind),
+        "mongodb" | "couchbase" | "elasticsearch"
+    )
+}
+
+/// Required-field gate for document probes. A probe with a reachable
+/// port but a missing database or username must fail, never read
+/// connected. Reads top-level and the reference `parameters` object.
+fn probe_document_missing_field(kind: &str, body: &serde_json::Value) -> Option<&'static str> {
+    fn present(body: &serde_json::Value, keys: &[&str]) -> bool {
+        keys.iter().any(|k| {
+            body.get(*k)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+        }) || body.get("parameters").is_some_and(|p| {
+            keys.iter().any(|k| {
+                p.get(*k)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty())
+            })
+        })
+    }
+    match crate::v5::action_sinks::canonical_action_kind(kind) {
+        "mongodb" => {
+            if !present(body, &["server", "servers"]) {
+                return Some("server");
+            }
+            if !present(body, &["database"]) {
+                return Some("database");
+            }
+            None
+        }
+        "couchbase" => {
+            if !present(body, &["server", "servers"]) {
+                return Some("server");
+            }
+            if !present(body, &["username", "user"]) {
+                return Some("username");
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// True when the kind speaks HTTP, so the probe adds an HTTP round
+/// trip after the TCP dial.
+fn probe_kind_needs_http_handshake(kind: &str) -> bool {
+    matches!(
+        crate::v5::action_sinks::canonical_action_kind(kind),
+        "elasticsearch"
+    )
+}
+
+/// HTTP root handshake for search kinds: one bounded GET to `/`. Any
+/// HTTP answer counts as reachable; only a transport failure fails.
+/// A bare `host:port` reads as `http` unless the body carries an
+/// `https://` endpoint, mirroring the builder.
+async fn probe_http_root(target: &str, use_tls: bool) -> Result<(), String> {
+    probe_http_root_with(&probe_http_client(), target, use_tls).await
+}
+
+/// Build the search probe client. When `SSL_CERT_FILE` is set, the file
+/// is the trust store. The client turns off the built-in roots and adds
+/// every certificate in the file. An unreadable file trusts no root, so
+/// the probe fails closed. Without the variable the default roots stay.
+pub(crate) fn probe_http_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
+        builder = builder.tls_built_in_root_certs(false);
+        if let Ok(pem) = std::fs::read(path) {
+            for cert in probe_certificates(&pem) {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Read every PEM certificate in a file. Parse the bundle first. If one
+/// section is invalid, parse each section alone so a good certificate is
+/// still trusted.
+fn probe_certificates(pem: &[u8]) -> Vec<reqwest::Certificate> {
+    if let Ok(certs) = reqwest::Certificate::from_pem_bundle(pem) {
+        return certs;
+    }
+    let text = String::from_utf8_lossy(pem);
+    let mut certs = Vec::new();
+    for section in text.split("-----BEGIN CERTIFICATE-----").skip(1) {
+        let block = format!("-----BEGIN CERTIFICATE-----{section}");
+        if let Ok(cert) = reqwest::Certificate::from_pem(block.as_bytes()) {
+            certs.push(cert);
+        }
+    }
+    certs
+}
+
+/// Return an error text with its source chain. The probe message keeps
+/// the TLS cause, so an operator can see a bad certificate.
+fn probe_error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+/// HTTP handshake with a caller-supplied client. Tests use a client that
+/// trusts their loopback certificate.
+pub(crate) async fn probe_http_root_with(
+    client: &reqwest::Client,
+    target: &str,
+    use_tls: bool,
+) -> Result<(), String> {
+    let url = if target.contains("://") {
+        target.to_string()
+    } else if use_tls {
+        format!("https://{target}/")
+    } else {
+        format!("http://{target}/")
+    };
+    client
+        .get(url.as_str())
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "search handshake to {target} failed: {}",
+                probe_error_chain(&error)
+            )
+        })
+}
+
+/// True when the probe body names an `https://` endpoint, so the
+/// search handshake dials TLS instead of plain HTTP.
+fn probe_body_wants_tls(body: &serde_json::Value) -> bool {
+    for key in ["server", "servers", "endpoint", "url"] {
+        if body
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.trim_start().starts_with("https://"))
+        {
+            return true;
+        }
+    }
+    if let Some(params) = body.get("parameters") {
+        for key in ["server", "servers", "endpoint", "url"] {
+            if params
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.trim_start().starts_with("https://"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Read one probe field from the top level, then from the reference
+/// `parameters` object.
+fn probe_string(body: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let read = |source: &serde_json::Value| {
+        keys.iter().find_map(|key| {
+            source
+                .get(*key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
+    };
+    read(body).or_else(|| body.get("parameters").and_then(read))
+}
+
+/// True when the kind needs a real protocol round trip after the TCP
+/// dial: MongoDB HELLO and Couchbase SASL PLAIN.
+fn probe_kind_needs_document_handshake(kind: &str) -> bool {
+    matches!(
+        crate::v5::action_sinks::canonical_action_kind(kind),
+        "mongodb" | "couchbase"
+    )
+}
+
+/// MongoDB probe: open one connection and run the driver handshake
+/// (HELLO plus SCRAM when credentials are configured).
+async fn probe_mongodb_handshake(body: &serde_json::Value, target: &str) -> Result<(), String> {
+    #[cfg(feature = "mongodb")]
+    {
+        let database = probe_string(body, &["database"])
+            .ok_or_else(|| "missing required field: database".to_string())?;
+        let mut connection_string = if target.contains("://") {
+            target.to_string()
+        } else {
+            format!("mongodb://{target}")
+        };
+        let username = probe_string(body, &["username", "user"]);
+        let password = probe_string(body, &["password"]);
+        match (username, password) {
+            (Some(username), Some(password)) => {
+                let scheme = if connection_string.starts_with("mongodb+srv://") {
+                    "mongodb+srv://"
+                } else {
+                    "mongodb://"
+                };
+                if !connection_string[scheme.len()..].contains('@') {
+                    connection_string = format!(
+                        "{scheme}{username}:{password}@{}",
+                        &connection_string[scheme.len()..]
+                    );
+                }
+            }
+            (None, None) => {}
+            _ => return Err("fields `username` and `password` must be set together".to_string()),
+        }
+        if let Some(auth_source) = probe_string(body, &["auth_source"]) {
+            let separator = if connection_string.contains('?') {
+                '&'
+            } else {
+                '?'
+            };
+            connection_string.push(separator);
+            connection_string.push_str("authSource=");
+            connection_string.push_str(&auth_source);
+        }
+        let config = broker_connectors_enterprise::MongoDbSinkConfig {
+            connection_string,
+            database,
+            collection_template: "mqtt".to_string(),
+            payload_template: None,
+            operation: broker_connectors_enterprise::MongoOperation::InsertOne,
+            batch_size: Some(1),
+            batch_bytes: Some(4_096),
+            linger_ms: Some(1),
+            max_retries: Some(0),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(1_500),
+        };
+        let transport = broker_connectors_enterprise::NativeMongoDbTransport::new(&config)
+            .map_err(|error| format!("mongodb handshake to {target} failed: {error}"))?;
+        transport
+            .connect()
+            .await
+            .map_err(|error| format!("mongodb handshake to {target} failed: {error}"))?;
+        Ok(())
+    }
+    #[cfg(not(feature = "mongodb"))]
+    {
+        let _ = (body, target);
+        Err("mongodb feature is disabled in this build".to_string())
+    }
+}
+
+/// Couchbase probe: open one connection and run SASL PLAIN, the same
+/// handshake the KV transport uses.
+async fn probe_couchbase_handshake(body: &serde_json::Value, target: &str) -> Result<(), String> {
+    #[cfg(feature = "couchbase")]
+    {
+        let username = probe_string(body, &["username", "user"])
+            .ok_or_else(|| "missing required field: username".to_string())?;
+        let password = probe_string(body, &["password"]).unwrap_or_default();
+        let connection_string =
+            if target.starts_with("couchbase://") || target.starts_with("couchbases://") {
+                target.to_string()
+            } else {
+                format!("couchbase://{target}")
+            };
+        let config = broker_connectors_enterprise::CouchbaseSinkConfig {
+            connection_string,
+            bucket: String::new(),
+            scope: None,
+            collection: None,
+            auth: broker_connectors_enterprise::CouchbaseAuth { username, password },
+            doc_id_template: String::new(),
+            sql_template: Some("SELECT 1".to_string()),
+            operation: broker_connectors_enterprise::CouchbaseOperation::Upsert,
+            expiry_secs: None,
+            batch_size: Some(1),
+            batch_bytes: Some(4_096),
+            linger_ms: Some(1),
+            max_retries: Some(0),
+            initial_backoff_ms: Some(1),
+            max_backoff_ms: Some(2),
+            timeout_ms: Some(1_500),
+        };
+        let transport = broker_connectors_enterprise::NativeCouchbaseTransport::new(&config)
+            .map_err(|error| format!("couchbase handshake to {target} failed: {error}"))?;
+        transport
+            .connect()
+            .await
+            .map_err(|error| format!("couchbase handshake to {target} failed: {error}"))?;
+        Ok(())
+    }
+    #[cfg(not(feature = "couchbase"))]
+    {
+        let _ = (body, target);
+        Err("couchbase feature is disabled in this build".to_string())
+    }
+}
+
+async fn probe_document_handshake(
+    kind: &str,
+    body: &serde_json::Value,
+    target: &str,
+) -> Result<(), String> {
+    match crate::v5::action_sinks::canonical_action_kind(kind) {
+        "mongodb" => probe_mongodb_handshake(body, target).await,
+        "couchbase" => probe_couchbase_handshake(body, target).await,
+        _ => Ok(()),
     }
 }
 
@@ -7112,19 +7472,71 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
     if let Some(message) = kind_refusal(&kind) {
         return probe_failed(message);
     }
+    // Document kinds fail without their required fields, never read
+    // connected on a bare port.
+    if let Some(field) = probe_document_missing_field(&kind, &body) {
+        return probe_failed(format!("missing required field: {field}"));
+    }
     // Runtime probe hook (the W3-17 dial path reused from the connector
     // create path): kinds that expose a network target get one bounded
-    // dial; kinds without one count as reachable once the kind itself
-    // validated. No store write, no runtime registration, no background
-    // task survives the return.
-    if let Some(target) = extract_target_host_port(&body) {
+    // dial plus a protocol handshake where the driver allows one; a
+    // document kind without a target fails instead of reading
+    // reachable. Kinds without a network target count as reachable once
+    // the kind itself validated. No store write, no runtime registration,
+    // no background task survives the return.
+    let target = extract_target_host_port(&body).or_else(|| {
+        if document_kind_needs_target(&kind) {
+            probe_string(
+                &body,
+                &["server", "servers", "endpoint", "url", "connection_string"],
+            )
+        } else {
+            None
+        }
+    });
+    if let Some(target) = target {
         let dial =
             tokio::time::timeout(CONNECTOR_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
         match dial {
-            Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Ok(())) => {
+                if probe_kind_needs_http_handshake(&kind) {
+                    let use_tls = probe_body_wants_tls(&body);
+                    match tokio::time::timeout(
+                        CONNECTOR_PROBE_TIMEOUT,
+                        probe_http_root(&target, use_tls),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+                        Ok(Err(error)) => probe_failed(error),
+                        Err(_) => {
+                            probe_failed(format!("search handshake to {target} timed out after 5s"))
+                        }
+                    }
+                } else if probe_kind_needs_document_handshake(&kind) {
+                    match tokio::time::timeout(
+                        CONNECTOR_PROBE_TIMEOUT,
+                        probe_document_handshake(&kind, &body, &target),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+                        Ok(Err(error)) => probe_failed(error),
+                        Err(_) => probe_failed(format!(
+                            "document handshake to {target} timed out after 5s"
+                        )),
+                    }
+                } else {
+                    StatusCode::NO_CONTENT.into_response()
+                }
+            }
             Ok(Err(err)) => probe_failed(err),
             Err(_) => probe_failed(format!("Connection to {} timed out after 5s", target)),
         }
+    } else if document_kind_needs_target(&kind) {
+        probe_failed(format!(
+            "connector type {kind} needs a probe target: missing required field: server"
+        ))
     } else {
         StatusCode::NO_CONTENT.into_response()
     }
@@ -7221,18 +7633,70 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
     if let Some(message) = kind_refusal(&kind) {
         return probe_failed(message);
     }
+    // Document kinds fail without their required fields, never read
+    // connected on a bare port.
+    if let Some(field) = probe_document_missing_field(&kind, &body) {
+        return probe_failed(format!("missing required field: {field}"));
+    }
     // Runtime probe hook (the connector dial path reused from the
     // connector create path): kinds that expose a network target get one
-    // bounded dial; kinds without one count as reachable once the kind
+    // bounded dial plus a protocol handshake where the driver allows
+    // one; a document kind without a target fails instead of reading
+    // reachable. Kinds without one count as reachable once the kind
     // itself validated. No store write, no runtime registration, no
     // background task survives the return.
-    if let Some(target) = extract_target_host_port(&body) {
+    let target = extract_target_host_port(&body).or_else(|| {
+        if document_kind_needs_target(&kind) {
+            probe_string(
+                &body,
+                &["server", "servers", "endpoint", "url", "connection_string"],
+            )
+        } else {
+            None
+        }
+    });
+    if let Some(target) = target {
         let dial = tokio::time::timeout(ACTION_PROBE_TIMEOUT, check_tcp_reachable(&target)).await;
         match dial {
-            Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Ok(())) => {
+                if probe_kind_needs_http_handshake(&kind) {
+                    let use_tls = probe_body_wants_tls(&body);
+                    match tokio::time::timeout(
+                        ACTION_PROBE_TIMEOUT,
+                        probe_http_root(&target, use_tls),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+                        Ok(Err(error)) => probe_failed(error),
+                        Err(_) => {
+                            probe_failed(format!("search handshake to {target} timed out after 5s"))
+                        }
+                    }
+                } else if probe_kind_needs_document_handshake(&kind) {
+                    match tokio::time::timeout(
+                        ACTION_PROBE_TIMEOUT,
+                        probe_document_handshake(&kind, &body, &target),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+                        Ok(Err(error)) => probe_failed(error),
+                        Err(_) => probe_failed(format!(
+                            "document handshake to {target} timed out after 5s"
+                        )),
+                    }
+                } else {
+                    StatusCode::NO_CONTENT.into_response()
+                }
+            }
             Ok(Err(err)) => probe_failed(err),
             Err(_) => probe_failed(format!("Connection to {} timed out after 5s", target)),
         }
+    } else if document_kind_needs_target(&kind) {
+        probe_failed(format!(
+            "connector type {kind} needs a probe target: missing required field: server"
+        ))
     } else {
         StatusCode::NO_CONTENT.into_response()
     }

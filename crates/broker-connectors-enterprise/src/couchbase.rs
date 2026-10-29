@@ -142,6 +142,11 @@ pub struct CouchbaseSinkConfig {
     pub auth: CouchbaseAuth,
     /// Document key template (`${client_id}::${timestamp}`, ...).
     pub doc_id_template: String,
+    /// Optional SQL++ statement template. When set, the driver runs the
+    /// rendered query instead of a KV mutation; the statement names its
+    /// own keyspace, key and value.
+    #[serde(default)]
+    pub sql_template: Option<String>,
     /// Write operation (default upsert).
     #[serde(default)]
     pub operation: CouchbaseOperation,
@@ -178,25 +183,37 @@ impl CouchbaseSinkConfig {
 
     pub fn validate(&self) -> Result<()> {
         parse_connection_string(&self.connection_string)?;
-        if self.bucket.trim().is_empty() || self.bucket.contains(['/', ' ', '\0']) {
-            return Err(ConnectorError::Dispatch(format!(
-                "couchbase bucket must be a bare name: {:?}",
-                self.bucket
-            )));
-        }
         if self.auth.username.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
                 "couchbase username must not be empty".to_string(),
             ));
         }
-        if self.doc_id_template.trim().is_empty() {
+        if let Some(template) = &self.sql_template {
+            if template.trim().is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "couchbase sql_template must not be empty".to_string(),
+                ));
+            }
+            // A template that reads payload fields is checked at flush
+            // time, when its fields exist; the dummy below covers the
+            // fixed variables.
+            if !template.contains("${payload.") && !template.contains("${.") {
+                self.render_sql("dummy", br#"{"client_id":"dummy"}"#, QoS::AtMostOnce, 0, 0)?;
+            }
+        } else if self.bucket.trim().is_empty() || self.bucket.contains(['/', ' ', '\0']) {
+            return Err(ConnectorError::Dispatch(format!(
+                "couchbase bucket must be a bare name: {:?}",
+                self.bucket
+            )));
+        } else if self.doc_id_template.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
                 "couchbase doc_id_template must not be empty".to_string(),
             ));
+        } else {
+            // Strict template check with dummy values (a dummy client id
+            // satisfies the non-empty routing rule at validation time).
+            self.resolve_doc_id("dummy", br#"{"client_id":"dummy"}"#, QoS::AtMostOnce, 0, 0)?;
         }
-        // Strict template check with dummy values (a dummy client id
-        // satisfies the non-empty routing rule at validation time).
-        self.resolve_doc_id("dummy", br#"{"client_id":"dummy"}"#, QoS::AtMostOnce, 0, 0)?;
         if self.batch_size == Some(0) {
             return Err(ConnectorError::Dispatch(
                 "couchbase batch_size must be >= 1".to_string(),
@@ -264,6 +281,75 @@ impl CouchbaseSinkConfig {
             ("timestamp".to_string(), millis.to_string()),
             ("seq".to_string(), seq.to_string()),
         ]
+    }
+
+    /// Render one SQL++ statement template. The reference template
+    /// syntax `${.field}` maps onto this broker's rule output fields:
+    /// `${.field}` reads as `${field}`, and every payload field is
+    /// visible both as `${payload.<field>}` and as `${field}`.
+    /// Returns the statement with `$name` placeholders plus the event
+    /// values, so the driver binds them as named query parameters.
+    /// Values never render inline, so a payload value cannot inject SQL.
+    fn render_sql(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        millis: i64,
+        seq: u64,
+    ) -> Result<(String, Vec<(String, String)>)> {
+        let template = self.sql_template.as_deref().ok_or_else(|| {
+            ConnectorError::Dispatch("couchbase sql_template is absent".to_string())
+        })?;
+        let normalized = template.replace("${.}", "${payload}").replace("${.", "${");
+        let payload_text = std::str::from_utf8(payload)
+            .map_err(|_| ConnectorError::Dispatch("couchbase payload must be UTF-8".to_string()))?;
+        let mut vars = Self::template_vars(topic, payload, qos, millis, seq);
+        vars.push(("payload".to_string(), payload_text.to_string()));
+        let doc: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
+        if let Some(map) = doc.as_object() {
+            for (name, value) in map {
+                let text = match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    scalar if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
+                    _ => continue,
+                };
+                vars.push((format!("payload.{name}"), text.clone()));
+                vars.push((name.clone(), text));
+            }
+        }
+        let mut sql = String::with_capacity(normalized.len() + 32);
+        let mut rest = normalized.as_str();
+        while let Some(pos) = rest.find("${") {
+            sql.push_str(&rest[..pos]);
+            let after = &rest[pos + 2..];
+            let Some(end) = after.find('}') else {
+                return Err(ConnectorError::Dispatch(format!(
+                    "unclosed template variable in {normalized:?}"
+                )));
+            };
+            let name = &after[..end];
+            if name.is_empty() {
+                return Err(ConnectorError::Dispatch(format!(
+                    "empty template variable in {normalized:?}"
+                )));
+            }
+            if !vars.iter().any(|(key, _)| key == name) {
+                return Err(ConnectorError::Dispatch(format!(
+                    "unknown template variable {name:?} in {normalized:?}"
+                )));
+            }
+            sql.push('$');
+            sql.push_str(&name.replace('.', "_"));
+            rest = &after[end + 1..];
+        }
+        sql.push_str(rest);
+        if sql.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "couchbase sql_template resolved empty".to_string(),
+            ));
+        }
+        Ok((sql, vars))
     }
 
     /// Render the document key (rejects empty results). Routing
@@ -538,6 +624,9 @@ pub struct CouchbaseDocItem {
     pub key: String,
     pub body: Vec<u8>,
     pub expiry_secs: u32,
+    /// Event values bound as named query parameters (`$topic`,
+    /// `$payload_<field>`) next to the rendered statement.
+    pub params: Vec<(String, String)>,
 }
 
 #[async_trait]
@@ -723,6 +812,11 @@ impl CouchbaseTransport for NativeCouchbaseTransport {
             return Ok(());
         }
         let _ = (bucket, scope, coll);
+        if items.iter().any(|item| item.key.is_empty()) {
+            return Err(ConnectorError::Dispatch(
+                "couchbase SQL++ needs the official driver transport".to_string(),
+            ));
+        }
         self.connect().await?;
         // Pipeline: one opaque per item, single write, ordered reads.
         let mut opaques = Vec::with_capacity(items.len());
@@ -843,16 +937,21 @@ impl DriverCouchbaseTransport {
             ))
         })?
         .map_err(|e| ConnectorError::Connection(format!("couchbase driver connect: {e}")))?;
-        let bucket = cluster.bucket(self.config.bucket.clone());
-        tokio::time::timeout(timeout, bucket.wait_until_ready(None))
-            .await
-            .map_err(|_| {
-                ConnectorError::Connection(format!(
-                    "couchbase bucket timed out: {}",
-                    self.config.bucket
-                ))
-            })?
-            .map_err(|e| ConnectorError::Connection(format!("couchbase bucket ready: {e}")))?;
+        // SQL++ runs on the query service, not a bucket: no bucket
+        // wait applies. `Cluster::connect` already bootstraps, and
+        // the sink retries a raced first query.
+        if self.config.sql_template.is_none() {
+            let bucket = cluster.bucket(self.config.bucket.clone());
+            tokio::time::timeout(timeout, bucket.wait_until_ready(None))
+                .await
+                .map_err(|_| {
+                    ConnectorError::Connection(format!(
+                        "couchbase bucket timed out: {}",
+                        self.config.bucket
+                    ))
+                })?
+                .map_err(|e| ConnectorError::Connection(format!("couchbase bucket ready: {e}")))?;
+        }
         *guard = Some(cluster.clone());
         Ok(cluster)
     }
@@ -935,6 +1034,32 @@ impl CouchbaseTransport for DriverCouchbaseTransport {
             return Ok(());
         }
         let cluster = self.cluster_handle().await?;
+        if self.config.sql_template.is_some() {
+            for item in &items {
+                let sql = String::from_utf8(item.body.clone()).map_err(|_| {
+                    ConnectorError::Dispatch("couchbase SQL must be UTF-8".to_string())
+                })?;
+                // Bind the event values as named query parameters, so a
+                // statement that names `$topic` or `$payload_<field>` reads
+                // the row values. Dots are not valid in parameter names.
+                let mut options = couchbase::options::query_options::QueryOptions::new();
+                for (name, value) in &item.params {
+                    let key = name.replace('.', "_");
+                    options = options
+                        .add_named_parameter(key, value.clone())
+                        .map_err(|e| {
+                            ConnectorError::Dispatch(format!("couchbase query parameter: {e}"))
+                        })?;
+                }
+                tokio::time::timeout(self.timeout, cluster.query(sql, Some(options)))
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::Connection("couchbase query timed out".to_string())
+                    })?
+                    .map_err(|e| ConnectorError::Connection(format!("couchbase query: {e}")))?;
+            }
+            return Ok(());
+        }
         let collection = cluster.bucket(bucket).scope(scope).collection(coll);
         for item in &items {
             Self::write_one(&collection, self.config.operation, item, self.timeout).await?;
@@ -952,6 +1077,7 @@ impl CouchbaseTransport for DriverCouchbaseTransport {
 struct CouchbaseRow {
     key: String,
     body: Vec<u8>,
+    params: Vec<(String, String)>,
 }
 
 struct CouchbaseBuffer {
@@ -1048,9 +1174,10 @@ impl CouchbaseSink {
             .map_err(|e| ConnectorError::Dispatch(format!("couchbase encode failed: {e}")))
     }
 
-    /// Flush buffered rows (no-op when empty). Backpressure retries
-    /// in place; terminal conflicts and exhaustion restore the
-    /// buffer, engage backoff, and propagate.
+    /// Flush buffered rows (no-op when empty). Backpressure retries in
+    /// place; terminal conflicts restore the buffer and engage backoff.
+    /// Connection exhaustion drops the batch and clears the backoff, so
+    /// the next event dials again.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest, taken_bytes) = {
@@ -1068,6 +1195,7 @@ impl CouchbaseSink {
                 key: row.key.clone(),
                 body: row.body.clone(),
                 expiry_secs: self.config.effective_expiry(),
+                params: row.params.clone(),
             })
             .collect();
         let record_count = rows.len() as u64;
@@ -1092,12 +1220,11 @@ impl CouchbaseSink {
                 }
                 Err(ConnectorError::Connection(message)) => {
                     if attempt >= max_retries {
-                        return self.restore_err(
-                            rows,
-                            oldest,
-                            taken_bytes,
-                            ConnectorError::Connection(message),
-                        );
+                        // The batch did not reach the target. Drop it
+                        // and clear the backoff so the next event dials
+                        // again.
+                        self.backoff.lock().success();
+                        return Err(ConnectorError::Connection(message));
                     }
                     attempt += 1;
                     tokio::time::sleep(self.backoff_delay(attempt)).await;
@@ -1133,13 +1260,23 @@ impl CouchbaseSink {
         }
         let millis = now_millis();
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        let key = self
-            .config
-            .resolve_doc_id(topic.as_str(), payload, qos, millis, seq)?;
-        let body = Self::build_body(topic, payload, qos, millis)?;
-        let added = key.len() + body.len();
+        let (key, body, params) = if self.config.sql_template.is_some() {
+            let (sql, params) =
+                self.config
+                    .render_sql(topic.as_str(), payload, qos, millis, seq)?;
+            (String::new(), sql.into_bytes(), params)
+        } else {
+            (
+                self.config
+                    .resolve_doc_id(topic.as_str(), payload, qos, millis, seq)?,
+                Self::build_body(topic, payload, qos, millis)?,
+                Vec::new(),
+            )
+        };
+        let added =
+            key.len() + body.len() + params.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
         let mut buffer = self.buffer.lock();
-        let full = buffer.queue.push(CouchbaseRow { key, body });
+        let full = buffer.queue.push(CouchbaseRow { key, body, params });
         buffer.bytes = buffer.bytes.saturating_add(added);
         Ok(full || buffer.bytes >= self.config.effective_batch_bytes())
     }
@@ -1200,6 +1337,7 @@ mod tests {
                 password: "secret".to_string(),
             },
             doc_id_template: "${client_id}::${timestamp}".to_string(),
+            sql_template: None,
             operation: CouchbaseOperation::Upsert,
             expiry_secs: Some(3_600),
             batch_size: Some(100),
@@ -1375,6 +1513,40 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&captured[0].items[0].body).unwrap();
         assert_eq!(doc["_mqtt"]["topic"], "sensors/t1");
         assert_eq!(sink.sent_records(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sql_template_binds_payload_fields() {
+        let mut config = test_config();
+        config.sql_template = Some(
+            "UPSERT INTO `telemetry` (KEY, VALUE) VALUES (\"${client_id}\", {\"v\":${payload.v},\"w\":${.w}})"
+                .to_string(),
+        );
+        let (sink, transport) = test_sink(config);
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from_static(br#"{"client_id":"edge-7","v":21,"w":7}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].items.len(), 1);
+        let statement = std::str::from_utf8(&captured[0].items[0].body).unwrap();
+        assert!(statement.contains("$client_id"), "{statement}");
+        assert!(!statement.contains("edge-7"), "{statement}");
+        let params = &captured[0].items[0].params;
+        let get = |name: &str| {
+            params
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(get("client_id"), Some("edge-7"));
+        assert_eq!(get("payload.v"), Some("21"));
+        assert_eq!(get("w"), Some("7"));
     }
 
     #[tokio::test]
@@ -1753,6 +1925,7 @@ mod tests {
                 password: password.clone(),
             },
             doc_id_template: "${client_id}".to_string(),
+            sql_template: None,
             operation: CouchbaseOperation::Upsert,
             expiry_secs: None,
             batch_size: Some(100),
@@ -1834,6 +2007,7 @@ mod tests {
                 password: password.clone(),
             },
             doc_id_template: "${client_id}".to_string(),
+            sql_template: None,
             operation: CouchbaseOperation::Upsert,
             expiry_secs: Some(2),
             batch_size: Some(1),

@@ -73,8 +73,8 @@ pub use disk_log::{
 #[cfg(feature = "elasticsearch")]
 pub use elasticsearch::{
     BulkOutcome, CapturedBulk, DriverElasticsearchTransport, ElasticsearchAuth,
-    ElasticsearchConnector, ElasticsearchSink, ElasticsearchSinkConfig, ElasticsearchTransport,
-    HttpElasticsearchTransport, MockElasticsearchTransport,
+    ElasticsearchConnector, ElasticsearchOperation, ElasticsearchSink, ElasticsearchSinkConfig,
+    ElasticsearchTransport, HttpElasticsearchTransport, MockElasticsearchTransport,
 };
 pub use greptimedb::{
     build_greptime_sql_insert, build_influx_line_protocol, extract_greptime_record,

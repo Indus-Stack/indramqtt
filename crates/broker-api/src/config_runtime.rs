@@ -180,6 +180,9 @@ async fn apply_candidate(
     if let Err(err) = state.config.validate_whole_snapshot(candidate) {
         return Err(Box::new(bad_request(err.to_string())));
     }
+    if let Err(err) = validate_connector_io_settings(candidate) {
+        return Err(Box::new(bad_request(err)));
+    }
     let previous = state.config.snapshot();
     // An empty administrator list restores the default account and its
     // default password. Refuse a candidate that removes all the
@@ -291,6 +294,9 @@ async fn apply_restore(
     let candidate = version.snapshot.clone();
     if let Err(err) = state.config.validate_whole_snapshot(&candidate) {
         return Err(Box::new(bad_request(err.to_string())));
+    }
+    if let Err(err) = validate_connector_io_settings(&candidate) {
+        return Err(Box::new(bad_request(err)));
     }
     let previous = state.config.snapshot();
     let diff = state.config.diff(&previous, &candidate);
@@ -408,6 +414,25 @@ fn resolve_connector_params(entry: &broker_config::ConnectorEntry) -> Option<ser
     Some(params)
 }
 
+/// Refuse a document-store connector entry that carries an unsupported
+/// pool, pipelining, inactivity or TLS field. The create and update
+/// paths refuse these fields before a write. The file, reload, restore
+/// and boot paths call this check so an entry cannot be stored and then
+/// ignored.
+fn validate_connector_io_settings(snapshot: &FullSnapshot) -> Result<(), String> {
+    for entry in &snapshot.connectors.connectors {
+        let kind = crate::v5::action_sinks::canonical_action_kind(&entry.connector_type);
+        if !matches!(kind, "mongodb" | "couchbase" | "elasticsearch") {
+            continue;
+        }
+        let Some(params) = resolve_connector_params(entry) else {
+            continue;
+        };
+        crate::v5::action_sinks::validate_connector_io_bounds(&params, &entry.id, "config file")?;
+    }
+    Ok(())
+}
+
 fn resolve_params_secrets_in_place(
     value: &mut serde_json::Value,
 ) -> Result<(), broker_config::ConfigError> {
@@ -509,6 +534,18 @@ async fn apply_connectors_live(
             pending_live.push(entry.id.clone());
             continue;
         };
+        let kind = crate::v5::action_sinks::canonical_action_kind(&entry.connector_type);
+        if matches!(kind, "mongodb" | "couchbase" | "elasticsearch") {
+            if let Err(error) = crate::v5::action_sinks::validate_connector_io_bounds(
+                &params,
+                &entry.id,
+                "config file",
+            ) {
+                tracing::warn!(connector = %entry.id, "{error}");
+                pending_live.push(entry.id.clone());
+                continue;
+            }
+        }
         if !super::v5::rules::probe_connector_reachable(&params).await {
             pending_live.push(entry.id.clone());
             continue;
@@ -1295,6 +1332,65 @@ mod tests {
         assert!(harness.state.engine.list_rules().is_empty());
         assert_eq!(harness.state.config.history_list().len(), history_len);
 
+        let dir = harness.state.config.dir().to_path_buf();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file or reload entry for a document store refuses an
+    /// unsupported pool, pipelining, inactivity or TLS field. The
+    /// whole reload is rejected before the store changes.
+    #[tokio::test]
+    async fn reload_refuses_document_store_io_settings_from_a_file_entry() {
+        let harness = Harness::start().await;
+        let token = harness.login_as_admin().await;
+        let before = (*harness.state.config.snapshot()).clone();
+        for (kind, config) in [
+            (
+                "mongodb",
+                json!({"server": "127.0.0.1:27017", "database": "db"}),
+            ),
+            (
+                "couchbase",
+                json!({"server": "127.0.0.1:11210", "username": "u"}),
+            ),
+            ("elasticsearch", json!({"server": "127.0.0.1:9200"})),
+        ] {
+            for (field, value) in [
+                ("ssl", json!(true)),
+                ("pool_size", json!(8)),
+                ("pipelining", json!(true)),
+                ("enable_pipelining", json!(true)),
+                ("max_inactive", json!(8)),
+            ] {
+                let mut snapshot = before.clone();
+                let mut connector = config.clone();
+                connector[field] = value;
+                snapshot
+                    .connectors
+                    .connectors
+                    .push(broker_config::ConnectorEntry {
+                        id: format!("mv02c-file-{kind}-{field}"),
+                        connector_type: kind.to_string(),
+                        enable: true,
+                        config: connector.to_string(),
+                    });
+                let (status, body) = harness
+                    .post_auth(
+                        "/api/v1/config/reload",
+                        json!({"snapshot": snapshot}),
+                        &token,
+                    )
+                    .await;
+                assert_eq!(status, 400, "{kind} {field} must refuse: {body}");
+                let error = body["error"].as_str().unwrap_or("");
+                assert!(error.contains(field), "{kind} {field}: {error}");
+                assert_eq!(
+                    harness.state.config.snapshot().connectors.connectors.len(),
+                    before.connectors.connectors.len(),
+                    "{kind} {field} must not enter the store"
+                );
+            }
+        }
         let dir = harness.state.config.dir().to_path_buf();
         std::fs::remove_dir_all(&dir).ok();
     }

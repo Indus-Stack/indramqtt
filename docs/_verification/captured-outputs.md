@@ -27,6 +27,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/cassandra.md` | 196 | `ok` |
 | `connectors/cassandra.md` | 258 | `ok` |
 | `connectors/clickhouse.md` | 84 | `ok` |
+| `connectors/couchbase.md` | 100 | `ok` |
 | `connectors/datalayers.md` | 44 | `ok` |
 | `connectors/datalayers.md` | 73 | `ok` |
 | `connectors/datalayers.md` | 102 | `ok` |
@@ -41,6 +42,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/doris.md` | 165 | `ok` |
 | `connectors/doris.md` | 195 | `ok` |
 | `connectors/doris.md` | 257 | `ok` |
+| `connectors/elasticsearch.md` | 110 | `ok` |
 | `connectors/greptimedb.md` | 45 | `ok` |
 | `connectors/greptimedb.md` | 74 | `ok` |
 | `connectors/greptimedb.md` | 103 | `ok` |
@@ -50,7 +52,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/greptimedb.md` | 226 | `ok` |
 | `connectors/greptimedb.md` | 292 | `ok` |
 | `connectors/http.md` | 93 | `delivered` |
-| `connectors/index.md` | 137 | `ok` |
+| `connectors/index.md` | 139 | `ok` |
 | `connectors/influxdb.md` | 86 | `influxdb` |
 | `connectors/iotdb.md` | 45 | `ok` |
 | `connectors/iotdb.md` | 73 | `ok` |
@@ -60,7 +62,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/iotdb.md` | 190 | `ok` |
 | `connectors/iotdb.md` | 255 | `ok` |
 | `connectors/kafka.md` | 83 | `ok` |
-| `connectors/mongodb.md` | 87 | `ok` |
+| `connectors/mongodb.md` | 102 | `ok` |
 | `connectors/mqtt-bridge.md` | 91 | `mqtt_bridge` |
 | `connectors/mysql.md` | 79 | `mysql` |
 | `connectors/opentsdb.md` | 43 | `ok` |
@@ -175,4 +177,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 159 blocks. Each output matches its page.
+The run captured 161 blocks. Each output matches its page.

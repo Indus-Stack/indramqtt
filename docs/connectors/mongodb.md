@@ -7,9 +7,9 @@ sidebar:
 
 # MongoDB connector
 
-The MongoDB connector bulk-inserts rule results as documents. It routes collections with a template. It uses the maintained MongoDB driver with acknowledged writes.
+The MongoDB connector writes rule results as documents. The connector holds the connection and database. The action holds the collection and document template. It uses the maintained MongoDB driver with acknowledged writes.
 
-Use it when documents must hold telemetry with changing shape. You get one bulk insert per batch.
+Use it when documents must hold telemetry with changing shape. You get one insert per send.
 
 ```mermaid
 flowchart LR
@@ -26,36 +26,51 @@ flowchart LR
 
 ## Settings
 
-Set `kind` to `mongodb`.
+Set the connector type to `mongodb`. The aliases `mongo` and `documentdb`
+select the same runtime.
 
 | Setting | Required | Meaning |
 |---|---|---|
-| `connection_string` | yes | Connection URI, `mongodb://` or `mongodb+srv://`. |
+| `server` | yes | Host and port, or a full `mongodb://` URI. |
+| `servers` | for `rs` and `sharded` | Comma-separated node list. |
 | `database` | yes | Target database name. |
-| `collection_template` | yes | Collection name with `${topic}` substitution. |
-| `operation` | no | Write operation; default inserts one document. |
-| `batch_size` | no | Documents per bulk batch; default 500. |
-| `batch_bytes` | no | Batch byte limit over BSON; default 4 MiB. |
-| `linger_ms` | no | Linger before a partial batch flushes; default 20. |
-| `max_retries` | no | Retries on transient faults; default 4. |
+| `mongo_type` | no | `single`, `rs` or `sharded`. Default `single`. |
+| `username` | no | Database user. |
+| `password` | no | Database password. |
+| `auth_source` | no | Authentication database. |
 
-Example:
+The action type is `mongodb`. It owns the target and the document.
+
+| Action setting | Required | Meaning |
+|---|---|---|
+| `connector` | yes | Connector name. |
+| `collection` | no | Collection template. Default `mqtt`. |
+| `payload_template` | no | Document template. The result must be a JSON object. |
+
+A document template that does not render a JSON object counts one failed
+forward. The broker does not store the raw string.
+
+Example connector:
 
 ```json
 {
-  "id": "mongo-1",
-  "kind": "mongodb",
-  "config": {
-    "connection_string": "mongodb://u:p@127.0.0.1:27017",
-    "database": "telemetry",
-    "collection_template": "readings",
-    "operation": {"type": "insert_one"},
-    "batch_size": 50,
-    "batch_bytes": 65536,
-    "linger_ms": 20,
-    "max_retries": 2,
-    "initial_backoff_ms": 10,
-    "max_backoff_ms": 100
+  "name": "mongo-docs",
+  "type": "mongodb",
+  "server": "127.0.0.1:27017",
+  "database": "telemetry"
+}
+```
+
+Example action:
+
+```json
+{
+  "name": "mongo-docs-act",
+  "type": "mongodb",
+  "connector": "mongo-docs",
+  "parameters": {
+    "collection": "readings",
+    "payload_template": "{\"v\":${payload.v}}"
   }
 }
 ```
@@ -89,28 +104,26 @@ python3 - <<'PY'
 import json, os, urllib.request
 port = os.environ.get("API_PORT", "18083")
 key = os.environ["API_KEY"]
-body = json.dumps({"id": "mongo-1", "kind": "mongodb",
-                   "config": {"connection_string": "mongodb://u:p@127.0.0.1:27017",
-                              "database": "telemetry",
-                              "collection_template": "readings",
-                              "operation": {"type": "insert_one"},
-                              "batch_size": 50, "batch_bytes": 65536,
-                              "linger_ms": 20, "max_retries": 2,
-                              "initial_backoff_ms": 10,
-                              "max_backoff_ms": 100}}).encode()
-req = urllib.request.Request(
-    f"http://127.0.0.1:{port}/api/v1/connectors", data=body, method="POST",
-    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-try:
-    with urllib.request.urlopen(req, timeout=5) as res:
-        status, created = res.status, json.load(res)
-except urllib.error.HTTPError as err:
-    status, created = err.code, json.load(err)
+def post(path, body):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return res.status, json.load(res)
+    except urllib.error.HTTPError as err:
+        return err.code, json.load(err)
+status, created = post("/api/v5/connectors", {"name": "mongo-docs", "type": "mongodb",
+                                              "server": "127.0.0.1:27017",
+                                              "database": "telemetry"})
 assert status in (201, 400), (status, created)
 if status == 201:
-    assert created["kind"] == "mongodb", created
+    assert created.get("type") == "mongodb", created
 else:
-    assert "mongodb" in created["error"], created
+    assert "feature" in str(created).lower(), created
+status, body = post("/api/v5/connectors", {"name": "mongo-docs-bad", "type": "mongodb",
+                                           "server": "127.0.0.1:27017"})
+assert status == 400 and "database" in body["message"], body
 print("ok")
 PY
 ```
@@ -121,7 +134,8 @@ ok
 
 ## Limits
 
-- An empty `connection_string`, `database`, or `collection_template` is refused with 400.
+- A missing `server` or `database` is refused with 400 naming the field.
+- The default collection is `mqtt`.
 - Writes use acknowledged write concern. A lost acknowledgement retries the batch.
 - The bounded queue sheds past its bound. A slow cluster never stalls publishers.
 

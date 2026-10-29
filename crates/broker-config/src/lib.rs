@@ -137,6 +137,15 @@ pub const KNOWN_CONNECTOR_TYPES: &[&str] = &[
     "cql",
     "greptime",
     "ch",
+    // MV-02c document-store aliases. The KC-00 map owns each alias; each
+    // maps to the runtime of its base kind.
+    "mongo",
+    "documentdb",
+    "couch",
+    "cb",
+    "elastic",
+    "es",
+    "opensearch",
 ];
 
 /// Returns true for a connector type the kernel can instantiate.
@@ -227,6 +236,15 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "cql",
     "greptime",
     "ch",
+    // MV-02c document-store aliases. The KC-00 map owns each alias; each
+    // maps to the runtime of its base kind.
+    "mongo",
+    "documentdb",
+    "couch",
+    "cb",
+    "elastic",
+    "es",
+    "opensearch",
 ];
 
 /// Returns true for an action kind the kernel can execute.

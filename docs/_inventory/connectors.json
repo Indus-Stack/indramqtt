@@ -45,6 +45,10 @@
       "tier": "community"
     },
     {
+      "kind": "cb",
+      "tier": "community"
+    },
+    {
       "kind": "ch",
       "tier": "community"
     },
@@ -69,6 +73,10 @@
       "tier": "community"
     },
     {
+      "kind": "couch",
+      "tier": "community"
+    },
+    {
       "kind": "couchbase",
       "tier": "community"
     },
@@ -89,6 +97,10 @@
       "tier": "community"
     },
     {
+      "kind": "documentdb",
+      "tier": "community"
+    },
+    {
       "kind": "doris",
       "tier": "community"
     },
@@ -101,7 +113,15 @@
       "tier": "community"
     },
     {
+      "kind": "elastic",
+      "tier": "community"
+    },
+    {
       "kind": "elasticsearch",
+      "tier": "community"
+    },
+    {
+      "kind": "es",
       "tier": "community"
     },
     {
@@ -157,6 +177,10 @@
       "tier": "community"
     },
     {
+      "kind": "mongo",
+      "tier": "community"
+    },
+    {
       "kind": "mongodb",
       "tier": "community"
     },
@@ -182,6 +206,10 @@
     },
     {
       "kind": "opc_ua",
+      "tier": "community"
+    },
+    {
+      "kind": "opensearch",
       "tier": "community"
     },
     {

@@ -1,0 +1,1548 @@
+[
+  {
+    "body": {
+      "database": "telemetry",
+      "name": "mv02c-lc-mongo",
+      "server": "127.0.0.1:9",
+      "type": "mongodb",
+      "parameters": {
+        "mongo_type": "single",
+        "server": "127.0.0.1:9"
+      }
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv02c-lc-couch",
+      "password": "p",
+      "server": "127.0.0.1:9",
+      "type": "couchbase",
+      "username": "u"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv02c-lc-es",
+      "server": "127.0.0.1:9",
+      "type": "elasticsearch"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "database": "telemetry",
+      "name": "mv02c-lc-mongo-a",
+      "server": "127.0.0.1:9",
+      "type": "mongodb",
+      "parameters": {
+        "mongo_type": "single",
+        "server": "127.0.0.1:9"
+      }
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo-a"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo-a"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv02c-lc-couch-a",
+      "password": "p",
+      "server": "127.0.0.1:9",
+      "type": "couch",
+      "username": "u"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch-a"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch-a"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv02c-lc-es-a",
+      "server": "127.0.0.1:9",
+      "type": "elasticsearch"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es-a"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es-a"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "database": "telemetry",
+      "name": "mv02c-lc-mongo-dup",
+      "server": "127.0.0.1:9",
+      "type": "mongodb",
+      "parameters": {
+        "mongo_type": "single",
+        "server": "127.0.0.1:9"
+      }
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo-dup"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo-dup"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "database": "telemetry",
+            "name": "mv02c-lc-mongo-dup",
+            "server": "127.0.0.1:9",
+            "type": "mongodb",
+            "parameters": {
+              "mongo_type": "single",
+              "server": "127.0.0.1:9"
+            }
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv02c-lc-couch-dup",
+      "password": "p",
+      "server": "127.0.0.1:9",
+      "type": "couchbase",
+      "username": "u"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch-dup"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch-dup"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-couch-dup",
+            "password": "p",
+            "server": "127.0.0.1:9",
+            "type": "couchbase",
+            "username": "u"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-mongo",
+      "name": "mv02c-lc-mongo-act",
+      "parameters": {
+        "collection": "events",
+        "payload_template": "{\"topic\":\"${topic}\",\"payload\":${payload}}"
+      },
+      "type": "mongodb"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-mongo-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-mongo-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "database": "telemetry",
+            "name": "mv02c-lc-mongo",
+            "server": "127.0.0.1:9",
+            "type": "mongodb",
+            "parameters": {
+              "mongo_type": "single",
+              "server": "127.0.0.1:9"
+            }
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-couch",
+      "name": "mv02c-lc-couch-act",
+      "parameters": {
+        "sql": "UPSERT INTO default:mqtt._default.events (KEY, VALUE) VALUES (\"${client_id}\", ${payload})"
+      },
+      "type": "couchbase"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-couch",
+            "password": "p",
+            "server": "127.0.0.1:9",
+            "type": "couchbase",
+            "username": "u"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-es",
+      "name": "mv02c-lc-es-act",
+      "parameters": {
+        "action": "create",
+        "doc": "{\"topic\":\"${topic}\",\"payload\":${payload}}",
+        "id": "${topic}",
+        "index": "events-${YYYY.MM.dd}"
+      },
+      "type": "elasticsearch"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-es",
+            "server": "127.0.0.1:9",
+            "type": "elasticsearch"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-mongo-a",
+      "name": "mv02c-lc-mongo-a-act",
+      "parameters": {
+        "collection": "events",
+        "payload_template": "{\"topic\":\"${topic}\",\"payload\":${payload}}"
+      },
+      "type": "documentdb"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-mongo-a-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo-a"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-mongo-a-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo-a"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "database": "telemetry",
+            "name": "mv02c-lc-mongo-a",
+            "server": "127.0.0.1:9",
+            "type": "mongodb",
+            "parameters": {
+              "mongo_type": "single",
+              "server": "127.0.0.1:9"
+            }
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-couch-a",
+      "name": "mv02c-lc-couch-a-act",
+      "parameters": {
+        "sql": "UPSERT INTO default:mqtt._default.events (KEY, VALUE) VALUES (\"${client_id}\", ${payload})"
+      },
+      "type": "cb"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-a-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch-a"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-a-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch-a"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-couch-a",
+            "password": "p",
+            "server": "127.0.0.1:9",
+            "type": "couchbase",
+            "username": "u"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-es-a",
+      "name": "mv02c-lc-es-a-act",
+      "parameters": {
+        "action": "create",
+        "doc": "{\"topic\":\"${topic}\",\"payload\":${payload}}",
+        "id": "${topic}",
+        "index": "events-${YYYY.MM.dd}"
+      },
+      "type": "opensearch"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-a-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es-a"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-a-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es-a"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-es-a",
+            "server": "127.0.0.1:9",
+            "type": "elasticsearch"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-couch",
+      "name": "mv02c-lc-couch-bad-act",
+      "parameters": {},
+      "type": "couchbase"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-bad-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-bad-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-couch",
+            "password": "p",
+            "server": "127.0.0.1:9",
+            "type": "couchbase",
+            "username": "u"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-es",
+      "name": "mv02c-lc-es-bad-act",
+      "parameters": {
+        "action": "create"
+      },
+      "type": "elasticsearch"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-bad-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-bad-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-es",
+            "server": "127.0.0.1:9",
+            "type": "elasticsearch"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-es",
+      "name": "mv02c-lc-es-bad-id-act",
+      "parameters": {
+        "action": "update",
+        "index": "events"
+      },
+      "type": "elasticsearch"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-bad-id-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-bad-id-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-es",
+            "server": "127.0.0.1:9",
+            "type": "elasticsearch"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "database": "telemetry",
+      "name": "mv02c-lc-mongo",
+      "server": "127.0.0.1:9",
+      "type": "mongodb",
+      "parameters": {
+        "mongo_type": "single",
+        "server": "127.0.0.1:9"
+      }
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "PUT /connectors/{id}",
+    "path_params": {
+      "id": "mv02c-lc-mongo"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "database": "telemetry",
+            "name": "mv02c-lc-mongo",
+            "server": "127.0.0.1:9",
+            "type": "mongodb",
+            "parameters": {
+              "mongo_type": "single",
+              "server": "127.0.0.1:9"
+            }
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv02c-lc-couch",
+      "password": "p",
+      "server": "127.0.0.1:9",
+      "type": "couchbase",
+      "username": "u"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "PUT /connectors/{id}",
+    "path_params": {
+      "id": "mv02c-lc-couch"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-couch",
+            "password": "p",
+            "server": "127.0.0.1:9",
+            "type": "couchbase",
+            "username": "u"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv02c-lc-es",
+      "server": "127.0.0.1:9",
+      "type": "elasticsearch"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "PUT /connectors/{id}",
+    "path_params": {
+      "id": "mv02c-lc-es"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-es",
+            "server": "127.0.0.1:9",
+            "type": "elasticsearch"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv02c-lc-mongo-bad-upd",
+      "server": "127.0.0.1:9",
+      "type": "mongodb"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo-bad-upd"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "PUT /connectors/{id}",
+    "path_params": {
+      "id": "mv02c-lc-mongo-bad-upd"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo-bad-upd"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "database": "telemetry",
+            "name": "mv02c-lc-mongo-bad-upd",
+            "server": "127.0.0.1:9",
+            "type": "mongodb",
+            "parameters": {
+              "mongo_type": "single",
+              "server": "127.0.0.1:9"
+            }
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv02c-lc-couch-bad-upd",
+      "server": "127.0.0.1:9",
+      "type": "couchbase"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch-bad-upd"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "PUT /connectors/{id}",
+    "path_params": {
+      "id": "mv02c-lc-couch-bad-upd"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch-bad-upd"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-couch-bad-upd",
+            "password": "p",
+            "server": "127.0.0.1:9",
+            "type": "couchbase",
+            "username": "u"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-mongo",
+      "name": "mv02c-lc-mongo-act",
+      "parameters": {
+        "collection": "events2",
+        "payload_template": "{\"topic\":\"${topic}\"}"
+      },
+      "type": "mongodb"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-mongo-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "PUT /actions/{id}",
+    "path_params": {
+      "id": "mv02c-lc-mongo-act"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-mongo-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-mongo"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "database": "telemetry",
+            "name": "mv02c-lc-mongo",
+            "server": "127.0.0.1:9",
+            "type": "mongodb",
+            "parameters": {
+              "mongo_type": "single",
+              "server": "127.0.0.1:9"
+            }
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "connector": "mv02c-lc-mongo",
+            "name": "mv02c-lc-mongo-act",
+            "parameters": {
+              "collection": "events2",
+              "payload_template": "{\"topic\":\"${topic}\"}"
+            },
+            "type": "mongodb"
+          },
+          "method": "POST",
+          "path": "/actions"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-couch",
+      "name": "mv02c-lc-couch-act",
+      "parameters": {
+        "sql": "UPSERT INTO default:mqtt._default.events2 (KEY, VALUE) VALUES (\"${client_id}\", ${payload})"
+      },
+      "type": "couchbase"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "PUT /actions/{id}",
+    "path_params": {
+      "id": "mv02c-lc-couch-act"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-couch",
+            "password": "p",
+            "server": "127.0.0.1:9",
+            "type": "couchbase",
+            "username": "u"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "connector": "mv02c-lc-couch",
+            "name": "mv02c-lc-couch-act",
+            "parameters": {
+              "sql": "UPSERT INTO default:mqtt._default.events2 (KEY, VALUE) VALUES (\"${client_id}\", ${payload})"
+            },
+            "type": "couchbase"
+          },
+          "method": "POST",
+          "path": "/actions"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-es",
+      "name": "mv02c-lc-es-act",
+      "parameters": {
+        "action": "create",
+        "doc": "{\"topic\":\"${topic}\"}",
+        "id": "${topic}",
+        "index": "events2"
+      },
+      "type": "elasticsearch"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "PUT /actions/{id}",
+    "path_params": {
+      "id": "mv02c-lc-es-act"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-es",
+            "server": "127.0.0.1:9",
+            "type": "elasticsearch"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "connector": "mv02c-lc-es",
+            "name": "mv02c-lc-es-act",
+            "parameters": {
+              "action": "create",
+              "doc": "{\"topic\":\"${topic}\"}",
+              "id": "${topic}",
+              "index": "events2"
+            },
+            "type": "elasticsearch"
+          },
+          "method": "POST",
+          "path": "/actions"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-couch",
+      "name": "mv02c-lc-couch-bad-act-upd",
+      "parameters": {},
+      "type": "couchbase"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-bad-act-upd"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "PUT /actions/{id}",
+    "path_params": {
+      "id": "mv02c-lc-couch-bad-act-upd"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-couch-bad-act-upd"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-couch"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-couch",
+            "password": "p",
+            "server": "127.0.0.1:9",
+            "type": "couchbase",
+            "username": "u"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "connector": "mv02c-lc-couch",
+            "name": "mv02c-lc-couch-bad-act-upd",
+            "parameters": {
+              "sql": "UPSERT INTO default:mqtt._default.events (KEY, VALUE) VALUES (\"${client_id}\", ${payload})"
+            },
+            "type": "couchbase"
+          },
+          "method": "POST",
+          "path": "/actions"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv02c-lc-es",
+      "name": "mv02c-lc-es-bad-id-act-upd",
+      "parameters": {
+        "action": "update",
+        "index": "events"
+      },
+      "type": "elasticsearch"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-bad-id-act-upd"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "PUT /actions/{id}",
+    "path_params": {
+      "id": "mv02c-lc-es-bad-id-act-upd"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02c-lc-es-bad-id-act-upd"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02c-lc-es"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "name": "mv02c-lc-es",
+            "server": "127.0.0.1:9",
+            "type": "elasticsearch"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "connector": "mv02c-lc-es",
+            "name": "mv02c-lc-es-bad-id-act-upd",
+            "parameters": {
+              "action": "update",
+              "doc": "{\"topic\":\"${topic}\"}",
+              "id": "${topic}",
+              "index": "events"
+            },
+            "type": "elasticsearch"
+          },
+          "method": "POST",
+          "path": "/actions"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "database": "d",
+      "server": "127.0.0.1:9",
+      "type": "mongodb"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "server": "127.0.0.1:9",
+      "type": "couchbase",
+      "username": "u"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "server": "127.0.0.1:9",
+      "type": "elasticsearch"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "server": "127.0.0.1:9",
+      "type": "mongodb"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "server": "127.0.0.1:9",
+      "type": "couchbase"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "server": "127.0.0.1:9",
+      "type": "elasticsearch"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /schemas/{name}",
+    "path_params": {
+      "name": "bridge_mongodb.post_bridge_v2"
+    },
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /schemas/{name}",
+    "path_params": {
+      "name": "action_couchbase.post_bridge_v2"
+    },
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /schemas/{name}",
+    "path_params": {
+      "name": "bridge_elasticsearch.post_bridge_v2"
+    },
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "parameters": {
+        "database": "d",
+        "server": "127.0.0.1:9"
+      },
+      "type": "mongodb"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "parameters": {
+        "server": "127.0.0.1:9",
+        "username": "u"
+      },
+      "type": "couchbase"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "parameters": {
+        "server": "127.0.0.1:9"
+      },
+      "type": "elasticsearch"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "parameters": {
+        "database": "d",
+        "server": "127.0.0.1:9"
+      },
+      "type": "mongodb"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "parameters": {
+        "server": "127.0.0.1:9",
+        "username": "u"
+      },
+      "type": "couchbase"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "parameters": {
+        "server": "127.0.0.1:9"
+      },
+      "type": "elasticsearch"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  }
+]

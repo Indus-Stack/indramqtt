@@ -27,13 +27,13 @@ flowchart LR
 | cockroachdb | cockroach | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
 | confluent | confluent_kafka, confluent_cloud, confluent_producer | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | confluent |
 | console | logger | local | KC-00/D9 | ready | yes | yes | yes | yes | yes | - |
-| couchbase | couch, cb | document-store | MV-02c | pending MV-02c | yes | yes | yes | yes | yes | couchbase |
+| couchbase | couch, cb | document-store | MV-02c | ready | yes | yes | yes | yes | yes | couchbase |
 | databricks | delta_lake | object-store | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | - |
 | datalayers |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | disk_log | disk, disklog | object-store | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | - |
 | doris |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | dynamodb | dynamo, ddb | object-store | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | dynamodb |
-| elasticsearch | elastic, es, opensearch | document-store | MV-02c | pending MV-02c | yes | yes | yes | yes | yes | elasticsearch |
+| elasticsearch | elastic, es, opensearch | document-store | MV-02c | ready | yes | yes | yes | yes | yes | elasticsearch |
 | gcp_iot | gcp_iot_core, cloud_iot | cloud-iot | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | gcp_iot |
 | gcp_pubsub | gcp, pubsub, gcp_pubsub_consumer, gcp_pubsub_producer | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | gcp_pubsub |
 | greptimedb | greptime | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
@@ -42,7 +42,7 @@ flowchart LR
 | iotdb |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | kafka | kafka_producer, kafka_consumer | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | kafka |
 | kinesis | aws_kinesis | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | kinesis |
-| mongodb | mongo, documentdb | document-store | MV-02c | pending MV-02c | yes | yes | yes | yes | yes | mongodb |
+| mongodb | mongo, documentdb | document-store | MV-02c | ready | yes | yes | yes | yes | yes | mongodb |
 | mqtt_bridge | mqtt, mqtt-bridge, bridge | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
 | mssql | sqlserver | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
 | mysql | mariadb | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |

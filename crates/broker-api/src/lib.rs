@@ -3716,6 +3716,40 @@ connector_id = "pending-good"
         body: Vec<u8>,
     }
 
+    /// Build the `_bulk` response that a real search node returns for
+    /// the NDJSON request body: one `items` entry per action line.
+    fn mv02b_bulk_reply(body: &[u8]) -> Vec<u8> {
+        let text = String::from_utf8_lossy(body);
+        let mut items = Vec::new();
+        let mut source_line = false;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            if source_line {
+                source_line = false;
+                continue;
+            }
+            let Ok(action) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some((name, _meta)) = action.as_object().and_then(|map| map.iter().next()) else {
+                continue;
+            };
+            if !matches!(name.as_str(), "create" | "index" | "update" | "delete") {
+                continue;
+            }
+            let status = if name == "create" || name == "index" {
+                201
+            } else {
+                200
+            };
+            let mut item = serde_json::Map::new();
+            item.insert(name.clone(), json!({"status": status}));
+            items.push(serde_json::Value::Object(item));
+            source_line = name != "delete";
+        }
+        serde_json::to_vec(&json!({"took": 1, "errors": false, "items": items}))
+            .expect("bulk reply encodes")
+    }
+
     /// Minimal HTTP responder for the MV-02b delivery tests: one TCP
     /// listener that answers every request with a fixed status and body
     /// and records what arrived. Dropping the fake closes the port, so
@@ -3761,7 +3795,7 @@ connector_id = "pending-good"
                         break;
                     };
                     let received = std::sync::Arc::clone(&task_received);
-                    let reply = reply.clone();
+                    let mut reply = reply.clone();
                     tokio::spawn(async move {
                         let mut stream = stream;
                         let mut head = Vec::new();
@@ -3812,6 +3846,10 @@ connector_id = "pending-good"
                             Some((p, q)) => (p.to_string(), q.to_string()),
                             None => (target, String::new()),
                         };
+                        let body_data = body_data;
+                        if path == "/_bulk" && reply.as_slice() == b"{}" {
+                            reply = mv02b_bulk_reply(&body_data);
+                        }
                         received.lock().expect("fake lock").push(Mv02bCaptured {
                             method,
                             path,
@@ -3819,7 +3857,7 @@ connector_id = "pending-good"
                             body: body_data,
                         });
                         let header = format!(
-                            "HTTP/1.1 {status} MV02B\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            "HTTP/1.1 {status} MV02B\r\nX-Elastic-Product: Elasticsearch\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             reply.len()
                         );
                         let mut out = header.into_bytes();
@@ -3861,9 +3899,809 @@ connector_id = "pending-good"
         }
     }
 
+    /// One command captured from the MongoDB loopback fake.
+    #[cfg(feature = "mongodb")]
+    #[derive(Clone, Debug)]
+    struct Mv02cMongoCall {
+        command: String,
+        db: String,
+        collection: String,
+        documents: Vec<broker_connectors_enterprise::BsonDocument>,
+    }
+
+    /// Loopback MongoDB wire server. It answers HELLO, PING and insert
+    /// commands and records each insert's database, collection and
+    /// documents. Dropping it closes the port for the down-server step.
+    #[cfg(feature = "mongodb")]
+    struct Mv02cMongoFake {
+        port: u16,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Mv02cMongoCall>>>,
+        connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(feature = "mongodb")]
+    impl Drop for Mv02cMongoFake {
+        fn drop(&mut self) {
+            self._task.abort();
+            for handle in self
+                .connections
+                .lock()
+                .expect("mongo fake connections")
+                .drain(..)
+            {
+                handle.abort();
+            }
+        }
+    }
+
+    #[cfg(feature = "mongodb")]
+    impl Mv02cMongoFake {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mongo fake");
+            Self::serve(listener).await
+        }
+
+        async fn start_on(port: u16) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("rebind mongo fake");
+            Self::serve(listener).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener) -> Self {
+            let port = listener.local_addr().expect("mongo fake addr").port();
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let connections = std::sync::Arc::new(std::sync::Mutex::new(Vec::<
+                tokio::task::JoinHandle<()>,
+            >::new()));
+            let task_calls = std::sync::Arc::clone(&calls);
+            let task_connections = std::sync::Arc::clone(&connections);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let calls = std::sync::Arc::clone(&task_calls);
+                    let handle = tokio::spawn(async move {
+                        loop {
+                            let mut head = [0u8; 4];
+                            if stream.read_exact(&mut head).await.is_err() {
+                                break;
+                            }
+                            let total = i32::from_le_bytes(head) as usize;
+                            if !(16..=48 * 1024 * 1024).contains(&total) {
+                                break;
+                            }
+                            let mut rest = vec![0u8; total - 4];
+                            if stream.read_exact(&mut rest).await.is_err() {
+                                break;
+                            }
+                            let mut frame = head.to_vec();
+                            frame.extend_from_slice(&rest);
+                            let request_id =
+                                i32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+                            let opcode =
+                                i32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]);
+                            let (body, sequences, reply_opcode) = if opcode == 2013 {
+                                let Ok((body, sequences)) = mv02c_parse_mongo_sections(&frame)
+                                else {
+                                    break;
+                                };
+                                (body, sequences, 2013)
+                            } else if opcode == 2004 {
+                                let Ok(body) = mv02c_parse_mongo_query(&frame) else {
+                                    break;
+                                };
+                                (body, Vec::new(), 1)
+                            } else {
+                                break;
+                            };
+                            let command = body
+                                .fields
+                                .first()
+                                .map(|(name, _)| name.clone())
+                                .unwrap_or_default();
+                            let db = body
+                                .get("$db")
+                                .and_then(mv02c_bson_text)
+                                .unwrap_or_default();
+                            let reply = match command.as_str() {
+                                "hello" | "isMaster" | "ismaster" => mv02c_mongo_hello(),
+                                "insert" => {
+                                    let collection = body
+                                        .get("insert")
+                                        .and_then(mv02c_bson_text)
+                                        .unwrap_or_default();
+                                    let documents = sequences
+                                        .iter()
+                                        .find(|(name, _)| name == "documents")
+                                        .map(|(_, docs)| docs.clone())
+                                        .or_else(|| body.get("documents").and_then(mv02c_bson_docs))
+                                        .unwrap_or_default();
+                                    let count = documents.len() as i32;
+                                    calls.lock().expect("mongo fake lock").push(Mv02cMongoCall {
+                                        command: "insert".to_string(),
+                                        db,
+                                        collection,
+                                        documents,
+                                    });
+                                    mv02c_mongo_ok_with_count(count)
+                                }
+                                "update" | "delete" => {
+                                    let collection = body
+                                        .get(command.as_str())
+                                        .and_then(mv02c_bson_text)
+                                        .unwrap_or_default();
+                                    calls.lock().expect("mongo fake lock").push(Mv02cMongoCall {
+                                        command: command.clone(),
+                                        db,
+                                        collection,
+                                        documents: Vec::new(),
+                                    });
+                                    mv02c_mongo_ok_with_count(1)
+                                }
+                                _ => mv02c_mongo_ok(),
+                            };
+                            let out = if reply_opcode == 1 {
+                                mv02c_encode_mongo_reply(&reply, request_id)
+                            } else {
+                                let mut out =
+                                    broker_connectors_enterprise::encode_op_msg(&reply, 0);
+                                out[8..12].copy_from_slice(&request_id.to_le_bytes());
+                                out
+                            };
+                            if stream.write_all(&out).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    task_connections
+                        .lock()
+                        .expect("mongo fake connections")
+                        .push(handle);
+                }
+            });
+            Self {
+                port,
+                calls,
+                connections,
+                _task: task,
+            }
+        }
+
+        async fn wait_for(&self, count: usize) -> Vec<Mv02cMongoCall> {
+            for _ in 0..300 {
+                let got = self.calls.lock().expect("mongo fake lock").clone();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "mongo fake got {} insert calls, wanted at least {count}",
+                self.calls.lock().expect("mongo fake lock").len()
+            );
+        }
+    }
+
+    #[cfg(feature = "mongodb")]
+    fn mv02c_bson_text(value: &broker_connectors_enterprise::BsonValue) -> Option<String> {
+        use broker_connectors_enterprise::BsonValue;
+        match value {
+            BsonValue::String(text) => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "mongodb")]
+    fn mv02c_bson_docs(
+        value: &broker_connectors_enterprise::BsonValue,
+    ) -> Option<Vec<broker_connectors_enterprise::BsonDocument>> {
+        use broker_connectors_enterprise::BsonValue;
+        match value {
+            BsonValue::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        BsonValue::Document(doc) => Some(doc.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "mongodb")]
+    type Mv02cMongoSections = (
+        broker_connectors_enterprise::BsonDocument,
+        Vec<(String, Vec<broker_connectors_enterprise::BsonDocument>)>,
+    );
+
+    #[cfg(feature = "mongodb")]
+    fn mv02c_parse_mongo_sections(frame: &[u8]) -> Result<Mv02cMongoSections, ()> {
+        use broker_connectors_enterprise::BsonDocument;
+        if frame.len() < 21 {
+            return Err(());
+        }
+        let mut body = BsonDocument::new();
+        let mut sequences = Vec::new();
+        let mut at = 20usize;
+        while at < frame.len() {
+            let kind = frame[at];
+            at += 1;
+            match kind {
+                0 => {
+                    if frame.len() < at + 4 {
+                        return Err(());
+                    }
+                    let len = i32::from_le_bytes([
+                        frame[at],
+                        frame[at + 1],
+                        frame[at + 2],
+                        frame[at + 3],
+                    ]) as usize;
+                    if len < 5 || frame.len() < at + len {
+                        return Err(());
+                    }
+                    body = BsonDocument::decode(&frame[at..at + len]).map_err(|_| ())?;
+                    at += len;
+                }
+                1 => {
+                    if frame.len() < at + 4 {
+                        return Err(());
+                    }
+                    let size = i32::from_le_bytes([
+                        frame[at],
+                        frame[at + 1],
+                        frame[at + 2],
+                        frame[at + 3],
+                    ]) as usize;
+                    let end = at + size;
+                    if size < 5 || frame.len() < end {
+                        return Err(());
+                    }
+                    at += 4;
+                    let Some(name_end) = frame[at..end].iter().position(|byte| *byte == 0) else {
+                        return Err(());
+                    };
+                    let name = String::from_utf8_lossy(&frame[at..at + name_end]).to_string();
+                    at += name_end + 1;
+                    let mut docs = Vec::new();
+                    while at < end {
+                        let len = i32::from_le_bytes([
+                            frame[at],
+                            frame[at + 1],
+                            frame[at + 2],
+                            frame[at + 3],
+                        ]) as usize;
+                        if len < 5 || end < at + len {
+                            return Err(());
+                        }
+                        docs.push(BsonDocument::decode(&frame[at..at + len]).map_err(|_| ())?);
+                        at += len;
+                    }
+                    sequences.push((name, docs));
+                }
+                _ => return Err(()),
+            }
+        }
+        Ok((body, sequences))
+    }
+
+    #[cfg(feature = "mongodb")]
+    fn mv02c_parse_mongo_query(
+        frame: &[u8],
+    ) -> Result<broker_connectors_enterprise::BsonDocument, ()> {
+        use broker_connectors_enterprise::BsonDocument;
+        let mut at = 20usize;
+        let Some(name_end) = frame
+            .get(at..)
+            .and_then(|rest| rest.iter().position(|b| *b == 0))
+        else {
+            return Err(());
+        };
+        at += name_end + 1;
+        at += 8;
+        if frame.len() < at + 5 {
+            return Err(());
+        }
+        BsonDocument::decode(&frame[at..]).map_err(|_| ())
+    }
+
+    #[cfg(feature = "mongodb")]
+    fn mv02c_encode_mongo_reply(
+        reply: &broker_connectors_enterprise::BsonDocument,
+        request_id: i32,
+    ) -> Vec<u8> {
+        let document = reply.encode();
+        let total = 16 + 4 + 8 + 4 + 4 + document.len();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&(total as i32).to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&request_id.to_le_bytes());
+        out.extend_from_slice(&1i32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&0i64.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&1i32.to_le_bytes());
+        out.extend_from_slice(&document);
+        out
+    }
+
+    #[cfg(feature = "mongodb")]
+    fn mv02c_mongo_ok() -> broker_connectors_enterprise::BsonDocument {
+        use broker_connectors_enterprise::{BsonDocument, BsonValue};
+        let mut doc = BsonDocument::new();
+        doc.fields.push(("ok".to_string(), BsonValue::Double(1.0)));
+        doc
+    }
+
+    #[cfg(feature = "mongodb")]
+    fn mv02c_mongo_ok_with_count(count: i32) -> broker_connectors_enterprise::BsonDocument {
+        use broker_connectors_enterprise::BsonValue;
+        let mut doc = mv02c_mongo_ok();
+        doc.fields.push(("n".to_string(), BsonValue::Int32(count)));
+        doc
+    }
+
+    #[cfg(feature = "mongodb")]
+    fn mv02c_mongo_hello() -> broker_connectors_enterprise::BsonDocument {
+        use broker_connectors_enterprise::{BsonDocument, BsonValue};
+        let mut doc = BsonDocument::new();
+        doc.fields.push(("ok".to_string(), BsonValue::Double(1.0)));
+        for key in ["ismaster", "isWritablePrimary"] {
+            doc.fields.push((key.to_string(), BsonValue::Bool(true)));
+        }
+        doc.fields
+            .push(("maxWireVersion".to_string(), BsonValue::Int32(21)));
+        doc.fields
+            .push(("minWireVersion".to_string(), BsonValue::Int32(0)));
+        doc.fields.push((
+            "maxBsonObjectSize".to_string(),
+            BsonValue::Int32(16_777_216),
+        ));
+        doc.fields.push((
+            "maxMessageSizeBytes".to_string(),
+            BsonValue::Int32(48_000_000),
+        ));
+        doc.fields
+            .push(("maxWriteBatchSize".to_string(), BsonValue::Int32(100_000)));
+        doc.fields.push((
+            "logicalSessionTimeoutMinutes".to_string(),
+            BsonValue::Int32(30),
+        ));
+        doc.fields
+            .push(("connectionId".to_string(), BsonValue::Int32(1)));
+        doc.fields
+            .push(("readOnly".to_string(), BsonValue::Bool(false)));
+        doc.fields
+            .push(("compression".to_string(), BsonValue::Array(Vec::new())));
+        doc
+    }
+
+    /// Loopback Couchbase server for the query path. It answers the
+    /// memdx bootstrap (HELLO, SASL PLAIN and SCRAM-SHA512, cluster
+    /// config, select bucket) and the `query/service` HTTP request on the
+    /// same port.
+    #[cfg(feature = "couchbase")]
+    struct Mv02cCouchFake {
+        port: u16,
+        queries: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        connections: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(feature = "couchbase")]
+    impl Drop for Mv02cCouchFake {
+        fn drop(&mut self) {
+            self._task.abort();
+            for handle in self
+                .connections
+                .lock()
+                .expect("couch fake connections")
+                .drain(..)
+            {
+                handle.abort();
+            }
+        }
+    }
+
+    #[cfg(feature = "couchbase")]
+    impl Mv02cCouchFake {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind couch fake");
+            Self::serve(listener).await
+        }
+
+        async fn start_on(port: u16) -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("rebind couch fake");
+            Self::serve(listener).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener) -> Self {
+            let port = listener.local_addr().expect("couch fake addr").port();
+            let queries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let connections = std::sync::Arc::new(std::sync::Mutex::new(Vec::<
+                tokio::task::JoinHandle<()>,
+            >::new()));
+            let task_queries = std::sync::Arc::clone(&queries);
+            let task_connections = std::sync::Arc::clone(&connections);
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let queries = std::sync::Arc::clone(&task_queries);
+                    let config = mv02c_couch_config(port);
+                    let handle = tokio::spawn(async move {
+                        let mut first = [0u8; 1];
+                        if stream.peek(&mut first).await.is_err() {
+                            return;
+                        }
+                        if first[0] == 0x80 {
+                            let mut scram: Option<(String, String)> = None;
+                            loop {
+                                let mut header = [0u8; 24];
+                                if stream.read_exact(&mut header).await.is_err() {
+                                    break;
+                                }
+                                let total = u32::from_be_bytes([
+                                    header[8], header[9], header[10], header[11],
+                                ]) as usize;
+                                let opaque = u32::from_be_bytes([
+                                    header[12], header[13], header[14], header[15],
+                                ]);
+                                let mut body = vec![0u8; total];
+                                if stream.read_exact(&mut body).await.is_err() {
+                                    break;
+                                }
+                                let opcode = header[1];
+                                let key_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+                                let ext_len = header[4] as usize;
+                                let key_end = ext_len.saturating_add(key_len).min(body.len());
+                                let key = body.get(ext_len..key_end).unwrap_or(&[]);
+                                let value = body.get(key_end..).unwrap_or(&[]);
+                                let (status, reply) = match opcode {
+                                    0x1f => (0u16, Vec::new()),
+                                    0x20 => {
+                                        // The driver reads this list as
+                                        // space-separated text.
+                                        (0, b"PLAIN SCRAM-SHA512".to_vec())
+                                    }
+                                    0x21 => {
+                                        // The fake verifies the PLAIN token
+                                        // the probe sends, and starts SCRAM
+                                        // for the driver. A wrong user or
+                                        // password gets AUTH_ERROR.
+                                        if key == b"PLAIN".as_slice() {
+                                            if value == b"\0u\0p".as_slice() {
+                                                (0, Vec::new())
+                                            } else {
+                                                (0x20, Vec::new())
+                                            }
+                                        } else if key.starts_with(b"SCRAM-SHA".as_slice()) {
+                                            match mv02c_scram_server_first(value) {
+                                                Some((bare, server_first, _)) => {
+                                                    scram = Some((bare, server_first.clone()));
+                                                    (0x21, server_first.into_bytes())
+                                                }
+                                                None => (0x20, Vec::new()),
+                                            }
+                                        } else {
+                                            (0x20, Vec::new())
+                                        }
+                                    }
+                                    0x22 => {
+                                        let ok = scram.take().is_some_and(|(bare, first)| {
+                                            std::str::from_utf8(value).ok().is_some_and(|text| {
+                                                mv02c_scram_proof_ok(&bare, &first, text)
+                                            })
+                                        });
+                                        if ok {
+                                            (0, Vec::new())
+                                        } else {
+                                            (0x20, Vec::new())
+                                        }
+                                    }
+                                    0x89 => (0, Vec::new()),
+                                    0xb5 => (0, config.as_bytes().to_vec()),
+                                    _ => (0, Vec::new()),
+                                };
+                                let out = mv02c_couch_response(opcode, opaque, status, &reply);
+                                if stream.write_all(&out).await.is_err() {
+                                    break;
+                                }
+                            }
+                        } else {
+                            mv02c_couch_http(&mut stream, &queries, port).await;
+                        }
+                    });
+                    task_connections
+                        .lock()
+                        .expect("couch fake connections")
+                        .push(handle);
+                }
+            });
+            Self {
+                port,
+                queries,
+                connections,
+                _task: task,
+            }
+        }
+
+        async fn wait_for(&self, count: usize) -> Vec<String> {
+            for _ in 0..300 {
+                let got = self.queries.lock().expect("couch fake lock").clone();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "couch fake got {} queries, wanted at least {count}",
+                self.queries.lock().expect("couch fake lock").len()
+            );
+        }
+    }
+
+    #[cfg(feature = "couchbase")]
+    fn mv02c_couch_response(opcode: u8, opaque: u32, status: u16, value: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x81, opcode];
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.push(0);
+        out.push(0);
+        out.extend_from_slice(&status.to_be_bytes());
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(&opaque.to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// First SCRAM-SHA512 server message for the fake user `u`. Returns
+    /// the client-first bare text, the server-first text and the nonce.
+    #[cfg(feature = "couchbase")]
+    fn mv02c_scram_server_first(client_first: &[u8]) -> Option<(String, String, String)> {
+        use base64::Engine as _;
+        let text = std::str::from_utf8(client_first).ok()?;
+        let bare = text.strip_prefix("n,,")?;
+        let mut user = None;
+        let mut nonce = None;
+        for part in bare.split(',') {
+            if let Some(value) = part.strip_prefix("n=") {
+                user = Some(value);
+            }
+            if let Some(value) = part.strip_prefix("r=") {
+                nonce = Some(value);
+            }
+        }
+        if user != Some("u") {
+            return None;
+        }
+        let nonce = nonce?.to_string();
+        let server_nonce = format!("{nonce}server");
+        let salt = base64::engine::general_purpose::STANDARD.encode(b"mv02c-scram-salt");
+        let server_first = format!("r={server_nonce},s={salt},i=4096");
+        Some((bare.to_string(), server_first, server_nonce))
+    }
+
+    /// True when the client-final SCRAM proof matches password `p`.
+    #[cfg(feature = "couchbase")]
+    fn mv02c_scram_proof_ok(
+        client_first_bare: &str,
+        server_first: &str,
+        client_final: &str,
+    ) -> bool {
+        use base64::Engine as _;
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha512};
+        let Some((without_proof, proof)) = client_final.rsplit_once(",p=") else {
+            return false;
+        };
+        let Ok(proof) = base64::engine::general_purpose::STANDARD.decode(proof) else {
+            return false;
+        };
+        let Some(salt) = server_first
+            .split(',')
+            .find_map(|field| field.strip_prefix("s="))
+            .and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok())
+        else {
+            return false;
+        };
+        let iterations = server_first
+            .split(',')
+            .find_map(|field| field.strip_prefix("i="))
+            .and_then(|text| text.parse::<u32>().ok())
+            .unwrap_or(4096);
+        let hmac = |key: &[u8], data: &[u8]| {
+            let mut mac = Hmac::<Sha512>::new_from_slice(key).expect("HMAC accepts any key length");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        };
+        let mut block = salt;
+        block.extend_from_slice(&1u32.to_be_bytes());
+        let mut u = hmac(b"p".as_slice(), &block);
+        let mut salted = u.clone();
+        for _ in 1..iterations {
+            u = hmac(b"p".as_slice(), &u);
+            for (left, right) in salted.iter_mut().zip(u.iter()) {
+                *left ^= right;
+            }
+        }
+        let client_key = hmac(&salted, b"Client Key".as_slice());
+        let stored_key = Sha512::digest(&client_key).to_vec();
+        let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+        let client_signature = hmac(&stored_key, auth_message.as_bytes());
+        if proof.len() != client_signature.len() {
+            return false;
+        }
+        let recovered: Vec<u8> = proof
+            .iter()
+            .zip(client_signature.iter())
+            .map(|(left, right)| left ^ right)
+            .collect();
+        Sha512::digest(&recovered).to_vec() == stored_key
+    }
+
+    #[cfg(feature = "couchbase")]
+    fn mv02c_couch_config(port: u16) -> String {
+        serde_json::json!({
+            "rev": 1,
+            "revEpoch": 0,
+            "clusterName": "mv02c-fake",
+            "clusterUUID": "00000000000000000000000000000000",
+            "nodeLocator": "vbucket",
+            "nodes": [{
+                "hostname": "127.0.0.1",
+                "ports": {
+                    "direct": port,
+                    "http": port,
+                    "n1ql": port,
+                    "ssl": 0
+                }
+            }],
+            "nodesExt": [{
+                "hostname": "127.0.0.1",
+                "services": {
+                    "kv": port,
+                    "kvSSL": 0,
+                    "mgmt": port,
+                    "mgmtSSL": 0,
+                    "n1ql": port,
+                    "n1qlSSL": 0,
+                    "capi": port,
+                    "capiSSL": 0,
+                    "fts": 0,
+                    "ftsSSL": 0,
+                    "indexAdmin": 0,
+                    "indexScan": 0,
+                    "indexHttp": 0,
+                    "indexHttps": 0,
+                    "cbas": 0,
+                    "cbasSSL": 0,
+                    "eventingAdminPort": 0,
+                    "eventingSSL": 0,
+                    "backupAPI": 0,
+                    "backupAPIHTTPS": 0
+                }
+            }],
+            "bucketCapabilitiesVer": "",
+            "bucketCapabilities": [
+                "cbhello", "touch", "couchapi", "ccc", "xattr", "dcp", "cboy",
+                "collections", "durableWrite", "tombstonedUserXAttrs", "subdoc",
+                "subdoc.ReplicaRead", "subdoc.BinaryNoDocid", "subdoc.CreateAsDeleted",
+                "subdoc.ReplaceBodyWithXattr", "subdoc.ReviveDocument"
+            ],
+            "clusterCapabilitiesVer": [1, 0],
+            "clusterCapabilities": {}
+        })
+        .to_string()
+    }
+
+    #[cfg(feature = "couchbase")]
+    async fn mv02c_couch_http(
+        stream: &mut tokio::net::TcpStream,
+        queries: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        port: u16,
+    ) {
+        let mut head = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => return,
+                Ok(n) => {
+                    head.extend_from_slice(&buf[..n]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                    if head.len() > 65536 {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+        let head_end = head
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|at| at + 4)
+            .unwrap_or(head.len());
+        let head_text = String::from_utf8_lossy(&head[..head_end]).to_string();
+        let request_path = head_text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        let mut content_length = 0usize;
+        for line in head_text.lines() {
+            let lower = line.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = head[head_end..].to_vec();
+        while body.len() < content_length {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => body.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        body.truncate(content_length);
+        if !body.is_empty() {
+            queries
+                .lock()
+                .expect("couch fake lock")
+                .push(String::from_utf8_lossy(&body).to_string());
+        }
+        let reply = if request_path.contains("query") {
+            serde_json::json!({
+                "requestID": "mv02c-fake",
+                "signature": null,
+                "results": [],
+                "status": "success",
+                "metrics": {
+                    "elapsedTime": "1ms",
+                    "executionTime": "1ms",
+                    "resultCount": 0,
+                    "resultSize": 0
+                },
+                "errors": []
+            })
+            .to_string()
+        } else if request_path == "/pools" || request_path.starts_with("/pools?") {
+            serde_json::json!({
+                "implementationVersion": "7.0.0",
+                "pools": [{"name": "default", "uri": "/pools/default"}]
+            })
+            .to_string()
+        } else if request_path.contains("pools/default") {
+            mv02c_couch_config(port)
+        } else {
+            "{}".to_string()
+        };
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            reply.len()
+        );
+        let mut out = header.into_bytes();
+        out.extend_from_slice(reply.as_bytes());
+        let _ = stream.write_all(&out).await;
+    }
+
     /// Poll one action's metrics until `success` reaches `want`.
     async fn mv02b_wait_success(server: &TestServer, token: &str, action: &str, want: u64) {
-        for _ in 0..100 {
+        for _ in 0..300 {
             let (status, metrics) = server
                 .get_auth(&format!("/api/v5/actions/{action}/metrics"), token)
                 .await;
@@ -4031,6 +4869,1204 @@ connector_id = "pending-good"
         assert!(got[0].query.contains("events2"), "query: {}", got[0].query);
         mv02b_wait_success(&server, &token, "mv02b-ch-act", 1).await;
         drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    #[tokio::test]
+    async fn mv02c_elasticsearch_delivers_action_target_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02c-elasticsearch");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "{}").await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "elasticsearch", "name": "mv02c-es", "server": endpoint}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "elasticsearch", "name": "mv02c-es-act",
+                       "connector": "mv02c-es",
+                       "parameters": {"action": "create", "index": "events",
+                                      "id": "id-${seq}",
+                                      "doc": "{\"topic\":\"${topic}\",\"payload\":${payload}}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02c-es-rule", "name": "mv02c-es-rule",
+                       "sql": "SELECT * FROM \"mv02c/es\"", "actions": ["mv02c-es-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02c/es", "{\"v\":1}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got[0].method, "POST");
+        assert_eq!(got[0].path, "/_bulk");
+        let body_text = Mv02bFake::body_text(&got[0]);
+        let lines: Vec<&str> = body_text.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let action: serde_json::Value = serde_json::from_str(lines[0]).expect("action line");
+        let source: serde_json::Value = serde_json::from_str(lines[1]).expect("source line");
+        assert_eq!(action["index"]["_index"], json!("events"));
+        assert_eq!(action["index"]["_id"], json!("id-0"));
+        assert_eq!(source, json!({"topic": "mv02c/es", "payload": {"v": 1}}));
+        mv02b_wait_success(&server, &token, "mv02c-es-act", 1).await;
+
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02c-es-act",
+                json!({"type": "elasticsearch", "name": "mv02c-es-act",
+                       "connector": "mv02c-es",
+                       "parameters": {"action": "create", "index": "events2",
+                                      "id": "id-${seq}",
+                                      "doc": "{\"topic\":\"${topic}\"}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02c/es", "{\"v\":2}").await;
+        let got = fake.wait_for(2).await;
+        let action: serde_json::Value =
+            serde_json::from_str(Mv02bFake::body_text(&got[1]).lines().next().unwrap_or(""))
+                .expect("action line");
+        assert_eq!(action["index"]["_index"], json!("events2"));
+        mv02b_wait_success(&server, &token, "mv02c-es-act", 2).await;
+
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv02c-es-act",
+                json!({"type": "elasticsearch", "name": "mv02c-es-act",
+                       "connector": "mv02c-es",
+                       "parameters": {"action": "update", "index": "events2"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an update without an id refuses: {body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("id"),
+            "{body}"
+        );
+        mv02b_publish(&server, &token, "mv02c/es", "{\"v\":3}").await;
+        let got = fake.wait_for(3).await;
+        let action: serde_json::Value =
+            serde_json::from_str(Mv02bFake::body_text(&got[2]).lines().next().unwrap_or(""))
+                .expect("action line");
+        assert_eq!(action["index"]["_index"], json!("events2"));
+        mv02b_wait_success(&server, &token, "mv02c-es-act", 3).await;
+
+        // Reference `overwrite` false writes `create` (fail on conflict).
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02c-es-act",
+                json!({"type": "elasticsearch", "name": "mv02c-es-act",
+                       "connector": "mv02c-es",
+                       "parameters": {"action": "create", "index": "events2",
+                                      "id": "id-${seq}",
+                                      "doc": "{\"topic\":\"${topic}\"}",
+                                      "overwrite": false}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02c/es", "{\"v\":33}").await;
+        let got = fake.wait_for(4).await;
+        let action: serde_json::Value =
+            serde_json::from_str(Mv02bFake::body_text(&got[3]).lines().next().unwrap_or(""))
+                .expect("action line");
+        assert_eq!(action["create"]["_index"], json!("events2"));
+        mv02b_wait_success(&server, &token, "mv02c-es-act", 4).await;
+
+        let down_port = fake.port;
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02c/es", "{\"v\":4}").await;
+        for _ in 0..100 {
+            let (status, metrics) = server
+                .get_auth("/api/v5/actions/mv02c-es-act/metrics", &token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02c-es-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(metrics["metrics"]["failed"], json!(1));
+        // The server returns on the same port: delivery resumes.
+        let fake = Mv02bFake::start_on(down_port, 200, "{}").await;
+        mv02b_publish(&server, &token, "mv02c/es", "{\"v\":5}").await;
+        let got = fake.wait_for(1).await;
+        assert_eq!(got.len(), 1);
+        mv02b_wait_success(&server, &token, "mv02c-es-act", 5).await;
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Poll one action's metrics until `failed` reaches `want`.
+    /// Exact equality: a duplicate failure count fails instead of passing.
+    #[cfg(any(feature = "mongodb", feature = "couchbase"))]
+    async fn mv02c_wait_failed(server: &TestServer, token: &str, action: &str, want: u64) {
+        for _ in 0..300 {
+            let (status, metrics) = server
+                .get_auth(&format!("/api/v5/actions/{action}/metrics"), token)
+                .await;
+            assert_eq!(status, 200);
+            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) == want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("action {action} never reached failed {want}");
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn mv02c_mongodb_wiring_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02c-mongodb");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02cMongoFake::start().await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let target = format!("127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "mongodb", "name": "mv02c-mongo",
+                       "server": target, "database": "db", "timeout_ms": 1_000}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "mongodb", "name": "mv02c-mongo-act",
+                       "connector": "mv02c-mongo",
+                       "parameters": {"collection": "events",
+                                      "payload_template": "{\"v\":${payload.v}}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02c-mongo-rule", "name": "mv02c-mongo-rule",
+                       "sql": "SELECT * FROM \"mv02c/mongo\"", "actions": ["mv02c-mongo-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // The loopback server receives the exact database, collection
+        // and document value the action names.
+        mv02b_publish(&server, &token, "mv02c/mongo", "{\"v\":1}").await;
+        let calls = fake.wait_for(1).await;
+        assert_eq!(calls[0].command, "insert");
+        assert_eq!(calls[0].db, "db");
+        assert_eq!(calls[0].collection, "events");
+        assert_eq!(
+            calls[0].documents[0].get("v"),
+            Some(&broker_connectors_enterprise::BsonValue::Int32(1)),
+            "{:?}",
+            calls[0].documents[0]
+        );
+        mv02b_wait_success(&server, &token, "mv02c-mongo-act", 1).await;
+
+        // An update moves the collection on the wire.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02c-mongo-act",
+                json!({"type": "mongodb", "name": "mv02c-mongo-act",
+                       "connector": "mv02c-mongo",
+                       "parameters": {"collection": "events2",
+                                      "payload_template": "{\"v\":${payload.v}}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(&server, &token, "mv02c/mongo", "{\"v\":2}").await;
+        let calls = fake.wait_for(2).await;
+        assert_eq!(calls[1].collection, "events2");
+        assert_eq!(
+            calls[1].documents[0].get("v"),
+            Some(&broker_connectors_enterprise::BsonValue::Int32(2)),
+            "{:?}",
+            calls[1].documents[0]
+        );
+        mv02b_wait_success(&server, &token, "mv02c-mongo-act", 2).await;
+
+        // A refused update keeps the old collection delivering.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv02c-mongo-act",
+                json!({"type": "mongodb", "name": "mv02c-mongo-act",
+                       "connector": "mv02c-mongo",
+                       "parameters": {"collection": "events3",
+                                      "payload_template": "not json ${topic}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "the refused update answers 400: {body}");
+        mv02b_publish(&server, &token, "mv02c/mongo", "{\"v\":5}").await;
+        let calls = fake.wait_for(3).await;
+        assert_eq!(calls[2].db, "db");
+        assert_eq!(calls[2].collection, "events2");
+        assert_eq!(
+            calls[2].documents[0].get("v"),
+            Some(&broker_connectors_enterprise::BsonValue::Int32(5)),
+            "{:?}",
+            calls[2].documents[0]
+        );
+        mv02b_wait_success(&server, &token, "mv02c-mongo-act", 3).await;
+
+        // The server dies: the action counts one failed forward.
+        drop(fake);
+        mv02b_publish(&server, &token, "mv02c/mongo", "{\"v\":3}").await;
+        mv02c_wait_failed(&server, &token, "mv02c-mongo-act", 1).await;
+        let (status, read) = server
+            .get_auth("/api/v5/connectors/mv02c-mongo", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes with the
+        // stored connector and the updated collection.
+        let fake = Mv02cMongoFake::start_on(port).await;
+        mv02b_publish(&server, &token, "mv02c/mongo", "{\"v\":4}").await;
+        let calls = fake.wait_for(1).await;
+        assert_eq!(calls[0].db, "db");
+        assert_eq!(calls[0].collection, "events2");
+        assert_eq!(
+            calls[0].documents[0].get("v"),
+            Some(&broker_connectors_enterprise::BsonValue::Int32(4)),
+            "{:?}",
+            calls[0].documents[0]
+        );
+        mv02b_wait_success(&server, &token, "mv02c-mongo-act", 4).await;
+
+        // Two actions on one connector with different collections both
+        // deliver through the same stored connection.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "mongodb", "name": "mv02c-mongo-act-b",
+                       "connector": "mv02c-mongo",
+                       "parameters": {"collection": "events-b",
+                                      "payload_template": "{\"v\":${payload.v}}"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/rules/mv02c-mongo-rule",
+                json!({"id": "mv02c-mongo-rule", "name": "mv02c-mongo-rule",
+                       "sql": "SELECT * FROM \"mv02c/mongo\"",
+                       "actions": ["mv02c-mongo-act", "mv02c-mongo-act-b"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "the rule keeps both actions: {body}");
+        mv02b_publish(&server, &token, "mv02c/mongo", "{\"v\":6}").await;
+        let calls = fake.wait_for(3).await;
+        let mut collections = vec![calls[1].collection.clone(), calls[2].collection.clone()];
+        collections.sort();
+        assert_eq!(
+            collections,
+            vec!["events-b".to_string(), "events2".to_string()]
+        );
+        mv02b_wait_success(&server, &token, "mv02c-mongo-act", 5).await;
+        mv02b_wait_success(&server, &token, "mv02c-mongo-act-b", 1).await;
+
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "couchbase")]
+    #[tokio::test]
+    async fn mv02c_couchbase_wiring_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02c-couchbase");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02cCouchFake::start().await;
+        let port = fake.port;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let target = format!("127.0.0.1:{port}");
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "couchbase", "name": "mv02c-cb",
+                       "server": target, "username": "u", "password": "p",
+                       "timeout_ms": 1_000}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "couchbase", "name": "mv02c-cb-act",
+                       "connector": "mv02c-cb",
+                       "parameters": {"sql": "UPSERT INTO `b` (KEY, VALUE) VALUES ($client_id, {\"v\":$payload_v})"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02c-cb-rule", "name": "mv02c-cb-rule",
+                       "sql": "SELECT * FROM \"mv02c/cb\"", "actions": ["mv02c-cb-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        // The loopback query service receives the exact statement and
+        // bound value for the event.
+        mv02b_publish(
+            &server,
+            &token,
+            "mv02c/cb",
+            "{\"client_id\":\"edge-7\",\"v\":21}",
+        )
+        .await;
+        let queries = fake.wait_for(1).await;
+        let query: serde_json::Value =
+            serde_json::from_str(&queries[0]).expect("couch query body is JSON");
+        assert_eq!(
+            query["statement"],
+            json!("UPSERT INTO `b` (KEY, VALUE) VALUES ($client_id, {\"v\":$payload_v})")
+        );
+        assert_eq!(query["$client_id"], json!("edge-7"), "{query}");
+        assert_eq!(query["$payload_v"], json!("21"), "{query}");
+        mv02b_wait_success(&server, &token, "mv02c-cb-act", 1).await;
+
+        // An update moves the statement on the wire.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/actions/mv02c-cb-act",
+                json!({"type": "couchbase", "name": "mv02c-cb-act",
+                       "connector": "mv02c-cb",
+                       "parameters": {"sql": "UPSERT INTO `b2` (KEY, VALUE) VALUES ($client_id, {\"v\":$payload_v})"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        mv02b_publish(
+            &server,
+            &token,
+            "mv02c/cb",
+            "{\"client_id\":\"edge-8\",\"v\":22}",
+        )
+        .await;
+        let queries = fake.wait_for(2).await;
+        let query: serde_json::Value =
+            serde_json::from_str(&queries[1]).expect("couch query body is JSON");
+        assert_eq!(
+            query["statement"],
+            json!("UPSERT INTO `b2` (KEY, VALUE) VALUES ($client_id, {\"v\":$payload_v})")
+        );
+        assert_eq!(query["$client_id"], json!("edge-8"), "{query}");
+        assert_eq!(query["$payload_v"], json!("22"), "{query}");
+        mv02b_wait_success(&server, &token, "mv02c-cb-act", 2).await;
+
+        // A refused update keeps the old statement delivering.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv02c-cb-act",
+                json!({"type": "couchbase", "name": "mv02c-cb-act",
+                       "connector": "mv02c-cb", "parameters": {}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an update without sql refuses: {body}");
+        mv02b_publish(
+            &server,
+            &token,
+            "mv02c/cb",
+            "{\"client_id\":\"edge-11\",\"v\":25}",
+        )
+        .await;
+        let queries = fake.wait_for(3).await;
+        let query: serde_json::Value =
+            serde_json::from_str(&queries[2]).expect("couch query body is JSON");
+        assert_eq!(
+            query["statement"],
+            json!("UPSERT INTO `b2` (KEY, VALUE) VALUES ($client_id, {\"v\":$payload_v})")
+        );
+        assert_eq!(query["$client_id"], json!("edge-11"), "{query}");
+        assert_eq!(query["$payload_v"], json!("25"), "{query}");
+        mv02b_wait_success(&server, &token, "mv02c-cb-act", 3).await;
+
+        // The server dies: the action counts one failed forward.
+        drop(fake);
+        mv02b_publish(
+            &server,
+            &token,
+            "mv02c/cb",
+            "{\"client_id\":\"edge-9\",\"v\":23}",
+        )
+        .await;
+        mv02c_wait_failed(&server, &token, "mv02c-cb-act", 1).await;
+        let (status, read) = server.get_auth("/api/v5/connectors/mv02c-cb", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(read["status"], json!("disconnected"));
+
+        // The server returns on the same port: delivery resumes with the
+        // stored connector and the updated statement.
+        let fake = Mv02cCouchFake::start_on(port).await;
+        mv02b_publish(
+            &server,
+            &token,
+            "mv02c/cb",
+            "{\"client_id\":\"edge-10\",\"v\":24}",
+        )
+        .await;
+        let queries = fake.wait_for(1).await;
+        let query: serde_json::Value =
+            serde_json::from_str(&queries[0]).expect("couch query body is JSON");
+        assert_eq!(
+            query["statement"],
+            json!("UPSERT INTO `b2` (KEY, VALUE) VALUES ($client_id, {\"v\":$payload_v})")
+        );
+        assert_eq!(query["$client_id"], json!("edge-10"), "{query}");
+        assert_eq!(query["$payload_v"], json!("24"), "{query}");
+        mv02b_wait_success(&server, &token, "mv02c-cb-act", 4).await;
+
+        // Two actions on one connector with different statements both
+        // deliver through the same stored connection.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "couchbase", "name": "mv02c-cb-act-b",
+                       "connector": "mv02c-cb",
+                       "parameters": {"sql": "UPSERT INTO `b3` (KEY, VALUE) VALUES ($client_id, {\"v\":$payload_v})"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/rules/mv02c-cb-rule",
+                json!({"id": "mv02c-cb-rule", "name": "mv02c-cb-rule",
+                       "sql": "SELECT * FROM \"mv02c/cb\"",
+                       "actions": ["mv02c-cb-act", "mv02c-cb-act-b"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "the rule keeps both actions: {body}");
+        mv02b_publish(
+            &server,
+            &token,
+            "mv02c/cb",
+            "{\"client_id\":\"edge-12\",\"v\":26}",
+        )
+        .await;
+        let queries = fake.wait_for(3).await;
+        let mut statements = Vec::new();
+        for raw in queries.iter().skip(1).take(2) {
+            let query: serde_json::Value =
+                serde_json::from_str(raw).expect("couch query body is JSON");
+            assert_eq!(query["$client_id"], json!("edge-12"), "{query}");
+            assert_eq!(query["$payload_v"], json!("26"), "{query}");
+            statements.push(query["statement"].as_str().unwrap_or("").to_string());
+        }
+        statements.sort();
+        let mut expected = vec![
+            "UPSERT INTO `b2` (KEY, VALUE) VALUES ($client_id, {\"v\":$payload_v})".to_string(),
+            "UPSERT INTO `b3` (KEY, VALUE) VALUES ($client_id, {\"v\":$payload_v})".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(statements, expected);
+        mv02b_wait_success(&server, &token, "mv02c-cb-act", 5).await;
+        mv02b_wait_success(&server, &token, "mv02c-cb-act-b", 1).await;
+
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    #[tokio::test]
+    async fn mv02c_two_actions_on_one_connector_keep_delivering() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02c-two-actions");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Mv02bFake::start(200, "{}").await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("http://127.0.0.1:{}", fake.port);
+
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "elasticsearch", "name": "mv02c-es2", "server": endpoint}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        for (name, index) in [("mv02c-es2-a", "events-a"), ("mv02c-es2-b", "events-b")] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/actions",
+                    json!({"type": "elasticsearch", "name": name,
+                           "connector": "mv02c-es2",
+                           "parameters": {"action": "create", "index": index,
+                                          "id": "id-${seq}",
+                                          "doc": "{\"topic\":\"${topic}\"}"}}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 201, "action {name} creates");
+        }
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02c-es2-rule", "name": "mv02c-es2-rule",
+                       "sql": "SELECT * FROM \"mv02c/es2\"",
+                       "actions": ["mv02c-es2-a", "mv02c-es2-b"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+
+        mv02b_publish(&server, &token, "mv02c/es2", "{\"v\":1}").await;
+        let got = fake.wait_for(2).await;
+        let mut indexes: Vec<String> = got
+            .iter()
+            .take(2)
+            .map(|request| {
+                let action: serde_json::Value = serde_json::from_str(
+                    Mv02bFake::body_text(request).lines().next().unwrap_or(""),
+                )
+                .expect("action line");
+                let key = if action.get("index").is_some() {
+                    "index"
+                } else {
+                    "create"
+                };
+                action[key]["_index"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        indexes.sort();
+        assert_eq!(
+            indexes,
+            vec!["events-a".to_string(), "events-b".to_string()]
+        );
+        mv02b_wait_success(&server, &token, "mv02c-es2-a", 1).await;
+        mv02b_wait_success(&server, &token, "mv02c-es2-b", 1).await;
+
+        // A failed update keeps both actions delivering on their targets.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/actions/mv02c-es2-a",
+                json!({"type": "elasticsearch", "name": "mv02c-es2-a",
+                       "connector": "mv02c-es2",
+                       "parameters": {"action": "update", "index": "events-a"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "an update without an id refuses: {body}");
+        mv02b_publish(&server, &token, "mv02c/es2", "{\"v\":2}").await;
+        let got = fake.wait_for(4).await;
+        let mut indexes: Vec<String> = got
+            .iter()
+            .skip(2)
+            .take(2)
+            .map(|request| {
+                let action: serde_json::Value = serde_json::from_str(
+                    Mv02bFake::body_text(request).lines().next().unwrap_or(""),
+                )
+                .expect("action line");
+                let key = if action.get("index").is_some() {
+                    "index"
+                } else {
+                    "create"
+                };
+                action[key]["_index"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        indexes.sort();
+        assert_eq!(
+            indexes,
+            vec!["events-a".to_string(), "events-b".to_string()]
+        );
+        mv02b_wait_success(&server, &token, "mv02c-es2-a", 2).await;
+        mv02b_wait_success(&server, &token, "mv02c-es2-b", 2).await;
+
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    const MV02C_PROBE_CERT_DER: &[u8] = &[
+        48, 130, 3, 26, 48, 130, 2, 2, 160, 3, 2, 1, 2, 2, 20, 111, 123, 43, 80, 249, 16, 79, 225,
+        66, 77, 171, 171, 136, 95, 33, 232, 34, 50, 219, 135, 48, 13, 6, 9, 42, 134, 72, 134, 247,
+        13, 1, 1, 11, 5, 0, 48, 20, 49, 18, 48, 16, 6, 3, 85, 4, 3, 12, 9, 49, 50, 55, 46, 48, 46,
+        48, 46, 49, 48, 30, 23, 13, 50, 54, 49, 48, 50, 56, 48, 56, 49, 48, 52, 52, 90, 23, 13, 51,
+        54, 49, 48, 50, 53, 48, 56, 49, 48, 52, 52, 90, 48, 20, 49, 18, 48, 16, 6, 3, 85, 4, 3, 12,
+        9, 49, 50, 55, 46, 48, 46, 48, 46, 49, 48, 130, 1, 34, 48, 13, 6, 9, 42, 134, 72, 134, 247,
+        13, 1, 1, 1, 5, 0, 3, 130, 1, 15, 0, 48, 130, 1, 10, 2, 130, 1, 1, 0, 219, 145, 36, 232,
+        25, 40, 98, 20, 178, 222, 121, 215, 147, 92, 250, 59, 67, 96, 187, 29, 245, 172, 239, 90,
+        246, 201, 200, 207, 141, 135, 221, 23, 221, 6, 63, 55, 236, 6, 171, 149, 59, 72, 67, 75,
+        209, 91, 244, 238, 135, 28, 190, 232, 144, 47, 180, 159, 206, 229, 15, 10, 33, 11, 170,
+        247, 81, 219, 144, 107, 74, 75, 42, 47, 148, 197, 119, 164, 191, 133, 72, 214, 110, 215,
+        155, 51, 25, 215, 217, 44, 127, 18, 181, 25, 230, 255, 53, 174, 201, 201, 84, 164, 195,
+        136, 22, 196, 45, 12, 248, 16, 246, 6, 120, 150, 175, 233, 254, 216, 86, 1, 231, 134, 49,
+        246, 160, 211, 49, 237, 33, 9, 65, 247, 3, 116, 120, 30, 59, 201, 3, 165, 32, 120, 79, 71,
+        116, 189, 107, 246, 59, 8, 23, 223, 94, 62, 220, 38, 218, 156, 166, 108, 255, 174, 151, 3,
+        57, 113, 198, 160, 60, 131, 8, 251, 185, 21, 236, 167, 95, 27, 226, 162, 33, 110, 4, 186,
+        217, 100, 31, 49, 224, 253, 254, 171, 252, 98, 1, 110, 138, 236, 219, 139, 6, 132, 151,
+        102, 65, 222, 2, 175, 6, 188, 50, 103, 44, 143, 21, 109, 11, 20, 45, 236, 25, 249, 236, 46,
+        168, 149, 128, 74, 11, 137, 41, 202, 210, 4, 241, 174, 89, 193, 14, 7, 195, 115, 229, 252,
+        45, 234, 40, 169, 243, 107, 100, 179, 43, 237, 161, 38, 248, 31, 2, 3, 1, 0, 1, 163, 100,
+        48, 98, 48, 29, 6, 3, 85, 29, 14, 4, 22, 4, 20, 180, 195, 96, 120, 195, 153, 11, 207, 231,
+        78, 14, 9, 116, 145, 138, 194, 26, 166, 243, 25, 48, 31, 6, 3, 85, 29, 35, 4, 24, 48, 22,
+        128, 20, 180, 195, 96, 120, 195, 153, 11, 207, 231, 78, 14, 9, 116, 145, 138, 194, 26, 166,
+        243, 25, 48, 15, 6, 3, 85, 29, 17, 4, 8, 48, 6, 135, 4, 127, 0, 0, 1, 48, 15, 6, 3, 85, 29,
+        19, 1, 1, 255, 4, 5, 48, 3, 1, 1, 255, 48, 13, 6, 9, 42, 134, 72, 134, 247, 13, 1, 1, 11,
+        5, 0, 3, 130, 1, 1, 0, 157, 26, 128, 240, 144, 145, 4, 15, 171, 17, 202, 61, 96, 141, 194,
+        133, 199, 89, 96, 148, 33, 238, 74, 119, 63, 208, 111, 83, 187, 254, 104, 176, 124, 135,
+        217, 176, 83, 44, 84, 108, 236, 194, 39, 151, 83, 40, 155, 214, 26, 37, 255, 92, 105, 122,
+        182, 213, 63, 122, 161, 166, 195, 216, 79, 172, 148, 225, 66, 194, 236, 139, 232, 204, 144,
+        210, 243, 248, 124, 84, 16, 218, 211, 60, 158, 150, 150, 8, 206, 135, 112, 176, 55, 154,
+        58, 43, 62, 86, 215, 142, 188, 162, 215, 82, 58, 229, 183, 93, 224, 24, 2, 192, 151, 99,
+        161, 226, 108, 156, 105, 46, 55, 96, 237, 202, 239, 140, 29, 219, 201, 209, 19, 157, 13,
+        184, 80, 72, 220, 3, 223, 3, 18, 159, 57, 16, 54, 142, 77, 127, 88, 68, 0, 105, 35, 214,
+        220, 105, 132, 193, 173, 44, 76, 203, 105, 197, 140, 6, 3, 56, 136, 80, 104, 123, 123, 193,
+        180, 15, 106, 122, 243, 6, 83, 243, 60, 80, 46, 71, 6, 38, 103, 177, 16, 216, 228, 200,
+        151, 80, 183, 142, 38, 105, 244, 7, 164, 227, 81, 2, 133, 8, 179, 6, 167, 166, 178, 56,
+        236, 236, 254, 44, 134, 170, 210, 171, 46, 187, 111, 100, 151, 120, 32, 67, 193, 131, 226,
+        56, 240, 242, 172, 121, 213, 123, 73, 91, 222, 7, 133, 48, 63, 152, 24, 187, 170, 94, 169,
+        214, 33, 208, 9, 91,
+    ];
+    #[cfg(feature = "elasticsearch")]
+    const MV02C_PROBE_KEY_DER: &[u8] = &[
+        48, 130, 4, 189, 2, 1, 0, 48, 13, 6, 9, 42, 134, 72, 134, 247, 13, 1, 1, 1, 5, 0, 4, 130,
+        4, 167, 48, 130, 4, 163, 2, 1, 0, 2, 130, 1, 1, 0, 219, 145, 36, 232, 25, 40, 98, 20, 178,
+        222, 121, 215, 147, 92, 250, 59, 67, 96, 187, 29, 245, 172, 239, 90, 246, 201, 200, 207,
+        141, 135, 221, 23, 221, 6, 63, 55, 236, 6, 171, 149, 59, 72, 67, 75, 209, 91, 244, 238,
+        135, 28, 190, 232, 144, 47, 180, 159, 206, 229, 15, 10, 33, 11, 170, 247, 81, 219, 144,
+        107, 74, 75, 42, 47, 148, 197, 119, 164, 191, 133, 72, 214, 110, 215, 155, 51, 25, 215,
+        217, 44, 127, 18, 181, 25, 230, 255, 53, 174, 201, 201, 84, 164, 195, 136, 22, 196, 45, 12,
+        248, 16, 246, 6, 120, 150, 175, 233, 254, 216, 86, 1, 231, 134, 49, 246, 160, 211, 49, 237,
+        33, 9, 65, 247, 3, 116, 120, 30, 59, 201, 3, 165, 32, 120, 79, 71, 116, 189, 107, 246, 59,
+        8, 23, 223, 94, 62, 220, 38, 218, 156, 166, 108, 255, 174, 151, 3, 57, 113, 198, 160, 60,
+        131, 8, 251, 185, 21, 236, 167, 95, 27, 226, 162, 33, 110, 4, 186, 217, 100, 31, 49, 224,
+        253, 254, 171, 252, 98, 1, 110, 138, 236, 219, 139, 6, 132, 151, 102, 65, 222, 2, 175, 6,
+        188, 50, 103, 44, 143, 21, 109, 11, 20, 45, 236, 25, 249, 236, 46, 168, 149, 128, 74, 11,
+        137, 41, 202, 210, 4, 241, 174, 89, 193, 14, 7, 195, 115, 229, 252, 45, 234, 40, 169, 243,
+        107, 100, 179, 43, 237, 161, 38, 248, 31, 2, 3, 1, 0, 1, 2, 130, 1, 0, 3, 188, 77, 111,
+        113, 118, 33, 109, 14, 186, 0, 66, 173, 172, 40, 73, 183, 212, 190, 122, 61, 2, 203, 51,
+        181, 253, 42, 224, 117, 28, 249, 162, 253, 76, 172, 232, 171, 168, 85, 100, 253, 148, 54,
+        40, 229, 15, 246, 115, 212, 114, 165, 192, 217, 43, 38, 156, 141, 109, 146, 58, 238, 226,
+        254, 238, 164, 66, 227, 11, 32, 65, 117, 31, 72, 29, 175, 242, 106, 155, 190, 232, 127, 12,
+        70, 4, 177, 140, 221, 146, 7, 59, 111, 63, 88, 145, 192, 253, 15, 75, 208, 151, 217, 7,
+        200, 179, 95, 188, 215, 191, 154, 31, 244, 15, 68, 64, 235, 232, 12, 86, 141, 244, 215,
+        134, 197, 167, 178, 50, 193, 156, 25, 163, 210, 163, 78, 213, 119, 148, 121, 109, 225, 199,
+        91, 68, 142, 26, 228, 96, 102, 150, 212, 232, 131, 255, 75, 106, 51, 154, 125, 77, 47, 39,
+        44, 100, 13, 39, 68, 176, 139, 137, 175, 156, 66, 74, 254, 25, 122, 78, 155, 34, 210, 47,
+        8, 210, 224, 26, 58, 3, 49, 94, 237, 208, 46, 197, 23, 144, 36, 159, 74, 31, 10, 171, 80,
+        116, 211, 94, 207, 13, 92, 247, 107, 14, 26, 171, 108, 172, 134, 105, 19, 128, 67, 174, 26,
+        109, 69, 26, 5, 132, 234, 156, 227, 158, 251, 218, 59, 43, 243, 73, 75, 103, 116, 208, 130,
+        20, 15, 206, 80, 3, 176, 234, 238, 28, 159, 220, 18, 119, 229, 201, 2, 129, 129, 0, 245,
+        38, 3, 190, 83, 206, 66, 63, 85, 205, 66, 251, 135, 237, 110, 36, 200, 221, 247, 201, 34,
+        200, 115, 35, 43, 216, 232, 162, 19, 56, 51, 3, 177, 189, 87, 127, 76, 88, 160, 64, 244,
+        227, 10, 43, 228, 33, 196, 67, 114, 6, 139, 89, 91, 16, 202, 148, 69, 52, 56, 19, 125, 77,
+        158, 126, 28, 245, 85, 216, 163, 82, 16, 107, 76, 7, 116, 9, 252, 91, 98, 38, 151, 54, 208,
+        181, 240, 195, 31, 143, 125, 184, 33, 77, 111, 249, 234, 11, 168, 175, 50, 250, 71, 244,
+        221, 38, 118, 13, 7, 49, 204, 242, 111, 230, 255, 233, 168, 196, 147, 78, 239, 1, 111, 213,
+        156, 193, 65, 96, 69, 125, 2, 129, 129, 0, 229, 73, 62, 92, 125, 173, 83, 82, 205, 172,
+        226, 6, 75, 217, 93, 189, 125, 213, 58, 119, 200, 119, 212, 107, 243, 235, 231, 66, 59, 29,
+        188, 72, 187, 170, 23, 94, 167, 82, 206, 242, 37, 25, 100, 237, 40, 83, 235, 47, 90, 237,
+        122, 143, 244, 77, 198, 236, 193, 25, 31, 150, 227, 215, 0, 38, 219, 177, 224, 7, 107, 206,
+        63, 66, 34, 61, 141, 101, 67, 33, 91, 100, 178, 124, 224, 169, 196, 121, 116, 173, 206,
+        110, 122, 20, 237, 79, 183, 31, 219, 16, 35, 174, 72, 126, 153, 230, 72, 158, 59, 139, 49,
+        76, 97, 26, 208, 92, 4, 124, 164, 71, 73, 156, 0, 114, 146, 234, 162, 93, 182, 203, 2, 129,
+        128, 98, 167, 167, 190, 2, 111, 241, 13, 23, 244, 128, 206, 68, 199, 114, 25, 239, 148, 20,
+        81, 167, 99, 207, 162, 9, 213, 66, 217, 102, 174, 169, 41, 5, 112, 83, 51, 241, 127, 129,
+        14, 98, 254, 179, 107, 50, 101, 188, 92, 0, 25, 78, 30, 233, 156, 250, 73, 109, 8, 52, 192,
+        243, 30, 55, 120, 61, 35, 38, 39, 6, 162, 209, 228, 188, 54, 11, 166, 177, 29, 253, 131,
+        214, 58, 195, 7, 85, 26, 209, 42, 167, 199, 95, 239, 143, 238, 157, 23, 144, 12, 225, 145,
+        3, 64, 49, 119, 118, 238, 139, 68, 169, 91, 175, 88, 225, 8, 33, 88, 234, 135, 75, 123,
+        226, 139, 174, 135, 191, 77, 132, 233, 2, 129, 129, 0, 226, 171, 78, 248, 54, 210, 99, 190,
+        71, 80, 115, 62, 80, 59, 186, 61, 59, 169, 209, 156, 91, 85, 131, 109, 153, 125, 140, 104,
+        224, 114, 92, 17, 247, 92, 134, 175, 239, 112, 160, 223, 167, 167, 124, 44, 44, 35, 18, 45,
+        5, 146, 34, 9, 48, 54, 183, 194, 148, 127, 22, 200, 159, 195, 140, 5, 222, 72, 241, 181,
+        196, 112, 231, 254, 164, 68, 255, 132, 173, 33, 203, 237, 55, 186, 214, 139, 94, 141, 199,
+        184, 143, 140, 142, 42, 36, 21, 27, 111, 101, 172, 133, 233, 165, 7, 107, 115, 202, 52,
+        139, 158, 230, 132, 160, 182, 214, 103, 49, 148, 90, 255, 146, 152, 163, 164, 160, 243, 78,
+        194, 160, 147, 2, 129, 128, 101, 176, 243, 114, 124, 68, 135, 50, 92, 222, 149, 224, 99,
+        156, 15, 92, 152, 8, 110, 232, 222, 77, 69, 75, 238, 194, 18, 213, 59, 104, 30, 190, 151,
+        71, 108, 212, 66, 29, 247, 208, 52, 170, 25, 14, 230, 19, 106, 163, 204, 126, 65, 95, 15,
+        47, 84, 213, 55, 31, 17, 192, 113, 18, 240, 92, 15, 209, 86, 96, 246, 215, 197, 0, 30, 87,
+        65, 149, 108, 202, 31, 179, 33, 57, 244, 196, 132, 158, 159, 71, 194, 25, 24, 8, 240, 225,
+        63, 245, 125, 144, 153, 212, 69, 117, 147, 223, 254, 59, 128, 179, 190, 201, 254, 82, 35,
+        194, 206, 146, 252, 46, 239, 130, 45, 130, 80, 56, 87, 29, 224, 49,
+    ];
+
+    #[cfg(all(feature = "mongodb", feature = "couchbase", feature = "elasticsearch"))]
+    #[tokio::test]
+    async fn mv02c_connector_settings_refused_at_create_and_update() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02c-settings");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+
+        for (kind, body) in [
+            (
+                "mongodb",
+                json!({"name": "mv02c-set-mongo", "server": "127.0.0.1:9",
+                       "database": "db"}),
+            ),
+            (
+                "couchbase",
+                json!({"name": "mv02c-set-cb", "server": "127.0.0.1:9",
+                       "username": "u", "password": "p"}),
+            ),
+            (
+                "elasticsearch",
+                json!({"name": "mv02c-set-es", "server": "127.0.0.1:9"}),
+            ),
+        ] {
+            for (field, value) in [
+                ("pool_size", json!(8)),
+                ("pipelining", json!(true)),
+                ("enable_pipelining", json!(true)),
+                ("max_inactive", json!(8)),
+                ("ssl", json!(true)),
+            ] {
+                let mut refused = body.clone();
+                refused["type"] = json!(kind);
+                refused[field] = value;
+                let (status, error) = server
+                    .post_auth("/api/v5/connectors", refused, &token)
+                    .await;
+                assert_eq!(status, 400, "{kind} {field} refuses: {error}");
+                assert!(
+                    error["message"].as_str().unwrap_or("").contains(field),
+                    "{kind} {field}: {error}"
+                );
+            }
+            let mut valid = body;
+            valid["type"] = json!(kind);
+            let (status, created) = server.post_auth("/api/v5/connectors", valid, &token).await;
+            assert_eq!(status, 201, "{kind} valid create: {created}");
+            let name = created["name"].as_str().expect("created name").to_string();
+            for (field, value) in [
+                ("pool_size", json!(8)),
+                ("pipelining", json!(true)),
+                ("enable_pipelining", json!(true)),
+                ("max_inactive", json!(8)),
+                ("ssl", json!(true)),
+            ] {
+                let mut update = created.clone();
+                update[field] = value;
+                let (status, error) = server
+                    .put_auth(&format!("/api/v5/connectors/{name}"), update, &token)
+                    .await;
+                assert_eq!(status, 400, "{kind} {field} update refuses: {error}");
+                assert!(
+                    error["message"].as_str().unwrap_or("").contains(field),
+                    "{kind} {field}: {error}"
+                );
+            }
+        }
+
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(all(feature = "mongodb", feature = "couchbase", feature = "elasticsearch"))]
+    #[tokio::test]
+    async fn mv02c_connector_create_refuses_missing_fields_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02c-missing-fields");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+
+        // The shared create path names each missing field.
+        for (kind, body, field) in [
+            (
+                "mongodb",
+                json!({"name": "mv02c-miss-mongo", "server": "127.0.0.1:9"}),
+                "database",
+            ),
+            (
+                "couchbase",
+                json!({"name": "mv02c-miss-couch", "server": "127.0.0.1:9"}),
+                "username",
+            ),
+            ("elasticsearch", json!({"name": "mv02c-miss-es"}), "server"),
+        ] {
+            let mut body = body;
+            body["type"] = json!(kind);
+            let (status, error) = server.post_auth("/api/v5/connectors", body, &token).await;
+            assert_eq!(status, 400, "{kind} refuses without {field}: {error}");
+            assert_eq!(error["code"], json!("BAD_REQUEST"));
+            assert!(
+                error["message"].as_str().unwrap_or("").contains(field),
+                "{kind} names {field}: {error}"
+            );
+        }
+
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(all(feature = "mongodb", feature = "couchbase", feature = "elasticsearch"))]
+    #[tokio::test]
+    async fn mv02c_probe_success_and_required_fields_through_the_broker() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02c-probe");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+
+        // MongoDB success needs the HELLO answer, not only a TCP port.
+        let mongo_fake = Mv02cMongoFake::start().await;
+        let mongo_target = format!("127.0.0.1:{}", mongo_fake.port);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "mongodb", "server": mongo_target, "database": "db"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        // A bare listener fails the handshake instead of reading connected.
+        let bare = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bare probe listener");
+        let bare_target = format!("127.0.0.1:{}", bare.local_addr().expect("bare addr").port());
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "mongodb", "server": bare_target, "database": "db"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "mongodb needs a HELLO answer");
+        drop(bare);
+        // MongoDB without a database fails instead of reading connected.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "mongodb", "server": mongo_target}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("database"),
+            "{body}"
+        );
+
+        // Couchbase success needs the SASL PLAIN answer.
+        let cb_fake = Mv02cCouchFake::start().await;
+        let cb_target = format!("127.0.0.1:{}", cb_fake.port);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "couchbase", "server": cb_target, "username": "u",
+                       "password": "p"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        // The fake checks the PLAIN token: a wrong password fails.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "couchbase", "server": cb_target, "username": "u",
+                       "password": "wrong"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "couchbase rejects a wrong PLAIN token: {body}");
+        let bare = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bare probe listener");
+        let bare_target = format!("127.0.0.1:{}", bare.local_addr().expect("bare addr").port());
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "couchbase", "server": bare_target, "username": "u"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "couchbase needs a SASL answer");
+        drop(bare);
+        // Couchbase without a username fails instead of reading connected.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "couchbase", "server": cb_target}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("username"),
+            "{body}"
+        );
+
+        // Elasticsearch success through the HTTP handshake.
+        let fake = Mv02bFake::start(200, "{}").await;
+        let endpoint = format!("http://127.0.0.1:{}", fake.port);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "elasticsearch", "server": endpoint}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        // A document kind without a target fails instead of reading connected.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "elasticsearch"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("server"),
+            "{body}"
+        );
+
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    #[tokio::test]
+    async fn mv02c_probe_https_success_uses_tls() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        use base64::Engine as _;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use std::io::{Read as _, Write as _};
+
+        // The probe builds its own client, so trust the loopback
+        // certificate through the process root file the TLS backend
+        // reads. Restore the old value when the test ends.
+        let dir = unique_data_dir("mv02c-probe-tls");
+        std::fs::create_dir_all(&dir).expect("create tls dir");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(MV02C_PROBE_CERT_DER);
+        let mut certificate = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            certificate.push_str(std::str::from_utf8(chunk).expect("base64 text"));
+            certificate.push('\n');
+        }
+        certificate.push_str("-----END CERTIFICATE-----\n");
+        let mut bundle =
+            std::fs::read_to_string("/etc/ssl/certs/ca-certificates.crt").unwrap_or_default();
+        bundle.push_str(&certificate);
+        let root_file = dir.join("probe-ca.pem");
+        std::fs::write(&root_file, bundle).expect("write probe root file");
+        let previous_root = std::env::var_os("SSL_CERT_FILE");
+        std::env::set_var("SSL_CERT_FILE", &root_file);
+        struct RestoreRoot(Option<std::ffi::OsString>);
+        impl Drop for RestoreRoot {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("SSL_CERT_FILE", value),
+                    None => std::env::remove_var("SSL_CERT_FILE"),
+                }
+            }
+        }
+        let _restore_root = RestoreRoot(previous_root);
+
+        let certs = vec![CertificateDer::from(MV02C_PROBE_CERT_DER.to_vec())];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(MV02C_PROBE_KEY_DER.to_vec()));
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("tls protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("tls server config");
+        let tls_config = std::sync::Arc::new(config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tls listener");
+        let port = listener.local_addr().expect("tls addr").port();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let tls_server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let config = std::sync::Arc::clone(&tls_config);
+                let done_tx = done_tx.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = stream.into_std() else {
+                        return;
+                    };
+                    let handled = tokio::task::spawn_blocking(move || -> Option<()> {
+                        // A blocking socket makes the TLS handler wait
+                        // for the client hello. A nonblocking read can
+                        // fail with WouldBlock before the hello lands.
+                        let _ = stream.set_nonblocking(false);
+                        let conn = rustls::ServerConnection::new(config).ok()?;
+                        let mut tls = rustls::StreamOwned::new(conn, stream);
+                        let mut head = [0u8; 4096];
+                        // The probe dials once for reachability, then
+                        // opens the TLS connection. A zero-byte read is
+                        // the first dial and needs no answer.
+                        let read = tls.read(&mut head).ok()?;
+                        if read == 0 {
+                            return None;
+                        }
+                        tls.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .ok()?;
+                        tls.flush().ok()?;
+                        Some(())
+                    })
+                    .await;
+                    if matches!(handled, Ok(Some(()))) {
+                        let _ = done_tx.try_send(());
+                    }
+                });
+            }
+        });
+
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("https://127.0.0.1:{port}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors_probe",
+                json!({"type": "elasticsearch", "server": endpoint}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204, "https probe through the API: {body}");
+        tokio::time::timeout(std::time::Duration::from_secs(10), done_rx.recv())
+            .await
+            .expect("tls server task timed out")
+            .expect("tls response sent");
+        tls_server.abort();
+        let _ = tls_server.await;
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    #[tokio::test]
+    async fn mv02c_probe_client_trusts_the_process_root_file() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        use base64::Engine as _;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use std::io::{Read as _, Write as _};
+
+        // The root file holds only the loopback certificate. A client
+        // that reads it must trust the server, and it must not fall back
+        // to the built-in roots.
+        let dir = unique_data_dir("mv02c-probe-client-tls");
+        std::fs::create_dir_all(&dir).expect("create tls dir");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(MV02C_PROBE_CERT_DER);
+        let mut certificate = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            certificate.push_str(std::str::from_utf8(chunk).expect("base64 text"));
+            certificate.push('\n');
+        }
+        certificate.push_str("-----END CERTIFICATE-----\n");
+        let root_file = dir.join("probe-only-ca.pem");
+        std::fs::write(&root_file, certificate).expect("write probe root file");
+        let previous_root = std::env::var_os("SSL_CERT_FILE");
+        std::env::set_var("SSL_CERT_FILE", &root_file);
+        struct RestoreRoot(Option<std::ffi::OsString>);
+        impl Drop for RestoreRoot {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("SSL_CERT_FILE", value),
+                    None => std::env::remove_var("SSL_CERT_FILE"),
+                }
+            }
+        }
+        let _restore_root = RestoreRoot(previous_root);
+
+        let certs = vec![CertificateDer::from(MV02C_PROBE_CERT_DER.to_vec())];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(MV02C_PROBE_KEY_DER.to_vec()));
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("tls protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("tls server config");
+        let tls_config = std::sync::Arc::new(config);
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind blocking tls listener");
+        let port = listener.local_addr().expect("tls addr").port();
+        let tls_server = tokio::task::spawn_blocking(move || -> bool {
+            let Ok((stream, _)) = listener.accept() else {
+                return false;
+            };
+            let Ok(conn) = rustls::ServerConnection::new(tls_config) else {
+                return false;
+            };
+            let mut tls = rustls::StreamOwned::new(conn, stream);
+            let mut head = [0u8; 4096];
+            if tls.read(&mut head).unwrap_or(0) == 0 {
+                return false;
+            }
+            if tls
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .is_err()
+            {
+                return false;
+            }
+            tls.flush().is_ok()
+        });
+
+        let client = crate::v5::rules::probe_http_client();
+        let target = format!("127.0.0.1:{port}");
+        let result = crate::v5::rules::probe_http_root_with(&client, &target, true).await;
+        assert!(
+            result.is_ok(),
+            "the probe client trusts SSL_CERT_FILE: {result:?}"
+        );
+        assert!(
+            tls_server.await.expect("tls server task"),
+            "the tls server answered"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6622,7 +8658,7 @@ connector_id = "pending-good"
         ) -> (String, String) {
             let salt = BASE64.decode(salt_b64).expect("challenge salt");
             let salted = salted_password(password, &salt, iterations);
-            let client_key = hmac(&salted, b"Client Key");
+            let client_key = hmac(&salted, b"Client Key".as_slice());
             let stored_key: [u8; 32] = Sha256::digest(client_key).into();
             let client_sig = hmac(&stored_key, auth_message.as_bytes());
             let mut proof = [0u8; 32];
@@ -15938,7 +17974,6 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         for (name, kind) in [
             ("cf05-kafka-pending", "kafka"),
             ("cf05-mysql-pending", "mysql"),
-            ("cf05-mongo-pending", "mongodb"),
         ] {
             let (status, body) = server
                 .post_auth(

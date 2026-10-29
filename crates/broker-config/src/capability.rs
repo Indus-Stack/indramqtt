@@ -261,7 +261,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["couch", "cb"],
         family: "document-store",
         owner: "MV-02c",
-        state: KindState::Pending("MV-02c"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -351,7 +351,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["elastic", "es", "opensearch"],
         family: "document-store",
         owner: "MV-02c",
-        state: KindState::Pending("MV-02c"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -491,7 +491,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["mongo", "documentdb"],
         family: "document-store",
         owner: "MV-02c",
-        state: KindState::Pending("MV-02c"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -868,7 +868,7 @@ static TEST_KINDS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Family tickets whose kinds the plan accepts as `ready` at the close of
 /// KC-00. Add a ticket only after its family contract is accepted. The
 /// readiness test derives the expected state from this list.
-pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &["MV-01", "KC-00/D9", "MV-02b"];
+pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &["MV-01", "KC-00/D9", "MV-02b", "MV-02c"];
 
 /// Enable the test-only `test` kind for this process. Test builds call
 /// this; a release build does not.
@@ -1196,6 +1196,13 @@ mod tests {
         assert!(is_kind_ready("influxdb"));
         assert!(is_kind_ready("timestream"));
         assert!(is_kind_ready("cassandra"));
+        assert!(is_kind_ready("mongodb"));
+        assert!(is_kind_ready("couchbase"));
+        assert!(is_kind_ready("elasticsearch"));
+        assert!(is_kind_ready("opensearch"));
+        assert_eq!(kind_row("mongodb").map(|row| row.owner), Some("MV-02c"));
+        assert_eq!(kind_row("couchbase").map(|row| row.owner), Some("MV-02c"));
+        assert_eq!(kind_row("opensearch").map(|row| row.owner), Some("MV-02c"));
         assert!(!is_kind_ready("http"));
         assert!(!is_kind_ready("kafka"));
         assert!(!is_kind_ready("mysql"));

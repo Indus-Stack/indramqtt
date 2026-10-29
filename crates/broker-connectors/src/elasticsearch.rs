@@ -23,8 +23,9 @@
 //! Elasticsearch auto-generates one.
 //!
 //! HTTP 429/503 responses retry in place with exponential backoff
-//! (preserving the in-flight rows); other failures restore the buffer,
-//! engage backoff, and propagate the error.
+//! (preserving the in-flight rows); other failures restore the buffer
+//! and engage backoff. A transport failure drops the batch and clears
+//! the backoff, so the next event dials the target again.
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -91,6 +92,25 @@ fn default_max_retries() -> usize {
     5
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Bulk write operation of one Elasticsearch action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ElasticsearchOperation {
+    /// Insert or overwrite a document (the connector default).
+    #[default]
+    Index,
+    /// Insert a document and fail when the id exists.
+    Create,
+    /// Update an existing document.
+    Update,
+    /// Delete a document.
+    Delete,
+}
+
 /// Elasticsearch sink configuration. Every depth is user-configurable
 /// with no clamped ceiling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +122,25 @@ pub struct ElasticsearchSinkConfig {
     /// Optional document id template; omitted ids auto-generate.
     #[serde(default)]
     pub doc_id_template: Option<String>,
+    /// Write operation (default index).
+    #[serde(default)]
+    pub operation: ElasticsearchOperation,
+    /// Optional document template. The rendered JSON object is the
+    /// document source; without it the sink writes the event envelope.
+    #[serde(default)]
+    pub doc_template: Option<String>,
+    /// Create action: overwrite an existing id (default true).
+    #[serde(default = "default_true")]
+    pub overwrite: bool,
+    /// Update action: insert when the id is absent (default false).
+    #[serde(default)]
+    pub doc_as_upsert: bool,
+    /// Require the index to be an alias (default false).
+    #[serde(default)]
+    pub require_alias: bool,
+    /// Optional custom routing value.
+    #[serde(default)]
+    pub routing: Option<String>,
     /// Authentication (default none).
     #[serde(default)]
     pub auth: ElasticsearchAuth,
@@ -136,10 +175,28 @@ impl ElasticsearchSinkConfig {
                 "elasticsearch index_template must not be empty".to_string(),
             ));
         }
-        // Strict template checks with dummy values.
-        self.resolve_index("dummy", 0)?;
+        // Strict template checks with dummy values. A payload-indexed
+        // template is checked at flush time, when its fields exist.
+        if !self.index_template.contains("${payload.") {
+            self.resolve_index("dummy", 0)?;
+        }
         if let Some(template) = &self.doc_id_template {
-            self.resolve_doc_id(template, "dummy", b"{}", 0)?;
+            if !template.contains("${payload.") && !template.contains("${field:") {
+                self.resolve_doc_id(template, "dummy", b"{}", 0)?;
+            }
+        }
+        if let Some(template) = &self.doc_template {
+            if template.trim().is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "elasticsearch doc_template must not be empty".to_string(),
+                ));
+            }
+            // A template that reads payload fields is checked at flush
+            // time, when its fields exist. The sample below carries
+            // fields for the rest.
+            if !template.contains("${payload.") && !template.contains("${.") {
+                self.render_doc(template, "dummy", br#"{"id":"dummy-id","v":1}"#, 0, 0)?;
+            }
         }
         self.auth.header_value().map(|_| ())?;
         if self.batch_size == 0 {
@@ -156,15 +213,38 @@ impl ElasticsearchSinkConfig {
     /// `logs-${YYYY}.${MM}.${DD}` and the `logs-${YYYY.MM.dd}`
     /// shorthand resolve (likewise `-` and `/` separators).
     pub fn resolve_index(&self, topic: &str, millis: i64) -> Result<String> {
+        self.resolve_index_with_payload(topic, b"{}", millis)
+    }
+
+    /// Resolve the index with payload field variables for one event.
+    fn resolve_index_with_payload(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        millis: i64,
+    ) -> Result<String> {
         let (year, month, day) = ymd_from_millis(millis);
-        let vars = [
-            ("topic", topic.to_string()),
-            ("YYYY", format!("{year:04}")),
-            ("MM", format!("{month:02}")),
-            ("DD", format!("{day:02}")),
+        let doc: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
+        let mut vars: Vec<(String, String)> = vec![
+            ("topic".to_string(), topic.to_string()),
+            ("YYYY".to_string(), format!("{year:04}")),
+            ("MM".to_string(), format!("{month:02}")),
+            ("DD".to_string(), format!("{day:02}")),
         ];
+        for (name, value) in doc.as_object().into_iter().flatten() {
+            let text = match value {
+                serde_json::Value::String(text) => text.clone(),
+                scalar if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
+                _ => continue,
+            };
+            vars.push((format!("payload.{name}"), text));
+        }
+        let borrowed: Vec<(&str, String)> = vars
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.clone()))
+            .collect();
         let expanded = expand_date_shorthands(&self.index_template);
-        let raw = render_template(&expanded, &vars)?;
+        let raw = render_template(&expanded, &borrowed)?;
         let sanitized: String = raw
             .chars()
             .map(|c| {
@@ -226,6 +306,19 @@ impl ElasticsearchSinkConfig {
         if template.contains("${device_id}") {
             extra.push(("device_id".to_string(), field("device_id")));
         }
+        // `${payload.<name>}` extracts one payload field, as the
+        // reference action examples do.
+        let mut rest = template;
+        while let Some(start) = rest.find("${payload.") {
+            let after = &rest[start + "${payload.".len()..];
+            if let Some(close) = after.find('}') {
+                let name = &after[..close];
+                extra.push((format!("payload.{name}"), field(name)));
+                rest = &after[close + 1..];
+            } else {
+                break;
+            }
+        }
         let mut vars = vec![
             ("timestamp", millis.to_string()),
             ("seq", seq.to_string()),
@@ -245,6 +338,105 @@ impl ElasticsearchSinkConfig {
             ));
         }
         Ok(id)
+    }
+
+    /// Render one document source from an action template. The result
+    /// must be a JSON object; anything else is a failed forward. The
+    /// reference `${.field}` syntax reads as `${field}`; every payload
+    /// field is visible both as `${payload.<field>}` and as `${field}`.
+    fn render_doc(
+        &self,
+        template: &str,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        millis: i64,
+    ) -> Result<serde_json::Value> {
+        let normalized = template.replace("${.}", "${payload}").replace("${.", "${");
+        let template = normalized.as_str();
+        let doc: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
+        let mut vars: Vec<(String, String)> = vec![
+            ("topic".to_string(), topic.to_string()),
+            ("qos".to_string(), qos.to_string()),
+            ("timestamp".to_string(), millis.to_string()),
+            (
+                "payload".to_string(),
+                String::from_utf8_lossy(payload).into_owned(),
+            ),
+        ];
+        for (name, value) in doc.as_object().into_iter().flatten() {
+            let text = match value {
+                serde_json::Value::String(text) => text.clone(),
+                scalar if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
+                _ => continue,
+            };
+            vars.push((format!("payload.{name}"), text.clone()));
+            if !vars.iter().any(|(key, _)| key == name) {
+                vars.push((name.clone(), text));
+            }
+        }
+        let borrowed: Vec<(&str, String)> = vars
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.clone()))
+            .collect();
+        let rendered = render_template(template, &borrowed)?;
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).map_err(|e| {
+            ConnectorError::Dispatch(format!(
+                "elasticsearch doc_template must render a JSON document: {e}"
+            ))
+        })?;
+        if !parsed.is_object() {
+            return Err(ConnectorError::Dispatch(
+                "elasticsearch doc_template must render a JSON object".to_string(),
+            ));
+        }
+        Ok(parsed)
+    }
+
+    /// Render one routing value from its template. A failure is
+    /// permanent for the row; the caller counts it as rejected.
+    pub fn resolve_routing(
+        &self,
+        template: &str,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        millis: i64,
+    ) -> Result<String> {
+        let normalized = template.replace("${.}", "${payload}").replace("${.", "${");
+        let template = normalized.as_str();
+        let doc: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
+        let mut vars: Vec<(String, String)> = vec![
+            ("topic".to_string(), topic.to_string()),
+            ("qos".to_string(), qos.to_string()),
+            ("timestamp".to_string(), millis.to_string()),
+            (
+                "payload".to_string(),
+                String::from_utf8_lossy(payload).into_owned(),
+            ),
+        ];
+        for (name, value) in doc.as_object().into_iter().flatten() {
+            let text = match value {
+                serde_json::Value::String(text) => text.clone(),
+                scalar if scalar.is_number() || scalar.is_boolean() => scalar.to_string(),
+                _ => continue,
+            };
+            vars.push((format!("payload.{name}"), text.clone()));
+            if !vars.iter().any(|(key, _)| key == name) {
+                vars.push((name.clone(), text));
+            }
+        }
+        let borrowed: Vec<(&str, String)> = vars
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.clone()))
+            .collect();
+        let routing = render_template(template, &borrowed)?;
+        if routing.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "elasticsearch routing resolved empty".to_string(),
+            ));
+        }
+        Ok(routing)
     }
 }
 
@@ -586,15 +778,50 @@ impl ElasticsearchSink {
     /// row (caller counts it as rejected and never retries it).
     fn render_row(&self, row: &EsRow, index: &str, now: i64) -> Result<Vec<u8>> {
         let mut body = Vec::new();
-        let action = match &self.config.doc_id_template {
+        let id = match &self.config.doc_id_template {
             Some(template) => {
-                let id = self
-                    .config
-                    .resolve_doc_id(template, &row.topic, &row.payload, row.seq)?;
-                serde_json::json!({"index": {"_index": index, "_id": id}})
+                Some(
+                    self.config
+                        .resolve_doc_id(template, &row.topic, &row.payload, row.seq)?,
+                )
             }
-            None => serde_json::json!({"index": {"_index": index}}),
+            None => None,
         };
+        let operation = match self.config.operation {
+            ElasticsearchOperation::Index if self.config.overwrite => "index",
+            ElasticsearchOperation::Index | ElasticsearchOperation::Create => "create",
+            ElasticsearchOperation::Update => "update",
+            ElasticsearchOperation::Delete => "delete",
+        };
+        if matches!(
+            self.config.operation,
+            ElasticsearchOperation::Update | ElasticsearchOperation::Delete
+        ) && id.is_none()
+        {
+            return Err(ConnectorError::Dispatch(
+                "elasticsearch update/delete needs an id template".to_string(),
+            ));
+        }
+        let mut meta = serde_json::Map::new();
+        meta.insert("_index".to_string(), serde_json::json!(index));
+        if let Some(id) = &id {
+            meta.insert("_id".to_string(), serde_json::json!(id));
+        }
+        if let Some(template) = &self.config.routing {
+            let routing =
+                self.config
+                    .resolve_routing(template, &row.topic, &row.payload, row.qos, now)?;
+            meta.insert("routing".to_string(), serde_json::json!(routing));
+        }
+        if self.config.require_alias {
+            meta.insert("require_alias".to_string(), serde_json::json!(true));
+        }
+        if self.config.operation == ElasticsearchOperation::Update && self.config.doc_as_upsert {
+            meta.insert("doc_as_upsert".to_string(), serde_json::json!(true));
+        }
+        let mut action_object = serde_json::Map::new();
+        action_object.insert(operation.to_string(), serde_json::Value::Object(meta));
+        let action = serde_json::Value::Object(action_object);
         body.extend_from_slice(
             serde_json::to_vec(&action)
                 .map_err(|e| {
@@ -603,18 +830,36 @@ impl ElasticsearchSink {
                 .as_slice(),
         );
         body.push(b'\n');
-        let payload: serde_json::Value =
-            serde_json::from_slice(&row.payload).unwrap_or_else(|_| {
-                serde_json::Value::String(String::from_utf8_lossy(&row.payload).into_owned())
-            });
-        let doc = serde_json::json!({
-            "topic": row.topic,
-            "qos": row.qos,
-            "payload": payload,
-            "timestamp": rfc3339_millis(now),
-        });
+        if self.config.operation == ElasticsearchOperation::Delete {
+            return Ok(body);
+        }
+        let doc = match &self.config.doc_template {
+            Some(template) => {
+                self.config
+                    .render_doc(template, &row.topic, &row.payload, row.qos, now)?
+            }
+            None => {
+                let payload: serde_json::Value = serde_json::from_slice(&row.payload)
+                    .unwrap_or_else(|_| {
+                        serde_json::Value::String(
+                            String::from_utf8_lossy(&row.payload).into_owned(),
+                        )
+                    });
+                serde_json::json!({
+                    "topic": row.topic,
+                    "qos": row.qos,
+                    "payload": payload,
+                    "timestamp": rfc3339_millis(now),
+                })
+            }
+        };
+        let source = if self.config.operation == ElasticsearchOperation::Update {
+            serde_json::json!({ "doc": doc })
+        } else {
+            doc
+        };
         body.extend_from_slice(
-            serde_json::to_vec(&doc)
+            serde_json::to_vec(&source)
                 .map_err(|e| {
                     ConnectorError::Dispatch(format!("elasticsearch doc encode failed: {e}"))
                 })?
@@ -710,9 +955,9 @@ fn count_bulk_item_outcome(items: &[serde_json::Value]) -> (u64, u64) {
 
 impl ElasticsearchSink {
     /// Account for a 2xx `_bulk` response body. Empty bodies count the
-    /// whole batch as inserted (legacy scripted transports); otherwise
-    /// the body must be valid JSON with an `items` array whenever it
-    /// reports `"errors": true`.
+    /// whole batch as inserted for legacy scripted transports. A body
+    /// with data must carry the per-row `items` array that a real
+    /// `_bulk` answer returns; each item decides its row result.
     fn account_bulk_body(&self, response_body: &[u8], record_count: u64) -> Result<()> {
         if response_body.iter().all(u8::is_ascii_whitespace) {
             self.inserted_docs
@@ -724,22 +969,12 @@ impl ElasticsearchSink {
                 "elasticsearch bulk response was not valid JSON: {e}"
             ))
         })?;
-        let errors = parsed
-            .get("errors")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         let items = parsed.get("items").and_then(serde_json::Value::as_array);
-        match (errors, items) {
-            (true, None) => Err(ConnectorError::Dispatch(
-                "elasticsearch bulk response reported errors but contained no `items` array"
-                    .to_string(),
+        match items {
+            None => Err(ConnectorError::Dispatch(
+                "elasticsearch bulk response contained no `items` array".to_string(),
             )),
-            (false, None) => {
-                self.inserted_docs
-                    .fetch_add(record_count, Ordering::Relaxed);
-                Ok(())
-            }
-            (_, Some(items)) => {
+            Some(items) => {
                 let (inserted, rejected) = count_bulk_item_outcome(items);
                 self.inserted_docs.fetch_add(inserted, Ordering::Relaxed);
                 self.rejected_docs.fetch_add(rejected, Ordering::Relaxed);
@@ -772,7 +1007,8 @@ impl ElasticsearchSink {
     /// backing off, fails fast without touching the transport. 429/503
     /// retries in place up to `max_retries` with exponential backoff
     /// (2s, 4s, ... capped by [`BackoffState`]); terminal failures
-    /// restore the buffer, engage backoff, and propagate.
+    /// restore the buffer and engage backoff. A transport failure drops
+    /// the batch and clears the backoff, so the next event dials again.
     ///
     /// 2xx responses are additionally inspected per item: documents
     /// Elasticsearch rejected inside an otherwise successful `_bulk`
@@ -793,7 +1029,10 @@ impl ElasticsearchSink {
         let mut rejected: u64 = 0;
         let mut first_reason: Option<String> = None;
         for (position, row) in rows.into_iter().enumerate() {
-            let index = match self.config.resolve_index(&row.topic, now) {
+            let index = match self
+                .config
+                .resolve_index_with_payload(&row.topic, &row.payload, now)
+            {
                 Ok(index) => index,
                 Err(e) => {
                     let reason = e.to_string();
@@ -910,8 +1149,9 @@ impl ElasticsearchSink {
                     )));
                 }
                 Err(e) => {
-                    self.buffer.lock().restore(sendable, oldest);
-                    self.backoff.lock().failure();
+                    // The batch did not reach the target. Drop it and
+                    // clear the backoff so the next event dials again.
+                    self.backoff.lock().success();
                     return Err(e);
                 }
             }
@@ -987,6 +1227,12 @@ mod tests {
             endpoint: "http://127.0.0.1:9200".to_string(),
             index_template: "iot-telemetry-${YYYY.MM.dd}".to_string(),
             doc_id_template: None,
+            operation: ElasticsearchOperation::Index,
+            doc_template: None,
+            overwrite: true,
+            doc_as_upsert: false,
+            require_alias: false,
+            routing: None,
             auth: ElasticsearchAuth::None,
             batch_size: 500,
             batch_timeout_ms: 100,
@@ -1137,6 +1383,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_doc_template_and_routing_render_payload_fields() {
+        let mut config = test_config();
+        config.batch_size = 10;
+        config.doc_template = Some(r#"{"topic":"${topic}","v":${payload.v}}"#.to_string());
+        config.routing = Some("route-${.v}".to_string());
+        let (sink, transport) = test_sink(config);
+
+        sink.send(
+            &Topic::new("sensors/t1").unwrap(),
+            &Bytes::from(r#"{"v":21}"#),
+            QoS::AtMostOnce,
+        )
+        .await
+        .unwrap();
+        sink.flush().await.unwrap();
+
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1);
+        let body = String::from_utf8(captured[0].body.clone()).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let action: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(action["index"]["routing"], "route-21");
+        let doc: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(doc["v"], 21);
+        assert_eq!(doc["topic"], "sensors/t1");
+    }
+
+    #[tokio::test]
     async fn test_retry_on_429_then_success() {
         let mut config = test_config();
         config.batch_size = 10;
@@ -1281,6 +1556,30 @@ mod tests {
             matches!(err, ConnectorError::Dispatch(_)),
             "expected Dispatch, got: {err:?}"
         );
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_body_without_items_is_not_counted_as_success() {
+        let mut config = test_config();
+        config.batch_size = 10;
+        let (sink, transport) = test_sink(config);
+        transport.script_responses(vec![(200, br#"{"took":5,"errors":false}"#.to_vec())]);
+
+        let topic = Topic::new("sensors/a").unwrap();
+        sink.send(&topic, &Bytes::from(r#"{"v":1}"#), QoS::AtMostOnce)
+            .await
+            .unwrap();
+        let err = sink
+            .flush()
+            .await
+            .expect_err("a body without items must err");
+        assert!(
+            matches!(err, ConnectorError::Dispatch(_)),
+            "expected Dispatch, got: {err:?}"
+        );
+        assert_eq!(sink.inserted_docs(), 0);
+        assert_eq!(sink.rejected_docs(), 0);
         assert_eq!(sink.buffered_rows(), 0);
     }
 
@@ -1558,6 +1857,12 @@ mod tests {
             endpoint: endpoint.clone(),
             index_template: index.clone(),
             doc_id_template: None,
+            operation: ElasticsearchOperation::Index,
+            doc_template: None,
+            overwrite: true,
+            doc_as_upsert: false,
+            require_alias: false,
+            routing: None,
             auth,
             batch_size: 500,
             batch_timeout_ms: 50,

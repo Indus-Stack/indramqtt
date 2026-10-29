@@ -98,6 +98,8 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | [PostgreSQL](./postgres.md) | Relational rows. |
 | [MySQL](./mysql.md) | Relational rows. |
 | [MongoDB](./mongodb.md) | Documents. |
+| [Couchbase](./couchbase.md) | Document statements. |
+| [Elasticsearch](./elasticsearch.md) | Search documents. |
 | [Redis](./redis.md) | Streams and keys. |
 | [InfluxDB](./influxdb.md) | Metrics. |
 | [ClickHouse](./clickhouse.md) | Analytics rows. |
@@ -144,7 +146,7 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {key}"})
 with urllib.request.urlopen(req, timeout=5) as res:
     names = set(json.load(res))
-assert names == {"pgsql", "opents", "tdengine", "datalayers", "clickhouse", "greptimedb", "aws_timestream", "cassandra", "iotdb", "doris", "influxdb"}, names
+assert names == {"pgsql", "opents", "tdengine", "datalayers", "clickhouse", "greptimedb", "aws_timestream", "cassandra", "iotdb", "doris", "influxdb", "mongodb", "couchbase", "elasticsearch"}, names
 for pending in ("http", "mqtt", "kafka_producer", "redis", "mysql"):
     assert pending not in names, pending
 print("ok")

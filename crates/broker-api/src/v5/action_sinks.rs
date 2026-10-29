@@ -405,6 +405,9 @@ pub(crate) fn canonical_action_kind(kind: &str) -> &str {
         "scylla" | "scylladb" | "cql" => "cassandra",
         "greptime" => "greptimedb",
         "ch" => "clickhouse",
+        "mongo" | "documentdb" => "mongodb",
+        "couch" | "cb" => "couchbase",
+        "elastic" | "es" | "opensearch" => "elasticsearch",
         _ => kind,
     }
 }
@@ -430,6 +433,9 @@ pub(crate) fn action_owned_kind(kind: &str) -> bool {
             | "influxdb"
             | "timestream"
             | "cassandra"
+            | "mongodb"
+            | "couchbase"
+            | "elasticsearch"
     )
 }
 
@@ -1084,6 +1090,9 @@ pub(crate) fn build_action_sink(
         "datalayers" => build_datalayers_sink(record, connector_doc).map(Some),
         "timestream" => build_timestream_sink(record, connector_doc).map(Some),
         "cassandra" => build_cassandra_sink(record, connector_doc).map(Some),
+        "mongodb" => build_mongodb_sink(record, connector_doc).map(Some),
+        "couchbase" => build_couchbase_sink(record, connector_doc).map(Some),
+        "elasticsearch" => build_elasticsearch_sink(record, connector_doc).map(Some),
         // Other kinds own no runtime yet: no sink, no registration.
         // Delivery stays refused-by-default (the fire counts one
         // failure) until the kind plots its own data path (KC-00).
@@ -1318,6 +1327,40 @@ fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
                 }
             }
         }
+        "couchbase" => {
+            if param_string(record, "sql").is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: sql (field `parameters.sql`)",
+                    record.id
+                ));
+            }
+        }
+        "elasticsearch" => {
+            let action = param_string(record, "action").ok_or_else(|| {
+                format!(
+                    "action {:?} is missing required field: action (field `parameters.action`)",
+                    record.id
+                )
+            })?;
+            if !["create", "update", "delete"].contains(&action.as_str()) {
+                return Err(bad(
+                    "action",
+                    format!("must be one of create, update, delete: {action:?}"),
+                ));
+            }
+            if param_string(record, "index").is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: index (field `parameters.index`)",
+                    record.id
+                ));
+            }
+            if action != "create" && param_string(record, "id").is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: id (field `parameters.id`)",
+                    record.id
+                ));
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -1510,6 +1553,39 @@ fn connector_field(
         })
 }
 
+/// Read one required document-store connector field through its
+/// accepted key aliases, top-level or inside the reference
+/// `parameters` object.
+#[cfg(any(feature = "mongodb", feature = "couchbase", feature = "elasticsearch"))]
+fn document_connector_field(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    action_id: &str,
+    keys: &[&str],
+    field: &str,
+) -> Result<String, String> {
+    first_string_nested(connector_doc, keys)
+        .map(|value| value.into_owned())
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: {field} (action {action_id:?})"
+            )
+        })
+}
+
+/// Read one string from the connector document, then from its
+/// reference-shaped `parameters` object.
+#[cfg(any(feature = "mongodb", feature = "couchbase", feature = "elasticsearch"))]
+fn first_string_nested<'a>(
+    doc: &'a serde_json::Value,
+    keys: &[&str],
+) -> Option<std::borrow::Cow<'a, str>> {
+    first_string(doc, keys).or_else(|| {
+        doc.get("parameters")
+            .and_then(|parameters| first_string(parameters, keys))
+    })
+}
+
 /// Normalize one HTTP(S) endpoint: a bare `host:port` reads as `http`.
 /// Reason: the reference documents bare `Host[:Port]` entries, while
 /// every driver below needs a URL scheme to dial.
@@ -1542,14 +1618,100 @@ pub(crate) fn iotdb_endpoint(raw: &str) -> String {
     }
 }
 
-/// Read the shared request-timeout knob (`timeout_ms`, `timeout`,
-/// `request_timeout_ms`) of one connector document.
+/// Read the shared request-timeout knob of one connector document.
+/// Reads `timeout_ms`, `timeout`, `request_timeout_ms` and the reference
+/// `connect_timeout` (milliseconds or a duration string such as `15s`),
+/// top-level or inside `parameters`. `None` keeps the driver default.
 fn connector_timeout_ms(connector_doc: &serde_json::Value) -> Option<u64> {
-    connector_doc
-        .get("timeout_ms")
-        .or_else(|| connector_doc.get("timeout"))
-        .or_else(|| connector_doc.get("request_timeout_ms"))
-        .and_then(|value| value.as_u64())
+    let params = connector_doc.get("parameters");
+    for key in ["timeout_ms", "timeout", "request_timeout_ms"] {
+        if let Some(value) = connector_doc
+            .get(key)
+            .or_else(|| params.and_then(|p| p.get(key)))
+            .and_then(|value| value.as_u64())
+        {
+            return Some(value);
+        }
+    }
+    if let Some(value) = connector_doc
+        .get("connect_timeout")
+        .or_else(|| params.and_then(|p| p.get("connect_timeout")))
+    {
+        if let Some(millis) = value.as_u64() {
+            return Some(millis);
+        }
+        if let Some(text) = value.as_str() {
+            if let Some(millis) = duration_str_to_ms(text) {
+                return Some(millis);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a duration string such as `15s`, `10s` or `100ms` to millis.
+/// `None` when the text is not a duration.
+fn duration_str_to_ms(text: &str) -> Option<u64> {
+    let text = text.trim().to_ascii_lowercase();
+    let split = text.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    let millis = match unit.trim() {
+        "ms" => number,
+        "s" => number * 1_000.0,
+        "m" => number * 60.0 * 1_000.0,
+        "h" => number * 3600.0 * 1_000.0,
+        _ => return None,
+    };
+    if millis > u64::MAX as f64 {
+        return None;
+    }
+    Some(millis as u64)
+}
+
+/// Refuse the pooled-connection and TLS fields of one document-store
+/// connector. The timeout knob above is the applied one. The official
+/// drivers own their pools and TLS, so an explicit pool, pipelining or
+/// `ssl` value fails closed with 400 instead of being ignored.
+pub(crate) fn validate_connector_io_bounds(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    context: &str,
+) -> Result<(), String> {
+    let refused = |field: &str, why: &str| {
+        format!("connector {connector:?} field `{field}` {why} ({context})")
+    };
+    let params = connector_doc.get("parameters");
+    for key in ["pool_size", "pipelining", "enable_pipelining"] {
+        let present = connector_doc
+            .get(key)
+            .or_else(|| params.and_then(|p| p.get(key)));
+        if let Some(value) = present {
+            if !value.is_null() {
+                return Err(refused(key, "is not supported; remove it"));
+            }
+        }
+    }
+    if let Some(value) = connector_doc
+        .get("max_inactive")
+        .or_else(|| params.and_then(|p| p.get("max_inactive")))
+    {
+        if !value.is_null() {
+            return Err(refused("max_inactive", "is not supported; remove it"));
+        }
+    }
+    if let Some(value) = connector_doc
+        .get("ssl")
+        .or_else(|| params.and_then(|p| p.get("ssl")))
+    {
+        if !value.is_null() {
+            return Err(refused("ssl", "is not supported; remove it"));
+        }
+    }
+    Ok(())
 }
 
 /// Read one target field from the merged view: the action parameter
@@ -2792,6 +2954,500 @@ pub(crate) fn build_cassandra_sink(
 ) -> Result<Arc<dyn broker_connectors::Sink>, String> {
     Err(format!(
         "action {:?} needs cargo feature `cassandra` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Build the action's `mongodb` sink: the connection and database come
+/// from the connector; the action owns the collection and optional
+/// document template.
+///
+/// Values and defaults:
+/// - `server` (alias `servers` for a replica set or sharded cluster)
+///   and `database`: connector fields, required.
+/// - `username`/`password`: connector fields; a half pair refuses.
+/// - `collection`: the action parameter, else the connector field;
+///   default `mqtt`, the reference action default.
+/// - `payload_template`: renders one JSON document. A result that is
+///   not a JSON object is a failed forward. Without it the sink writes
+///   the event envelope.
+/// - Batching belongs to the action runtime; the inner sink keeps one
+///   row per send with a short linger.
+#[cfg(feature = "mongodb")]
+pub(crate) fn mongodb_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors_enterprise::MongoDbSinkConfig, String> {
+    use broker_connectors_enterprise::{MongoDbSinkConfig, MongoOperation};
+    let connector = record.connector.trim().to_string();
+    validate_connector_io_bounds(
+        connector_doc,
+        &connector,
+        &format!("action {:?}", record.id),
+    )?;
+    let mongo_type = first_string_nested(connector_doc, &["mongo_type"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "single".to_string());
+    let raw_server = if matches!(mongo_type.as_str(), "rs" | "sharded") {
+        document_connector_field(
+            connector_doc,
+            &connector,
+            &record.id,
+            &["servers", "server", "connection_string"],
+            "servers",
+        )?
+    } else {
+        document_connector_field(
+            connector_doc,
+            &connector,
+            &record.id,
+            &["server", "servers", "connection_string"],
+            "server",
+        )?
+    };
+    let database = document_connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["database"],
+        "database",
+    )?;
+    let username =
+        first_string(connector_doc, &["username", "user"]).map(|value| value.into_owned());
+    let password = first_string(connector_doc, &["password"]).map(|value| value.into_owned());
+    let credentials = match (username, password) {
+        (Some(username), Some(password)) => Some((username, password)),
+        (None, None) => None,
+        _ => {
+            return Err(format!(
+                "connector {connector:?} fields `username` and `password` must be set together (action {:?})",
+                record.id
+            ));
+        }
+    };
+    let auth_source =
+        first_string_nested(connector_doc, &["auth_source"]).map(|value| value.into_owned());
+    let mut connection_string =
+        if raw_server.starts_with("mongodb://") || raw_server.starts_with("mongodb+srv://") {
+            raw_server
+        } else {
+            format!("mongodb://{raw_server}")
+        };
+    if let Some((username, password)) = &credentials {
+        let scheme = if connection_string.starts_with("mongodb+srv://") {
+            "mongodb+srv://"
+        } else {
+            "mongodb://"
+        };
+        if !connection_string[scheme.len()..].contains('@') {
+            connection_string = format!(
+                "{scheme}{username}:{password}@{}",
+                &connection_string[scheme.len()..]
+            );
+        }
+    }
+    if let Some(auth_source) = &auth_source {
+        let separator = if connection_string.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        connection_string.push(separator);
+        connection_string.push_str("authSource=");
+        connection_string.push_str(auth_source);
+    }
+    let collection = param_string(record, "collection")
+        .or_else(|| {
+            first_string_nested(connector_doc, &["collection", "collection_template"])
+                .map(|value| value.into_owned())
+        })
+        .unwrap_or_else(|| "mqtt".to_string());
+    let payload_template = param_string(record, "payload_template").or_else(|| {
+        first_string_nested(connector_doc, &["payload_template"]).map(|v| v.into_owned())
+    });
+    let config = MongoDbSinkConfig {
+        connection_string,
+        database,
+        collection_template: collection,
+        payload_template,
+        operation: MongoOperation::InsertOne,
+        // One row per send: the action runtime owns batching (RO-01).
+        // Source: MV-02c action runtime contract, single-row flush.
+        batch_size: Some(1),
+        // 4 MiB batch cap: the driver default batch byte limit.
+        // Source: `MongoDbSinkConfig::default_batch_bytes`.
+        batch_bytes: Some(4_194_304),
+        // Short linger: the runtime groups rows before send.
+        // Source: MV-02c action runtime contract, 10 ms flush window.
+        linger_ms: Some(10),
+        // 4 retries: the driver default retry count.
+        // Source: `MongoDbSinkConfig::default_max_retries`.
+        max_retries: Some(4),
+        // 100 ms first retry delay: the driver default backoff.
+        // Source: `MongoDbSinkConfig::default_initial_backoff_ms`.
+        initial_backoff_ms: Some(100),
+        // 3 s retry ceiling: the driver default backoff cap.
+        // Source: `MongoDbSinkConfig::default_max_backoff_ms`.
+        max_backoff_ms: Some(3_000),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    Ok(config)
+}
+
+/// Build the action's `mongodb` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+#[cfg(feature = "mongodb")]
+pub(crate) fn build_mongodb_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::{DriverMongoDbTransport, MongoDbSink};
+    let config = mongodb_sink_config(record, connector_doc)?;
+    let transport = DriverMongoDbTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its mongodb transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = MongoDbSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its mongodb sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+#[cfg(not(feature = "mongodb"))]
+pub(crate) fn build_mongodb_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `mongodb` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Build the action's `couchbase` sink: the connector supplies the
+/// server and credentials; the action supplies the SQL++ statement.
+///
+/// Values and defaults:
+/// - `server`: the connector's `server`, required.
+/// - `username`: the connector's `username`, required.
+/// - `password`: the connector's `password`; default empty.
+/// - `sql`: the action's SQL++ template, required. The statement names
+///   the keyspace, key and value, so no fixed bucket or collection is
+///   invented.
+/// - `max_retries`: the action parameter; default `3`, the reference
+///   action default.
+/// - Batching belongs to the action runtime; the query driver keeps one
+///   statement per send.
+#[cfg(feature = "couchbase")]
+pub(crate) fn couchbase_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors_enterprise::CouchbaseSinkConfig, String> {
+    use broker_connectors_enterprise::{CouchbaseAuth, CouchbaseOperation, CouchbaseSinkConfig};
+    let connector = record.connector.trim().to_string();
+    validate_connector_io_bounds(
+        connector_doc,
+        &connector,
+        &format!("action {:?}", record.id),
+    )?;
+    let raw_server = document_connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["server", "servers", "connection_string"],
+        "server",
+    )?;
+    let connection_string =
+        if raw_server.starts_with("couchbase://") || raw_server.starts_with("couchbases://") {
+            raw_server
+        } else {
+            format!("couchbase://{raw_server}")
+        };
+    let nested_auth = connector_doc.get("auth");
+    let username = first_string_nested(connector_doc, &["username", "user"])
+        .map(|value| value.into_owned())
+        .or_else(|| {
+            nested_auth
+                .and_then(|auth| auth.get("username"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: username (action {:?})",
+                record.id
+            )
+        })?;
+    let password = first_string_nested(connector_doc, &["password"])
+        .map(|value| value.into_owned())
+        .or_else(|| {
+            nested_auth
+                .and_then(|auth| auth.get("password"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let sql = merged_field(
+        record,
+        connector_doc,
+        "sql",
+        &["sql", "sql_template"],
+        "sql",
+    )?;
+    let max_retries = param_value(record, "max_retries")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(3);
+    let config = CouchbaseSinkConfig {
+        connection_string,
+        bucket: String::new(),
+        scope: None,
+        collection: None,
+        auth: CouchbaseAuth { username, password },
+        doc_id_template: String::new(),
+        sql_template: Some(sql),
+        operation: CouchbaseOperation::Upsert,
+        expiry_secs: None,
+        // One row per send: the action runtime owns batching (RO-01).
+        // Source: MV-02c action runtime contract, single-row flush.
+        batch_size: Some(1),
+        // 2 MiB batch cap: the driver default batch byte limit.
+        // Source: `CouchbaseSinkConfig::default_batch_bytes`.
+        batch_bytes: Some(2_097_152),
+        // Short linger: the runtime groups rows before send.
+        // Source: MV-02c action runtime contract, 10 ms flush window.
+        linger_ms: Some(10),
+        // Reference `max_retries` default is 3.
+        // Source: reference `action_couchbase.parameters`.
+        max_retries: Some(max_retries as usize),
+        // 100 ms first retry delay: the driver default backoff.
+        // Source: `CouchbaseSinkConfig::default_initial_backoff_ms`.
+        initial_backoff_ms: Some(100),
+        // 2 s retry ceiling: the driver default backoff cap.
+        // Source: `CouchbaseSinkConfig::default_max_backoff_ms`.
+        max_backoff_ms: Some(2_000),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    Ok(config)
+}
+
+/// Build the action's `couchbase` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+#[cfg(feature = "couchbase")]
+pub(crate) fn build_couchbase_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::{CouchbaseSink, DriverCouchbaseTransport};
+    let config = couchbase_sink_config(record, connector_doc)?;
+    let transport = DriverCouchbaseTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its couchbase transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = CouchbaseSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its couchbase sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+#[cfg(not(feature = "couchbase"))]
+pub(crate) fn build_couchbase_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `couchbase` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Build the action's `elasticsearch` sink: the server and authentication
+/// come from the connector; the action owns the operation, index, id and
+/// document.
+///
+/// Values and defaults:
+/// - `server`: the connector's `server` (aliases `endpoint`, `servers`,
+///   `url`); required, no invented default.
+/// - `username`/`password` or `authentication`: the connector credential;
+///   absent means no authorization header.
+/// - `action`: `create`, `update` or `delete`, required.
+/// - `index`: the action parameter, else the connector `index`; required.
+/// - `id`: the action parameter, else the connector `doc_id_template`;
+///   optional for create, required for update and delete.
+/// - `doc`: renders one JSON document; a result that is not a JSON object
+///   is a failed forward. Without it the sink writes the event envelope.
+/// - `overwrite` (default true), `doc_as_upsert` (default false),
+///   `require_alias` (default false) and `routing` from the action.
+/// - Batching belongs to the action runtime; the inner sink keeps one
+///   row per send with a short linger.
+#[cfg(feature = "elasticsearch")]
+pub(crate) fn elasticsearch_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors::elasticsearch::ElasticsearchSinkConfig, String> {
+    use broker_connectors::elasticsearch::{
+        ElasticsearchAuth, ElasticsearchOperation, ElasticsearchSinkConfig,
+    };
+    let connector = record.connector.trim().to_string();
+    validate_connector_io_bounds(
+        connector_doc,
+        &connector,
+        &format!("action {:?}", record.id),
+    )?;
+    let raw_server = document_connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["server", "endpoint", "servers", "url"],
+        "server",
+    )?;
+    let endpoint = http_endpoint(&raw_server);
+    let index = merged_field(
+        record,
+        connector_doc,
+        "index",
+        &["index", "index_template"],
+        "index",
+    )?;
+    let doc_id_template = param_string(record, "id").or_else(|| {
+        first_string_nested(connector_doc, &["id", "doc_id_template"]).map(|v| v.into_owned())
+    });
+    let action = param_string(record, "action").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: action (field `parameters.action`)",
+            record.id
+        )
+    })?;
+    let bool_param = |key: &str, default: bool| {
+        param_value(record, key)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(default)
+    };
+    // Reference `overwrite` default is true: true writes `index`
+    // (overwrite), false writes `create` (fail on conflict).
+    let overwrite = bool_param("overwrite", true);
+    let operation = match action.as_str() {
+        "create" if overwrite => ElasticsearchOperation::Index,
+        "create" => ElasticsearchOperation::Create,
+        "update" => ElasticsearchOperation::Update,
+        "delete" => ElasticsearchOperation::Delete,
+        other => {
+            return Err(format!(
+                "action {:?} field `parameters.action` must be one of create, update, delete: {other:?}",
+                record.id
+            ));
+        }
+    };
+    if matches!(
+        operation,
+        ElasticsearchOperation::Update | ElasticsearchOperation::Delete
+    ) && doc_id_template.is_none()
+    {
+        return Err(format!(
+            "action {:?} is missing required field: id (field `parameters.id`)",
+            record.id
+        ));
+    }
+    let username = first_string(connector_doc, &["username", "user"])
+        .map(|value| value.into_owned())
+        .or_else(|| {
+            connector_doc
+                .get("authentication")
+                .and_then(|auth| auth.get("username"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+    let password = first_string_nested(connector_doc, &["password"])
+        .map(|value| value.into_owned())
+        .or_else(|| {
+            connector_doc
+                .get("authentication")
+                .and_then(|auth| auth.get("password"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+    let auth = match (username, password) {
+        (Some(username), Some(password)) => ElasticsearchAuth::Basic { username, password },
+        (None, None) => ElasticsearchAuth::None,
+        _ => {
+            return Err(format!(
+                "connector {connector:?} fields `username` and `password` must be set together (action {:?})",
+                record.id
+            ));
+        }
+    };
+    let max_retries = param_value(record, "max_retries")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(2);
+    let config = ElasticsearchSinkConfig {
+        endpoint,
+        index_template: index,
+        doc_id_template,
+        operation,
+        doc_template: param_string(record, "doc"),
+        overwrite,
+        doc_as_upsert: bool_param("doc_as_upsert", false),
+        require_alias: bool_param("require_alias", false),
+        routing: param_string(record, "routing")
+            .or_else(|| first_string_nested(connector_doc, &["routing"]).map(|v| v.into_owned())),
+        auth,
+        // One row per send: the action runtime owns batching (RO-01).
+        // Source: MV-02c action runtime contract, single-row flush.
+        batch_size: 1,
+        // Short linger: the runtime groups rows before send.
+        // Source: MV-02c action runtime contract, 10 ms flush window.
+        batch_timeout_ms: 10,
+        // Reference `max_retries` default is 2.
+        // Source: reference `bridge_elasticsearch.action_create`.
+        max_retries: max_retries as usize,
+        request_timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    Ok(config)
+}
+
+/// Build the action's `elasticsearch` sink from its config. The config
+/// carries the applied defaults; the transport and sink add no new
+/// values.
+#[cfg(feature = "elasticsearch")]
+pub(crate) fn build_elasticsearch_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors::elasticsearch::{DriverElasticsearchTransport, ElasticsearchSink};
+    let config = elasticsearch_sink_config(record, connector_doc)?;
+    let transport = DriverElasticsearchTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its elasticsearch transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = ElasticsearchSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its elasticsearch sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+#[cfg(not(feature = "elasticsearch"))]
+pub(crate) fn build_elasticsearch_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `elasticsearch` (disabled in this build)",
         record.id
     ))
 }
@@ -4115,6 +4771,216 @@ mod tests {
         assert_eq!(snapshot.success, 0);
         assert_eq!(snapshot.failed, 3);
         assert_eq!(snapshot.dropped, 0);
+    }
+
+    #[test]
+    fn canonical_action_kind_maps_every_mv02c_alias() {
+        assert_eq!(canonical_action_kind("mongo"), "mongodb");
+        assert_eq!(canonical_action_kind("documentdb"), "mongodb");
+        assert_eq!(canonical_action_kind("couch"), "couchbase");
+        assert_eq!(canonical_action_kind("cb"), "couchbase");
+        assert_eq!(canonical_action_kind("elastic"), "elasticsearch");
+        assert_eq!(canonical_action_kind("es"), "elasticsearch");
+        assert_eq!(canonical_action_kind("opensearch"), "elasticsearch");
+    }
+
+    #[test]
+    fn action_owned_kind_covers_the_mv02c_kinds() {
+        for kind in [
+            "mongodb",
+            "mongo",
+            "documentdb",
+            "couchbase",
+            "couch",
+            "cb",
+            "elasticsearch",
+            "elastic",
+            "es",
+            "opensearch",
+        ] {
+            assert!(action_owned_kind(kind), "{kind} owns a runtime");
+        }
+    }
+
+    #[cfg(feature = "mongodb")]
+    #[test]
+    fn mongodb_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "mongodb",
+            "mongodb:up",
+            serde_json::json!({"collection": "events"}),
+        );
+        let error = build_mongodb_sink(&rec, &serde_json::json!({"database": "db"}))
+            .err()
+            .expect("a missing server refuses");
+        assert!(error.contains("server"), "{error}");
+        let error = build_mongodb_sink(&rec, &serde_json::json!({"server": "h:27017"}))
+            .err()
+            .expect("a missing database refuses");
+        assert!(error.contains("database"), "{error}");
+        let error = build_mongodb_sink(
+            &rec,
+            &serde_json::json!({"server": "h:27017", "database": "db", "username": "u"}),
+        )
+        .err()
+        .expect("a half credential pair refuses");
+        assert!(error.contains("together"), "{error}");
+        let sink = build_mongodb_sink(
+            &rec,
+            &serde_json::json!({"server": "h:27017", "database": "db"}),
+        )
+        .expect("a full mongodb pair builds");
+        assert_eq!(sink.kind(), "mongodb");
+        let cfg = mongodb_sink_config(
+            &rec,
+            &serde_json::json!({"server": "h:27017", "database": "db"}),
+        )
+        .expect("a full mongodb config builds");
+        assert_eq!(cfg.collection_template, "events");
+        assert_eq!(cfg.max_retries, Some(4));
+        let bare = mv02b_record("act", "mongo", "mongodb:up", serde_json::json!({}));
+        let sink = build_mongodb_sink(
+            &bare,
+            &serde_json::json!({"server": "h:27017", "database": "db"}),
+        )
+        .expect("the documented collection default builds");
+        assert_eq!(sink.kind(), "mongodb");
+        let cfg = mongodb_sink_config(
+            &bare,
+            &serde_json::json!({"server": "h:27017", "database": "db"}),
+        )
+        .expect("the documented collection default config builds");
+        assert_eq!(cfg.collection_template, "mqtt");
+        let bad = mv02b_record(
+            "act",
+            "documentdb",
+            "mongodb:up",
+            serde_json::json!({"payload_template": "not json ${topic}"}),
+        );
+        let error = build_mongodb_sink(
+            &bad,
+            &serde_json::json!({"server": "h:27017", "database": "db"}),
+        )
+        .err()
+        .expect("a non-JSON document template refuses");
+        assert!(error.contains("payload_template"), "{error}");
+    }
+
+    #[cfg(feature = "couchbase")]
+    #[test]
+    fn couchbase_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "couchbase",
+            "couchbase:up",
+            serde_json::json!({"sql": "UPSERT INTO default:b.s.c (KEY, VALUE) VALUES (\"${client_id}\", ${payload})"}),
+        );
+        let error =
+            build_couchbase_sink(&rec, &serde_json::json!({"username": "u", "password": "p"}))
+                .err()
+                .expect("a missing server refuses");
+        assert!(error.contains("server"), "{error}");
+        let error = build_couchbase_sink(&rec, &serde_json::json!({"server": "h:11210"}))
+            .err()
+            .expect("a missing username refuses");
+        assert!(error.contains("username"), "{error}");
+        let no_sql = mv02b_record("act", "couch", "couchbase:up", serde_json::json!({}));
+        let error = build_couchbase_sink(
+            &no_sql,
+            &serde_json::json!({"server": "h:11210", "username": "u"}),
+        )
+        .err()
+        .expect("a missing sql refuses");
+        assert!(error.contains("sql"), "{error}");
+        let sink = build_couchbase_sink(
+            &rec,
+            &serde_json::json!({"server": "h:11210", "username": "u", "password": "p"}),
+        )
+        .expect("a full couchbase pair builds");
+        assert_eq!(sink.kind(), "couchbase");
+        let cfg = couchbase_sink_config(
+            &rec,
+            &serde_json::json!({"server": "h:11210", "username": "u", "password": "p"}),
+        )
+        .expect("a full couchbase config builds");
+        assert_eq!(cfg.max_retries, Some(3));
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    fn elasticsearch_sink_uses_the_action_target_and_refuses_the_missing_fields() {
+        let rec = mv02b_record(
+            "act",
+            "elasticsearch",
+            "elasticsearch:up",
+            serde_json::json!({"index": "events", "id": "${topic}"}),
+        );
+        let error =
+            build_elasticsearch_sink(&rec, &serde_json::json!({"server": "127.0.0.1:9200"}))
+                .err()
+                .expect("a missing action refuses");
+        assert!(error.contains("action"), "{error}");
+        let no_index = mv02b_record(
+            "act",
+            "es",
+            "elasticsearch:up",
+            serde_json::json!({"action": "create"}),
+        );
+        let error =
+            build_elasticsearch_sink(&no_index, &serde_json::json!({"server": "127.0.0.1:9200"}))
+                .err()
+                .expect("a missing index refuses");
+        assert!(error.contains("index"), "{error}");
+        let no_id = mv02b_record(
+            "act",
+            "opensearch",
+            "elasticsearch:up",
+            serde_json::json!({"action": "update", "index": "events"}),
+        );
+        let error =
+            build_elasticsearch_sink(&no_id, &serde_json::json!({"server": "127.0.0.1:9200"}))
+                .err()
+                .expect("an update without an id refuses");
+        assert!(error.contains("id"), "{error}");
+        let sink = build_elasticsearch_sink(
+            &mv02b_record(
+                "act",
+                "elasticsearch",
+                "elasticsearch:up",
+                serde_json::json!({"action": "create", "index": "events", "id": "${topic}"}),
+            ),
+            &serde_json::json!({"server": "127.0.0.1:9200"}),
+        )
+        .expect("a full elasticsearch pair builds");
+        assert_eq!(sink.kind(), "elasticsearch");
+        let cfg = elasticsearch_sink_config(
+            &mv02b_record(
+                "act",
+                "elasticsearch",
+                "elasticsearch:up",
+                serde_json::json!({"action": "create", "index": "events", "id": "${topic}"}),
+            ),
+            &serde_json::json!({"server": "127.0.0.1:9200"}),
+        )
+        .expect("a full elasticsearch config builds");
+        assert!(cfg.overwrite);
+        assert_eq!(
+            cfg.operation,
+            broker_connectors::elasticsearch::ElasticsearchOperation::Index
+        );
+        assert_eq!(cfg.max_retries, 2);
+        let bad = mv02b_record(
+            "act",
+            "elastic",
+            "elasticsearch:up",
+            serde_json::json!({"action": "create", "index": "events", "doc": "not json ${topic}"}),
+        );
+        let error =
+            build_elasticsearch_sink(&bad, &serde_json::json!({"server": "127.0.0.1:9200"}))
+                .err()
+                .expect("a non-JSON document template refuses");
+        assert!(error.contains("doc_template"), "{error}");
     }
 
     #[tokio::test]

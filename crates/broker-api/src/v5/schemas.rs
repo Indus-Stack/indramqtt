@@ -269,15 +269,27 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "mongodb",
             json!({
                 "mongo_type": enum_prop(&["single", "rs", "sharded"], "single"),
-                "server": str_prop("127.0.0.1:27017"),
-                "database": str_prop("test"),
+                "server": str_prop(""),
+                "servers": str_prop(""),
+                "database": str_prop(""),
                 "username": str_prop(""),
                 "password": pwd_prop(),
-                "auth_source": str_prop("admin"),
-                "pool_size": int_prop(8),
-                "ssl": ssl_prop()
+                "auth_source": str_prop(""),
+                "parameters": json!({
+                    "type": "object",
+                    "description": "Reference-shaped parameters: single needs server, rs and sharded need servers.",
+                    "properties": {
+                        "mongo_type": {"type": "string", "enum": ["single", "rs", "sharded"], "default": "single"},
+                        "server": {"type": "string", "default": ""},
+                        "servers": {"type": "string", "default": ""},
+                        "replica_set_name": {"type": "string", "default": ""},
+                        "database": {"type": "string", "default": ""},
+                        "w_mode": {"type": "string", "enum": ["unsafe", "safe"], "default": "unsafe"},
+                        "r_mode": {"type": "string", "enum": ["master", "slave_ok"], "default": "master"}
+                    }
+                })
             }),
-            &["name", "server", "database"],
+            &["name", "database", "parameters"],
         ),
     );
 
@@ -490,12 +502,19 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 21. Elasticsearch
     schemas.insert(
         "elasticsearch.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "elasticsearch",
             json!({
-                "server": str_prop("http://127.0.0.1:9200"),
-                "username": str_prop("elastic"),
+                "server": str_prop("127.0.0.1:9200"),
+                "username": str_prop(""),
                 "password": pwd_prop(),
-                "ssl": ssl_prop()
+                "authentication": json!({
+                    "type": "object",
+                    "properties": {
+                        "username": str_prop(""),
+                        "password": pwd_prop()
+                    }
+                })
             }),
             &["name", "server"],
         ),
@@ -571,14 +590,16 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 27. Couchbase
     schemas.insert(
         "connector_couchbase.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "couchbase",
             json!({
-                "servers": str_prop("127.0.0.1:11210"),
-                "bucket": str_prop("default"),
+                "server": str_prop(""),
+                "servers": str_prop(""),
                 "username": str_prop(""),
-                "password": pwd_prop()
+                "password": pwd_prop(),
+                "connect_timeout": str_prop("15s")
             }),
-            &["name", "servers", "bucket"],
+            &["name", "server", "username"],
         ),
     );
 
@@ -1044,6 +1065,55 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         ),
     );
 
+    // MongoDB action
+    schemas.insert(
+        "bridge_mongodb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "mongodb",
+            json!({
+                "connector": str_prop(""),
+                "collection": str_prop("mqtt"),
+                "payload_template": str_prop("")
+            }),
+            &["name", "connector"],
+        ),
+    );
+
+    // Couchbase action
+    schemas.insert(
+        "action_couchbase.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "couchbase",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop(""),
+                "max_retries": int_prop(3)
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // Elasticsearch action
+    schemas.insert(
+        "bridge_elasticsearch.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "elasticsearch",
+            json!({
+                "connector": str_prop(""),
+                "action": enum_prop(&["create", "update", "delete"], "create"),
+                "index": str_prop(""),
+                "id": str_prop(""),
+                "doc": str_prop(""),
+                "overwrite": bool_prop(true),
+                "doc_as_upsert": bool_prop(false),
+                "require_alias": bool_prop(false),
+                "routing": str_prop(""),
+                "max_retries": int_prop(2)
+            }),
+            &["name", "connector", "action", "index"],
+        ),
+    );
+
     // MQTT action
     schemas.insert(
         "bridge_mqtt_publisher.post_bridge_v2".to_string(),
@@ -1075,37 +1145,45 @@ pub async fn get_schema(Path(name): Path<String>) -> Response {
     // the JSON schema value, not an envelope.
     //
     // `hotconf` is canonical; `hot-config` resolves to the same value.
+    // A ready connector or action schema name returns that schema.
     // Any other name is 404.
     //
-    // Bound: the registry is code-defined (three canonical names plus one
-    // alias). `MAX_DASHBOARD_OBJECTS` is finite and each request clones at
-    // most one bounded object. The route is read-only.
+    // Bound: the registry is code-defined. `MAX_DASHBOARD_OBJECTS` is
+    // finite and each request clones at most one bounded object. The
+    // route is read-only.
     //
     // Management-plane only: reads a `LazyLock` static, takes no lock,
     // and publish/deliver never touch it.
     let canonical = match name.as_str() {
-        "hotconf" | "hot-config" => "hotconf",
-        "actions" => "actions",
-        "connectors" => "connectors",
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "code": "NOT_FOUND",
-                    "message": format!("schema '{}' not found", name),
-                })),
-            )
-                .into_response();
-        }
+        "hotconf" | "hot-config" => Some("hotconf"),
+        "actions" => Some("actions"),
+        "connectors" => Some("connectors"),
+        _ => None,
     };
     let schema = match canonical {
-        "hotconf" => {
+        Some("hotconf") => {
             // The broker does not track hot-config sections as live state.
             // It reports only the served-name list from this registry.
             json!({ "sections": ["actions", "connectors", "hotconf"] })
         }
-        "actions" => ready_kind_schemas(&ACTIONS_SCHEMA["components"]["schemas"]),
-        _ => ready_kind_schemas(&CONNECTORS_SCHEMA["components"]["schemas"]),
+        Some("actions") => ready_kind_schemas(&ACTIONS_SCHEMA["components"]["schemas"]),
+        Some(_) => ready_kind_schemas(&CONNECTORS_SCHEMA["components"]["schemas"]),
+        None => {
+            let connectors = ready_kind_schemas(&CONNECTORS_SCHEMA["components"]["schemas"]);
+            let actions = ready_kind_schemas(&ACTIONS_SCHEMA["components"]["schemas"]);
+            if let Some(schema) = connectors.get(&name).or_else(|| actions.get(&name)) {
+                schema.clone()
+            } else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "code": "NOT_FOUND",
+                        "message": format!("schema '{}' not found", name),
+                    })),
+                )
+                    .into_response();
+            }
+        }
     };
     let body = serde_json::to_string(&schema).expect("schema value serializes");
     (
