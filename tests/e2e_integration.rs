@@ -4067,6 +4067,167 @@ async fn sb23_window_plain_payload_emits_through_mqtt() {
     kernel.finish().await;
 }
 
+/// SB-27 plain payloads agree inline and in windows through sockets.
+#[tokio::test]
+async fn sb27_inline_and_window_plain_payload_agree_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let inline_id = "sb27-inline";
+    let inline_sql = format!("SELECT * FROM \"mv00/in/{inline_id}\"");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(inline_id, &inline_sql),
+    )
+    .await;
+    assert_eq!(status, 201, "inline create: {body}");
+    let window_id = "sb27-window";
+    let window_sql = format!("SELECT * FROM \"mv00/in/{window_id}\" GROUP BY COUNTWINDOW(1)");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(window_id, &window_sql),
+    )
+    .await;
+    assert_eq!(status, 201, "window create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "sb27-agree-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "sb27-agree-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(&format!("mv00/in/{inline_id}"), 0, 0, false, b"hello"),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(&format!("mv00/in/{window_id}"), 0, 0, false, b"hello"),
+    )
+    .await;
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (head, body) = tokio::time::timeout(STEP, recv_mqtt(&mut subscriber))
+            .await
+            .expect("rule output in time");
+        assert_eq!(head & 0xf0, 0x30);
+        let message = sy02_parse_publish_classic(head, &body);
+        let output: serde_json::Value =
+            serde_json::from_slice(&message.payload).expect("rule JSON");
+        assert_eq!(output, serde_json::json!({}), "plain yields empty row");
+        got.push(message.topic);
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            format!("mv00/out/{inline_id}"),
+            format!("mv00/out/{window_id}")
+        ]
+    );
+    for id in [inline_id, window_id] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules/{id}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "metrics read: {body}");
+        assert_eq!(body["metrics"]["matched"], 1, "{body}");
+        assert_eq!(body["metrics"]["passed"], 1, "{body}");
+        assert_eq!(body["metrics"]["failed"], 0, "{body}");
+    }
+    let object_id = "sb27-object";
+    let object_sql = format!("SELECT * FROM \"mv00/in/{object_id}\" GROUP BY COUNTWINDOW(1)");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(object_id, &object_sql),
+    )
+    .await;
+    assert_eq!(status, 201, "object window create: {body}");
+    // A JSON object payload uses the same rule path.
+    // It delivers the object in windows.
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(&format!("mv00/in/{object_id}"), 0, 0, false, br#"{"v":42}"#),
+    )
+    .await;
+    let (head, body) = tokio::time::timeout(STEP, recv_mqtt(&mut subscriber))
+        .await
+        .expect("object window output in time");
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{object_id}"));
+    let output: serde_json::Value =
+        serde_json::from_slice(&message.payload).expect("object window JSON");
+    assert_eq!(
+        output,
+        serde_json::json!({"v": 42}),
+        "object yields its fields"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{object_id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "object metrics read: {body}");
+    assert_eq!(body["metrics"]["matched"], 1, "{body}");
+    assert_eq!(body["metrics"]["passed"], 1, "{body}");
+    assert_eq!(body["metrics"]["failed"], 0, "{body}");
+    // A filtered input counts failed once. The rule stays stored.
+    let filtered_id = "sb27-filtered";
+    let filtered_sql = format!("SELECT * FROM \"mv00/in/{filtered_id}\" WHERE v = 1");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(filtered_id, &filtered_sql),
+    )
+    .await;
+    assert_eq!(status, 201, "filtered create: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{filtered_id}"),
+            0,
+            0,
+            false,
+            br#"{"v":2}"#,
+        ),
+    )
+    .await;
+    for _ in 0..100 {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            &format!("/api/v5/rules/{filtered_id}/metrics"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "filtered metrics read: {body}");
+        if body["metrics"]["failed"].as_u64().unwrap_or(0) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        &format!("/api/v5/rules/{filtered_id}/metrics"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "filtered metrics read: {body}");
+    assert_eq!(body["metrics"]["matched"], 1, "{body}");
+    assert_eq!(body["metrics"]["passed"], 0, "{body}");
+    assert_eq!(body["metrics"]["failed"], 1, "{body}");
+    kernel.finish().await;
+}
+
 /// Group rows keep first-seen order and each group's payload metadata keys.
 #[tokio::test]
 async fn mv00_group_windows_keep_order_and_payload_shadows() {

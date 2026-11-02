@@ -1488,7 +1488,8 @@ fn lower_window_call(
     };
     let lowered = name.to_ascii_lowercase();
     match lowered.as_str() {
-        "tumblingwindow" | "hoppingwindow" | "slidingwindow" | "countwindow" | "sessionwindow" => {}
+        "tumblingwindow" | "hoppingwindow" | "slidingwindow" | "countwindow" | "sessionwindow"
+        | "statewindow" => {}
         _ => return Ok(None),
     }
     let bad = |msg: &str| StdParseError::new(item_line, item_col, msg.to_string());
@@ -1566,6 +1567,19 @@ fn lower_window_call(
                 size: u64_arg(&args[0])? as usize,
                 interval: if args.len() == 2 {
                     Some(u64_arg(&args[1])? as usize)
+                } else {
+                    None
+                },
+            }
+        }
+        "statewindow" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(bad("STATEWINDOW expects 1 or 2 arguments"));
+            }
+            WindowDef::State {
+                start_condition: args[0].clone(),
+                end_condition: if args.len() == 2 {
+                    Some(args[1].clone())
                 } else {
                     None
                 },

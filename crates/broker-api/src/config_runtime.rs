@@ -254,6 +254,8 @@ async fn apply_candidate(
                 .connectors
                 .reconcile(&previous.connectors, &candidate.connectors)
                 .await;
+            // A kept pending record stays visible and raises its alarm.
+            state.raise_unavailable_stored_kinds();
             Ok(ReloadResult {
                 version,
                 diff,
@@ -267,6 +269,7 @@ async fn apply_candidate(
             undo_connectors_live(&state.engine, &connector_undo);
             apply_zone_live(&state.sessions, &previous.global_zone);
             let _ = ensure_history_truncated(&state.config, history_len_before);
+            state.raise_unavailable_stored_kinds();
             Err(Box::new(apply_failed(format!(
                 "config commit failed: {err}"
             ))))
@@ -344,6 +347,8 @@ async fn apply_restore(
                 .connectors
                 .reconcile(&previous.connectors, &candidate.connectors)
                 .await;
+            // A kept pending record stays visible and raises its alarm.
+            state.raise_unavailable_stored_kinds();
             Ok(ReloadResult {
                 version,
                 diff,
@@ -356,6 +361,7 @@ async fn apply_restore(
             let _ = state.admin_users.apply_snapshot_conf(&previous.admin_users);
             undo_connectors_live(&state.engine, &connector_undo);
             apply_zone_live(&state.sessions, &previous.global_zone);
+            state.raise_unavailable_stored_kinds();
             Err(Box::new(apply_failed(format!(
                 "config commit failed: {err}"
             ))))
@@ -2096,5 +2102,124 @@ mod tests {
 
         std::fs::remove_dir_all(&config_dir).ok();
         std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// SB-27 reload keeps a stored pending record and raises its alarm.
+    /// The reload, a rolled-back bad change and a history restore all
+    /// keep the record. The API and the alarm name it.
+    #[tokio::test]
+    async fn sb27_reload_keeps_pending_mysql_and_restores_history() {
+        let harness = Harness::start().await;
+        let token = harness.login_as_admin().await;
+        let mut snapshot = (*harness.state.config.snapshot()).clone();
+        snapshot
+            .connectors
+            .connectors
+            .push(broker_config::ConnectorEntry {
+                id: "sb27-mysql".to_string(),
+                connector_type: "mysql".to_string(),
+                enable: true,
+                config: "{}".to_string(),
+            });
+        let (status, body) = harness
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": snapshot, "actor": "tester", "summary": "add pending mysql"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "reload keeps pending record: {body}");
+        let pending = body["pending_live"].as_array().expect("pending list");
+        assert!(pending.iter().any(|id| id == "sb27-mysql"), "{body:?}");
+        let (status, connectors) = harness.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        let row = connectors
+            .as_array()
+            .expect("connector list")
+            .iter()
+            .find(|row| row["id"] == json!("sb27-mysql"))
+            .expect("pending record stays listed");
+        assert_eq!(row["status"], json!("disconnected"));
+        let (status, alarms) = harness.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"connector_unavailable:sb27-mysql"),
+            "{names:?}"
+        );
+        let history_len = harness.state.config.history_list().len();
+        let mut bad = (*harness.state.config.snapshot()).clone();
+        bad.connectors
+            .connectors
+            .push(broker_config::ConnectorEntry {
+                id: "sb27-bad".to_string(),
+                connector_type: "not-a-connector".to_string(),
+                enable: true,
+                config: String::new(),
+            });
+        let (status, _) = harness
+            .post_auth("/api/v1/config/reload", json!({"snapshot": bad}), &token)
+            .await;
+        assert_eq!(status, 400, "bad change rolls back");
+        assert!(
+            harness
+                .state
+                .config
+                .snapshot()
+                .connectors
+                .connectors
+                .iter()
+                .any(|entry| entry.id == "sb27-mysql"),
+            "rollback keeps the pending record"
+        );
+        assert_eq!(harness.state.config.history_list().len(), history_len);
+        let (status, history) = harness.get_auth("/api/v1/config/history", &token).await;
+        assert_eq!(status, 200);
+        let id = history["versions"]
+            .as_array()
+            .expect("versions")
+            .first()
+            .expect("one version")
+            .get("id")
+            .and_then(|id| id.as_u64())
+            .expect("version id");
+        let (status, body) = harness
+            .post_auth(
+                &format!("/api/v1/config/history/{id}/restore"),
+                json!({"actor": "tester"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "restore keeps pending record: {body}");
+        assert!(
+            harness
+                .state
+                .config
+                .snapshot()
+                .connectors
+                .connectors
+                .iter()
+                .any(|entry| entry.id == "sb27-mysql"),
+            "restored snapshot keeps the record"
+        );
+        let (status, alarms) = harness.get_auth("/api/v5/alarms", &token).await;
+        assert_eq!(status, 200);
+        let names: Vec<&str> = alarms["data"]
+            .as_array()
+            .expect("alarm rows")
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"connector_unavailable:sb27-mysql"),
+            "{names:?}"
+        );
+        let dir = harness.state.config.dir().to_path_buf();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

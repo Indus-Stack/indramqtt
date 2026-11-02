@@ -1092,7 +1092,7 @@ pub struct ConnectorsConf {
 impl ConnectorsConf {
     /// Validates ids (non-empty, unique) and connector types (known).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_with(false)
+        self.validate_with(false, false)
     }
 
     /// Validates stored records while tolerating kinds this broker removed.
@@ -1102,10 +1102,16 @@ impl ConnectorsConf {
     /// read and delete them. Management writes validate with
     /// [`Self::validate`] and refuse the removed kinds.
     pub fn validate_stored(&self) -> Result<(), ConfigError> {
-        self.validate_with(true)
+        self.validate_with(true, true)
     }
 
-    fn validate_with(&self, allow_removed: bool) -> Result<(), ConfigError> {
+    /// Validates a reload snapshot: tolerates pending/refused kinds
+    /// (mysql, kafka, http) but still refuses removed kinds (s3_tables).
+    pub fn validate_legacy(&self) -> Result<(), ConfigError> {
+        self.validate_with(false, true)
+    }
+
+    fn validate_with(&self, allow_removed: bool, allow_refused: bool) -> Result<(), ConfigError> {
         let mut seen = HashSet::with_capacity(self.connectors.len());
         for (index, connector) in self.connectors.iter().enumerate() {
             if connector.id.trim().is_empty() {
@@ -1128,7 +1134,7 @@ impl ConnectorsConf {
             // KC-00: a strict load refuses a known kind whose capability
             // state is not `ready`. The stored-state load tolerates it so
             // an operator can still read and delete an old record.
-            if !allow_removed && is_kind_refused(&connector.connector_type) {
+            if !allow_refused && is_kind_refused(&connector.connector_type) {
                 return Err(ConfigError::Invalid(format!(
                     "connectors.connectors[{index}].connector_type {:?} is not available in this broker (field `connector_type`)",
                     connector.connector_type
@@ -2295,18 +2301,28 @@ impl ActionsConf {
     /// Validates action ids (non-empty, bounded, unique), kinds (known)
     /// and the registry length cap.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_with(false)
+        self.validate_with(false, false)
     }
 
-    /// Validates stored records while tolerating kinds this broker removed.
-    ///
-    /// Same scope as [`ConnectorsConf::validate_stored`]: only boot and a
-    /// stored-state rewrite use this; management writes stay strict.
+    /// Used only to load and rewrite a state file written by an older
+    /// broker: the removed records stay in place so the operator can still
+    /// read and delete them. Management writes validate with
+    /// [`Self::validate`] and refuse the removed kinds.
     pub fn validate_stored(&self) -> Result<(), ConfigError> {
-        self.validate_with(true)
+        self.validate_with(true, true)
     }
 
-    fn validate_with(&self, allow_removed: bool) -> Result<(), ConfigError> {
+    /// Validates a reload snapshot: tolerates pending/refused kinds
+    /// but still refuses removed kinds.
+    pub fn validate_legacy(&self) -> Result<(), ConfigError> {
+        self.validate_with(false, true)
+    }
+
+    pub(crate) fn validate_with(
+        &self,
+        allow_removed: bool,
+        allow_refused: bool,
+    ) -> Result<(), ConfigError> {
         if self.actions.len() > MAX_ACTIONS {
             return Err(ConfigError::Invalid(format!(
                 "actions.actions holds {} entries, at most {} (field `actions`)",
@@ -2339,7 +2355,7 @@ impl ActionsConf {
                     entry.action_type
                 )));
             }
-            if !allow_removed && is_kind_refused(&entry.action_type) {
+            if !allow_refused && is_kind_refused(&entry.action_type) {
                 return Err(ConfigError::Invalid(format!(
                     "actions.actions[{index}].action_type {:?} is not available in this broker (field `action_type`)",
                     entry.action_type
@@ -2409,18 +2425,28 @@ impl SourcesConf {
     /// Validates source ids (non-empty, bounded, unique), kinds (known)
     /// and the registry length cap.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_with(false)
+        self.validate_with(false, false)
     }
 
     /// Validates stored records while tolerating kinds this broker removed.
     ///
-    /// Only boot and a stored-state rewrite use this; management writes
-    /// stay strict.
+    /// Same scope as [`ConnectorsConf::validate_stored`]: only boot and a
+    /// stored-state rewrite use this; management writes stay strict.
     pub fn validate_stored(&self) -> Result<(), ConfigError> {
-        self.validate_with(true)
+        self.validate_with(true, true)
     }
 
-    fn validate_with(&self, allow_removed: bool) -> Result<(), ConfigError> {
+    /// Validates a reload snapshot: tolerates pending/refused kinds
+    /// but still refuses removed kinds.
+    pub fn validate_legacy(&self) -> Result<(), ConfigError> {
+        self.validate_with(false, true)
+    }
+
+    pub(crate) fn validate_with(
+        &self,
+        allow_removed: bool,
+        allow_refused: bool,
+    ) -> Result<(), ConfigError> {
         if self.sources.len() > MAX_SOURCES {
             return Err(ConfigError::Invalid(format!(
                 "sources.sources holds {} entries, at most {} (field `sources`)",
@@ -2453,7 +2479,7 @@ impl SourcesConf {
                     entry.source_type
                 )));
             }
-            if !allow_removed && is_kind_refused(&entry.source_type) {
+            if !allow_refused && is_kind_refused(&entry.source_type) {
                 return Err(ConfigError::Invalid(format!(
                     "sources.sources[{index}].source_type {:?} is not available in this broker (field `source_type`)",
                     entry.source_type

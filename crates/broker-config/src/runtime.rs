@@ -302,13 +302,16 @@ pub fn validate_whole(snapshot: &FullSnapshot) -> Result<(), ConfigError> {
     if let Err(err) = snapshot.rules.validate() {
         problems.push(err.to_string());
     }
-    if let Err(err) = snapshot.connectors.validate() {
+    // A stored legacy or pending-kind record stays readable. The
+    // strict load still refuses a new pending create, but a whole
+    // snapshot keeps the record and marks it pending at apply time.
+    if let Err(err) = snapshot.connectors.validate_legacy() {
         problems.push(err.to_string());
     }
-    if let Err(err) = snapshot.actions.validate() {
+    if let Err(err) = snapshot.actions.validate_legacy() {
         problems.push(err.to_string());
     }
-    if let Err(err) = snapshot.sources.validate() {
+    if let Err(err) = snapshot.sources.validate_legacy() {
         problems.push(err.to_string());
     }
     let known: HashSet<&str> = snapshot

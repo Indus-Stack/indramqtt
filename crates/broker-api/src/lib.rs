@@ -3260,6 +3260,33 @@ mod tests {
             .await;
     }
 
+    /// SB-27 refuses a state window at create with 400 and a clear message.
+    #[tokio::test]
+    async fn sb27_state_window_is_refused_at_create_through_the_api() {
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "sb27-state",
+                    "name": "sb27-state",
+                    "sql": "SELECT * FROM \"sb27/state\" GROUP BY STATEWINDOW(a = 1, a = 5)",
+                    "actions": [],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400, "state window refuses: {body}");
+        let message = body["message"].as_str().unwrap_or("");
+        assert!(message.contains("state window"), "{body}");
+        assert!(
+            state.engine.get_rule("sb27-state").is_none(),
+            "nothing is stored"
+        );
+    }
+
     #[tokio::test]
     async fn test_kind_is_available_only_when_the_test_switch_is_on() {
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
@@ -6322,7 +6349,7 @@ connector_id = "pending-good"
             &server,
             &token,
             "mv02b/nl\nrow",
-            "{\"msg\":\"line1\nline2\"}",
+            "{\"msg\":\"line1\\nline2\"}",
         )
         .await;
         let got = fake.wait_for(3).await;
@@ -6411,9 +6438,11 @@ connector_id = "pending-good"
             ),
         ];
         for (kind, mut connector) in bodies {
-            if (kind == "clickhouse" && !cfg!(feature = "clickhouse"))
-                || (kind == "cassandra" && !cfg!(feature = "cassandra"))
-            {
+            // Cassandra is pending (SB-27). It never creates.
+            if kind == "cassandra" {
+                continue;
+            }
+            if kind == "clickhouse" && !cfg!(feature = "clickhouse") {
                 continue;
             }
             let conn = format!("mv02b-ten-{kind}");
@@ -7880,8 +7909,8 @@ connector_id = "pending-good"
         let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
         let token = server.login_as_admin().await;
 
-        // A closed port stores (the driver dials lazily at send time).
-        let (status, _) = server
+        // Scylla stays pending (SB-27). It never creates.
+        let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
                 json!({"type": "scylla", "name": "mv02b-cass",
@@ -7889,106 +7918,7 @@ connector_id = "pending-good"
                 &token,
             )
             .await;
-        assert_eq!(status, 201, "the scylla alias creates");
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/actions",
-                json!({"type": "cql", "name": "mv02b-cass-act",
-                       "connector": "mv02b-cass", "parameters": {}}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 201, "the cql alias creates");
-        let (status, _) = server
-            .post_auth(
-                "/api/v5/rules",
-                json!({"id": "mv02b-cass-rule", "name": "mv02b-cass-rule",
-                       "sql": "SELECT * FROM \"mv02b/cass\"", "actions": ["mv02b-cass-act"]}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 201);
-
-        mv02b_publish(&server, &token, "mv02b/cass", "{\"device_id\":\"d1\"}").await;
-        for _ in 0..100 {
-            let (status, metrics) = server
-                .get_auth("/api/v5/actions/mv02b-cass-act/metrics", &token)
-                .await;
-            assert_eq!(status, 200);
-            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let (status, metrics) = server
-            .get_auth("/api/v5/actions/mv02b-cass-act/metrics", &token)
-            .await;
-        assert_eq!(status, 200);
-        assert_eq!(metrics["metrics"]["failed"], json!(1));
-
-        // The action override moves the table; delivery still fails
-        // against the closed port.
-        let (status, _) = server
-            .put_auth(
-                "/api/v5/actions/mv02b-cass-act",
-                json!({"type": "cql", "name": "mv02b-cass-act",
-                       "connector": "mv02b-cass", "parameters": {"table": "events2"}}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 200);
-
-        // A refused connector update keeps the old state: the next
-        // publish still counts a failed forward through the old sink.
-        let (status, body) = server
-            .put_auth(
-                "/api/v5/connectors/mv02b-cass",
-                json!({"type": "cassandra", "name": "mv02b-cass",
-                       "servers": "127.0.0.1:9", "table": "events2"}),
-                &token,
-            )
-            .await;
-        assert_eq!(status, 400, "a dropped keyspace refuses: {body}");
-        assert!(
-            body["message"].as_str().unwrap_or("").contains("keyspace"),
-            "{body}"
-        );
-        mv02b_publish(&server, &token, "mv02b/cass", "{\"device_id\":\"d2\"}").await;
-        for _ in 0..100 {
-            let (status, metrics) = server
-                .get_auth("/api/v5/actions/mv02b-cass-act/metrics", &token)
-                .await;
-            assert_eq!(status, 200);
-            if metrics["metrics"]["failed"].as_u64().unwrap_or(0) >= 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let (status, metrics) = server
-            .get_auth("/api/v5/actions/mv02b-cass-act/metrics", &token)
-            .await;
-        assert_eq!(status, 200);
-        assert_eq!(metrics["metrics"]["failed"], json!(2));
-        drop(server);
-        drop(registry);
-
-        // A restart stores the outage: the entry reads disconnected.
-        let reloaded = Arc::new(ConfigRegistry::load(&dir).expect("reload data dir"));
-        let (server, _state) = TestServer::start_with_registry(reloaded).await;
-        let (status, body) = server
-            .post(
-                "/api/v5/login",
-                json!({"username": "admin", "password": "Adm1n-test-pass!"}),
-            )
-            .await;
-        assert_eq!(status, 200);
-        let token = body["token"].as_str().expect("admin token").to_string();
-        let (status, read) = server
-            .get_auth("/api/v5/connectors/mv02b-cass", &token)
-            .await;
-        assert_eq!(status, 200, "stored entry survives the restart");
-        assert_eq!(read["status"], json!("disconnected"));
-        drop(server);
+        assert_eq!(status, 400, "pending scylla refuses: {body}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8102,10 +8032,9 @@ connector_id = "pending-good"
             let (status, created) = server
                 .post_auth("/api/v5/connectors", Value::Object(full), &token)
                 .await;
-            if (kind == "scylla" || kind == "scylladb" || kind == "cql")
-                && !cfg!(feature = "cassandra")
-            {
-                assert_eq!(status, 400, "{kind} without the feature refuses");
+            // Scylla aliases stay pending (SB-27). They never create.
+            if kind == "scylla" || kind == "scylladb" || kind == "cql" {
+                assert_eq!(status, 400, "{kind} pending refuses");
                 continue;
             }
             if kind == "ch" && !cfg!(feature = "clickhouse") {

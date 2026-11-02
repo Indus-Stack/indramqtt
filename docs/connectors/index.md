@@ -146,8 +146,8 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {key}"})
 with urllib.request.urlopen(req, timeout=5) as res:
     names = set(json.load(res))
-assert names == {"pgsql", "opents", "tdengine", "datalayers", "clickhouse", "greptimedb", "aws_timestream", "cassandra", "iotdb", "doris", "influxdb", "mongodb", "couchbase", "elasticsearch"}, names
-for pending in ("http", "mqtt", "kafka_producer", "redis", "mysql"):
+assert names == {"pgsql", "opents", "tdengine", "datalayers", "clickhouse", "greptimedb", "aws_timestream", "iotdb", "doris", "influxdb", "mongodb", "couchbase", "elasticsearch"}, names
+for pending in ("http", "mqtt", "kafka_producer", "redis", "mysql", "cassandra"):
     assert pending not in names, pending
 print("ok")
 PY

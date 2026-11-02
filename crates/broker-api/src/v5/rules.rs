@@ -2147,7 +2147,10 @@ pub(crate) fn kind_refusal(kind: &str) -> Option<String> {
         Some(_) => {}
         None => return None,
     }
-    if let Some(feature) = disabled_connector_feature(kind) {
+    let base = broker_config::capability::kind_row(kind)
+        .map(|row| row.name)
+        .unwrap_or(kind);
+    if let Some(feature) = disabled_connector_feature(base) {
         return Some(format!(
             "connector type {kind} is not available in this broker: feature `{feature}` is not compiled in"
         ));
@@ -2173,24 +2176,7 @@ pub(crate) fn compiled_connector_features() -> Vec<&'static str> {
 /// create dials the same target as the historic alias. Unknown names
 /// pass through unchanged (the caller rejects them before this runs).
 fn live_sink_kind(conn_type: &str) -> &str {
-    match conn_type {
-        "mqtt" => "mqtt_bridge",
-        "kafka_producer" | "kafka_consumer" => "kafka",
-        "confluent_producer" => "confluent",
-        "gcp_pubsub_producer" | "gcp_pubsub_consumer" => "gcp_pubsub",
-        "azure_event_hub_producer" => "azure_eventhubs",
-        "aws_timestream" => "timestream",
-        "ch" => "clickhouse",
-        "opents" => "opentsdb",
-        "snowflake_streaming" => "snowflake",
-        "postgres" => "pgsql",
-        "sqlserver" => "mssql",
-        "dynamo" => "dynamodb",
-        "mongo" | "documentdb" => "mongodb",
-        "couch" | "cb" => "couchbase",
-        "elastic" | "es" | "opensearch" => "elasticsearch",
-        _ => conn_type,
-    }
+    broker_config::capability::live_sink_kind_for(conn_type)
 }
 
 /// Canonical type of a document-store connector. The KC-00 aliases map to

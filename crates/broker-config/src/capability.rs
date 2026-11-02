@@ -181,12 +181,15 @@ pub static KIND_ROWS: &[KindRow] = &[
         default_build: false,
         full_build: true,
     },
+    // cassandra stays pending: its rule-path qualification
+    // (sb27_cassandra_rule_path_qualifies_through_manager) is ignored and
+    // never runs against a real server, so delivery is not proved.
     KindRow {
         name: "cassandra",
         aliases: &["scylla", "scylladb", "cql"],
         family: "time-series",
-        owner: "MV-02b",
-        state: KindState::Ready,
+        owner: "SB-27",
+        state: KindState::Pending("SB-27"),
         connector: true,
         action: true,
         source: true,
@@ -921,6 +924,45 @@ pub fn is_kind_refused(name: &str) -> bool {
     kind_row(name).is_some_and(|row| !row_is_ready(row))
 }
 
+/// Single source for the documented sink names. Each pair maps one
+/// accepted input name to its runtime kind. The v5 path uses this
+/// table. Tests derive the accepted set from it.
+pub const LIVE_SINK_KIND_TABLE: &[(&str, &str)] = &[
+    ("mqtt", "mqtt_bridge"),
+    ("kafka_producer", "kafka"),
+    ("kafka_consumer", "kafka"),
+    ("confluent_producer", "confluent"),
+    ("gcp_pubsub_producer", "gcp_pubsub"),
+    ("gcp_pubsub_consumer", "gcp_pubsub"),
+    ("azure_event_hub_producer", "azure_eventhubs"),
+    ("aws_timestream", "timestream"),
+    ("ch", "clickhouse"),
+    ("opents", "opentsdb"),
+    ("snowflake_streaming", "snowflake"),
+    ("postgres", "pgsql"),
+    ("sqlserver", "mssql"),
+    ("dynamo", "dynamodb"),
+    ("mongo", "mongodb"),
+    ("documentdb", "mongodb"),
+    ("couch", "couchbase"),
+    ("cb", "couchbase"),
+    ("elastic", "elasticsearch"),
+    ("es", "elasticsearch"),
+    ("opensearch", "elasticsearch"),
+];
+
+/// Map one accepted name to its runtime kind. Unknown names pass
+/// through unchanged. The v5 path calls this table.
+#[must_use]
+pub fn live_sink_kind_for(conn_type: &str) -> &str {
+    for (input, runtime) in LIVE_SINK_KIND_TABLE {
+        if *input == conn_type {
+            return runtime;
+        }
+    }
+    conn_type
+}
+
 /// Cargo feature required by `name`, when gated.
 #[must_use]
 pub fn kind_feature(name: &str) -> Option<&'static str> {
@@ -1024,109 +1066,18 @@ mod tests {
     use crate::{KNOWN_ACTION_TYPES, KNOWN_CONNECTOR_TYPES, KNOWN_SOURCE_TYPES};
     use std::collections::HashSet;
 
-    /// Names the v5 API accepts outside the three `KNOWN_*` registries.
-    /// The list is copied from `live_sink_kind`, `typed.rs` and the kind
-    /// matches in `v5/rules.rs` and `lib.rs`. Add a name here when one of
-    /// those paths starts to accept it.
-    const BROKER_API_ACCEPTED_NAMES: &[&str] = &[
-        // live_sink_kind
-        "mqtt",
-        "kafka_producer",
-        "kafka_consumer",
-        "confluent_producer",
-        "gcp_pubsub_producer",
-        "gcp_pubsub_consumer",
-        "azure_event_hub_producer",
-        "aws_timestream",
-        "opents",
-        "snowflake_streaming",
-        "postgres",
-        "sqlserver",
-        "dynamo",
-        // typed.rs SPEC_ACTION_TYPES and SPEC_SOURCE_TYPES
-        "timescale",
-        "mongodb",
-        "oracle",
-        "pulsar",
-        "tdengine",
-        "azure_blob_storage",
-        "elasticsearch",
-        "influxdb",
-        "cassandra",
-        "cockroachdb",
-        "kinesis",
-        "iotdb",
-        "mysql",
-        "rabbitmq",
-        "greptimedb",
-        "disk_log",
-        "datalayers",
-        "http",
-        "redis",
-        "redshift",
-        "clickhouse",
-        "tablestore",
-        "alloydb",
-        "bigquery",
-        "snowflake",
-        "rocketmq",
-        "s3",
-        "doris",
-        "couchbase",
-        // rules.rs and lib.rs kind matches
-        "amqp",
-        "azblob",
-        "azureblob",
-        "bq",
-        "cb",
-        "ch",
-        "confluent_cloud",
-        "confluent_kafka",
-        "couch",
-        "cql",
-        "documentdb",
-        "elastic",
-        "es",
-        "gbq",
-        "gcp",
-        "pubsub",
-        "rabbit",
-        "bridge",
-        "cockroach",
-        "disk",
-        "disklog",
-        "greptime",
-        "minio",
-        "mongo",
-        "scylla",
-        "scylladb",
-        "sparkplug",
-        "opcua",
-        "opensearch",
-        "aws_iot_core",
-        "azure",
-        "azure_event_hubs",
-        "eventhubs",
-        "azure_iot_hub",
-        "azure_iothub",
-        "iothub",
-        "gcp_iot_core",
-        "cloud_iot",
-        "delta_lake",
-        "ots",
-        "oci",
-        "aws_kinesis",
-        "ddb",
-        "pgsql",
-        "webhook",
-        "console",
-        "logger",
-    ];
+    /// Every name the v5 sink mapping accepts. The set comes from
+    /// the same table the runtime uses. No hand copy lives here.
+    fn live_sink_inputs() -> Vec<&'static str> {
+        LIVE_SINK_KIND_TABLE
+            .iter()
+            .map(|(input, _)| *input)
+            .collect()
+    }
 
     /// KC-00: every name in the known lists and every name the v5 mapping
-    /// functions and kind matches accept resolves to exactly one row. The
-    /// test fails if a listed name has no row, and if one alias is claimed
-    /// by two rows.
+    /// accepts resolves to exactly one row. The test fails if a listed
+    /// name has no row, and if one alias is claimed by two rows.
     #[test]
     fn every_accepted_name_has_one_row() {
         let mut owners: HashSet<&'static str> = HashSet::new();
@@ -1143,16 +1094,24 @@ mod tests {
                 );
             }
         }
+        let sink_inputs = live_sink_inputs();
         for name in KNOWN_CONNECTOR_TYPES
             .iter()
             .chain(KNOWN_ACTION_TYPES.iter())
             .chain(KNOWN_SOURCE_TYPES.iter())
-            .chain(BROKER_API_ACCEPTED_NAMES.iter())
+            .chain(sink_inputs.iter())
             .chain(KIND_ROWS.iter().flat_map(|row| row.aliases.iter()))
         {
             assert!(
                 kind_row(name).is_some(),
                 "accepted name {name} has no capability row"
+            );
+        }
+        // The mapping source and the capability map agree on every input.
+        for input in &sink_inputs {
+            assert!(
+                kind_row(input).is_some(),
+                "sink input {input} has no capability row"
             );
         }
     }
@@ -1195,7 +1154,12 @@ mod tests {
         assert!(is_kind_ready("datalayers"));
         assert!(is_kind_ready("influxdb"));
         assert!(is_kind_ready("timestream"));
-        assert!(is_kind_ready("cassandra"));
+        assert!(!is_kind_ready("cassandra"));
+        assert_eq!(
+            kind_state("cassandra"),
+            Some(KindState::Pending("SB-27")),
+            "cassandra is pending until its qualification runs"
+        );
         assert!(is_kind_ready("mongodb"));
         assert!(is_kind_ready("couchbase"));
         assert!(is_kind_ready("elasticsearch"));

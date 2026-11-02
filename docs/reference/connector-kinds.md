@@ -22,7 +22,7 @@ flowchart LR
 | azure_eventhubs | azure_event_hubs, azure, eventhubs, azure_event_hub_producer | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | azure_eventhubs |
 | azure_iot | azure_iot_hub, azure_iothub, iothub | cloud-iot | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | azure_iot |
 | bigquery | bq, gbq | object-store | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | bigquery |
-| cassandra | scylla, scylladb, cql | time-series | MV-02b | ready | yes | yes | yes | yes | yes | cassandra |
+| cassandra | scylla, scylladb, cql | time-series | SB-27 | pending SB-27 | yes | yes | yes | yes | yes | cassandra |
 | clickhouse | ch | time-series | MV-02b | ready | yes | yes | yes | yes | yes | clickhouse |
 | cockroachdb | cockroach | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
 | confluent | confluent_kafka, confluent_cloud, confluent_producer | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | confluent |

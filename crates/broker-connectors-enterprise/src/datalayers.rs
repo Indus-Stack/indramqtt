@@ -229,9 +229,13 @@ pub struct DatalayersWriteRequest {
     pub records: Vec<DatalayersRecord>,
 }
 
-/// Escape a measurement name. Escapes commas and spaces.
+/// Escape commas, spaces, newlines and carriage returns in names.
+/// Reason: a raw newline splits one line into two records.
 fn escape_measurement(name: &str) -> String {
-    name.replace(',', "\\,").replace(' ', "\\ ")
+    name.replace(',', "\\,")
+        .replace(' ', "\\ ")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Escape a tag key, tag value, or field key. Escapes commas, equals, spaces.
@@ -855,6 +859,11 @@ mod tests {
     }
 
     #[test]
+    fn sb27_measurement_escapes_newline_and_carriage_return() {
+        assert_eq!(escape_measurement("a\nb\rc,d e"), "a\\nb\\rc\\,d\\ e");
+    }
+
+    #[test]
     fn test_config_validation_and_auth_header() {
         let cfg = sample_config();
         assert!(cfg.validate().is_ok());
@@ -1272,6 +1281,51 @@ mod tests {
             buffer_capacity: None,
             timeout_ms: Some(5_000),
         }
+    }
+
+    #[tokio::test]
+    async fn sb27_table_escape_goes_through_manager() {
+        // Broker path (publish, deliver): ConnectorManager::send ->
+        // Sink::send -> HttpDatalayersTransport POST against the
+        // loopback server. A table with newline and carriage return
+        // arrives escaped on the wire.
+        use broker_connectors::ConnectorManager;
+        let fake = Arc::new(FakeDatalayers {
+            status: StdMutex::new(200),
+            ..Default::default()
+        });
+        let (endpoint, server) = serve_fake(fake.clone()).await;
+        let mut config = fake_config(&endpoint, None);
+        config.table = "a\nb\rc,d e".to_string();
+        let transport = Arc::new(HttpDatalayersTransport::with_client(
+            &config,
+            reqwest::Client::new(),
+        ));
+        let sink = Arc::new(DatalayersSink::new(config, transport).expect("fake sink"));
+        let manager = ConnectorManager::new();
+        manager.register("dl-sb27", sink.clone());
+
+        let topic = Topic::new("machinery/lineA").unwrap();
+        manager
+            .send(
+                "dl-sb27",
+                &topic,
+                &Bytes::from_static(br#"{"custom_ts": 1726000000, "line": "A1", "pressure": 9.5}"#),
+                QoS::AtLeastOnce,
+            )
+            .await
+            .expect("broker send buffers");
+        sink.flush().await.expect("loopback flush");
+
+        assert_eq!(sink.sent_count(), 1);
+        let bodies = fake.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let line = bodies[0].trim();
+        assert!(
+            line.starts_with("a\\nb\\rc\\,d\\ e,"),
+            "escaped table on the wire: {line}"
+        );
+        server.abort();
     }
 
     #[tokio::test]

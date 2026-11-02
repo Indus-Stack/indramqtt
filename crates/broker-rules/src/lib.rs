@@ -2361,6 +2361,13 @@ impl RuleEngine {
                 }
                 None => (None, None, Vec::new(), false, Vec::new()),
             };
+        if let Some(stmt) = parsed_query.as_ref() {
+            if matches!(stmt.window, Some(rekuiper_sql::WindowDef::State { .. })) {
+                return Err(RuleEngineError::InvalidRule(
+                    "state window cannot emit in this build (field `sql_query`)".to_string(),
+                ));
+            }
+        }
         if self.rules.read().contains_key(&id) {
             return Err(RuleEngineError::InvalidRule(format!(
                 "duplicate rule id: {id}"
@@ -2796,6 +2803,13 @@ impl RuleEngine {
                 }
                 None => (None, None, Vec::new(), false, Vec::new()),
             };
+        if let Some(stmt) = parsed_query.as_ref() {
+            if matches!(stmt.window, Some(rekuiper_sql::WindowDef::State { .. })) {
+                return Err(RuleEngineError::InvalidRule(
+                    "state window cannot emit in this build (field `sql_query`)".to_string(),
+                ));
+            }
+        }
         let tier = match &parsed_query {
             Some(stmt) if stmt.window.is_some() => RuleTier::Enterprise,
             _ => RuleTier::Community,
@@ -5793,18 +5807,9 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
                 &rule.std_explicit_keys,
                 &injected,
             );
-            // SELECT * keeps the payload fields only. A non-object
-            // payload leaves no field after the strip, so forward
-            // the raw bytes instead of an empty object.
-            if projected.is_empty()
-                && rule.std_has_wildcard
-                && !matches!(
-                    serde_json::from_slice::<serde_json::Value>(payload),
-                    Ok(serde_json::Value::Object(_))
-                )
-            {
-                return vec![payload.clone()];
-            }
+            // SELECT * keeps the payload fields only. A plain
+            // payload yields no field after the strip, so the
+            // row is empty. The window path yields the same.
             let object: serde_json::Map<String, serde_json::Value> = projected;
             match serde_json::to_vec(&serde_json::Value::Object(object)) {
                 Ok(bytes) => vec![Bytes::from(bytes)],

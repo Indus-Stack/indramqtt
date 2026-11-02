@@ -109,7 +109,7 @@ For rows `{"v":1}` and `{"v":3}`, the duplicate-name contract for
 `SELECT sum(v) AS v, * ... GROUP BY COUNTWINDOW(2)` requires `{"v":1}`:
 the later wildcard supplies the raw first-record value.
 
-A payload that is not a JSON object never matches a SQL rule. Numbers, strings, and arrays match only rules without SQL.
+A payload that is not a JSON object matches only `SELECT *` and rules without SQL. `SELECT *` yields `{}` inline and in windows. Other SQL yields no row.
 
 ## WHERE
 

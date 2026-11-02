@@ -326,7 +326,10 @@ pub fn build_greptime_sql_insert(table: &str, records: &[GreptimeRecord]) -> Res
 
 /// Escape an InfluxDB line protocol measurement (` ,` and space).
 fn escape_influx_measurement(s: &str) -> String {
-    s.replace(',', "\\,").replace(' ', "\\ ")
+    s.replace(',', "\\,")
+        .replace(' ', "\\ ")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Escape an InfluxDB line protocol field key (`,`, `=` and space).
