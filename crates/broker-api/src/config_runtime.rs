@@ -224,6 +224,7 @@ async fn apply_candidate(
             "admin_users backend refused: {err}"
         ))));
     }
+    let _sink_guard = state.action_sink_lock.lock().await;
     let (connector_undo, pending_live) =
         apply_connectors_live(&state.engine, &previous, candidate).await;
     // Default-zone knobs (AP-03): apply to the live session manager so a
@@ -237,23 +238,34 @@ async fn apply_candidate(
         Ok(version) => {
             // Keep the observable v5 connector list in step with the
             // committed snapshot (reference form, redacted at read time);
-            // removals drop, additions/updates upsert.
+            // removals drop, additions/updates upsert. Reconcile before
+            // the action rebuild so the rebuild reads the new connector
+            // document, never the previous one.
+            state
+                .connectors
+                .reconcile(&previous.connectors, &candidate.connectors)
+                .await;
             // MV-01/SB-03: bring every stored action's owned sink back
             // in step with the committed connectors (dependent actions
             // rebuilt from the applied settings, sinks dropped when the
             // target connector is gone). Runs after the commit, so the
             // old generation never half-swaps; a rebuild failure keeps
             // the previous sink and reports through the alarm.
-            crate::v5::action_sinks::rebuild_all_action_sinks(
+            let replaced = crate::v5::action_sinks::rebuild_all_action_sinks(
                 &state.engine,
                 &state.connectors,
                 &state.actions,
                 &state.alarms,
             );
-            state
-                .connectors
-                .reconcile(&previous.connectors, &candidate.connectors)
+            // Probe the rebuilt sinks before the reload answers. A down
+            // target reads `disconnected` from a real attempt.
+            crate::v5::action_sinks::probe_action_sinks(&state.engine, &state.actions, |_| true)
                 .await;
+            // Drain each replaced generation so a buffered batch still
+            // reaches the old target after the swap.
+            for old in replaced {
+                let _ = old.flush().await;
+            }
             // A kept pending record stays visible and raises its alarm.
             state.raise_unavailable_stored_kinds();
             Ok(ReloadResult {
@@ -324,6 +336,7 @@ async fn apply_restore(
             "admin_users backend refused: {err}"
         ))));
     }
+    let _sink_guard = state.action_sink_lock.lock().await;
     let (connector_undo, pending_live) =
         apply_connectors_live(&state.engine, &previous, &candidate).await;
     // Default-zone knobs (AP-03): same live apply as a reload, with the
@@ -331,22 +344,33 @@ async fn apply_restore(
     apply_zone_live(&state.sessions, &candidate.global_zone);
     match state.config.history_restore(id, actor) {
         Ok(version) => {
+            // Reconcile before the action rebuild so the rebuild reads
+            // the restored connector document, never the previous one.
+            state
+                .connectors
+                .reconcile(&previous.connectors, &candidate.connectors)
+                .await;
             // MV-01/SB-03: bring every stored action's owned sink back
             // in step with the committed connectors (dependent actions
             // rebuilt from the applied settings, sinks dropped when the
             // target connector is gone). Runs after the commit, so the
             // old generation never half-swaps; a rebuild failure keeps
             // the previous sink and reports through the alarm.
-            crate::v5::action_sinks::rebuild_all_action_sinks(
+            let replaced = crate::v5::action_sinks::rebuild_all_action_sinks(
                 &state.engine,
                 &state.connectors,
                 &state.actions,
                 &state.alarms,
             );
-            state
-                .connectors
-                .reconcile(&previous.connectors, &candidate.connectors)
+            // Probe the rebuilt sinks before the restore answers. A down
+            // target reads `disconnected` from a real attempt.
+            crate::v5::action_sinks::probe_action_sinks(&state.engine, &state.actions, |_| true)
                 .await;
+            // Drain each replaced generation so a buffered batch still
+            // reaches the old target after the swap.
+            for old in replaced {
+                let _ = old.flush().await;
+            }
             // A kept pending record stays visible and raises its alarm.
             state.raise_unavailable_stored_kinds();
             Ok(ReloadResult {
@@ -574,7 +598,9 @@ async fn apply_connectors_live(
             pending_live.push(entry.id.clone());
             continue;
         }
-        if engine.connectors().get(&entry.id).is_some() {
+        if let Some(sink) = engine.connectors().get(&entry.id) {
+            // Reconcile the connector health before the reload answers.
+            let _ = sink.probe().await;
             undo.added.push(entry.id.clone());
             undo.added
                 .push(format!("{}:{}", entry.connector_type, entry.id));
@@ -2221,5 +2247,175 @@ mod tests {
         );
         let dir = harness.state.config.dir().to_path_buf();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reload that cannot rebuild an action sink keeps the previous
+    /// registered sink and its delivery. The reload still commits the
+    /// connector document.
+    #[tokio::test]
+    async fn reload_rebuild_failure_keeps_the_previous_action_sink() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("receiver binds");
+        let address = listener.local_addr().expect("receiver address");
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&delivered);
+        let receiver = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let count = Arc::clone(&count);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    loop {
+                        let mut byte = [0_u8; 1];
+                        if socket.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head).into_owned();
+                    let length: usize = text
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().ok())
+                        })
+                        .flatten()
+                        .unwrap_or(0);
+                    let mut body = vec![0_u8; length];
+                    let _ = socket.read_exact(&mut body).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    count.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        let harness = Harness::start().await;
+        let token = harness.login_as_admin().await;
+        let secret_dir = unique_dir("mv01-reload-secret");
+        std::fs::create_dir_all(&secret_dir).expect("secret dir");
+        let secret = secret_dir.join("url");
+        std::fs::write(&secret, format!("http://{address}")).expect("secret file");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/connectors",
+                json!({
+                    "name": "mv01-reload-link",
+                    "type": "webhook",
+                    "url": format!("file:{}", secret.display()),
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "connector create: {body}");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/actions",
+                json!({
+                    "name": "mv01-reload-action",
+                    "type": "webhook",
+                    "connector": "mv01-reload-link",
+                    "parameters": {"path": "/reload"},
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "action create: {body}");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "mv01-reload-rule",
+                    "sql": "SELECT * FROM \"mv01/reload\"",
+                    "actions": ["mv01-reload-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule create: {body}");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/publish",
+                json!({"topic": "mv01/reload", "payload": "one"}),
+                &token,
+            )
+            .await;
+        assert!(status == 200 || status == 202, "publish: {body}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while delivered.load(Ordering::SeqCst) < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the old sink delivers before the reload"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let mut snapshot = (*harness.state.config.snapshot()).clone();
+        // The v5 rule names the action dispatch key, which the whole-config
+        // validator does not list as a connector. Remove it for the reload
+        // and create it again through the API after the reload.
+        snapshot
+            .rules
+            .rules
+            .retain(|rule| rule.id != "mv01-reload-rule");
+        std::fs::remove_file(&secret).expect("remove the secret");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v1/config/reload",
+                json!({"snapshot": snapshot}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200, "the reload itself commits: {body}");
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "id": "mv01-reload-rule",
+                    "sql": "SELECT * FROM \"mv01/reload\"",
+                    "actions": ["mv01-reload-action"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule re-create: {body}");
+        let (status, body) = harness
+            .get_auth("/api/v5/actions/mv01-reload-action", &token)
+            .await;
+        assert_eq!(status, 200, "the action stays readable: {body}");
+        assert_eq!(
+            body["status"], "disconnected",
+            "the rebuild failure reports the missing reference: {body}"
+        );
+        let (status, body) = harness
+            .post_auth(
+                "/api/v5/publish",
+                json!({"topic": "mv01/reload", "payload": "two"}),
+                &token,
+            )
+            .await;
+        assert!(status == 200 || status == 202, "publish: {body}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while delivered.load(Ordering::SeqCst) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the previous sink still delivers after the failed rebuild"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        receiver.abort();
+        std::fs::remove_dir_all(&secret_dir).ok();
     }
 }

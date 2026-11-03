@@ -1003,6 +1003,12 @@ impl ConnectorStore {
                                         kind = %conn_type,
                                         "{register_error}"
                                     );
+                                } else if lazy_http {
+                                    // The registration stayed lazy, but the
+                                    // health probe now runs before service.
+                                    if let Some(sink) = engine.connectors().get(&id) {
+                                        let _ = sink.probe().await;
+                                    }
                                 }
                             }
                         }
@@ -1848,16 +1854,35 @@ fn connector_live_view(
         .and_then(|v| v.as_str())
         .or_else(|| body.get("name").and_then(|v| v.as_str()))
         .unwrap_or("");
-    let live = engine.connectors().get(id).is_some();
+    let registered = engine.connectors().get(id);
+    let health = registered.as_ref().and_then(|sink| sink.health());
+    // A sink that reports its own probe result decides the state. A sink
+    // without a probe falls back to registration presence. Never assume
+    // a webhook target is reachable because it is registered.
+    let live = match &health {
+        Some(result) => result.healthy,
+        None => registered.is_some(),
+    };
     // KC-00/D2: a stored record whose kind is removed or not `ready` is
     // kept and visible but reads back `disconnected` with a reason.
-    let reason = body.get("type").and_then(|v| v.as_str()).and_then(|kind| {
+    let mut reason = body.get("type").and_then(|v| v.as_str()).and_then(|kind| {
         if broker_config::is_removed_connector_type(kind) {
             Some(crate::REMOVED_CONNECTOR_MESSAGE.to_string())
         } else {
             kind_refusal(kind)
         }
     });
+    if reason.is_none() {
+        if let Some(result) = health {
+            if !result.healthy {
+                reason = Some(
+                    result
+                        .reason
+                        .unwrap_or_else(|| "health check failed".to_string()),
+                );
+            }
+        }
+    }
     let status = if reason.is_some() {
         "disconnected"
     } else {
@@ -2178,10 +2203,12 @@ fn live_sink_kind(conn_type: &str) -> &str {
     broker_config::capability::live_sink_kind_for(conn_type)
 }
 
-/// Canonical type of a document-store connector. The KC-00 aliases map to
-/// their base kind. Every other name is unchanged.
+/// Canonical type of a connector. Documented aliases map to the
+/// runtime kind that executes them. The reference names its HTTP
+/// connector `http`; the tree runs it in the `webhook` arm.
 fn canonical_connector_kind(conn_type: &str) -> &str {
     match conn_type {
+        "http" => "webhook",
         "mongo" | "documentdb" => "mongodb",
         "couch" | "cb" => "couchbase",
         "elastic" | "es" | "opensearch" => "elasticsearch",
@@ -2254,6 +2281,16 @@ fn normalize_connector_document(conn_type: &str, body: &mut serde_json::Value) {
         "parameters".to_string(),
         serde_json::Value::Object(parameters),
     );
+}
+
+/// Client for a registered webhook connector. The request timeout bounds
+/// a delivery the same way the action runtime bounds one; the action path
+/// passes its own client built from `resource_opts.request_ttl`.
+fn webhook_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(broker_connectors::DEFAULT_WEBHOOK_TIMEOUT)
+        .build()
+        .unwrap_or_default()
 }
 
 /// Checked registration: a kind whose Cargo feature is disabled fails
@@ -2352,7 +2389,7 @@ pub(crate) async fn register_live_sink(
             let sink = Arc::new(broker_connectors::HttpWebhookSink::new(
                 url,
                 reqwest::header::HeaderMap::new(),
-                reqwest::Client::new(),
+                webhook_http_client(),
             ));
             engine.connectors().register(name, sink.clone());
             engine
@@ -2481,7 +2518,7 @@ pub(crate) async fn register_live_sink(
             let sink = Arc::new(broker_connectors::HttpWebhookSink::new(
                 url,
                 reqwest::header::HeaderMap::new(),
-                reqwest::Client::new(),
+                webhook_http_client(),
             ));
             engine.connectors().register(name, sink.clone());
             engine.connectors().register(format!("http:{}", name), sink);
@@ -2537,16 +2574,45 @@ pub(crate) async fn register_live_sink(
                 .get("username")
                 .and_then(|v| v.as_str())
                 .unwrap_or("postgres");
-            let password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
-            let conn_url = format!(
-                "postgres://{}:{}@{}/{}",
-                username, password, server, database
-            );
+            let raw_password = body.get("password").and_then(|v| v.as_str()).unwrap_or("");
+            let password = broker_connectors::resolve_field_secret(raw_password);
+            if broker_config::secrets::is_secret_ref(raw_password) && password.is_empty() {
+                return Err(format!(
+                    "connector {name:?} password reference is not resolvable (field `password`)"
+                ));
+            }
+            let (host, port) = match server.rsplit_once(':') {
+                Some((host, port)) => match port.parse::<u16>() {
+                    Ok(port) => (host.trim().trim_matches(&['[', ']'][..]).to_string(), port),
+                    Err(_) => (server.to_string(), 5432),
+                },
+                None => (server.to_string(), 5432),
+            };
+            if host.is_empty() {
+                return Err(format!(
+                    "connector {name:?} is missing required field: server (field `server`)"
+                ));
+            }
+            let use_tls = body
+                .get("ssl")
+                .and_then(|ssl| ssl.get("enable"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let settings = broker_connectors::postgres::PgConnectionSettings {
+                host,
+                port,
+                user: username.to_string(),
+                password,
+                database: database.to_string(),
+                use_tls,
+            };
             if let Some(transport) = record_sink_error!(
-                broker_connectors::postgres::DriverPgTransport::new(&conn_url, 1)
+                broker_connectors::postgres::DriverPgTransport::from_settings(settings, 1)
             ) {
+                let display_url =
+                    format!("postgres://{}@{}:{}/{}", username, server, port, database);
                 let config = broker_connectors::postgres::PostgreSqlSinkConfig {
-                    connection_url: conn_url,
+                    connection_url: display_url,
                     sql_template: "INSERT INTO test_telemetry (clientid, topic, payload, timestamp) VALUES ('rule-engine', $1, $3, 0)".to_string(),
                     pool_size: 1,
                     batch_size: 1,
@@ -6044,6 +6110,7 @@ pub async fn create_connector(
     State(state): State<ApiState>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
+    let _sink_guard = state.action_sink_lock.lock().await;
     let Some(obj_check) = body.as_object() else {
         return ApiError::BadRequest("request body must be a JSON object".to_string())
             .into_response();
@@ -6097,6 +6164,11 @@ pub async fn create_connector(
     if conn_type.is_empty() {
         return ApiError::BadRequest("missing required field: type".to_string()).into_response();
     }
+    // The reference names its HTTP connector `http`. The tree runs
+    // that connector in the `webhook` arm. Canonicalize before every
+    // check so the readiness gate and the stored row see the runtime
+    // that executes.
+    let conn_type = canonical_connector_kind(conn_type.as_str()).to_string();
     if let Some(message) = crate::removed_connector_refusal(&conn_type) {
         return ApiError::AlreadyExists(message.to_string()).into_response();
     }
@@ -6166,18 +6238,18 @@ pub async fn create_connector(
         return ApiError::AlreadyExists(message).into_response();
     }
 
-    // Register the live sink on the create event through the same
-    // path boot replay uses: delivery dials its target lazily at send
-    // time, so registration never depends on a point-in-time
-    // reachability probe. A kind with no execution path registers
-    // nothing, so it honestly reads back `disconnected` (stored config
-    // first, no claimed execution).
-    // A sink that fails to build is refused with the documented error
-    // shape carrying the sink text, and nothing is stored. A valid sink
-    // whose server is down now still builds, so it stores as before.
+    // Build the connector's live sink into a staged generation. The
+    // staged keys are invisible to delivery until the store commits, so
+    // a persist failure leaves the live map as it was.
+    state.engine.connectors().begin_stage();
+    // Delivery dials its target lazily at send time, so registration
+    // never depends on a point-in-time reachability probe. A kind with
+    // no execution path registers nothing, so it honestly reads back
+    // `disconnected` (stored config first, no claimed execution).
     if let Err(register_error) =
         try_register_live_sink(&state.engine, &conn_type, &name, &body).await
     {
+        state.engine.connectors().abort_stage();
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -6187,12 +6259,6 @@ pub async fn create_connector(
         )
             .into_response();
     }
-    // Live health, never a write-time snapshot: a kind with no
-    // execution path registers nothing, so it honestly reads back
-    // `disconnected` (stored config first, no claimed execution).
-    let live = state.engine.connectors().get(&name).is_some();
-    let status_str = connector_status(live);
-
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(name.clone()));
         obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
@@ -6200,14 +6266,9 @@ pub async fn create_connector(
             "type".to_string(),
             serde_json::Value::String(conn_type.clone()),
         );
-        obj.insert(
-            "status".to_string(),
-            serde_json::Value::String(status_str.to_string()),
-        );
         if !obj.contains_key("enable") {
             obj.insert("enable".to_string(), serde_json::Value::Bool(true));
         }
-        obj.insert("node_status".to_string(), connector_node_status(status_str));
     }
     normalize_connector_document(&conn_type, &mut body);
 
@@ -6216,10 +6277,12 @@ pub async fn create_connector(
     match state.connectors.try_insert(&name, body.clone()) {
         Ok(()) => {}
         Err(ConnectorInsertError::Duplicate) => {
+            state.engine.connectors().abort_stage();
             return ApiError::AlreadyExists(format!("connector {name:?} already exists"))
                 .into_response();
         }
         Err(ConnectorInsertError::Full) => {
+            state.engine.connectors().abort_stage();
             return ApiError::BadRequest(format!(
                 "connector store holds {} entries, at most {MAX_CONNECTORS}",
                 state.connectors.len()
@@ -6234,25 +6297,43 @@ pub async fn create_connector(
     let created_enable = body.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
     state.engine.set_action_enabled(&name, created_enable);
 
-    // A persist failure is a 500 (the in-memory entry stays but the disk
-    // save failed); the loss must never be silent.
     if let Err(error) = state.connectors.persist() {
+        // The store and the live map stay as they were: drop the staged
+        // sinks and remove the uncommitted row.
+        state.engine.connectors().abort_stage();
+        state.connectors.remove(&name);
+        state.engine.remove_action(&name);
         return connector_persist_error(error);
     }
-
-    // MV-01: the new connector can resolve actions that stored while
-    // dangling (dangling references keep the action storable, see
-    // `stage_action_sink`): replay every stored action's owned sink from
-    // the stores so a stored action starts delivering the moment its
-    // target connector arrives. Actions whose targets still miss keep
-    // their wiring state and alarm — the replay is observational for
-    // everything it cannot build.
-    crate::v5::action_sinks::rebuild_all_action_sinks(
+    // Publish the generation, then drain any sink it replaced.
+    for old in state.engine.connectors().commit_stage() {
+        let _ = old.flush().await;
+    }
+    // The new connector can resolve actions that stored while dangling
+    // (dangling references keep the action storable): rebuild only the
+    // actions of this connector so a stored action starts delivering
+    // the moment its target arrives. An unrelated action update is never
+    // overwritten by a stale full replay.
+    let replaced = crate::v5::action_sinks::rebuild_connector_action_sinks(
         &state.engine,
         &state.connectors,
         &state.actions,
         &state.alarms,
+        &name,
     );
+    for old in replaced {
+        let _ = old.flush().await;
+    }
+    // Probe the new connector and every action it wired before the write
+    // answers, so a down target reads `disconnected` from a real attempt.
+    if let Some(sink) = state.engine.connectors().get(&name) {
+        let _ = sink.probe().await;
+    }
+    crate::v5::action_sinks::probe_action_sinks(&state.engine, &state.actions, |record| {
+        crate::v5::action_sinks::action_targets_connector(&state.connectors, record, &name)
+    })
+    .await;
+    let body = connector_live_view(&body, &state.engine);
 
     (StatusCode::CREATED, Json(body)).into_response()
 }
@@ -6305,6 +6386,7 @@ pub async fn update_connector(
     Query(_ignored): Query<HashMap<String, String>>,
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
+    let _sink_guard = state.action_sink_lock.lock().await;
     // The path id is authoritative and accepts the bare id or the
     // `{type}:{name}` key. No fuzzy matching: any other form is 404.
     // Existence before validation: an unknown id is 404 and creates
@@ -6352,6 +6434,11 @@ pub async fn update_connector(
     if conn_type.is_empty() {
         return ApiError::BadRequest("missing required field: type".to_string()).into_response();
     }
+    // The reference names its HTTP connector `http`. The tree runs
+    // that connector in the `webhook` arm. Canonicalize before every
+    // check so the readiness gate and the stored row see the runtime
+    // that executes.
+    let conn_type = canonical_connector_kind(conn_type.as_str()).to_string();
     if let Some(message) = crate::removed_connector_refusal(&conn_type) {
         return ApiError::BadRequest(message.to_string()).into_response();
     }
@@ -6392,15 +6479,30 @@ pub async fn update_connector(
             return ApiError::BadRequest(message).into_response();
         }
     }
-    // MV-01 (R2-04): every dependent action must accept the new
-    // connector settings before anything swaps in. Each action's owned
-    // sink is built here staged (built, never registered): a failure
-    // answers 400 naming the action and the field, keeps every old
-    // sink (the old generation keeps delivering) and leaves the stored
-    // row untouched. On success the staged sinks swap in under the
-    // action dispatch keys below, after the stored update and its
-    // persist.
-    let mut staged_sinks: Vec<(String, Arc<dyn broker_connectors::Sink>)> = Vec::new();
+    // MV-01 (R2-04): build the whole new generation before anything
+    // swaps in. The connector's own sinks and every dependent action's
+    // owned sink go into one staged map. A failure answers 400 naming
+    // the action and the field, keeps every old sink (the old
+    // generation keeps delivering) and leaves the stored row untouched.
+    // Every dependent action must accept the new connector settings
+    // before anything swaps in; each action's owned sink is built here
+    // staged (built, never published): on success the staged sinks swap
+    // in under the action dispatch keys below, after the stored update
+    // and its persist.
+    state.engine.connectors().begin_stage();
+    if let Err(register_error) =
+        try_register_live_sink(&state.engine, &conn_type, &bare, &body).await
+    {
+        state.engine.connectors().abort_stage();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "BAD_REQUEST",
+                "message": register_error,
+            })),
+        )
+            .into_response();
+    }
     let mut staged_ids: Vec<String> = Vec::new();
     for record in state.actions.snapshot() {
         if !crate::v5::action_sinks::action_targets_connector(&state.connectors, &record, &bare) {
@@ -6415,6 +6517,7 @@ pub async fn update_connector(
         ) {
             Ok(opts) => opts,
             Err(message) => {
+                state.engine.connectors().abort_stage();
                 return ApiError::BadRequest(format!(
                     "action {:?} cannot use connector {bare:?}: {message}",
                     record.id
@@ -6436,13 +6539,14 @@ pub async fn update_connector(
                     opts,
                     extract_target_host_port(&body),
                 );
-                staged_sinks.push((key, sink));
+                state.engine.connectors().register(key, sink);
                 staged_ids.push(record.id.clone());
             }
             Ok(None) => {
                 staged_ids.push(record.id.clone());
             }
             Err(message) => {
+                state.engine.connectors().abort_stage();
                 return ApiError::BadRequest(format!(
                     "action {:?} cannot use connector {bare:?}: {message}",
                     record.id
@@ -6452,49 +6556,28 @@ pub async fn update_connector(
         }
     }
     let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
-    // Swap the live sink first: drop every registration for this id
-    // (bare plus any `kind:id` alias, mirroring delete) so a kind change
-    // leaves no stale alias behind, then re-register through the same
-    // path create uses. Registration never depends on a point-in-time
-    // reachability probe (delivery dials lazily at send time); a kind
-    // with no execution path registers nothing and honestly reads back
-    // `disconnected`.
-    for registered in state.engine.connectors().ids() {
-        if registered == bare
-            || (registered.ends_with(&format!(":{bare}"))
-                && !broker_config::is_v5_action_sink_key(&registered))
-        {
-            state.engine.connectors().unregister(&registered);
-        }
-    }
-    if let Err(register_error) =
-        try_register_live_sink(&state.engine, &conn_type, &bare, &body).await
-    {
-        // The failed replace stores nothing: put the previous live sink
-        // back so the engine still matches the stored entry.
-        let old_kind = stored
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if !old_kind.is_empty() {
-            let _ = try_register_live_sink(&state.engine, &old_kind, &bare, &stored).await;
-        }
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "code": "BAD_REQUEST",
-                "message": register_error,
-            })),
-        )
-            .into_response();
-    }
-    // Live health, never a write-time snapshot: a kind with no
-    // execution path registers nothing, so it honestly reads back
-    // `disconnected` (stored config first, no claimed execution).
-    let live = state.engine.connectors().get(&bare).is_some();
-    let status_str = connector_status(live);
+    let old_enable = stored
+        .get("enable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let old_connector_sinks: Vec<(String, Arc<dyn broker_connectors::Sink>)> = state
+        .engine
+        .connectors()
+        .ids()
+        .into_iter()
+        .filter(|registered| {
+            registered == &bare
+                || (registered.ends_with(&format!(":{bare}"))
+                    && !broker_config::is_v5_action_sink_key(registered))
+        })
+        .filter_map(|registered| {
+            state
+                .engine
+                .connectors()
+                .get(&registered)
+                .map(|sink| (registered, sink))
+        })
+        .collect();
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(bare.clone()));
         obj.insert("name".to_string(), serde_json::Value::String(bare.clone()));
@@ -6503,14 +6586,10 @@ pub async fn update_connector(
             serde_json::Value::String(conn_type.clone()),
         );
         obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
-        obj.insert(
-            "status".to_string(),
-            serde_json::Value::String(status_str.to_string()),
-        );
-        obj.insert("node_status".to_string(), connector_node_status(status_str));
     }
     normalize_connector_document(&conn_type, &mut body);
     if !state.connectors.replace(&bare, body.clone()) {
+        state.engine.connectors().abort_stage();
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     }
     // W3-19: mirror the flag into the dispatch snapshot (same lock-free
@@ -6519,22 +6598,37 @@ pub async fn update_connector(
     // MV-01/R2: the replace can flip the enable flag along with the
     // settings; the dependent actions' delivery follows it.
     mirror_dependent_actions(&state, &bare, enable);
-    // A persist failure is a 500 (the in-memory replacement stays but the
-    // disk save failed); the loss must never be silent.
     if let Err(error) = state.connectors.persist() {
+        // Nothing swapped: drop the staged generation, restore the
+        // stored row and the flags, and keep every old sink delivering.
+        state.engine.connectors().abort_stage();
+        state.connectors.replace(&bare, stored.clone());
+        state.engine.set_action_enabled(&bare, old_enable);
+        mirror_dependent_actions(&state, &bare, old_enable);
         return connector_persist_error(error);
     }
-    // MV-01/R2-04: swap the staged dependent-action sinks in under their
-    // action dispatch keys (staged build → persist → swap, in that
-    // order) and report their wiring live. The actions that staged
-    // nothing keep their state (they never owned a sink for this
-    // connector's new shape). Rows that still wait in an old runtime
-    // count as stopped drops before the swap.
-    for (key, sink) in staged_sinks {
-        if let Some(old) = state.engine.connectors().get(&key) {
-            old.discard_buffered();
+    // Publish the new generation in one step (staged build, persist,
+    // swap, in that order). Drain the waiting rows of each replaced
+    // sink with no loss. A
+    // registration that the new
+    // kind no longer claims is removed too, so a kind change leaves
+    // no stale alias.
+    // The actions that staged nothing keep their state (they never
+    // owned a sink for this connector's new shape).
+    let mut replaced = state.engine.connectors().commit_stage();
+    for (registered, old) in old_connector_sinks {
+        if state
+            .engine
+            .connectors()
+            .get(&registered)
+            .is_some_and(|current| Arc::ptr_eq(&current, &old))
+        {
+            state.engine.connectors().unregister(&registered);
+            replaced.push(old);
         }
-        state.engine.connectors().register(key, sink);
+    }
+    for old in replaced {
+        let _ = old.flush().await;
     }
     for action_id in &staged_ids {
         state
@@ -6544,10 +6638,22 @@ pub async fn update_connector(
             .alarms
             .deactivate(&format!("action_build_failed:{action_id}"));
     }
+    // Probe the updated connector and every dependent action before the
+    // write answers, so a down target reads `disconnected` from a real
+    // attempt.
+    if let Some(sink) = state.engine.connectors().get(&bare) {
+        let _ = sink.probe().await;
+    }
+    crate::v5::action_sinks::probe_action_sinks(&state.engine, &state.actions, |record| {
+        crate::v5::action_sinks::action_targets_connector(&state.connectors, record, &bare)
+    })
+    .await;
+    let body = connector_live_view(&body, &state.engine);
     (StatusCode::OK, Json(body)).into_response()
 }
 
 pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    let _sink_guard = state.action_sink_lock.lock().await;
     // The path id accepts the bare id or the `{type}:{name}` key. No
     // fuzzy matching: any other form is 404. Read (C07-04) and replace
     // (C07-05) match exactly the same way.
@@ -6600,13 +6706,20 @@ pub async fn delete_connector(State(state): State<ApiState>, Path(id): Path<Stri
     // rulebook does not decide; the current choice guards rules and
     // actions (the only stores with a connector reference field today)
     // until the checker pins it.
+    let mut removed_sinks = Vec::new();
     for registered in state.engine.connectors().ids() {
         if registered == bare
             || (registered.ends_with(&format!(":{bare}"))
                 && !broker_config::is_v5_action_sink_key(&registered))
         {
+            if let Some(sink) = state.engine.connectors().get(&registered) {
+                removed_sinks.push(sink);
+            }
             state.engine.connectors().unregister(&registered);
         }
+    }
+    for sink in removed_sinks {
+        let _ = sink.flush().await;
     }
 
     if !state.connectors.remove(&bare) {
@@ -6689,6 +6802,7 @@ pub async fn set_connector_enabled(
     State(state): State<ApiState>,
     Path((id, enable_raw)): Path<(String, String)>,
 ) -> Response {
+    let _sink_guard = state.action_sink_lock.lock().await;
     // The path id accepts the bare id or the `{type}:{name}` key.
     // Existence before validation: an unknown id is 404 and persists
     // nothing, even when the flag is also malformed.
@@ -6727,6 +6841,9 @@ pub async fn set_connector_enabled(
     // delivery; an enable restores them (the flap rides the same
     // mirror, before persist, after the store flip).
     mirror_dependent_actions(&state, &bare, enable);
+    if !enable {
+        flush_dependent_actions(&state, &bare).await;
+    }
     if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
@@ -6849,6 +6966,7 @@ pub async fn run_node_connector_operation(
 /// with no body. Management-plane only; see the caller for the
 /// locking and fire-path notes.
 async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) -> Response {
+    let _sink_guard = state.action_sink_lock.lock().await;
     // The path id accepts the bare id or the `{type}:{name}` key.
     // Existence before validation: an unknown id is 404 and persists
     // nothing, even when the operation is also unknown.
@@ -6888,10 +7006,27 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     // MV-01/R2: a connector disable stops every dependent action's
     // delivery; an enable restores them.
     mirror_dependent_actions(state, &bare, enable);
+    if !enable {
+        flush_dependent_actions(state, &bare).await;
+    }
     if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Drain every dependent action runtime after its connector stops. The
+/// flags already stop new fires; the buffered rows still reach the old
+/// target.
+async fn flush_dependent_actions(state: &ApiState, bare: &str) {
+    for record in state.actions.snapshot() {
+        if crate::v5::action_sinks::action_targets_connector(&state.connectors, &record, bare) {
+            let key = broker_config::v5_action_sink_key(&record.id);
+            if let Some(sink) = state.engine.connectors().get(&key) {
+                let _ = sink.flush().await;
+            }
+        }
+    }
 }
 
 /// Resolve one URL-like connector field to a real `http`/`https` network

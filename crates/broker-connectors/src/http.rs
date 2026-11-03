@@ -1136,7 +1136,6 @@ mod tests {
             encoding: HmacEncoding::Hex,
         });
 
-        config.linger_ms = None;
         let (sink, transport) = test_sink(config);
         let topic = Topic::new("t").unwrap();
         for v in [1, 2, 3] {
@@ -1176,7 +1175,6 @@ mod tests {
         config.body_format = HttpBodyFormat::JsonBatchArray;
         config.batch_size = Some(100);
 
-        config.linger_ms = None;
         let (sink, transport) = test_sink(config);
         sink.send(
             &Topic::new("a/1").unwrap(),
@@ -1216,7 +1214,6 @@ mod tests {
         config.body_format = HttpBodyFormat::JsonBatchArray;
         config.batch_size = Some(100);
 
-        config.linger_ms = None;
         let (sink, transport) = test_sink(config);
         let topic = Topic::new("t").unwrap();
         for v in [1, 2, 3] {

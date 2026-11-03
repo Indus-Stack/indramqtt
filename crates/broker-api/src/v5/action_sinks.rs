@@ -570,9 +570,13 @@ struct ActionHealth {
 
 impl ActionHealth {
     fn new() -> Self {
+        // A sink starts unprobed, never healthy. The create and update
+        // paths probe before they answer; boot and reload probe before
+        // service starts. Until then the read path reports the pending
+        // state instead of an assumed reachable target.
         Self {
-            healthy: AtomicBool::new(true),
-            reason: Mutex::new(None),
+            healthy: AtomicBool::new(false),
+            reason: Mutex::new(Some("health check pending".to_string())),
         }
     }
 
@@ -616,6 +620,8 @@ struct ActionRuntimeState {
     buffer: Mutex<RuntimeBuffer>,
     inflight: Arc<tokio::sync::Semaphore>,
     health: ActionHealth,
+    health_target: Option<String>,
+    health_timeout: Option<Duration>,
 }
 
 /// Action-owned runtime sink. It applies `resource_opts` for one action:
@@ -644,6 +650,8 @@ impl ActionRuntimeSink {
             metrics,
             buffer: Mutex::new(RuntimeBuffer::default()),
             health: ActionHealth::new(),
+            health_target: health_target.clone(),
+            health_timeout,
         });
         let (wake, receiver) = tokio::sync::mpsc::channel(1);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1002,6 +1010,22 @@ impl Drop for ActionRuntimeState {
 
 #[async_trait::async_trait]
 impl Sink for ActionRuntimeSink {
+    async fn flush(&self) -> broker_connectors::Result<()> {
+        self.state.flush_pending(true).await
+    }
+
+    async fn probe(&self) -> std::result::Result<(), String> {
+        let Some(target) = self.state.health_target.as_deref() else {
+            // A kind without a network target has nothing to dial and is
+            // not a down target.
+            self.state.health.record(Ok(()));
+            return Ok(());
+        };
+        let result = probe_target(target, self.state.health_timeout).await;
+        self.state.health.record(result.clone());
+        result
+    }
+
     async fn send(
         &self,
         topic: &Topic,
@@ -1136,6 +1160,10 @@ pub(crate) struct ActionSinkStage {
     pub resource_opts: ActionResourceOpts,
     /// Network target for the periodic health probe.
     pub health_target: Option<String>,
+    /// Run one probe before the write answers. The check runs after the
+    /// secret resolver, so a target behind a secret reference is dialled
+    /// too.
+    pub probe_on_create: bool,
 }
 
 /// Resolve the connector an action references and stage its owned
@@ -1155,6 +1183,9 @@ pub(crate) fn stage_action_sink(
     connectors: &ConnectorStore,
     record: &ActionRecord,
 ) -> Result<ActionSinkStage, String> {
+    if let Some(message) = super::rules::kind_refusal(&record.action_type) {
+        return Err(message);
+    }
     let resource_opts = ActionResourceOpts::parse(&record.id, &record.resource_opts)?;
     if !action_owned_kind(&record.action_type) {
         // This kind owns no action runtime yet, so only the documented
@@ -1171,6 +1202,7 @@ pub(crate) fn stage_action_sink(
             wiring: ActionWiring::None,
             resource_opts,
             health_target: None,
+            probe_on_create: false,
         });
     }
     required_action_parameters(record)?;
@@ -1191,16 +1223,18 @@ pub(crate) fn stage_action_sink(
             )),
             resource_opts,
             health_target: None,
+            probe_on_create: false,
         });
     };
     let sink = build_action_sink(record, &doc, &resource_opts)?;
-    let health_target = if sink.is_some() {
+    let has_sink = sink.is_some();
+    let health_target = if has_sink {
         super::rules::extract_target_host_port(&doc)
     } else {
         None
     };
     Ok(ActionSinkStage {
-        wiring: if sink.is_some() {
+        wiring: if has_sink {
             ActionWiring::Live
         } else {
             ActionWiring::None
@@ -1208,6 +1242,10 @@ pub(crate) fn stage_action_sink(
         sink,
         resource_opts,
         health_target,
+        // Every built sink probes before the write answers, including a
+        // target that arrives through a secret reference. The resolver
+        // runs first, so the probe dials the real target.
+        probe_on_create: has_sink,
     })
 }
 
@@ -1229,7 +1267,7 @@ pub(crate) fn build_action_sink(
         "alloydb" => build_pg_family_sink("alloydb", record, connector_doc).map(Some),
         "cockroachdb" => build_pg_family_sink("cockroachdb", record, connector_doc).map(Some),
         "redshift" => build_pg_family_sink("redshift", record, connector_doc).map(Some),
-        "webhook" | "http" => build_webhook_sink(record, connector_doc).map(Some),
+        "webhook" | "http" => build_webhook_sink(record, connector_doc, opts).map(Some),
         "clickhouse" => build_clickhouse_sink(record, connector_doc).map(Some),
         "influxdb" => build_influxdb_sink(record, connector_doc).map(Some),
         "greptimedb" => build_greptimedb_sink(record, connector_doc).map(Some),
@@ -1533,11 +1571,15 @@ fn clean_server(server: &str) -> String {
 /// optional), the statement and the pool shape from this action.
 ///
 /// Values and defaults:
-/// - `connection_url`: `postgres://{user}:{password}@{server}/{db}`
-///   from the connector document. No invented fallback: a missing
-///   `server`, `database` or `username` fails the build (fail closed,
-///   S1-01) and the write that introduced it is refused with the
-///   field named.
+/// - Connection fields: the transport receives `host`, `port`, `user`,
+///   `password` and `database` as values through
+///   [`broker_connectors::postgres::PgConnectionSettings`], so a
+///   delimiter in a value cannot change the target. No invented
+///   fallback: a missing `server`, `database` or `username` fails the
+///   build (fail closed, S1-01) and the write that introduced it is
+///   refused with the field named.
+/// - `connection_url`: a display-only string without the password. The
+///   transport never parses it.
 /// - `sql_template`: this action's `parameters.sql`.
 /// - `pool_size`: the connector setting, with the reference schema
 ///   default `8`; it bounds the action's concurrent batch connections.
@@ -1561,16 +1603,40 @@ pub(crate) fn build_pgsql_sink(
     let database = first_string(connector_doc, &["database"]).ok_or_else(|| named("database"))?;
     let username =
         first_string(connector_doc, &["username", "user"]).ok_or_else(|| named("username"))?;
-    let password =
-        first_string(connector_doc, &["password"]).unwrap_or(std::borrow::Cow::Borrowed(""));
+    // A connector may store a secret reference instead of the password,
+    // as the webhook connector does. Resolve it at build time so the
+    // store keeps the reference and an unresolvable reference fails
+    // closed instead of dialling with a placeholder.
+    let raw_password = first_string(connector_doc, &["password"]);
+    let password = raw_password
+        .as_deref()
+        .map(broker_connectors::resolve_field_secret)
+        .unwrap_or_default();
+    if raw_password
+        .as_deref()
+        .is_some_and(broker_config::secrets::is_secret_ref)
+        && password.is_empty()
+    {
+        return Err(format!(
+            "connector {connector:?} password reference is not resolvable (field `password`, action {:?})",
+            record.id
+        ));
+    }
     let server = clean_server(&raw_server);
     if server.is_empty() {
         return Err(named("server"));
     }
-    let conn_url = format!(
-        "postgres://{}:{}@{}/{}",
-        username, password, server, database
-    );
+    let (host, port) = match server.rsplit_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => (
+            host.trim().trim_matches(&['[', ']'][..]).to_string(),
+            port.parse::<u16>().map_err(|_| named("server"))?,
+        ),
+        _ => (server, 5432),
+    };
+    if host.is_empty() {
+        return Err(named("server"));
+    }
+    let use_tls = pgsql_tls_enabled(connector_doc, &connector, &record.id)?;
     let sql = param_string(record, "sql").ok_or_else(|| {
         format!(
             "action {:?} is missing required field: sql (field `parameters.sql`)",
@@ -1586,15 +1652,36 @@ pub(crate) fn build_pgsql_sink(
     // `send_batch`, so this driver must not batch a second time.
     let batch_size = 1;
     let batch_timeout_ms = 0;
-    let transport = broker_connectors::postgres::DriverPgTransport::new(&conn_url, pool_size)
-        .map_err(|e| {
-            format!(
-                "action {:?} cannot build its pgsql transport: {e}",
-                record.id
-            )
-        })?;
+    let settings = broker_connectors::postgres::PgConnectionSettings {
+        host,
+        port,
+        user: username.to_string(),
+        password,
+        database: database.to_string(),
+        use_tls,
+    };
+    let transport =
+        broker_connectors::postgres::DriverPgTransport::from_settings(settings, pool_size)
+            .map_err(|e| {
+                format!(
+                    "action {:?} cannot build its pgsql transport: {e}",
+                    record.id
+                )
+            })?;
+    // The display form leaves out the password; the transport above owns
+    // the connection fields and never parses this string.
+    let display_url = format!(
+        "postgres://{}@{}:{}/{}",
+        username,
+        connector_doc
+            .get("server")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        port,
+        database
+    );
     let config = broker_connectors::postgres::PostgreSqlSinkConfig {
-        connection_url: conn_url,
+        connection_url: display_url,
         sql_template: sql,
         pool_size,
         batch_size,
@@ -1931,6 +2018,72 @@ fn pg_family_tls(
     Ok(true)
 }
 
+/// Map the connector `ssl` object onto the PostgreSQL transport. TLS is
+/// on only when `ssl.enable` is true. The transport verifies the server
+/// certificate against the system roots; a client certificate and a
+/// custom CA file are refused here because this transport does not load
+/// them, so the broker never accepts a setting it does not apply.
+fn pgsql_tls_enabled(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    action_id: &str,
+) -> Result<bool, String> {
+    let Some(ssl) = connector_doc.get("ssl") else {
+        return Ok(false);
+    };
+    if !ssl.is_object() {
+        return Err(format!(
+            "connector {connector:?} field `ssl` must be an object (action {action_id:?})"
+        ));
+    }
+    let enabled = ssl.get("enable").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !enabled {
+        return Ok(false);
+    }
+    // The transport always verifies the server certificate against the
+    // system trust store. Accept only the value that it applies and
+    // refuse `verify_none` instead of accepting it and ignoring it.
+    if let Some(verify) = ssl.get("verify").and_then(|v| v.as_str()) {
+        match verify {
+            "verify_peer" => {}
+            "verify_none" => {
+                return Err(format!(
+                    "connector {connector:?} field `ssl.verify` value \"verify_none\" is not supported: this transport always verifies the server certificate (action {action_id:?})"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "connector {connector:?} field `ssl.verify` value {other:?} is not supported (action {action_id:?})"
+                ));
+            }
+        }
+    }
+    for (field, value) in [
+        ("cacertfile", ssl.get("cacertfile")),
+        ("certfile", ssl.get("certfile")),
+        ("keyfile", ssl.get("keyfile")),
+    ] {
+        if value
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            return Err(format!(
+                "connector {connector:?} field `ssl.{field}` is not supported by this transport (action {action_id:?})"
+            ));
+        }
+    }
+    if let Some(name) = ssl
+        .get("server_name_indication")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty() && *v != "disable")
+    {
+        return Err(format!(
+            "connector {connector:?} field `ssl.server_name_indication` value {name:?} is not supported by this transport (action {action_id:?})"
+        ));
+    }
+    Ok(true)
+}
+
 /// Build one PostgreSQL-protocol action sink (`alloydb`,
 /// `cockroachdb`, `redshift`): the maintained `tokio-postgres` driver
 /// dials `server`/`database` with `username` and the resolved
@@ -2195,7 +2348,8 @@ pub(crate) fn build_oracle_sink(
     Ok(Arc::new(sink))
 }
 
-/// Build the action's `webhook`/`http` sink: the base URL comes from/// the connector document, this action's `parameters` adds the path,
+/// Build the action's `webhook`/`http` sink: the base URL comes from
+/// the connector document, this action's `parameters` adds the path,
 /// method and headers.
 ///
 /// Values and defaults:
@@ -2210,6 +2364,7 @@ pub(crate) fn build_oracle_sink(
 pub(crate) fn build_webhook_sink(
     record: &ActionRecord,
     connector_doc: &serde_json::Value,
+    opts: &ActionResourceOpts,
 ) -> Result<Arc<dyn broker_connectors::Sink>, String> {
     let connector = record.connector.trim().to_string();
     let named = |field: &str| {
@@ -2266,15 +2421,28 @@ pub(crate) fn build_webhook_sink(
             };
             let name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
                 .map_err(|_| format!("action {:?} header name {key:?} is invalid", record.id))?;
-            let value = reqwest::header::HeaderValue::from_str(text)
-                .map_err(|_| format!("action {:?} header value {text:?} is invalid", record.id))?;
+            // Do not echo the value: a header often carries a secret.
+            let value = reqwest::header::HeaderValue::from_str(text).map_err(|_| {
+                format!(
+                    "action {:?} header value for {key:?} is invalid (field `parameters.headers`)",
+                    record.id
+                )
+            })?;
             headers.insert(name, value);
         }
     }
+    let mut client = reqwest::Client::builder();
+    if let Some(ttl) = opts.request_ttl {
+        client = client.timeout(ttl);
+    }
+    let client = client.build().map_err(|_| {
+        format!(
+            "action {:?} cannot build its webhook client (field `resource_opts.request_ttl`)",
+            record.id
+        )
+    })?;
     Ok(Arc::new(broker_connectors::HttpWebhookSink::new(
-        target,
-        headers,
-        reqwest::Client::new(),
+        target, headers, client,
     )))
 }
 
@@ -4213,9 +4381,59 @@ pub fn rebuild_all_action_sinks(
     connectors: &ConnectorStore,
     actions: &ActionStore,
     alarms: &crate::v5::alarms::AlarmStore,
+) -> Vec<Arc<dyn broker_connectors::Sink>> {
+    rebuild_action_sinks(engine, connectors, actions, alarms, |_| true)
+}
+
+/// Rebuild only the actions that target one connector. Connector create
+/// uses this instead of the full replay, so an unrelated action update
+/// can never be overwritten by a stale generation.
+pub(crate) fn rebuild_connector_action_sinks(
+    engine: &broker_rules::RuleEngine,
+    connectors: &ConnectorStore,
+    actions: &ActionStore,
+    alarms: &crate::v5::alarms::AlarmStore,
+    bare: &str,
+) -> Vec<Arc<dyn broker_connectors::Sink>> {
+    rebuild_action_sinks(engine, connectors, actions, alarms, |record| {
+        action_targets_connector(connectors, record, bare)
+    })
+}
+
+/// Probe the registered runtime sinks of the selected actions. Boot,
+/// reload, restore and write paths await this before they answer.
+/// A down target then reads `disconnected` from a real attempt.
+/// No action without a registered sink is dialled.
+pub async fn probe_action_sinks(
+    engine: &broker_rules::RuleEngine,
+    actions: &ActionStore,
+    include: impl Fn(&ActionRecord) -> bool,
 ) {
     for record in actions.snapshot() {
+        if !include(&record) {
+            continue;
+        }
         let key = broker_config::v5_action_sink_key(&record.id);
+        if let Some(sink) = engine.connectors().get(&key) {
+            let _ = sink.probe().await;
+        }
+    }
+}
+
+fn rebuild_action_sinks(
+    engine: &broker_rules::RuleEngine,
+    connectors: &ConnectorStore,
+    actions: &ActionStore,
+    alarms: &crate::v5::alarms::AlarmStore,
+    include: impl Fn(&ActionRecord) -> bool,
+) -> Vec<Arc<dyn broker_connectors::Sink>> {
+    let mut replaced = Vec::new();
+    for record in actions.snapshot() {
+        if !include(&record) {
+            continue;
+        }
+        let key = broker_config::v5_action_sink_key(&record.id);
+        let previous = engine.connectors().get(&key);
         // MV-01/R2: the dispatch flag is the AND of the action's own
         // enable and its connector's (a connector disable stops every
         // dependent action; a connector enable restores them). Mirrored
@@ -4227,10 +4445,11 @@ pub fn rebuild_all_action_sinks(
         if !action_owned_kind(&record.action_type) {
             // No runtime for this kind yet (or the kind changed): drop
             // a stale registration so the key stops claiming delivery.
-            // Waiting rows count as stopped drops first.
-            if let Some(old) = engine.connectors().get(&key) {
-                old.discard_buffered();
+            // The replaced generation is handed to the caller so it
+            // drains the buffered rows to the old target.
+            if previous.is_some() {
                 engine.connectors().unregister(&key);
+                replaced.extend(previous);
             }
             actions.set_wiring(&record.id, ActionWiring::None);
             alarms.deactivate(&format!("action_build_failed:{}", record.id));
@@ -4239,7 +4458,9 @@ pub fn rebuild_all_action_sinks(
         let stage = match stage_action_sink(connectors, &record) {
             Ok(stage) => stage,
             Err(message) => {
-                set_failed_wiring(engine, actions, alarms, &record, message);
+                // Keep the previous sink: a reload or restore that cannot
+                // rebuild one action must not stop its delivery.
+                set_failed_wiring(actions, alarms, &record, message);
                 continue;
             }
         };
@@ -4255,49 +4476,45 @@ pub fn rebuild_all_action_sinks(
                         stage.health_target,
                     );
                     // Boot finds nothing here. A reload or restore swap
-                    // counts the old waiting rows as stopped drops first.
-                    if let Some(old) = engine.connectors().get(&key) {
-                        old.discard_buffered();
-                    }
+                    // hands the old generation to the caller for drain.
                     engine.connectors().register(key, sink);
+                    replaced.extend(previous);
                 }
                 actions.set_wiring(&record.id, ActionWiring::Live);
                 alarms.deactivate(&format!("action_build_failed:{}", record.id));
             }
             ActionWiring::Failed(message) => {
-                set_failed_wiring(engine, actions, alarms, &record, message);
+                // Keep the old generation delivering. The wiring and the
+                // alarm report the failure.
+                set_failed_wiring(actions, alarms, &record, message);
             }
             ActionWiring::None => {
                 // No runtime for this kind (or the reference dangles
                 // with no resolution): drop a stale registration so the
-                // key stops claiming delivery. Waiting rows count as
-                // stopped drops first.
-                if let Some(old) = engine.connectors().get(&key) {
-                    old.discard_buffered();
+                // key stops claiming delivery. The replaced generation
+                // is handed to the caller for drain.
+                if previous.is_some() {
                     engine.connectors().unregister(&key);
+                    replaced.extend(previous);
                 }
                 actions.set_wiring(&record.id, ActionWiring::None);
                 alarms.deactivate(&format!("action_build_failed:{}", record.id));
             }
         }
     }
+    replaced
 }
 
 /// Fail one action's wiring into the stored, alarm-raising, honest
-/// `disconnected` state: drop the key, keep the record readable with
-/// the reason and raise `action_build_failed:{id}`.
+/// `disconnected` state. A previously registered sink stays live (the
+/// old generation), so a reload or restore never stops delivery because
+/// one rebuild failed.
 fn set_failed_wiring(
-    engine: &broker_rules::RuleEngine,
     actions: &ActionStore,
     alarms: &crate::v5::alarms::AlarmStore,
     record: &ActionRecord,
     message: String,
 ) {
-    let key = broker_config::v5_action_sink_key(&record.id);
-    if let Some(old) = engine.connectors().get(&key) {
-        old.discard_buffered();
-        engine.connectors().unregister(&key);
-    }
     actions.set_wiring(&record.id, ActionWiring::Failed(message.clone()));
     alarms.activate(
         &format!("action_build_failed:{}", record.id),
@@ -4330,14 +4547,14 @@ mod tests {
     fn webhook_record(id: &str, connector: &str, parameters: serde_json::Value) -> ActionRecord {
         ActionRecord {
             parameters,
-            ..record(id, "http", connector)
+            ..record(id, "webhook", connector)
         }
     }
 
     #[tokio::test]
     async fn stage_non_owned_kind_wires_nothing() {
         let connectors = ConnectorStore::new();
-        let stage = stage_action_sink(&connectors, &record("act", "mqtt_bridge", "mqtt:up"))
+        let stage = stage_action_sink(&connectors, &record("act", "console", "console:up"))
             .expect("staging a kind with no runtime stages nothing");
         assert!(stage.sink.is_none());
         assert_eq!(stage.wiring, ActionWiring::None);
@@ -4346,7 +4563,7 @@ mod tests {
     #[tokio::test]
     async fn stage_missing_connector_field_refuses_the_write() {
         let connectors = ConnectorStore::new();
-        let error = stage_action_sink(&connectors, &record("act", "http", ""))
+        let error = stage_action_sink(&connectors, &record("act", "webhook", ""))
             .err()
             .expect("an owned kind without a connector is refused");
         assert!(
@@ -4358,7 +4575,7 @@ mod tests {
     #[tokio::test]
     async fn stage_dangling_connector_stores_disconnected_without_dialling() {
         let connectors = ConnectorStore::new();
-        let stage = stage_action_sink(&connectors, &record("act", "http", "webhook:gone-away"))
+        let stage = stage_action_sink(&connectors, &record("act", "webhook", "webhook:gone-away"))
             .expect("a dangling reference is not a build failure");
         assert!(stage.sink.is_none());
         let ActionWiring::Failed(reason) = stage.wiring else {

@@ -10572,12 +10572,15 @@ async fn serve_api(listener: tokio::net::TcpListener, shared: Shared) -> std::io
     // Boot replay MV-01: rebuild the stored action sinks on the shared
     // stores after the swaps above. The build and the wiring report then
     // live in the same stores that the routes and alarms read.
-    broker_api::v5::action_sinks::rebuild_all_action_sinks(
+    let _ = broker_api::v5::action_sinks::rebuild_all_action_sinks(
         &state.engine,
         &state.connectors,
         &state.actions,
         &state.alarms,
     );
+    // Probe every rebuilt action sink before the API serves.
+    // A down target then reads `disconnected` from a real attempt.
+    broker_api::v5::action_sinks::probe_action_sinks(&state.engine, &state.actions, |_| true).await;
     // Share the monitor ring (F1-02, T-72) so the kernel sampler and the
     // `GET /monitor` reads observe the same bounded buffer instead of an
     // empty per-request copy. One `Arc` clone; management-plane only, the

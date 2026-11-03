@@ -26,7 +26,7 @@ use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use reqwest::header::{HeaderMap, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -114,8 +114,8 @@ pub use opentsdb::{
     OpenTsdbTransport,
 };
 pub use postgres::{
-    DriverPgTransport, MemoryPgTransport, PgBatch, PgTransport, PostgreSqlSink,
-    PostgreSqlSinkConfig, TcpPgTransport,
+    DriverPgTransport, MemoryPgTransport, PgBatch, PgConnectionSettings, PgTransport,
+    PostgreSqlSink, PostgreSqlSinkConfig, TcpPgTransport,
 };
 #[cfg(feature = "rabbitmq")]
 pub use rabbitmq::{
@@ -178,6 +178,21 @@ pub trait Sink: Send + Sync {
         for item in items {
             self.send(&item.topic, &item.payload, item.qos).await?;
         }
+        Ok(())
+    }
+
+    /// Flush buffered rows before a swap or a lifecycle stop. The default
+    /// has no buffer. A batching runtime drains its queue here so a
+    /// replaced or disabled sink loses no message.
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Run one health check against the live target. The default runs no
+    /// probe. An action-owned runtime performs a real connection attempt
+    /// so a down target is reported as `disconnected`, never assumed
+    /// reachable.
+    async fn probe(&self) -> std::result::Result<(), String> {
         Ok(())
     }
 
@@ -281,11 +296,24 @@ pub fn compiled_kinds() -> Vec<&'static str> {
 pub struct RegisteredConnector {
     id: String,
     sink: Arc<dyn Sink>,
+    is_v1: bool,
 }
 
 impl RegisteredConnector {
     fn new(id: String, sink: Arc<dyn Sink>) -> Self {
-        Self { id, sink }
+        Self {
+            id,
+            sink,
+            is_v1: false,
+        }
+    }
+
+    fn new_v1(id: String, sink: Arc<dyn Sink>) -> Self {
+        Self {
+            id,
+            sink,
+            is_v1: true,
+        }
     }
 }
 
@@ -315,6 +343,9 @@ pub struct HttpWebhookSink {
     client: reqwest::Client,
     timeout: Duration,
     sent: AtomicU64,
+    /// Last health probe. It starts unprobed, never healthy, so a
+    /// registered target is not reported reachable before a real dial.
+    health: std::sync::Mutex<SinkHealth>,
 }
 
 /// Resolve a connector config field that may hold a secret reference.
@@ -350,6 +381,10 @@ impl HttpWebhookSink {
             client,
             timeout: DEFAULT_WEBHOOK_TIMEOUT,
             sent: AtomicU64::new(0),
+            health: std::sync::Mutex::new(SinkHealth {
+                healthy: false,
+                reason: Some("health check pending".to_string()),
+            }),
         }
     }
 
@@ -378,7 +413,6 @@ impl Sink for HttpWebhookSink {
             .header("X-MQTT-Topic", topic.as_str())
             .header("X-MQTT-QoS", u8::from(qos).to_string())
             .body(payload.to_vec())
-            .timeout(self.timeout)
             .send()
             .await
             .map_err(|e| ConnectorError::Connection(e.to_string()))?;
@@ -394,8 +428,48 @@ impl Sink for HttpWebhookSink {
         Ok(())
     }
 
+    async fn probe(&self) -> std::result::Result<(), String> {
+        let result = probe_webhook_target(&self.url, self.timeout).await;
+        let mut health = self
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *health = SinkHealth {
+            healthy: result.is_ok(),
+            reason: result.as_ref().err().cloned(),
+        };
+        result
+    }
+
+    fn health(&self) -> Option<SinkHealth> {
+        Some(
+            self.health
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+    }
+
     fn kind(&self) -> &'static str {
         "webhook"
+    }
+}
+
+/// One bounded TCP dial to the target of a webhook URL. The probe does
+/// not send a request, so it cannot trigger the webhook action.
+async fn probe_webhook_target(url: &str, timeout: Duration) -> std::result::Result<(), String> {
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|error| format!("webhook url is invalid: {error}"))?;
+    let host = parsed
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "webhook url has no host".to_string())?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let target = format!("{host}:{port}");
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&target)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(format!("Connection refused to {target}: {error}")),
+        Err(_) => Err(format!("health check timed out for {target}")),
     }
 }
 
@@ -450,10 +524,36 @@ impl Sink for ConsoleLoggerSink {
     }
 }
 
+/// Upper bound for the v1 `/connectors` name space. Reason: the v1
+/// path has no separate store, so the registry itself must stay small.
+/// 512 matches the v5 connector catalogue bound and keeps the per-request
+/// management clones cheap.
+pub const MAX_V1_CONNECTORS: usize = 512;
+
+/// One-lock result for a rule forward. See
+/// [`ConnectorManager::forward_lookup`].
+pub struct ForwardLookup {
+    /// Live sink under the bare forward id, when one is registered.
+    pub sink: Option<Arc<dyn Sink>>,
+    /// True when the bare id belongs to the v1 `/connectors` path.
+    pub is_v1: bool,
+    /// True when a v5 action runtime owns the `action:{id}` key.
+    pub has_action_sink: bool,
+}
+
 /// Registry of live outbound connectors by id.
 #[derive(Default)]
 pub struct ConnectorManager {
     connectors: parking_lot::RwLock<HashMap<String, RegisteredConnector>>,
+    /// Registrations collected by [`Self::begin_stage`]. While a stage is
+    /// open, [`Self::register`] writes here instead of the live map, so a
+    /// management write can build every new sink before it persists and
+    /// swap them together only after the stores commit.
+    staged: parking_lot::Mutex<Option<HashMap<String, Arc<dyn Sink>>>>,
+    /// Ids registered through the v1 `/connectors` path. They share the
+    /// live map with v5 connectors but not the v5 action name space, so
+    /// a bare forward to one never attributes to a v5 action metric.
+    v1_ids: parking_lot::RwLock<HashSet<String>>,
 }
 
 impl ConnectorManager {
@@ -461,14 +561,94 @@ impl ConnectorManager {
         Self::default()
     }
 
+    /// Open one staging generation. The caller serialises writers, so
+    /// only one stage is open at a time.
+    pub fn begin_stage(&self) {
+        *self.staged.lock() = Some(HashMap::new());
+    }
+
+    /// Drop the staged generation without touching the live map.
+    pub fn abort_stage(&self) {
+        *self.staged.lock() = None;
+    }
+
+    /// Swap every staged registration into the live map in one step and
+    /// return the sinks they replaced, so the caller can drain them.
+    pub fn commit_stage(&self) -> Vec<Arc<dyn Sink>> {
+        let Some(staged) = self.staged.lock().take() else {
+            return Vec::new();
+        };
+        let mut replaced = Vec::new();
+        let mut live = self.connectors.write();
+        for (id, sink) in staged {
+            if let Some(previous) = live.insert(id.clone(), RegisteredConnector::new(id, sink)) {
+                replaced.push(previous.sink);
+            }
+        }
+        replaced
+    }
+
     pub fn register(&self, id: impl Into<String>, sink: Arc<dyn Sink>) {
         let id = id.into();
+        if let Some(staged) = self.staged.lock().as_mut() {
+            staged.insert(id, sink);
+            return;
+        }
+        // A direct live write owns the bare id now. It is not a v1 id.
+        self.v1_ids.write().remove(&id);
         self.connectors
             .write()
             .insert(id.clone(), RegisteredConnector::new(id, sink));
     }
 
+    /// Register one connector of the v1 `/connectors` path. It lives in
+    /// the live map under its bare id but stays outside the v5 action
+    /// name space. Returns false when the name space is full and the id
+    /// is new; a replace of an existing id always succeeds.
+    /// It writes straight to the live map, never to a staged v5
+    /// generation, so a v5 stage cannot adopt it.
+    pub fn register_v1(&self, id: impl Into<String>, sink: Arc<dyn Sink>) -> bool {
+        let id = id.into();
+        {
+            let mut ids = self.v1_ids.write();
+            if !ids.contains(&id) && ids.len() >= MAX_V1_CONNECTORS {
+                return false;
+            }
+            ids.insert(id.clone());
+        }
+        self.connectors
+            .write()
+            .insert(id.clone(), RegisteredConnector::new_v1(id, sink));
+        true
+    }
+
+    /// True when the id belongs to the v1 `/connectors` path.
+    /// Management and test paths use this. The publish path uses
+    /// [`Self::forward_lookup`] instead, so it takes no extra lock.
+    pub fn is_v1_connector(&self, id: &str) -> bool {
+        self.v1_ids.read().contains(id)
+    }
+
+    /// One-lock view for the publish path. One `connectors` read serves
+    /// the sink, the v1 flag and the action-sink check together, so a
+    /// forward takes at most one lock read. Reason: the forward runs on
+    /// the publish path, where extra locks add delay to every message.
+    pub fn forward_lookup(&self, id: &str) -> ForwardLookup {
+        let live = self.connectors.read();
+        let entry = live.get(id);
+        let sink = entry.map(|found| found.sink.clone());
+        let is_v1 = entry.is_some_and(|found| found.is_v1);
+        let action_key = broker_config::v5_action_sink_key(id);
+        let has_action_sink = live.get(&action_key).is_some();
+        ForwardLookup {
+            sink,
+            is_v1,
+            has_action_sink,
+        }
+    }
+
     pub fn unregister(&self, id: &str) -> bool {
+        self.v1_ids.write().remove(id);
         self.connectors.write().remove(id).is_some()
     }
 
@@ -896,6 +1076,26 @@ mod tests {
                 .push((topic, payload, qos, retain));
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_v1_registry_has_a_finite_bound() {
+        let manager = ConnectorManager::new();
+        for index in 0..MAX_V1_CONNECTORS {
+            assert!(
+                manager.register_v1(format!("v1-{index}"), Arc::new(RecordingSink::default())),
+                "a new v1 id below the bound registers"
+            );
+        }
+        assert!(
+            !manager.register_v1("v1-over".to_string(), Arc::new(RecordingSink::default())),
+            "a new v1 id past the bound is refused"
+        );
+        assert!(
+            manager.register_v1("v1-0".to_string(), Arc::new(RecordingSink::default())),
+            "a replace of an existing v1 id still succeeds"
+        );
+        assert!(manager.is_v1_connector("v1-0"));
     }
 
     #[tokio::test]

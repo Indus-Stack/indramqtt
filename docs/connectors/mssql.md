@@ -119,7 +119,7 @@ PY
 ```
 
 ```output
-connected
+disconnected
 ```
 
 ## Limits

@@ -4572,7 +4572,16 @@ fn mv01_spawn_http_receiver(
     tokio::spawn(async move {
         let mut recorded = Vec::with_capacity(expected);
         for _ in 0..expected {
-            let (mut socket, _) = listener.accept().await.expect("HTTP request accepted");
+            // A health probe opens and closes a bare TCP connection. Skip
+            // it; only a real HTTP request is a delivery.
+            let (mut socket, _) = loop {
+                let (socket, _) = listener.accept().await.expect("HTTP request accepted");
+                let mut probe = [0_u8; 1];
+                match socket.peek(&mut probe).await {
+                    Ok(0) | Err(_) => continue,
+                    Ok(_) => break (socket, ()),
+                }
+            };
             let mut request = Vec::new();
             loop {
                 let mut byte = [0_u8; 1];
@@ -4634,7 +4643,16 @@ fn mv01_spawn_http_receiver_active(
         let recorded = Arc::new(Mutex::new(Vec::with_capacity(expected)));
         let mut handlers = Vec::with_capacity(expected);
         for _ in 0..expected {
-            let (mut socket, _) = listener.accept().await.expect("HTTP request accepted");
+            // A health probe opens and closes a bare TCP connection. Skip
+            // it; only a real HTTP request is a delivery.
+            let (mut socket, _) = loop {
+                let (socket, _) = listener.accept().await.expect("HTTP request accepted");
+                let mut probe = [0_u8; 1];
+                match socket.peek(&mut probe).await {
+                    Ok(0) | Err(_) => continue,
+                    Ok(_) => break (socket, ()),
+                }
+            };
             let current = active.fetch_add(1, Ordering::SeqCst) + 1;
             max_active.fetch_max(current, Ordering::SeqCst);
             let active = Arc::clone(&active);
@@ -5531,17 +5549,8 @@ async fn ro01_stored_pgsql_legacy_batch_timeout_boots() {
     let fake = {
         let captured = Arc::clone(&captured);
         tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.expect("pg backend accepted");
-                let mut probe = [0_u8; 8];
-                if stream.peek(&mut probe).await.expect("pg peek") == 0 {
-                    // The boot reachability probe connects and closes
-                    // without a protocol message.
-                    continue;
-                }
-                mv01_pg_serve_one(stream, captured).await;
-                break;
-            }
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, captured, "u", "pwd", "db", 2).await;
         })
     };
     let mut kernel = spawn_kernel("").await;
@@ -5787,6 +5796,8 @@ async fn ro01_action_resource_opts_fields_apply_through_publish() {
         body["metrics"]["dropped.queue_full"].as_u64().unwrap_or(0) >= 1,
         "queue-full drops are counted: {body}"
     );
+    let buffered = body["metrics"]["queuing"].as_u64().unwrap_or(0) as usize;
+    let drained = mv01_spawn_http_receiver(Arc::clone(&listener), buffered);
     let (status, _) = mv00_api(
         &kernel,
         reqwest::Method::DELETE,
@@ -5803,6 +5814,15 @@ async fn ro01_action_resource_opts_fields_apply_through_publish() {
     )
     .await;
     assert_eq!(status, 204);
+    let drained = tokio::time::timeout(STEP, drained)
+        .await
+        .expect("delete drains the buffered rows in time")
+        .expect("HTTP receiver task");
+    assert_eq!(
+        drained.len(),
+        buffered,
+        "delete delivers the buffered rows before the next block"
+    );
 
     // `request_ttl` of zero expires every row before the send.
     let (status, body) = mv00_api(
@@ -6245,17 +6265,9 @@ async fn ro01_worker_pool_size_caps_driver_batches_through_publish() {
     let fake = {
         let captured = Arc::clone(&captured);
         tokio::spawn(async move {
-            let mut served = 0;
-            while served < 2 {
-                let (stream, _) = listener.accept().await.expect("pg backend accepted");
-                let mut probe = [0_u8; 8];
-                if stream.peek(&mut probe).await.expect("pg peek") == 0 {
-                    // A reachability probe connects and closes without a
-                    // protocol message.
-                    continue;
-                }
-                mv01_pg_serve_one(stream, Arc::clone(&captured)).await;
-                served += 1;
+            for _ in 0..2 {
+                let stream = mv01_pg_accept(&listener).await;
+                mv01_pg_serve_one(stream, Arc::clone(&captured), "u", "pwd", "db", 2).await;
             }
         })
     };
@@ -6480,6 +6492,11 @@ async fn mv01_pg_read_startup(stream: &mut tokio::net::TcpStream) -> Vec<(String
     let len = i32::from_be_bytes(len_buf) as usize;
     let mut body = vec![0_u8; len - 4];
     stream.read_exact(&mut body).await.expect("startup body");
+    mv01_pg_startup_params(&body)
+}
+
+/// Parse one startup body (protocol version plus parameters).
+fn mv01_pg_startup_params(body: &[u8]) -> Vec<(String, String)> {
     assert_eq!(
         &body[..4],
         &196608_i32.to_be_bytes(),
@@ -6507,90 +6524,152 @@ async fn mv01_pg_ready(stream: &mut tokio::net::TcpStream) {
 /// rows the sink flushed (each row: topic, QoS, payload).
 type PgCaptured = Arc<Mutex<Vec<(String, Vec<Vec<Vec<u8>>>)>>>;
 
-/// One fake backend: cleartext trust auth, then the two-round extended
-/// protocol the maintained `tokio-postgres` driver runs (an unnamed
-/// prepare with inferred types, then a bind/execute of one engine row),
-/// whose parsed statement and bound values are captured.
-async fn mv01_pg_serve_one(mut stream: tokio::net::TcpStream, captured: PgCaptured) {
+/// Accept one real protocol connection. A reachability probe connects
+/// and closes without a byte; skip it so the fake serves the driver.
+async fn mv01_pg_accept(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    loop {
+        let (stream, _) = listener.accept().await.expect("pg backend accepted");
+        let mut probe = [0_u8; 8];
+        match stream.peek(&mut probe).await {
+            Ok(0) | Err(_) => continue,
+            Ok(_) => return stream,
+        }
+    }
+}
+
+/// One fake backend. It checks the password, then speaks the extended
+/// query protocol that the maintained driver sends: Parse, Describe,
+/// Sync for a prepared statement, then Bind, Execute, Sync for each row.
+/// Every row of one connection is captured under its statement.
+async fn mv01_pg_serve_one(
+    mut stream: tokio::net::TcpStream,
+    captured: PgCaptured,
+    expected_user: &str,
+    expected_password: &str,
+    expected_database: &str,
+    expected_rows: usize,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut probe = [0_u8; 8];
-    stream.read_exact(&mut probe).await.expect("ssl probe");
-    assert_eq!(&probe[4..8], &80877103_i32.to_be_bytes(), "SSLRequest");
-    stream.write_all(b"N").await.expect("ssl deny");
-    let params = mv01_pg_read_startup(&mut stream).await;
+    if stream.read_exact(&mut probe).await.is_err() {
+        return;
+    }
+    // A real server accepts both an SSLRequest and a direct plaintext
+    // startup message. The maintained driver sends a startup message
+    // directly when TLS is off.
+    let params = if probe[4..8] == 80877103_i32.to_be_bytes() {
+        stream.write_all(b"N").await.expect("ssl deny");
+        mv01_pg_read_startup(&mut stream).await
+    } else {
+        let len = i32::from_be_bytes([probe[0], probe[1], probe[2], probe[3]]) as usize;
+        let mut body = probe[4..8].to_vec();
+        let rest = len.saturating_sub(8);
+        let mut tail = vec![0_u8; rest];
+        stream.read_exact(&mut tail).await.expect("startup body");
+        body.extend_from_slice(&tail);
+        mv01_pg_startup_params(&body)
+    };
     // The connection settings come from the connector document alone.
-    assert!(params.iter().any(|(k, v)| k == "user" && v == "u"));
-    assert!(params.iter().any(|(k, v)| k == "database" && v == "db"));
-    // Trust authentication, then ready for the prepared statement.
+    assert!(
+        params
+            .iter()
+            .any(|(k, v)| k == "user" && v == expected_user),
+        "the fake checks the user: {params:?}"
+    );
+    assert!(
+        params
+            .iter()
+            .any(|(k, v)| k == "database" && v == expected_database),
+        "the fake checks the database: {params:?}"
+    );
+    // Cleartext password authentication: the driver sends the password as
+    // a PasswordMessage. The fake verifies it before it answers OK.
+    mv01_pg_write_msg(&mut stream, b'R', &3_i32.to_be_bytes()).await;
+    let (tag, body) = mv01_pg_read_msg(&mut stream).await;
+    assert_eq!(tag, b'p', "the driver answers the password request");
+    let sent_password = body
+        .strip_suffix(&[0])
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        sent_password, expected_password,
+        "the fake checks the password"
+    );
     mv01_pg_write_msg(&mut stream, b'R', &0_i32.to_be_bytes()).await;
     mv01_pg_ready(&mut stream).await;
-    // Prepare round: the driver annotates no parameter types, so the
-    // fake infers the three engine columns (topic, qos, payload) as
-    // text and serves an insert-shaped statement with no result rows.
-    let (tag, body) = mv01_pg_read_msg(&mut stream).await;
-    assert_eq!(tag, b'P', "prepare parses the action's statement");
-    let (statement_name, sql) = {
-        let mut cursor = &body[..];
-        let take_cstr = |cur: &mut &[u8]| {
-            let end = cur.iter().position(|&b| b == 0).expect("cstr");
-            let text = String::from_utf8_lossy(&cur[..end]).into_owned();
-            *cur = &cur[end + 1..];
-            text
-        };
-        (take_cstr(&mut cursor), take_cstr(&mut cursor))
-    };
-    mv01_pg_write_msg(&mut stream, b'1', &[]).await;
-    // ParameterDescription: three text parameters (oids 25).
-    let mut types = Vec::new();
-    types.extend_from_slice(&3_u16.to_be_bytes());
-    types.extend_from_slice(&25_i32.to_be_bytes());
-    types.extend_from_slice(&25_i32.to_be_bytes());
-    types.extend_from_slice(&25_i32.to_be_bytes());
-    mv01_pg_write_msg(&mut stream, b't', &types).await;
-    let (tag, _) = mv01_pg_read_msg(&mut stream).await;
-    assert_eq!(tag, b'D', "the driver describes the prepared statement");
-    mv01_pg_write_msg(&mut stream, b'n', &[]).await;
-    mv01_pg_ready(&mut stream).await;
-    // Execute round: each row binds against the prepared statement, all
-    // values in text format, and the batch syncs once after the last row.
+    let mut statement = String::new();
     let mut rows = Vec::new();
-    let sync_tag;
     loop {
-        let (tag, body) = mv01_pg_read_msg(&mut stream).await;
-        if tag != b'B' {
-            sync_tag = tag;
+        let mut header = [0_u8; 5];
+        if stream.read_exact(&mut header).await.is_err() {
             break;
         }
-        let mut cursor = &body[..];
-        let skip_cstr = |cursor: &mut &[u8]| {
-            let end = cursor.iter().position(|&b| b == 0).expect("cstr");
-            *cursor = &cursor[end + 1..];
-        };
-        skip_cstr(&mut cursor);
-        skip_cstr(&mut cursor);
-        let formats = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
-        cursor = &cursor[2 + formats * 2..];
-        let count = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
-        cursor = &cursor[2..];
-        let mut row = Vec::new();
-        for _ in 0..count {
-            let len = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
-            cursor = &cursor[4..];
-            row.push(cursor[..len as usize].to_vec());
-            cursor = &cursor[len as usize..];
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut body = vec![0_u8; len - 4];
+        stream.read_exact(&mut body).await.expect("pg body");
+        match header[0] {
+            b'P' => {
+                let mut cursor = &body[..];
+                let take_cstr = |cur: &mut &[u8]| {
+                    let end = cur.iter().position(|&b| b == 0).expect("cstr");
+                    let text = String::from_utf8_lossy(&cur[..end]).into_owned();
+                    *cur = &cur[end + 1..];
+                    text
+                };
+                let name = take_cstr(&mut cursor);
+                statement = format!("{name}|{}", take_cstr(&mut cursor));
+                mv01_pg_write_msg(&mut stream, b'1', &[]).await;
+            }
+            b'D' => {
+                if body.first() == Some(&b'S') {
+                    // ParameterDescription: three text parameters (oid 25).
+                    let mut types = Vec::new();
+                    types.extend_from_slice(&3_u16.to_be_bytes());
+                    types.extend_from_slice(&25_i32.to_be_bytes());
+                    types.extend_from_slice(&25_i32.to_be_bytes());
+                    types.extend_from_slice(&25_i32.to_be_bytes());
+                    mv01_pg_write_msg(&mut stream, b't', &types).await;
+                }
+                // An INSERT returns no rows; NoData ends the description.
+                mv01_pg_write_msg(&mut stream, b'n', &[]).await;
+            }
+            b'S' => {
+                mv01_pg_ready(&mut stream).await;
+                if !rows.is_empty() && rows.len() >= expected_rows {
+                    break;
+                }
+            }
+            b'B' => {
+                let mut cursor = &body[..];
+                let skip_cstr = |cursor: &mut &[u8]| {
+                    let end = cursor.iter().position(|&b| b == 0).expect("cstr");
+                    *cursor = &cursor[end + 1..];
+                };
+                skip_cstr(&mut cursor);
+                skip_cstr(&mut cursor);
+                let formats = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+                cursor = &cursor[2 + formats * 2..];
+                let count = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+                cursor = &cursor[2..];
+                let mut row = Vec::new();
+                for _ in 0..count {
+                    let len = i32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+                    cursor = &cursor[4..];
+                    row.push(cursor[..len as usize].to_vec());
+                    cursor = &cursor[len as usize..];
+                }
+                rows.push(row);
+                mv01_pg_write_msg(&mut stream, b'2', &[]).await;
+            }
+            b'E' => mv01_pg_write_msg(&mut stream, b'C', b"INSERT 0 1\0").await,
+            b'X' => break,
+            _ => {}
         }
-        rows.push(row);
-        mv01_pg_write_msg(&mut stream, b'2', &[]).await;
-        let (tag, _) = mv01_pg_read_msg(&mut stream).await;
-        assert_eq!(tag, b'E', "the bound portal executes");
-        mv01_pg_write_msg(&mut stream, b'C', b"INSERT 0 1\0").await;
     }
-    assert_eq!(sync_tag, b'S', "the batch syncs");
-    mv01_pg_ready(&mut stream).await;
     captured
         .lock()
         .expect("capture lock")
-        .push((format!("{statement_name}|{sql}"), rows));
+        .push((statement, rows));
 }
 
 /// Two `pgsql` actions on one connector own separate statement shapes: each
@@ -6607,8 +6686,8 @@ async fn mv01_pgsql_action_delivers_engine_rows_to_connector_settings() {
         let captured = Arc::clone(&captured);
         tokio::spawn(async move {
             for _ in 0..2 {
-                let (stream, _) = listener.accept().await.expect("pg backend accepted");
-                mv01_pg_serve_one(stream, Arc::clone(&captured)).await;
+                let stream = mv01_pg_accept(&listener).await;
+                mv01_pg_serve_one(stream, Arc::clone(&captured), "u", "pwd", "db", 1).await;
             }
         })
     };
@@ -6733,8 +6812,8 @@ async fn mv01_pgsql_action_update_swaps_statement_and_refusal_keeps_old() {
         let captured = Arc::clone(&captured);
         tokio::spawn(async move {
             for _ in 0..3 {
-                let (stream, _) = listener.accept().await.expect("pg backend accepted");
-                mv01_pg_serve_one(stream, Arc::clone(&captured)).await;
+                let stream = mv01_pg_accept(&listener).await;
+                mv01_pg_serve_one(stream, Arc::clone(&captured), "u", "pwd", "db", 1).await;
             }
         })
     };
@@ -6812,6 +6891,10 @@ async fn mv01_pgsql_action_update_swaps_statement_and_refusal_keeps_old() {
         &sy02_publish311("mv01/in/up", 0, 0, false, br#"{"u":2}"#),
     )
     .await;
+    // Wait for the refused-update publish to flush on the old sink before
+    // the replacement swaps it. A publish still in the broker task would
+    // otherwise land on the new statement.
+    mv01_wait_pg_batches(&captured, 2).await;
     // A full replacement swaps the statement in for the next publish.
     let (status, body) = mv00_api(
         &kernel,
@@ -6874,6 +6957,883 @@ async fn mv01_pgsql_action_update_swaps_statement_and_refusal_keeps_old() {
         assert_eq!(row[1], &b"0"[..]);
         assert_eq!(row[2], *expected_payload);
     }
+    kernel.finish().await;
+}
+
+/// Wait for one more captured PostgreSQL batch. The fake flushes one
+/// batch per connection, so the count is the number of completed sends.
+async fn mv01_wait_pg_batches(captured: &PgCaptured, count: usize) {
+    let deadline = std::time::Instant::now() + STEP;
+    loop {
+        if captured.lock().expect("capture lock").len() >= count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pgsql batches arrived in time: wanted {count}, got {}",
+            captured.lock().expect("capture lock").len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A pgsql action stops on disable, resumes on enable and stops on delete.
+#[tokio::test]
+async fn mv01_pgsql_action_disable_enable_delete() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-life",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-life",
+            "type": "pgsql",
+            "connector": "mv01-pg-life",
+            "parameters": {"sql": "MV01-LIFE INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-life-rule",
+            "sql": "SELECT * FROM \"mv01/in/life\"",
+            "actions": ["mv01-pg-life"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-life-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/life", 0, 0, false, br#"{"n":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-pg-life/enable/false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "disable: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/life", 0, 0, false, br#"{"n":2}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        captured.lock().expect("capture lock").len(),
+        1,
+        "a disabled action delivers nothing"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-pg-life/enable/true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "enable: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/life", 0, 0, false, br#"{"n":3}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 2).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/rules/mv01-pg-life-rule",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "rule delete: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-pg-life",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/life", 0, 0, false, br#"{"n":4}"#),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        captured.lock().expect("capture lock").len(),
+        2,
+        "a deleted action delivers nothing"
+    );
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A pgsql action stores while its server is down, reports `disconnected`
+/// from the real attempt, and delivers after the server starts.
+#[tokio::test]
+async fn mv01_pgsql_down_server_reports_disconnected_and_delivers_when_up() {
+    let reserve = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let address = reserve.local_addr().expect("reserved address");
+    drop(reserve);
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-down",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-down",
+            "type": "pgsql",
+            "connector": "mv01-pg-down",
+            "parameters": {"sql": "MV01-DOWN INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "a down target still stores: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-down-rule",
+            "sql": "SELECT * FROM \"mv01/in/pgdown\"",
+            "actions": ["mv01-pg-down"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("the server starts on the reserved port");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-down-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgdown", 0, 0, false, br#"{"up":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A pgsql action delivers after a broker restart from the stored
+/// connector and action.
+#[tokio::test]
+async fn mv01_pgsql_action_survives_restart() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let mut kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-restart",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-restart",
+            "type": "pgsql",
+            "connector": "mv01-pg-restart",
+            "parameters": {"sql": "MV01-RESTART INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-restart-rule",
+            "sql": "SELECT * FROM \"mv01/in/pgrestart\"",
+            "actions": ["mv01-pg-restart"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-restart-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgrestart", 0, 0, false, br#"{"r":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-pg-restart",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "connected", "the replay rebuilt it: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-restart-pub2").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgrestart", 0, 0, false, br#"{"r":2}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 2).await;
+    {
+        let captured = captured.lock().expect("capture lock");
+        assert!(captured[0].0.contains("MV01-RESTART"));
+        assert!(captured[1].0.contains("MV01-RESTART"));
+    }
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A connector update refuses when one dependent pgsql action cannot use
+/// the new settings; the old statement keeps delivering and the refused
+/// attempt leaks no connection or task.
+#[tokio::test]
+async fn mv01_pgsql_refused_connector_update_keeps_old_and_leaks_nothing() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let fake_captured = Arc::clone(&captured);
+    let fake_accepted = Arc::clone(&accepted);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            fake_accepted.fetch_add(1, Ordering::SeqCst);
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-refuse",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-refuse",
+            "type": "pgsql",
+            "connector": "mv01-pg-refuse",
+            "parameters": {"sql": "MV01-REFUSE INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-refuse-rule",
+            "sql": "SELECT * FROM \"mv01/in/pgrefuse\"",
+            "actions": ["mv01-pg-refuse"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-refuse-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgrefuse", 0, 0, false, br#"{"v":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    let accepted_before = accepted.load(Ordering::SeqCst);
+    let tasks_before = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    // The new body drops `database`, so the dependent action cannot build.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-pg-refuse",
+        serde_json::json!({
+            "name": "mv01-pg-refuse",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "username": "u",
+            "password": "pwd",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "the dependent build refuses: {body}");
+    let message = body["message"].as_str().expect("refusal message");
+    assert!(
+        message.contains("mv01-pg-refuse") && message.contains("database"),
+        "the refusal names the action and the field: {message}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        accepted_before,
+        "the refused update opens no connection"
+    );
+    let deadline = std::time::Instant::now() + STEP;
+    let tasks_after = loop {
+        let alive = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        if alive <= tasks_before || std::time::Instant::now() >= deadline {
+            break alive;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(
+        tasks_after <= tasks_before,
+        "the refused update leaks no task: before {tasks_before}, after {tasks_after}"
+    );
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/pgrefuse", 0, 0, false, br#"{"v":2}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 2).await;
+    {
+        let captured = captured.lock().expect("capture lock");
+        assert!(captured[1].0.contains("MV01-REFUSE"));
+    }
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A successful connector update keeps two dependent actions on their own
+/// statements.
+#[tokio::test]
+async fn mv01_pgsql_connector_update_keeps_two_action_statements() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-two",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+            "pool_size": 2,
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    for (id, sql) in [
+        ("mv01-pg-two-a", "MV01-TWO-A INSERT $1, $2, $3"),
+        ("mv01-pg-two-b", "MV01-TWO-B INSERT $1, $2, $3"),
+    ] {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/actions",
+            serde_json::json!({
+                "name": id,
+                "type": "pgsql",
+                "connector": "mv01-pg-two",
+                "parameters": {"sql": sql},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "action {id}: {body}");
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::POST,
+            "/api/v5/rules",
+            serde_json::json!({
+                "id": format!("{id}-rule"),
+                "sql": format!("SELECT * FROM \"mv01/in/two/{id}\""),
+                "actions": [id],
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "rule {id}: {body}");
+    }
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-two-pub").await;
+    for id in ["mv01-pg-two-a", "mv01-pg-two-b"] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv01/in/two/{id}"), 0, 0, false, id.as_bytes()),
+        )
+        .await;
+    }
+    mv01_wait_pg_batches(&captured, 2).await;
+    // A second server observes the rebuild: after the update every row
+    // must reach the new target. A no-op connector update fails here.
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("second pg fake binds");
+    let address2 = listener2.local_addr().expect("second pg fake address");
+    let captured2: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake2_captured = Arc::clone(&captured2);
+    let fake2 = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener2).await;
+            mv01_pg_serve_one(stream, Arc::clone(&fake2_captured), "u", "pwd", "db", 1).await;
+        }
+    });
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-pg-two",
+        serde_json::json!({
+            "name": "mv01-pg-two",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address2.port()),
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+            "pool_size": 4,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "connector update: {body}");
+    for id in ["mv01-pg-two-a", "mv01-pg-two-b"] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv01/in/two/{id}"), 0, 0, false, id.as_bytes()),
+        )
+        .await;
+    }
+    mv01_wait_pg_batches(&captured2, 2).await;
+    {
+        let captured2 = captured2.lock().expect("capture lock");
+        let statements: Vec<&str> = captured2
+            .iter()
+            .map(|(statement, _)| {
+                statement
+                    .split_once('|')
+                    .map(|(_, sql)| sql)
+                    .unwrap_or(statement.as_str())
+            })
+            .collect();
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|sql| sql.contains("MV01-TWO-A"))
+                .count(),
+            1,
+            "action A rebuilt onto the new server: {statements:?}"
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|sql| sql.contains("MV01-TWO-B"))
+                .count(),
+            1,
+            "action B rebuilt onto the new server: {statements:?}"
+        );
+    }
+    fake.abort();
+    fake2.abort();
+    kernel.finish().await;
+}
+
+/// A stored pgsql action whose password reference disappears reports the
+/// error state and raises the build alarm at boot.
+#[tokio::test]
+async fn mv01_pgsql_failed_boot_wiring_reports_error_and_alarm() {
+    let mut kernel = spawn_kernel("").await;
+    let secret = kernel.scratch.join("mv01-pg-password");
+    std::fs::write(&secret, "pwd").expect("secret file");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-boot",
+            "type": "postgres",
+            "server": "127.0.0.1:9",
+            "database": "db",
+            "username": "u",
+            "password": format!("file:{}", secret.display()),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-boot",
+            "type": "pgsql",
+            "connector": "mv01-pg-boot",
+            "parameters": {"sql": "MV01-BOOT INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    std::fs::remove_file(&secret).expect("remove the secret");
+    mv00_restart(&mut kernel).await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-pg-boot",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "the failed action stays readable: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    let reason = body["status_reason"].as_str().expect("status reason");
+    assert!(
+        reason.contains("password"),
+        "the reason names the field: {reason}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/alarms",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "alarms read: {body}");
+    let alarm = body["data"]
+        .as_array()
+        .expect("alarm rows")
+        .iter()
+        .find(|row| row["name"] == "action_build_failed:mv01-pg-boot")
+        .expect("the boot failure raised its alarm");
+    assert!(
+        alarm["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("password")),
+        "the alarm carries the build reason: {alarm}"
+    );
+    kernel.finish().await;
+}
+
+/// A password and a database that contain URL delimiters reach the
+/// driver as values, not as a hand-joined URL.
+#[tokio::test]
+async fn mv01_pgsql_special_password_and_database_reach_driver() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(
+                stream,
+                Arc::clone(&fake_captured),
+                "u",
+                "p@ss/w?rd#1",
+                "db@x/y?z#w",
+                1,
+            )
+            .await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-special",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db@x/y?z#w",
+            "username": "u",
+            "password": "p@ss/w?rd#1",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-special",
+            "type": "pgsql",
+            "connector": "mv01-pg-special",
+            "parameters": {"sql": "MV01-SPECIAL INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-special-rule",
+            "sql": "SELECT * FROM \"mv01/in/special\"",
+            "actions": ["mv01-pg-special"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-special-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/special", 0, 0, false, br#"{"s":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A buffered batch survives an update, a disable and a delete: each
+/// swap drains the old runtime before it stops it.
+#[tokio::test]
+async fn mv01_action_buffer_drains_on_update_disable_and_delete() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-drain",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let opts = serde_json::json!({
+        "batch_size": 3,
+        "batch_time": "10s",
+        "health_check_interval": "1h",
+    });
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-drain",
+            "type": "webhook",
+            "connector": "mv01-drain",
+            "parameters": {"path": "/drain"},
+            "resource_opts": opts,
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-drain-rule",
+            "sql": "SELECT * FROM \"mv01/in/drain\"",
+            "actions": ["mv01-drain"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-drain-pub").await;
+    // One row waits in the old buffer; the update drains it to /drain.
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/drain", 0, 0, false, br#"{"d":1}"#),
+    )
+    .await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-drain",
+        serde_json::json!({
+            "name": "mv01-drain",
+            "type": "webhook",
+            "connector": "mv01-drain",
+            "parameters": {"path": "/after"},
+            "resource_opts": opts,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "action update: {body}");
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("updated sink drained in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].0, "/drain");
+    assert_eq!(received[0].1.as_slice(), &br#"{"d":1}"#[..]);
+    // Two rows wait in the new buffer; the disable drains them.
+    for n in [2, 3] {
+        let payload = format!("{{\"d\":{n}}}");
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("mv01/in/drain", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+    let second = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-drain/enable/false",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "disable: {body}");
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("disabled sink drained in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 2);
+    assert!(received.iter().all(|(path, _)| path == "/after"));
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-drain/enable/true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "enable: {body}");
+    // Two rows wait again; the delete drains them after the rule detach.
+    for n in [4, 5] {
+        let payload = format!("{{\"d\":{n}}}");
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311("mv01/in/drain", 0, 0, false, payload.as_bytes()),
+        )
+        .await;
+    }
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/mv01-drain-rule",
+        serde_json::json!({
+            "sql": "SELECT * FROM \"mv01/in/drain\"",
+            "actions": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "rule detach: {body}");
+    let third = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::DELETE,
+        "/api/v5/actions/mv01-drain",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204, "action delete: {body}");
+    let received = tokio::time::timeout(STEP, third)
+        .await
+        .expect("deleted sink drained in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 2);
+    assert!(received.iter().all(|(path, _)| path == "/after"));
     kernel.finish().await;
 }
 
@@ -7277,6 +8237,134 @@ async fn mv01_action_persist_failure_keeps_the_old_sink_delivering() {
     kernel.finish().await;
 }
 
+/// A persistence failure on connector create and update keeps the store
+/// and every sink as they were.
+#[tokio::test]
+async fn mv01_connector_persist_failure_keeps_the_previous_generation() {
+    let old_listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("old receiver binds"),
+    );
+    let old_address = old_listener.local_addr().expect("old receiver address");
+    let new_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("new receiver binds");
+    let new_address = new_listener.local_addr().expect("new receiver address");
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-conn-persist",
+            "type": "webhook",
+            "url": format!("http://{old_address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-conn-persist",
+            "type": "webhook",
+            "connector": "mv01-conn-persist",
+            "parameters": {"path": "/keep"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-conn-persist-rule",
+            "sql": "SELECT * FROM \"mv01/in/connpersist\"",
+            "actions": ["mv01-conn-persist"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-conn-persist-pub").await;
+    let first = mv01_spawn_http_receiver(Arc::clone(&old_listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/connpersist", 0, 0, false, br#"{"c":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, first)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].1.as_slice(), &br#"{"c":1}"#[..]);
+    // Block the atomic save for every later write.
+    let state_path = kernel.scratch.join("state.toml");
+    std::fs::remove_file(&state_path).expect("state file exists after the writes");
+    std::fs::create_dir(&state_path).expect("state path blocks the rename");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-conn-persist",
+        serde_json::json!({
+            "name": "mv01-conn-persist",
+            "type": "webhook",
+            "url": format!("http://{new_address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 500, "the update persist failure: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-conn-persist",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["url"],
+        serde_json::json!(format!("http://{old_address}")),
+        "the stored connector is unchanged: {body}"
+    );
+    let second = mv01_spawn_http_receiver(Arc::clone(&old_listener), 1);
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/connpersist", 0, 0, false, br#"{"c":2}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, second)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received[0].0, "/keep");
+    assert_eq!(received[0].1.as_slice(), &br#"{"c":2}"#[..]);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-conn-persist-new",
+            "type": "webhook",
+            "url": format!("http://{new_address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 500, "the create persist failure: {body}");
+    let (status, _body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-conn-persist-new",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 404, "the uncommitted connector is not stored");
+    kernel.finish().await;
+}
+
 /// One rule mixes an owned `pgsql` action, an owned `webhook` action and
 /// a kind with no owned runtime: both owned sinks deliver and the
 /// refused kind counts one failed fire.
@@ -7289,8 +8377,8 @@ async fn mv01_mixed_kind_rule_delivers_owned_actions_and_counts_refused_failure(
     let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
     let pg_captured = Arc::clone(&captured);
     let pg_fake = tokio::spawn(async move {
-        let (stream, _) = pg_listener.accept().await.expect("pg backend accepted");
-        mv01_pg_serve_one(stream, pg_captured).await;
+        let stream = mv01_pg_accept(&pg_listener).await;
+        mv01_pg_serve_one(stream, pg_captured, "u", "pwd", "db", 1).await;
     });
     let listener = Arc::new(
         tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -7441,7 +8529,10 @@ async fn mv01_failed_boot_action_wiring_reports_error_and_alarm() {
     )
     .await;
     assert_eq!(status, 201, "action create: {body}");
-    assert_eq!(body["status"], "connected", "the action built live: {body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "the secret resolves to a down target and the probe reports it: {body}"
+    );
     // The secret disappears before the restart, so the boot replay cannot
     // rebuild the action sink.
     std::fs::remove_file(&secret).expect("remove the secret");
@@ -7516,6 +8607,10 @@ async fn mv01_down_webhook_server_stores_the_action_and_delivers_when_up() {
     )
     .await;
     assert_eq!(status, 201, "a down target still stores: {body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "a real connection attempt reports the down target: {body}"
+    );
     let (status, body) = mv00_api(
         &kernel,
         reqwest::Method::GET,
@@ -7525,6 +8620,10 @@ async fn mv01_down_webhook_server_stores_the_action_and_delivers_when_up() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["parameters"]["path"], "/down", "{body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "the read keeps the real probe result: {body}"
+    );
     let (status, body) = mv00_api(
         &kernel,
         reqwest::Method::POST,
@@ -7690,10 +8789,23 @@ async fn mv01_v5_action_and_v1_connector_share_a_name_and_survive_restart() {
         vec!["/v1", "/v5", "/v5"],
         "same-name v1 connector and v5 action routed separately: {received:?}"
     );
-    // Restart: the v1 sink registers live again and the v5 action replay
-    // rebuilds under its dispatch key.
+    // The v1 forward on the same bare name does not inflate the v5 action
+    // metrics: only the two v5 fires count.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/shared/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "action metrics: {body}");
+    assert_eq!(body["metrics"]["matched"], serde_json::json!(2), "{body}");
+    assert_eq!(body["metrics"]["success"], serde_json::json!(2), "{body}");
+    // Restart: the v5 action replay rebuilds under its dispatch key. The
+    // v1 path stays in its own memory-only name space, as it did before
+    // MV-01, so it does not write a v5 connector row and does not resume.
     mv00_restart(&mut kernel).await;
-    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), topics.len());
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 2);
     let mut publisher = mv00_connect(&kernel, "mv01-ns-pub2").await;
     for topic in topics {
         send_mqtt(
@@ -7710,8 +8822,592 @@ async fn mv01_v5_action_and_v1_connector_share_a_name_and_survive_restart() {
     paths.sort_unstable();
     assert_eq!(
         paths,
-        vec!["/v1", "/v5", "/v5"],
-        "delivery resumed for both namespaces after restart: {received:?}"
+        vec!["/v5", "/v5"],
+        "the v5 actions resumed and the v1 row stayed out of the v5 store: {received:?}"
+    );
+    // The v1 rule fired on the same bare name after the restart too. Its
+    // forward must not credit the v5 action's metrics.
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/shared/metrics",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "post-restart action metrics: {body}");
+    assert_eq!(
+        body["metrics"]["matched"],
+        serde_json::json!(2),
+        "only the two v5 fires count after restart: {body}"
+    );
+    assert_eq!(
+        body["metrics"]["success"],
+        serde_json::json!(2),
+        "only the two v5 fires succeed after restart: {body}"
+    );
+    kernel.finish().await;
+}
+
+/// A webhook connector that is down reads `disconnected` from its own
+/// probe at create and at read time, and `connected` after the target
+/// comes up and the update probes it again.
+#[tokio::test]
+async fn mv01_down_webhook_connector_reads_disconnected_from_probe() {
+    let reserve = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let address = reserve.local_addr().expect("reserved address");
+    drop(reserve);
+    let kernel = spawn_kernel("").await;
+    let connector = serde_json::json!({
+        "name": "mv01-probe-link",
+        "type": "webhook",
+        "url": format!("http://{address}"),
+    });
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        connector.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "the create probe reports the down target: {body}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-probe-link",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "connector read: {body}");
+    assert_eq!(
+        body["status"], "disconnected",
+        "the read keeps the probe result: {body}"
+    );
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("the target starts on the reserved port");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-probe-link",
+        connector,
+    )
+    .await;
+    assert_eq!(status, 200, "connector update: {body}");
+    assert_eq!(
+        body["status"], "connected",
+        "the update probe reports the live target: {body}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/connectors/mv01-probe-link",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "connector read: {body}");
+    assert_eq!(body["status"], "connected", "{body}");
+    drop(listener);
+    kernel.finish().await;
+}
+
+/// A not-ready action kind is refused at the KC-00 map with the create
+/// code `ALREADY_EXISTS` and the update code `BAD_REQUEST`.
+#[tokio::test]
+async fn mv01_action_readiness_refusals_keep_the_documented_codes() {
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-http-not-ready",
+            "type": "http",
+            "connector": "mv01-missing-link",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "a not-ready kind is refused: {body}");
+    assert_eq!(body["code"], "ALREADY_EXISTS", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-ready-link",
+            "type": "webhook",
+            "url": "http://127.0.0.1:9",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-ready-action",
+            "type": "webhook",
+            "connector": "mv01-ready-link",
+            "parameters": {"path": "/ready"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "ready action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/actions/mv01-ready-action",
+        serde_json::json!({
+            "name": "mv01-ready-action",
+            "type": "http",
+            "connector": "mv01-ready-link",
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "the update refuses the not-ready kind: {body}");
+    assert_eq!(body["code"], "BAD_REQUEST", "{body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-ready-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the refused update keeps the old action: {body}"
+    );
+    assert_eq!(body["type"], "webhook", "{body}");
+    kernel.finish().await;
+}
+
+/// An invalid header value is refused without echoing the value.
+#[tokio::test]
+async fn mv01_action_header_value_is_not_echoed_in_the_error() {
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-header-link",
+            "type": "webhook",
+            "url": "http://127.0.0.1:9",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-header-action",
+            "type": "webhook",
+            "connector": "mv01-header-link",
+            "parameters": {
+                "path": "/header",
+                "headers": {"X-Secret": "super-secret\nvalue"},
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "the invalid header value is refused: {body}");
+    assert_eq!(body["code"], "ALREADY_EXISTS", "{body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(message.contains("X-Secret"), "the key is named: {message}");
+    assert!(
+        message.contains("parameters.headers"),
+        "the field is named: {message}"
+    );
+    assert!(
+        !message.contains("super-secret"),
+        "the header value is not echoed: {message}"
+    );
+    kernel.finish().await;
+}
+
+/// The action request timeout comes from `resource_opts.request_ttl`, not
+/// from the sink's 5 s default.
+#[tokio::test]
+async fn mv01_action_request_ttl_bounds_the_http_request() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let receiver = mv01_spawn_http_receiver_active(
+        Arc::clone(&listener),
+        1,
+        std::time::Duration::from_secs(3),
+    );
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-ttl-link",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-ttl-action",
+            "type": "webhook",
+            "connector": "mv01-ttl-link",
+            "parameters": {"path": "/ttl"},
+            "resource_opts": {
+                "batch_size": 1,
+                "batch_time": "0ms",
+                "request_ttl": "1s",
+                "health_check_interval": "1h",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-ttl-rule",
+            "sql": "SELECT * FROM \"mv01/in/ttl\"",
+            "actions": ["mv01-ttl-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-ttl-pub").await;
+    let start = std::time::Instant::now();
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/ttl", 0, 0, false, br#"{"ttl":1}"#),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+    loop {
+        let (status, body) = mv00_api(
+            &kernel,
+            reqwest::Method::GET,
+            "/api/v5/actions/mv01-ttl-action/metrics",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, 200, "metrics: {body}");
+        if body["metrics"]["failed"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the request timed out from request_ttl, not the 5 s default: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(2500),
+        "the 1 s request TTL applies"
+    );
+    receiver.abort();
+    kernel.finish().await;
+}
+
+/// The pgsql transport applies `ssl.verify = verify_peer` and refuses
+/// `verify_none` instead of accepting a value it cannot apply.
+#[tokio::test]
+async fn mv01_pgsql_tls_verify_is_applied_or_refused() {
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-tls",
+            "type": "postgres",
+            "server": "127.0.0.1:9",
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+            "ssl": {"enable": true, "verify": "verify_none"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-tls",
+            "type": "pgsql",
+            "connector": "mv01-pg-tls",
+            "parameters": {"sql": "MV01-TLS INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "verify_none is refused: {body}");
+    assert_eq!(body["code"], "ALREADY_EXISTS", "{body}");
+    let message = body["message"].as_str().expect("error message");
+    assert!(
+        message.contains("ssl.verify") && message.contains("verify_none"),
+        "the refusal names the setting: {message}"
+    );
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/connectors/mv01-pg-tls",
+        serde_json::json!({
+            "name": "mv01-pg-tls",
+            "type": "postgres",
+            "server": "127.0.0.1:9",
+            "database": "db",
+            "username": "u",
+            "password": "pwd",
+            "ssl": {"enable": true, "verify": "verify_peer"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "connector update: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-tls",
+            "type": "pgsql",
+            "connector": "mv01-pg-tls",
+            "parameters": {"sql": "MV01-TLS INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "verify_peer builds: {body}");
+    assert_eq!(body["status"], "disconnected", "{body}");
+    kernel.finish().await;
+}
+
+/// A `file:` password reference resolves before the driver dials, and the
+/// fake server checks the real password.
+#[tokio::test]
+async fn mv01_pgsql_secret_password_reaches_driver() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pg fake binds");
+    let address = listener.local_addr().expect("pg fake address");
+    let captured: PgCaptured = Arc::new(Mutex::new(Vec::new()));
+    let fake_captured = Arc::clone(&captured);
+    let fake = tokio::spawn(async move {
+        loop {
+            let stream = mv01_pg_accept(&listener).await;
+            mv01_pg_serve_one(
+                stream,
+                Arc::clone(&fake_captured),
+                "u",
+                "pwd-from-file",
+                "db",
+                1,
+            )
+            .await;
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let secret = kernel.scratch.join("mv01-pg-password");
+    std::fs::write(&secret, "pwd-from-file").expect("secret file");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-pg-secret",
+            "type": "postgres",
+            "server": format!("127.0.0.1:{}", address.port()),
+            "database": "db",
+            "username": "u",
+            "password": format!("file:{}", secret.display()),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        serde_json::json!({
+            "name": "mv01-pg-secret",
+            "type": "pgsql",
+            "connector": "mv01-pg-secret",
+            "parameters": {"sql": "MV01-SECRET INSERT $1, $2, $3"},
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-pg-secret-rule",
+            "sql": "SELECT * FROM \"mv01/in/secret\"",
+            "actions": ["mv01-pg-secret"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let mut publisher = mv00_connect(&kernel, "mv01-pg-secret-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/secret", 0, 0, false, br#"{"secret":1}"#),
+    )
+    .await;
+    mv01_wait_pg_batches(&captured, 1).await;
+    fake.abort();
+    kernel.finish().await;
+}
+
+/// A connector create must not rebuild an unrelated action from a stale
+/// snapshot. Action updates and connector creates run together; after the
+/// churn the sink that delivers matches the stored action.
+#[tokio::test]
+async fn mv01_connector_rebuild_does_not_overwrite_an_action_update() {
+    let listener = Arc::new(
+        tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP receiver binds"),
+    );
+    let address = listener.local_addr().expect("HTTP receiver address");
+    let drain_listener = Arc::clone(&listener);
+    let drain = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = drain_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut byte = [0_u8; 1];
+                let _ = socket.read_exact(&mut byte).await;
+            });
+        }
+    });
+    let kernel = spawn_kernel("").await;
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/connectors",
+        serde_json::json!({
+            "name": "mv01-churn-link",
+            "type": "webhook",
+            "url": format!("http://{address}"),
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "connector create: {body}");
+    let action_body = |path: &str| {
+        serde_json::json!({
+            "name": "mv01-churn-action",
+            "type": "webhook",
+            "connector": "mv01-churn-link",
+            "parameters": {"path": path},
+        })
+    };
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/actions",
+        action_body("/p0"),
+    )
+    .await;
+    assert_eq!(status, 201, "action create: {body}");
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        serde_json::json!({
+            "id": "mv01-churn-rule",
+            "sql": "SELECT * FROM \"mv01/in/churn\"",
+            "actions": ["mv01-churn-action"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "rule create: {body}");
+    let updates = async {
+        for index in 1..30 {
+            let path = format!("/p{index}");
+            let (status, body) = mv00_api(
+                &kernel,
+                reqwest::Method::PUT,
+                "/api/v5/actions/mv01-churn-action",
+                action_body(&path),
+            )
+            .await;
+            assert_eq!(status, 200, "action update: {body}");
+        }
+    };
+    let creates = async {
+        for index in 0..15 {
+            let name = format!("mv01-churn-{index}");
+            let (status, body) = mv00_api(
+                &kernel,
+                reqwest::Method::POST,
+                "/api/v5/connectors",
+                serde_json::json!({
+                    "name": name,
+                    "type": "webhook",
+                    "url": format!("http://{address}"),
+                }),
+            )
+            .await;
+            assert_eq!(status, 201, "unrelated connector create: {body}");
+            let path = format!("/api/v5/connectors/{name}");
+            let (status, _) = mv00_api(
+                &kernel,
+                reqwest::Method::DELETE,
+                &path,
+                serde_json::Value::Null,
+            )
+            .await;
+            assert_eq!(status, 204, "unrelated connector delete");
+        }
+    };
+    tokio::join!(updates, creates);
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::GET,
+        "/api/v5/actions/mv01-churn-action",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "action read: {body}");
+    let stored_path = body["parameters"]["path"]
+        .as_str()
+        .expect("stored path")
+        .to_string();
+    drain.abort();
+    let receiver = mv01_spawn_http_receiver(Arc::clone(&listener), 1);
+    let mut publisher = mv00_connect(&kernel, "mv01-churn-pub").await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("mv01/in/churn", 0, 0, false, br#"{"churn":1}"#),
+    )
+    .await;
+    let received = tokio::time::timeout(STEP, receiver)
+        .await
+        .expect("HTTP delivery in time")
+        .expect("HTTP receiver task");
+    assert_eq!(received.len(), 1, "one delivery");
+    assert_eq!(
+        received[0].0, stored_path,
+        "the delivering sink matches the stored action"
     );
     kernel.finish().await;
 }
@@ -8070,8 +9766,8 @@ async fn mv02a_pg_family_delivers_bound_rows_through_broker() {
         let fake = {
             let captured = Arc::clone(&captured);
             tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.expect("pg backend accepted");
-                mv01_pg_serve_one(stream, Arc::clone(&captured)).await;
+                let stream = mv01_pg_accept(&listener).await;
+                mv01_pg_serve_one(stream, Arc::clone(&captured), "u", "pwd", "db", 1).await;
             })
         };
         let kernel = spawn_kernel("").await;
@@ -8182,19 +9878,30 @@ async fn mv02a_pg_family_delivers_bound_rows_through_broker() {
 }
 
 /// Reads one MySQL packet (seq plus body) from the fake server stream.
-async fn mv02a_mysql_read_packet(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+/// Returns `None` for a reachability probe that connects and closes
+/// without a byte, so the fake skips it and serves the driver.
+async fn mv02a_mysql_read_packet(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut header = [0_u8; 4];
-    stream.read_exact(&mut header).await.expect("pkt head");
+    if stream.read_exact(&mut header).await.is_err() {
+        return None;
+    }
     let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
     let mut body = vec![0_u8; 1 + len];
     body[0] = header[3];
-    stream.read_exact(&mut body[1..]).await.expect("pkt body");
-    body
+    if stream.read_exact(&mut body[1..]).await.is_err() {
+        return None;
+    }
+    Some(body)
 }
 
 /// Writes one MySQL packet with the given seq to the fake server stream.
-async fn mv02a_mysql_write_packet(stream: &mut tokio::net::TcpStream, seq: u8, body: &[u8]) {
+/// Returns false when the peer closed, so the caller skips it.
+async fn mv02a_mysql_write_packet(
+    stream: &mut tokio::net::TcpStream,
+    seq: u8,
+    body: &[u8],
+) -> bool {
     use tokio::io::AsyncWriteExt;
     let len = body.len() as u32;
     let mut frame = vec![
@@ -8204,7 +9911,7 @@ async fn mv02a_mysql_write_packet(stream: &mut tokio::net::TcpStream, seq: u8, b
         seq,
     ];
     frame.extend_from_slice(body);
-    stream.write_all(&frame).await.expect("pkt write");
+    stream.write_all(&frame).await.is_ok()
 }
 
 /// Decodes one length-encoded integer from the fake server cursor.
@@ -8292,11 +9999,19 @@ async fn mv02a_mysql_serve_one(
     greeting.extend_from_slice(seed_part2);
     greeting.push(0);
     greeting.extend_from_slice(b"mysql_native_password\0");
-    mv02a_mysql_write_packet(&mut stream, 0, &greeting).await;
-    let _handshake = mv02a_mysql_read_packet(&mut stream).await;
-    mv02a_mysql_write_packet(&mut stream, 2, &[0x00, 0, 0, 0, 0, 0, 0]).await;
+    if !mv02a_mysql_write_packet(&mut stream, 0, &greeting).await {
+        return;
+    }
+    let Some(_handshake) = mv02a_mysql_read_packet(&mut stream).await else {
+        return;
+    };
+    if !mv02a_mysql_write_packet(&mut stream, 2, &[0x00, 0, 0, 0, 0, 0, 0]).await {
+        return;
+    }
     let request = loop {
-        let request = mv02a_mysql_read_packet(&mut stream).await;
+        let Some(request) = mv02a_mysql_read_packet(&mut stream).await else {
+            return;
+        };
         if request[1] == 0x03 {
             mv02a_mysql_answer_settings_query(&mut stream, &request[2..]).await;
             continue;
@@ -8319,7 +10034,9 @@ async fn mv02a_mysql_serve_one(
         mv02a_mysql_write_column_def(&mut stream, seq, b"").await;
     }
     mv02a_mysql_write_packet(&mut stream, 5, &[0xFE, 0, 0, 0, 0]).await;
-    let request = mv02a_mysql_read_packet(&mut stream).await;
+    let Some(request) = mv02a_mysql_read_packet(&mut stream).await else {
+        return;
+    };
     assert_eq!(request[1], 0x17, "execute binds one engine row");
     let stmt_id = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
     assert_eq!(stmt_id, 7, "execute uses the prepared statement");
@@ -8349,8 +10066,20 @@ async fn mv02a_mysql_delivers_bound_rows_through_broker() {
         let captured_sql = Arc::clone(&captured_sql);
         let captured_rows = Arc::clone(&captured_rows);
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("mysql backend accepted");
-            mv02a_mysql_serve_one(stream, captured_sql, captured_rows).await;
+            loop {
+                let (stream, _) = listener.accept().await.expect("mysql backend accepted");
+                mv02a_mysql_serve_one(
+                    stream,
+                    Arc::clone(&captured_sql),
+                    Arc::clone(&captured_rows),
+                )
+                .await;
+                let done = !captured_sql.lock().expect("sql lock").is_empty()
+                    && !captured_rows.lock().expect("rows lock").is_empty();
+                if done {
+                    break;
+                }
+            }
         })
     };
     let kernel = spawn_kernel("").await;
@@ -8561,7 +10290,7 @@ async fn mv02a_mssql_delivers_bound_rows_through_broker() {
     let fake = {
         let captured = Arc::clone(&captured);
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("mssql backend accepted");
+            let stream = mv01_pg_accept(&listener).await;
             mv02a_mssql_serve_one(stream, Arc::clone(&captured)).await;
         })
     };

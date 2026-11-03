@@ -4281,6 +4281,9 @@ fn attribute_source_ingress(
 /// relaxed `fetch_add`s, no lock, no allocation). Unknown ids
 /// (plain connectors with no action record) move only the per-rule
 /// counters, never the per-action map.
+/// Each forward takes one registry read lock at most. The single
+/// `forward_lookup` call fetches the sink, the v1 flag and the
+/// action-sink check together.
 // TODO(parity): Do skipped disabled forwards count in rule action totals?
 // TODO(parity): Do skipped disabled forwards count in per-action totals?
 #[allow(clippy::too_many_arguments)]
@@ -4395,12 +4398,33 @@ async fn run_actions_in_tenant(
                 );
             }
             RuleAction::ForwardConnector { connector_id } => {
-                // A verbatim connector id may also name a stored action;
-                // the per-action record rides the dispatch key
-                // (`action:{id}`), so fall back to it before concluding the
-                // id is unknown. One `HashMap` lookup and no allocation.
+                // One dispatch key owns one metric record. A v5 rule
+                // fires under `action:{id}` and counts there. A bare id
+                // that names a v1 connector must never credit a v5
+                // action. A bare id for a kind with no owned runtime
+                // (legacy state, pending kinds, console) still falls
+                // back to its `action:{id}` record so its failure
+                // counts. A bare id whose v5 action owns a runtime
+                // never falls back: the runtime counts itself, and a
+                // v1 forward with the same name stays out, including
+                // after a restart when the v1 id is gone but the v5
+                // runtime was rebuilt.
+                // One lock read serves this forward. `forward_lookup`
+                // reads the registry once for the sink, the v1 flag
+                // and the action-sink check together.
+                let lookup = connectors.forward_lookup(connector_id);
                 let per_action = action_metrics.get(connector_id).or_else(|| {
-                    action_metrics.get(&broker_config::v5_action_sink_key(connector_id))
+                    if broker_config::is_v5_action_sink_key(connector_id) {
+                        return None;
+                    }
+                    if lookup.is_v1 {
+                        return None;
+                    }
+                    if lookup.has_action_sink {
+                        return None;
+                    }
+                    let action_key = broker_config::v5_action_sink_key(connector_id);
+                    action_metrics.get(&action_key)
                 });
                 // W3-04: a disabled action is skipped at fire time. RO-01
                 // records the shed message against the action's dropped
@@ -4419,9 +4443,20 @@ async fn run_actions_in_tenant(
                 // success, failed and drop outcomes. The rule counters stay
                 // here so rule metrics keep their meaning. A plain
                 // connector forward is counted here as before.
-                let (outcome, owns_metrics) = connectors
-                    .send_with_action_metrics(connector_id, topic, &payload, qos_cap)
-                    .await;
+                // The sink comes from the single lookup above, so
+                // delivery takes no second lock.
+                let (outcome, owns_metrics) = match lookup.sink {
+                    Some(ref sink) => {
+                        let owns = sink.owns_action_metrics();
+                        (sink.send(topic, &payload, qos_cap).await, owns)
+                    }
+                    None => (
+                        Err(broker_connectors::ConnectorError::UnknownConnector(
+                            connector_id.to_string(),
+                        )),
+                        false,
+                    ),
+                };
                 if let Err(e) = outcome {
                     counters.total.fetch_add(1, Ordering::Relaxed);
                     counters.failed.fetch_add(1, Ordering::Relaxed);

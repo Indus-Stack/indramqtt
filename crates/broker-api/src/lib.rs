@@ -282,6 +282,11 @@ pub struct ApiState {
     /// snapshot, never this store directly, and publish and deliver
     /// never touch it.
     pub actions: Arc<crate::v5::actions::ActionStore>,
+    /// Serialises the action-sink and connector-sink lifecycle: action
+    /// create/update/delete, connector create/update/delete, and the
+    /// config reload/restore replay. It makes one staged generation
+    /// (build, persist, swap, drain) atomic with respect to the others.
+    pub action_sink_lock: Arc<tokio::sync::Mutex<()>>,
     /// Connector instance directory for `GET /api/v5/connectors`,
     /// `POST /api/v5/connectors`, `DELETE /api/v5/connectors/{id}`,
     /// `GET`/`PUT /api/v5/connectors/{id}`, the enable flip and the
@@ -475,6 +480,7 @@ impl ApiState {
         // (today's empty behaviour: an empty store lists as an empty
         // page).
         let actions = Arc::new(crate::v5::actions::ActionStore::from_registry(&config));
+        let action_sink_lock = Arc::new(tokio::sync::Mutex::new(()));
         // The alarm directory hoisted here so the action-sink boot replay
         // can raise build failures (W1-16 owns the endpoint).
         let alarms = Arc::new(crate::v5::alarms::AlarmStore::new());
@@ -523,7 +529,12 @@ impl ApiState {
         // stored, leaves no runtime sink, raises
         // `action_build_failed:{id}` and reports `disconnected` with the
         // reason — never an invented value, nothing dialled.
-        crate::v5::action_sinks::rebuild_all_action_sinks(&engine, &connectors, &actions, &alarms);
+        let _ = crate::v5::action_sinks::rebuild_all_action_sinks(
+            &engine,
+            &connectors,
+            &actions,
+            &alarms,
+        );
         {
             let cache = Arc::clone(&authn_node_cache);
             authn_settings.set_subscriber(Arc::new(
@@ -642,6 +653,7 @@ impl ApiState {
             sso_backends,
             sources,
             actions,
+            action_sink_lock,
             connectors,
             rule_engine_config,
             operator_api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
@@ -755,6 +767,7 @@ impl ApiState {
             sso_backends: Arc::new(crate::v5::sso::SsoStore::new()),
             sources: Arc::new(crate::v5::sources::SourceStore::new()),
             actions: Arc::new(crate::v5::actions::ActionStore::new()),
+            action_sink_lock: Arc::new(tokio::sync::Mutex::new(())),
             connectors,
             rule_engine_config,
             operator_api_keys: Arc::new(crate::api_keys::ApiKeyStore::from_env()),
@@ -1595,38 +1608,29 @@ async fn create_connector(
     if let Some(message) = removed_connector_refusal(&kind) {
         return bad_request(message);
     }
+    // MV-01: `action:` names the reserved dispatch-key space of the v5
+    // action-owned sinks. A v1 connector with that prefix would collide
+    // with it, so it is refused here before the sink is built.
+    if broker_config::is_v5_action_sink_key(req.id.trim()) {
+        return bad_request(format!(
+            "connector id {:?} is reserved: ids starting with `action:` name action sinks (field `id`)",
+            req.id
+        ));
+    }
     let built = build_connector(&req).await;
     match built {
         Ok((kind, sink)) => {
-            state.engine.connectors().register(req.id.clone(), sink);
-            // Persist the legacy connector through the same connector
-            // store the boot replay reads, so the v1 path keeps delivery
-            // after a restart. Only a kind the stored snapshot accepts
-            // is persisted; an unready kind keeps its current v1
-            // behaviour and stays memory-only.
-            let persistable = broker_config::is_known_connector_type(&kind)
-                && !broker_config::is_removed_connector_type(&kind)
-                && crate::v5::rules::kind_refusal(&kind).is_none();
-            if persistable {
-                let mut doc = serde_json::Map::new();
-                doc.insert("id".to_string(), serde_json::json!(req.id.clone()));
-                doc.insert("name".to_string(), serde_json::json!(req.id.clone()));
-                doc.insert("type".to_string(), serde_json::json!(kind.clone()));
-                doc.insert("enable".to_string(), serde_json::json!(true));
-                match &req.config {
-                    serde_json::Value::Object(fields) => {
-                        for (key, value) in fields {
-                            doc.entry(key.clone()).or_insert_with(|| value.clone());
-                        }
-                    }
-                    other => {
-                        doc.insert("config".to_string(), other.clone());
-                    }
-                }
-                state.connectors.upsert(serde_json::Value::Object(doc));
-                if let Err(error) = state.connectors.persist() {
-                    return crate::v5::rules::connector_persist_error(error);
-                }
+            // The v1 path keeps its own name space: its sinks live in the
+            // connector manager under the bare id and are not written into
+            // the v5 connector store. The persisted v5 connectors and
+            // their boot replay therefore never adopt a v1 row. The name
+            // space has a finite bound so it cannot grow without limit.
+            if !state.engine.connectors().register_v1(req.id.clone(), sink) {
+                return bad_request(format!(
+                    "v1 connector store holds {} entries, at most {}",
+                    broker_connectors::MAX_V1_CONNECTORS,
+                    broker_connectors::MAX_V1_CONNECTORS
+                ));
             }
             (
                 StatusCode::CREATED,
@@ -21483,9 +21487,9 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
-    async fn action_update_counts_waiting_rows_as_stopped_drops() {
-        // One row waits in the bounded buffer. An action update counts it
-        // as a stopped drop instead of losing it silently.
+    async fn action_update_drains_waiting_rows_with_no_loss() {
+        // One row waits in the bounded buffer. An action update drains it
+        // to the old target with no loss.
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
@@ -21555,17 +21559,18 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/actions/sb25-update-action/metrics", &token)
             .await;
         assert_eq!(status, 200, "{body}");
-        assert_eq!(body["metrics"]["dropped"], json!(1), "{body}");
+        assert_eq!(body["metrics"]["success"], json!(1), "{body}");
+        assert_eq!(body["metrics"]["dropped"], json!(0), "{body}");
         assert_eq!(
             body["metrics"]["dropped.resource_stopped"],
-            json!(1),
+            json!(0),
             "{body}"
         );
         assert_eq!(body["metrics"]["queuing"], json!(0), "{body}");
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the waiting row never reached the old target"
+            1,
+            "the waiting row reached the old target"
         );
         let (status, _) = server
             .delete_auth("/api/v5/rules/sb25-update-rule", &token)
@@ -21583,13 +21588,13 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     }
 
     #[tokio::test]
-    async fn connector_update_counts_waiting_action_rows_as_stopped_drops() {
-        // One row waits in the action buffer. A connector update counts it
-        // as a stopped drop before the runtime swap.
+    async fn connector_update_drains_waiting_rows_with_no_loss() {
+        // One row waits in the action buffer. A connector update drains it
+        // with no loss before the runtime swap.
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let (server, state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        let (address, _hits, receiver) = spawn_ro_counting_http_target().await;
+        let (address, hits, receiver) = spawn_ro_counting_http_target().await;
         let connector = json!({
             "name": "sb25-connector-hook",
             "type": "webhook",
@@ -21648,13 +21653,19 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             .get_auth("/api/v5/actions/sb25-connector-action/metrics", &token)
             .await;
         assert_eq!(status, 200, "{body}");
-        assert_eq!(body["metrics"]["dropped"], json!(1), "{body}");
+        assert_eq!(body["metrics"]["success"], json!(1), "{body}");
+        assert_eq!(body["metrics"]["dropped"], json!(0), "{body}");
         assert_eq!(
             body["metrics"]["dropped.resource_stopped"],
-            json!(1),
+            json!(0),
             "{body}"
         );
         assert_eq!(body["metrics"]["queuing"], json!(0), "{body}");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the waiting row reached the target"
+        );
         let (status, _) = server
             .delete_auth("/api/v5/rules/sb25-connector-rule", &token)
             .await;

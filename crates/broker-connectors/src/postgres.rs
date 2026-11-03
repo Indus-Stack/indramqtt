@@ -1189,34 +1189,41 @@ impl tokio_postgres::types::ToSql for PgPayloadParam {
     }
 }
 
-/// Production PostgreSQL transport. With `sslmode=require` it runs the
-/// startup, MD5/SCRAM authentication and the extended query inside the
-/// maintained `tokio-postgres` driver (MIT, rustls TLS, system trust
-/// store); plaintext connects speak the extended protocol directly on
-/// the stream (`Parse`, `Describe`, `Bind` per row, `Execute` per row,
-/// `Sync`), because the driver's prepare step pipelines a `Sync` before
-/// the parameter description and cannot talk to a backend that answers
-/// `NoData` there. Parameters travel bound (`$1` topic, `$2` QoS, `$3`
-/// payload), so values stay out-of-band exactly as on the legacy path.
-/// The legacy [`TcpPgTransport`] stays for offline unit tests only.
+/// Production PostgreSQL transport on the maintained `tokio-postgres`
+/// driver (MIT) with a `rustls` TLS connector (system trust store) when
+/// the URL opts in via `sslmode=require`, plaintext otherwise. Startup,
+/// MD5 and SCRAM-SHA-256 authentication and the extended query protocol
+/// (Parse/Bind/Describe/Execute/Sync) all run inside the driver;
+/// parameters travel bound (`$1` topic, `$2` QoS, `$3` payload), so
+/// values stay out-of-band exactly as on the legacy path. The legacy
+/// [`TcpPgTransport`] stays for offline unit tests only; production
+/// wiring uses this transport.
 ///
-/// One short-lived connection per batch: a batch is written as one
-/// extended-protocol sequence (`Parse`, `Describe`, `Bind` per row,
-/// `Execute` per row, `Sync`) on its own connection, which is dropped
-/// when the batch lands. No connection outlives the flush that owns it,
-/// so no task or connection leaks after a refused update, and a batch
-/// never shares a connection with another batch. `pool_size` bounds the
-/// number of batches that dial at the same time.
+/// Bound: the pool holds at most `pool_size` driver clients plus the
+/// sink buffer in front of it; no background queue. `pool_size`
+/// carries the configured default 10 (`default_pool_size`): the
+/// default is finite because an unbounded pool under fan-in would
+/// repeat the multi-GB RSS collapse the v4 benchmark measured on this
+/// path.
 pub struct DriverPgTransport {
     pg_config: tokio_postgres::Config,
     use_tls: bool,
-    endpoint: PgEndpoint,
-    permits: tokio::sync::Semaphore,
+    pool: Vec<AsyncMutex<Option<tokio_postgres::Client>>>,
+    cursor: AtomicU64,
 }
 
-enum Link {
-    Stream(TcpStream),
-    Client(tokio_postgres::Client),
+/// Connection fields for one PostgreSQL target. The action-owned sink
+/// builds these from the connector document, so a password or database
+/// with a URL delimiter (`@`, `/`, `?`, `#`) reaches the driver as a
+/// value instead of a hand-joined URL.
+#[derive(Debug, Clone)]
+pub struct PgConnectionSettings {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+    pub use_tls: bool,
 }
 
 impl DriverPgTransport {
@@ -1227,17 +1234,40 @@ impl DriverPgTransport {
             ));
         }
         let (host, port, user, password, database, use_tls) = parse_driver_endpoint(url)?;
-        Ok(Self {
-            pg_config: pg_connect_config(&host, port, &user, &password, &database),
-            use_tls,
-            endpoint: PgEndpoint {
+        Self::from_settings(
+            PgConnectionSettings {
                 host,
                 port,
                 user,
                 password,
                 database,
+                use_tls,
             },
-            permits: tokio::sync::Semaphore::new(pool_size),
+            pool_size,
+        )
+    }
+
+    /// Build the pool from explicit connection fields. The driver's
+    /// config struct receives each value verbatim, so no value needs URL
+    /// escaping and no delimiter in a password or database name can
+    /// change the target.
+    pub fn from_settings(settings: PgConnectionSettings, pool_size: usize) -> Result<Self> {
+        if pool_size == 0 {
+            return Err(ConnectorError::Dispatch(
+                "postgres pool_size must be >= 1".to_string(),
+            ));
+        }
+        Ok(Self {
+            pg_config: pg_connect_config(
+                &settings.host,
+                settings.port,
+                &settings.user,
+                &settings.password,
+                &settings.database,
+            ),
+            use_tls: settings.use_tls,
+            pool: (0..pool_size).map(|_| AsyncMutex::new(None)).collect(),
+            cursor: AtomicU64::new(0),
         })
     }
 
@@ -1278,18 +1308,12 @@ impl DriverPgTransport {
         Ok(Self {
             pg_config: pg_connect_config(host, port, &user, password, database),
             use_tls,
-            endpoint: PgEndpoint {
-                host: host.to_string(),
-                port,
-                user,
-                password: password.to_string(),
-                database: database.to_string(),
-            },
-            permits: tokio::sync::Semaphore::new(pool_size),
+            pool: (0..pool_size).map(|_| AsyncMutex::new(None)).collect(),
+            cursor: AtomicU64::new(0),
         })
     }
 
-    async fn dial(&self) -> Result<Link> {
+    async fn dial(&self) -> Result<tokio_postgres::Client> {
         if self.use_tls {
             let tls = pg_tls_connector()?;
             let connect = self.pg_config.connect(tls);
@@ -1302,44 +1326,20 @@ impl DriverPgTransport {
                     tracing::warn!(error = %e, "postgres driver connection closed");
                 }
             });
-            Ok(Link::Client(client))
+            Ok(client)
         } else {
-            let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-            let mut stream =
-                tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
-                    .await
-                    .map_err(|_| {
-                        ConnectorError::Connection(format!("postgres connect timeout: {addr}"))
-                    })?
-                    .map_err(|e| {
-                        ConnectorError::Connection(format!("postgres connect failed: {e}"))
-                    })?;
-            startup_handshake(&self.endpoint, &mut stream).await?;
-            Ok(Link::Stream(stream))
-        }
-    }
-
-    /// Drain one batch's responses: skip everything up to the
-    /// `ReadyForQuery` that follows a `CommandComplete`, so the
-    /// `ReadyForQuery` the server sends after `Describe` does not end
-    /// the drain early.
-    async fn drain_batch(stream: &mut TcpStream) -> Result<()> {
-        let mut command_complete = false;
-        loop {
-            let (tag, body) = read_msg(stream).await?;
-            match tag {
-                b'C' => command_complete = true,
-                b'Z' if command_complete => break,
-                b'E' => {
-                    return Err(ConnectorError::Dispatch(format!(
-                        "postgres: {}",
-                        error_message(&body)
-                    )))
+            let connect = self.pg_config.connect(tokio_postgres::NoTls);
+            let (client, connection) = tokio::time::timeout(PG_DRIVER_CONNECT_TIMEOUT, connect)
+                .await
+                .map_err(|_| ConnectorError::Connection("postgres connect timeout".to_string()))?
+                .map_err(|e| ConnectorError::Connection(format!("postgres connect failed: {e}")))?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!(error = %e, "postgres driver connection closed");
                 }
-                _ => {}
-            }
+            });
+            Ok(client)
         }
-        Ok(())
     }
 
     /// Execute one row's bound parameters through the driver's
@@ -1398,51 +1398,26 @@ impl PgTransport for DriverPgTransport {
         if batch.rows.is_empty() {
             return Ok(());
         }
-        // One connection per batch, dialled fresh: a batch never shares a
-        // connection with another batch, and no connection outlives the
-        // flush that owns it. The permit bounds concurrent batches to the
-        // configured pool size. A connection failure is retried once on a
-        // new connection; a server data error (Dispatch) is reported and
-        // the batch is not replayed.
-        let _permit = self.permits.acquire().await.map_err(|_| {
-            ConnectorError::Dispatch("postgres pool permits are closed".to_string())
-        })?;
+        // Round-robin checkout with reconnect-once for I/O failures. A
+        // server data error (Dispatch) leaves the connection healthy,
+        // so it is kept and nothing is replayed; a connection failure
+        // drops the slot and the batch is retried once on a fresh
+        // client, which is also what recovers a killed backend.
+        let slot = (self.cursor.fetch_add(1, Ordering::SeqCst) as usize) % self.pool.len();
+        let mut guard = self.pool[slot].lock().await;
         let mut last_error: Option<ConnectorError> = None;
         for _ in 0..2 {
-            let link = match self.dial().await {
-                Ok(link) => link,
-                Err(error) => {
-                    last_error = Some(error);
-                    continue;
+            if guard.is_none() {
+                *guard = Some(self.dial().await?);
+            }
+            let client = guard.as_ref().expect("connected");
+            match Self::execute_rows(client, &batch.sql, &batch.rows).await {
+                Ok(()) => return Ok(()),
+                Err(ConnectorError::Connection(message)) => {
+                    *guard = None;
+                    last_error = Some(ConnectorError::Connection(message));
                 }
-            };
-            match link {
-                Link::Stream(mut stream) => match execute_extended(&mut stream, batch).await {
-                    Ok(()) => match Self::drain_batch(&mut stream).await {
-                        Ok(()) => return Ok(()),
-                        Err(ConnectorError::Connection(message)) => {
-                            last_error = Some(ConnectorError::Connection(format!(
-                                "postgres batch failed after reconnect: {message}"
-                            )));
-                        }
-                        Err(other) => return Err(other),
-                    },
-                    Err(ConnectorError::Connection(message)) => {
-                        last_error = Some(ConnectorError::Connection(format!(
-                            "postgres batch failed after reconnect: {message}"
-                        )));
-                    }
-                    Err(other) => return Err(other),
-                },
-                Link::Client(client) => {
-                    match Self::execute_rows(&client, &batch.sql, &batch.rows).await {
-                        Ok(()) => return Ok(()),
-                        Err(ConnectorError::Connection(message)) => {
-                            last_error = Some(ConnectorError::Connection(message));
-                        }
-                        Err(other) => return Err(other),
-                    }
-                }
+                Err(other) => return Err(other),
             }
         }
         Err(match last_error {
@@ -1456,9 +1431,8 @@ impl PgTransport for DriverPgTransport {
 }
 
 /// Run one batch through the extended protocol, pipelined in a single
-/// write: Parse once, Describe once, then Bind/Execute per row, then
-/// Sync. Values travel as TEXT params; the server casts (e.g.
-/// `$3::jsonb`).
+/// write: Parse once, then Bind/Describe/Execute per row, then Sync.
+/// Values travel as TEXT params; the server casts (e.g. `$3::jsonb`).
 fn encode_extended_batch(batch: &PgBatch) -> Vec<u8> {
     fn push_msg(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
         out.push(tag);
@@ -1474,10 +1448,6 @@ fn encode_extended_batch(batch: &PgBatch) -> Vec<u8> {
     parse.push(0);
     parse.extend_from_slice(&0u16.to_be_bytes());
     push_msg(&mut out, b'P', &parse);
-    // Describe the statement once: parameter/row descriptions follow.
-    let mut describe = vec![b'S'];
-    describe.push(0);
-    push_msg(&mut out, b'D', &describe);
 
     for (index, row) in batch.rows.iter().enumerate() {
         let portal = format!("indra_{index}");
@@ -1497,6 +1467,11 @@ fn encode_extended_batch(batch: &PgBatch) -> Vec<u8> {
         }
         bind.extend_from_slice(&0u16.to_be_bytes());
         push_msg(&mut out, b'B', &bind);
+        // Describe portal (drains parameter/row descriptions).
+        let mut describe = vec![b'P'];
+        describe.extend_from_slice(portal.as_bytes());
+        describe.push(0);
+        push_msg(&mut out, b'D', &describe);
         // Execute to completion.
         let mut execute = Vec::new();
         execute.extend_from_slice(portal.as_bytes());
