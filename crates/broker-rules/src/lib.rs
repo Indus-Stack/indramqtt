@@ -3883,12 +3883,15 @@ impl RuleEngine {
         // Snapshot matching rules so the sink (which may touch the router,
         // never this map) runs without holding the lock.
         // B4-07 live wiring (durability push after match, see below).
+        // The rule path ignores the `$` guard. The flag above gates `$SYS`.
         let matched: Vec<Arc<Rule>> = {
             let rules = self.rules.read();
             rules
                 .values()
                 .filter(|rule| {
-                    rule.enabled && rule.tenant == tenant && rule.topic_filter.matches(topic)
+                    rule.enabled
+                        && rule.tenant == tenant
+                        && rule.topic_filter.matches_for_rule_engine(topic)
                 })
                 .cloned()
                 .collect()
@@ -4046,7 +4049,9 @@ impl RuleEngine {
                         .filter(|r| {
                             r.enabled
                                 && r.tenant == tenant
-                                && r.topic_filter.matches(&event.topic)
+                                // The rule path ignores the `$` guard, so
+                                // `#` still reaches `$events/...` here.
+                                && r.topic_filter.matches_for_rule_engine(&event.topic)
                                 && std_sources_match(&r.std_sources, &event.topic)
                         })
                         .cloned()

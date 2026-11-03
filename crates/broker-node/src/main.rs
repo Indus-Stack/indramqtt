@@ -21259,6 +21259,299 @@ mod tests {
             .is_empty());
     }
 
+    /// SA-23 items 1 and 2 over a real socket: a narrow rule never covers
+    /// a wider request. Rule `a/+` denies `a/#`, rule `+` denies `#`,
+    /// while `a/b` and `x` still subscribe under the covering rules.
+    #[tokio::test]
+    async fn sa23_narrow_rule_denies_wider_request_over_socket() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        fn remaining_len(mut len: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let mut byte = (len % 128) as u8;
+                len /= 128;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    return out;
+                }
+            }
+        }
+        fn connect_v4(client_id: &str) -> Vec<u8> {
+            let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id.as_bytes());
+            let mut packet = vec![0x10];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        fn subscribe_once(packet_id: u16, filter: &str) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            body.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+            body.extend_from_slice(filter.as_bytes());
+            body.push(0x00);
+            let mut packet = vec![0x82];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        async fn read_packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).await?;
+            let mut packet = vec![first[0]];
+            let mut multiplier = 1usize;
+            let mut remaining = 0usize;
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                packet.push(byte[0]);
+                remaining += ((byte[0] & 0x7F) as usize) * multiplier;
+                multiplier *= 128;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+            }
+            if remaining > 0 {
+                let mut body = vec![0u8; remaining];
+                stream.read_exact(&mut body).await?;
+                packet.extend_from_slice(&body);
+            }
+            Ok(packet)
+        }
+        async fn suback_code(client: &mut TcpStream, packet_id: u16, filter: &str) -> u8 {
+            client
+                .write_all(&subscribe_once(packet_id, filter))
+                .await
+                .expect("SUBSCRIBE sends");
+            let suback =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(client))
+                    .await
+                    .expect("SUBACK in time")
+                    .expect("SUBACK reads");
+            assert_eq!(suback[0], 0x90);
+            *suback.last().expect("suback has a code")
+        }
+
+        let shared = test_shared();
+        shared
+            .auth
+            .add_rule(AclRule::new(
+                "sa23-cover",
+                AclAction::Subscribe,
+                "a/+",
+                true,
+            ))
+            .expect("memory-only persist cannot fail");
+        shared
+            .auth
+            .add_rule(AclRule::new("sa23-cover", AclAction::Subscribe, "+", true))
+            .expect("memory-only persist cannot fail");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let mut listeners = broker_config::schema::ListenersConf::default();
+        listeners.tcp.enabled = true;
+        listeners.tcp.bind = format!("127.0.0.1:{port}");
+        listeners.tls.enabled = false;
+        listeners.ws.enabled = false;
+        listeners.wss.enabled = false;
+        shared.listener_store.reset_from_config(&listeners);
+        let control = std::sync::Arc::new(super::native::NativeListenerController::new(
+            shared.clone(),
+            listeners,
+        ));
+        shared.listener_store.set_controller(control.clone());
+        let row = shared
+            .listener_store
+            .get("tcp:default")
+            .expect("tcp row exists");
+        broker_api::v5::listeners::ListenerController::start_listener(&*control, &row)
+            .expect("listener starts");
+        let mut running = row;
+        running.running = true;
+        shared.listener_store.update(running);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("client dials");
+        client
+            .write_all(&connect_v4("sa23-cover"))
+            .await
+            .expect("CONNECT sends");
+        let connack =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                .await
+                .expect("CONNACK in time")
+                .expect("CONNACK reads");
+        assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+        // `a/+` does not cover `a/#`; `+` does not cover `#`.
+        assert_eq!(suback_code(&mut client, 7, "a/#").await, 0x80u8);
+        assert_eq!(suback_code(&mut client, 8, "#").await, 0x80u8);
+        // The covered requests still subscribe.
+        assert_eq!(suback_code(&mut client, 9, "a/b").await, 0x00u8);
+        assert_eq!(suback_code(&mut client, 10, "x").await, 0x00u8);
+        assert!(!shared
+            .router
+            .matches(&Topic::new("a/b").unwrap())
+            .is_empty());
+        assert!(shared
+            .router
+            .matches(&Topic::new("secret/x").unwrap())
+            .is_empty());
+    }
+
+    /// SA-23 item 2 over a real socket: a deny rule applies on overlap.
+    /// Deny `secret/#` plus allow `#` denies `#` and `secret/x` but
+    /// still grants `other/x`.
+    #[tokio::test]
+    async fn sa23_deny_overlap_blocks_hash_over_socket() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        fn remaining_len(mut len: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let mut byte = (len % 128) as u8;
+                len /= 128;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    return out;
+                }
+            }
+        }
+        fn connect_v4(client_id: &str) -> Vec<u8> {
+            let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3C];
+            body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+            body.extend_from_slice(client_id.as_bytes());
+            let mut packet = vec![0x10];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        fn subscribe_once(packet_id: u16, filter: &str) -> Vec<u8> {
+            let mut body = packet_id.to_be_bytes().to_vec();
+            body.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+            body.extend_from_slice(filter.as_bytes());
+            body.push(0x00);
+            let mut packet = vec![0x82];
+            packet.extend_from_slice(&remaining_len(body.len()));
+            packet.extend_from_slice(&body);
+            packet
+        }
+        async fn read_packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).await?;
+            let mut packet = vec![first[0]];
+            let mut multiplier = 1usize;
+            let mut remaining = 0usize;
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await?;
+                packet.push(byte[0]);
+                remaining += ((byte[0] & 0x7F) as usize) * multiplier;
+                multiplier *= 128;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+            }
+            if remaining > 0 {
+                let mut body = vec![0u8; remaining];
+                stream.read_exact(&mut body).await?;
+                packet.extend_from_slice(&body);
+            }
+            Ok(packet)
+        }
+        async fn suback_code(client: &mut TcpStream, packet_id: u16, filter: &str) -> u8 {
+            client
+                .write_all(&subscribe_once(packet_id, filter))
+                .await
+                .expect("SUBSCRIBE sends");
+            let suback =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(client))
+                    .await
+                    .expect("SUBACK in time")
+                    .expect("SUBACK reads");
+            assert_eq!(suback[0], 0x90);
+            *suback.last().expect("suback has a code")
+        }
+
+        let shared = test_shared();
+        shared
+            .auth
+            .add_rule(AclRule::new(
+                "sa23-deny",
+                AclAction::Subscribe,
+                "secret/#",
+                false,
+            ))
+            .expect("memory-only persist cannot fail");
+        shared
+            .auth
+            .add_rule(AclRule::new("sa23-deny", AclAction::Subscribe, "#", true))
+            .expect("memory-only persist cannot fail");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let mut listeners = broker_config::schema::ListenersConf::default();
+        listeners.tcp.enabled = true;
+        listeners.tcp.bind = format!("127.0.0.1:{port}");
+        listeners.tls.enabled = false;
+        listeners.ws.enabled = false;
+        listeners.wss.enabled = false;
+        shared.listener_store.reset_from_config(&listeners);
+        let control = std::sync::Arc::new(super::native::NativeListenerController::new(
+            shared.clone(),
+            listeners,
+        ));
+        shared.listener_store.set_controller(control.clone());
+        let row = shared
+            .listener_store
+            .get("tcp:default")
+            .expect("tcp row exists");
+        broker_api::v5::listeners::ListenerController::start_listener(&*control, &row)
+            .expect("listener starts");
+        let mut running = row;
+        running.running = true;
+        shared.listener_store.update(running);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("client dials");
+        client
+            .write_all(&connect_v4("sa23-deny"))
+            .await
+            .expect("CONNECT sends");
+        let connack =
+            tokio::time::timeout(std::time::Duration::from_secs(5), read_packet(&mut client))
+                .await
+                .expect("CONNACK in time")
+                .expect("CONNACK reads");
+        assert_eq!(connack, vec![0x20, 0x02, 0x00, 0x00]);
+
+        // `#` reaches `secret/...`, so the deny overlaps and denies.
+        assert_eq!(suback_code(&mut client, 7, "#").await, 0x80u8);
+        assert_eq!(suback_code(&mut client, 8, "secret/x").await, 0x80u8);
+        // Outside the denied branch the later allow still grants.
+        assert_eq!(suback_code(&mut client, 9, "other/x").await, 0x00u8);
+        assert!(!shared
+            .router
+            .matches(&Topic::new("other/x").unwrap())
+            .is_empty());
+        assert!(shared
+            .router
+            .matches(&Topic::new("secret/x").unwrap())
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn publish_denied_yields_puback_0x87_and_drops() {
         let shared = test_shared();

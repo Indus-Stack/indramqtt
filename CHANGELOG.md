@@ -77,6 +77,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Failed settings write keeps the old state**: a refused or failed `PUT /authorization/settings` validates before the live value changes. The save precedes the live swap. A failed save leaves the live and the stored decision unchanged.
 
 ### Fixed
+- **Subscribe cover check**: a narrow allow rule no longer covers a wider request. `a/+` does not cover `a/#`, and `+` does not cover `#`. A deny rule applies when it overlaps the request, so deny `secret/#` denies a subscribe to `#`. A `#` or `+` at the first level no longer matches `$` topics. A subscribe that was allowed before and is denied now is correct here.
 - Rule API errors follow the reference API: duplicate rule creation returns `400 BAD_REQUEST`; a stored-rule test for an absent id returns `404 RULE_NOT_FOUND`. A refused duplicate keeps the existing rule and its stored settings.
 - **Messages that did not arrive in a large fan-out**: the kernel wrote one batch for each wake of a link and then waited. A publish to more subscribers than one batch holds left messages in the queues, and the kernel counted them as delivered. The kernel now writes until the queues are empty.
 

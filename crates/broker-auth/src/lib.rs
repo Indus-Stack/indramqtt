@@ -192,25 +192,114 @@ impl AclRule {
     /// Whether `filter` (a subscription request) is covered by this rule's
     /// topic pattern: every topic the request could match must also match
     /// the rule pattern. Level-wise: `#` (final) covers anything below,
-    /// `+` covers exactly one level, anything else must equal.
+    /// `+` covers exactly one level but never a `#` request level,
+    /// anything else must equal. A filter that starts with `#` or `+`
+    /// never reaches `$` topics (MQTT 5.0 section 4.7.2). A `$` request
+    /// needs a `$` rule. A plain request needs a plain rule.
     fn filter_covered(&self, filter: &TopicFilter) -> bool {
-        let pattern_levels: Vec<&str> = self.topic_pattern.split('/').collect();
-        let request_levels: Vec<&str> = filter.as_str().split('/').collect();
-        let mut pi = 0;
-        for &req in request_levels.iter() {
-            match pattern_levels.get(pi) {
-                Some(&"#") => return true,
-                Some(&"+") => {
-                    pi += 1;
-                }
-                Some(&pat) if pat == req => {
-                    pi += 1;
-                }
-                _ => return false,
-            }
-        }
-        pi == pattern_levels.len() || (pi == pattern_levels.len() - 1 && pattern_levels[pi] == "#")
+        filter_covered_by(self.topic_pattern.as_str(), filter.as_str())
     }
+
+    /// Whether `filter` (a subscription request) overlaps this rule's
+    /// topic pattern: at least one topic matches both. A deny rule uses
+    /// this test. It applies when the request could reach a denied topic.
+    /// It does not need to cover the whole request.
+    fn filter_overlaps(&self, filter: &TopicFilter) -> bool {
+        filters_overlap(self.topic_pattern.as_str(), filter.as_str())
+    }
+
+    /// Whether this rule decides one subscribe request. An allow rule
+    /// decides when the rule covers the request. A deny rule decides when
+    /// the rule overlaps the request. The first deciding rule wins.
+    fn matches_subscribe(&self, filter: &TopicFilter) -> bool {
+        if self.allow {
+            self.filter_covered(filter)
+        } else {
+            self.filter_overlaps(filter)
+        }
+    }
+}
+
+/// First level of a `/`-separated filter (empty string for an empty one).
+fn first_level_of(filter: &str) -> &str {
+    filter.split('/').next().unwrap_or("")
+}
+
+/// True when a filter can match a topic that starts with `$`.
+///
+/// Only a filter whose first level names the `$` prefix literally (for
+/// example `$SYS/#`) reaches those topics. A filter that starts with a
+/// wildcard (`#`, `+`) never does (MQTT 5.0 section 4.7.2).
+fn reaches_dollar_topics(first_level: &str) -> bool {
+    first_level.starts_with('$')
+}
+
+/// Cover test for one rule pattern over one request filter: every topic
+/// the request could match is also matched by the rule. Both inputs are
+/// filters; `#` must be final in each (the loaders enforce this).
+pub(crate) fn filter_covered_by(rule: &str, request: &str) -> bool {
+    if reaches_dollar_topics(first_level_of(request)) != reaches_dollar_topics(first_level_of(rule))
+    {
+        return false;
+    }
+    let pattern_levels: Vec<&str> = rule.split('/').collect();
+    let request_levels: Vec<&str> = request.split('/').collect();
+    let mut pi = 0;
+    for &req in request_levels.iter() {
+        match pattern_levels.get(pi) {
+            Some(&"#") => return true,
+            Some(&"+") => {
+                // `+` covers one level, never a `#` request level: the
+                // request `#` always reaches further than one level.
+                if req == "#" {
+                    return false;
+                }
+                pi += 1;
+            }
+            Some(&pat) if pat == req => {
+                pi += 1;
+            }
+            _ => return false,
+        }
+    }
+    pi == pattern_levels.len() || (pi == pattern_levels.len() - 1 && pattern_levels[pi] == "#")
+}
+
+/// Overlap test for two filters: at least one topic matches both. Both
+/// inputs are filters; `#` must be final in each (the loaders enforce
+/// this). Filters of different `$` reach never overlap.
+pub(crate) fn filters_overlap(first: &str, second: &str) -> bool {
+    if reaches_dollar_topics(first_level_of(first)) != reaches_dollar_topics(first_level_of(second))
+    {
+        return false;
+    }
+    overlap_levels(
+        &first.split('/').collect::<Vec<&str>>(),
+        &second.split('/').collect::<Vec<&str>>(),
+    )
+}
+
+/// Level-wise overlap once both filters share the same `$` reach.
+fn overlap_levels(first: &[&str], second: &[&str]) -> bool {
+    if first.is_empty() && second.is_empty() {
+        return true;
+    }
+    // A trailing `#` also matches its own parent, so an exhausted side
+    // still overlaps when the other side holds only `#`.
+    if first.is_empty() || second.is_empty() {
+        return (first.len() == 1 && first[0] == "#") || (second.len() == 1 && second[0] == "#");
+    }
+    let (head_first, tail_first) = (first[0], &first[1..]);
+    let (head_second, tail_second) = (second[0], &second[1..]);
+    if head_first == "#" || head_second == "#" {
+        // `#` is final, so it covers every level below the match so far.
+        return true;
+    }
+    if head_first == "+" || head_second == "+" {
+        // `+` covers any one level here, literal or `+`.
+        return overlap_levels(tail_first, tail_second);
+    }
+    head_first == head_second && overlap_levels(tail_first, tail_second)
 }
 
 /// In-memory credentials + ACL authorizer.
@@ -3147,11 +3236,11 @@ impl MemoryAuth {
             key,
             client_id,
             AclAction::Subscribe,
-            |rule| rule.filter_covered(&filter),
+            |rule| rule.matches_subscribe(&filter),
         ) {
             Some(decision) => decision,
             None => self.check_in_tenant(&tenants, key, client_id, AclAction::Subscribe, |rule| {
-                rule.filter_covered(&filter)
+                rule.matches_subscribe(&filter)
             }),
         };
         drop(tenants);
@@ -3955,6 +4044,91 @@ mod tests {
             .await
             .is_err());
         assert!(auth.authorize_subscribe("c", &filter("#")).await.is_err());
+    }
+
+    /// SA-23 cover table through the production entry.
+    ///
+    /// Each row holds a request filter, one rule pattern with its allow
+    /// flag, and the expected subscribe decision. Allow rows run against
+    /// that single allow rule. Deny rows run against the deny rule plus
+    /// a trailing catch-all allow. The catch-all is `#`, or `$SYS/#`
+    /// for a `$` request. A denied row proves the deny overlapped the
+    /// request. An allowed row proves it did not.
+    #[tokio::test]
+    async fn sa23_cover_table_through_production_entry() {
+        // (request, rule, rule allows, expected allow).
+        let rows: &[(&str, &str, bool, bool)] = &[
+            // A wider rule covers a narrower request.
+            ("a/b", "a/b", true, true),
+            ("a/b", "a/+", true, true),
+            ("a/b", "a/#", true, true),
+            ("a/b", "#", true, true),
+            ("a", "a/#", true, true),
+            ("a/b/c", "a/#", true, true),
+            ("a/+", "a/#", true, true),
+            ("+", "#", true, true),
+            ("sport/tennis/player1", "sport/tennis/#", true, true),
+            ("sport/+", "sport/#", true, true),
+            ("a/b", "a/b/#", true, true),
+            ("a", "#", true, true),
+            ("#", "#", true, true),
+            ("a/#", "#", true, true),
+            ("$SYS/broker/uptime", "$SYS/#", true, true),
+            ("$SYS/broker", "$SYS/+", true, true),
+            // A narrower rule never covers a wider request.
+            ("a/#", "a/+", true, false),
+            ("#", "+", true, false),
+            ("a/b/c", "a/+", true, false),
+            ("a", "a/+", true, false),
+            ("sensors/+", "sensors/temp", true, false),
+            ("#", "sensors/#", true, false),
+            ("a/b", "b/+", true, false),
+            ("a/b", "a/b/+", true, false),
+            // `#` and `+` at the first level never reach `$` topics.
+            ("$SYS/broker/uptime", "#", true, false),
+            ("$SYS/#", "#", true, false),
+            ("$SYS/broker", "+", true, false),
+            ("$a", "+", true, false),
+            ("$a", "#", true, false),
+            // A deny rule applies on overlap, not only on cover.
+            ("#", "secret/#", false, false),
+            ("secret/x", "secret/#", false, false),
+            ("secret/#", "secret/#", false, false),
+            ("secret", "secret/#", false, false),
+            ("other/x", "secret/#", false, true),
+            ("other/#", "secret/#", false, true),
+            ("$SYS/broker/uptime", "secret/#", false, true),
+            ("$SYS/other/x", "$SYS/broker/#", false, true),
+            ("$SYS/broker/uptime", "$SYS/#", false, false),
+        ];
+        assert!(rows.len() >= 25, "the table holds at least 25 rows");
+        for (request, pattern, rule_allows, expected) in rows {
+            let auth = MemoryAuth::new();
+            auth.add_rule(AclRule::new(
+                "*",
+                AclAction::Subscribe,
+                (*pattern).to_string(),
+                *rule_allows,
+            ))
+            .expect("memory-only persist cannot fail");
+            if !rule_allows {
+                let catch_all = if request.starts_with('$') {
+                    "$SYS/#"
+                } else {
+                    "#"
+                };
+                auth.add_rule(AclRule::new("*", AclAction::Subscribe, catch_all, true))
+                    .expect("memory-only persist cannot fail");
+            }
+            let decision = auth
+                .authorize_subscribe("probe", &filter(request))
+                .await
+                .is_ok();
+            assert_eq!(
+                decision, *expected,
+                "row (request={request}, rule={pattern}, allows={rule_allows}) must be {expected}"
+            );
+        }
     }
 
     #[tokio::test]
