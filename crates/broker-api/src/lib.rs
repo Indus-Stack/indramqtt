@@ -4939,6 +4939,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_authz_cache_ttl_filter_round_trip() {
+        // TTL filter through the production router: one fresh decision
+        // reads as a list with one entry, one expired decision reads as empty.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Connect and subscribe through the broker.
+        let mut subscriber = WsClient::connect(server.port).await;
+        subscriber
+            .send_bin(&mqtt_connect("w2-01-cache-ttl", None, None))
+            .await;
+        let connack = subscriber.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        subscriber
+            .send_bin(&mqtt_subscribe(7, &[("conf/authz/ttl", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+
+        // Fresh entry reads as a list with one entry.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w2-01-cache-ttl/authorization/cache",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["topic"], json!("conf/authz/ttl"));
+        assert_eq!(entries[0]["access"], json!("subscribe"));
+        assert_eq!(entries[0]["result"], json!("allow"));
+        assert!(entries[0]["updated_time"].is_number());
+
+        // Short TTL expires the entry. Wait past the TTL.
+        // Short TTL keeps the wait small. Long wait avoids timing luck.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/settings",
+                json!({
+                    "no_match": "deny",
+                    "deny_action": "ignore",
+                    "cache": {
+                        "enable": true,
+                        "max_size": 32,
+                        "ttl": "1ms",
+                        "excludes": [],
+                    },
+                    "include_mountpoint": false,
+                    "ignore_backend_failures": false,
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w2-01-cache-ttl/authorization/cache",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+    }
+
+    #[tokio::test]
+    async fn client_authz_cache_latest_decision_round_trip() {
+        // Latest decision through the production router: two fresh
+        // subscribes, the read returns both entries with the latest last.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let mut subscriber = WsClient::connect(server.port).await;
+        subscriber
+            .send_bin(&mqtt_connect("w2-01-cache-latest", None, None))
+            .await;
+        let connack = subscriber.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        subscriber
+            .send_bin(&mqtt_subscribe(7, &[("conf/authz/latest-a", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+        subscriber
+            .send_bin(&mqtt_subscribe(8, &[("conf/authz/latest-b", 0)]))
+            .await;
+        let suback = subscriber.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/clients/w2-01-cache-latest/authorization/cache",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1]["topic"], json!("conf/authz/latest-b"));
+        assert_eq!(entries[1]["access"], json!("subscribe"));
+        assert_eq!(entries[1]["result"], json!("allow"));
+        assert!(entries[1]["updated_time"].is_number());
+    }
+
+    #[tokio::test]
     async fn authz_global_cache_clear_round_trip() {
         // Global decision-cache clear (W2-13, C04-01) through the broker:
         // authorized activity populates the per-session decision caches
@@ -9901,6 +10010,332 @@ mod tests {
             .await;
         assert_eq!(status, 400);
         assert_eq!(body["code"], json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn mv09b_client_rules_http_round_trip_order_replace_refused() {
+        // Per-client rules through the production router: create, list
+        // with paging, read, replace, delete, order, merge and refusal.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Empty index reads as an empty page, never an error.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"], json!([]));
+        assert_eq!(body["meta"]["count"], json!(0));
+
+        // Create one rule. Success is 204 with no body.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients",
+                json!({"clientid": "mv09b-c1", "topic": "mv09b/c1/#", "permission": "allow", "action": "publish"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+
+        // Duplicate scope is rejected, never merged.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients",
+                json!({"clientid": "mv09b-c1", "topic": "mv09b/c1/#", "permission": "deny", "action": "publish"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+
+        // Malformed bodies are rejected and store nothing new.
+        for bad in [
+            json!({"topic": "mv09b/x/#", "permission": "allow", "action": "publish"}),
+            json!({"clientid": "", "topic": "mv09b/x/#", "permission": "allow", "action": "publish"}),
+            json!({"clientid": "*", "topic": "mv09b/x/#", "permission": "allow", "action": "publish"}),
+            json!({"clientid": "mv09b-x", "topic": "", "permission": "allow", "action": "publish"}),
+            json!({"clientid": "mv09b-x", "topic": "mv09b/x/#", "permission": "maybe", "action": "publish"}),
+            json!({"clientid": "mv09b-x", "topic": "mv09b/x/#", "permission": "allow", "action": "forward"}),
+        ] {
+            let (status, body) = server
+                .post_auth(
+                    "/api/v5/authorization/sources/built_in_database/rules/clients",
+                    bad,
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 400);
+            assert_eq!(body["code"], json!("BAD_REQUEST"));
+        }
+
+        // Seed two more clients so paging has three rows.
+        for (id, topic) in [("mv09b-c2", "mv09b/c2/#"), ("mv09b-c3", "mv09b/c3/#")] {
+            let (status, _) = server
+                .post_auth(
+                    "/api/v5/authorization/sources/built_in_database/rules/clients",
+                    json!({"clientid": id, "topic": topic, "permission": "allow", "action": "publish"}),
+                    &token,
+                )
+                .await;
+            assert_eq!(status, 204);
+        }
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients?page=2&limit=1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"].as_array().expect("data array").len(), 1);
+        assert_eq!(body["meta"]["count"], json!(3));
+
+        // Detail read carries the key plus the rule set.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-c1",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["clientid"], json!("mv09b-c1"));
+        assert_eq!(body["rules"].as_array().expect("rules array").len(), 1);
+
+        // Unknown ids read as 404 with the documented shape.
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-missing",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+
+        // Replace sets order: first match wins. Broad allow first opens
+        // the narrow topic.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/#", "permission": "allow", "action": "publish"},
+                    {"topic": "mv09b/order/secret/#", "permission": "deny", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        // Prove at socket: first-match allow admits the publish.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("mv09b-ord", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        client
+            .send_bin(&mqtt_publish("mv09b/order/secret/x", 1, 1, b"x"))
+            .await;
+        let puback = client.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/mv09b-ord/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["access"], json!("publish"));
+        assert_eq!(entries[0]["topic"], json!("mv09b/order/secret/x"));
+        assert_eq!(entries[0]["result"], json!("allow"));
+
+        // Reversed order denies the same probe.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/secret/#", "permission": "deny", "action": "publish"},
+                    {"topic": "mv09b/order/#", "permission": "allow", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        // Prove at socket: reversed order, first match denies.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("mv09b-ord", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        client
+            .send_bin(&mqtt_publish("mv09b/order/secret/x", 2, 1, b"x"))
+            .await;
+        let puback = client.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/mv09b-ord/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["access"], json!("publish"));
+        assert_eq!(entries[0]["topic"], json!("mv09b/order/secret/x"));
+        assert_eq!(entries[0]["result"], json!("deny"));
+
+        // Replace drops omitted rules, it never merges.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/kept/#", "permission": "allow", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rules"].as_array().expect("rules array").len(), 1);
+        assert_eq!(body["rules"][0]["topic"], json!("mv09b/order/kept/#"));
+
+        // A refused replace keeps the active policy.
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/ok/#", "permission": "allow", "action": "publish"},
+                    {"topic": "", "permission": "allow", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["rules"].as_array().expect("rules array").len(), 1);
+        // Prove at socket: refused replace keeps the stored allow policy.
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("mv09b-ord", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+        client
+            .send_bin(&mqtt_publish("mv09b/order/kept/x", 3, 1, b"x"))
+            .await;
+        let puback = client.recv_msg().await.expect("puback");
+        assert_eq!(mqtt_packet_type(&puback), 4);
+        let (status, body) = server
+            .get_auth("/api/v5/clients/mv09b-ord/authorization/cache", &token)
+            .await;
+        assert_eq!(status, 200);
+        let entries = body.as_array().expect("cache is a bare list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["access"], json!("publish"));
+        assert_eq!(entries[0]["topic"], json!("mv09b/order/kept/x"));
+        assert_eq!(entries[0]["result"], json!("allow"));
+
+        // Duplicate scope inside one batch is rejected and keeps policy.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                json!({"rules": [
+                    {"topic": "mv09b/order/dup/#", "permission": "allow", "action": "publish"},
+                    {"topic": "mv09b/order/dup/#", "permission": "deny", "action": "publish"},
+                ]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+
+        // Delete removes every rule for the id. A second delete is 404.
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-ord",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn mv09b_changed_client_rule_applies_without_reconnect() {
+        // A changed client rule steers the next operation on a connected
+        // client. The client stays connected throughout: HTTP changes the
+        // rule, the next subscribe on the same connection follows it.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        let mut client = WsClient::connect(server.port).await;
+        client
+            .send_bin(&mqtt_connect("mv09b-noreconn", None, None))
+            .await;
+        let connack = client.recv_msg().await.expect("connack");
+        assert_eq!(mqtt_packet_type(&connack), 2);
+        assert_eq!(connack[3], 0);
+
+        // Empty table is open, so the first subscribe succeeds.
+        client
+            .send_bin(&mqtt_subscribe(7, &[("mv09b/noreconn/#", 0)]))
+            .await;
+        let suback = client.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
+
+        // Deny the same filter over HTTP. The next subscribe on the same
+        // connection is refused without a reconnect.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients",
+                json!({"clientid": "mv09b-noreconn", "topic": "mv09b/noreconn/#", "permission": "deny", "action": "subscribe"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        client
+            .send_bin(&mqtt_subscribe(8, &[("mv09b/noreconn/#", 0)]))
+            .await;
+        let suback = client.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0x87]);
+
+        // Delete the rule over HTTP. The next subscribe on the same
+        // connection succeeds again, still without a reconnect.
+        let (status, _) = server
+            .delete_auth(
+                "/api/v5/authorization/sources/built_in_database/rules/clients/mv09b-noreconn",
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        client
+            .send_bin(&mqtt_subscribe(9, &[("mv09b/noreconn/#", 0)]))
+            .await;
+        let suback = client.recv_msg().await.expect("suback");
+        assert_eq!(mqtt_packet_type(&suback), 9);
+        assert_eq!(&suback[4..], &[0]);
     }
 
     #[tokio::test]

@@ -487,6 +487,9 @@ async fn backup_file_download_through_broker_api() {
     use std::time::Duration;
     use tokio::net::TcpListener;
 
+    // Bound for one management request in this test. Five seconds
+    // matches STEP above; a cold debug boot plus parallel hashing
+    // and fsync completes within five seconds under load.
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     let engine = Arc::new(RuleEngine::new(16, BackpressurePolicy::DropOldest));
