@@ -563,12 +563,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 25. Redshift
     schemas.insert(
         "connector_redshift.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "redshift",
             json!({
                 "server": str_prop("127.0.0.1:5439"),
                 "database": str_prop("dev"),
                 "username": str_prop("awsuser"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -619,12 +621,15 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 29. Oracle
     schemas.insert(
         "bridge_oracle.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "oracle",
             json!({
                 "server": str_prop("127.0.0.1:1521"),
                 "service_name": str_prop("XE"),
+                "sid": str_prop(""),
                 "username": str_prop("system"),
-                "password": pwd_prop()
+                "password": pwd_prop(),
+                "pool_size": int_prop(8)
             }),
             &["name", "server", "service_name"],
         ),
@@ -633,12 +638,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 30. Microsoft SQL Server
     schemas.insert(
         "bridge_mssql.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "mssql",
             json!({
                 "server": str_prop("127.0.0.1:1433"),
                 "database": str_prop("master"),
                 "username": str_prop("sa"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -646,12 +653,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     );
     schemas.insert(
         "bridge_sqlserver.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "sqlserver",
             json!({
                 "server": str_prop("127.0.0.1:1433"),
                 "database": str_prop("master"),
                 "username": str_prop("sa"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -661,12 +670,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 31. CockroachDB
     schemas.insert(
         "connector_cockroachdb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "cockroachdb",
             json!({
                 "server": str_prop("127.0.0.1:26257"),
                 "database": str_prop("defaultdb"),
                 "username": str_prop("root"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -792,12 +803,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 38. AlloyDB
     schemas.insert(
         "connector_alloydb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "alloydb",
             json!({
                 "server": str_prop("127.0.0.1:5432"),
                 "database": str_prop("postgres"),
                 "username": str_prop("postgres"),
                 "password": pwd_prop(),
+                "pool_size": int_prop(8),
                 "ssl": ssl_prop()
             }),
             &["name", "server", "database"],
@@ -919,6 +932,73 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "connector": str_prop(""),
         "sql": str_prop("INSERT INTO telemetry(clientid, topic, payload, timestamp) VALUES (${clientid}, ${topic}, ${payload}, ${timestamp})")
     }), &["name", "connector", "sql"]));
+
+    // SQL Server action: the statement binds $1 (event time), $2
+    // (topic), $3 (client id), $4 (QoS) and $5 (payload JSON).
+    schemas.insert(
+        "bridge_sqlserver.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "mssql",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES ($2, $4, $5)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // Oracle action: the statement binds :1 (topic), :2 (QoS) and :3
+    // (payload).
+    schemas.insert(
+        "bridge_oracle.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "oracle",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES (:1, :2, :3)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // AlloyDB action: PostgreSQL markers $1 (topic), $2 (QoS), $3 (payload).
+    schemas.insert(
+        "action_alloydb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "alloydb",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES ($1, $2, $3)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // CockroachDB action: PostgreSQL markers $1 (topic), $2 (QoS), $3 (payload).
+    schemas.insert(
+        "action_cockroachdb.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "cockroachdb",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES ($1, $2, $3)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
+
+    // Redshift action: PostgreSQL markers $1 (topic), $2 (QoS), $3 (payload).
+    schemas.insert(
+        "action_redshift.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "redshift",
+            json!({
+                "connector": str_prop(""),
+                "sql": str_prop("INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES ($1, $2, $3)")
+            }),
+            &["name", "connector", "sql"],
+        ),
+    );
 
     // ClickHouse action
     schemas.insert(

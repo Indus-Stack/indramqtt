@@ -15,7 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use broker_connectors::SinkBatchItem;
 use broker_connectors::{BackoffState, BatchQueue, Connector, ConnectorError, Result, Sink};
+use std::sync::atomic::AtomicUsize;
+use std::sync::OnceLock;
 
 fn default_batch_size() -> Option<usize> {
     Some(500)
@@ -492,6 +495,40 @@ impl OracleTransport for HttpOracleTransport {
     }
 }
 
+/// Driver attempts seen on this process, newest last.
+/// The driver records each statement with its binds before dial.
+/// The offline test reads them through the broker path.
+/// Bound is 64 entries: fan-in stays finite.
+fn oracle_attempts_store() -> &'static Mutex<Vec<CapturedOracleExecution>> {
+    static STORE: OnceLock<Mutex<Vec<CapturedOracleExecution>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Record one attempted row before the dial.
+/// Keep only the newest 64 rows.
+fn record_oracle_attempt(statement: &str, binds: &[OracleBindParam]) {
+    const MAX_ORACLE_ATTEMPTS: usize = 64;
+    let mut guard = oracle_attempts_store().lock();
+    guard.push(CapturedOracleExecution {
+        statement: statement.to_string(),
+        binds: binds.to_vec(),
+    });
+    if guard.len() > MAX_ORACLE_ATTEMPTS {
+        let drop = guard.len() - MAX_ORACLE_ATTEMPTS;
+        guard.drain(0..drop);
+    }
+}
+
+/// Read the recorded driver attempts.
+pub fn oracle_driver_attempts() -> Vec<CapturedOracleExecution> {
+    oracle_attempts_store().lock().clone()
+}
+
+/// Clear the recorded driver attempts.
+pub fn clear_oracle_driver_attempts() {
+    oracle_attempts_store().lock().clear();
+}
+
 /// Map a sink bind value onto the driver value.
 /// Booleans become 1/0 numbers: the server type is NUMBER.
 fn oracle_value_to_driver(value: &OracleValue) -> oracle_rs::Value {
@@ -537,6 +574,7 @@ pub struct DriverOracleTransport {
     host: String,
     port: u16,
     service: String,
+    uses_sid: bool,
     username: String,
     password: String,
     timeout: Duration,
@@ -554,6 +592,32 @@ impl DriverOracleTransport {
         password: &str,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::build(host, port, service, false, username, password, timeout)
+    }
+
+    /// Create a direct database transport that dials by SID.
+    /// Fails closed on empty host, sid, username or zero port.
+    pub fn with_sid(
+        host: &str,
+        port: u16,
+        sid: &str,
+        username: &str,
+        password: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::build(host, port, sid, true, username, password, timeout)
+    }
+
+    /// Share the build checks of both constructors.
+    fn build(
+        host: &str,
+        port: u16,
+        service: &str,
+        uses_sid: bool,
+        username: &str,
+        password: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
         if host.trim().is_empty() {
             return Err(ConnectorError::Dispatch(
                 "oracle host cannot be empty".into(),
@@ -565,6 +629,11 @@ impl DriverOracleTransport {
             ));
         }
         if service.trim().is_empty() {
+            if uses_sid {
+                return Err(ConnectorError::Dispatch(
+                    "oracle sid cannot be empty".into(),
+                ));
+            }
             return Err(ConnectorError::Dispatch(
                 "oracle service cannot be empty".into(),
             ));
@@ -578,6 +647,7 @@ impl DriverOracleTransport {
             host: host.to_string(),
             port,
             service: service.to_string(),
+            uses_sid,
             username: username.to_string(),
             password: password.to_string(),
             timeout,
@@ -585,15 +655,30 @@ impl DriverOracleTransport {
         })
     }
 
+    /// True when this transport dials by SID.
+    pub fn uses_sid(&self) -> bool {
+        self.uses_sid
+    }
+
     /// Open one TNS session for the stored credentials.
     async fn connect_new(&self) -> Result<oracle_rs::Connection> {
-        let config = oracle_rs::Config::new(
-            self.host.clone(),
-            self.port,
-            self.service.clone(),
-            self.username.clone(),
-            self.password.clone(),
-        );
+        let config = if self.uses_sid {
+            oracle_rs::Config::with_sid(
+                self.host.clone(),
+                self.port,
+                self.service.clone(),
+                self.username.clone(),
+                self.password.clone(),
+            )
+        } else {
+            oracle_rs::Config::new(
+                self.host.clone(),
+                self.port,
+                self.service.clone(),
+                self.username.clone(),
+                self.password.clone(),
+            )
+        };
         tokio::time::timeout(
             self.timeout,
             oracle_rs::Connection::connect_with_config(config),
@@ -713,6 +798,9 @@ impl OracleTransport for DriverOracleTransport {
                 error_message: None,
             });
         }
+        for binds in all_binds {
+            record_oracle_attempt(statement, binds);
+        }
         let mut guard = self.connection.lock().await;
         if guard.is_none() {
             match self.connect_new().await {
@@ -787,6 +875,7 @@ impl OracleTransport for DriverOracleTransport {
     }
 
     async fn execute(&self, statement: &str, binds: &[OracleBindParam]) -> Result<OracleResponse> {
+        record_oracle_attempt(statement, binds);
         let mut guard = self.connection.lock().await;
         if guard.is_none() {
             match self.connect_new().await {
@@ -1062,6 +1151,206 @@ impl Sink for OracleSink {
             }
         }
         Ok(())
+    }
+
+    fn kind(&self) -> &'static str {
+        "oracle"
+    }
+}
+
+/// Scan an Oracle statement for positional `:N` markers outside
+/// string literals and comments. A colon counts only when the next
+/// character starts a number and the previous character is not part
+/// of a name (`t.col` is not a marker; `12:10` is not one either).
+/// Returns the marker numbers in order of appearance.
+pub fn referenced_oracle_params(template: &str) -> Vec<u32> {
+    let chars: Vec<char> = template.chars().collect();
+    let n = chars.len();
+    let mut found = Vec::new();
+    let mut i = 0;
+    let mut in_string: Option<char> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while i < n {
+        let c = chars[i];
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && i + 1 < n && chars[i + 1] == '/' {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(quote) = in_string {
+            if c == quote {
+                if quote == '\'' && i + 1 < n && chars[i + 1] == '\'' {
+                    i += 2;
+                } else {
+                    in_string = None;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                in_string = Some(c);
+                i += 1;
+            }
+            '-' if i + 1 < n && chars[i + 1] == '-' => {
+                in_line_comment = true;
+                i += 2;
+            }
+            '/' if i + 1 < n && chars[i + 1] == '*' => {
+                in_block_comment = true;
+                i += 2;
+            }
+            ':' => {
+                let prev_is_name = i > 0
+                    && (chars[i - 1].is_ascii_alphanumeric()
+                        || chars[i - 1] == '_'
+                        || chars[i - 1] == ':'
+                        || chars[i - 1] == '.');
+                let mut j = i + 1;
+                while j < n && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if !prev_is_name && j > i + 1 {
+                    if let Ok(number) = chars[i + 1..j].iter().collect::<String>().parse::<u32>() {
+                        found.push(number);
+                    }
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    found
+}
+
+/// Validate an action statement for [`OracleActionSink`]: at least one
+/// marker, and every marker is `:1` (topic), `:2` (QoS) or `:3`
+/// (payload). Values bind out-of-band; the check keeps a statement
+/// that cannot bind from being stored.
+pub fn validate_oracle_action_sql(statement: &str) -> Result<()> {
+    if statement.trim().is_empty() {
+        return Err(ConnectorError::Dispatch(
+            "oracle sql must not be empty".to_string(),
+        ));
+    }
+    let mut referenced = referenced_oracle_params(statement);
+    referenced.sort_unstable();
+    referenced.dedup();
+    if referenced.is_empty() || referenced.iter().any(|n| *n == 0 || *n > 3) {
+        let shown: Vec<String> = referenced.iter().map(|n| format!(":{n}")).collect();
+        return Err(ConnectorError::Dispatch(format!(
+            "oracle sql must reference :1..:3 (topic, qos, payload), got {}",
+            shown.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Action-owned Oracle sink (MV-02a): the v5 action's `parameters.sql`
+/// runs once per batch with `:1` (topic), `:2` (QoS) and `:3`
+/// (payload) bound through the maintained `oracle_rs` driver, never
+/// formatted into the statement text. The pool holds at most one
+/// driver session per entry (each dials lazily on first use); batches
+/// rotate across entries. Failures map through the typed MV-13b
+/// classifier, so a delivery error counts as failed, never silent.
+pub struct OracleActionSink {
+    statement: String,
+    pool: Vec<Arc<dyn OracleTransport>>,
+    next: AtomicUsize,
+}
+
+impl OracleActionSink {
+    /// Build from an already validated statement and at least one
+    /// transport (one per `pool_size` session, each lazy).
+    pub fn new(statement: String, pool: Vec<Arc<dyn OracleTransport>>) -> Result<Self> {
+        validate_oracle_action_sql(&statement)?;
+        if pool.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "oracle action sink needs at least one transport".to_string(),
+            ));
+        }
+        Ok(Self {
+            statement,
+            pool,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// The bound statement this sink runs.
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
+    /// Number of pooled sessions.
+    pub fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
+    fn pick(&self) -> Arc<dyn OracleTransport> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        Arc::clone(&self.pool[index])
+    }
+
+    fn row_binds(item: &SinkBatchItem) -> Vec<OracleBindParam> {
+        vec![
+            OracleBindParam {
+                name: "1".to_string(),
+                value: OracleValue::String(item.topic.as_str().to_string()),
+                data_type: Some("VARCHAR2".to_string()),
+            },
+            OracleBindParam {
+                name: "2".to_string(),
+                value: OracleValue::Integer(i64::from(u8::from(item.qos))),
+                data_type: Some("NUMBER".to_string()),
+            },
+            OracleBindParam {
+                name: "3".to_string(),
+                value: OracleValue::String(String::from_utf8_lossy(&item.payload).into_owned()),
+                data_type: Some("VARCHAR2".to_string()),
+            },
+        ]
+    }
+}
+
+#[async_trait::async_trait]
+impl Sink for OracleActionSink {
+    async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
+        self.send_batch(&[SinkBatchItem {
+            topic: topic.clone(),
+            payload: payload.clone(),
+            qos,
+        }])
+        .await
+    }
+
+    async fn send_batch(&self, items: &[SinkBatchItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let binds: Vec<Vec<OracleBindParam>> = items.iter().map(Self::row_binds).collect();
+        self.pick()
+            .execute_many(&self.statement, &binds)
+            .await
+            .map(|_| ())
     }
 
     fn kind(&self) -> &'static str {
@@ -1707,6 +1996,19 @@ mod tests {
         assert!(matches!(denied, Err(ConnectorError::Dispatch(_))));
         let ok = DriverOracleTransport::new("db", 1521, "FREEPDB1", "system", "pw", timeout);
         assert!(ok.is_ok());
+        assert!(!ok.expect("service name builds").uses_sid());
+    }
+
+    /// A SID transport builds and marks itself for `Config::with_sid`.
+    /// An empty SID fails closed.
+    #[test]
+    fn test_driver_transport_with_sid() {
+        let timeout = Duration::from_secs(1);
+        let denied = DriverOracleTransport::with_sid("db", 1521, "", "system", "pw", timeout);
+        assert!(matches!(denied, Err(ConnectorError::Dispatch(_))));
+        let ok = DriverOracleTransport::with_sid("db", 1521, "ORCL", "system", "pw", timeout);
+        assert!(ok.is_ok());
+        assert!(ok.expect("sid builds").uses_sid());
     }
 
     /// Fail closed when the environment lacks the named address.
@@ -2010,5 +2312,204 @@ mod tests {
             .expect("qual drop table");
         admin.commit().await.expect("qual drop commits");
         eprintln!("qual done: rows={ROWS} table={table} cleaned");
+    }
+
+    #[test]
+    fn test_action_sql_validation() {
+        let good = "INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES (:1, :2, :3)";
+        assert!(validate_oracle_action_sql(good).is_ok());
+        // A subset still binds: unused engine values stay unbound.
+        assert!(validate_oracle_action_sql("INSERT INTO t(topic) VALUES (:1)").is_ok());
+        // No marker refuses.
+        assert!(validate_oracle_action_sql("INSERT INTO t VALUES (1)").is_err());
+        // Markers outside 1..=3 refuse.
+        assert!(validate_oracle_action_sql("INSERT INTO t VALUES (:1, :4)").is_err());
+        // Empty refuses.
+        assert!(validate_oracle_action_sql("  ").is_err());
+        // A colon inside a time literal or a qualified name is not a marker.
+        assert_eq!(
+            referenced_oracle_params("SELECT '12:10', t.col FROM t"),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            referenced_oracle_params("INSERT INTO t(a, b) VALUES (:1, :2) -- :9"),
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_action_sink_binds_engine_row() {
+        let transport = Arc::new(MockOracleTransport::new());
+        let sink = OracleActionSink::new(
+            "INSERT INTO t_mqtt_msg(topic, qos, payload) VALUES (:1, :2, :3)".to_string(),
+            vec![transport.clone() as Arc<dyn OracleTransport>],
+        )
+        .expect("valid action sink");
+        assert_eq!(sink.kind(), "oracle");
+        assert_eq!(sink.pool_len(), 1);
+        let topic = Topic::new("sensors/temp").expect("topic");
+        sink.send(&topic, &Bytes::from_static(b"it's"), QoS::AtLeastOnce)
+            .await
+            .expect("send binds");
+        let executions = transport.executions.lock().clone();
+        assert_eq!(executions.len(), 1);
+        assert!(executions[0].statement.contains("INSERT INTO t_mqtt_msg"));
+        // The engine row binds positionally: topic, qos, payload.
+        assert_eq!(executions[0].binds.len(), 3);
+        assert_eq!(
+            executions[0].binds[0].value,
+            OracleValue::String("sensors/temp".to_string())
+        );
+        assert_eq!(executions[0].binds[1].value, OracleValue::Integer(1));
+        // A quote travels bound, never formatted into the statement.
+        assert_eq!(
+            executions[0].binds[2].value,
+            OracleValue::String("it's".to_string())
+        );
+        assert!(!executions[0].statement.contains("it's"));
+    }
+
+    /// Qualification of the MV-02a action sink against a real Oracle
+    /// Database server over the maintained driver.
+    ///
+    /// Run with e.g.:
+    /// `ORACLE_HOST=127.0.0.1 ORACLE_PORT=1521 ORACLE_SERVICE=FREEPDB1 \
+    ///  ORACLE_USER=system ORACLE_PASSWORD='Oraclepass1' \
+    ///  ORACLE_TABLE=qual_b334 \
+    ///  cargo test -p broker-connectors-enterprise --lib oracle::tests::test_qualify_action_delivery -- --ignored --nocapture --test-threads=1`
+    ///
+    /// Creates the table. Streams 100 rows through the broker's rule
+    /// path (a rule registered with the connector manager, a message
+    /// published through the rule engine, never `sink.send`
+    /// directly). Asserts the exact count and every key back from the
+    /// server. Drops the table. Panics when its environment is
+    /// missing (fail closed, never skips).
+    #[tokio::test]
+    #[ignore = "needs a real Oracle Database server (see ORACLE_* env)"]
+    async fn test_qualify_action_delivery() {
+        use broker_rules::{BackpressurePolicy, RuleEngine};
+        const ROWS: usize = 100;
+
+        let host = qual_require("ORACLE_HOST");
+        let port: u16 = qual_require("ORACLE_PORT")
+            .parse()
+            .expect("qual ORACLE_PORT must be a port number");
+        let service = qual_require("ORACLE_SERVICE");
+        let user = qual_require("ORACLE_USER");
+        let password = qual_require("ORACLE_PASSWORD");
+        let table = qual_identifier("table", &qual_require("ORACLE_TABLE"));
+
+        let admin = qual_connect(&host, port, &service, &user, &password).await;
+        admin
+            .execute(
+                &format!(
+                    "CREATE TABLE {table} (topic VARCHAR2(256), qos NUMBER, payload VARCHAR2(4000))"
+                ),
+                &[],
+            )
+            .await
+            .expect("qual create table");
+        admin.commit().await.expect("qual create commits");
+        eprintln!("qual table created: {table}");
+
+        // The broker's path: the action sink registers with the
+        // shared connector manager and a rule forwards into it, so
+        // the qualification publishes through the rule engine.
+        let timeout = Duration::from_secs(30);
+        let mut pool: Vec<Arc<dyn OracleTransport>> = Vec::new();
+        for _ in 0..4 {
+            pool.push(Arc::new(
+                DriverOracleTransport::new(&host, port, &service, &user, &password, timeout)
+                    .expect("qual transport builds"),
+            ));
+        }
+        let statement = format!("INSERT INTO {table}(topic, qos, payload) VALUES (:1, :2, :3)");
+        let sink =
+            Arc::new(OracleActionSink::new(statement, pool).expect("qual action sink builds"));
+        assert_eq!(sink.kind(), "oracle");
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+        engine.connectors().register("qual-ora-action", sink);
+        engine
+            .create_rule(
+                "qual-ora-rule".to_string(),
+                broker_protocol::TopicFilter::new("sensors/qual").unwrap(),
+                Some(
+                    r#"SELECT * FROM "sensors/qual" INTO connector("qual-ora-action")"#.to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("qual rule creates");
+
+        #[derive(Debug, Default)]
+        struct DiscardSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for DiscardSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: Bytes,
+                _qos: QoS,
+                _retain: bool,
+            ) -> std::result::Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+        let egress: Arc<dyn broker_rules::BrokerSink> = Arc::new(DiscardSink);
+        let topic = Topic::new("sensors/qual").unwrap();
+        for seq in 0..ROWS {
+            let payload = Bytes::from(format!(r#"{{"client_id":"qual-{seq:04}","seq":{seq}}}"#));
+            engine
+                .dispatch_ingress(&topic, &payload, QoS::AtLeastOnce, &egress)
+                .await;
+        }
+
+        let count_rows = admin
+            .query(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .await
+            .expect("qual count");
+        let count = count_rows
+            .rows
+            .first()
+            .and_then(|row| row.get(0))
+            .map(qual_as_i64)
+            .expect("qual count row");
+        assert_eq!(count, ROWS as i64, "qual count mismatch");
+        eprintln!("qual rows asserted: count={ROWS} table={table}");
+
+        let value_rows = admin
+            .query(&format!("SELECT topic, qos, payload FROM {table}"), &[])
+            .await
+            .expect("qual values");
+        assert_eq!(value_rows.rows.len(), ROWS, "qual value row count");
+        let mut seen = std::collections::HashSet::with_capacity(ROWS);
+        for row in &value_rows.rows {
+            let row_topic = row.get(0).map(qual_as_str).expect("qual topic");
+            let row_qos = row.get(1).map(qual_as_i64).expect("qual qos");
+            let row_payload = row.get(2).map(qual_as_str).expect("qual payload");
+            assert_eq!(row_topic, "sensors/qual");
+            assert_eq!(row_qos, 1);
+            let value: serde_json::Value =
+                serde_json::from_str(&row_payload).expect("qual payload JSON");
+            let client = value
+                .get("client_id")
+                .and_then(|v| v.as_str())
+                .expect("qual client_id");
+            assert!(seen.insert(client.to_string()), "qual duplicate {client}");
+        }
+        for seq in 0..ROWS {
+            assert!(
+                seen.contains(&format!("qual-{seq:04}")),
+                "qual missing key qual-{seq:04}"
+            );
+        }
+        eprintln!("qual values asserted: every key present");
+
+        admin
+            .execute(&format!("DROP TABLE {table}"), &[])
+            .await
+            .expect("qual drop table");
+        admin.commit().await.expect("qual drop commits");
+        eprintln!("qual done: rows={ROWS} table={table}");
     }
 }

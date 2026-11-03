@@ -1015,7 +1015,10 @@ fn trial_days_remaining(trial_started_at: u64, now_secs: u64) -> Option<u64> {
     let trial_secs = TRIAL_DAYS.saturating_mul(SECS_PER_DAY);
     let elapsed = now_secs.saturating_sub(trial_started_at);
     if elapsed < trial_secs {
-        Some((trial_secs - elapsed) / SECS_PER_DAY)
+        // Use ceiling division. Truncation drops to 89 after one
+        // second. Ceiling keeps 90 for the first full day.
+        let remaining = trial_secs.saturating_sub(elapsed);
+        Some(remaining.saturating_add(SECS_PER_DAY - 1) / SECS_PER_DAY)
     } else {
         None
     }
@@ -1052,7 +1055,10 @@ pub fn evaluate_installation(
     match verify_token_at_time(token, &identity.identity, trusted, effective) {
         Ok(payload) => {
             if effective <= payload.expires_at {
-                let days_remaining = payload.expires_at.saturating_sub(effective) / SECS_PER_DAY;
+                // Use ceiling division. Truncation drops one day
+                // after one second. Ceiling keeps the count stable.
+                let remaining = payload.expires_at.saturating_sub(effective);
+                let days_remaining = remaining.saturating_add(SECS_PER_DAY - 1) / SECS_PER_DAY;
                 InstallationState::Valid {
                     customer: payload.customer,
                     expires_at: payload.expires_at,
@@ -1065,7 +1071,10 @@ pub fn evaluate_installation(
                 let grace_secs = payload.grace_period_days.saturating_mul(SECS_PER_DAY);
                 let elapsed = effective.saturating_sub(payload.expires_at);
                 if elapsed <= grace_secs {
-                    let days_remaining = grace_secs.saturating_sub(elapsed) / SECS_PER_DAY;
+                    // Use ceiling division. Truncation drops one day
+                    // after one second. Ceiling keeps the count stable.
+                    let remaining = grace_secs.saturating_sub(elapsed);
+                    let days_remaining = remaining.saturating_add(SECS_PER_DAY - 1) / SECS_PER_DAY;
                     InstallationState::Grace {
                         customer: payload.customer,
                         expires_at: payload.expires_at,

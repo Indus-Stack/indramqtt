@@ -1591,6 +1591,10 @@ async fn create_connector(
     if req.id.trim().is_empty() {
         return bad_request("connector id must not be empty");
     }
+    let kind = req.kind.to_ascii_lowercase();
+    if let Some(message) = removed_connector_refusal(&kind) {
+        return bad_request(message);
+    }
     let built = build_connector(&req).await;
     match built {
         Ok((kind, sink)) => {
@@ -3114,13 +3118,16 @@ mod tests {
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        let message = "connector type mysql is not available in this broker";
+        let message = "connector type snowflake is not available in this broker";
 
         // Create of a pending kind stores nothing.
         let (status, body) = server
             .post_auth(
                 "/api/v5/connectors",
-                json!({"id": "pending-conn", "type": "mysql"}),
+                json!({"id": "pending-conn", "type": "snowflake",
+                       "account": "xy12345.us-east-1", "user": "indra_loader",
+                       "database": "IOT", "schema": "PUBLIC", "table": "TELEMETRY",
+                       "private_key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"}),
                 &token,
             )
             .await;
@@ -3160,7 +3167,7 @@ mod tests {
         let (status, body) = server
             .put_auth(
                 "/api/v5/connectors/pending-keep-conn",
-                json!({"type": "mysql"}),
+                json!({"type": "snowflake"}),
                 &token,
             )
             .await;
@@ -3177,7 +3184,7 @@ mod tests {
         let (status, body) = server
             .put_auth(
                 "/api/v5/actions/pending-keep-action",
-                json!({"type": "mysql"}),
+                json!({"type": "snowflake"}),
                 &token,
             )
             .await;
@@ -3193,7 +3200,7 @@ mod tests {
         let (status, body) = server
             .put_auth(
                 "/api/v5/sources/pending-keep-source",
-                json!({"type": "mysql"}),
+                json!({"type": "snowflake"}),
                 &token,
             )
             .await;
@@ -3212,7 +3219,7 @@ mod tests {
             ("/api/v5/sources", "pending-source"),
         ] {
             let (status, body) = server
-                .post_auth(path, json!({"id": id, "type": "mysql"}), &token)
+                .post_auth(path, json!({"id": id, "type": "snowflake"}), &token)
                 .await;
             assert_eq!(status, 400, "{path} create");
             assert_eq!(body["code"], json!("ALREADY_EXISTS"), "{path}");
@@ -3226,7 +3233,7 @@ mod tests {
             "/api/v5/sources_probe",
         ] {
             let (status, body) = server
-                .post_auth(path, json!({"type": "mysql"}), &token)
+                .post_auth(path, json!({"type": "snowflake"}), &token)
                 .await;
             assert_eq!(status, 400, "{path}");
             assert_eq!(body["code"], json!("TEST_FAILED"), "{path}");
@@ -3236,17 +3243,21 @@ mod tests {
         let (status, connectors) = server.get_auth("/api/v5/connectors", &token).await;
         assert_eq!(status, 200);
         for row in connectors.as_array().expect("connector list") {
-            assert_ne!(row["type"], json!("mysql"), "pending connector not stored");
+            assert_ne!(
+                row["type"],
+                json!("snowflake"),
+                "pending connector not stored"
+            );
         }
         let (status, actions) = server.get_auth("/api/v5/actions", &token).await;
         assert_eq!(status, 200);
         for row in actions.as_array().expect("action list") {
-            assert_ne!(row["type"], json!("mysql"), "pending action not stored");
+            assert_ne!(row["type"], json!("snowflake"), "pending action not stored");
         }
         let (status, sources) = server.get_auth("/api/v5/sources", &token).await;
         assert_eq!(status, 200);
         for row in sources.as_array().expect("source list") {
-            assert_ne!(row["type"], json!("mysql"), "pending source not stored");
+            assert_ne!(row["type"], json!("snowflake"), "pending source not stored");
         }
 
         let _ = server
@@ -3608,8 +3619,8 @@ connector_id = "legacy-good"
         std::fs::create_dir_all(&dir).expect("create data dir");
         let pending = r#"
 [[connectors.connectors]]
-id = "pending-mysql"
-connector_type = "mysql"
+id = "pending-snowflake"
+connector_type = "snowflake"
 enable = true
 config = '{}'
 
@@ -3620,10 +3631,10 @@ enable = true
 config = '{}'
 
 [[actions.actions]]
-id = "pending-mysql"
-action_type = "mysql"
+id = "pending-snowflake"
+action_type = "snowflake"
 enable = true
-config = '{"connector":"pending-mysql"}'
+config = '{"connector":"pending-snowflake"}'
 
 [[actions.actions]]
 id = "pending-good"
@@ -3636,7 +3647,7 @@ id = "pending-rule"
 name = "pending rule"
 tenant = "default"
 topic_filter = "pending/#"
-sql_query = 'SELECT * FROM "pending/+" INTO connector("pending-mysql")'
+sql_query = 'SELECT * FROM "pending/+" INTO connector("pending-snowflake")'
 enabled = true
 
 [[rules.rules.actions]]
@@ -3649,7 +3660,7 @@ connector_id = "pending-good"
             Arc::new(ConfigRegistry::load_for_boot(&dir).expect("pending state loads for boot"));
         let (server, _state) = TestServer::start_with_registry(registry).await;
         let token = server.login_as_admin().await;
-        let reason = "connector type mysql is not available in this broker";
+        let reason = "connector type snowflake is not available in this broker";
 
         let (status, connectors) = server.get_auth("/api/v5/connectors", &token).await;
         assert_eq!(status, 200);
@@ -3657,7 +3668,7 @@ connector_id = "pending-good"
             .as_array()
             .expect("connector list")
             .iter()
-            .find(|row| row["id"] == json!("pending-mysql"))
+            .find(|row| row["id"] == json!("pending-snowflake"))
             .expect("pending connector kept and listed");
         assert_eq!(pending_connector["status"], json!("disconnected"));
         assert_eq!(pending_connector["status_reason"], json!(reason));
@@ -3676,7 +3687,7 @@ connector_id = "pending-good"
             .as_array()
             .expect("action list")
             .iter()
-            .find(|row| row["id"] == json!("pending-mysql"))
+            .find(|row| row["id"] == json!("pending-snowflake"))
             .expect("pending action kept and listed");
         assert_eq!(pending_action["status"], json!("disconnected"));
         assert_eq!(pending_action["status_reason"], json!(reason));
@@ -3694,11 +3705,11 @@ connector_id = "pending-good"
             .filter_map(|row| row["name"].as_str())
             .collect();
         assert!(
-            names.contains(&"connector_unavailable:pending-mysql"),
+            names.contains(&"connector_unavailable:pending-snowflake"),
             "{names:?}"
         );
         assert!(
-            names.contains(&"action_unavailable:pending-mysql"),
+            names.contains(&"action_unavailable:pending-snowflake"),
             "{names:?}"
         );
 
@@ -3713,7 +3724,7 @@ connector_id = "pending-good"
         assert_eq!(status, 202, "no subscriber: accepted for the rule path");
 
         let (status, metrics) = server
-            .get_auth("/api/v5/actions/pending-mysql/metrics", &token)
+            .get_auth("/api/v5/actions/pending-snowflake/metrics", &token)
             .await;
         assert_eq!(status, 200);
         assert_eq!(metrics["metrics"]["total"], json!(1));
@@ -5049,7 +5060,6 @@ connector_id = "pending-good"
 
     /// Poll one action's metrics until `failed` reaches `want`.
     /// Exact equality: a duplicate failure count fails instead of passing.
-    #[cfg(any(feature = "mongodb", feature = "couchbase"))]
     async fn mv02c_wait_failed(server: &TestServer, token: &str, action: &str, want: u64) {
         for _ in 0..300 {
             let (status, metrics) = server
@@ -5249,7 +5259,7 @@ connector_id = "pending-good"
                 "/api/v5/connectors",
                 json!({"type": "couchbase", "name": "mv02c-cb",
                        "server": target, "username": "u", "password": "p",
-                       "timeout_ms": 1_000}),
+                       "timeout_ms": 5_000}),
                 &token,
             )
             .await;
@@ -5434,6 +5444,113 @@ connector_id = "pending-good"
         mv02b_wait_success(&server, &token, "mv02c-cb-act", 5).await;
         mv02b_wait_success(&server, &token, "mv02c-cb-act-b", 1).await;
 
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mv02a_oracle_delivers_bound_rows_through_broker() {
+        // Oracle has no loopback TNS fake. The driver records each
+        // statement with its binds before the dial. This test reads
+        // that record after driving the full broker path.
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("mv02a-oracle");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        broker_connectors_enterprise::oracle::clear_oracle_driver_attempts();
+
+        // A dead port fails the dial fast. The attempt record stays.
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"type": "oracle", "name": "mv02a-ora",
+                       "server": "127.0.0.1:1", "username": "u", "password": "pwd",
+                       "service_name": "XE"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "connector create: {body}");
+        let sql = "MV02A-ORACLE-SQL INSERT INTO t(topic, qos, payload) VALUES (:1, :2, :3)";
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"type": "oracle", "name": "mv02a-ora-act",
+                       "connector": "mv02a-ora",
+                       "parameters": {"sql": sql}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "action create: {body}");
+        // The stored statement echoes exactly. No value is formatted in.
+        let (status, read) = server
+            .get_auth("/api/v5/actions/mv02a-ora-act", &token)
+            .await;
+        assert_eq!(status, 200, "{read}");
+        assert_eq!(read["parameters"]["sql"], json!(sql), "{read}");
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({"id": "mv02a-ora-rule", "name": "mv02a-ora-rule",
+                       "sql": "SELECT * FROM \"mv02a/ora\"", "actions": ["mv02a-ora-act"]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201, "rule create: {body}");
+
+        // One publish drives the stored rule path with a quote payload.
+        // The management publish entry is a production entry.
+        let payload = "{\"v\":\"a\\\"b\"}";
+        mv02b_publish(&server, &token, "mv02a/ora", payload).await;
+        mv02c_wait_failed(&server, &token, "mv02a-ora-act", 1).await;
+
+        // The dead dial counts one failed forward, none succeeds.
+        let (status, metrics) = server
+            .get_auth("/api/v5/actions/mv02a-ora-act/metrics", &token)
+            .await;
+        assert_eq!(status, 200, "{metrics}");
+        assert_eq!(metrics["metrics"]["failed"], json!(1), "{metrics}");
+        assert_eq!(metrics["metrics"]["success"], json!(0), "{metrics}");
+
+        // The driver got the bound row: topic, qos, payload with quote.
+        // The quote never enters the statement text.
+        let attempts = broker_connectors_enterprise::oracle::oracle_driver_attempts();
+        assert!(!attempts.is_empty(), "the rule path reached the driver");
+        for attempt in &attempts {
+            assert_eq!(attempt.statement, sql, "exact :1 :2 :3 statement");
+            assert_eq!(attempt.binds.len(), 3, "topic, qos, payload");
+            assert_eq!(
+                attempt.binds[0].value,
+                broker_connectors_enterprise::oracle::OracleValue::String("mv02a/ora".to_string())
+            );
+            assert_eq!(
+                attempt.binds[1].value,
+                broker_connectors_enterprise::oracle::OracleValue::Integer(0)
+            );
+            assert_eq!(
+                attempt.binds[2].value,
+                broker_connectors_enterprise::oracle::OracleValue::String(payload.to_string())
+            );
+            assert!(
+                !attempt.statement.contains("a\"b"),
+                "quote stays bound: {}",
+                attempt.statement
+            );
+        }
+
+        let (status, _) = server
+            .delete_auth("/api/v5/rules/mv02a-ora-rule", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/mv02a-ora-act", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/mv02a-ora", &token)
+            .await;
+        assert_eq!(status, 204);
         drop(server);
         drop(registry);
         std::fs::remove_dir_all(&dir).ok();
@@ -17902,12 +18019,15 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
         for (name, kind) in [
             ("cf05-kafka-pending", "kafka"),
-            ("cf05-mysql-pending", "mysql"),
+            ("cf05-snowflake-pending", "snowflake"),
         ] {
             let (status, body) = server
                 .post_auth(
                     "/api/v5/connectors",
-                    json!({"name": name, "type": kind, "endpoint": "http://127.0.0.1:9"}),
+                    json!({"name": name, "type": kind, "endpoint": "http://127.0.0.1:9",
+                           "account": "xy12345.us-east-1", "user": "indra_loader",
+                           "database": "IOT", "schema": "PUBLIC", "table": "TELEMETRY",
+                           "private_key_pem": "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----"}),
                     &token,
                 )
                 .await;
@@ -25942,10 +26062,23 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             kinds.contains("pgsql"),
             "type list holds the documented ready kind pgsql"
         );
-        for pending in ["http", "mqtt", "kafka_producer", "redis", "mysql"] {
+        for pending in ["http", "mqtt", "kafka_producer", "redis"] {
             assert!(
                 !kinds.contains(pending),
                 "type list has no pending '{pending}'"
+            );
+        }
+        for ready in [
+            "mysql",
+            "oracle",
+            "sqlserver",
+            "redshift",
+            "alloydb",
+            "cockroachdb",
+        ] {
+            assert!(
+                kinds.contains(ready),
+                "type list holds the documented ready kind {ready}"
             );
         }
         for name in &kinds {

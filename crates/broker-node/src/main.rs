@@ -17733,16 +17733,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create data dir");
         let pending = r#"
 [[connectors.connectors]]
-id = "pending-mysql"
-connector_type = "mysql"
+id = "pending-snowflake"
+connector_type = "snowflake"
 enable = true
 config = '{}'
 
 [[actions.actions]]
-id = "pending-mysql"
-action_type = "mysql"
+id = "pending-snowflake"
+action_type = "snowflake"
 enable = true
-config = '{"connector":"pending-mysql"}'
+config = '{"connector":"pending-snowflake"}'
 "#;
         std::fs::write(dir.join("state.toml"), pending).expect("write pending state");
 
@@ -17773,11 +17773,11 @@ config = '{"connector":"pending-mysql"}'
             .filter_map(|row| row["name"].as_str())
             .collect();
         assert!(
-            names.contains(&"connector_unavailable:pending-mysql"),
+            names.contains(&"connector_unavailable:pending-snowflake"),
             "{names:?}"
         );
         assert!(
-            names.contains(&"action_unavailable:pending-mysql"),
+            names.contains(&"action_unavailable:pending-snowflake"),
             "{names:?}"
         );
 

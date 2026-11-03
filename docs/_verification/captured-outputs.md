@@ -19,6 +19,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `concepts/index.md` | 85 | `hello-docs` |
 | `concepts/listeners.md` | 78 | `ok` |
 | `concepts/listeners.md` | 88 | `hello-listeners` |
+| `connectors/alloydb.md` | 89 | `connected` |
 | `connectors/cassandra.md` | 46 | `ok` |
 | `connectors/cassandra.md` | 78 | `ok` |
 | `connectors/cassandra.md` | 107 | `ok` |
@@ -27,6 +28,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/cassandra.md` | 196 | `ok` |
 | `connectors/cassandra.md` | 258 | `ok` |
 | `connectors/clickhouse.md` | 84 | `ok` |
+| `connectors/cockroachdb.md` | 89 | `connected` |
 | `connectors/couchbase.md` | 100 | `ok` |
 | `connectors/datalayers.md` | 44 | `ok` |
 | `connectors/datalayers.md` | 73 | `ok` |
@@ -52,7 +54,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/greptimedb.md` | 226 | `ok` |
 | `connectors/greptimedb.md` | 292 | `ok` |
 | `connectors/http.md` | 93 | `delivered` |
-| `connectors/index.md` | 139 | `ok` |
+| `connectors/index.md` | 144 | `ok` |
 | `connectors/influxdb.md` | 86 | `influxdb` |
 | `connectors/iotdb.md` | 45 | `ok` |
 | `connectors/iotdb.md` | 73 | `ok` |
@@ -64,6 +66,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/kafka.md` | 83 | `ok` |
 | `connectors/mongodb.md` | 102 | `ok` |
 | `connectors/mqtt-bridge.md` | 91 | `mqtt_bridge` |
+| `connectors/mssql.md` | 90 | `connected` |
 | `connectors/mysql.md` | 79 | `mysql` |
 | `connectors/opentsdb.md` | 43 | `ok` |
 | `connectors/opentsdb.md` | 72 | `ok` |
@@ -71,8 +74,10 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/opentsdb.md` | 130 | `ok` |
 | `connectors/opentsdb.md` | 160 | `ok` |
 | `connectors/opentsdb.md` | 222 | `ok` |
+| `connectors/oracle.md` | 88 | `connected` |
 | `connectors/postgres.md` | 79 | `postgres` |
 | `connectors/redis.md` | 81 | `redis` |
+| `connectors/redshift.md` | 89 | `connected` |
 | `connectors/s3.md` | 88 | `ok` |
 | `connectors/tdengine.md` | 48 | `ok` |
 | `connectors/tdengine.md` | 76 | `ok` |
@@ -177,4 +182,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 161 blocks. Each output matches its page.
+The run captured 166 blocks. Each output matches its page.

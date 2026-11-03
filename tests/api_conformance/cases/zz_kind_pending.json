@@ -5,7 +5,7 @@
     "query": {},
     "body": {
       "name": "conf-kc00-pending-conn",
-      "type": "mysql"
+      "type": "kafka"
     },
     "expect_status": 400,
     "setup": [
@@ -33,7 +33,7 @@
     "query": {},
     "body": {
       "name": "conf-kc00-pending-upd",
-      "type": "mysql"
+      "type": "kafka"
     },
     "expect_status": 400,
     "setup": [
@@ -70,7 +70,7 @@
     "query": {},
     "body": {
       "name": "conf-kc00-pending-act",
-      "type": "mysql"
+      "type": "kafka"
     },
     "expect_status": 400,
     "setup": [
@@ -98,7 +98,7 @@
     "query": {},
     "body": {
       "name": "conf-kc00-pending-act-upd",
-      "type": "mysql"
+      "type": "kafka"
     },
     "expect_status": 400,
     "setup": [
@@ -133,7 +133,7 @@
     "path_params": {},
     "query": {},
     "body": {
-      "type": "mysql"
+      "type": "kafka"
     },
     "expect_status": 400,
     "setup": [],
@@ -144,7 +144,7 @@
     "path_params": {},
     "query": {},
     "body": {
-      "type": "mysql"
+      "type": "kafka"
     },
     "expect_status": 400,
     "setup": [],

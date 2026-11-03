@@ -2137,7 +2137,8 @@ pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str
 /// refuses it the same way everywhere. Unknown names are not the map's
 /// business: the caller answers them before this runs.
 pub(crate) fn kind_refusal(kind: &str) -> Option<String> {
-    match broker_config::kind_state(kind) {
+    let row = broker_config::kind_row(kind);
+    match row.map(|r| r.state) {
         Some(broker_config::KindState::Ready) => return None,
         Some(broker_config::KindState::TestOnly) => {
             if broker_config::test_kinds_enabled() {
@@ -2147,16 +2148,14 @@ pub(crate) fn kind_refusal(kind: &str) -> Option<String> {
         Some(_) => {}
         None => return None,
     }
-    let base = broker_config::capability::kind_row(kind)
-        .map(|row| row.name)
-        .unwrap_or(kind);
-    if let Some(feature) = disabled_connector_feature(base) {
+    let canonical = row.map(|r| r.name).unwrap_or(kind);
+    if let Some(feature) = disabled_connector_feature(canonical) {
         return Some(format!(
-            "connector type {kind} is not available in this broker: feature `{feature}` is not compiled in"
+            "connector type {canonical} is not available in this broker: feature `{feature}` is not compiled in"
         ));
     }
     Some(format!(
-        "connector type {kind} is not available in this broker"
+        "connector type {canonical} is not available in this broker"
     ))
 }
 
@@ -2565,6 +2564,21 @@ pub(crate) async fn register_live_sink(
             }
         }
         "mysql" => {
+            // Fail closed when the target is missing: no invented server
+            // or database. An empty config stays persist-only and reports
+            // pending, never live. The username keeps the reference
+            // default `root`, like the action builder.
+            let has_server = body
+                .get("server")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_database = body
+                .get("database")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_server || !has_database {
+                return Ok(());
+            }
             let server = body
                 .get("server")
                 .and_then(|v| v.as_str())

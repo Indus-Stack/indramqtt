@@ -410,6 +410,11 @@ pub(crate) fn canonical_action_kind(kind: &str) -> &str {
         "mongo" | "documentdb" => "mongodb",
         "couch" | "cb" => "couchbase",
         "elastic" | "es" | "opensearch" => "elasticsearch",
+        "sqlserver" => "mssql",
+        "mariadb" => "mysql",
+        "cockroach" => "cockroachdb",
+        "postgres" | "postgresql" => "pgsql",
+        "google_alloydb" | "alloy_db" => "alloydb",
         _ => kind,
     }
 }
@@ -418,7 +423,9 @@ pub(crate) fn canonical_action_kind(kind: &str) -> &str {
 /// documented `http` action kind and the historic `webhook` base kind
 /// share one builder; `pgsql` covers `postgres`-filed rows; each
 /// MV-02b alias (for example `aws_timestream`) runs on the builder of
-/// its canonical kind.
+/// its canonical kind. MV-02a adds the relational family: `mysql`,
+/// `mssql`, `oracle` and the PostgreSQL-protocol kinds `alloydb`,
+/// `cockroachdb`, `redshift`.
 pub(crate) fn action_owned_kind(kind: &str) -> bool {
     matches!(
         canonical_action_kind(kind),
@@ -435,6 +442,12 @@ pub(crate) fn action_owned_kind(kind: &str) -> bool {
             | "influxdb"
             | "timestream"
             | "cassandra"
+            | "mysql"
+            | "mssql"
+            | "oracle"
+            | "alloydb"
+            | "cockroachdb"
+            | "redshift"
             | "mongodb"
             | "couchbase"
             | "elasticsearch"
@@ -1210,6 +1223,12 @@ pub(crate) fn build_action_sink(
 ) -> Result<Option<Arc<dyn broker_connectors::Sink>>, String> {
     match canonical_action_kind(record.action_type.as_str()) {
         "pgsql" => build_pgsql_sink(record, connector_doc, opts).map(Some),
+        "mysql" => build_mysql_sink(record, connector_doc).map(Some),
+        "mssql" => build_mssql_sink(record, connector_doc).map(Some),
+        "oracle" => build_oracle_sink(record, connector_doc).map(Some),
+        "alloydb" => build_pg_family_sink("alloydb", record, connector_doc).map(Some),
+        "cockroachdb" => build_pg_family_sink("cockroachdb", record, connector_doc).map(Some),
+        "redshift" => build_pg_family_sink("redshift", record, connector_doc).map(Some),
         "webhook" | "http" => build_webhook_sink(record, connector_doc).map(Some),
         "clickhouse" => build_clickhouse_sink(record, connector_doc).map(Some),
         "influxdb" => build_influxdb_sink(record, connector_doc).map(Some),
@@ -1340,7 +1359,11 @@ fn param_string_map(record: &ActionRecord, key: &str) -> std::collections::HashM
 /// dangling connector does not accept an action that is missing its
 /// own required field.
 fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
-    if record.action_type == "pgsql" && param_string(record, "sql").is_none() {
+    if matches!(
+        canonical_action_kind(record.action_type.as_str()),
+        "pgsql" | "mysql" | "mssql" | "oracle" | "alloydb" | "cockroachdb" | "redshift"
+    ) && param_string(record, "sql").is_none()
+    {
         return Err(format!(
             "action {:?} is missing required field: sql (field `parameters.sql`)",
             record.id
@@ -1582,8 +1605,597 @@ pub(crate) fn build_pgsql_sink(
     Ok(Arc::new(sink))
 }
 
-/// Build the action's `webhook`/`http` sink: the base URL comes from
-/// the connector document, this action's `parameters` adds the path,
+/// Split a `Host[:Port]` connector value into its parts. A
+/// `scheme://` prefix and any `/path` or `?query` suffix are stripped;
+/// a `@` userinfo prefix is refused (credentials travel in their own
+/// fields, never inside the host value). A missing port takes the
+/// caller default (the protocol default the reference documents).
+/// An empty host or a bad port fails closed naming the field.
+fn parse_host_port(
+    action_id: &str,
+    connector: &str,
+    field: &str,
+    raw: &str,
+    default_port: u16,
+) -> Result<(String, u16), String> {
+    let named = || {
+        format!("connector {connector:?} is missing required field: {field} (action {action_id:?})")
+    };
+    let mut clean = raw.trim();
+    if clean.is_empty() {
+        return Err(named());
+    }
+    if let Some((_, rest)) = clean.split_once("://") {
+        clean = rest;
+    }
+    if clean.contains('@') {
+        return Err(format!(
+            "connector {connector:?} field `{field}` must be `Host[:Port]`, got userinfo (action {action_id:?})"
+        ));
+    }
+    clean = clean.split('/').next().unwrap_or(clean);
+    clean = clean.split('?').next().unwrap_or(clean);
+    // Bracketed IPv6 (`[::1]` or `[::1]:5432`).
+    if let Some(rest) = clean.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return Err(format!(
+                "connector {connector:?} field `{field}` has an unbalanced bracket (action {action_id:?})"
+            ));
+        };
+        let host = rest[..end].trim().to_string();
+        if host.is_empty() {
+            return Err(named());
+        }
+        let port = rest[end + 1..]
+            .strip_prefix(':')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<u16>().map_err(|_| {
+                    format!(
+                        "connector {connector:?} field `{field}` has a bad port (action {action_id:?})"
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(default_port);
+        if port == 0 {
+            return Err(format!(
+                "connector {connector:?} field `{field}` has a bad port (action {action_id:?})"
+            ));
+        }
+        return Ok((host, port));
+    }
+    match clean.rsplit_once(':') {
+        Some((host, port_text)) if !port_text.is_empty() => {
+            let host = host.trim();
+            if host.is_empty() {
+                return Err(named());
+            }
+            // A second colon without brackets is an unbracketed IPv6
+            // literal: refuse it instead of guessing the port.
+            if host.contains(':') {
+                return Err(format!(
+                    "connector {connector:?} field `{field}` must bracket IPv6 literals like `[::1]:{default_port}` (action {action_id:?})"
+                ));
+            }
+            let port = port_text.trim().parse::<u16>().map_err(|_| {
+                format!(
+                    "connector {connector:?} field `{field}` has a bad port (action {action_id:?})"
+                )
+            })?;
+            if port == 0 {
+                return Err(format!(
+                    "connector {connector:?} field `{field}` has a bad port (action {action_id:?})"
+                ));
+            }
+            Ok((host.to_string(), port))
+        }
+        _ => {
+            let host = clean.trim().trim_end_matches(':');
+            if host.is_empty() || host.contains(':') {
+                return Err(named());
+            }
+            Ok((host.to_string(), default_port))
+        }
+    }
+}
+
+/// Resolve the connector password: empty reads as unconfigured; a
+/// `file:`/`env:` reference resolves at build time and fails closed
+/// when unresolvable (never an empty credential standing in for one).
+fn connector_password(
+    action_id: &str,
+    connector: &str,
+    doc: &serde_json::Value,
+) -> Result<String, String> {
+    let raw = first_string(doc, &["password"])
+        .map(|s| s.into_owned())
+        .unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(String::new());
+    }
+    if broker_config::secrets::is_secret_ref(raw.trim()) {
+        let resolved = broker_connectors::resolve_field_secret(&raw);
+        if resolved.trim().is_empty() {
+            return Err(format!(
+                "connector {connector:?} password reference is not resolvable (field `password`, action {action_id:?})"
+            ));
+        }
+        return Ok(resolved);
+    }
+    Ok(raw)
+}
+
+/// Connector pool size: the reference default is 8. Zero and values
+/// above 1024 are refused: one connector keeps at most 1024 server
+/// sessions, and the action runtime already caps concurrent driver
+/// calls at its own inflight window.
+fn connector_pool_size(
+    action_id: &str,
+    connector: &str,
+    doc: &serde_json::Value,
+) -> Result<usize, String> {
+    match doc.get("pool_size") {
+        None | Some(serde_json::Value::Null) => Ok(8),
+        Some(value) => {
+            let Some(number) = value.as_u64() else {
+                return Err(format!(
+                    "connector {connector:?} field `pool_size` must be an integer (action {action_id:?})"
+                ));
+            };
+            let size = usize::try_from(number).unwrap_or(usize::MAX);
+            if size == 0 || size > 1024 {
+                return Err(format!(
+                    "connector {connector:?} field `pool_size` must be between 1 and 1024 (action {action_id:?})"
+                ));
+            }
+            Ok(size)
+        }
+    }
+}
+
+/// The action statement with positional markers bound by the driver.
+/// Values travel out-of-band, so a quote in a value never escapes
+/// into the statement text.
+fn action_sql(record: &ActionRecord) -> Result<String, String> {
+    param_string(record, "sql").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: sql (field `parameters.sql`)",
+            record.id
+        )
+    })
+}
+
+/// Build the action's `mysql` sink: the maintained `mysql_async`
+/// driver dials `server`/`database` with `username` (reference
+/// default `root`) and the resolved password; the action's
+/// `parameters.sql` carries exactly three `?` markers bound to
+/// (topic, QoS, payload). `ssl.enable` is refused: the driver
+/// transport of this runtime has no TLS knob. Pool and batch
+/// shape follow the `pgsql` builder: `pool_size` bounds server
+/// sessions, one row per send with no linger (the action runtime
+/// owns the batch size and the batch timer).
+pub(crate) fn build_mysql_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    let connector = record.connector.trim().to_string();
+    let named = |field: &str| {
+        format!(
+            "connector {connector:?} is missing required field: {field} (action {:?})",
+            record.id
+        )
+    };
+    if connector_doc
+        .get("ssl")
+        .and_then(|v| v.as_object())
+        .and_then(|ssl| ssl.get("enable"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        // TODO(parity): the reference documents `ssl` for MySQL. The
+        // rulebook does not decide whether the action runtime must
+        // offer TLS; the current choice refuses it instead of
+        // silently running plaintext against a TLS-only server.
+        return Err(format!(
+            "connector {connector:?} field `ssl.enable` is not supported for kind `mysql` (action {:?})",
+            record.id
+        ));
+    }
+    let raw_server =
+        first_string(connector_doc, &["server", "host"]).ok_or_else(|| named("server"))?;
+    let (host, port) = parse_host_port(&record.id, &connector, "server", &raw_server, 3306)?;
+    let database = first_string(connector_doc, &["database"]).ok_or_else(|| named("database"))?;
+    let username = first_string(connector_doc, &["username", "user"])
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|| "root".to_string());
+    let password = connector_password(&record.id, &connector, connector_doc)?;
+    let pool_size = connector_pool_size(&record.id, &connector, connector_doc)?;
+    let sql = action_sql(record)?;
+    refuse_undefined_vars_as_null(record)?;
+    // Display URL only: the credential travels as a driver value
+    // through `from_parts`, never inside this string. It names the
+    // target for diagnostics without carrying the secret.
+    let display_url = format!("mysql://{username}@{host}:{port}/{database}");
+    let config = broker_connectors::MySqlSinkConfig {
+        connection_url: display_url,
+        sql_template: sql,
+        pool_size,
+        batch_size: 1,
+        batch_timeout_ms: 0,
+    };
+    config
+        .validate()
+        .map_err(|e| format!("action {:?} cannot build its mysql sink: {e}", record.id))?;
+    let transport = broker_connectors::DriverMySqlTransport::from_parts(
+        &host, port, &username, &password, &database, pool_size,
+    )
+    .map_err(|e| {
+        format!(
+            "action {:?} cannot build its mysql transport: {e}",
+            record.id
+        )
+    })?;
+    let sink = broker_connectors::MySqlSink::new(config, Arc::new(transport))
+        .map_err(|e| format!("action {:?} cannot build its mysql sink: {e}", record.id))?;
+    Ok(Arc::new(sink))
+}
+
+/// Read one non-default PostgreSQL-protocol connector option. The
+/// reference documents the field but this runtime cannot apply it, so
+/// a non-default value is refused with the field named instead of
+/// being accepted and ignored.
+fn refuse_pg_connector_override(
+    action_id: &str,
+    connector: &str,
+    doc: &serde_json::Value,
+    field: &str,
+    is_default: impl Fn(&serde_json::Value) -> bool,
+) -> Result<(), String> {
+    if let Some(value) = doc.get(field) {
+        if value.is_null() || is_default(value) {
+            return Ok(());
+        }
+        return Err(format!(
+            "connector {connector:?} field `{field}` is not supported (action {action_id:?})"
+        ));
+    }
+    Ok(())
+}
+
+/// Check the `undefined_vars_as_null` action option of the relational
+/// family. Absent or `false` keeps the fixed engine row. The row binds
+/// topic, QoS and payload. These values are always defined. `true` asks
+/// for missing variables as SQL NULL. These statements carry no
+/// variables. The runtime refuses `true` and names the field.
+fn refuse_undefined_vars_as_null(record: &ActionRecord) -> Result<(), String> {
+    match record.parameters.get("undefined_vars_as_null") {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(serde_json::Value::Bool(false)) => Ok(()),
+        Some(serde_json::Value::Bool(true)) => Err(format!(
+            "action {:?} field `parameters.undefined_vars_as_null` value true is not supported: these statements bind (topic, qos, payload) positionally and carry no variables to render as null",
+            record.id
+        )),
+        Some(_) => Err(format!(
+            "action {:?} field `parameters.undefined_vars_as_null` must be a boolean",
+            record.id
+        )),
+    }
+}
+
+/// Split the reference `ssl` object of a PostgreSQL-protocol
+/// connector into the TLS choice. Absent or disabled reads as
+/// plaintext; enabled reads as TLS through the system trust store.
+/// An explicit `verify_none`, a custom CA, client certificate, key
+/// or any other TLS knob is refused: the driver transport verifies
+/// with the system roots only.
+fn pg_family_tls(
+    action_id: &str,
+    connector: &str,
+    doc: &serde_json::Value,
+) -> Result<bool, String> {
+    let Some(ssl) = doc.get("ssl") else {
+        return Ok(false);
+    };
+    if ssl.is_null() {
+        return Ok(false);
+    }
+    let Some(obj) = ssl.as_object() else {
+        return Err(format!(
+            "connector {connector:?} field `ssl` must be an object (action {action_id:?})"
+        ));
+    };
+    if !obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Ok(false);
+    }
+    match obj.get("verify").and_then(|v| v.as_str()).map(str::trim) {
+        None | Some("") | Some("verify_peer") => {}
+        Some("verify_none") => {
+            return Err(format!(
+                "connector {connector:?} field `ssl.verify` value \"verify_none\" is not supported: this action runtime always verifies the server chain (action {action_id:?})"
+            ));
+        }
+        Some(other) => {
+            return Err(format!(
+                "connector {connector:?} field `ssl.verify` value {other:?} is not supported (action {action_id:?})"
+            ));
+        }
+    }
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "enable" | "verify") {
+            return Err(format!(
+                "connector {connector:?} field `ssl.{key}` is not supported: this action runtime verifies with the system roots only (action {action_id:?})"
+            ));
+        }
+    }
+    Ok(true)
+}
+
+/// Build one PostgreSQL-protocol action sink (`alloydb`,
+/// `cockroachdb`, `redshift`): the maintained `tokio-postgres` driver
+/// dials `server`/`database` with `username` and the resolved
+/// password; the action's `parameters.sql` carries `$1` (topic),
+/// `$2` (QoS) and `$3` (payload) bound out-of-band. Differences from
+/// the `pgsql` builder are exactly the documented ones: the default
+/// port (CockroachDB 26257, Redshift 5439, AlloyDB 5432), the
+/// reference `ssl` object (enabled maps to system-root TLS), and the
+/// refused PostgreSQL options (`disable_prepared_statements: true`
+/// has no effect here because every send prepares; an explicit
+/// `application_name` is metadata this runtime never stamps).
+/// Pool and batch shape follow the `pgsql` builder.
+pub(crate) fn build_pg_family_sink(
+    kind: &'static str,
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    let connector = record.connector.trim().to_string();
+    let named = |field: &str| {
+        format!(
+            "connector {connector:?} is missing required field: {field} (action {:?})",
+            record.id
+        )
+    };
+    let default_port = match kind {
+        "cockroachdb" => 26257,
+        "redshift" => 5439,
+        _ => 5432,
+    };
+    let raw_server = first_string(connector_doc, &["server", "host", "servers"])
+        .ok_or_else(|| named("server"))?;
+    let (host, port) =
+        parse_host_port(&record.id, &connector, "server", &raw_server, default_port)?;
+    let database = first_string(connector_doc, &["database"]).ok_or_else(|| named("database"))?;
+    let username =
+        first_string(connector_doc, &["username", "user"]).ok_or_else(|| named("username"))?;
+    let password = connector_password(&record.id, &connector, connector_doc)?;
+    let pool_size = connector_pool_size(&record.id, &connector, connector_doc)?;
+    let use_tls = pg_family_tls(&record.id, &connector, connector_doc)?;
+    refuse_undefined_vars_as_null(record)?;
+    refuse_pg_connector_override(
+        &record.id,
+        &connector,
+        connector_doc,
+        "disable_prepared_statements",
+        |v| v.as_bool().is_some_and(|b| !b),
+    )?;
+    refuse_pg_connector_override(
+        &record.id,
+        &connector,
+        connector_doc,
+        "application_name",
+        // The name is metadata for the server's activity view. This
+        // runtime never stamps it, so any explicit value is refused
+        // instead of being accepted and ignored.
+        |_| false,
+    )?;
+    let sql = action_sql(record)?;
+    let display_url = if use_tls {
+        format!("postgres://{username}@{host}:{port}/{database}?sslmode=require")
+    } else {
+        format!("postgres://{username}@{host}:{port}/{database}")
+    };
+    let config = broker_connectors::postgres::PostgreSqlSinkConfig {
+        connection_url: display_url,
+        sql_template: sql,
+        pool_size,
+        batch_size: 1,
+        batch_timeout_ms: 0,
+    };
+    config
+        .validate()
+        .map_err(|e| format!("action {:?} cannot build its {kind} sink: {e}", record.id))?;
+    let transport = broker_connectors::postgres::DriverPgTransport::from_parts(
+        &host, port, &username, &password, &database, pool_size, use_tls,
+    )
+    .map_err(|e| {
+        format!(
+            "action {:?} cannot build its {kind} transport: {e}",
+            record.id
+        )
+    })?;
+    let sink = broker_connectors::postgres::PostgreSqlSink::new(config, Arc::new(transport))
+        .map_err(|e| format!("action {:?} cannot build its {kind} sink: {e}", record.id))?;
+    Ok(Arc::new(sink.with_kind(kind)))
+}
+
+/// Build the action's `mssql` sink: the maintained `tiberius` driver
+/// dials `server` (default port 1433) with `database`, `username`
+/// (reference default `sa`) and the resolved password; the action's
+/// `parameters.sql` runs as a custom upsert with `$1` (event time),
+/// `$2` (topic), `$3` (client id from the JSON payload, else empty),
+/// `$4` (QoS) and `$5` (payload JSON) bound through
+/// `sp_executesql`. The reference `driver` field accepts only the
+/// default `ms-sql`: no other driver maps to this transport. The SSL
+/// choice follows the enterprise default (encrypt, trust the chain)
+/// unless the connector carries `ssl: {enable: true}`, which verifies
+/// it. The table travels inside the SQL text, so the sink config
+/// carries the action id only as the in-memory batch group, never as
+/// a wire value. Pool and batch shape follow the `pgsql` builder.
+pub(crate) fn build_mssql_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::mssql as enterprise_mssql;
+    let connector = record.connector.trim().to_string();
+    let named = |field: &str| {
+        format!(
+            "connector {connector:?} is missing required field: {field} (action {:?})",
+            record.id
+        )
+    };
+    let raw_server =
+        first_string(connector_doc, &["server", "host"]).ok_or_else(|| named("server"))?;
+    let (host, port) = parse_host_port(&record.id, &connector, "server", &raw_server, 1433)?;
+    let database = first_string(connector_doc, &["database"]).ok_or_else(|| named("database"))?;
+    let username = first_string(connector_doc, &["username", "user"])
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|| "sa".to_string());
+    let password = connector_password(&record.id, &connector, connector_doc)?;
+    if let Some(driver) = connector_doc
+        .get("driver")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !driver.eq_ignore_ascii_case("ms-sql") {
+            return Err(format!(
+                "connector {connector:?} field `driver` value {driver:?} is not supported: this action runtime dials with the default driver only (action {:?})",
+                record.id
+            ));
+        }
+    }
+    let trust_server_certificate = !connector_doc
+        .get("ssl")
+        .and_then(|v| v.as_object())
+        .and_then(|ssl| ssl.get("enable"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let pool_size = connector_pool_size(&record.id, &connector, connector_doc)?;
+    let sql = action_sql(record)?;
+    refuse_undefined_vars_as_null(record)?;
+    let config = enterprise_mssql::MssqlSinkConfig {
+        host,
+        port: Some(port),
+        database: database.to_string(),
+        table_template: record.id.clone(),
+        auth: enterprise_mssql::MssqlAuth::SqlPassword { username, password },
+        query_mode: enterprise_mssql::MssqlQueryMode::CustomUpsert { sql_template: sql },
+        trust_server_certificate,
+        batch_size: Some(1),
+        batch_bytes: None,
+        linger_ms: Some(0),
+        max_retries: Some(3),
+        initial_backoff_ms: None,
+        max_backoff_ms: None,
+        timeout_ms: None,
+    };
+    config
+        .validate()
+        .map_err(|e| format!("action {:?} cannot build its mssql sink: {e}", record.id))?;
+    let transport =
+        enterprise_mssql::PooledMssqlTransport::new(&config, pool_size).map_err(|e| {
+            format!(
+                "action {:?} cannot build its mssql transport: {e}",
+                record.id
+            )
+        })?;
+    let sink = enterprise_mssql::MssqlSink::new(config, Arc::new(transport))
+        .map_err(|e| format!("action {:?} cannot build its mssql sink: {e}", record.id))?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `oracle` sink: the maintained `oracle_rs`
+/// driver dials `server` (default port 1521, the reference default)
+/// with `username`, the resolved password and `service_name` (or
+/// `sid` when no service name is set; one of the two is required).
+/// The `sysdba` role is refused (the driver transport has no role
+/// knob). The action's `parameters.sql` carries `:1` (topic), `:2`
+/// (QoS) and `:3` (payload) bound out-of-band. One pooled session
+/// per `pool_size` entry dials lazily on first use; batches rotate
+/// across entries. Failures map through the typed MV-13b
+/// classifier. Pool and batch shape follow the `pgsql` builder: one
+/// row per send at the driver, the action runtime owns batching.
+pub(crate) fn build_oracle_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::oracle as enterprise_oracle;
+    let connector = record.connector.trim().to_string();
+    let named = |field: &str| {
+        format!(
+            "connector {connector:?} is missing required field: {field} (action {:?})",
+            record.id
+        )
+    };
+    let raw_server =
+        first_string(connector_doc, &["server", "host"]).ok_or_else(|| named("server"))?;
+    let (host, port) = parse_host_port(&record.id, &connector, "server", &raw_server, 1521)?;
+    let username =
+        first_string(connector_doc, &["username", "user"]).ok_or_else(|| named("username"))?;
+    let password = connector_password(&record.id, &connector, connector_doc)?;
+    // A service name wins when set; a bare `sid` dials by identifier.
+    // One of the two is required.
+    let service_name = first_string(connector_doc, &["service_name"])
+        .map(|s| s.into_owned())
+        .filter(|s| !s.trim().is_empty());
+    let sid = first_string(connector_doc, &["sid"])
+        .map(|s| s.into_owned())
+        .filter(|s| !s.trim().is_empty());
+    let (service, uses_sid) = match (service_name, sid) {
+        (Some(name), _) => (name, false),
+        (None, Some(sid)) => (sid, true),
+        (None, None) => {
+            return Err(format!(
+                "connector {connector:?} is missing required field: service_name or sid (action {:?})",
+                record.id
+            ));
+        }
+    };
+    if let Some(role) = connector_doc
+        .get("role")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !role.eq_ignore_ascii_case("normal") {
+            return Err(format!(
+                "connector {connector:?} field `role` value {role:?} is not supported: this action runtime connects with the default role only (action {:?})",
+                record.id
+            ));
+        }
+    }
+    let pool_size = connector_pool_size(&record.id, &connector, connector_doc)?;
+    let sql = action_sql(record)?;
+    refuse_undefined_vars_as_null(record)?;
+    // Bound one dial attempt: the driver opens one TNS session per pool
+    // entry on first use. Ten seconds caps a hung dial on the
+    // management-plane action path without stalling the rule engine.
+    let timeout = std::time::Duration::from_secs(10);
+    let mut pool: Vec<Arc<dyn enterprise_oracle::OracleTransport>> = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let transport = if uses_sid {
+            enterprise_oracle::DriverOracleTransport::with_sid(
+                &host, port, &service, &username, &password, timeout,
+            )
+        } else {
+            enterprise_oracle::DriverOracleTransport::new(
+                &host, port, &service, &username, &password, timeout,
+            )
+        }
+        .map_err(|e| {
+            format!(
+                "action {:?} cannot build its oracle transport: {e}",
+                record.id
+            )
+        })?;
+        pool.push(Arc::new(transport));
+    }
+    let sink = enterprise_oracle::OracleActionSink::new(sql, pool)
+        .map_err(|e| format!("action {:?} cannot build its oracle sink: {e}", record.id))?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `webhook`/`http` sink: the base URL comes from/// the connector document, this action's `parameters` adds the path,
 /// method and headers.
 ///
 /// Values and defaults:
@@ -4496,6 +5108,387 @@ mod tests {
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn mysql_record(id: &str, connector: &str, sql: &str) -> ActionRecord {
+        ActionRecord {
+            parameters: serde_json::json!({"sql": sql}),
+            ..record(id, "mysql", connector)
+        }
+    }
+
+    fn mysql_doc(server: &str) -> serde_json::Value {
+        serde_json::json!({"server": server, "database": "db", "username": "u"})
+    }
+
+    #[tokio::test]
+    async fn mysql_sink_builds_from_reference_fields_and_refuses_gaps() {
+        // The documented three-marker statement builds.
+        let sink = build_mysql_sink(
+            &mysql_record(
+                "act",
+                "mysql:up",
+                "INSERT INTO t(topic, qos, payload) VALUES (?, ?, ?)",
+            ),
+            &mysql_doc("127.0.0.1:3306"),
+        )
+        .expect("a complete mysql action builds");
+        assert_eq!(sink.kind(), "mysql");
+        // A missing server refuses with the field named.
+        let error = build_mysql_sink(
+            &mysql_record("act", "mysql:up", "INSERT INTO t VALUES (?, ?, ?)"),
+            &serde_json::json!({"database": "db", "username": "u"}),
+        )
+        .err()
+        .expect("a missing server refuses");
+        assert!(error.contains("server"), "{error}");
+        // A missing database refuses.
+        let error = build_mysql_sink(
+            &mysql_record("act", "mysql:up", "INSERT INTO t VALUES (?, ?, ?)"),
+            &serde_json::json!({"server": "127.0.0.1:3306", "username": "u"}),
+        )
+        .err()
+        .expect("a missing database refuses");
+        assert!(error.contains("database"), "{error}");
+        // A missing statement refuses with the action parameter named.
+        let error = build_mysql_sink(
+            &record("act", "mysql", "mysql:up"),
+            &mysql_doc("127.0.0.1:3306"),
+        )
+        .err()
+        .expect("a missing sql refuses");
+        assert!(error.contains("parameters.sql"), "{error}");
+        // A statement without exactly three markers refuses.
+        let error = build_mysql_sink(
+            &mysql_record("act", "mysql:up", "INSERT INTO t VALUES (?, ?)"),
+            &mysql_doc("127.0.0.1:3306"),
+        )
+        .err()
+        .expect("a two-marker statement refuses");
+        assert!(error.contains('?'), "{error}");
+        // TLS has no driver knob here: enabling it refuses instead of
+        // running plaintext against a TLS-only server.
+        let error = build_mysql_sink(
+            &mysql_record("act", "mysql:up", "INSERT INTO t VALUES (?, ?, ?)"),
+            &serde_json::json!({"server": "127.0.0.1:3306", "database": "db", "ssl": {"enable": true}}),
+        )
+        .err()
+        .expect("an enabled ssl refuses");
+        assert!(error.contains("ssl.enable"), "{error}");
+        // A zero pool refuses.
+        let error = build_mysql_sink(
+            &mysql_record("act", "mysql:up", "INSERT INTO t VALUES (?, ?, ?)"),
+            &serde_json::json!({"server": "127.0.0.1:3306", "database": "db", "pool_size": 0}),
+        )
+        .err()
+        .expect("a zero pool refuses");
+        assert!(error.contains("pool_size"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn mysql_alias_selects_the_mysql_runtime() {
+        assert_eq!(canonical_action_kind("mariadb"), "mysql");
+        assert!(action_owned_kind("mariadb"));
+        let sink = build_action_sink(
+            &record("act", "mariadb", "mysql:up"),
+            &serde_json::json!({}),
+            &ActionResourceOpts::default(),
+        );
+        // An empty connector document is not a build failure path here:
+        // the missing server refuses with the field named.
+        let error = sink.err().expect("a missing server refuses");
+        assert!(error.contains("server"), "{error}");
+        // Absent or false renders the fixed row; true refuses named.
+        let mut null_opt = record("act", "mysql", "mysql:up");
+        null_opt.parameters = serde_json::json!({"sql": "INSERT INTO t VALUES (?, ?, ?)", "undefined_vars_as_null": true});
+        let error = refuse_undefined_vars_as_null(&null_opt).expect_err("true refuses");
+        assert!(error.contains("undefined_vars_as_null"), "{error}");
+        null_opt.parameters = serde_json::json!({"sql": "INSERT INTO t VALUES (?, ?, ?)", "undefined_vars_as_null": false});
+        assert!(refuse_undefined_vars_as_null(&null_opt).is_ok());
+        null_opt.parameters = serde_json::json!({"sql": "INSERT INTO t VALUES (?, ?, ?)"});
+        assert!(refuse_undefined_vars_as_null(&null_opt).is_ok());
+    }
+
+    #[test]
+    fn connector_pool_size_defaults_and_bounds() {
+        let doc = serde_json::json!({});
+        assert_eq!(
+            connector_pool_size("act", "conn", &doc).expect("absent pools to 8"),
+            8
+        );
+        assert_eq!(
+            connector_pool_size("act", "conn", &serde_json::json!({"pool_size": 3}))
+                .expect("an explicit pool applies"),
+            3
+        );
+        assert!(connector_pool_size("act", "conn", &serde_json::json!({"pool_size": 0})).is_err());
+        assert!(
+            connector_pool_size("act", "conn", &serde_json::json!({"pool_size": 1025})).is_err()
+        );
+        assert!(
+            connector_pool_size("act", "conn", &serde_json::json!({"pool_size": "many"})).is_err()
+        );
+    }
+
+    #[test]
+    fn host_port_split_keeps_protocol_defaults() {
+        let (host, port) =
+            parse_host_port("act", "conn", "server", "db-host", 5432).expect("bare host");
+        assert_eq!((host.as_str(), port), ("db-host", 5432));
+        let (host, port) =
+            parse_host_port("act", "conn", "server", "db-host:6432", 5432).expect("explicit port");
+        assert_eq!((host.as_str(), port), ("db-host", 6432));
+        let (host, port) =
+            parse_host_port("act", "conn", "server", "mysql://db-host/db", 3306).expect("scheme");
+        assert_eq!((host.as_str(), port), ("db-host", 3306));
+        let (host, port) =
+            parse_host_port("act", "conn", "server", "[::1]:7432", 5432).expect("bracketed ipv6");
+        assert_eq!((host.as_str(), port), ("::1", 7432));
+        assert!(parse_host_port("act", "conn", "server", "", 5432).is_err());
+        assert!(parse_host_port("act", "conn", "server", "u@db-host", 5432).is_err());
+        assert!(parse_host_port("act", "conn", "server", "db-host:0", 5432).is_err());
+        assert!(parse_host_port("act", "conn", "server", "db-host:notaport", 5432).is_err());
+    }
+
+    #[test]
+    fn pg_tls_maps_the_reference_ssl_object() {
+        let plain = serde_json::json!({});
+        assert!(!pg_family_tls("act", "conn", &plain).expect("absent ssl is plaintext"));
+        let enabled = serde_json::json!({"ssl": {"enable": true}});
+        assert!(pg_family_tls("act", "conn", &enabled).expect("enabled ssl is TLS"));
+        let peer = serde_json::json!({"ssl": {"enable": true, "verify": "verify_peer"}});
+        assert!(pg_family_tls("act", "conn", &peer).expect("verify_peer is TLS"));
+        let none = serde_json::json!({"ssl": {"enable": true, "verify": "verify_none"}});
+        assert!(pg_family_tls("act", "conn", &none).is_err());
+        let custom = serde_json::json!({"ssl": {"enable": true, "cacertfile": "/ca.pem"}});
+        assert!(pg_family_tls("act", "conn", &custom).is_err());
+        let disabled = serde_json::json!({"ssl": {"enable": false}});
+        assert!(!pg_family_tls("act", "conn", &disabled).expect("disabled ssl is plaintext"));
+    }
+
+    fn pg_record(kind: &str, id: &str, connector: &str, sql: &str) -> ActionRecord {
+        ActionRecord {
+            parameters: serde_json::json!({"sql": sql}),
+            ..record(id, kind, connector)
+        }
+    }
+
+    fn pg_doc(server: &str) -> serde_json::Value {
+        serde_json::json!({"server": server, "database": "db", "username": "u"})
+    }
+
+    #[tokio::test]
+    async fn pg_family_sink_builds_per_kind_and_refuses_gaps() {
+        for kind in ["alloydb", "cockroachdb", "redshift"] {
+            // The default port per kind (CockroachDB 26257, Redshift
+            // 5439, AlloyDB 5432) is proved by the e2e tests, which run
+            // the server without a port and observe the dial.
+            let sink = build_pg_family_sink(
+                kind,
+                &pg_record(
+                    kind,
+                    "act",
+                    "conn:up",
+                    "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)",
+                ),
+                &pg_doc("127.0.0.1"),
+            )
+            .expect("a complete pg-family action builds");
+            assert_eq!(sink.kind(), kind);
+            // A missing username refuses: the reference names no default.
+            let error = build_pg_family_sink(
+                kind,
+                &pg_record(kind, "act", "conn:up", "INSERT INTO t VALUES ($1, $2, $3)"),
+                &serde_json::json!({"server": "127.0.0.1", "database": "db"}),
+            )
+            .err()
+            .expect("a missing username refuses");
+            assert!(error.contains("username"), "{error}");
+            // A marker outside $1..$3 refuses.
+            let error = build_pg_family_sink(
+                kind,
+                &pg_record(kind, "act", "conn:up", "INSERT INTO t VALUES ($1, $2, $4)"),
+                &pg_doc("127.0.0.1"),
+            )
+            .err()
+            .expect("a $4 marker refuses");
+            assert!(error.contains("$4"), "{error}");
+            // A prepared-statement opt-out refuses: every send prepares.
+            let error = build_pg_family_sink(
+            kind,
+            &pg_record(kind, "act", "conn:up", "INSERT INTO t VALUES ($1, $2, $3)"),
+            &serde_json::json!({"server": "127.0.0.1", "database": "db", "username": "u", "disable_prepared_statements": true}),
+        )
+        .err()
+        .expect("disabling prepared statements refuses");
+            assert!(error.contains("disable_prepared_statements"), "{error}");
+            // An explicit application name refuses: never stamped.
+            let error = build_pg_family_sink(
+            kind,
+            &pg_record(kind, "act", "conn:up", "INSERT INTO t VALUES ($1, $2, $3)"),
+            &serde_json::json!({"server": "127.0.0.1", "database": "db", "username": "u", "application_name": "app"}),
+        )
+        .err()
+        .expect("an application name refuses");
+            assert!(error.contains("application_name"), "{error}");
+        }
+        // The cockroach alias selects the cockroachdb runtime.
+        assert_eq!(canonical_action_kind("cockroach"), "cockroachdb");
+        assert!(action_owned_kind("cockroach"));
+    }
+
+    #[tokio::test]
+    async fn mssql_sink_builds_custom_upsert_and_refuses_gaps() {
+        let doc = serde_json::json!({"server": "127.0.0.1:1433", "database": "db"});
+        let sink = build_mssql_sink(
+            &pg_record(
+                "mssql",
+                "act",
+                "mssql:up",
+                "INSERT INTO t(topic, qos, payload) VALUES ($2, $4, $5)",
+            ),
+            &doc,
+        )
+        .expect("a complete mssql action builds");
+        assert_eq!(sink.kind(), "mssql");
+        // A missing database refuses.
+        let error = build_mssql_sink(
+            &pg_record("mssql", "act", "mssql:up", "INSERT INTO t VALUES ($2)"),
+            &serde_json::json!({"server": "127.0.0.1:1433"}),
+        )
+        .err()
+        .expect("a missing database refuses");
+        assert!(error.contains("database"), "{error}");
+        // A non-default driver refuses: only the default maps here.
+        let error = build_mssql_sink(
+            &pg_record("mssql", "act", "mssql:up", "INSERT INTO t VALUES ($2)"),
+            &serde_json::json!({"server": "127.0.0.1:1433", "database": "db", "driver": "FreeTDS"}),
+        )
+        .err()
+        .expect("a foreign driver refuses");
+        assert!(error.contains("driver"), "{error}");
+        // The sqlserver alias selects the mssql runtime.
+        assert_eq!(canonical_action_kind("sqlserver"), "mssql");
+        assert!(action_owned_kind("sqlserver"));
+        // The postgres alias selects the pgsql runtime (MV-02a binding).
+        assert_eq!(canonical_action_kind("postgres"), "pgsql");
+        assert_eq!(canonical_action_kind("postgresql"), "pgsql");
+        assert!(action_owned_kind("postgres"));
+        // An action filed as postgres builds through the pgsql builder.
+        let pg_doc =
+            serde_json::json!({"server": "127.0.0.1:5432", "database": "db", "username": "u"});
+        let pg_sink = build_action_sink(
+            &pg_record(
+                "postgres",
+                "act",
+                "pg:up",
+                "INSERT INTO t VALUES ($1, $2, $3)",
+            ),
+            &pg_doc,
+            &ActionResourceOpts::default(),
+        )
+        .expect("a postgres action builds")
+        .expect("an owned kind builds a sink");
+        assert_eq!(pg_sink.kind(), "postgres");
+    }
+
+    #[tokio::test]
+    async fn oracle_sink_builds_from_service_name_and_refuses_gaps() {
+        let doc =
+            serde_json::json!({"server": "127.0.0.1:1521", "username": "u", "service_name": "XE"});
+        let sink = build_oracle_sink(
+            &pg_record(
+                "oracle",
+                "act",
+                "oracle:up",
+                "INSERT INTO t(topic, qos, payload) VALUES (:1, :2, :3)",
+            ),
+            &doc,
+        )
+        .expect("a complete oracle action builds");
+        assert_eq!(sink.kind(), "oracle");
+        // A missing service refuses naming both fields.
+        let error = build_oracle_sink(
+            &pg_record("oracle", "act", "oracle:up", "INSERT INTO t VALUES (:1)"),
+            &serde_json::json!({"server": "127.0.0.1:1521", "username": "u"}),
+        )
+        .err()
+        .expect("a missing service refuses");
+        assert!(error.contains("service_name"), "{error}");
+        // A sysdba role refuses: the driver has no role knob.
+        let error = build_oracle_sink(
+            &pg_record("oracle", "act", "oracle:up", "INSERT INTO t VALUES (:1)"),
+            &serde_json::json!({"server": "127.0.0.1", "username": "u", "sid": "XE", "role": "sysdba"}),
+        )
+        .err()
+        .expect("a sysdba role refuses");
+        assert!(error.contains("role"), "{error}");
+        // A marker outside :1..:3 refuses.
+        let error = build_oracle_sink(
+            &pg_record(
+                "oracle",
+                "act",
+                "oracle:up",
+                "INSERT INTO t VALUES (:1, :4)",
+            ),
+            &doc,
+        )
+        .err()
+        .expect("a :4 marker refuses");
+        assert!(error.contains(":4"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn oracle_sink_builds_from_sid_alone() {
+        // A bare `sid` builds: the transport dials by identifier.
+        let doc = serde_json::json!({"server": "127.0.0.1:1521", "username": "u", "sid": "XE"});
+        let sink = build_oracle_sink(
+            &pg_record(
+                "oracle",
+                "act",
+                "oracle:up",
+                "INSERT INTO t(topic, qos, payload) VALUES (:1, :2, :3)",
+            ),
+            &doc,
+        )
+        .expect("a sid-only oracle action builds");
+        assert_eq!(sink.kind(), "oracle");
+        // A service name wins when both are set.
+        let doc = serde_json::json!({"server": "127.0.0.1:1521", "username": "u", "service_name": "XE", "sid": "ORCL"});
+        let sink = build_oracle_sink(
+            &pg_record(
+                "oracle",
+                "act",
+                "oracle:up",
+                "INSERT INTO t(topic, qos, payload) VALUES (:1, :2, :3)",
+            ),
+            &doc,
+        )
+        .expect("a service-name oracle action builds");
+        assert_eq!(sink.kind(), "oracle");
+    }
+
+    #[tokio::test]
+    async fn relational_staging_wires_live_without_dialling() {
+        let connectors = ConnectorStore::new();
+        connectors.upsert(serde_json::json!({
+            "id": "mysql:up",
+            "name": "up",
+            "type": "mysql",
+            "server": "127.0.0.1:9",
+            "database": "db",
+        }));
+        let stage = stage_action_sink(
+            &connectors,
+            &mysql_record(
+                "act",
+                "mysql:up",
+                "INSERT INTO t(topic, qos, payload) VALUES (?, ?, ?)",
+            ),
+        )
+        .expect("a resolvable mysql connector stages");
+        assert_eq!(stage.wiring, ActionWiring::Live);
+        assert!(stage.sink.is_some());
+    }
 
     #[derive(Default)]
     struct BatchSink {

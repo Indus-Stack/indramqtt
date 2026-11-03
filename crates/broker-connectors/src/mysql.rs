@@ -11,7 +11,7 @@
 //! (mysql_native_password), prepare, and execute path, retained for
 //! offline unit tests only.
 
-use super::{ConnectorError, Result, Sink};
+use super::{ConnectorError, Result, Sink, SinkBatchItem};
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
@@ -37,6 +37,14 @@ fn default_batch_size() -> usize {
 fn default_batch_timeout_ms() -> u64 {
     50
 }
+
+// MySQL documented default for max packet (4 MiB).
+// The driver asks the server on connect. Setting it saves one roundtrip.
+const DRIVER_MAX_ALLOWED_PACKET: usize = 4_194_304;
+
+// MySQL documented default for wait timeout (8 hours in seconds).
+// The driver asks the server on connect. Setting it saves one roundtrip.
+const DRIVER_WAIT_TIMEOUT: usize = 28_800;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MySqlSinkConfig {
@@ -858,6 +866,53 @@ impl DriverMySqlTransport {
             pool: mysql_async::Pool::new(mysql_async::Opts::from(builder)),
         })
     }
+
+    /// Build from discrete connection fields instead of a URL. User,
+    /// password and database travel as driver values (never formatted
+    /// into a URL string), so a value with URL delimiters (`@`, `:`,
+    /// `/`, `?`, `#`) or a quote reaches the server verbatim as a
+    /// bound credential, not as URL syntax.
+    pub fn from_parts(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        database: &str,
+        pool_size: usize,
+    ) -> Result<Self> {
+        if host.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "mysql host must not be empty".to_string(),
+            ));
+        }
+        if port == 0 {
+            return Err(ConnectorError::Dispatch(
+                "mysql port must be 1..=65535".to_string(),
+            ));
+        }
+        if pool_size == 0 {
+            return Err(ConnectorError::Dispatch(
+                "mysql pool_size must be >= 1".to_string(),
+            ));
+        }
+        let user = if user.is_empty() { "root" } else { user };
+        let constraints = mysql_async::PoolConstraints::new(0, pool_size).ok_or_else(|| {
+            ConnectorError::Dispatch(format!("mysql invalid pool size {pool_size}"))
+        })?;
+        let pool_opts = mysql_async::PoolOpts::default().with_constraints(constraints);
+        let builder = mysql_async::OptsBuilder::default()
+            .ip_or_hostname(host)
+            .tcp_port(port)
+            .user(Some(user.to_string()))
+            .pass(Some(password.to_string()))
+            .db_name(Some(database.to_string()))
+            .max_allowed_packet(Some(DRIVER_MAX_ALLOWED_PACKET))
+            .wait_timeout(Some(DRIVER_WAIT_TIMEOUT))
+            .pool_opts(pool_opts);
+        Ok(Self {
+            pool: mysql_async::Pool::new(mysql_async::Opts::from(builder)),
+        })
+    }
 }
 
 #[async_trait]
@@ -1232,6 +1287,18 @@ impl Sink for MySqlSink {
         Ok(())
     }
 
+    /// Buffer every row, then flush once: one batch means one driver
+    /// call, so `batch_size: 2` sends two rows together.
+    async fn send_batch(&self, items: &[SinkBatchItem]) -> super::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        for item in items {
+            self.buffer_row(&item.topic, &item.payload, item.qos);
+        }
+        self.flush().await
+    }
+
     fn kind(&self) -> &'static str {
         "mysql"
     }
@@ -1506,6 +1573,38 @@ mod tests {
         assert_eq!(rows[0][1], b"1");
         assert_eq!(rows[0][2], br#"{ "v": 1 }"#);
         assert_eq!(rows[1][2], br#"{ "v": 2 }"#);
+    }
+
+    #[tokio::test]
+    async fn test_send_batch_delivers_two_rows_in_one_driver_call() {
+        // `batch_size: 2` sends two rows in one driver call: the batch
+        // buffers both rows, then flushes once.
+        let transport = Arc::new(MemoryMySqlTransport::new());
+        let mut config = test_config();
+        config.batch_size = 1;
+        config.batch_timeout_ms = 0;
+        let sink = MySqlSink::new(config, transport.clone()).expect("valid sink");
+        let first = Topic::new("sensors/temp").unwrap();
+        let second = Topic::new("sensors/temp").unwrap();
+        sink.send_batch(&[
+            SinkBatchItem {
+                topic: first,
+                payload: Bytes::from_static(br#"{ "v": 1 }"#),
+                qos: QoS::AtLeastOnce,
+            },
+            SinkBatchItem {
+                topic: second,
+                payload: Bytes::from_static(br#"{ "v": 2 }"#),
+                qos: QoS::AtLeastOnce,
+            },
+        ])
+        .await
+        .expect("batch sends");
+        assert_eq!(transport.calls(), 1);
+        assert_eq!(sink.sent_batches(), 1);
+        let batches = transport.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].rows.len(), 2);
     }
 
     #[tokio::test]

@@ -22,13 +22,14 @@ use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use broker_connectors::{
     now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
+    SinkBatchItem,
 };
 
 /// Days since 0001-01-01 (proleptic Gregorian) for a civil date
@@ -893,6 +894,12 @@ impl MssqlTransport for NativeMssqlTransport {
 // Maintained-driver transport (tiberius).
 // ---------------------------------------------------------------------------
 
+fn install_mssql_tls_provider() {
+    // Tiberius negotiates TLS through rustls when the server requires
+    // encryption. Install the process default provider first.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// Concrete driver session: a `tiberius` TDS client over a tokio TCP
 /// stream adapted to futures-io via `tokio-util` compat.
 type DriverClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
@@ -966,13 +973,13 @@ fn driver_datetimeoffset(millis: i64) -> DriverDateTimeOffset {
 /// (`DATETIMEOFFSET`, `NVARCHAR`, `BIGINT`), negotiated by the driver
 /// instead of by hand.
 ///
-/// Bound: one cached driver session plus the sink buffer in front of
-/// it (batch rows default 200, batch bytes default 2 MiB); no pool,
-/// no background queue. The default is finite because an unbounded
-/// session pool under fan-in would repeat the multi-GB RSS collapse
-/// the v4 benchmark measured on this path. The sink's send path runs
-/// behind the rule engine's bounded queue, so no benchmark numbers
-/// are needed.
+/// Bound: one pooled driver session per `pool_size` entry plus the
+/// sink buffer in front of it (batch rows default 200, batch bytes
+/// default 2 MiB); no background queue. The default is finite because
+/// an unbounded session pool under fan-in would repeat the multi-GB
+/// RSS collapse the v4 benchmark measured on this path. The sink's
+/// send path runs behind the rule engine's bounded queue, so no
+/// benchmark numbers are needed.
 pub struct DriverMssqlTransport {
     config: MssqlSinkConfig,
     client: tokio::sync::Mutex<Option<DriverClient>>,
@@ -1024,6 +1031,9 @@ impl DriverMssqlTransport {
         if self.config.trust_server_certificate {
             driver.trust_cert();
         }
+        // Plaintext when the server allows it. The driver uses TLS
+        // when the server requires encryption. This keeps both modes.
+        driver.encryption(tiberius::EncryptionLevel::NotSupported);
         Ok(driver)
     }
 
@@ -1032,6 +1042,7 @@ impl DriverMssqlTransport {
     /// redirect is a misconfiguration, and looping would hang flush).
     async fn connect_new(&self, driver: tiberius::Config) -> Result<DriverClient> {
         use tokio_util::compat::TokioAsyncWriteCompatExt;
+        install_mssql_tls_provider();
         let addr = driver.get_addr().to_string();
         let tcp = tokio::time::timeout(
             self.timeout,
@@ -1132,6 +1143,67 @@ impl MssqlTransport for DriverMssqlTransport {
             }
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pooled driver transport: one driver session per pool entry.
+// ---------------------------------------------------------------------------
+
+/// One driver session per `pool_size` entry. Each member dials lazily
+/// on first use and owns its session; batches rotate across members,
+/// so at most one session per entry exists. The entry count comes
+/// from the connector `pool_size` (1 to 1024).
+pub struct PooledMssqlTransport {
+    members: Vec<Arc<dyn MssqlTransport>>,
+    next: AtomicUsize,
+}
+
+impl PooledMssqlTransport {
+    /// Build the pool from ready members (one per entry).
+    /// Refuses an empty pool: at least one session must exist.
+    pub fn from_members(members: Vec<Arc<dyn MssqlTransport>>) -> Result<Self> {
+        if members.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "mssql pool_size must be >= 1".to_string(),
+            ));
+        }
+        Ok(Self {
+            members,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// Build one driver session per entry from the sink config.
+    pub fn new(config: &MssqlSinkConfig, pool_size: usize) -> Result<Self> {
+        if pool_size == 0 {
+            return Err(ConnectorError::Dispatch(
+                "mssql pool_size must be >= 1".to_string(),
+            ));
+        }
+        let mut members: Vec<Arc<dyn MssqlTransport>> = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            members.push(Arc::new(DriverMssqlTransport::new(config)?));
+        }
+        Self::from_members(members)
+    }
+
+    /// The entry count: one live session at most per entry.
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// True when the pool holds no entry (never built this way).
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+}
+
+#[async_trait]
+impl MssqlTransport for PooledMssqlTransport {
+    async fn execute_batch(&self, table: &str, rows: Vec<MssqlRowItem>) -> Result<()> {
+        let index = self.next.fetch_add(1, Ordering::SeqCst) % self.members.len();
+        self.members[index].execute_batch(table, rows).await
     }
 }
 
@@ -1319,6 +1391,18 @@ impl Sink for MssqlSink {
             self.flush().await?;
         }
         Ok(())
+    }
+
+    /// Buffer every row, then flush once: one batch means one driver
+    /// call per table, so `batch_size: 2` sends two rows together.
+    async fn send_batch(&self, items: &[SinkBatchItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        for item in items {
+            self.buffer_row(&item.topic, &item.payload, item.qos)?;
+        }
+        self.flush().await
     }
 
     fn kind(&self) -> &'static str {
@@ -1539,6 +1623,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_send_batch_delivers_two_rows_in_one_driver_call() {
+        // `batch_size: 2` sends two rows in one driver call: the batch
+        // buffers both rows, then flushes once.
+        let mut config = test_config();
+        config.batch_size = Some(1);
+        let (sink, transport) = test_sink(config);
+        let first = Topic::new("sensors/t1").unwrap();
+        let second = Topic::new("sensors/t1").unwrap();
+        sink.send_batch(&[
+            SinkBatchItem {
+                topic: first,
+                payload: Bytes::from_static(br#"{"client_id":"d7","v":1}"#),
+                qos: QoS::AtLeastOnce,
+            },
+            SinkBatchItem {
+                topic: second,
+                payload: Bytes::from_static(br#"{"client_id":"d7","v":2}"#),
+                qos: QoS::AtLeastOnce,
+            },
+        ])
+        .await
+        .unwrap();
+        assert_eq!(transport.calls(), 1);
+        let captured = transport.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].rows.len(), 2);
+        assert_eq!(sink.sent_records(), 2);
+    }
+
+    #[tokio::test]
     async fn test_custom_upsert_wiring() {
         // CustomUpsert mode flows through the same typed rows; the SQL
         // text itself is a transport-side concern (covered by shapes).
@@ -1614,6 +1728,41 @@ mod tests {
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
         assert_eq!(sink.buffered_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pooled_transport_rotates_members() {
+        let first = Arc::new(MockMssqlTransport::new());
+        let second = Arc::new(MockMssqlTransport::new());
+        let members: Vec<Arc<dyn MssqlTransport>> =
+            vec![first.clone() as Arc<dyn MssqlTransport>, second.clone()];
+        let pooled = PooledMssqlTransport::from_members(members).expect("two members build");
+        assert_eq!(pooled.len(), 2);
+        let rows = || {
+            vec![MssqlRowItem {
+                time_ms: 0,
+                topic: "t".to_string(),
+                client_id: String::new(),
+                qos: 0,
+                payload_json: "{}".to_string(),
+            }]
+        };
+        pooled
+            .execute_batch("t", rows())
+            .await
+            .expect("first fires");
+        pooled
+            .execute_batch("t", rows())
+            .await
+            .expect("second fires");
+        pooled
+            .execute_batch("t", rows())
+            .await
+            .expect("third fires");
+        assert_eq!(first.calls(), 2);
+        assert_eq!(second.calls(), 1);
+        let empty: Vec<Arc<dyn MssqlTransport>> = vec![];
+        assert!(PooledMssqlTransport::from_members(empty).is_err());
     }
 
     #[tokio::test]

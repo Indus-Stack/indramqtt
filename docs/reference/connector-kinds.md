@@ -16,7 +16,7 @@ flowchart LR
 
 | kind | aliases | family | owner | state | connector | action | source | probe | SQL INTO | feature |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| alloydb |  | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
+| alloydb | google_alloydb, alloy_db | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | aws_iot | aws_iot_core | cloud-iot | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | aws_iot |
 | azure_blob | azure_blob_storage, azureblob, azblob | object-store | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | azure_blob |
 | azure_eventhubs | azure_event_hubs, azure, eventhubs, azure_event_hub_producer | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | azure_eventhubs |
@@ -24,7 +24,7 @@ flowchart LR
 | bigquery | bq, gbq | object-store | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | bigquery |
 | cassandra | scylla, scylladb, cql | time-series | SB-27 | pending SB-27 | yes | yes | yes | yes | yes | cassandra |
 | clickhouse | ch | time-series | MV-02b | ready | yes | yes | yes | yes | yes | clickhouse |
-| cockroachdb | cockroach | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
+| cockroachdb | cockroach | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | confluent | confluent_kafka, confluent_cloud, confluent_producer | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | confluent |
 | console | logger | local | KC-00/D9 | ready | yes | yes | yes | yes | yes | - |
 | couchbase | couch, cb | document-store | MV-02c | ready | yes | yes | yes | yes | yes | couchbase |
@@ -44,17 +44,17 @@ flowchart LR
 | kinesis | aws_kinesis | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | kinesis |
 | mongodb | mongo, documentdb | document-store | MV-02c | ready | yes | yes | yes | yes | yes | mongodb |
 | mqtt_bridge | mqtt, mqtt-bridge, bridge | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
-| mssql | sqlserver | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
-| mysql | mariadb | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
+| mssql | sqlserver | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
+| mysql | mariadb | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | oci_streaming | oci | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | - |
 | opc_ua | opcua | device | MV-03c | pending MV-03c | yes | yes | yes | yes | yes | - |
 | opentsdb | opents | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
-| oracle |  | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
+| oracle |  | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | pgsql | postgres, postgresql | relational | MV-01 | ready | yes | yes | yes | yes | yes | - |
 | pulsar |  | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
 | rabbitmq | rabbit, amqp | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | rabbitmq |
 | redis |  | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
-| redshift |  | relational | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
+| redshift |  | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | rocketmq |  | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
 | s3 | minio | object-store | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | s3 |
 | snowflake | snowflake_streaming, snowflake_aggregated | object-store | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | - |
@@ -62,7 +62,7 @@ flowchart LR
 | tablestore | ots | object-store | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | - |
 | tdengine |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | test |  | local | MV-03c | test-only | yes | no | no | yes | yes | - |
-| timescaledb | timescale | time-series | MV-02a | pending MV-02a | yes | yes | yes | yes | yes | - |
+| timescaledb | timescale | time-series | MV-02d | pending MV-02d | yes | yes | yes | yes | yes | - |
 | timestream | aws_timestream | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | webhook |  | http | MV-01 | ready | yes | yes | yes | yes | yes | - |
 | azure_event_grid |  | cloud-messaging | D3 | refused D3 | no | no | no | no | no | - |

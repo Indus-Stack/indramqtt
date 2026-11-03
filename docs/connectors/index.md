@@ -114,6 +114,11 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | [HTTP webhook](./http.md) | Any HTTP receiver. |
 | [MQTT bridge](./mqtt-bridge.md) | A remote broker. |
 | [S3](./s3.md) | Object files. |
+| [SQL Server](./mssql.md) | Relational rows. |
+| [Oracle](./oracle.md) | Relational rows. |
+| [AlloyDB](./alloydb.md) | Relational rows. |
+| [CockroachDB](./cockroachdb.md) | Relational rows. |
+| [Redshift](./redshift.md) | Relational rows. |
 
 ## Check that it works
 
@@ -146,8 +151,8 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {key}"})
 with urllib.request.urlopen(req, timeout=5) as res:
     names = set(json.load(res))
-assert names == {"pgsql", "opents", "tdengine", "datalayers", "clickhouse", "greptimedb", "aws_timestream", "iotdb", "doris", "influxdb", "mongodb", "couchbase", "elasticsearch"}, names
-for pending in ("http", "mqtt", "kafka_producer", "redis", "mysql", "cassandra"):
+assert names == {"alloydb", "aws_timestream", "clickhouse", "cockroachdb", "couchbase", "datalayers", "doris", "elasticsearch", "greptimedb", "influxdb", "iotdb", "mongodb", "mysql", "opents", "oracle", "pgsql", "redshift", "sqlserver", "tdengine"}, names
+for pending in ("http", "mqtt", "kafka_producer", "redis", "cassandra"):
     assert pending not in names, pending
 print("ok")
 PY

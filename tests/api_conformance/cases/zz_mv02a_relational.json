@@ -1,0 +1,724 @@
+[
+  {
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-my",
+      "type": "mysql",
+      "server": "127.0.0.1:3306",
+      "database": "db",
+      "username": "u"
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-ms",
+      "type": "sqlserver",
+      "server": "127.0.0.1:1433",
+      "database": "db"
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ms"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ms"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-ora",
+      "type": "oracle",
+      "server": "127.0.0.1:1521",
+      "username": "u",
+      "service_name": "XE"
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ora"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ora"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-adb",
+      "type": "alloydb",
+      "server": "127.0.0.1:5432",
+      "database": "db",
+      "username": "u"
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-adb"
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-adb"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "PUT /connectors/{id}",
+    "path_params": {
+      "id": "conf-mv02a-my-upd"
+    },
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-my-upd",
+      "type": "mysql",
+      "server": "127.0.0.1:3306",
+      "database": "db2",
+      "username": "u"
+    },
+    "expect_status": 200,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my-upd"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-my-upd",
+            "type": "mysql",
+            "server": "127.0.0.1:3306",
+            "database": "db",
+            "username": "u"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my-upd"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "type": "mysql"
+    },
+    "expect_status": 204,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "type": "mssql",
+      "server": "127.0.0.1:9"
+    },
+    "expect_status": 400,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-my-act",
+      "type": "mysql",
+      "connector": "conf-mv02a-my",
+      "parameters": {
+        "sql": "INSERT INTO t(topic, qos, payload) VALUES (?, ?, ?)"
+      }
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-my-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-my",
+            "type": "mysql",
+            "server": "127.0.0.1:3306",
+            "database": "db",
+            "username": "u"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-my-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-my-nosql",
+      "type": "mysql",
+      "connector": "conf-mv02a-my",
+      "parameters": {}
+    },
+    "expect_status": 400,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-my-nosql"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-my",
+            "type": "mysql",
+            "server": "127.0.0.1:3306",
+            "database": "db",
+            "username": "u"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-my-nosql"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-ms-act",
+      "type": "mssql",
+      "connector": "conf-mv02a-ms",
+      "parameters": {
+        "sql": "INSERT INTO t(topic, qos, payload) VALUES ($2, $4, $5)"
+      }
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-ms-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ms"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-ms",
+            "type": "sqlserver",
+            "server": "127.0.0.1:1433",
+            "database": "db"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-ms-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ms"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-ora-act",
+      "type": "oracle",
+      "connector": "conf-mv02a-ora",
+      "parameters": {
+        "sql": "INSERT INTO t(topic, qos, payload) VALUES (:1, :2, :3)"
+      }
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-ora-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ora"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-ora",
+            "type": "oracle",
+            "server": "127.0.0.1:1521",
+            "username": "u",
+            "service_name": "XE"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-ora-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ora"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-adb-act",
+      "type": "alloydb",
+      "connector": "conf-mv02a-adb",
+      "parameters": {
+        "sql": "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)"
+      }
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-adb-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-adb"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-adb",
+            "type": "alloydb",
+            "server": "127.0.0.1:5432",
+            "database": "db",
+            "username": "u"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-adb-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-adb"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-crdb-act",
+      "type": "cockroachdb",
+      "connector": "conf-mv02a-crdb",
+      "parameters": {
+        "sql": "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)"
+      }
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-crdb-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-crdb"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-crdb",
+            "type": "cockroachdb",
+            "server": "127.0.0.1:26257",
+            "database": "db",
+            "username": "u"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-crdb-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-crdb"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-rs-act",
+      "type": "redshift",
+      "connector": "conf-mv02a-rs",
+      "parameters": {
+        "sql": "INSERT INTO t(topic, qos, payload) VALUES ($1, $2, $3)"
+      }
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-rs-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-rs"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-rs",
+            "type": "redshift",
+            "server": "127.0.0.1:5439",
+            "database": "db",
+            "username": "u"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-rs-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-rs"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-sq-act",
+      "type": "sqlserver",
+      "connector": "conf-mv02a-ms",
+      "parameters": {
+        "sql": "INSERT INTO t(topic) VALUES ($2)"
+      }
+    },
+    "expect_status": 201,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-sq-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ms"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-ms",
+            "type": "sqlserver",
+            "server": "127.0.0.1:1433",
+            "database": "db"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-sq-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-ms"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "PUT /actions/{id}",
+    "path_params": {
+      "id": "conf-mv02a-my-act-upd"
+    },
+    "query": {},
+    "body": {
+      "name": "conf-mv02a-my-act-upd",
+      "type": "mysql",
+      "connector": "conf-mv02a-my",
+      "parameters": {
+        "sql": "INSERT INTO t2(topic, qos, payload) VALUES (?, ?, ?)"
+      }
+    },
+    "expect_status": 200,
+    "setup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-my-act-upd"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my"
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "name": "conf-mv02a-my",
+            "type": "mysql",
+            "server": "127.0.0.1:3306",
+            "database": "db",
+            "username": "u"
+          }
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/actions",
+          "body": {
+            "name": "conf-mv02a-my-act-upd",
+            "type": "mysql",
+            "connector": "conf-mv02a-my",
+            "parameters": {
+              "sql": "INSERT INTO t(topic, qos, payload) VALUES (?, ?, ?)"
+            }
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/conf-mv02a-my-act-upd"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/conf-mv02a-my"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "type": "mysql"
+    },
+    "expect_status": 204,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "body": {
+      "type": "oracle"
+    },
+    "expect_status": 204,
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /schemas/{name}",
+    "path_params": {
+      "name": "connectors"
+    },
+    "query": {},
+    "body": null,
+    "expect_status": 200,
+    "setup": [],
+    "cleanup": []
+  }
+]

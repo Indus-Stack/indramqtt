@@ -1241,6 +1241,54 @@ impl DriverPgTransport {
         })
     }
 
+    /// Build from discrete connection fields instead of a URL. Password
+    /// and database travel as values (never formatted into a URL), so a
+    /// value with URL delimiters (`@`, `:`, `/`, `?`, `#`) or a quote
+    /// reaches the driver verbatim. `use_tls` selects the maintained
+    /// rustls connector with the system trust store.
+    pub fn from_parts(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        database: &str,
+        pool_size: usize,
+        use_tls: bool,
+    ) -> Result<Self> {
+        if host.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "postgres host must not be empty".to_string(),
+            ));
+        }
+        if port == 0 {
+            return Err(ConnectorError::Dispatch(
+                "postgres port must be 1..=65535".to_string(),
+            ));
+        }
+        if pool_size == 0 {
+            return Err(ConnectorError::Dispatch(
+                "postgres pool_size must be >= 1".to_string(),
+            ));
+        }
+        let user = if user.is_empty() {
+            "postgres".to_string()
+        } else {
+            user.to_string()
+        };
+        Ok(Self {
+            pg_config: pg_connect_config(host, port, &user, password, database),
+            use_tls,
+            endpoint: PgEndpoint {
+                host: host.to_string(),
+                port,
+                user,
+                password: password.to_string(),
+                database: database.to_string(),
+            },
+            permits: tokio::sync::Semaphore::new(pool_size),
+        })
+    }
+
     async fn dial(&self) -> Result<Link> {
         if self.use_tls {
             let tls = pg_tls_connector()?;
@@ -1481,6 +1529,11 @@ async fn execute_extended(stream: &mut TcpStream, batch: &PgBatch) -> Result<()>
 /// (`$1` topic, `$2` QoS, `$3` payload) and flushes full or stale
 /// batches through the transport. Transport failures back off
 /// exponentially (capped) without losing buffered rows.
+///
+/// The kind label stays `postgres` unless an action builder sets its
+/// own protocol kind (AlloyDB, CockroachDB and Redshift speak the
+/// same wire protocol): the label only names the sink for display,
+/// delivery never branches on it.
 pub struct PostgreSqlSink {
     config: PostgreSqlSinkConfig,
     transport: Arc<dyn PgTransport>,
@@ -1488,6 +1541,7 @@ pub struct PostgreSqlSink {
     backoff: parking_lot::Mutex<super::BackoffState>,
     sent_batches: AtomicU64,
     rejected_rows: AtomicU64,
+    kind: &'static str,
 }
 
 impl PostgreSqlSink {
@@ -1501,7 +1555,15 @@ impl PostgreSqlSink {
             backoff: parking_lot::Mutex::new(super::BackoffState::default()),
             sent_batches: AtomicU64::new(0),
             rejected_rows: AtomicU64::new(0),
+            kind: "postgres",
         })
+    }
+
+    /// Name this sink for display (a PostgreSQL-protocol family kind
+    /// sharing the wire format). Delivery never branches on the label.
+    pub fn with_kind(mut self, kind: &'static str) -> Self {
+        self.kind = kind;
+        self
     }
 
     pub fn config(&self) -> &PostgreSqlSinkConfig {
@@ -1626,7 +1688,7 @@ impl Sink for PostgreSqlSink {
     }
 
     fn kind(&self) -> &'static str {
-        "postgres"
+        self.kind
     }
 }
 

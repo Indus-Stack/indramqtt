@@ -2117,7 +2117,7 @@ mod tests {
             .connectors
             .push(broker_config::ConnectorEntry {
                 id: "sb27-mysql".to_string(),
-                connector_type: "mysql".to_string(),
+                connector_type: "snowflake".to_string(),
                 enable: true,
                 config: "{}".to_string(),
             });

@@ -231,9 +231,10 @@ pub use opc_ua::{
 };
 pub use oracle::{
     build_merge_sql, classify_ora_code, classify_ora_error, classify_oracle_driver_error,
-    extract_oracle_row, ora_error_is_retryable, parse_ora_code, CapturedOracleExecution,
-    DriverOracleTransport, HttpOracleTransport, MockOracleTransport, OraErrorClassification,
-    OraErrorKind, OracleBindParam, OracleConnector, OracleResponse, OracleRow, OracleSink,
+    extract_oracle_row, ora_error_is_retryable, parse_ora_code, referenced_oracle_params,
+    validate_oracle_action_sql, CapturedOracleExecution, DriverOracleTransport,
+    HttpOracleTransport, MockOracleTransport, OraErrorClassification, OraErrorKind,
+    OracleActionSink, OracleBindParam, OracleConnector, OracleResponse, OracleRow, OracleSink,
     OracleSinkConfig, OracleTransport, OracleValue,
 };
 pub use pulsar::{

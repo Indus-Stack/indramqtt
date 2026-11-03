@@ -88,10 +88,10 @@ pub struct KindRow {
 pub static KIND_ROWS: &[KindRow] = &[
     KindRow {
         name: "alloydb",
-        aliases: &[],
+        aliases: &["google_alloydb", "alloy_db"],
         family: "relational",
         owner: "MV-02a",
-        state: KindState::Pending("MV-02a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -219,7 +219,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["cockroach"],
         family: "relational",
         owner: "MV-02a",
-        state: KindState::Pending("MV-02a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -524,7 +524,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["sqlserver"],
         family: "relational",
         owner: "MV-02a",
-        state: KindState::Pending("MV-02a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -539,7 +539,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["mariadb"],
         family: "relational",
         owner: "MV-02a",
-        state: KindState::Pending("MV-02a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -599,7 +599,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "relational",
         owner: "MV-02a",
-        state: KindState::Pending("MV-02a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -674,7 +674,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &[],
         family: "relational",
         owner: "MV-02a",
-        state: KindState::Pending("MV-02a"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -789,12 +789,15 @@ pub static KIND_ROWS: &[KindRow] = &[
         default_build: true,
         full_build: true,
     },
+    // timescaledb stays pending: its family ticket has not run yet.
+    // It keeps the MV-02d owner until its ticket is planned, so MV-02a
+    // stays accepted with only its six ready kinds.
     KindRow {
         name: "timescaledb",
         aliases: &["timescale"],
         family: "time-series",
-        owner: "MV-02a",
-        state: KindState::Pending("MV-02a"),
+        owner: "MV-02d",
+        state: KindState::Pending("MV-02d"),
         connector: true,
         action: true,
         source: true,
@@ -871,7 +874,7 @@ static TEST_KINDS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Family tickets whose kinds the plan accepts as `ready` at the close of
 /// KC-00. Add a ticket only after its family contract is accepted. The
 /// readiness test derives the expected state from this list.
-pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &["MV-01", "KC-00/D9", "MV-02b", "MV-02c"];
+pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &["MV-01", "KC-00/D9", "MV-02a", "MV-02b", "MV-02c"];
 
 /// Enable the test-only `test` kind for this process. Test builds call
 /// this; a release build does not.
@@ -1169,7 +1172,12 @@ mod tests {
         assert_eq!(kind_row("opensearch").map(|row| row.owner), Some("MV-02c"));
         assert!(!is_kind_ready("http"));
         assert!(!is_kind_ready("kafka"));
-        assert!(!is_kind_ready("mysql"));
+        assert!(is_kind_ready("mysql"));
+        assert!(is_kind_ready("mssql"));
+        assert!(is_kind_ready("oracle"));
+        assert!(is_kind_ready("alloydb"));
+        assert!(is_kind_ready("cockroachdb"));
+        assert!(is_kind_ready("redshift"));
         assert_eq!(kind_state("postgres"), Some(KindState::Ready));
         assert_eq!(kind_state("snowflake"), Some(KindState::Pending("MV-02d")));
         assert_eq!(kind_state("tablestore"), Some(KindState::Pending("MV-02d")));
