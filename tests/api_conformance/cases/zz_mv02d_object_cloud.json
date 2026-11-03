@@ -1,0 +1,1073 @@
+[
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "s3",
+      "name": "mv02d-lc-s3",
+      "endpoint": "http://127.0.0.1:9000",
+      "region": "us-east-1",
+      "access_key_id": "AKID",
+      "secret_access_key": "secret"
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-s3"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "s3",
+      "name": "mv02d-lc-s3-bad"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "azure_blob_storage",
+      "name": "mv02d-lc-az",
+      "account_name": "acct",
+      "account_key": "a2V5"
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-az"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "azure_blob_storage",
+      "name": "mv02d-lc-az-bad",
+      "account_name": "acct"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "dynamo",
+      "name": "mv02d-lc-ddb",
+      "url": "http://127.0.0.1:8000",
+      "region": "us-east-1",
+      "aws_access_key_id": "AKID",
+      "aws_secret_access_key": "secret"
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-ddb"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "dynamo",
+      "name": "mv02d-lc-ddb-bad",
+      "url": "http://127.0.0.1:8000"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "bigquery",
+      "name": "mv02d-lc-bq",
+      "authentication": {
+        "type": "attached_service_account",
+        "gcp_project_id": "proj"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-bq"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "bigquery",
+      "name": "mv02d-lc-bq-bad"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "disk_log",
+      "name": "mv02d-lc-disk",
+      "filepath": "mv02d-lc/audit.log",
+      "max_file_size": "1MB",
+      "max_file_number": 3,
+      "rotation": {
+        "period": "day",
+        "retention_period": 2
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-disk"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "disk_log",
+      "name": "mv02d-lc-disk-bad",
+      "filepath": "../escape.log",
+      "max_file_size": "1MB",
+      "max_file_number": 3
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "snowflake_streaming",
+      "name": "mv02d-lc-sf",
+      "account": "acct",
+      "pipe_user": "user",
+      "server": "http://127.0.0.1:9"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "tablestore",
+      "name": "mv02d-lc-ots",
+      "endpoint": "http://127.0.0.1:9000",
+      "instance_name": "inst",
+      "access_key_id": "ak",
+      "access_key_secret": "sk"
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-ots"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "tablestore",
+      "name": "mv02d-lc-ots-bad",
+      "endpoint": "http://127.0.0.1:9000"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors",
+    "body": {
+      "type": "databricks",
+      "name": "mv02d-lc-db"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /connectors/{id}",
+    "body": {
+      "type": "s3",
+      "name": "mv02d-lc-s3",
+      "endpoint": "http://127.0.0.1:9000",
+      "region": "us-east-1",
+      "access_key_id": "AKID",
+      "secret_access_key": "secret"
+    },
+    "expect_status": 200,
+    "path_params": {
+      "id": "mv02d-lc-s3"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "s3",
+            "name": "mv02d-lc-s3",
+            "endpoint": "http://127.0.0.1:9000",
+            "region": "us-east-1",
+            "access_key_id": "AKID",
+            "secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-s3"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "PUT /connectors/{id}",
+    "body": {
+      "type": "s3",
+      "name": "mv02d-lc-s3",
+      "endpoint": "http://127.0.0.1:9000",
+      "region": "us-east-1"
+    },
+    "expect_status": 200,
+    "path_params": {
+      "id": "mv02d-lc-s3"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "s3",
+            "name": "mv02d-lc-s3",
+            "endpoint": "http://127.0.0.1:9000",
+            "region": "us-east-1",
+            "access_key_id": "AKID",
+            "secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-s3"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "body": {
+      "type": "s3",
+      "name": "p",
+      "endpoint": "http://127.0.0.1:9"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "body": {
+      "type": "azure_blob_storage",
+      "name": "p",
+      "account_name": "a",
+      "account_key": "a2V5",
+      "endpoint": "http://127.0.0.1:9"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "body": {
+      "type": "dynamo",
+      "name": "p",
+      "url": "http://127.0.0.1:9",
+      "region": "us-east-1",
+      "aws_access_key_id": "A",
+      "aws_secret_access_key": "S"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /connectors_probe",
+    "body": {
+      "type": "tablestore",
+      "name": "p",
+      "endpoint": "http://127.0.0.1:9",
+      "instance_name": "i",
+      "access_key_id": "a",
+      "access_key_secret": "s"
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "s3",
+      "name": "mv02d-lc-s3-act",
+      "connector": "mv02d-lc-s3",
+      "parameters": {
+        "bucket": "telemetry",
+        "key": "events/${topic}/${seq}.ndjson"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "s3",
+            "name": "mv02d-lc-s3",
+            "endpoint": "http://127.0.0.1:9000",
+            "region": "us-east-1",
+            "access_key_id": "AKID",
+            "secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02d-lc-s3-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-s3"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "s3",
+      "name": "mv02d-lc-s3-act-bad",
+      "connector": "mv02d-lc-s3",
+      "parameters": {
+        "bucket": "telemetry"
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "s3",
+            "name": "mv02d-lc-s3",
+            "endpoint": "http://127.0.0.1:9000",
+            "region": "us-east-1",
+            "access_key_id": "AKID",
+            "secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-s3"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "azure_blob_storage",
+      "name": "mv02d-lc-az-act",
+      "connector": "mv02d-lc-az",
+      "parameters": {
+        "container": "telemetry",
+        "blob": "event/${batch_id}.json"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "azure_blob_storage",
+            "name": "mv02d-lc-az",
+            "account_name": "acct",
+            "account_key": "a2V5"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02d-lc-az-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-az"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "azure_blob_storage",
+      "name": "mv02d-lc-az-act-bad",
+      "connector": "mv02d-lc-az",
+      "parameters": {
+        "container": "telemetry"
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "azure_blob_storage",
+            "name": "mv02d-lc-az",
+            "account_name": "acct",
+            "account_key": "a2V5"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-az"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "dynamo",
+      "name": "mv02d-lc-ddb-act",
+      "connector": "mv02d-lc-ddb",
+      "parameters": {
+        "table": "events",
+        "hash_key": "id",
+        "template": "{\"id\":\"${payload.id}\"}"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "dynamo",
+            "name": "mv02d-lc-ddb",
+            "url": "http://127.0.0.1:8000",
+            "region": "us-east-1",
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02d-lc-ddb-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-ddb"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "dynamo",
+      "name": "mv02d-lc-ddb-act-bad",
+      "connector": "mv02d-lc-ddb",
+      "parameters": {
+        "table": "events"
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "dynamo",
+            "name": "mv02d-lc-ddb",
+            "url": "http://127.0.0.1:8000",
+            "region": "us-east-1",
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-ddb"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "bigquery",
+      "name": "mv02d-lc-bq-act",
+      "connector": "mv02d-lc-bq",
+      "parameters": {
+        "dataset": "telemetry",
+        "table": "events"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "bigquery",
+            "name": "mv02d-lc-bq",
+            "authentication": {
+              "type": "attached_service_account",
+              "gcp_project_id": "proj"
+            }
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02d-lc-bq-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-bq"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "bigquery",
+      "name": "mv02d-lc-bq-act-bad",
+      "connector": "mv02d-lc-bq",
+      "parameters": {
+        "dataset": "telemetry"
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "bigquery",
+            "name": "mv02d-lc-bq",
+            "authentication": {
+              "type": "attached_service_account",
+              "gcp_project_id": "proj"
+            }
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-bq"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "disk_log",
+      "name": "mv02d-lc-disk-act",
+      "connector": "mv02d-lc-disk",
+      "parameters": {
+        "write_mode": "sync"
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "disk_log",
+            "name": "mv02d-lc-disk",
+            "filepath": "mv02d-lc/audit.log",
+            "max_file_size": "1MB",
+            "max_file_number": 3,
+            "rotation": {
+              "period": "day",
+              "retention_period": 2
+            }
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02d-lc-disk-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-disk"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "disk_log",
+      "name": "mv02d-lc-disk-act-bad",
+      "connector": "mv02d-lc-disk",
+      "parameters": {
+        "template": "${payload}"
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "disk_log",
+            "name": "mv02d-lc-disk",
+            "filepath": "mv02d-lc/audit.log",
+            "max_file_size": "1MB",
+            "max_file_number": 3,
+            "rotation": {
+              "period": "day",
+              "retention_period": 2
+            }
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-disk"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "snowflake_streaming",
+      "name": "mv02d-lc-sf-act",
+      "connector": "mv02d-lc-sf",
+      "parameters": {
+        "database": "DB",
+        "schema": "PUBLIC"
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "snowflake_streaming",
+            "name": "mv02d-lc-sf",
+            "account": "acct",
+            "pipe_user": "user",
+            "server": "http://127.0.0.1:9"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-sf"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "tablestore",
+      "name": "mv02d-lc-ots-act",
+      "connector": "mv02d-lc-ots",
+      "parameters": {
+        "table_name": "events",
+        "measurement": "telemetry",
+        "tags": {
+          "device": "${client_id}"
+        },
+        "fields": [
+          {
+            "column": "temp",
+            "value": "${payload.temp}"
+          }
+        ]
+      }
+    },
+    "expect_status": 201,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "tablestore",
+            "name": "mv02d-lc-ots",
+            "endpoint": "http://127.0.0.1:9000",
+            "instance_name": "inst",
+            "access_key_id": "ak",
+            "access_key_secret": "sk"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02d-lc-ots-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-ots"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "tablestore",
+      "name": "mv02d-lc-ots-act-bad",
+      "connector": "mv02d-lc-ots",
+      "parameters": {
+        "table_name": "events",
+        "measurement": "telemetry"
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "tablestore",
+            "name": "mv02d-lc-ots",
+            "endpoint": "http://127.0.0.1:9000",
+            "instance_name": "inst",
+            "access_key_id": "ak",
+            "access_key_secret": "sk"
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-ots"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions",
+    "body": {
+      "type": "databricks",
+      "name": "mv02d-lc-db-act",
+      "connector": "mv02d-lc-db",
+      "parameters": {}
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "PUT /actions/{id}",
+    "body": {
+      "type": "s3",
+      "name": "mv02d-lc-s3-act",
+      "connector": "mv02d-lc-s3",
+      "parameters": {
+        "bucket": "telemetry2",
+        "key": "events/${topic}.ndjson"
+      }
+    },
+    "expect_status": 200,
+    "path_params": {
+      "id": "mv02d-lc-s3-act"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "method": "POST",
+          "path": "/connectors",
+          "body": {
+            "type": "s3",
+            "name": "mv02d-lc-s3",
+            "endpoint": "http://127.0.0.1:9000",
+            "region": "us-east-1",
+            "access_key_id": "AKID",
+            "secret_access_key": "secret"
+          }
+        }
+      },
+      {
+        "api": {
+          "method": "POST",
+          "path": "/actions",
+          "body": {
+            "type": "s3",
+            "name": "mv02d-lc-s3-act",
+            "connector": "mv02d-lc-s3",
+            "parameters": {
+              "bucket": "telemetry",
+              "key": "events/${topic}.ndjson"
+            }
+          }
+        }
+      }
+    ],
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv02d-lc-s3-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv02d-lc-s3"
+        }
+      }
+    ]
+  },
+  {
+    "operation": "POST /actions_probe",
+    "body": {
+      "type": "s3",
+      "name": "p",
+      "connector": "c",
+      "parameters": {
+        "bucket": "b",
+        "key": "k"
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "POST /actions_probe",
+    "body": {
+      "type": "tablestore",
+      "name": "p",
+      "connector": "c",
+      "parameters": {
+        "table_name": "t",
+        "measurement": "m",
+        "tags": {
+          "d": "${client_id}"
+        },
+        "fields": [
+          {
+            "column": "v",
+            "value": "${payload.v}"
+          }
+        ]
+      }
+    },
+    "expect_status": 400,
+    "path_params": {},
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /schemas/{name}",
+    "body": null,
+    "expect_status": 200,
+    "path_params": {
+      "name": "connector_disk_log.post_connector"
+    },
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  },
+  {
+    "operation": "GET /schemas/{name}",
+    "body": null,
+    "expect_status": 200,
+    "path_params": {
+      "name": "bridge_s3.post_connector"
+    },
+    "query": {},
+    "setup": [],
+    "cleanup": []
+  }
+]

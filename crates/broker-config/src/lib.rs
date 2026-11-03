@@ -5207,19 +5207,19 @@ mod tests {
         let mut snapshot = FullSnapshot::default();
         snapshot.connectors.connectors.push(ConnectorEntry {
             id: "pending-snowflake".to_string(),
-            connector_type: "snowflake".to_string(),
+            connector_type: "kafka".to_string(),
             enable: true,
             config: "{}".to_string(),
         });
         snapshot.actions.actions.push(ActionEntry {
             id: "pending-snowflake".to_string(),
-            action_type: "snowflake".to_string(),
+            action_type: "kafka".to_string(),
             enable: true,
             config: "{}".to_string(),
         });
         snapshot.sources.sources.push(SourceEntry {
             id: "pending-snowflake".to_string(),
-            source_type: "snowflake".to_string(),
+            source_type: "kafka".to_string(),
             enable: true,
             config: "{}".to_string(),
         });
@@ -5239,7 +5239,7 @@ mod tests {
             message.contains("connector_type"),
             "names the key: {message}"
         );
-        assert!(message.contains("snowflake"), "names the kind: {message}");
+        assert!(message.contains("kafka"), "names the kind: {message}");
 
         let registry = ConfigRegistry::load_for_boot(&dir).expect("boot accepts pending");
         let loaded = registry.snapshot();

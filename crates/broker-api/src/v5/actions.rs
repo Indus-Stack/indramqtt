@@ -772,7 +772,8 @@ pub async fn create_action(
     // connector that does not resolve keeps the action storable (the
     // accepted conformance contract): the staged wiring reports the
     // reason and the run reads `disconnected` until the connector
-    // arrives.
+    // arrives. A connector that resolves but stays incomplete (its own
+    // credential is missing) stores the same way.
     let staged = match crate::v5::action_sinks::stage_action_sink(&state.connectors, &entry) {
         Ok(staged) => staged,
         Err(message) => return ApiError::AlreadyExists(message).into_response(),
@@ -1024,9 +1025,10 @@ pub async fn update_action(
         Err(reason) => return ApiError::BadRequest(reason).into_response(),
     };
     // MV-01 (R2-03/04): stage the owned sink built from the NEW entry
-    // (never registered). A build that cannot complete is refused with
-    // 400 naming the action and the field; every old sink keeps
-    // delivering and the stored row is untouched.
+    // (never registered). A build that cannot complete for an
+    // action-side reason is refused with 400 naming the action and the
+    // field; every old sink keeps delivering and the stored row is
+    // untouched. A connector-side gap stores with failed wiring.
     let staged = match crate::v5::action_sinks::stage_action_sink(&state.connectors, &entry) {
         Ok(staged) => staged,
         Err(message) => return ApiError::BadRequest(message).into_response(),

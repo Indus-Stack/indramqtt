@@ -61,7 +61,7 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | `timestream` | out | An AWS Timestream database and credentials. | implemented, not verified against the live service |
 | `dynamodb` | out | An AWS DynamoDB table and credentials. | implemented |
 | `snowflake` | out | A Snowflake account and stage. | implemented, not verified against the live service |
-| `databricks` | out | A Databricks SQL warehouse and token. | implemented |
+| `databricks` (`delta_lake`) | out | No pinned reference schema. | refused under D3 |
 | `doris` | out | An Apache Doris cluster. | implemented |
 | `bigquery` | out | A BigQuery dataset and credentials. | implemented |
 | `redshift` | out | A Redshift cluster and credentials. | implemented |
@@ -119,6 +119,12 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | [AlloyDB](./alloydb.md) | Relational rows. |
 | [CockroachDB](./cockroachdb.md) | Relational rows. |
 | [Redshift](./redshift.md) | Relational rows. |
+| [Azure Blob](./azure-blob.md) | Azure object files. |
+| [BigQuery](./bigquery.md) | Analytics rows. |
+| [Disk log](./disk-log.md) | Local rotating files. |
+| [DynamoDB](./dynamodb.md) | Key-value items. |
+| [Snowflake](./snowflake.md) | Warehouse rows. |
+| [Tablestore](./tablestore.md) | Wide-column rows. |
 
 ## Check that it works
 
@@ -151,7 +157,7 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {key}"})
 with urllib.request.urlopen(req, timeout=5) as res:
     names = set(json.load(res))
-assert names == {"alloydb", "aws_timestream", "clickhouse", "cockroachdb", "couchbase", "datalayers", "doris", "elasticsearch", "greptimedb", "influxdb", "iotdb", "mongodb", "mysql", "opents", "oracle", "pgsql", "redshift", "sqlserver", "tdengine"}, names
+assert names == {"opents", "mongodb", "oracle", "tdengine", "azure_blob_storage", "snowflake_streaming", "elasticsearch", "influxdb", "pgsql", "cockroachdb", "iotdb", "mysql", "greptimedb", "disk_log", "datalayers", "sqlserver", "redshift", "clickhouse", "tablestore", "alloydb", "aws_timestream", "bigquery", "snowflake", "s3", "doris", "couchbase", "dynamo"}, names
 for pending in ("http", "mqtt", "kafka_producer", "redis", "cassandra"):
     assert pending not in names, pending
 print("ok")

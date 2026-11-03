@@ -914,7 +914,14 @@ impl SnowflakeSink {
         let mut attempt = 0usize;
         loop {
             // Fresh JWT per attempt (tokens may expire mid-backoff).
-            let token = self.fresh_token()?;
+            // A signing failure restores the batch instead of dropping
+            // rows without a counter.
+            let token = match self.fresh_token() {
+                Ok(token) => token,
+                Err(error) => {
+                    return self.restore_err(rows, oldest, taken_bytes, error);
+                }
+            };
             let mut outcome: Result<()> = Ok(());
             for (table, items) in &groups {
                 if let Err(e) = self

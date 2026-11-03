@@ -339,7 +339,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 13. Amazon S3
     schemas.insert(
         "bridge_s3.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "s3",
             json!({
                 "endpoint": str_prop("https://s3.amazonaws.com"),
                 "bucket": str_prop("my-bucket"),
@@ -820,7 +821,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 39. Disk Log
     schemas.insert(
         "connector_disk_log.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "disk_log",
             json!({
                 "file": str_prop("data/disk_log.txt")
             }),

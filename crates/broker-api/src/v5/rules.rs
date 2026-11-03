@@ -1167,6 +1167,17 @@ impl ConnectorStore {
         }
     }
 
+    /// Directory holding kernel state. Disk sinks join it.
+    /// Defaults to `./data` in unit tests with no registry.
+    pub(crate) fn data_dir(&self) -> std::path::PathBuf {
+        self.registry
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|registry| registry.dir().to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("./data"))
+    }
+
     /// Export the store as a validated config root: entries sorted by id
     /// so the persisted file is deterministic. Only inputs persist: the
     /// derived `status`/`node_status` display values are stripped and
@@ -1341,7 +1352,11 @@ fn connector_node_status(status: &str) -> serde_json::Value {
 /// Only the six connector families that previously carried built-in
 /// credentials or invented identities are gated here. Every other family
 /// keeps its existing behaviour; see the marker on the fallback arm below.
-fn missing_connector_field(conn_type: &str, body: &serde_json::Value) -> Option<&'static str> {
+fn missing_connector_field(
+    conn_type: &str,
+    body: &serde_json::Value,
+    data_dir: &std::path::Path,
+) -> Option<&'static str> {
     fn present(body: &serde_json::Value, keys: &[&str]) -> bool {
         keys.iter().any(|k| {
             body.get(*k)
@@ -1385,45 +1400,6 @@ fn missing_connector_field(conn_type: &str, body: &serde_json::Value) -> Option<
             }
             if !present(body, &["table", "table_template"]) {
                 return Some("table");
-            }
-            None
-        }
-        "snowflake" => {
-            if !present(body, &["private_key_pem", "private_key"]) {
-                return Some("private_key_pem");
-            }
-            if !present(body, &["account"]) {
-                return Some("account");
-            }
-            if !present(body, &["user", "username"]) {
-                return Some("user");
-            }
-            if !present(body, &["database"]) {
-                return Some("database");
-            }
-            if !present(body, &["schema"]) {
-                return Some("schema");
-            }
-            if !present(body, &["table", "table_template"]) {
-                return Some("table");
-            }
-            None
-        }
-        "tablestore" | "ots" => {
-            if !present(body, &["access_key_id", "ak"]) {
-                return Some("access_key_id");
-            }
-            if !present(body, &["access_key_secret", "sk"]) {
-                return Some("access_key_secret");
-            }
-            if !present(body, &["instance_name", "instance"]) {
-                return Some("instance_name");
-            }
-            if !present(body, &["table_name", "table"]) {
-                return Some("table_name");
-            }
-            if !present(body, &["endpoint", "url"]) {
-                return Some("endpoint");
             }
             None
         }
@@ -1499,12 +1475,151 @@ fn missing_connector_field(conn_type: &str, body: &serde_json::Value) -> Option<
             }
             None
         }
+        // MV-02d object, file and cloud kinds: every target value is
+        // operator-supplied. A missing field answers 400 with its name.
+        "s3" | "minio" => {
+            if !present(body, &["endpoint", "host", "url", "server"]) {
+                return Some("host");
+            }
+            None
+        }
+        "azure_blob" | "azure_blob_storage" | "azureblob" | "azblob" => {
+            if !present(body, &["account_name", "account"]) {
+                return Some("account_name");
+            }
+            if !present(body, &["account_key", "accountKey"]) {
+                return Some("account_key");
+            }
+            None
+        }
+        "dynamodb" | "dynamo" | "ddb" => {
+            if !present(body, &["url", "endpoint", "server"]) {
+                return Some("url");
+            }
+            if !present(body, &["region"]) {
+                return Some("region");
+            }
+            None
+        }
+        "bigquery" | "bq" | "gbq" => {
+            if !body
+                .get("authentication")
+                .is_some_and(|value| value.is_object())
+            {
+                return Some("authentication");
+            }
+            None
+        }
+        "disk_log" | "disk" | "disklog" => {
+            if !present(body, &["filepath", "file", "path"]) {
+                return Some("filepath");
+            }
+            if !present(body, &["max_file_size"]) {
+                return Some("max_file_size");
+            }
+            if !body
+                .get("max_file_number")
+                .and_then(|value| value.as_u64())
+                .is_some_and(|value| value > 0)
+            {
+                return Some("max_file_number");
+            }
+            let filepath = body
+                .get("filepath")
+                .or_else(|| body.get("file"))
+                .or_else(|| body.get("path"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if !disk_log_path_contained(filepath, data_dir) {
+                return Some("filepath");
+            }
+            None
+        }
+        "snowflake" | "snowflake_streaming" | "snowflake_aggregated" => {
+            if !present(body, &["account"]) {
+                return Some("account");
+            }
+            if !present(body, &["pipe_user", "user", "username"]) {
+                return Some("pipe_user");
+            }
+            if !present(body, &["private_key_pem", "private_key"]) {
+                return Some("private_key_pem");
+            }
+            if !present(body, &["server", "endpoint", "url"]) {
+                return Some("server");
+            }
+            None
+        }
+        "tablestore" | "ots" => {
+            if !present(body, &["access_key_secret", "sk"]) {
+                return Some("access_key_secret");
+            }
+            if !present(body, &["access_key_id", "ak"]) {
+                return Some("access_key_id");
+            }
+            if !present(body, &["instance_name", "instance"]) {
+                return Some("instance_name");
+            }
+            if !present(body, &["endpoint", "url"]) {
+                return Some("endpoint");
+            }
+            None
+        }
         // The MV-02b time-series families carry their own fail-closed
         // gate (documented defaults only); the remaining families keep
         // their existing behaviour until their service documentation is
         // checked for real defaults.
         _ => missing_mv02b_connector_field(conn_type, body),
     }
+}
+
+/// True when a `disk_log` file path stays inside the data directory:
+/// relative, with no `..`, root or Windows prefix component, and with
+/// no symlink that leaves the directory.
+fn disk_log_path_contained(filepath: &str, data_dir: &std::path::Path) -> bool {
+    use std::path::{Component, Path};
+    let path = Path::new(filepath);
+    if filepath.trim().is_empty()
+        || path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return false;
+    }
+    // Fail closed on symlinks: any symlink on the path or its parents
+    // can point outside the data directory, so refuse it. Check the
+    // path as given and joined to the data directory, so a link
+    // inside the data directory is refused even when the process
+    // working directory differs from the data directory.
+    if disk_log_has_symlink(path) {
+        return false;
+    }
+    if disk_log_has_symlink(&data_dir.join(filepath)) {
+        return false;
+    }
+    true
+}
+
+/// True when the path or any existing parent is a symlink.
+fn disk_log_has_symlink(path: &std::path::Path) -> bool {
+    let mut current = path;
+    loop {
+        if std::fs::symlink_metadata(current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent,
+            _ => break,
+        }
+        if current.as_os_str().is_empty() {
+            break;
+        }
+    }
+    false
 }
 
 /// MV-02b time-series required fields (S1-01): the connector create and
@@ -2157,9 +2272,7 @@ pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str
 /// KC-00 refusal for a kind whose capability state is not `ready`.
 ///
 /// Returns `None` for a ready kind (and for the `test` helper in a test
-/// build); otherwise the exact refusal message. A kind whose Cargo
-/// feature is not compiled in names the feature, so a disabled build
-/// refuses it the same way everywhere. Unknown names are not the map's
+/// build); otherwise the exact refusal message. Unknown names are not the map's
 /// business: the caller answers them before this runs.
 pub(crate) fn kind_refusal(kind: &str) -> Option<String> {
     let row = broker_config::kind_row(kind);
@@ -2174,11 +2287,6 @@ pub(crate) fn kind_refusal(kind: &str) -> Option<String> {
         None => return None,
     }
     let canonical = row.map(|r| r.name).unwrap_or(kind);
-    if let Some(feature) = disabled_connector_feature(canonical) {
-        return Some(format!(
-            "connector type {canonical} is not available in this broker: feature `{feature}` is not compiled in"
-        ));
-    }
     Some(format!(
         "connector type {canonical} is not available in this broker"
     ))
@@ -2216,6 +2324,107 @@ fn canonical_connector_kind(conn_type: &str) -> &str {
     }
 }
 
+/// Split an S3-style endpoint into the reference `host` and `port`.
+/// The API accepts `endpoint`, `url`, `server` or `host`. The reference
+/// connector schema requires `host` and `port`, so the stored document
+/// carries the derived pair next to the operator value. A port the
+/// endpoint does not name defaults to the URL scheme (`http` reads 80,
+/// `https` reads 443). An unparseable value changes nothing.
+fn normalize_s3_host_port(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    fn text(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+        obj.get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    }
+    if text(obj, "host").is_some() && obj.get("port").and_then(|v| v.as_u64()).is_some() {
+        return;
+    }
+    let Some(raw) = text(obj, "endpoint")
+        .or_else(|| text(obj, "url"))
+        .or_else(|| text(obj, "server"))
+        .or_else(|| text(obj, "host"))
+    else {
+        return;
+    };
+    let (scheme, rest) = match raw.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_lowercase(), rest),
+        None => (String::new(), raw.as_str()),
+    };
+    let authority = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
+    let authority = authority
+        .split('@')
+        .next_back()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(':');
+    if authority.is_empty() {
+        return;
+    }
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        // Bracketed IPv6 (`[::1]:9000`).
+        match stripped.split_once("]:") {
+            Some((host, port)) => (format!("[{host}]"), port.trim().to_string()),
+            None => (authority.to_string(), String::new()),
+        }
+    } else if authority.matches(':').count() == 1 {
+        match authority.split_once(':') {
+            Some((host, port)) => (host.trim().to_string(), port.trim().to_string()),
+            None => (authority.to_string(), String::new()),
+        }
+    } else {
+        (authority.to_string(), String::new())
+    };
+    if host.is_empty() {
+        return;
+    }
+    let port = port
+        .parse::<u64>()
+        .ok()
+        .filter(|port| *port > 0)
+        .or_else(|| {
+            if scheme == "http" {
+                Some(80)
+            } else if scheme == "https" {
+                Some(443)
+            } else {
+                None
+            }
+        });
+    if text(obj, "host").is_none() {
+        obj.insert("host".to_string(), serde_json::Value::String(host));
+    }
+    if obj.get("port").and_then(|v| v.as_u64()).is_none() {
+        if let Some(port) = port {
+            obj.insert("port".to_string(), serde_json::Value::Number(port.into()));
+        }
+    }
+}
+
+/// Store a numeric `disk_log` retention count in its string form.
+/// The reference rotation schema reads a duration string (`"12m"`) or
+/// `"infinity"`. The driver also accepts a day count, so a numeric
+/// count is stored as its string form. The driver parses the same
+/// days back. A string value stays unchanged.
+fn normalize_disk_log_retention(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(rotation) = obj.get_mut("rotation").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    if let Some(days) = rotation.get("retention_period").and_then(|v| v.as_u64()) {
+        rotation.insert(
+            "retention_period".to_string(),
+            serde_json::Value::String(days.to_string()),
+        );
+    }
+}
+
 /// Write the canonical type and the reference MongoDB `parameters` object
 /// into a connector body. The API accepts top-level fields. A missing value
 /// is never invented.
@@ -2236,6 +2445,11 @@ fn normalize_connector_document(conn_type: &str, body: &mut serde_json::Value) {
         "type".to_string(),
         serde_json::Value::String(canonical.to_string()),
     );
+    match crate::v5::action_sinks::canonical_action_kind(conn_type) {
+        "s3" => normalize_s3_host_port(obj),
+        "disk_log" => normalize_disk_log_retention(obj),
+        _ => {}
+    }
     if canonical != "mongodb" {
         return;
     }
@@ -4489,16 +4703,36 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(feature = "s3")]
         "s3" | "minio" => {
-            let endpoint = body
+            let Some(endpoint) = body
                 .get("endpoint")
                 .or_else(|| body.get("url"))
                 .or_else(|| body.get("server"))
+                .or_else(|| body.get("host"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("http://127.0.0.1:9000");
-            let bucket = body
-                .get("bucket")
-                .and_then(|v| v.as_str())
-                .unwrap_or("telemetry");
+                .map(|value| {
+                    if value.starts_with("http://") || value.starts_with("https://") {
+                        value.to_string()
+                    } else if value.contains(':') {
+                        format!("http://{value}")
+                    } else {
+                        let port = body
+                            .get("port")
+                            .and_then(|port| port.as_u64())
+                            .unwrap_or(443);
+                        format!("https://{value}:{port}")
+                    }
+                })
+            else {
+                return Ok(());
+            };
+            // The bucket and key are action targets. Without them this
+            // connector has no legacy target, so it registers no sink.
+            let Some(bucket) = body.get("bucket").and_then(|v| v.as_str()) else {
+                return Ok(());
+            };
+            let Some(key_template) = body.get("key_template").and_then(|v| v.as_str()) else {
+                return Ok(());
+            };
             let region = body
                 .get("region")
                 .and_then(|v| v.as_str())
@@ -4511,10 +4745,6 @@ pub(crate) async fn register_live_sink(
                 .get("secret_access_key")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let key_template = body
-                .get("key_template")
-                .and_then(|v| v.as_str())
-                .unwrap_or("telemetry/${topic}_${seq}.ndjson");
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -4630,11 +4860,15 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(feature = "dynamodb")]
         "dynamodb" | "dynamo" | "ddb" => {
-            let table = body
+            // The table and keys are action targets. Without them this
+            // connector has no legacy target, so it registers no sink.
+            let Some(table) = body
                 .get("table_name")
                 .or_else(|| body.get("table"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("sensor_events");
+            else {
+                return Ok(());
+            };
             let region = body
                 .get("region")
                 .and_then(|v| v.as_str())
@@ -4644,14 +4878,20 @@ pub(crate) async fn register_live_sink(
                 .or_else(|| body.get("url"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let access_key = body
+            let Some(access_key) = body
                 .get("access_key_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("test");
-            let secret_key = body
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return Ok(());
+            };
+            let Some(secret_key) = body
                 .get("secret_access_key")
                 .and_then(|v| v.as_str())
-                .unwrap_or("test");
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return Ok(());
+            };
             let partition_key_name = body
                 .get("partition_key")
                 .and_then(|v| v.as_str())
@@ -4678,6 +4918,7 @@ pub(crate) async fn register_live_sink(
                 ttl_attribute: None,
                 ttl_secs: None,
                 attributes_mapping: std::collections::HashMap::new(),
+                undefined_vars_as_null: false,
                 batch_size: Some(1),
                 batch_bytes: Some(1_048_576),
                 linger_ms: Some(10),
@@ -5057,25 +5298,30 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(feature = "azure_blob")]
         "azure_blob" | "azure_blob_storage" | "azureblob" | "azblob" => {
-            let account_name = body
-                .get("account_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("devstoreaccount1");
-            let container_name = body
+            let Some(account_name) = body.get("account_name").and_then(|v| v.as_str()) else {
+                return Ok(());
+            };
+            // The container and blob are action targets. Without them
+            // this connector has no legacy target, so it registers no sink.
+            let Some(container_name) = body
                 .get("container_name")
                 .or_else(|| body.get("container"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("telemetry");
+            else {
+                return Ok(());
+            };
             let endpoint = body
                 .get("endpoint")
                 .or_else(|| body.get("url"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let blob_path = body
+            let Some(blob_path) = body
                 .get("blob_path_template")
                 .or_else(|| body.get("path_template"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("telemetry/${batch_id}.json");
+            else {
+                return Ok(());
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -5465,21 +5711,33 @@ pub(crate) async fn register_live_sink(
         }
         #[cfg(feature = "bigquery")]
         "bigquery" | "bq" | "gbq" => {
-            let project_id = body
+            let Some(project_id) = body
                 .get("project_id")
                 .or_else(|| body.get("project"))
+                .or_else(|| {
+                    body.get("authentication")
+                        .and_then(|auth| auth.get("gcp_project_id"))
+                })
                 .and_then(|v| v.as_str())
-                .unwrap_or("test-project");
-            let dataset_id = body
+            else {
+                return Ok(());
+            };
+            // Dataset and table are action targets. Without them this
+            // connector has no legacy target, so it registers no sink.
+            let Some(dataset_id) = body
                 .get("dataset_id")
                 .or_else(|| body.get("dataset"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("test-dataset");
-            let table = body
+            else {
+                return Ok(());
+            };
+            let Some(table) = body
                 .get("table")
                 .or_else(|| body.get("table_template"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("telemetry");
+            else {
+                return Ok(());
+            };
             let endpoint = body
                 .get("endpoint")
                 .or_else(|| body.get("url"))
@@ -5913,6 +6171,15 @@ pub(crate) async fn register_live_sink(
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
+            // The action owns the measurement. The legacy connector
+            // registers no live sink without one. Fail closed.
+            let Some(measurement) = body
+                .get("measurement")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                return Ok(());
+            };
 
             let config = broker_connectors_enterprise::tablestore::TablestoreSinkConfig {
                 endpoint: endpoint.to_string(),
@@ -5935,6 +6202,7 @@ pub(crate) async fn register_live_sink(
                             broker_connectors_enterprise::tablestore::AttributeColumnType::Double,
                     },
                 ],
+                measurement: measurement.to_string(),
                 batch_size: Some(1),
                 buffer_capacity: None,
                 linger_ms: Some(10),
@@ -5953,7 +6221,6 @@ pub(crate) async fn register_live_sink(
                     )
                 ) {
                     let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
                     engine
                         .connectors()
                         .register(format!("tablestore:{}", name), sink.clone());
@@ -6164,6 +6431,18 @@ pub async fn create_connector(
     if conn_type.is_empty() {
         return ApiError::BadRequest("missing required field: type".to_string()).into_response();
     }
+    // Fail closed (S1-01): a connector without its required credential
+    // or identity names that field first, even when the kind is not
+    // ready yet. A credential-complete body whose kind is not ready is
+    // refused with ALREADY_EXISTS after alias mapping, below.
+    let missing = missing_connector_field(conn_type.as_str(), &body, &state.connectors.data_dir());
+    if missing.is_none() {
+        // Refuse a pending kind before alias mapping: an alias of a
+        // ready kind must not hide a pending one.
+        if let Some(message) = kind_refusal(conn_type.as_str()) {
+            return ApiError::AlreadyExists(message).into_response();
+        }
+    }
     // The reference names its HTTP connector `http`. The tree runs
     // that connector in the `webhook` arm. Canonicalize before every
     // check so the readiness gate and the stored row see the runtime
@@ -6203,14 +6482,28 @@ pub async fn create_connector(
     // identity is rejected here with the missing field named. It is never
     // stored in a degraded state, and `register_live_sink` below also
     // refuses to invent values.
-    if let Some(missing) = missing_connector_field(&conn_type, &body) {
+    if let Some(missing) = missing {
+        let message = format!("missing required field: {missing} for connector type {conn_type}");
+        // `POST /connectors` documents one 400 code, `ALREADY_EXISTS`.
+        // The object, file and cloud kinds answer with that code so the
+        // refusal body validates. Older kinds keep `BAD_REQUEST`.
+        if matches!(
+            crate::v5::action_sinks::canonical_action_kind(&conn_type),
+            "s3" | "azure_blob"
+                | "dynamodb"
+                | "bigquery"
+                | "disk_log"
+                | "snowflake"
+                | "tablestore"
+                | "databricks"
+        ) {
+            return ApiError::AlreadyExists(message).into_response();
+        }
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "code": "BAD_REQUEST",
-                "message": format!(
-                    "missing required field: {missing} for connector type {conn_type}"
-                ),
+                "message": message,
             })),
         )
             .into_response();
@@ -6434,6 +6727,10 @@ pub async fn update_connector(
     if conn_type.is_empty() {
         return ApiError::BadRequest("missing required field: type".to_string()).into_response();
     }
+    // Refuse a pending kind before alias mapping.
+    if let Some(message) = kind_refusal(conn_type.as_str()) {
+        return ApiError::BadRequest(message).into_response();
+    }
     // The reference names its HTTP connector `http`. The tree runs
     // that connector in the `webhook` arm. Canonicalize before every
     // check so the readiness gate and the stored row see the runtime
@@ -6461,7 +6758,8 @@ pub async fn update_connector(
     }
     // Fail closed (S1-01): same required-field gate as create; an update
     // that drops a credential or identity is rejected with the field named.
-    if let Some(missing) = missing_connector_field(&conn_type, &body) {
+    if let Some(missing) = missing_connector_field(&conn_type, &body, &state.connectors.data_dir())
+    {
         return ApiError::BadRequest(format!(
             "missing required field: {missing} for connector type {conn_type}"
         ))
@@ -6525,7 +6823,12 @@ pub async fn update_connector(
                 .into_response();
             }
         };
-        match crate::v5::action_sinks::build_action_sink(&record, &body, &opts) {
+        match crate::v5::action_sinks::build_action_sink_with_dir(
+            &record,
+            &body,
+            &opts,
+            state.config.dir(),
+        ) {
             Ok(Some(sink)) => {
                 let key = broker_config::v5_action_sink_key(&record.id);
                 // R2-04: wrap the rebuilt sink in its resource-option
@@ -7743,7 +8046,10 @@ fn is_known_probe_action_type(kind: &str) -> bool {
 // The rulebook does not decide the exact per-kind schemas; the current
 // choice validates the kind against the W3-01 registry and dials the
 // exposed network target, storing nothing, until the checker pins it.
-pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
+pub async fn probe_action(
+    State(state): State<ApiState>,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
     let body = match body {
         Some(Json(b)) => b,
         None => return probe_failed("request body is required"),
@@ -7771,6 +8077,20 @@ pub async fn probe_action(body: Option<Json<serde_json::Value>>) -> Response {
     // `TEST_FAILED`.
     if let Some(message) = kind_refusal(&kind) {
         return probe_failed(message);
+    }
+    // Fail closed: the probe tests the action's delivery path. A named
+    // connector that resolves to nothing has no path to test.
+    if let Some(reference) = body
+        .get("connector")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+    {
+        if resolve_action_connector(&state.connectors, reference).is_none() {
+            return probe_failed(format!(
+                "connector {reference:?} of the action not found (field `connector`)"
+            ));
+        }
     }
     // Document kinds fail without their required fields, never read
     // connected on a bare port.
@@ -8166,6 +8486,7 @@ mod connector_feature_tests {
             ttl_attribute: None,
             ttl_secs: None,
             attributes_mapping: std::collections::HashMap::new(),
+            undefined_vars_as_null: false,
             batch_size: Some(1),
             batch_bytes: Some(1_048_576),
             linger_ms: Some(10),

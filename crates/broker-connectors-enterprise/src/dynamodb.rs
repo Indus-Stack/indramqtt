@@ -137,6 +137,36 @@ fn render_key_template(template: &str, vars: &[(String, String)]) -> Result<Stri
     render_template(template, &borrowed)
 }
 
+/// Dummy payload for build-time template checks. It carries every
+/// referenced `${payload.<field>}` as a number, so a template over a
+/// payload field renders non-empty here for both `S` and `N` key
+/// types. A missing field at runtime still renders empty and fails
+/// the write; unknown or unclosed variables still fail this check.
+fn validation_dummy_payload(templates: &[&str]) -> Vec<u8> {
+    let mut fields = std::collections::BTreeSet::new();
+    for template in templates {
+        let mut rest = *template;
+        while let Some(start) = rest.find("${payload.") {
+            let after = &rest[start + "${payload.".len()..];
+            if let Some(close) = after.find('}') {
+                fields.insert(after[..close].to_string());
+                rest = &after[close + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "client_id".to_string(),
+        serde_json::Value::String("dummy".to_string()),
+    );
+    for field in fields {
+        map.insert(field, serde_json::Value::Number(1.into()));
+    }
+    serde_json::Value::Object(map).to_string().into_bytes()
+}
+
 fn default_batch_size() -> Option<usize> {
     Some(25)
 }
@@ -192,6 +222,10 @@ pub struct DynamoDbSinkConfig {
     /// the whole JSON document into attributes.
     #[serde(default)]
     pub attributes_mapping: HashMap<String, String>,
+    /// Treat undefined variables as null instead of empty strings.
+    /// When true, a template that renders empty writes `{"NULL":true}`.
+    #[serde(default)]
+    pub undefined_vars_as_null: bool,
     /// Items per `BatchWriteItem` (default 25, API cap).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
@@ -253,21 +287,24 @@ impl DynamoDbSinkConfig {
             sort_key.validate("sort")?;
         }
         // Strict template checks with dummy values (syntax + key types).
-        self.partition_key.render(
-            "partition",
-            "dummy",
-            br#"{"client_id":"dummy"}"#,
-            QoS::AtMostOnce,
-            0,
-        )?;
+        // The dummy payload carries every referenced payload field, so a
+        // template over `${payload.<field>}` renders non-empty here and
+        // still fails at runtime when the field is absent. Unknown or
+        // unclosed variables still fail here.
+        let mut templates: Vec<&str> = vec![self.partition_key.template.as_str()];
         if let Some(sort_key) = &self.sort_key {
-            sort_key.render(
-                "sort",
-                "dummy",
-                br#"{"client_id":"dummy"}"#,
-                QoS::AtMostOnce,
-                0,
-            )?;
+            templates.push(sort_key.template.as_str());
+        }
+        for template in self.attributes_mapping.values() {
+            if template != "${payload}" {
+                templates.push(template.as_str());
+            }
+        }
+        let dummy_payload = validation_dummy_payload(&templates);
+        self.partition_key
+            .render("partition", "dummy", &dummy_payload, QoS::AtMostOnce, 0)?;
+        if let Some(sort_key) = &self.sort_key {
+            sort_key.render("sort", "dummy", &dummy_payload, QoS::AtMostOnce, 0)?;
         }
         for (name, template) in &self.attributes_mapping {
             if name.trim().is_empty() {
@@ -276,13 +313,7 @@ impl DynamoDbSinkConfig {
                 ));
             }
             if template != "${payload}" {
-                self.render_text(
-                    template,
-                    "dummy",
-                    br#"{"client_id":"dummy"}"#,
-                    QoS::AtMostOnce,
-                    0,
-                )?;
+                self.render_text(template, "dummy", &dummy_payload, QoS::AtMostOnce, 0)?;
             }
         }
         if self.batch_size == Some(0) {
@@ -451,6 +482,12 @@ pub fn build_item_body(
             continue;
         }
         let rendered = config.render_text(template, topic, payload, qos, millis)?;
+        // An undefined variable renders empty; with the flag it is a
+        // null, otherwise it stays an empty string.
+        if rendered.is_empty() && config.undefined_vars_as_null {
+            unpacked.push((name.clone(), serde_json::Value::Null));
+            continue;
+        }
         // Rendered numbers/bools keep their DynamoDB types so payload
         // passthrough preserves N/BOOL (raw text stays S).
         let value = serde_json::from_str::<serde_json::Value>(&rendered)
@@ -1230,6 +1267,7 @@ mod tests {
                 "temperature".to_string(),
                 "${payload.temperature}".to_string(),
             )]),
+            undefined_vars_as_null: false,
             batch_size: Some(25),
             batch_bytes: Some(1_048_576),
             linger_ms: Some(10),

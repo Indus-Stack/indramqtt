@@ -17737,13 +17737,13 @@ mod tests {
         let pending = r#"
 [[connectors.connectors]]
 id = "pending-snowflake"
-connector_type = "snowflake"
+connector_type = "kafka"
 enable = true
 config = '{}'
 
 [[actions.actions]]
 id = "pending-snowflake"
-action_type = "snowflake"
+action_type = "kafka"
 enable = true
 config = '{"connector":"pending-snowflake"}'
 "#;

@@ -9,10 +9,11 @@
 //! independently and stop sharing one sink.
 //!
 //! Bound (stated here and by construction): `pgsql`, the
-//! `webhook`/`http` pair and the ten MV-02b time-series kinds build
-//! their sinks here. The ten kinds are `clickhouse`, `tdengine`,
-//! `greptimedb`, `iotdb`, `opentsdb`, `doris`, `datalayers`,
-//! `influxdb`, `timestream` and `cassandra`. Every other action kind
+//! `webhook`/`http` pair, the ten MV-02b time-series kinds and the
+//! MV-02d object, file and cloud kinds build their sinks here. The
+//! MV-02d kinds are `s3`, `azure_blob`, `dynamodb`, `bigquery`,
+//! `disk_log`, `snowflake` and `tablestore`. `databricks`/`delta_lake`
+//! has no reference schema and stays refused. Every other action kind
 //! owns no runtime yet. It stores opaquely and registers nothing. It
 //! reads `disconnected` with a reason. A fire counts one `failed`
 //! delivery against its per-action metrics. The kind families accept
@@ -415,6 +416,13 @@ pub(crate) fn canonical_action_kind(kind: &str) -> &str {
         "cockroach" => "cockroachdb",
         "postgres" | "postgresql" => "pgsql",
         "google_alloydb" | "alloy_db" => "alloydb",
+        "minio" => "s3",
+        "azure_blob_storage" => "azure_blob",
+        "dynamo" | "ddb" => "dynamodb",
+        "bq" | "gbq" => "bigquery",
+        "snowflake_streaming" | "snowflake_aggregated" => "snowflake",
+        "ots" => "tablestore",
+        "delta_lake" => "databricks",
         _ => kind,
     }
 }
@@ -451,6 +459,13 @@ pub(crate) fn action_owned_kind(kind: &str) -> bool {
             | "mongodb"
             | "couchbase"
             | "elasticsearch"
+            | "s3"
+            | "azure_blob"
+            | "dynamodb"
+            | "bigquery"
+            | "disk_log"
+            | "snowflake"
+            | "tablestore"
     )
 }
 
@@ -1176,9 +1191,8 @@ pub(crate) struct ActionSinkStage {
 ///   (KC-00, `POST /actions` case with an unknown connector), so it
 ///   stages nothing and reports [`ActionWiring::Failed`] with the
 ///   reason. Nothing is dialled, no value invented.
-/// - Everything else (missing action field, missing connector field,
-///   invalid parameter) is a build failure: the caller REFUSES with
-///   the returned message, which names the action and the field.
+/// - Everything else (missing field, bad parameter) is a build failure:
+///   the caller refuses with a message that names the action and field.
 pub(crate) fn stage_action_sink(
     connectors: &ConnectorStore,
     record: &ActionRecord,
@@ -1226,7 +1240,7 @@ pub(crate) fn stage_action_sink(
             probe_on_create: false,
         });
     };
-    let sink = build_action_sink(record, &doc, &resource_opts)?;
+    let sink = build_action_sink_with_dir(record, &doc, &resource_opts, &connectors.data_dir())?;
     let has_sink = sink.is_some();
     let health_target = if has_sink {
         super::rules::extract_target_host_port(&doc)
@@ -1254,10 +1268,22 @@ pub(crate) fn stage_action_sink(
 /// marks a kind with no action-owned runtime. Every refusal names the
 /// action and the offending field, so a refused create or update can
 /// carry the reason straight to the operator.
+#[cfg(test)]
 pub(crate) fn build_action_sink(
     record: &ActionRecord,
     connector_doc: &serde_json::Value,
     opts: &ActionResourceOpts,
+) -> Result<Option<Arc<dyn broker_connectors::Sink>>, String> {
+    build_action_sink_with_dir(record, connector_doc, opts, std::path::Path::new("./data"))
+}
+
+/// Build one action sink inside `data_dir`. Only `disk_log` uses the
+/// directory. Other kinds ignore it.
+pub(crate) fn build_action_sink_with_dir(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    opts: &ActionResourceOpts,
+    data_dir: &std::path::Path,
 ) -> Result<Option<Arc<dyn broker_connectors::Sink>>, String> {
     match canonical_action_kind(record.action_type.as_str()) {
         "pgsql" => build_pgsql_sink(record, connector_doc, opts).map(Some),
@@ -1281,6 +1307,14 @@ pub(crate) fn build_action_sink(
         "mongodb" => build_mongodb_sink(record, connector_doc).map(Some),
         "couchbase" => build_couchbase_sink(record, connector_doc).map(Some),
         "elasticsearch" => build_elasticsearch_sink(record, connector_doc).map(Some),
+        "s3" => build_s3_object_sink(record, connector_doc, opts).map(Some),
+        "azure_blob" => build_azure_blob_sink(record, connector_doc, opts).map(Some),
+        "dynamodb" => build_dynamodb_action_sink(record, connector_doc, opts).map(Some),
+        "bigquery" => build_bigquery_sink(record, connector_doc, opts).map(Some),
+        "disk_log" => build_disk_log_action_sink_with_dir(record, connector_doc, data_dir, opts)
+            .map(|sink| Some(sink as Arc<dyn broker_connectors::Sink>)),
+        "snowflake" => build_snowflake_sink(record, connector_doc, opts).map(Some),
+        "tablestore" => build_tablestore_sink(record, connector_doc, opts).map(Some),
         // Other kinds own no runtime yet: no sink, no registration.
         // Delivery stays refused-by-default (the fire counts one
         // failure) until the kind plots its own data path (KC-00).
@@ -1527,6 +1561,91 @@ fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
                 ));
             }
         }
+        "s3" => {
+            for field in ["bucket", "key"] {
+                if param_string(record, field).is_none() {
+                    return Err(format!(
+                        "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                        record.id
+                    ));
+                }
+            }
+            refuse_object_upload_overrides(record)?;
+        }
+        "azure_blob" => {
+            for field in ["container", "blob"] {
+                if param_string(record, field).is_none() {
+                    return Err(format!(
+                        "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                        record.id
+                    ));
+                }
+            }
+            refuse_object_upload_overrides(record)?;
+        }
+        "dynamodb" => {
+            for field in ["table", "hash_key"] {
+                if param_string(record, field).is_none() {
+                    return Err(format!(
+                        "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                        record.id
+                    ));
+                }
+            }
+            if let Some(template) = param_string(record, "template") {
+                if !template.trim().is_empty() {
+                    serde_json::from_str::<serde_json::Value>(&template).map_err(|error| {
+                        bad(
+                            "template",
+                            format!("must be valid JSON with placeholders: {error}"),
+                        )
+                    })?;
+                }
+            }
+        }
+        "bigquery" => {
+            for field in ["dataset", "table"] {
+                if param_string(record, field).is_none() {
+                    return Err(format!(
+                        "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                        record.id
+                    ));
+                }
+            }
+        }
+        "snowflake" => {
+            for field in ["database", "schema", "pipe"] {
+                if param_string(record, field).is_none() {
+                    return Err(format!(
+                        "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                        record.id
+                    ));
+                }
+            }
+        }
+        "tablestore" => {
+            for field in ["table_name", "measurement"] {
+                if param_string(record, field).is_none() {
+                    return Err(format!(
+                        "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                        record.id
+                    ));
+                }
+            }
+            if let Some(fields) = param_value(record, "fields") {
+                if !fields.as_array().is_some_and(|items| !items.is_empty()) {
+                    return Err(bad(
+                        "fields",
+                        "must be a non-empty list of {column, value} objects".to_string(),
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "action {:?} is missing required field: fields (field `parameters.fields`)",
+                    record.id
+                ));
+            }
+        }
         "elasticsearch" => {
             let action = param_string(record, "action").ok_or_else(|| {
                 format!(
@@ -1553,7 +1672,57 @@ fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
                 ));
             }
         }
+        "disk_log" => {
+            if let Some(template) = param_string(record, "template") {
+                if template != "${.}" {
+                    return Err(bad(
+                    "template",
+                    "only the documented default `${.}` is supported: this driver writes the projected event as one record"
+                        .to_string(),
+                ));
+                }
+            }
+            if let Some(mode) = param_string(record, "write_mode") {
+                if !["sync", "async"].contains(&mode.as_str()) {
+                    return Err(bad(
+                        "write_mode",
+                        format!("must be `sync` or `async`: {mode:?}"),
+                    ));
+                }
+            }
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// The object-store driver joins the action `key` into the connector
+/// endpoint URL. The reference also allows custom content, headers and
+/// an ACL. The current driver writes the projected JSON body with the
+/// driver content type, so a non-default value is refused instead of
+/// accepted and ignored.
+fn refuse_object_upload_overrides(record: &ActionRecord) -> Result<(), String> {
+    if let Some(content) = param_string(record, "content") {
+        if content != "${.}" {
+            return Err(format!(
+                "action {:?} field `parameters.content` value {content:?} is not supported: the driver writes the projected event body",
+                record.id
+            ));
+        }
+    }
+    if let Some(headers) = param_value(record, "headers") {
+        if !headers.as_object().is_some_and(|map| map.is_empty()) {
+            return Err(format!(
+                "action {:?} field `parameters.headers` is not supported: the driver writes the projected event body with the driver content type",
+                record.id
+            ));
+        }
+    }
+    if let Some(acl) = param_string(record, "acl") {
+        return Err(format!(
+            "action {:?} field `parameters.acl` value {acl:?} is not supported: the driver writes a private object",
+            record.id
+        ));
     }
     Ok(())
 }
@@ -4029,6 +4198,164 @@ pub(crate) fn build_mongodb_sink(
     })?;
     Ok(Arc::new(sink))
 }
+/// Build the action's `s3` object sink. The endpoint, region and
+/// credentials come from the connector; the bucket, key and content
+/// come from the action. A key is required: the driver never invents a
+/// bucket or object name.
+///
+/// Values and defaults:
+/// - `endpoint`: connector `endpoint`/`url`/`server`, or `https://host:port`.
+/// - `region`: connector `region`; default `us-east-1`, the AWS default.
+/// - `bucket`, `key`: action `parameters.bucket` and `parameters.key`,
+///   both required. The key is the documented template.
+/// - `content`: only the documented default `${.}` is supported. The
+///   driver writes the projected event body (see `refuse_object_upload_overrides`).
+/// - Batching belongs to the action runtime (RO-01). The driver keeps
+///   one row per send with no linger.
+#[cfg(feature = "s3")]
+pub(crate) fn build_s3_object_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors::s3::{S3Compression, S3Sink, S3SinkConfig, SdkS3Transport};
+    let connector = record.connector.trim().to_string();
+    let endpoint = object_endpoint(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["endpoint", "url", "server", "host"],
+    )?;
+    let bucket = param_string(record, "bucket")
+        .ok_or_else(|| format!("action {:?} is missing required field: bucket", record.id))?;
+    let key = param_string(record, "key")
+        .ok_or_else(|| format!("action {:?} is missing required field: key", record.id))?;
+    let config = S3SinkConfig {
+        endpoint,
+        bucket,
+        region: first_string(connector_doc, &["region"])
+            .map(|value| value.into_owned())
+            .unwrap_or_else(|| "us-east-1".to_string()),
+        access_key_id: first_string(connector_doc, &["access_key_id", "access_key"])
+            .map(|value| value.into_owned())
+            .unwrap_or_default(),
+        secret_access_key: first_string(connector_doc, &["secret_access_key", "secret_key"])
+            .map(|value| value.into_owned())
+            .unwrap_or_default(),
+        key_template: key,
+        compression: S3Compression::None,
+        // One row per send with no linger: the action runtime owns
+        // batching (RO-01). Cap the buffer at 5 MiB (under the 5 GiB
+        // single-PUT limit).
+        batch_size: 1,
+        batch_bytes: 5 * 1024 * 1024,
+        batch_timeout_ms: 0,
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport = SdkS3Transport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its s3 transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = S3Sink::new(config, Arc::new(transport))
+        .map_err(|error| format!("action {:?} cannot build its s3 sink: {error}", record.id))?;
+    Ok(Arc::new(sink))
+}
+
+#[cfg(not(feature = "s3"))]
+pub(crate) fn build_s3_object_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `s3` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Build the action's `azure_blob` sink. The account, key and optional
+/// endpoint come from the connector; the container and blob come from
+/// the action. The driver never invents a container or blob name.
+///
+/// Batching belongs to the action runtime (RO-01). The driver keeps
+/// one blob per send.
+#[cfg(feature = "azure_blob")]
+pub(crate) fn build_azure_blob_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::azure_blob::{
+        AzureBlobAuth, AzureBlobCompression, AzureBlobSink, AzureBlobSinkConfig,
+        HttpAzureBlobTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let account_name = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["account_name", "account"],
+        "account_name",
+    )?;
+    let account_key = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["account_key", "accountKey"],
+        "account_key",
+    )?;
+    let container = param_string(record, "container").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: container",
+            record.id
+        )
+    })?;
+    let blob = param_string(record, "blob")
+        .ok_or_else(|| format!("action {:?} is missing required field: blob", record.id))?;
+    let endpoint = first_string(connector_doc, &["endpoint", "url"]).map(|value| {
+        let raw = value.into_owned();
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            raw
+        } else {
+            format!("http://{raw}")
+        }
+    });
+    let config = AzureBlobSinkConfig {
+        account_name,
+        container_name: container,
+        endpoint,
+        auth: AzureBlobAuth::SharedKey { account_key },
+        blob_path_template: blob,
+        compression: AzureBlobCompression::None,
+        // One blob per send: the action runtime owns batching (RO-01).
+        // Cap the blob at 10 MiB (under the block-blob staging limit
+        // for small rows). Keep one batch buffered to bound memory.
+        max_records_per_blob: Some(1),
+        max_bytes_per_blob: Some(10_485_760),
+        flush_interval_secs: 0,
+        buffer_capacity: Some(1),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout())
+        .build()
+        .unwrap_or_default();
+    let transport = HttpAzureBlobTransport::new(&config, client).map_err(|error| {
+        format!(
+            "action {:?} cannot build its azure_blob transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = AzureBlobSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its azure_blob sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
 
 #[cfg(not(feature = "mongodb"))]
 pub(crate) fn build_mongodb_sink(
@@ -4037,6 +4364,18 @@ pub(crate) fn build_mongodb_sink(
 ) -> Result<Arc<dyn broker_connectors::Sink>, String> {
     Err(format!(
         "action {:?} needs cargo feature `mongodb` (disabled in this build)",
+        record.id
+    ))
+}
+
+#[cfg(not(feature = "azure_blob"))]
+pub(crate) fn build_azure_blob_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `azure_blob` (disabled in this build)",
         record.id
     ))
 }
@@ -4171,6 +4510,148 @@ pub(crate) fn build_couchbase_sink(
     })?;
     Ok(Arc::new(sink))
 }
+/// Build the action's `dynamodb` sink. The endpoint, region and
+/// credentials come from the connector; the table and keys come from
+/// the action. The `template` object becomes the attribute mapping.
+///
+/// Batching belongs to the action runtime (RO-01). The driver keeps
+/// one item per send with no linger.
+#[cfg(feature = "dynamodb")]
+pub(crate) fn build_dynamodb_action_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::dynamodb::{
+        DynamoDbSink, DynamoDbSinkConfig, DynamoKeyConfig, SdkDynamoDbTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let endpoint = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["url", "endpoint", "server"],
+        "url",
+    )?;
+    let region = connector_field(connector_doc, &connector, &record.id, &["region"], "region")?;
+    let table = param_string(record, "table")
+        .ok_or_else(|| format!("action {:?} is missing required field: table", record.id))?;
+    let hash_key = param_string(record, "hash_key")
+        .ok_or_else(|| format!("action {:?} is missing required field: hash_key", record.id))?;
+    let range_key = param_string(record, "range_key");
+    let mut attributes = std::collections::HashMap::new();
+    let mut hash_template = format!("${{payload.{hash_key}}}");
+    let mut range_template = None;
+    if let Some(template) = param_string(record, "template") {
+        if !template.trim().is_empty() {
+            let value: serde_json::Value = serde_json::from_str(&template).map_err(|error| {
+                format!(
+                    "action {:?} field `parameters.template` must be valid JSON: {error}",
+                    record.id
+                )
+            })?;
+            let object = value.as_object().ok_or_else(|| {
+                format!(
+                    "action {:?} field `parameters.template` must be a JSON object",
+                    record.id
+                )
+            })?;
+            for (name, entry) in object {
+                let text = entry
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| entry.to_string());
+                if name == &hash_key {
+                    hash_template = text.clone();
+                }
+                if range_key.as_deref() == Some(name.as_str()) {
+                    range_template = Some(text.clone());
+                }
+                attributes.insert(name.clone(), text);
+            }
+        }
+    }
+    // The documented `undefined_vars_as_null` flag is applied: an
+    // empty render becomes a null attribute when true.
+    let undefined_vars_as_null = match param_value(record, "undefined_vars_as_null") {
+        None => false,
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(format!(
+                "action {:?} field `parameters.undefined_vars_as_null` must be a boolean: {text:?}",
+                record.id
+            ))
+            }
+        },
+        Some(other) => {
+            return Err(format!(
+                "action {:?} field `parameters.undefined_vars_as_null` must be a boolean: {other}",
+                record.id
+            ))
+        }
+    };
+    let config = DynamoDbSinkConfig {
+        table_name: table,
+        region,
+        endpoint: Some(http_endpoint(&endpoint)),
+        access_key_id: connector_field(
+            connector_doc,
+            &connector,
+            &record.id,
+            &["aws_access_key_id", "access_key_id", "access_key"],
+            "aws_access_key_id",
+        )?,
+        secret_access_key: connector_field(
+            connector_doc,
+            &connector,
+            &record.id,
+            &["aws_secret_access_key", "secret_access_key", "secret_key"],
+            "aws_secret_access_key",
+        )?,
+        session_token: first_string(connector_doc, &["session_token"])
+            .map(|value| value.into_owned()),
+        partition_key: DynamoKeyConfig {
+            name: hash_key,
+            template: hash_template,
+            key_type: "S".to_string(),
+        },
+        sort_key: range_key.map(|name| DynamoKeyConfig {
+            name,
+            template: range_template.unwrap_or_else(|| "${timestamp}".to_string()),
+            key_type: "S".to_string(),
+        }),
+        ttl_attribute: None,
+        ttl_secs: None,
+        attributes_mapping: attributes,
+        undefined_vars_as_null,
+        // One item per send with no linger: the action runtime owns
+        // batching (RO-01). Cap the batch at 1 MiB (under the 16 MiB
+        // API limit). Retry 3 times with backoff.
+        batch_size: Some(1),
+        batch_bytes: Some(1_048_576),
+        linger_ms: Some(0),
+        max_retries: Some(3),
+        initial_backoff_ms: Some(100),
+        max_backoff_ms: Some(2_000),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport = SdkDynamoDbTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its dynamodb transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = DynamoDbSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its dynamodb sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
 
 #[cfg(not(feature = "couchbase"))]
 pub(crate) fn build_couchbase_sink(
@@ -4179,6 +4660,18 @@ pub(crate) fn build_couchbase_sink(
 ) -> Result<Arc<dyn broker_connectors::Sink>, String> {
     Err(format!(
         "action {:?} needs cargo feature `couchbase` (disabled in this build)",
+        record.id
+    ))
+}
+
+#[cfg(not(feature = "dynamodb"))]
+pub(crate) fn build_dynamodb_action_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `dynamodb` (disabled in this build)",
         record.id
     ))
 }
@@ -4351,6 +4844,297 @@ pub(crate) fn build_elasticsearch_sink(
     })?;
     Ok(Arc::new(sink))
 }
+/// Build the action's `bigquery` sink. Authentication comes from the
+/// connector; the dataset, table and optional project override come
+/// from the action.
+///
+/// Batching belongs to the action runtime (RO-01). The driver keeps
+/// one row per send with no linger.
+#[cfg(feature = "bigquery")]
+pub(crate) fn build_bigquery_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::bigquery::{
+        BigQuerySink, BigQuerySinkConfig, SdkBigQueryTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let dataset = param_string(record, "dataset")
+        .ok_or_else(|| format!("action {:?} is missing required field: dataset", record.id))?;
+    let table = param_string(record, "table")
+        .ok_or_else(|| format!("action {:?} is missing required field: table", record.id))?;
+    let (project_id, auth) = bigquery_auth(connector_doc, &connector, &record.id)?;
+    let project_id = param_string(record, "project_id").unwrap_or(project_id);
+    let config = BigQuerySinkConfig {
+        project_id,
+        dataset_id: dataset,
+        table_template: table,
+        endpoint: first_string(connector_doc, &["endpoint", "url"])
+            .map(|value| value.into_owned())
+            .map(|value| http_endpoint(&value)),
+        auth,
+        ignore_unknown_values: true,
+        skip_invalid_rows: false,
+        template_suffix: None,
+        // One row per send with no linger: the action runtime owns
+        // batching (RO-01). Cap the batch at 1 MiB (under the 10 MiB
+        // API limit). Retry 3 times with backoff.
+        batch_size: Some(1),
+        batch_bytes: Some(1_048_576),
+        linger_ms: Some(0),
+        max_retries: Some(3),
+        initial_backoff_ms: Some(100),
+        max_backoff_ms: Some(2_000),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout())
+        .build()
+        .unwrap_or_default();
+    let transport = SdkBigQueryTransport::new(&config, client).map_err(|error| {
+        format!(
+            "action {:?} cannot build its bigquery transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = BigQuerySink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its bigquery sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+#[cfg(feature = "bigquery")]
+fn bigquery_auth(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    action_id: &str,
+) -> Result<(String, broker_connectors_enterprise::gcp_pubsub::GcpAuth), String> {
+    use broker_connectors_enterprise::gcp_pubsub::GcpAuth;
+    let authentication = connector_doc.get("authentication").ok_or_else(|| {
+        format!(
+            "connector {connector:?} is missing required field: authentication (action {action_id:?})"
+        )
+    })?;
+    let kind = authentication
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    match kind {
+        "service_account_json" => {
+            let raw = authentication
+                .get("service_account_json")
+                .or_else(|| connector_doc.get("service_account_json"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "connector {connector:?} is missing required field: authentication.service_account_json (action {action_id:?})"
+                    )
+                })?;
+            let key: serde_json::Value = serde_json::from_str(raw).map_err(|error| {
+                format!(
+                    "connector {connector:?} field `authentication.service_account_json` is not JSON: {error}"
+                )
+            })?;
+            let project_id = key
+                .get("project_id")
+                .or_else(|| authentication.get("gcp_project_id"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "connector {connector:?} field `authentication` is missing project_id (action {action_id:?})"
+                    )
+                })?
+                .to_string();
+            let client_email = key
+                .get("client_email")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "connector {connector:?} field `authentication.service_account_json` is missing client_email"
+                    )
+                })?
+                .to_string();
+            let private_key_pem = key
+                .get("private_key")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "connector {connector:?} field `authentication.service_account_json` is missing private_key"
+                    )
+                })?
+                .to_string();
+            Ok((
+                project_id,
+                GcpAuth::ServiceAccountKey {
+                    client_email,
+                    private_key_pem,
+                },
+            ))
+        }
+        "attached_service_account" => {
+            // The reference needs only `type` for this form.
+            // Use the project when the operator gives it.
+            let project_id = authentication
+                .get("gcp_project_id")
+                .or_else(|| connector_doc.get("gcp_project_id"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            // The attached identity uses the runtime environment.
+            // Use the token when the operator gives it.
+            // Use no static header when the token is absent.
+            let auth = authentication
+                .get("access_token")
+                .or_else(|| connector_doc.get("access_token"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.to_string())
+                .map(|token| GcpAuth::AccessToken { token })
+                .unwrap_or(GcpAuth::None);
+            Ok((project_id, auth))
+        }
+        other => Err(format!(
+            "connector {connector:?} field `authentication.type` value {other:?} is not supported: use a service account key or the attached account"
+        )),
+    }
+}
+
+#[cfg(not(feature = "bigquery"))]
+pub(crate) fn build_bigquery_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `bigquery` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Build the action's `disk_log` sink. The connector owns the file
+/// path, size and count limits, and rotation; the action owns the
+/// record template and write mode.
+///
+/// The path is relative to the kernel data directory. An absolute path
+/// or a `..` component is refused, so a connector cannot write outside
+/// the data directory.
+#[cfg(test)]
+pub(crate) fn build_disk_log_action_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    build_disk_log_action_sink_with_dir(record, connector_doc, std::path::Path::new("./data"), opts)
+        .map(|sink| sink as Arc<dyn broker_connectors::Sink>)
+}
+
+/// Build the `disk_log` sink inside `data_dir`. The file stays in the
+/// data directory. The textual checks still run first.
+///
+/// Batching belongs to the action runtime (RO-01). The file writer
+/// appends one record per send.
+///
+/// It returns the concrete sink. Tests read its config and drive
+/// exact timestamps through it.
+pub(crate) fn build_disk_log_action_sink_with_dir(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    data_dir: &std::path::Path,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<broker_connectors::disk_log::DiskLogSink>, String> {
+    use broker_connectors::disk_log::{
+        DiskLogCompression, DiskLogFormat, DiskLogSink, DiskLogSinkConfig, DiskSyncMode,
+    };
+    let connector = record.connector.trim().to_string();
+    let filepath = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["filepath", "file", "path"],
+        "filepath",
+    )?;
+    let (directory, filename_prefix, filename_extension) =
+        disk_log_parts_in_dir(&filepath, &record.id, data_dir)?;
+    let max_file_size = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["max_file_size"],
+        "max_file_size",
+    )?;
+    let max_file_size_bytes = parse_size(&max_file_size).ok_or_else(|| {
+        format!(
+            "connector {connector:?} field `max_file_size` value {max_file_size:?} is not a byte size (action {:?})",
+            record.id
+        )
+    })?;
+    let max_file_number = connector_doc
+        .get("max_file_number")
+        .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: max_file_number (action {:?})",
+                record.id
+            )
+        })? as usize;
+    let rotation = connector_doc.get("rotation");
+    let max_file_age_secs = rotation
+        .and_then(|value| value.get("period"))
+        .and_then(|value| value.as_str())
+        .and_then(|period| match period {
+            "hour" => Some(3_600),
+            "day" => Some(86_400),
+            _ => None,
+        });
+    let max_retention_days = rotation
+        .and_then(|value| value.get("retention_period"))
+        .and_then(|value| match value {
+            serde_json::Value::Number(number) => {
+                number.as_u64().and_then(|days| u32::try_from(days).ok())
+            }
+            serde_json::Value::String(text) if text != "infinity" => text.parse().ok(),
+            _ => None,
+        });
+    let sync_mode = match param_string(record, "write_mode").as_deref() {
+        Some("async") => DiskSyncMode::OsDefault,
+        _ => DiskSyncMode::EveryBatch,
+    };
+    let config = DiskLogSinkConfig {
+        directory,
+        filename_prefix,
+        filename_extension,
+        format: DiskLogFormat::Raw,
+        max_file_size_bytes: Some(max_file_size_bytes),
+        max_file_age_secs,
+        compression: DiskLogCompression::None,
+        max_backup_files: Some(max_file_number),
+        max_retention_days,
+        sync_mode,
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let writer = open_disk_log_writer(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot open its disk_log writer: {error}",
+            record.id
+        )
+    })?;
+    let sink = DiskLogSink::new(config, Arc::new(writer)).map_err(|error| {
+        format!(
+            "action {:?} cannot open its disk_log sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
 
 #[cfg(not(feature = "elasticsearch"))]
 pub(crate) fn build_elasticsearch_sink(
@@ -4361,6 +5145,424 @@ pub(crate) fn build_elasticsearch_sink(
         "action {:?} needs cargo feature `elasticsearch` (disabled in this build)",
         record.id
     ))
+}
+
+/// Open the file writer on a short current-thread runtime. The action
+/// builder runs on both async request paths and the synchronous boot
+/// replay, so it cannot await the async writer constructor.
+fn open_disk_log_writer(
+    config: &broker_connectors::disk_log::DiskLogSinkConfig,
+) -> Result<broker_connectors::disk_log::FileDiskLogWriter, String> {
+    let config = config.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("disk_log runtime: {error}"))?;
+        runtime
+            .block_on(broker_connectors::disk_log::FileDiskLogWriter::open(
+                &config,
+            ))
+            .map_err(|error| error.to_string())
+    })
+    .join()
+    .map_err(|_| "disk_log writer thread panicked".to_string())?
+}
+
+/// Split the connector `filepath` into data-directory-relative parts.
+/// An absolute path or a `..` component is refused: the file must stay
+/// inside the kernel data directory. A symlink is refused: it can
+/// point outside the data directory.
+fn disk_log_parts(filepath: &str, action_id: &str) -> Result<(String, String, String), String> {
+    use std::path::{Component, Path};
+    let path = Path::new(filepath);
+    // Check the symlink first. An absolute symlink must report the symlink.
+    if disk_log_has_symlink(path) {
+        return Err(format!(
+            "action {action_id:?} field `connector.filepath` must not be a symlink that leaves the data directory: {filepath:?}"
+        ));
+    }
+    if path.is_absolute() {
+        return Err(format!(
+            "action {action_id:?} field `connector.filepath` must be relative to the data directory: {filepath:?}"
+        ));
+    }
+    if path.components().any(|part| {
+        matches!(
+            part,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(format!(
+            "action {action_id:?} field `connector.filepath` must not leave the data directory: {filepath:?}"
+        ));
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "action {action_id:?} field `connector.filepath` must name one file: {filepath:?}"
+            )
+        })?;
+    let (prefix, extension) = match file_name.rsplit_once('.') {
+        Some((prefix, extension)) if !prefix.is_empty() && !extension.is_empty() => {
+            (prefix.to_string(), extension.to_string())
+        }
+        _ => (file_name.to_string(), "log".to_string()),
+    };
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    Ok((directory, prefix, extension))
+}
+
+/// True when the path or any existing parent is a symlink.
+fn disk_log_has_symlink(path: &std::path::Path) -> bool {
+    let mut current = path;
+    loop {
+        if std::fs::symlink_metadata(current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent,
+            _ => break,
+        }
+        if current.as_os_str().is_empty() {
+            break;
+        }
+    }
+    false
+}
+
+/// Split `filepath` and join the directory with `data_dir`.
+/// The file stays inside the data directory.
+/// The textual checks run on the relative path first.
+fn disk_log_parts_in_dir(
+    filepath: &str,
+    action_id: &str,
+    data_dir: &std::path::Path,
+) -> Result<(String, String, String), String> {
+    let (relative_dir, prefix, extension) = disk_log_parts(filepath, action_id)?;
+    let joined_file = data_dir.join(filepath);
+    if disk_log_has_symlink(&joined_file) {
+        return Err(format!(
+            "action {action_id:?} field `connector.filepath` must not be a symlink that leaves the data directory: {filepath:?}"
+        ));
+    }
+    let joined_dir = if relative_dir == "." {
+        data_dir.to_string_lossy().into_owned()
+    } else {
+        data_dir.join(&relative_dir).to_string_lossy().into_owned()
+    };
+    Ok((joined_dir, prefix, extension))
+}
+
+/// Parse `5mb`, `1gb`, `1024` and `64MiB` style sizes into bytes.
+fn parse_size(text: &str) -> Option<u64> {
+    let trimmed = text.trim();
+    let split = trimmed
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split);
+    let value: f64 = number.parse().ok()?;
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    let bytes = value * multiplier;
+    if bytes <= 0.0 || bytes > u64::MAX as f64 {
+        return None;
+    }
+    Some(bytes as u64)
+}
+
+/// Build the action's `snowflake` sink. The account, user, server and
+/// private key come from the connector; the database, schema and pipe
+/// come from the action. The reference `pipe` names the streaming
+/// pipe: the driver writes the streaming rows API with the pipe as
+/// the table template and the streaming channel.
+///
+/// Batching belongs to the action runtime (RO-01). The driver keeps
+/// one row per send with no linger.
+pub(crate) fn build_snowflake_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::snowflake::{
+        HttpSnowflakeTransport, SnowflakeSink, SnowflakeSinkConfig,
+    };
+    let connector = record.connector.trim().to_string();
+    let account = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["account"],
+        "account",
+    )?;
+    let user = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["pipe_user", "user", "username"],
+        "pipe_user",
+    )?;
+    let private_key_pem = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["private_key", "private_key_pem"],
+        "private_key",
+    )?;
+    let database = param_string(record, "database")
+        .ok_or_else(|| format!("action {:?} is missing required field: database", record.id))?;
+    let schema = param_string(record, "schema")
+        .ok_or_else(|| format!("action {:?} is missing required field: schema", record.id))?;
+    let pipe = param_string(record, "pipe")
+        .ok_or_else(|| format!("action {:?} is missing required field: pipe", record.id))?;
+    let endpoint = first_string(connector_doc, &["server", "endpoint", "url"])
+        .map(|value| http_endpoint(&value));
+    let config = SnowflakeSinkConfig {
+        account,
+        user,
+        database,
+        schema,
+        table_template: pipe.clone(),
+        private_key_pem,
+        endpoint,
+        role: None,
+        channel: pipe,
+        column_mappings: std::collections::HashMap::new(),
+        // One row per send with no linger: the action runtime owns
+        // batching (RO-01). Cap the batch at 4 MiB (under the 16 MiB
+        // streaming limit). Retry 3 times.
+        batch_size: Some(1),
+        batch_bytes: Some(4_194_304),
+        linger_ms: Some(0),
+        max_retries: Some(3),
+        initial_backoff_ms: Some(100),
+        max_backoff_ms: Some(2_000),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout())
+        .build()
+        .unwrap_or_default();
+    let transport = HttpSnowflakeTransport::new(&config, client).map_err(|error| {
+        format!(
+            "action {:?} cannot build its snowflake transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = SnowflakeSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its snowflake sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `tablestore` sink. The endpoint, instance and
+/// access keys come from the connector; the table, fields, tags,
+/// measurement and timestamp come from the action.
+///
+/// The action `tags` object becomes the primary-key columns, and
+/// `fields` become the attribute columns. When `tags` is empty, the
+/// `timestamp` parameter is the primary key.
+pub(crate) fn build_tablestore_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+    _opts: &ActionResourceOpts,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::tablestore::{
+        AttributeColumnMapping, AttributeColumnType, HttpTablestoreTransport, PrimaryKeyMapping,
+        PrimaryKeyType, TablestoreSink, TablestoreSinkConfig,
+    };
+    let connector = record.connector.trim().to_string();
+    let endpoint = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["endpoint", "url"],
+        "endpoint",
+    )?;
+    let instance_name = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["instance_name", "instance"],
+        "instance_name",
+    )?;
+    let access_key_id = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["access_key_id", "ak"],
+        "access_key_id",
+    )?;
+    let access_key_secret = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["access_key_secret", "sk"],
+        "access_key_secret",
+    )?;
+    let table_name = param_string(record, "table_name").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: table_name",
+            record.id
+        )
+    })?;
+    // The accepted `measurement` value travels into the sink config
+    // and is stored on every row, so it is applied, not ignored.
+    let measurement = param_string(record, "measurement").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: measurement",
+            record.id
+        )
+    })?;
+    let tags = param_string_map(record, "tags");
+    let mut primary_keys = Vec::new();
+    for (name, source) in &tags {
+        primary_keys.push(PrimaryKeyMapping {
+            name: name.clone(),
+            source: source.clone(),
+            data_type: PrimaryKeyType::String,
+        });
+    }
+    if primary_keys.is_empty() {
+        if let Some(timestamp) = param_string(record, "timestamp") {
+            if timestamp.starts_with("${") {
+                // The `${timestamp}` source resolves to millis as a number.
+                // Type it as integer so the strict string check still holds.
+                primary_keys.push(PrimaryKeyMapping {
+                    name: "timestamp".to_string(),
+                    source: timestamp,
+                    data_type: PrimaryKeyType::Integer,
+                });
+            }
+        }
+    }
+    if primary_keys.is_empty() {
+        return Err(format!(
+            "action {:?} needs a primary key: set `parameters.tags` or a `${{...}}` `parameters.timestamp`",
+            record.id
+        ));
+    }
+    let mut attribute_columns = Vec::new();
+    let fields = param_value(record, "fields")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("action {:?} is missing required field: fields", record.id))?;
+    for field in fields {
+        let column = field
+            .get("column")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "action {:?} field `parameters.fields` entry is missing column",
+                    record.id
+                )
+            })?;
+        let source = field
+            .get("value")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "action {:?} field `parameters.fields` entry {column:?} is missing a string value template",
+                    record.id
+                )
+            })?;
+        let is_binary = field
+            .get("isbinary")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let is_int = field
+            .get("isint")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let data_type = if is_binary {
+            AttributeColumnType::Binary
+        } else if is_int {
+            AttributeColumnType::Integer
+        } else {
+            AttributeColumnType::String
+        };
+        attribute_columns.push(AttributeColumnMapping {
+            name: column.to_string(),
+            source: source.to_string(),
+            data_type,
+        });
+    }
+    let config = TablestoreSinkConfig {
+        endpoint,
+        instance_name,
+        table_name,
+        access_key_id,
+        access_key_secret,
+        primary_keys,
+        attribute_columns,
+        measurement,
+        // One row per send with no linger: the action runtime owns
+        // batching (RO-01). Keep 10_000 rows buffered (fifty 200-row
+        // flushes) to bound memory.
+        batch_size: Some(1),
+        buffer_capacity: Some(10_000),
+        linger_ms: Some(0),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout())
+        .build()
+        .unwrap_or_default();
+    let transport = HttpTablestoreTransport::new(&config, client).map_err(|error| {
+        format!(
+            "action {:?} cannot build its tablestore transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = TablestoreSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its tablestore sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Endpoint for one object-store connector: an explicit
+/// `endpoint`/`url`/`server`, else `https://host[:port]`.
+#[cfg(feature = "s3")]
+fn object_endpoint(
+    connector_doc: &serde_json::Value,
+    connector: &str,
+    action_id: &str,
+    keys: &[&str],
+) -> Result<String, String> {
+    if let Some(raw) = first_string(connector_doc, keys) {
+        let raw = raw.into_owned();
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            return Ok(raw.trim_end_matches('/').to_string());
+        }
+        if raw.contains(':') {
+            return Ok(format!("http://{}", raw.trim_end_matches('/')));
+        }
+        return Ok(format!("https://{}", raw.trim_end_matches('/')));
+    }
+    let host = connector_field(connector_doc, connector, action_id, &["host"], "host")?;
+    let port = connector_doc
+        .get("port")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(443);
+    Ok(format!("https://{host}:{port}"))
 }
 
 /// Bring every stored action's owned runtime sink in step with the
@@ -6547,6 +7749,441 @@ mod tests {
                 .err()
                 .expect("a non-JSON document template refuses");
         assert!(error.contains("doc_template"), "{error}");
+    }
+
+    #[test]
+    fn canonical_action_kind_maps_every_mv02d_alias() {
+        assert_eq!(canonical_action_kind("minio"), "s3");
+        assert_eq!(canonical_action_kind("azure_blob_storage"), "azure_blob");
+        assert_eq!(canonical_action_kind("dynamo"), "dynamodb");
+        assert_eq!(canonical_action_kind("ddb"), "dynamodb");
+        assert_eq!(canonical_action_kind("bq"), "bigquery");
+        assert_eq!(canonical_action_kind("gbq"), "bigquery");
+        assert_eq!(canonical_action_kind("snowflake_streaming"), "snowflake");
+        assert_eq!(canonical_action_kind("snowflake_aggregated"), "snowflake");
+        assert_eq!(canonical_action_kind("ots"), "tablestore");
+        assert_eq!(canonical_action_kind("delta_lake"), "databricks");
+    }
+
+    #[test]
+    fn action_owned_kind_covers_the_mv02d_kinds() {
+        for kind in [
+            "s3",
+            "minio",
+            "azure_blob",
+            "azure_blob_storage",
+            "dynamodb",
+            "dynamo",
+            "ddb",
+            "bigquery",
+            "bq",
+            "gbq",
+            "disk_log",
+            "snowflake",
+            "snowflake_streaming",
+            "snowflake_aggregated",
+            "tablestore",
+            "ots",
+        ] {
+            assert!(action_owned_kind(kind), "{kind} owns a runtime");
+        }
+        assert!(!action_owned_kind("databricks"));
+        assert!(!action_owned_kind("delta_lake"));
+    }
+
+    fn mv02d_record(
+        id: &str,
+        action_type: &str,
+        connector: &str,
+        parameters: serde_json::Value,
+    ) -> ActionRecord {
+        ActionRecord {
+            parameters,
+            ..record(id, action_type, connector)
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn s3_action_builder_requires_the_bucket_and_key() {
+        let rec = mv02d_record("act", "s3", "s3:up", serde_json::json!({}));
+        let doc = serde_json::json!({"endpoint": "http://127.0.0.1:9000"});
+        let error = build_s3_object_sink(&rec, &doc, &ActionResourceOpts::default())
+            .err()
+            .expect("a missing bucket refuses");
+        assert!(error.contains("bucket"), "{error}");
+        let rec = mv02d_record(
+            "act",
+            "minio",
+            "s3:up",
+            serde_json::json!({"bucket": "test-bucket", "key": "k/${topic}.ndjson"}),
+        );
+        let sink = build_s3_object_sink(&rec, &doc, &ActionResourceOpts::default())
+            .expect("a full s3 pair builds");
+        assert_eq!(sink.kind(), "s3");
+    }
+
+    #[cfg(feature = "azure_blob")]
+    #[tokio::test]
+    async fn azure_blob_action_builder_requires_the_container_and_blob() {
+        let rec = mv02d_record("act", "azure_blob", "azure:up", serde_json::json!({}));
+        let doc = serde_json::json!({"account_name": "acct", "account_key": "a2V5"});
+        let error = build_azure_blob_sink(&rec, &doc, &ActionResourceOpts::default())
+            .err()
+            .expect("a missing container refuses");
+        assert!(error.contains("container"), "{error}");
+        let rec = mv02d_record(
+            "act",
+            "azure_blob_storage",
+            "azure:up",
+            serde_json::json!({"container": "test-container", "blob": "b/${batch_id}.json"}),
+        );
+        let sink = build_azure_blob_sink(&rec, &doc, &ActionResourceOpts::default())
+            .expect("a full azure pair builds");
+        assert_eq!(sink.kind(), "azure_blob");
+    }
+
+    #[cfg(feature = "dynamodb")]
+    #[tokio::test]
+    async fn dynamodb_action_builder_requires_the_table_and_hash_key() {
+        let rec = mv02d_record("act", "dynamo", "ddb:up", serde_json::json!({}));
+        let doc = serde_json::json!({
+            "url": "http://127.0.0.1:8000",
+            "region": "us-east-1",
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret",
+        });
+        let error = build_dynamodb_action_sink(&rec, &doc, &ActionResourceOpts::default())
+            .err()
+            .expect("a missing table refuses");
+        assert!(error.contains("table"), "{error}");
+        let rec = mv02d_record(
+            "act",
+            "ddb",
+            "ddb:up",
+            serde_json::json!({
+                "table": "events",
+                "hash_key": "id",
+                "template": "{\"id\":\"${payload.id}\",\"temp\":\"${payload.temp}\"}",
+            }),
+        );
+        let sink = build_dynamodb_action_sink(&rec, &doc, &ActionResourceOpts::default())
+            .expect("a full dynamo pair builds");
+        assert_eq!(sink.kind(), "dynamodb");
+    }
+
+    #[cfg(feature = "bigquery")]
+    #[tokio::test]
+    async fn bigquery_action_builder_requires_the_dataset_and_table() {
+        let rec = mv02d_record("act", "bigquery", "bq:up", serde_json::json!({}));
+        let doc = serde_json::json!({
+            "authentication": {"type": "attached_service_account", "gcp_project_id": "p",
+                               "access_token": "test-attached-token"},
+        });
+        let error = build_bigquery_sink(&rec, &doc, &ActionResourceOpts::default())
+            .err()
+            .expect("a missing dataset refuses");
+        assert!(error.contains("dataset"), "{error}");
+        let rec = mv02d_record(
+            "act",
+            "bq",
+            "bq:up",
+            serde_json::json!({"dataset": "d", "table": "events"}),
+        );
+        let sink = build_bigquery_sink(&rec, &doc, &ActionResourceOpts::default())
+            .expect("a full bigquery pair builds");
+        assert_eq!(sink.kind(), "bigquery");
+        // The attached form uses the runtime environment.
+        // It builds without a configured token.
+        let bare = serde_json::json!({
+            "authentication": {"type": "attached_service_account", "gcp_project_id": "p"},
+        });
+        let sink = build_bigquery_sink(&rec, &bare, &ActionResourceOpts::default())
+            .expect("attached without token builds");
+        assert_eq!(sink.kind(), "bigquery");
+    }
+
+    #[tokio::test]
+    async fn disk_log_action_builder_refuses_a_path_outside_the_data_directory() {
+        let doc = serde_json::json!({
+            "filepath": "../escape.log",
+            "max_file_size": "1MB",
+            "max_file_number": 3,
+        });
+        let rec = mv02d_record("act", "disk_log", "disk:up", serde_json::json!({}));
+        let error = build_disk_log_action_sink(&rec, &doc, &ActionResourceOpts::default())
+            .err()
+            .expect("a parent path refuses");
+        assert!(error.contains("leave the data directory"), "{error}");
+        let doc = serde_json::json!({
+            "filepath": "/tmp/escape.log",
+            "max_file_size": "1MB",
+            "max_file_number": 3,
+        });
+        let error = build_disk_log_action_sink(&rec, &doc, &ActionResourceOpts::default())
+            .err()
+            .expect("an absolute path refuses");
+        assert!(error.contains("relative to the data directory"), "{error}");
+        // A symlink that points out is refused, even with a clean name.
+        let dir = std::env::temp_dir().join(format!(
+            "mv02d-disklink-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let outside = dir.join("outside.log");
+        std::fs::write(&outside, b"x").expect("outside file");
+        let link = dir.join("link.log");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+        #[cfg(unix)]
+        {
+            let error =
+                disk_log_parts(link.to_str().expect("path"), "act").expect_err("a symlink refuses");
+            assert!(error.contains("symlink"), "{error}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    async fn disk_log_write_modes_check(scratch: &std::path::Path) {
+        use broker_connectors::disk_log::{DiskLogSink, MemoryDiskLogWriter};
+        // Each write mode delivers through the runtime. The flush count
+        // changes with the mode: `sync` flushes each batch, `async`
+        // leaves sync to the OS. The memory sink clones the entry
+        // config, so the test sets no field by hand.
+        for (mode, flushes) in [("sync", 1_u64), ("async", 0_u64)] {
+            let rec = mv02d_record(
+                "act",
+                "disk_log",
+                "disk:up",
+                serde_json::json!({"write_mode": mode}),
+            );
+            let doc = serde_json::json!({
+                "filepath": format!("logs/mv02d-{mode}.log"),
+                "max_file_size": "1MB",
+                "max_file_number": 3,
+            });
+            let file_sink = build_disk_log_action_sink_with_dir(
+                &rec,
+                &doc,
+                scratch,
+                &ActionResourceOpts::default(),
+            )
+            .expect("both write modes build");
+            assert_eq!(file_sink.kind(), "disk_log");
+            let config = file_sink.config().clone();
+            let metrics = std::sync::Arc::new(ActionMetrics::new());
+            let runtime = ActionRuntimeSink::new(
+                file_sink as std::sync::Arc<dyn broker_connectors::Sink>,
+                ActionResourceOpts::default(),
+                std::sync::Arc::clone(&metrics),
+                None,
+            );
+            let topic = Topic::new("t/mode").unwrap();
+            runtime
+                .send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+                .await
+                .expect("runtime sends the mode");
+            assert_eq!(
+                metrics.snapshot().success,
+                1,
+                "mode {mode} delivers through the runtime"
+            );
+            let writer =
+                std::sync::Arc::new(MemoryDiskLogWriter::new(&config).expect("entry config opens"));
+            let mem_sink = std::sync::Arc::new(
+                DiskLogSink::new(config, writer.clone()).expect("memory sink builds"),
+            );
+            let mem_metrics = std::sync::Arc::new(ActionMetrics::new());
+            let mem_runtime = ActionRuntimeSink::new(
+                std::sync::Arc::clone(&mem_sink) as std::sync::Arc<dyn broker_connectors::Sink>,
+                ActionResourceOpts::default(),
+                std::sync::Arc::clone(&mem_metrics),
+                None,
+            );
+            mem_runtime
+                .send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+                .await
+                .expect("memory runtime sends the mode");
+            assert_eq!(
+                mem_metrics.snapshot().success,
+                1,
+                "mode {mode} delivers in memory"
+            );
+            assert_eq!(
+                writer.flush_count(),
+                flushes,
+                "write mode {mode} flushes {flushes} time(s)"
+            );
+        }
+    }
+
+    async fn disk_log_retention_check(scratch: &std::path::Path) {
+        use broker_connectors::disk_log::{DiskLogSink, MemoryDiskLogWriter};
+        // `rotation.retention_period` builds through the broker entry.
+        // Delivery through the runtime is proven in the mode check
+        // and the period check. This check keeps the entry builds
+        // and the pruning difference.
+        let mut retention_configs = Vec::new();
+        for (tag, retention) in [
+            ("one", serde_json::json!(1)),
+            ("unlimited", serde_json::json!("infinity")),
+        ] {
+            let doc = serde_json::json!({
+                "filepath": format!("logs/mv02d-ret-{tag}.log"),
+                "max_file_size": "1MB",
+                "max_file_number": 10,
+                "rotation": {"period": "hour", "retention_period": retention.clone()},
+            });
+            let rec = mv02d_record("act", "disk_log", "disk:up", serde_json::json!({}));
+            let file_sink = build_disk_log_action_sink_with_dir(
+                &rec,
+                &doc,
+                scratch,
+                &ActionResourceOpts::default(),
+            )
+            .expect("both retention values build");
+            assert_eq!(file_sink.kind(), "disk_log");
+            retention_configs.push((tag, file_sink.config().clone()));
+        }
+        // `rotation.retention_period` changes pruning at the driver.
+        // One day keeps one fresh backup, no limit keeps three.
+        // Explicit timestamps keep the test exact. The configs come
+        // from the entry builds above, so no field is set by hand.
+        // Four writes land one hour apart, then one lands after one day.
+        let mut kept = Vec::new();
+        let topic = Topic::new("t").unwrap();
+        for (tag, config) in retention_configs {
+            let writer =
+                std::sync::Arc::new(MemoryDiskLogWriter::new(&config).expect("entry config opens"));
+            let sink = DiskLogSink::new(config, writer.clone()).expect("memory sink builds");
+            for millis in [0_i64, 3_700_000, 7_400_000, 92_000_000] {
+                sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, millis)
+                    .await
+                    .unwrap();
+            }
+            kept.push((tag, writer.backup_blobs().len(), sink.backup_names().len()));
+        }
+        assert_eq!(kept[0].1, 1, "one day keeps one backup");
+        assert_eq!(kept[0].2, 1, "one day lists one backup");
+        assert_eq!(kept[1].1, 3, "no limit keeps three backups");
+        assert_eq!(kept[1].2, 3, "no limit lists three backups");
+    }
+
+    async fn disk_log_period_check(scratch: &std::path::Path) {
+        use broker_connectors::disk_log::{DiskLogSink, MemoryDiskLogWriter};
+        // `rotation.period` changes age rotation at the driver.
+        // `hour` rotates a segment older than 3_600 s, `none` never
+        // rotates by age. Explicit timestamps keep the test exact.
+        for (period, rotates) in [("hour", 1_u64), ("none", 0_u64)] {
+            let doc = serde_json::json!({
+                "filepath": format!("logs/mv02d-age-{period}.log"),
+                "max_file_size": "1MB",
+                "max_file_number": 3,
+                "rotation": {"period": period},
+            });
+            let rec = mv02d_record("act", "disk_log", "disk:up", serde_json::json!({}));
+            let file_sink = build_disk_log_action_sink_with_dir(
+                &rec,
+                &doc,
+                scratch,
+                &ActionResourceOpts::default(),
+            )
+            .expect("both periods build");
+            assert_eq!(file_sink.kind(), "disk_log");
+            let config = file_sink.config().clone();
+            let metrics = std::sync::Arc::new(ActionMetrics::new());
+            let runtime = ActionRuntimeSink::new(
+                file_sink as std::sync::Arc<dyn broker_connectors::Sink>,
+                ActionResourceOpts::default(),
+                std::sync::Arc::clone(&metrics),
+                None,
+            );
+            let topic = Topic::new("t/age").unwrap();
+            runtime
+                .send(&topic, &Bytes::from("{}"), QoS::AtMostOnce)
+                .await
+                .expect("runtime sends with period");
+            assert_eq!(
+                metrics.snapshot().success,
+                1,
+                "period {period} delivers through the runtime"
+            );
+            let writer =
+                std::sync::Arc::new(MemoryDiskLogWriter::new(&config).expect("entry config opens"));
+            let sink = DiskLogSink::new(config, writer).expect("memory sink builds");
+            sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 0)
+                .await
+                .unwrap();
+            sink.append_at(&topic, &Bytes::from("{}"), QoS::AtMostOnce, 3_601_000)
+                .await
+                .unwrap();
+            assert_eq!(
+                sink.rotation_count(),
+                rotates,
+                "period {period} rotates by age: {rotates}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_log_rotation_and_write_mode_change_the_runtime_result() {
+        // Both documented write modes build through the broker entry.
+        // One scratch directory serves all three legs. Distinct file
+        // names keep isolation. The final call cleans the directory.
+        let scratch = std::env::temp_dir().join(format!(
+            "mv02d-diskmodes-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        disk_log_write_modes_check(&scratch).await;
+        disk_log_retention_check(&scratch).await;
+        disk_log_period_check(&scratch).await;
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[tokio::test]
+    async fn snowflake_and_tablestore_builders_refuse_the_missing_action_fields() {
+        let doc = serde_json::json!({
+            "account": "acct",
+            "pipe_user": "user",
+            "private_key": "not-a-key",
+        });
+        let rec = mv02d_record("act", "snowflake", "sf:up", serde_json::json!({}));
+        let error = build_snowflake_sink(&rec, &doc, &ActionResourceOpts::default())
+            .err()
+            .expect("a missing database refuses");
+        assert!(error.contains("database"), "{error}");
+
+        let doc = serde_json::json!({
+            "endpoint": "http://127.0.0.1:9000",
+            "instance_name": "i",
+            "access_key_id": "ak",
+            "access_key_secret": "sk",
+        });
+        let rec = mv02d_record("act", "ots", "ots:up", serde_json::json!({}));
+        let error = build_tablestore_sink(&rec, &doc, &ActionResourceOpts::default())
+            .err()
+            .expect("a missing table refuses");
+        assert!(error.contains("table_name"), "{error}");
+        let rec = mv02d_record(
+            "act",
+            "tablestore",
+            "ots:up",
+            serde_json::json!({
+                "table_name": "t",
+                "measurement": "m",
+                "tags": {"device": "${client_id}"},
+                "fields": [{"column": "temp", "value": "${payload.temp}"}],
+            }),
+        );
+        let sink = build_tablestore_sink(&rec, &doc, &ActionResourceOpts::default())
+            .expect("a full tablestore pair builds");
+        assert_eq!(sink.kind(), "tablestore");
     }
 
     #[tokio::test]

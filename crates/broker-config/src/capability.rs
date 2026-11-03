@@ -121,7 +121,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["azure_blob_storage", "azureblob", "azblob"],
         family: "object-store",
         owner: "MV-02d",
-        state: KindState::Pending("MV-02d"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -171,7 +171,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["bq", "gbq"],
         family: "object-store",
         owner: "MV-02d",
-        state: KindState::Pending("MV-02d"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -279,12 +279,12 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["delta_lake"],
         family: "object-store",
         owner: "MV-02d",
-        state: KindState::Pending("MV-02d"),
-        connector: true,
-        action: true,
-        source: true,
-        probe: true,
-        sql_into: true,
+        state: KindState::Refused("D3"),
+        connector: false,
+        action: false,
+        source: false,
+        probe: false,
+        sql_into: false,
         feature: None,
         default_build: true,
         full_build: true,
@@ -309,7 +309,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["disk", "disklog"],
         family: "object-store",
         owner: "MV-02d",
-        state: KindState::Pending("MV-02d"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -339,7 +339,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["dynamo", "ddb"],
         family: "object-store",
         owner: "MV-02d",
-        state: KindState::Pending("MV-02d"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -704,7 +704,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["minio"],
         family: "object-store",
         owner: "MV-02d",
-        state: KindState::Pending("MV-02d"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -719,7 +719,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["snowflake_streaming", "snowflake_aggregated"],
         family: "object-store",
         owner: "MV-02d",
-        state: KindState::Pending("MV-02d"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -749,7 +749,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["ots"],
         family: "object-store",
         owner: "MV-02d",
-        state: KindState::Pending("MV-02d"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -790,14 +790,14 @@ pub static KIND_ROWS: &[KindRow] = &[
         full_build: true,
     },
     // timescaledb stays pending: its family ticket has not run yet.
-    // It keeps the MV-02d owner until its ticket is planned, so MV-02a
-    // stays accepted with only its six ready kinds.
+    // It keeps a future owner until its ticket is planned, so accepted
+    // families stay green.
     KindRow {
         name: "timescaledb",
         aliases: &["timescale"],
         family: "time-series",
-        owner: "MV-02d",
-        state: KindState::Pending("MV-02d"),
+        owner: "SB-27",
+        state: KindState::Pending("SB-27"),
         connector: true,
         action: true,
         source: true,
@@ -874,7 +874,8 @@ static TEST_KINDS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Family tickets whose kinds the plan accepts as `ready` at the close of
 /// KC-00. Add a ticket only after its family contract is accepted. The
 /// readiness test derives the expected state from this list.
-pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &["MV-01", "KC-00/D9", "MV-02a", "MV-02b", "MV-02c"];
+pub const ACCEPTED_FAMILY_TICKETS: &[&str] =
+    &["MV-01", "KC-00/D9", "MV-02a", "MV-02b", "MV-02c", "MV-02d"];
 
 /// Enable the test-only `test` kind for this process. Test builds call
 /// this; a release build does not.
@@ -1179,9 +1180,14 @@ mod tests {
         assert!(is_kind_ready("cockroachdb"));
         assert!(is_kind_ready("redshift"));
         assert_eq!(kind_state("postgres"), Some(KindState::Ready));
-        assert_eq!(kind_state("snowflake"), Some(KindState::Pending("MV-02d")));
-        assert_eq!(kind_state("tablestore"), Some(KindState::Pending("MV-02d")));
-        assert_eq!(kind_state("databricks"), Some(KindState::Pending("MV-02d")));
+        assert_eq!(kind_state("snowflake"), Some(KindState::Ready));
+        assert_eq!(kind_state("tablestore"), Some(KindState::Ready));
+        assert_eq!(kind_state("s3"), Some(KindState::Ready));
+        assert_eq!(kind_state("azure_blob"), Some(KindState::Ready));
+        assert_eq!(kind_state("dynamodb"), Some(KindState::Ready));
+        assert_eq!(kind_state("bigquery"), Some(KindState::Ready));
+        assert_eq!(kind_state("disk_log"), Some(KindState::Ready));
+        assert_eq!(kind_state("databricks"), Some(KindState::Refused("D3")));
         assert_eq!(kind_state("s3_tables"), Some(KindState::Refused("MV-04")));
         assert_eq!(
             kind_state("azure_event_grid"),

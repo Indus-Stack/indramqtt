@@ -109,6 +109,10 @@ pub struct TablestoreSinkConfig {
     /// Attribute column mappings.
     #[serde(default)]
     pub attribute_columns: Vec<AttributeColumnMapping>,
+    /// Measurement name from the action. It is stored on every row as
+    /// the `measurement` attribute, so the accepted value reaches the
+    /// BatchWriteRow body instead of being ignored.
+    pub measurement: String,
     /// Flush trigger row count (default 200: the BatchWriteRow
     /// per-call ceiling; `None` is an explicit operator opt-in to
     /// unbounded, never the code's choice).
@@ -200,6 +204,11 @@ impl TablestoreSinkConfig {
         if self.access_key_secret.is_empty() {
             return Err(ConnectorError::Dispatch(
                 "tablestore access_key_secret must not be empty".to_string(),
+            ));
+        }
+        if self.measurement.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "tablestore measurement must not be empty".to_string(),
             ));
         }
         if self.primary_keys.is_empty() {
@@ -398,14 +407,16 @@ fn coerce_attr(
     name: &str,
 ) -> Result<OtsValue> {
     match data_type {
-        AttributeColumnType::String => value
-            .as_str()
-            .map(|s| OtsValue::String(s.to_string()))
-            .ok_or_else(|| {
-                ConnectorError::Dispatch(format!(
-                    "tablestore attribute {name:?} needs a JSON string"
-                ))
-            }),
+        // A string column renders JSON scalars as text, so a numeric
+        // payload value travels instead of failing the batch.
+        AttributeColumnType::String => match value {
+            serde_json::Value::String(text) => Ok(OtsValue::String(text.clone())),
+            serde_json::Value::Number(number) => Ok(OtsValue::String(number.to_string())),
+            serde_json::Value::Bool(flag) => Ok(OtsValue::String(flag.to_string())),
+            _ => Err(ConnectorError::Dispatch(format!(
+                "tablestore attribute {name:?} needs a JSON string"
+            ))),
+        },
         AttributeColumnType::Integer => as_integer(value).map(OtsValue::Integer).ok_or_else(|| {
             ConnectorError::Dispatch(format!(
                 "tablestore attribute {name:?} needs a JSON integer"
@@ -879,7 +890,7 @@ impl TablestoreSink {
                 coerce_pk(&value, mapping.data_type, &mapping.name)?,
             ));
         }
-        let mut attributes = Vec::with_capacity(self.config.attribute_columns.len());
+        let mut attributes = Vec::with_capacity(self.config.attribute_columns.len() + 1);
         for mapping in &self.config.attribute_columns {
             let source = parse_source(&mapping.source).map_err(ConnectorError::Dispatch)?;
             let value = resolve_source(&source, &event.topic, &event.payload, millis);
@@ -888,6 +899,12 @@ impl TablestoreSink {
                 coerce_attr(&value, mapping.data_type, &mapping.name)?,
             ));
         }
+        // The accepted action `measurement` travels as an attribute, so
+        // the BatchWriteRow body carries the configured value.
+        attributes.push((
+            "measurement".to_string(),
+            OtsValue::String(self.config.measurement.clone()),
+        ));
         Ok(OtsRow {
             primary_keys,
             attributes,
@@ -910,7 +927,17 @@ impl TablestoreSink {
         let millis = now_millis();
         let mut pending: Vec<(TablestoreRow, OtsRow)> = Vec::with_capacity(events.len());
         for event in &events {
-            pending.push((event.clone(), self.resolve_row(event, millis)?));
+            match self.resolve_row(event, millis) {
+                Ok(row) => pending.push((event.clone(), row)),
+                Err(error) => {
+                    // A bad row restores the batch instead of dropping
+                    // events without a counter.
+                    let mut buffer = self.buffer.lock();
+                    buffer.restore(events, oldest);
+                    self.backoff.lock().failure();
+                    return Err(error);
+                }
+            }
         }
         let total = pending.len() as u64;
         let auth = TablestoreAuth {
@@ -1081,6 +1108,7 @@ mod tests {
                     data_type: AttributeColumnType::Boolean,
                 },
             ],
+            measurement: "telemetry".to_string(),
             batch_size: Some(200),
             buffer_capacity: None,
             linger_ms: Some(100),

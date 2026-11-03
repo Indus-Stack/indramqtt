@@ -160,7 +160,7 @@ impl AzureBlobSinkConfig {
         }
         // Strict template check with dummy values: unknown or unclosed
         // variables fail here, not on the hot path.
-        self.resolve_path(0, 0)?;
+        self.resolve_path("dummy/topic", 0, 0)?;
         if self.max_records_per_blob == Some(0) {
             return Err(ConnectorError::Dispatch(
                 "azure_blob max_records_per_blob must be >= 1".to_string(),
@@ -182,14 +182,21 @@ impl AzureBlobSinkConfig {
         }
     }
 
-    /// Render the blob path for one flush: `${date.year}` /
-    /// `${date.month}` / `${date.day}` / `${date.hour}` come from
-    /// `millis` (UTC), `${batch_id}` is the flush sequence number.
-    /// A leading `/` is rejected so paths stay relative.
-    pub fn resolve_path(&self, batch_id: u64, millis: i64) -> Result<String> {
+    /// Render the blob path for one flush.
+    /// `${topic}` uses path-safe characters.
+    /// Date parts come from `millis` (UTC).
+    /// `${batch_id}` is the flush number.
+    /// A leading `/` is rejected.
+    pub fn resolve_path(&self, topic: &str, batch_id: u64, millis: i64) -> Result<String> {
+        if topic.is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "azure_blob path requires a non-empty topic".to_string(),
+            ));
+        }
         let (year, month, day) = ymd_from_millis(millis);
         let (hour, _, _, _) = hms_milli_from_millis(millis);
         let vars = [
+            ("topic", sanitize_topic(topic)),
             ("date.year", format!("{year:04}")),
             ("date.month", format!("{month:02}")),
             ("date.day", format!("{day:02}")),
@@ -279,6 +286,21 @@ fn validate_container_name(name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Keep hierarchy separators.
+/// Map outside `[A-Za-z0-9._-/]` to `_`.
+fn sanitize_topic(topic: &str) -> String {
+    topic
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +415,7 @@ pub fn shared_key_authorization(
 /// One buffered ndjson line.
 #[derive(Debug, Clone)]
 struct AzureBlobRow {
+    topic: String,
     line: String,
 }
 
@@ -410,7 +433,10 @@ fn render_row(topic: &Topic, payload: &Bytes, qos: QoS, millis: i64) -> Result<A
         "timestamp": broker_connectors::rfc3339_millis(millis),
     })
     .to_string();
-    Ok(AzureBlobRow { line })
+    Ok(AzureBlobRow {
+        topic: topic.as_str().to_string(),
+        line,
+    })
 }
 
 fn gzip_bytes(raw: &[u8]) -> Result<Vec<u8>> {
@@ -804,9 +830,10 @@ impl AzureBlobSink {
         self.buffer.lock().bytes
     }
 
-    /// Flush buffered rows as one block blob (no-op when empty). While
-    /// backing off, fails fast without touching the transport. Any
-    /// failure restores rows + byte count, engages backoff, propagates.
+    /// Flush buffered rows as one blob per key.
+    /// Do nothing when empty.
+    /// Fail fast while backing off.
+    /// Restore rows and back off on failure.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest, taken_bytes) = {
@@ -820,49 +847,32 @@ impl AzureBlobSink {
         }
         let batch_id = self.batch_seq.fetch_add(1, Ordering::SeqCst);
         let millis = now_millis();
-        let path = self
-            .config
-            .resolve_path(batch_id, millis)
-            .unwrap_or_else(|_| format!("unkeyed/{batch_id}.ndjson"));
-        let mut raw = String::new();
+        // Group by key with the same `batch_id` and `millis`.
+        // Keep first-seen group order.
+        // Send bad keys to `unkeyed/{batch_id}.ndjson`.
+        let unkeyed_key = format!("unkeyed/{batch_id}.ndjson");
+        let mut group_keys: Vec<String> = Vec::new();
+        let mut group_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut row_group: Vec<usize> = Vec::with_capacity(rows.len());
         for row in &rows {
-            raw.push_str(&row.line);
-            raw.push('\n');
+            let key = match self.config.resolve_path(&row.topic, batch_id, millis) {
+                Ok(key) => key,
+                Err(_) => unkeyed_key.clone(),
+            };
+            if let Some(&gi) = group_index.get(&key) {
+                row_group.push(gi);
+            } else {
+                let gi = group_keys.len();
+                group_keys.push(key.clone());
+                group_index.insert(key, gi);
+                row_group.push(gi);
+            }
         }
-        let (body, content_encoding, content_type) = match self.config.compression {
-            AzureBlobCompression::None => (raw.into_bytes(), None, "application/x-ndjson"),
-            AzureBlobCompression::Gzip => (
-                gzip_bytes(raw.as_bytes())?,
-                Some("gzip"),
-                "application/octet-stream",
-            ),
-        };
-        let date = crate::oci_streaming::rfc1123_date(millis);
-        let authorization = match &self.config.auth {
-            AzureBlobAuth::SharedKey { account_key } => Some(shared_key_authorization(
-                &self.config.account_name,
-                account_key,
-                &string_to_sign(
-                    &self.config.account_name,
-                    &self.config.base_endpoint(),
-                    &self.config.container_name,
-                    &path,
-                    body.len(),
-                    content_type,
-                    &date,
-                ),
-            )?),
-            AzureBlobAuth::BearerToken { token } => Some(format!("Bearer {token}")),
-            AzureBlobAuth::SasToken { .. } => None,
-        };
-        let put = AzureBlobPut {
-            url: self.config.blob_url(&path),
-            path,
-            body,
-            content_type,
-            content_encoding,
-        };
-        let record_count = rows.len() as u64;
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_keys.len()];
+        for (ri, gi) in row_group.iter().enumerate() {
+            members[*gi].push(ri);
+        }
         if let Err(e) = self.transport.ensure_container().await {
             let mut buffer = self.buffer.lock();
             buffer.queue.restore(rows, oldest);
@@ -870,25 +880,74 @@ impl AzureBlobSink {
             self.backoff.lock().failure();
             return Err(e);
         }
-        match self
-            .transport
-            .put_blob(&put, &date, authorization.as_deref())
-            .await
-        {
-            Ok(()) => {
-                self.backoff.lock().success();
-                self.sent_blobs.fetch_add(1, Ordering::Relaxed);
-                self.sent_records.fetch_add(record_count, Ordering::Relaxed);
-                Ok(())
+        let date = crate::oci_streaming::rfc1123_date(millis);
+        for (gi, path) in group_keys.iter().enumerate() {
+            let mut raw = String::new();
+            for &ri in &members[gi] {
+                raw.push_str(&rows[ri].line);
+                raw.push('\n');
             }
-            Err(e) => {
-                let mut buffer = self.buffer.lock();
-                buffer.queue.restore(rows, oldest);
-                buffer.bytes = buffer.bytes.saturating_add(taken_bytes);
-                self.backoff.lock().failure();
-                Err(e)
+            let (body, content_encoding, content_type) = match self.config.compression {
+                AzureBlobCompression::None => (raw.into_bytes(), None, "application/x-ndjson"),
+                AzureBlobCompression::Gzip => (
+                    gzip_bytes(raw.as_bytes())?,
+                    Some("gzip"),
+                    "application/octet-stream",
+                ),
+            };
+            let authorization = match &self.config.auth {
+                AzureBlobAuth::SharedKey { account_key } => Some(shared_key_authorization(
+                    &self.config.account_name,
+                    account_key,
+                    &string_to_sign(
+                        &self.config.account_name,
+                        &self.config.base_endpoint(),
+                        &self.config.container_name,
+                        path,
+                        body.len(),
+                        content_type,
+                        &date,
+                    ),
+                )?),
+                AzureBlobAuth::BearerToken { token } => Some(format!("Bearer {token}")),
+                AzureBlobAuth::SasToken { .. } => None,
+            };
+            let put = AzureBlobPut {
+                url: self.config.blob_url(path),
+                path: path.clone(),
+                body,
+                content_type,
+                content_encoding,
+            };
+            let record_count = members[gi].len() as u64;
+            match self
+                .transport
+                .put_blob(&put, &date, authorization.as_deref())
+                .await
+            {
+                Ok(()) => {
+                    self.sent_blobs.fetch_add(1, Ordering::Relaxed);
+                    self.sent_records.fetch_add(record_count, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    let mut unsent = Vec::new();
+                    let mut unsent_bytes = 0usize;
+                    for (ri, row) in rows.into_iter().enumerate() {
+                        if row_group[ri] >= gi {
+                            unsent_bytes = unsent_bytes.saturating_add(row.line.len() + 1);
+                            unsent.push(row);
+                        }
+                    }
+                    let mut buffer = self.buffer.lock();
+                    buffer.queue.restore(unsent, oldest);
+                    buffer.bytes = buffer.bytes.saturating_add(unsent_bytes);
+                    self.backoff.lock().failure();
+                    return Err(e);
+                }
             }
         }
+        self.backoff.lock().success();
+        Ok(())
     }
 
     /// Validate + buffer one event. Returns true when the batch is
@@ -916,6 +975,17 @@ impl AzureBlobSink {
 #[async_trait]
 impl Sink for AzureBlobSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
+        // A failed flush restores its rows. The buffer can hold one
+        // restored batch when the next row arrives. Flush the restored
+        // rows first, then accept the new row. The flush fails fast
+        // while backing off and fails closed while the server is down.
+        // The runtime counts that failure. Without this step, the
+        // restored row blocks every later send: the action buffer holds
+        // one batch and no flush worker runs.
+        let full = self.buffer.lock().queue.len() >= self.config.effective_buffer();
+        if full {
+            self.flush().await?;
+        }
         if self.buffer_row(topic, payload, qos)? {
             self.flush().await?;
         }
@@ -1135,15 +1205,22 @@ mod tests {
     fn test_blob_path_template_resolution() {
         let config = test_config();
         // 2026-09-12T11:18:09.123Z.
-        let path = config.resolve_path(0, 1_789_211_889_123).unwrap();
+        let path = config
+            .resolve_path("dummy/topic", 0, 1_789_211_889_123)
+            .unwrap();
         assert_eq!(path, "telemetry/year=2026/month=09/day=12/hour=11/0.json");
-        let next = config.resolve_path(41, 0).unwrap();
+        let next = config.resolve_path("dummy/topic", 41, 0).unwrap();
         assert_eq!(next, "telemetry/year=1970/month=01/day=01/hour=00/41.json");
 
         // Leading slashes are rejected (paths stay relative).
         let mut absolute = test_config();
         absolute.blob_path_template = "/abs/${batch_id}.json".to_string();
-        assert!(absolute.resolve_path(0, 0).is_err());
+        assert!(absolute.resolve_path("dummy/topic", 0, 0).is_err());
+        // A topic variable renders from the event topic.
+        let mut topical = test_config();
+        topical.blob_path_template = "events/${topic}/${batch_id}.json".to_string();
+        let topical_path = topical.resolve_path("mv02d/azure", 0, 0).unwrap();
+        assert_eq!(topical_path, "events/mv02d/azure/0.json");
     }
 
     #[test]
@@ -1199,6 +1276,27 @@ mod tests {
         assert_eq!(value["topic"], "sensors/t1");
         assert_eq!(value["payload"], serde_json::json!({"v": 1}));
         assert_eq!(value["timestamp"], "2026-09-12T11:18:09.123Z");
+    }
+
+    #[test]
+    fn test_endpoint_path_prefix_strips_query_and_fragment() {
+        // `?` and `#` start a query or fragment, never a path.
+        assert_eq!(
+            endpoint_path_prefix("http://127.0.0.1:10000/devstoreaccount1?sv=2021#frag"),
+            "/devstoreaccount1"
+        );
+        assert_eq!(
+            endpoint_path_prefix("https://acct.blob.core.windows.net?sv=1"),
+            ""
+        );
+        assert_eq!(
+            blob_request_path(
+                "http://127.0.0.1:10000/devstoreaccount1?sv=1#frag",
+                "telemetry",
+                "events/0.json"
+            ),
+            "/devstoreaccount1/telemetry/events/0.json"
+        );
     }
 
     #[test]
