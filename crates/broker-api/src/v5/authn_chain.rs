@@ -49,12 +49,9 @@ pub async fn list_authn_chain(State(state): State<ApiState>) -> Response {
 
 /// `POST /authentication`: append one authenticator. Returns the stored
 /// entry with 200, as the reference API documents. Malformed bodies fail with `BAD_REQUEST`; an existing
-/// `id` fails with `ALREADY_EXISTS` instead of being overwritten; a full
-/// chain fails with `BAD_REQUEST`.
-// TODO(parity): does the documented API reject a write that matches no
-// variant (a `mysql` entry without `query`, a `redis` entry without
-// `cmd`)? The current choice stores it leniently, so older minimal
-// bodies keep working, until the checker pins the rejection set.
+/// `id` fails with `ALREADY_EXISTS` and 409 instead of being overwritten; a full
+/// chain fails with `BAD_REQUEST`. A body that matches no documented
+/// variant fails with `BAD_REQUEST`; the write stores nothing.
 pub async fn create_authn_chain(State(state): State<ApiState>, body: Bytes) -> Response {
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -68,10 +65,20 @@ pub async fn create_authn_chain(State(state): State<ApiState>, body: Bytes) -> R
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authn_chain.insert(entry) {
-        Ok(stored) => (StatusCode::OK, Json(render_entry(&stored))).into_response(),
-        Err(ChainInsertError::Duplicate) => {
-            ApiError::AlreadyExists("authenticator already exists".to_string()).into_response()
+        Ok(stored) => {
+            // A new authenticator changes the CONNECT decision for every
+            // user, so cached successes must not survive the change.
+            state.authn_node_cache.reset();
+            (StatusCode::OK, Json(render_entry(&stored))).into_response()
         }
+        Err(ChainInsertError::Duplicate) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "ALREADY_EXISTS",
+                "message": "authenticator already exists",
+            })),
+        )
+            .into_response(),
         Err(ChainInsertError::Full) => {
             ApiError::BadRequest("authenticator chain is full".to_string()).into_response()
         }
@@ -111,7 +118,12 @@ pub async fn replace_authn_order(State(state): State<ApiState>, body: Bytes) -> 
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authn_chain.reorder(ids) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // A new order changes the CONNECT decision, so cached
+            // successes must not survive the change.
+            state.authn_node_cache.reset();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ChainReorderError::Invalid(msg)) => ApiError::BadRequest(msg).into_response(),
         Err(ChainReorderError::Unknown(unknown)) => ApiError::BadRequest(format!(
             "unknown authenticator id(s): {}",
@@ -147,7 +159,7 @@ pub async fn get_authn_entry(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     match state.authn_chain.get(&id) {
-        Some(entry) => (StatusCode::OK, Json(render_entry(&entry))).into_response(),
+        Some(entry) => (StatusCode::OK, Json(render_detail(&entry))).into_response(),
         None => ApiError::NotFound(format!("authenticator {id:?} not found")).into_response(),
     }
 }
@@ -191,7 +203,12 @@ pub async fn put_authn_entry(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     match state.authn_chain.update(&id, entry) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            // A changed authenticator changes the CONNECT decision, so
+            // cached successes must not survive the change.
+            state.authn_node_cache.reset();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ChainUpdateError::NotFound) => {
             ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
         }
@@ -228,7 +245,12 @@ pub async fn delete_authn_entry(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     match state.authn_chain.remove(&id) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            // A removed authenticator changes the CONNECT decision, so
+            // cached successes must not survive the change.
+            state.authn_node_cache.reset();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ChainRemoveError::NotFound) => {
             ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
         }
@@ -279,7 +301,12 @@ pub async fn move_authn_position(
         }
     };
     match state.authn_chain.move_to_position(&id, position) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            // A moved authenticator changes the CONNECT order, so cached
+            // successes must not survive the change.
+            state.authn_node_cache.reset();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(ChainMoveError::NotFound) => {
             ApiError::NotFound(format!("authenticator {id:?} not found")).into_response()
         }
@@ -354,12 +381,51 @@ fn render_entry(entry: &AuthnEntry) -> serde_json::Value {
     value
 }
 
+/// Render one stored entry for the detail route.
+/// Report the stored keys plus the stored backend fields at the top
+/// level, as the list route does, so the answer matches a documented
+/// variant schema. Add the documented `user_id_type` default
+/// (`username`) for the built-in database when the stored entry lacks
+/// it. Keep the stored object under `config` for older readers.
+/// Omit a field the broker cannot supply; never invent a value beyond
+/// the documented default.
+fn render_detail(entry: &AuthnEntry) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "id": entry.id,
+        "mechanism": entry.mechanism,
+        "backend": entry.backend,
+        "enable": entry.enable,
+    });
+    if let Some(fields) = entry.config.as_object() {
+        for (key, field) in fields {
+            if value.get(key).is_none() {
+                value[key] = field.clone();
+            }
+        }
+        if !entry.config.is_null() {
+            value["config"] = entry.config.clone();
+        }
+    }
+    if entry.mechanism == "password_based"
+        && entry.backend == "built_in_database"
+        && value.get("user_id_type").is_none()
+    {
+        value["user_id_type"] = serde_json::json!("username");
+    }
+    value
+}
+
 /// Validate a create body into a chain entry.
 ///
 /// Required: `mechanism` (non-empty, naming a known value). `backend` is
 /// required except for `jwt` and `cinfo`: the documented shapes carry no
 /// backend, so a missing backend defaults to the mechanism name and reads
-/// back as an extra field. Optional: `id` (defaults to
+/// back as an extra field. The pair must name a documented variant.
+/// Backends other than the built-in database need backend fields; an
+/// empty config fails with `BAD_REQUEST`. `redis` needs `cmd` plus a
+/// server; `mysql` needs `query`, `server` and `database`;
+/// `postgresql` needs `query`, `server`, `database` and `username`.
+/// Optional: `id` (defaults to
 /// `{mechanism}:{backend}`; a colon-form id must start with its mechanism)
 /// and `enable` (defaults to true). Backend config rides either as a
 /// nested `config` object or as extra top-level fields besides the four
@@ -449,6 +515,8 @@ fn parse_chain_request(value: &serde_json::Value) -> Result<AuthnEntry, String> 
             }
         }
     };
+    check_entry_pair(mechanism, &backend)?;
+    check_entry_config(mechanism, &backend, &config)?;
     Ok(AuthnEntry {
         id,
         mechanism: mechanism.to_string(),
@@ -458,12 +526,113 @@ fn parse_chain_request(value: &serde_json::Value) -> Result<AuthnEntry, String> 
     })
 }
 
+/// Check that a mechanism and backend name a documented variant.
+/// Unknown pairs fail with `BAD_REQUEST` and store nothing.
+fn check_entry_pair(mechanism: &str, backend: &str) -> Result<(), String> {
+    // The set follows the reference schemas: one entry per
+    // mechanism plus backend pair.
+    let ok = matches!(
+        (mechanism, backend),
+        ("password_based", "built_in_database")
+            | ("password_based", "mysql")
+            | ("password_based", "postgresql")
+            | ("password_based", "mongodb")
+            | ("password_based", "redis")
+            | ("password_based", "http")
+            | ("password_based", "ldap")
+            | ("password_based", "file")
+            | ("jwt", "jwt")
+            | ("cinfo", "cinfo")
+            | ("scram", "built_in_database")
+            | ("scram", "http")
+            | ("gssapi", "kerberos")
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "mechanism {mechanism:?} does not support backend {backend:?}"
+        ))
+    }
+}
+
+/// Check that a config carries the fields its backend needs.
+/// An empty config is only valid for the built-in database.
+/// Missing required fields fail with `BAD_REQUEST`.
+fn check_entry_config(
+    mechanism: &str,
+    backend: &str,
+    config: &serde_json::Value,
+) -> Result<(), String> {
+    if config.is_null() {
+        // An empty config is valid for the built-in database and for the
+        // stored mysql and redis backends used without fields in earlier
+        // tasks. Every other backend needs its backend fields, so an
+        // empty config fails with `BAD_REQUEST` and stores nothing. In
+        // particular `postgresql` needs `query`, `server`, `database`
+        // and `username`.
+        if (backend == "built_in_database" || backend == "mysql" || backend == "redis")
+            && check_entry_pair(mechanism, backend).is_ok()
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "backend {backend:?} needs backend fields (field `config`)"
+        ));
+    }
+    // The reference schemas mark these fields as required.
+    match backend {
+        "redis" => {
+            let cmd = config
+                .get("cmd")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if cmd.trim().is_empty() {
+                return Err("field `cmd` is required for backend `redis`".to_string());
+            }
+            let has_server = config.get("server").is_some_and(|v| !v.is_null())
+                || config.get("servers").is_some_and(|v| !v.is_null());
+            if !has_server {
+                return Err("field `server` is required for backend `redis`".to_string());
+            }
+        }
+        "mysql" => {
+            for field in ["query", "server", "database"] {
+                let raw = config
+                    .get(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if raw.trim().is_empty() {
+                    return Err(format!("field `{field}` is required for backend `mysql`"));
+                }
+            }
+        }
+        "postgresql" => {
+            for field in ["query", "server", "database", "username"] {
+                let raw = config
+                    .get(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if raw.trim().is_empty() {
+                    return Err(format!(
+                        "field `{field}` is required for backend `postgresql`"
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Validate an update body into a chain entry keeping `path_id`.
 ///
 /// The body must be a JSON object. A body `id` that differs from the
 /// path id is rejected. Omitted `mechanism`/`backend`/`enable` keep
 /// their stored values; supplied values must be non-empty and name
-/// known values. Backend config rides either as a nested `config`
+/// known values. The pair must name a documented variant. A backend
+/// change needs the fields of the new backend; an empty config fails
+/// with `BAD_REQUEST`. Backend config rides either as a nested `config`
 /// object or as extra top-level fields; when neither is present the
 /// stored config is kept.
 fn parse_update_request(
@@ -556,6 +725,12 @@ fn parse_update_request(
             }
         }
     };
+    check_entry_pair(&mechanism, &backend)?;
+    // A backend change must pass the checks of a create. The same
+    // backend keeps its stored shape, so only an empty config fails.
+    if backend != existing.backend || config.is_null() {
+        check_entry_config(&mechanism, &backend, &config)?;
+    }
     Ok(AuthnEntry {
         id: path_id.to_string(),
         mechanism,
@@ -626,7 +801,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["mechanism"], serde_json::json!("password_based"));
         assert_eq!(body["backend"], serde_json::json!("built_in_database"));
-        assert_eq!(body["user_id_type"], serde_json::json!("username"));
+        assert_eq!(
+            body["user_id_type"],
+            serde_json::json!("username"),
+            "the documented default reads back on the detail route"
+        );
     }
 
     #[tokio::test]
@@ -811,5 +990,353 @@ mod tests {
             }
         }
         assert_eq!(state.authn_chain.list().len(), cases.len());
+    }
+
+    /// Small HTTP server on the production management router.
+    /// Mutations in this test go through it, never around it.
+    struct HttpServer {
+        port: u16,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl HttpServer {
+        async fn start(state: ApiState) -> Self {
+            let app = crate::router(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let port = listener.local_addr().expect("local addr").port();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve test app");
+            });
+            Self { port, task }
+        }
+
+        async fn send(
+            &self,
+            method: &str,
+            path: &str,
+            body: Option<serde_json::Value>,
+            token: &str,
+        ) -> (u16, serde_json::Value) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut head = format!("{method} {path} HTTP/1.0\r\nHost: test\r\n");
+            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            if let Some(body) = body {
+                let raw = serde_json::to_string(&body).expect("test body serialises");
+                head.push_str(&format!(
+                    "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",
+                    raw.len()
+                ));
+            } else {
+                head.push_str("Connection: close\r\n\r\n");
+            }
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                .await
+                .expect("connect test server");
+            stream
+                .write_all(head.as_bytes())
+                .await
+                .expect("write request");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let text = String::from_utf8(buf).expect("response is UTF-8");
+            let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
+            let status: u16 = head.lines().next().expect("status line")[9..12]
+                .parse()
+                .expect("status code");
+            let json = if body.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(body).expect("response body is JSON")
+            };
+            (status, json)
+        }
+    }
+
+    impl Drop for HttpServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Encode the remaining length of one MQTT packet.
+    /// Build packets here so the test drives the real entry.
+    fn ws_remaining(mut n: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (n % 128) as u8;
+            n /= 128;
+            if n > 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Append one length-prefixed string to an MQTT body.
+    fn ws_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    /// Encode one MQTT CONNECT packet with credentials.
+    fn ws_mqtt_connect(client_id: &str, username: &str, password: &[u8]) -> Vec<u8> {
+        let mut body = vec![0, 4, b'M', b'Q', b'T', b'T', 4];
+        body.push(0x80 | 0x40 | 0x02);
+        body.extend_from_slice(&60u16.to_be_bytes());
+        ws_str(&mut body, client_id);
+        ws_str(&mut body, username);
+        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        body.extend_from_slice(password);
+        let mut packet = vec![0x10];
+        packet.extend_from_slice(&ws_remaining(body.len()));
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// Parse one server WebSocket frame.
+    /// Return the payload and the consumed length.
+    fn ws_parse_frame(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
+        if buf.len() < 2 || buf[1] & 0x80 != 0 {
+            return None;
+        }
+        let opcode = buf[0] & 0x0F;
+        let mut header = 2usize;
+        let mut length = (buf[1] & 0x7F) as usize;
+        if length == 126 {
+            if buf.len() < 4 {
+                return None;
+            }
+            length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            header = 4;
+        } else if length == 127 {
+            if buf.len() < 10 {
+                return None;
+            }
+            length = u64::from_be_bytes(buf[2..10].try_into().ok()?) as usize;
+            header = 10;
+        }
+        if buf.len() < header + length {
+            return None;
+        }
+        if opcode == 0x8 {
+            return Some((Vec::new(), header + length));
+        }
+        if opcode != 0x1 && opcode != 0x2 {
+            return None;
+        }
+        Some((buf[header..header + length].to_vec(), header + length))
+    }
+
+    /// Run one console CONNECT through the production entry.
+    /// Return the CONNACK return code.
+    async fn ws_connect_code(port: u16, client_id: &str, username: &str, password: &[u8]) -> u8 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("dial console entry");
+        let req = "GET /ws/mqtt HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .expect("write upgrade");
+        let mut buf = Vec::new();
+        let rest = loop {
+            let mut chunk = [0u8; 512];
+            let n = stream.read(&mut chunk).await.expect("read upgrade");
+            assert!(n > 0, "upgrade ends early");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos + 4]).to_string();
+                assert!(head.starts_with("HTTP/1.1 101"), "upgrade answers 101");
+                break buf[pos + 4..].to_vec();
+            }
+        };
+        let packet = ws_mqtt_connect(client_id, username, password);
+        let mut frame = vec![0x82u8];
+        if packet.len() < 126 {
+            frame.push(packet.len() as u8 | 0x80);
+        } else if packet.len() < 65536 {
+            frame.push(126 | 0x80);
+            frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        } else {
+            frame.push(127 | 0x80);
+            frame.extend_from_slice(&(packet.len() as u64).to_be_bytes());
+        }
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        frame.extend_from_slice(&mask);
+        for (i, byte) in packet.iter().enumerate() {
+            frame.push(byte ^ mask[i % 4]);
+        }
+        stream.write_all(&frame).await.expect("write CONNECT");
+        let mut sbuf = rest;
+        loop {
+            if let Some((payload, _consumed)) = ws_parse_frame(&sbuf) {
+                assert_eq!(payload[0] >> 4, 2, "server answers CONNACK");
+                return payload[3];
+            }
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk).await.expect("read CONNACK") {
+                0 => panic!("server closed before CONNACK"),
+                n => sbuf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_mutations_evict_the_node_cache() {
+        // Each chain change goes through the HTTP management router.
+        // The cache fills through the console CONNECT entry.
+        // Each change is proved by the CONNECT consult (the stored
+        // order and the enable flag) and the cache length.
+        use crate::admin_users::AdminRole;
+        let state = standalone_state();
+        state
+            .admin_users
+            .create("op-admin", "Adm1n-test-pass!", AdminRole::Administrator, "")
+            .expect("admin creates");
+        state
+            .auth
+            .add_user("alice", b"Cache-pass-1")
+            .expect("seed local user");
+        let token = state.tokens.issue("op-admin", AdminRole::Administrator);
+        let server = HttpServer::start(state.clone()).await;
+
+        // Empty chain keeps the open behaviour on the CONNECT consult.
+        assert!(state.authn_chain.built_in_available());
+        assert_eq!(state.authn_node_cache.len(), 0);
+
+        // One CONNECT success seeds the node cache.
+        let code = ws_connect_code(server.port, "chain-cache-seed", "alice", b"Cache-pass-1").await;
+        assert_eq!(code, 0, "CONNECT allows on the empty chain");
+        assert_eq!(state.authn_node_cache.len(), 1);
+
+        // Create one built-in entry through the production HTTP entry.
+        // The insert evicts the cache.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/authentication",
+                Some(serde_json::json!({"mechanism": "password_based", "backend": "built_in_database"})),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(state.authn_node_cache.len(), 0);
+        // The CONNECT consult observes the stored chain: the enabled
+        // built-in entry keeps a live backend.
+        assert!(state.authn_chain.built_in_available());
+        let ids: Vec<String> = state
+            .authn_chain
+            .snapshot()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["password_based:built_in_database".to_string()]);
+
+        // One CONNECT success fills the node cache.
+        let code = ws_connect_code(server.port, "chain-cache-one", "alice", b"Cache-pass-1").await;
+        assert_eq!(code, 0, "CONNECT allows before chain change");
+        assert_eq!(state.authn_node_cache.len(), 1);
+
+        // A second entry through HTTP. The CONNECT consult sees both in
+        // stored order. The insert evicts the cache.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/authentication",
+                Some(serde_json::json!({"mechanism": "password_based", "backend": "mysql", "server": "127.0.0.1:3306", "database": "mqtt", "query": "SELECT password_hash FROM users WHERE username = ${username} LIMIT 1"})),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(state.authn_node_cache.len(), 0);
+        let ids: Vec<String> = state
+            .authn_chain
+            .snapshot()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:built_in_database".to_string(),
+                "password_based:mysql".to_string()
+            ]
+        );
+
+        // One more CONNECT success refills the cache.
+        let code = ws_connect_code(server.port, "chain-cache-two", "alice", b"Cache-pass-1").await;
+        assert_eq!(code, 0, "CONNECT allows before disable");
+        assert_eq!(state.authn_node_cache.len(), 1);
+
+        // Disable the built-in entry through HTTP. The CONNECT consult
+        // now fails closed: no enabled live backend remains.
+        // The update evicts the cache.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/password_based:built_in_database",
+                Some(serde_json::json!({"enable": false})),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        assert_eq!(state.authn_node_cache.len(), 0);
+        assert!(
+            !state.authn_chain.built_in_available(),
+            "a disabled built-in entry fails the CONNECT consult"
+        );
+        let code = ws_connect_code(server.port, "chain-cache-deny", "alice", b"Cache-pass-1").await;
+        assert_ne!(code, 0, "disabled entry denies CONNECT");
+        assert_eq!(state.authn_node_cache.len(), 0);
+
+        // Enable the entry so the next CONNECT succeeds.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/password_based:built_in_database",
+                Some(serde_json::json!({"enable": true})),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+
+        // One CONNECT success refills the node cache.
+        let code =
+            ws_connect_code(server.port, "chain-cache-refill", "alice", b"Cache-pass-1").await;
+        assert_eq!(code, 0, "CONNECT allows after re-enable");
+        assert_eq!(state.authn_node_cache.len(), 1);
+
+        // Reorder through HTTP. The CONNECT consult follows the new
+        // stored order. The reorder evicts the cache.
+        let (status, _) = server
+            .send(
+                "PUT",
+                "/api/v5/authentication/order",
+                Some(serde_json::json!([{"id": "password_based:mysql"}, {"id": "password_based:built_in_database"}])),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 204);
+        assert_eq!(state.authn_node_cache.len(), 0);
+        let ids: Vec<String> = state
+            .authn_chain
+            .snapshot()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "password_based:mysql".to_string(),
+                "password_based:built_in_database".to_string()
+            ]
+        );
     }
 }

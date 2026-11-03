@@ -419,6 +419,10 @@ pub struct MemoryAuth {
     /// cost). `Arc` so the async migration can hold an owned permit
     /// across the blocking task without borrowing `self`.
     migrate_gate: Arc<tokio::sync::Semaphore>,
+    /// `auth.superusers`: usernames that bypass ACL checks on publish and
+    /// subscribe. Checked before the stored ACL rules in both authorize
+    /// paths. Populated from the config root at boot.
+    superusers: RwLock<Vec<String>>,
 }
 
 impl std::fmt::Debug for MemoryAuth {
@@ -454,6 +458,7 @@ impl Default for MemoryAuth {
             verify_dedup_joins: std::sync::atomic::AtomicU64::new(0),
             verify_runs: std::sync::atomic::AtomicU64::new(0),
             migrate_gate: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_MIGRATIONS)),
+            superusers: RwLock::new(Vec::new()),
         }
     }
 }
@@ -943,6 +948,19 @@ impl MemoryAuth {
     /// denied ignored).
     pub fn set_authz_settings(&self, store: Arc<AuthzSettingsStore>) {
         self.authz_settings.store(Some(store));
+    }
+
+    /// `auth.superusers`: usernames that bypass ACL checks on publish and
+    /// subscribe. Set from the config root at boot. An empty list keeps
+    /// today's behaviour (no superusers).
+    pub fn set_superusers(&self, superusers: Vec<String>) {
+        *self.superusers.write() = superusers;
+    }
+
+    /// True when `identity` is a configured superuser and bypasses ACL
+    /// checks. One short read lock; called only on the authorize path.
+    pub fn is_superuser(&self, identity: &str) -> bool {
+        self.superusers.read().iter().any(|u| u == identity)
     }
 
     /// True when an unmatched rule scan allows. Unlinked state denies.
@@ -3104,6 +3122,11 @@ impl MemoryAuth {
         client_id: &str,
         topic: &Topic,
     ) -> Result<()> {
+        // Superusers bypass all ACL checks.
+        if self.is_superuser(client_id) {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
         let key = tenant_key(tenant);
         // The allow path avoids locks. It reads the source link
         // and the settings with lock-free loads. It counts verdicts
@@ -3188,6 +3211,11 @@ impl MemoryAuth {
         client_id: &str,
         filter: &TopicFilter,
     ) -> Result<()> {
+        // Superusers bypass all ACL checks.
+        if self.is_superuser(client_id) {
+            self.record_authz_verdict(true);
+            return Ok(());
+        }
         let key = tenant_key(tenant);
         let filter = filter.clone();
         if !is_default_tenant(key) && !is_valid_tenant_id(key) {

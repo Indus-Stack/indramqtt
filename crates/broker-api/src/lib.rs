@@ -19406,7 +19406,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
         assert!(body["message"].is_string());
         let (status, body) = server
             .get_auth(
@@ -19431,7 +19431,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
 
         // Malformed batches are client errors with the documented shape
         // and apply nothing.

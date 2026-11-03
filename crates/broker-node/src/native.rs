@@ -6250,4 +6250,111 @@ mod tests {
         assert_eq!(run.bytes, 600);
         assert!(run.reads <= 3, "reads for 600 bytes: {}", run.reads);
     }
+
+    /// MV-09a: built-in credential CONNECTs through a real TCP socket
+    /// for both protocol versions. A correct password connects with
+    /// CONNACK 0x00; a wrong password is refused with a non-zero
+    /// CONNACK code. The socket is the production entry, not the store.
+    #[tokio::test]
+    async fn mv09a_builtin_auth_over_tcp_accepts_and_refuses_v4_and_v5() {
+        use tokio::io::AsyncWriteExt as _;
+        let shared = test_shared();
+        shared
+            .auth
+            .add_user("sock-alice", b"sock-secret")
+            .expect("user stores");
+        let port = p2_tcp_listener(shared).await;
+
+        // v4 correct password connects.
+        let mut v4 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v4.write_all(&ws_test_connect_with_auth(
+            "sock-v4-ok",
+            "sock-alice",
+            b"sock-secret",
+        ))
+        .await
+        .expect("CONNECT sends");
+        assert_eq!(
+            tcp_test_recv(&mut v4).await,
+            vec![0x20, 0x02, 0x00, 0x00],
+            "v4 correct password connects"
+        );
+
+        // v4 wrong password is refused with a non-zero code.
+        let mut v4bad = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v4bad
+            .write_all(&ws_test_connect_with_auth(
+                "sock-v4-bad",
+                "sock-alice",
+                b"nope",
+            ))
+            .await
+            .expect("CONNECT sends");
+        let connack = tcp_test_recv(&mut v4bad).await;
+        assert_eq!(connack.len(), 4, "v4 refusal carries a CONNACK");
+        assert_ne!(connack[3], 0, "v4 wrong password is refused");
+
+        // v5 correct password connects through the same listener.
+        let mut v5 = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v5.write_all(&mv09a_v5_connect_with_auth(
+            "sock-v5-ok",
+            "sock-alice",
+            b"sock-secret",
+        ))
+        .await
+        .expect("CONNECT sends");
+        let connack = p2_tcp_recv_full(&mut v5).await;
+        assert!(
+            connack.len() >= 4 && connack[0] == 0x20,
+            "v5 refusal or accept carries a CONNACK, got: {connack:?}"
+        );
+        assert_eq!(
+            connack[3], 0x00,
+            "v5 correct password connects, got: {connack:?}"
+        );
+
+        // v5 wrong password is refused with a non-zero reason code.
+        let mut v5bad = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp dials");
+        v5bad
+            .write_all(&mv09a_v5_connect_with_auth(
+                "sock-v5-bad",
+                "sock-alice",
+                b"nope",
+            ))
+            .await
+            .expect("CONNECT sends");
+        let connack = p2_tcp_recv_full(&mut v5bad).await;
+        assert!(
+            connack.len() >= 4 && connack[0] == 0x20,
+            "v5 refusal carries a CONNACK, got: {connack:?}"
+        );
+        assert_ne!(connack[3], 0x00, "v5 wrong password is refused");
+    }
+
+    /// Builds an MQTT 5 CONNECT packet with username and password.
+    /// Property length is zero. The socket entry reads the same bytes
+    /// the production listener parses.
+    fn mv09a_v5_connect_with_auth(client_id: &str, username: &str, password: &[u8]) -> Vec<u8> {
+        let mut body = vec![
+            0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0xC2, 0x00, 0x3C, 0x00,
+        ];
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id.as_bytes());
+        body.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        body.extend_from_slice(username.as_bytes());
+        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        body.extend_from_slice(password);
+        let mut packet = vec![0x10];
+        broker_protocol::wire::encode_varint(body.len() as u32, &mut packet);
+        packet.extend_from_slice(&body);
+        packet
+    }
 }

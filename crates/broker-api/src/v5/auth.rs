@@ -1412,7 +1412,7 @@ pub async fn list_authn_users(
 /// most [`MAX_AUTHN_USERNAME_LEN`] bytes) and `password` (non-empty, at
 /// most [`MAX_PASSWORD_BYTES`] bytes); anything else fails with
 /// `BAD_REQUEST` in the documented `{code, message}` shape. A `user_id`
-/// that already exists fails with `ALREADY_EXISTS` instead of updating
+/// that already exists fails with `BAD_REQUEST` instead of updating
 /// in place; a map that already holds [`MAX_AUTHN_USERS`] entries fails
 /// with `BAD_REQUEST`. Unknown authenticator ids fail with `NOT_FOUND`;
 /// a known non-built-in backend fails with `BAD_REQUEST`. On success
@@ -1425,7 +1425,7 @@ pub async fn list_authn_users(
 /// keeps reading under short read locks and publish/deliver never touch
 /// this store.
 // A duplicate `user_id` is rejected, never overwritten. It answers
-// 400 ALREADY_EXISTS.
+// 400 BAD_REQUEST with the documented code.
 pub async fn create_authn_user(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1452,7 +1452,7 @@ pub async fn create_authn_user(
         Err(msg) => return ApiError::BadRequest(msg).into_response(),
     };
     if state.auth.has_user(&user_id) {
-        return ApiError::AlreadyExists(format!("user {user_id:?} already exists")).into_response();
+        return ApiError::BadRequest(format!("user {user_id:?} already exists")).into_response();
     }
     if state.auth.user_count() >= MAX_AUTHN_USERS {
         return ApiError::BadRequest(format!(
@@ -1471,8 +1471,11 @@ pub async fn create_authn_user(
         return mqtt_persist_error(error);
     }
     // A changed user invalidates cached authorization decisions so the
-    // next operation is re-authorized (AZ-02).
+    // next operation is re-authorized (AZ-02). It also evicts the node
+    // authentication cache for this user so a changed password or a
+    // revocation is observed on the next CONNECT.
     state.sessions.clear_all_authz_caches();
+    state.authn_node_cache.remove_user(&user_id);
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
@@ -1617,8 +1620,11 @@ pub async fn update_authn_user(
         return mqtt_persist_error(error);
     }
     // A changed password invalidates cached authorization decisions so
-    // the next operation is re-authorized (AZ-02).
+    // the next operation is re-authorized (AZ-02). It also evicts the
+    // node authentication cache for this user so the new credential is
+    // observed on the next CONNECT.
     state.sessions.clear_all_authz_caches();
+    state.authn_node_cache.remove_user(&user_id);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1680,8 +1686,11 @@ pub async fn delete_authn_user(
     match state.auth.remove_user(&user_id) {
         Ok(true) => {
             // A removed user invalidates cached authorization decisions
-            // so the next operation is re-authorized (AZ-02).
+            // so the next operation is re-authorized (AZ-02). It also
+            // evicts the node authentication cache for this user so a
+            // revoked credential is denied on the next CONNECT.
             state.sessions.clear_all_authz_caches();
+            state.authn_node_cache.remove_user(&user_id);
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => ApiError::NotFound(format!("user {user_id:?} not found")).into_response(),
@@ -1744,8 +1753,10 @@ pub async fn import_authn_users(
     match state.auth.import_users(batch) {
         Ok(summary) => {
             // Imported users invalidate cached authorization decisions so
-            // the next operation is re-authorized (AZ-02).
+            // the next operation is re-authorized (AZ-02). A batch may
+            // touch many names, so the node authentication cache resets.
             state.sessions.clear_all_authz_caches();
+            state.authn_node_cache.reset();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1761,7 +1772,7 @@ pub async fn import_authn_users(
         Err(ImportUsersError::Malformed(msg) | ImportUsersError::TooMany(msg)) => {
             ApiError::BadRequest(msg).into_response()
         }
-        Err(ImportUsersError::Duplicate(msg)) => ApiError::AlreadyExists(msg).into_response(),
+        Err(ImportUsersError::Duplicate(msg)) => ApiError::BadRequest(msg).into_response(),
         Err(ImportUsersError::Persist(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -2053,7 +2064,7 @@ mod authn_users_tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
+        assert_eq!(duplicate["code"], serde_json::json!("BAD_REQUEST"));
         assert!(duplicate["message"].is_string());
 
         // Malformed bodies are client errors.

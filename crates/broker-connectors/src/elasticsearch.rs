@@ -1173,6 +1173,11 @@ mod tests {
         assert!(matches!(err, ConnectorError::Connection(_)));
         assert_eq!(sink.buffered_rows(), 1);
         assert_eq!(transport.calls(), 1);
+        // The failure must engage real backoff from the broker.
+        assert!(
+            sink.backoff.lock().retry_after.is_some(),
+            "503 must engage backoff"
+        );
         // Backoff engaged: immediate retry fails fast, no new call.
         assert!(sink.flush().await.is_err());
         assert_eq!(transport.calls(), 1);
