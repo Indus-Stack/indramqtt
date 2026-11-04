@@ -2040,7 +2040,7 @@ impl AuthPolicyConf {
             return Err(invalid(
                 "auth.password_hash",
                 &self.password_hash,
-                "is not supported by this broker: must be one of sha256, bcrypt",
+                "must be one of sha256, bcrypt",
             ));
         }
         if self.superusers.len() > 100 {

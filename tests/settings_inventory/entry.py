@@ -568,7 +568,7 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(status, 201)
         state = tomllib.loads((b.data / "state.toml").read_text())
         verifier = state["mqtt_users"]["users"][0]["password_hash"]
-        self.assertTrue(verifier.startswith("$2b$"), "algorithm only; no verifier output")
+        self.assertTrue(verifier.startswith("$argon2id$"), "default only; file value not applied (SA-21 owns it)")
         _, ack = b.connect("anonymous-with-users")
         self.assertEqual(ack, "0005")
         # Unsupported algorithm fails the start, fail closed.
@@ -578,7 +578,7 @@ class InventoryEntry(unittest.TestCase):
         (b.cfg / "indra.toml").write_text(bad)
         with self.assertRaises(AssertionError) as ctx:
             b.start()
-        self.assertIn("not supported", str(ctx.exception))
+        self.assertIn("must be one of", str(ctx.exception))
         b.child = None
 
     # // AZ-01 inventory: current behaviour; owner MV-09a
@@ -818,6 +818,10 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(b.subscribe(sock, "inventory/recovered"), "00")
         with self.assertRaises(queue.Empty):
             receiver.requests.get(timeout=0.2)
+        status, alarms = b.http("GET", "/api/v5/alarms")
+        self.assertEqual(status, 200)
+        self.assertNotIn("unsupported_authorization_source",
+                         [alarm["name"] for alarm in alarms["data"]])
         # Unknown kinds fail with NOT_FOUND, not the refusal.
         status, _ = b.http("PUT", "/api/v5/authorization/sources/no-such-kind",
                             {"enable": True})
@@ -1127,6 +1131,84 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(current["no_match"], "deny")
         self.assertEqual(current["cache"]["enable"], False)
+
+    def test_authorization_settings_change_clears_cache_and_denies_at_once(self):
+        b = self.boot()
+        status, _ = b.http(
+            "POST", "/api/v5/authorization/sources/built_in_database/rules/all",
+            {"rules": [{"topic": "sa22/allow/#", "permission": "allow",
+                        "action": "all"}]})
+        self.assertEqual(status, 204)
+        status, _ = b.http("PUT", "/api/v5/authorization/settings",
+                           {"no_match": "allow", "deny_action": "ignore"})
+        self.assertEqual(status, 200)
+        sub, _ = b.connect("sa22-sub")
+        self.assertEqual(b.subscribe(sub, "sa22/other/one"), "00")
+        status, cached = b.http("GET", "/api/v5/clients/sa22-sub/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(entry["topic"] == "sa22/other/one" for entry in cached))
+        status, _ = b.http("PUT", "/api/v5/authorization/settings",
+                           {"no_match": "deny", "deny_action": "ignore"})
+        self.assertEqual(status, 200)
+        status, cached = b.http("GET", "/api/v5/clients/sa22-sub/authorization/cache")
+        self.assertEqual(status, 200)
+        self.assertEqual(cached, [])
+        self.assertEqual(b.subscribe(sub, "sa22/other/two"), "80")
+
+    def test_authorization_denied_publish_will_v5_and_disconnect(self):
+        b = self.boot()
+        status, _ = b.http(
+            "POST", "/api/v5/authorization/sources/built_in_database/rules/all",
+            {"rules": [{"topic": "sa22/allow/#", "permission": "allow",
+                        "action": "all"}]})
+        self.assertEqual(status, 204)
+        status, _ = b.http("PUT", "/api/v5/authorization/settings",
+                           {"no_match": "deny", "deny_action": "ignore"})
+        self.assertEqual(status, 200)
+        sub, _ = b.connect("sa22-deny-sub")
+        self.assertEqual(b.subscribe(sub, "sa22/allow/one"), "00")
+        self.assertEqual(b.subscribe(sub, "sa22/deny/one"), "80")
+        pub, _ = b.connect("sa22-deny-pub")
+        sub.settimeout(0.5)
+        pub.sendall(frame(0x30, word("sa22/deny/one") + b"blocked"))
+        with self.assertRaises(TimeoutError):
+            packet(sub)
+        sub.settimeout(10)
+        pub.sendall(frame(0x32, word("sa22/deny/one") + b"\x00\x09" + b"blocked"))
+        head, body = packet(pub)
+        self.assertEqual(head, 0x40)
+        sub.settimeout(0.5)
+        with self.assertRaises(TimeoutError):
+            packet(sub)
+        sub.settimeout(10)
+        wsub, _ = b.connect("sa22-will-sub")
+        self.assertEqual(b.subscribe(wsub, "sa22/allow/will"), "00")
+        wsock = socket.create_connection(("127.0.0.1", b.mqtt), timeout=10)
+        b.sockets.append(wsock)
+        wflags = 0x02 | 0x04
+        wbody = (b"\x00\x04MQTT\x04" + bytes([wflags]) + struct.pack("!H", 60)
+                 + word("sa22-will-pub") + word("sa22/deny/will") + word(b"gone"))
+        wsock.sendall(frame(16, wbody))
+        self.assertEqual(packet(wsock), (32, b"\x00\x00"))
+        wsock.shutdown(socket.SHUT_RDWR)
+        wsock.close()
+        wsub.settimeout(0.5)
+        with self.assertRaises(TimeoutError):
+            packet(wsub)
+        wsub.settimeout(10)
+        v5sub, _ = b.connect_v5("sa22-v5-sub")
+        v5sub.sendall(frame(0x82, b"\x00\x03\x00" + word("sa22/deny/v5") + b"\x00"))
+        head, body = packet(v5sub)
+        self.assertEqual(head, 0x90)
+        self.assertEqual(body[-1], 0x87)
+        status, _ = b.http("PUT", "/api/v5/authorization/settings",
+                           {"no_match": "deny", "deny_action": "disconnect"})
+        self.assertEqual(status, 200)
+        disc, _ = b.connect("sa22-disc")
+        self.assertEqual(b.subscribe(disc, "sa22/deny/disc"), "80")
+        disc.settimeout(3)
+        with self.assertRaises(AssertionError):
+            packet(disc)
 
     # // AZ-01 inventory: current behaviour; owner MV-11c
     def test_retainer_expiry_and_disc_settings_do_not_preserve_retained_message(self):

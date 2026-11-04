@@ -155,6 +155,20 @@ Read the rules of one client through the management API.
 curl -sf http://127.0.0.1:18083/api/v5/authorization/sources/built_in_database/rules/clients/press-02 -H "Authorization: Bearer $INDRA_API_KEY"
 ```
 
+## Authorization settings
+
+The broker reads `no_match` on each unmatched check. `deny` refuses the action. `allow` permits it. The broker reads `deny_action` on each denial. `ignore` drops the message. `disconnect` closes the connection with reason code 0x87.
+
+The broker caches each decision per client. `cache.enable` selects caching. `cache.max_size` bounds entries per client. `cache.ttl` bounds staleness. `cache.excludes` skips listed topics. Each rule, source, user, client or settings change clears the cache at once.
+
+Only the built-in database source runs. The broker refuses other kinds at create and update with 400. It stores nothing. Old stored sources stay unchanged. Each decision that reaches such a source is denied. The broker raises `unsupported_authorization_source`. The operator lists and deletes the record through the API. Delete clears the alarm when no such source remains.
+
+```sh no-test
+# Needs a running broker with an operator key. The docs test never starts one.
+curl -sf -X PUT http://127.0.0.1:18083/api/v5/authorization/settings -H "Authorization: Bearer $INDRA_API_KEY" -H "Content-Type: application/json" -d '{"no_match":"deny","deny_action":"ignore"}'
+curl -sf http://127.0.0.1:18083/api/v5/alarms -H "Authorization: Bearer $INDRA_API_KEY"
+```
+
 ## Limits
 
 - Catch-all rules hold at most 128 entries. Per-client rules hold at most 100000 entries. Per-user rules hold at most 100000 entries. Writes past a cap fail with an error.

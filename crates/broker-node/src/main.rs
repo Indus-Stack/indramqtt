@@ -3,7 +3,7 @@ use broker_auth::{
     AuthnChain, AuthnEntry, AuthnSettingsStore, AuthzNodeCache, AuthzSettingsStore,
     AuthzSourceRegistry, DbAuthSet, DbAuthSetConfig, JwksAuthenticator, JwksConfig,
     KerberosAuthenticator, KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth,
-    NodeAuthCache, PasswordAlgorithm, PasswordHashPolicy, WebhookAuth, WebhookConfig,
+    NodeAuthCache, WebhookAuth, WebhookConfig,
 };
 use broker_cluster::{
     ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
@@ -11457,25 +11457,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .auth
         .seed_from_registry(&shared.config)
         .map_err(|e| format!("seeding MQTT users from the config registry failed: {e}"))?;
-    // Authentication hashing policy: apply the configured algorithm
-    // (auth.password_hash: sha256 or bcrypt) to credentials created or
-    // changed from now on. Existing verifiers keep verifying. An algorithm
-    // this build does not support fails the start, fail closed.
-    let algorithm = match cfg.auth.password_hash.as_str() {
-        "sha256" => PasswordAlgorithm::Sha256Legacy,
-        "bcrypt" => PasswordAlgorithm::Bcrypt,
-        algorithm => {
-            return Err(format!(
-                "auth.password_hash {algorithm:?} is not supported by this broker"
-            )
-            .into());
-        }
-    };
-    let policy = PasswordHashPolicy {
-        default_algorithm: algorithm,
-        ..Default::default()
-    };
-    shared.auth.set_policy(policy);
+    // Authentication hashing policy stays at the compiled default
+    // (Argon2id for new verifiers, owned by SA-21). The file value is
+    // validated and stored only; this task applies nothing from it.
     // Superusers (MV-09a): apply the configured list from boot.
     // An empty list keeps current behaviour with no bypass.
     shared.auth.set_superusers(cfg.auth.superusers.clone());

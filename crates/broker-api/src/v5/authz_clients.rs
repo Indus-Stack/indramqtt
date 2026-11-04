@@ -43,7 +43,7 @@
 // TODO(parity): is the duplicate scope (clientid, topic, action), and is
 // an unknown client id on delete a NOT_FOUND or a CLIENTID_NOT_FOUND?
 // The rulebook does not decide either. The current choice rejects a
-// duplicate create as BAD_REQUEST. It answers unknown ids with NOT_FOUND.
+// duplicate create as ALREADY_EXISTS. It answers unknown ids with NOT_FOUND.
 // Shape note: the detail envelope carries the key (`clientid` or
 // `username`) plus `rules`. The replace body carries `rules`, with an
 // optional key that must match the path.
@@ -119,7 +119,7 @@ pub async fn list_client_rules(State(state): State<ApiState>, params: PageParams
 /// `POST /authorization/sources/built_in_database/rules/clients`: add one
 /// client-scoped rule. Returns 204 with no body, as the reference API
 /// documents. Malformed bodies fail with `BAD_REQUEST`; a rule for the same client id and
-/// topic scope fails with `BAD_REQUEST` instead of merging; a full
+/// topic scope fails with `ALREADY_EXISTS` instead of merging; a full
 /// table fails with `BAD_REQUEST`.
 ///
 /// The write persists across a restart through the config registry (the
@@ -145,7 +145,7 @@ pub async fn create_client_rule(State(state): State<ApiState>, body: Bytes) -> R
             StatusCode::NO_CONTENT.into_response()
         }
         Err(ClientRuleError::Duplicate) => {
-            ApiError::BadRequest("client rule already exists".to_string()).into_response()
+            ApiError::AlreadyExists("client rule already exists".to_string()).into_response()
         }
         Err(ClientRuleError::Full) => {
             ApiError::BadRequest("client rule table is full".to_string()).into_response()
@@ -509,7 +509,7 @@ pub async fn list_user_rules(State(state): State<ApiState>, params: PageParams) 
 /// `POST /authorization/sources/built_in_database/rules/users`: add one
 /// user-scoped rule. Returns 204 with no body, as the reference API
 /// documents. Malformed bodies fail with `BAD_REQUEST`; a rule for the same username and
-/// topic scope fails with `BAD_REQUEST` instead of merging; a full
+/// topic scope fails with `ALREADY_EXISTS` instead of merging; a full
 /// table fails with `BAD_REQUEST`.
 ///
 /// The write persists across a restart through the config registry (the
@@ -538,7 +538,7 @@ pub async fn create_user_rule(State(state): State<ApiState>, body: Bytes) -> Res
             StatusCode::NO_CONTENT.into_response()
         }
         Err(ClientRuleError::Duplicate) => {
-            ApiError::BadRequest("user rule already exists".to_string()).into_response()
+            ApiError::AlreadyExists("user rule already exists".to_string()).into_response()
         }
         Err(ClientRuleError::Full) => {
             ApiError::BadRequest("user rule table is full".to_string()).into_response()
@@ -987,7 +987,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(duplicate["code"], serde_json::json!("BAD_REQUEST"));
+        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
         assert!(duplicate["message"].is_string());
         let (status, listed, _) =
             parts(list_client_rules(State(state.clone()), params(1, 100)).await).await;
@@ -1523,7 +1523,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(duplicate["code"], serde_json::json!("BAD_REQUEST"));
+        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
         assert!(duplicate["message"].is_string());
         let (status, detail, _) = get_user_detail(&state, "w221-u").await;
         assert_eq!(status, StatusCode::OK);

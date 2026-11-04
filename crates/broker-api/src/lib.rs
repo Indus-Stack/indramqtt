@@ -9771,7 +9771,7 @@ mod tests {
             status, 400,
             "duplicate source must be rejected, got: {body}"
         );
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
 
         // Unknown source types are 404 with the documented shape.
         let (status, body) = server
@@ -10049,7 +10049,7 @@ mod tests {
             )
             .await;
         assert_eq!(status, 400);
-        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
 
         // Malformed bodies are rejected and store nothing new.
         for bad in [

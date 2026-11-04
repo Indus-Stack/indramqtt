@@ -100,7 +100,7 @@ enum CreateError {
 /// `POST /authorization/sources`: register one source. Returns 204 with
 /// no body, as the reference API documents. Malformed bodies fail with `BAD_REQUEST`; a
 /// `type` that names no documented source fails with `NOT_FOUND`; an
-/// already-stored `type` fails with `BAD_REQUEST` instead of merging;
+/// already-stored `type` fails with `ALREADY_EXISTS` instead of merging;
 /// a full registry fails with `BAD_REQUEST`.
 // TODO(parity): does the documented API reject a write that matches no
 // variant (a `redis` source without `cmd`, a `file` source without
@@ -125,7 +125,7 @@ pub async fn create_authz_source(State(state): State<ApiState>, body: Bytes) -> 
     // An already-stored kind stays a duplicate rejection. This also
     // covers a source that an older version stored.
     if state.authz_sources.get(&entry.source_type).is_some() {
-        return ApiError::BadRequest("authorization source already exists".to_string())
+        return ApiError::AlreadyExists("authorization source already exists".to_string())
             .into_response();
     }
     // Only the built-in database executes in this build; every other
@@ -144,7 +144,8 @@ pub async fn create_authz_source(State(state): State<ApiState>, body: Bytes) -> 
             StatusCode::NO_CONTENT.into_response()
         }
         Err(SourceInsertError::Duplicate) => {
-            ApiError::BadRequest("authorization source already exists".to_string()).into_response()
+            ApiError::AlreadyExists("authorization source already exists".to_string())
+                .into_response()
         }
         Err(SourceInsertError::Full) => {
             ApiError::BadRequest("authorization source registry is full".to_string())
@@ -603,11 +604,12 @@ fn parse_order_request(value: &serde_json::Value) -> Result<Vec<String>, String>
 /// source is refused with `BAD_REQUEST` instead of leaving
 /// authorization open. On success returns 204 with no body. The removal
 /// persists across a restart through the config registry and the
-/// publish/subscribe consults honour it from the next verdict.
-/// Management-plane only for the write: one short registry write lock
-/// per request (plus the registry save lock on persist); the publish
-/// and subscribe consults load the lock-free order snapshot and never
-/// take this handler's lock.
+/// publish/subscribe consults honour it from the next verdict. When no
+/// unsupported source remains, the `unsupported_authorization_source`
+/// alarm clears for the default tenant. Management-plane only for the
+/// write: one short registry write lock per request (plus the registry
+/// save lock on persist); the publish and subscribe consults load the
+/// lock-free order snapshot and never take this handler's lock.
 // TODO(parity): is "last" the last entry of any kind, or the last
 // enabled entry / last live backend? The rulebook does not decide the
 // exact refusal set; the current choice refuses deleting the sole
@@ -620,6 +622,20 @@ pub async fn delete_authz_source(
     match state.authz_sources.remove(&source_type) {
         Ok(_) => {
             state.sessions.clear_all_authz_caches();
+            // Clear the D2 alarm when no unsupported source remains: an
+            // operator that deletes the last such source sees the alarm
+            // clear at once (SA-22 item 5).
+            let has_unsupported = state
+                .authz_sources
+                .list()
+                .iter()
+                .any(|entry| entry.source_type != "built_in_database");
+            if !has_unsupported {
+                state.alarms.deactivate_in_tenant(
+                    broker_auth::DEFAULT_TENANT_ID,
+                    "unsupported_authorization_source",
+                );
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Err(broker_auth::SourceRemoveError::NotFound) => {
@@ -1235,7 +1251,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(duplicate["code"], serde_json::json!("BAD_REQUEST"));
+        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
         assert!(duplicate["message"].is_string());
 
         // The built-in entry itself cannot be re-registered either.
@@ -1248,7 +1264,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(duplicate["code"], serde_json::json!("BAD_REQUEST"));
+        assert_eq!(duplicate["code"], serde_json::json!("ALREADY_EXISTS"));
 
         // Malformed bodies are client errors and apply nothing.
         for bad in [

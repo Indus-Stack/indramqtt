@@ -1278,7 +1278,7 @@ sock = socket.create_connection(("127.0.0.1", port), timeout=5)
 sock.sendall(frame(16, b"\x00\x04MQTT\x04\x02\x00\x3c" + word("refusal-anon")))
 head, ack = packet(sock)
 sock.close()
-sys.exit(0 if head == 32 and ack != b"\x02\x00\x00" else 1)
+sys.exit(0 if head == 32 and ack == b"\x00\x05" else 1)
 PY
     check "an anonymous CONNECT is refused when allow_anonymous is false" $?
 else

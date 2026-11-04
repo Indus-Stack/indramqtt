@@ -1489,7 +1489,9 @@ impl Session {
     /// of its write time. An expired match is removed and reads as a
     /// miss; other expired entries stay until a later lookup, trim or
     /// clear (the read filters them, the cap bounds them).
-    /// One short per-session write lock on the authorize event only.
+    /// A hit takes only a read lock; only an expired entry takes a
+    /// write lock to remove it. The publish path thus pays no write
+    /// lock on a hit (SA-22 item 7).
     pub fn cached_authz_verdict(
         &self,
         action: &str,
@@ -1499,17 +1501,34 @@ impl Session {
         ttl_ms: u64,
     ) -> Option<bool> {
         let now = now_ms();
+        // Fast path: read lock covers the hit. A fresh entry returns
+        // without ever taking the write lock.
+        {
+            let cache = self.authz_cache.read();
+            let entry = cache.iter().find(|entry| {
+                entry.action == action
+                    && entry.topic == topic
+                    && entry.qos == qos
+                    && entry.retain == retain
+            })?;
+            if now.saturating_sub(entry.updated_ms) <= ttl_ms {
+                return Some(entry.allow);
+            }
+        }
+        // Slow path: the entry exists but is stale. Take the write
+        // lock once to remove it, then report a miss.
         let mut cache = self.authz_cache.write();
-        let pos = cache.iter().position(|entry| {
+        if let Some(pos) = cache.iter().position(|entry| {
             entry.action == action
                 && entry.topic == topic
                 && entry.qos == qos
                 && entry.retain == retain
-        })?;
-        if now.saturating_sub(cache[pos].updated_ms) <= ttl_ms {
-            return Some(cache[pos].allow);
+        }) {
+            if now.saturating_sub(cache[pos].updated_ms) <= ttl_ms {
+                return Some(cache[pos].allow);
+            }
+            cache.remove(pos);
         }
-        cache.remove(pos);
         None
     }
 
