@@ -109,6 +109,11 @@ latency_buckets = "7ms, 70ms, 700ms"
 url = "http://127.0.0.1:9199"
 interval = "31s"
 
+# Offline bound (MV-11c). The file value seeds the live cap at boot.
+# The smoke value differs from the default, so the check observes it.
+[session]
+max_offline_queue = 7
+
 # A client with a username goes into the tenant of that username.
 [[tenants.rules]]
 expression = "t-\${username}"
@@ -501,6 +506,33 @@ for line in text.splitlines():
 report("the metrics exposition serves live counters over HTTP",
        status == 200 and ctype.startswith("text/plain")
        and received is not None and received >= 1)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+
+# --- 4d2. The file offline bound is in operation at boot ---
+# The file sets session.max_offline_queue to 7. The kernel installs
+# the value into the live manager at boot. The check reads
+# global_zone over HTTP. It proves the file value drives the live
+# cap.
+python3 - "$API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, sys, urllib.request
+port, key = sys.argv[1], sys.argv[2]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def api(path):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/v5{path}",
+        headers={"Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=5) as res:
+        return res.status, json.loads(res.read().decode())
+status, body = api("/configs/global_zone")
+mqueue = (body.get("mqtt") or {}).get("max_mqueue_len")
+report("session.max_offline_queue from indra.toml is the live max_mqueue_len in global_zone",
+       status == 200 and mqueue == 7)
 sys.exit(1 if failures else 0)
 PY
 [ $? = 0 ] || failures=$((failures + 1))

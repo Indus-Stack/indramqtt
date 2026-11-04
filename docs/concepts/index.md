@@ -77,7 +77,7 @@ level = "warn"
 allow_anonymous = true
 
 [session]
-max_offline_queue = 10000
+max_offline_queue = 50000
 ```
 
 Subscribe to `docs/hello`. Publish `hello-docs` to it. The subscriber prints the payload.
@@ -116,7 +116,7 @@ hello-docs
 
 ## Limits
 
-- The offline queue holds at most 10000 messages per session by default. 10000 messages cover reconnect storms without drops. See `session.max_offline_queue` in the [settings reference](../reference/settings.md).
+- The offline queue holds at most 50000 messages per session by default. 50000 messages cover reconnect storms without drops. The file value applies at boot. See `session.max_offline_queue` in the [settings reference](../reference/settings.md).
 - Packets hold at most 1048576 bytes. 1 MiB matches the server limit. See `session.max_packet_size` in the [settings reference](../reference/settings.md).
 
 ## Next steps

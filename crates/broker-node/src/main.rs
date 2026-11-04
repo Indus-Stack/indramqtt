@@ -11343,6 +11343,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .sessions
         .set_max_qos1_spill(cfg.session.max_qos1_spill);
+    // MV-11c: apply the configured offline queue bound to the session
+    // manager before any edge binds. One atomic store at boot; detached
+    // durable sessions inherit it for buffering and restore, and the
+    // zone view reads the same live value. A kept zone value still wins
+    // when set. Resolves through the layers
+    // (`session.max_offline_queue`).
+    shared
+        .sessions
+        .set_max_offline_queue(Some(cfg.session.max_offline_queue as usize));
     // B4-05: apply the configured inbound topic-alias bound to the
     // session manager before any edge binds. One atomic store at boot;
     // future sessions inherit it at creation and advertise it in CONNACK.

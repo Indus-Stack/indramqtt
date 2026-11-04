@@ -1463,11 +1463,13 @@ class InventoryEntry(unittest.TestCase):
             self.assertEqual(b.http("GET", "/api/v5/listeners/" + identifier)[0], 404)
 
     # // AZ-01 inventory: current behaviour; owner MV-11c
+    # MV-11c now applies max_offline_queue at boot; the other two legs
+    # still record gaps (max_inflight_messages, keep_alive_grace).
     def test_file_session_limits_do_not_set_live_bounds(self):
         b = self.boot(extra="[session]\nmax_offline_queue=1\nmax_inflight_messages=1\nkeep_alive_grace=3.0\n")
         status, actual = b.http("GET", "/api/v5/configs/global_zone")
         self.assertEqual(status, 200)
-        self.assertEqual(actual["mqtt"]["max_mqueue_len"], 10000)
+        self.assertEqual(actual["mqtt"]["max_mqueue_len"], 1)
         self.assertEqual(actual["mqtt"]["max_inflight"], 100)
         self.assertEqual(actual["mqtt"]["keepalive_multiplier"], 1.5)
         for key in ["max_offline_queue", "max_inflight_messages", "keep_alive_grace"]:
