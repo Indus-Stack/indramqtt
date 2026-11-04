@@ -3446,6 +3446,117 @@ mod tests {
         assert_eq!(body["code"], json!("NOT_FOUND"));
     }
 
+    /// Honest markers of deferred functions (MV-15): gateways, schema
+    /// validations, OpenTelemetry export and cluster links. Reads answer
+    /// the documented shape with a true empty or disabled state. Writes
+    /// refuse with the documented 400 code. Nothing is stored, so a
+    /// second read shows the same empty state.
+    #[tokio::test]
+    async fn test_deferred_features_are_honest() {
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+
+        // Gateways read empty; the console gateway page loads this list.
+        let (status, body) = server.get_auth("/api/v5/gateways", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, body) = server.get_auth("/api/v5/gateways/stomp", &token).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, body) = server
+            .put_auth("/api/v5/gateways/stomp", json!({"enable": true}), &token)
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        assert!(body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not available")));
+        let (status, body) = server
+            .put_auth("/api/v5/gateways/stomp/enable/true", json!({}), &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // A refused write stores nothing: the list still reads empty.
+        let (status, body) = server.get_auth("/api/v5/gateways", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // Schema validations read empty; writes refuse with the
+        // documented codes and store nothing.
+        let (status, body) = server.get_auth("/api/v5/schema_validations", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/schema_validations",
+                json!({"name": "mv15-v1", "strategy": "all_pass", "failure_action": "drop", "checks": [], "topics": "mv15/t"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("ALREADY_EXISTS"));
+        let (status, body) = server
+            .put_auth(
+                "/api/v5/schema_validations",
+                json!({"name": "mv15-v1", "strategy": "all_pass", "failure_action": "drop", "checks": [], "topics": "mv15/t"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .get_auth("/api/v5/schema_validations/validation/mv15-v1", &token)
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        let (status, _) = server
+            .delete_auth("/api/v5/schema_validations/validation/mv15-v1", &token)
+            .await;
+        assert_eq!(status, 404);
+        let (status, body) = server.get_auth("/api/v5/schema_validations", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+
+        // OpenTelemetry reads disabled; the write refuses and stores
+        // nothing.
+        let (status, body) = server.get_auth("/api/v5/opentelemetry", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["type"], json!("generic"));
+        assert_eq!(body["logs"]["enable"], json!(false));
+        assert_eq!(body["metrics"]["enable"], json!(false));
+        assert_eq!(body["traces"]["enable"], json!(false));
+        let (status, refused) = server
+            .put_auth(
+                "/api/v5/opentelemetry",
+                json!({"metrics": {"enable": true}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(refused["code"], json!("BAD_REQUEST"));
+        // A refused write stores nothing: the read still shows disabled.
+        let (status, reread) = server.get_auth("/api/v5/opentelemetry", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(reread, body);
+
+        // Cluster links read empty; the write refuses and stores nothing.
+        let (status, body) = server.get_auth("/api/v5/cluster/links", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+        let (status, body) = server
+            .post_auth(
+                "/api/v5/cluster/links",
+                json!({"name": "mv15-link", "server": "127.0.0.1:1883"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server.get_auth("/api/v5/cluster/links", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!([]));
+    }
+
     #[tokio::test]
     async fn test_rules_crud_lifecycle() {
         let (server, _state) = TestServer::start().await;
@@ -15094,14 +15205,16 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
 
     #[tokio::test]
     async fn removed_gateway_routes_return_404() {
+        // MV-15 owns `GET /gateways`, `GET+PUT /gateways/{name}` and
+        // `PUT /gateways/{name}/enable/{enable}` as honest markers: the
+        // list reads `[]`, an unknown name misses with 404, and writes
+        // refuse. The deeper per-gateway sub-resources stay removed.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in [
-            "/api/v5/gateways",
-            "/api/v5/gateways/stomp",
-            "/api/v5/gateways/stomp/clients/c1",
-            "/api/v5/gateway",
-        ] {
+        let (status, body) = server.get_auth("/api/v5/gateways", &token).await;
+        assert_eq!(status, 200, "honest route GET /gateways must be 200");
+        assert_eq!(body, json!([]));
+        for path in ["/api/v5/gateways/stomp/clients/c1", "/api/v5/gateway"] {
             let (status, _) = server
                 .request_raw(&format!(
                     "GET {path} HTTP/1.0\r\nHost: test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
@@ -18402,14 +18515,18 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
     #[tokio::test]
     async fn removed_schema_registry_routes_return_404() {
         // W3-37 owns `GET+POST /schema_registry` and
-        // `DELETE /schema_registry/:name`. The validation routes stay
-        // removed until their own task lands.
+        // `DELETE /schema_registry/:name`. MV-15 owns the validation
+        // list, create, replace and detail reads as honest markers; the
+        // per-validation metrics sub-route stays removed.
         let (server, _state) = TestServer::start().await;
         let token = server.login_as_admin().await;
-        for path in [
-            "/api/v5/schema_validations",
-            "/api/v5/schema_validations/validation/x/metrics",
-        ] {
+        let (status, body) = server.get_auth("/api/v5/schema_validations", &token).await;
+        assert_eq!(
+            status, 200,
+            "honest route GET /schema_validations must be 200"
+        );
+        assert_eq!(body, json!([]));
+        for path in ["/api/v5/schema_validations/validation/x/metrics"] {
             let (status, _) = server.get_auth(path, &token).await;
             assert_eq!(status, 404, "removed route {path} must be 404");
         }

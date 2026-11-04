@@ -356,6 +356,109 @@ pub async fn get_node_eviction_status() -> Response {
         .into_response()
 }
 
+/// `GET /gateways`: empty list. The broker runs no protocol gateways.
+/// The console gateway page loads this list first.
+pub async fn list_gateways() -> Response {
+    (StatusCode::OK, Json(serde_json::json!([]))).into_response()
+}
+
+/// `GET /gateways/{name}`: miss. Nothing is stored, so each name is
+/// unknown.
+pub async fn get_gateway(Path(name): Path<String>) -> Response {
+    ApiError::NotFound(format!("gateway {name:?} not found")).into_response()
+}
+
+/// `PUT /gateways/{name}`: refused. The broker runs no protocol
+/// gateways. The code is the documented 400 code of this operation.
+pub async fn update_gateway(Path(_name): Path<String>) -> Response {
+    ApiError::BadRequest("protocol gateways are not available in this broker".to_string())
+        .into_response()
+}
+
+/// `PUT /gateways/{name}/enable/{enable}`: miss. Nothing is stored, so
+/// each name is unknown. The operation documents 404 for unknown
+/// names, so the miss is the honest answer.
+pub async fn set_gateway_enabled(Path((_name, _enable)): Path<(String, String)>) -> Response {
+    ApiError::NotFound("gateway not found".to_string()).into_response()
+}
+
+/// `GET /schema_validations`: empty list. The broker runs no message
+/// validations. The console validation page loads this list first.
+pub async fn list_schema_validations() -> Response {
+    (StatusCode::OK, Json(serde_json::json!([]))).into_response()
+}
+
+/// `POST /schema_validations`: refused. The broker runs no message
+/// validations. The code is the documented 400 code of this operation.
+pub async fn create_schema_validation() -> Response {
+    ApiError::AlreadyExists("schema validations are not available in this broker".to_string())
+        .into_response()
+}
+
+/// `PUT /schema_validations`: refused. The broker runs no message
+/// validations. The code is the documented 400 code of this operation.
+pub async fn update_schema_validation() -> Response {
+    ApiError::BadRequest("schema validations are not available in this broker".to_string())
+        .into_response()
+}
+
+/// `GET /schema_validations/validation/{name}`: miss. Nothing is
+/// stored, so each name is unknown.
+pub async fn get_schema_validation(Path(name): Path<String>) -> Response {
+    ApiError::NotFound(format!("schema validation {name:?} not found")).into_response()
+}
+
+/// `DELETE /schema_validations/validation/{name}`: miss. Nothing is
+/// stored, so each name is unknown and nothing is removed.
+pub async fn delete_schema_validation(Path(name): Path<String>) -> Response {
+    ApiError::NotFound(format!("schema validation {name:?} not found")).into_response()
+}
+
+/// Disabled OpenTelemetry config. Each value is the documented default:
+/// `type` defaults to `generic`, the exporter targets the documented
+/// loopback gRPC endpoint, and every signal stays off. The broker runs
+/// no exporter, so no signal can turn on. The console reads this route
+/// on the observability page.
+fn disabled_opentelemetry() -> serde_json::Value {
+    serde_json::json!({
+        "type": "generic",
+        "exporter": {
+            "endpoint": "http://localhost:4317",
+            "protocol": "grpc",
+            "headers": {},
+        },
+        "logs": { "enable": false },
+        "metrics": { "enable": false },
+        "traces": { "enable": false },
+    })
+}
+
+/// `GET /opentelemetry`: disabled config. The broker runs no exporter.
+pub async fn get_opentelemetry() -> Response {
+    (StatusCode::OK, Json(disabled_opentelemetry())).into_response()
+}
+
+/// `PUT /opentelemetry`: refused. The broker runs no exporter. The code
+/// is the documented 400 code of this operation.
+pub async fn put_opentelemetry() -> Response {
+    ApiError::BadRequest("opentelemetry is not available in this broker".to_string())
+        .into_response()
+}
+
+/// `GET /cluster/links`: empty list. A single node holds no cluster
+/// links. The console linking page loads this list first.
+pub async fn list_cluster_links() -> Response {
+    (StatusCode::OK, Json(serde_json::json!([]))).into_response()
+}
+
+/// `POST /cluster/links`: refused. Clustering stays out of the MVP, so
+/// a single node accepts no link. The code is the documented 400 code
+/// of this operation.
+pub async fn create_cluster_link() -> Response {
+    ApiError::BadRequest("cluster links are not available in this broker".to_string())
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +695,79 @@ mod tests {
         assert_eq!(body, serde_json::json!({ "status": "disabled" }));
     }
 
+    #[tokio::test]
+    async fn gateway_list_reads_empty_and_detail_misses() {
+        let (status, body) = read(list_gateways().await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]));
+        let (status, body) = read(get_gateway(Path("stomp".to_string())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn gateway_writes_refuse_or_miss() {
+        let (status, body) = read(update_gateway(Path("stomp".to_string())).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not available")),
+            "refusal names the missing function: {body}"
+        );
+        let (status, body) =
+            read(set_gateway_enabled(Path(("stomp".to_string(), "true".to_string()))).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn schema_validation_list_reads_empty_and_detail_misses() {
+        let (status, body) = read(list_schema_validations().await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]));
+        let (status, body) = read(get_schema_validation(Path("v1".to_string())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+        let (status, body) = read(delete_schema_validation(Path("v1".to_string())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], serde_json::json!("NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn schema_validation_writes_refuse_with_documented_codes() {
+        let (status, body) = read(create_schema_validation().await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], serde_json::json!("ALREADY_EXISTS"));
+        let (status, body) = read(update_schema_validation().await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn opentelemetry_reads_disabled_and_write_refuses() {
+        let (status, body) = read(get_opentelemetry().await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["type"], serde_json::json!("generic"));
+        assert_eq!(body["logs"]["enable"], serde_json::json!(false));
+        assert_eq!(body["metrics"]["enable"], serde_json::json!(false));
+        assert_eq!(body["traces"]["enable"], serde_json::json!(false));
+        let (status, body) = read(put_opentelemetry().await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+    }
+
+    #[tokio::test]
+    async fn cluster_links_list_reads_empty_and_write_refuses() {
+        let (status, body) = read(list_cluster_links().await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]));
+        let (status, body) = read(create_cluster_link().await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], serde_json::json!("BAD_REQUEST"));
+    }
+
     #[test]
     fn new_segments_have_scopes() {
         use crate::v5::api_keys::PathAccess;
@@ -625,6 +801,30 @@ mod tests {
         );
         assert_eq!(
             access_for_path("/api/v5/node_eviction/status"),
+            PathAccess::Scope("cluster_operations")
+        );
+        assert_eq!(
+            access_for_path("/api/v5/gateways"),
+            PathAccess::Scope("gateways")
+        );
+        assert_eq!(
+            access_for_path("/api/v5/gateways/stomp"),
+            PathAccess::Scope("gateways")
+        );
+        assert_eq!(
+            access_for_path("/api/v5/schema_validations"),
+            PathAccess::Scope("data_integration")
+        );
+        assert_eq!(
+            access_for_path("/api/v5/schema_validations/validation/v1"),
+            PathAccess::Scope("data_integration")
+        );
+        assert_eq!(
+            access_for_path("/api/v5/opentelemetry"),
+            PathAccess::Scope("monitoring")
+        );
+        assert_eq!(
+            access_for_path("/api/v5/cluster/links"),
             PathAccess::Scope("cluster_operations")
         );
     }

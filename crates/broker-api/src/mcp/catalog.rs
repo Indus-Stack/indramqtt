@@ -403,10 +403,10 @@ pub const TOOLSETS: &[ToolsetDef] = &[
         name: "gateways",
         description: "Protocol gateways.",
     },
-    // TODO(parity): the router exposes no gateway operation, so this
-    // set stays empty and `list_toolsets` omits it. Gateways are not
-    // in the MVP. Add the probe tool once gateway routes land, with a
-    // live check behind it.
+    // Decided (MV-15): the router exposes the gateway honest markers
+    // (list, detail, enable), so this set holds their tools. Gateways
+    // stay out of the MVP: the tools answer the same empty or refused
+    // states as the routes.
     ToolsetDef {
         name: "license",
         description: "Licence document and settings.",

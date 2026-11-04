@@ -1145,6 +1145,39 @@ pub fn protected_router() -> Router<ApiState> {
             "/node_eviction/status",
             get(empty_states::get_node_eviction_status),
         )
+        // Honest empty states for deferred functions (MV-15): protocol
+        // gateways, message schema validations, OpenTelemetry export and
+        // cluster links. Reads answer the documented shape with a true
+        // empty or disabled state. Writes refuse with the documented 400
+        // code. Nothing is stored. Management-plane only; publish and
+        // deliver never touch this module.
+        .route("/gateways", get(empty_states::list_gateways))
+        .route(
+            "/gateways/:name",
+            get(empty_states::get_gateway).put(empty_states::update_gateway),
+        )
+        .route(
+            "/gateways/:name/enable/:enable",
+            put(empty_states::set_gateway_enabled),
+        )
+        .route(
+            "/schema_validations",
+            get(empty_states::list_schema_validations)
+                .post(empty_states::create_schema_validation)
+                .put(empty_states::update_schema_validation),
+        )
+        .route(
+            "/schema_validations/validation/:name",
+            get(empty_states::get_schema_validation).delete(empty_states::delete_schema_validation),
+        )
+        .route(
+            "/opentelemetry",
+            get(empty_states::get_opentelemetry).put(empty_states::put_opentelemetry),
+        )
+        .route(
+            "/cluster/links",
+            get(empty_states::list_cluster_links).post(empty_states::create_cluster_link),
+        )
         // Tenant namespaces (TM-02, C17): the 16 `/mt/...` operations.
         // Reads serve live broker state per tenant; writes touch only the
         // managed registry plus the tenant credential rows. Auth and the

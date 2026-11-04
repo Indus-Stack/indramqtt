@@ -259,9 +259,10 @@ The code holds one exclusion table with a reason for each entry:
   not sign-in flows.
 - Console pages, assets, probes and the transport itself: these are
   not management operations.
-- Gateways: gateways are not in the MVP. The router exposes no gateway
-  operation, so the catalog holds no gateway tool and `list_toolsets`
-  omits the empty `gateways` set.
+- Gateways: gateways are not in the MVP. The router exposes the
+  gateway honest markers only (an empty list, an unknown-name miss and
+  refused writes), so the catalog holds those tools and `list_toolsets`
+  lists the `gateways` set.
 
 ## Limits
 

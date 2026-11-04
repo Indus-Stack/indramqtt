@@ -1985,8 +1985,9 @@ mod tests {
 
     /// `tools/list` with `toolsets=all` names each catalog tool exactly
     /// once, plus each custom tool once. Each catalog description names
-    /// its route. No tool carries the `gateways` toolset: gateways are
-    /// not in the MVP and the router exposes no gateway operation.
+    /// its route. The `gateways` toolset holds the honest markers: the
+    /// router exposes the gateway list, detail and enable routes with
+    /// empty or refused answers.
     #[tokio::test]
     async fn all_list_names_each_catalog_tool_once() {
         let (state, token) = keyed_state();
@@ -2029,8 +2030,8 @@ mod tests {
             assert_eq!(count, 1, "custom tool {custom} is listed once");
         }
         assert!(
-            !catalog().iter().any(|tool| tool.toolset == "gateways"),
-            "no gateway tool exists"
+            catalog().iter().any(|tool| tool.toolset == "gateways"),
+            "gateway honest markers are tools now"
         );
         let (_, body) = server
             .client
@@ -2048,7 +2049,7 @@ mod tests {
         let text = body["result"]["content"][0]["text"]
             .as_str()
             .expect("text content");
-        assert!(!text.contains("\"gateways\""), "empty set stays out");
+        assert!(text.contains("\"gateways\""), "gateway set is listed");
     }
 
     /// Every generated forwarding tool answers through the endpoint:

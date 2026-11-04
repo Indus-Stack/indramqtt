@@ -63,6 +63,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Edge flow-control telemetry**: the Prometheus series `indramqtt_credit_clamped_total`, `indramqtt_credit_exhausted_total` and `indramqtt_credit_received_total` are gone. The edge `Credit` frame and its counters go away with the edge path.
 
 ### Unstable- **Single sign-on**: the login endpoints of single sign-on answer the error that the reference API documents: 404 `BACKEND_NOT_FOUND` for `POST /sso/login/{backend}` and `POST /sso/saml/acs`, and 400 `BAD_REQUEST` for `GET /sso/oidc/callback` and `POST /sso/token_exchange`. The message says that single sign-on is not available in this release. The flows did not connect to an identity provider. The endpoints that store a backend stay.
+- **Deferred functions read honest states**: protocol gateways, message schema validations, OpenTelemetry export and cluster links are not in this release. Each list or config read answers the documented shape with a true empty or disabled state. Each write refuses with the documented 400 code. Nothing is stored. The schema registry itself stays: it stores and serves schemas.
 
 ### Security
 - **Client certificate roots**: a listener with client certificate verification on (`verify = "verify_peer"` or `verify_client_cert = true`) needs `cacertfile`. The configuration check refuses an empty value, and a secure listener does not start without a CA file. The broker no longer uses a built-in set of public authorities for client certificates.

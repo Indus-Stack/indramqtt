@@ -722,12 +722,15 @@ pub fn access_for_path(path: &str) -> PathAccess {
         | "sources_summary"
         | "source_types"
         | "schema_registry"
+        | "schema_validations"
         | "schemas"
         | "message_transformations" => PathAccess::Scope("data_integration"),
         "authentication" | "authorization" => PathAccess::Scope("access_control"),
         "gateways" => PathAccess::Scope("gateways"),
         "metrics" | "monitor" | "monitor_current" | "stats" | "alarms" | "trace" | "tracing"
-        | "slow_subscriptions" | "telemetry" | "prometheus" => PathAccess::Scope("monitoring"),
+        | "slow_subscriptions" | "telemetry" | "opentelemetry" | "prometheus" => {
+            PathAccess::Scope("monitoring")
+        }
         "nodes" | "load_rebalance" | "node_eviction" | "cluster" => {
             PathAccess::Scope("cluster_operations")
         }
