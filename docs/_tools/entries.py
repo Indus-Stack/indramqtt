@@ -25,6 +25,8 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --check --area rules-type-checks
   python3 docs/_tools/entries.py --write --area rules-arrays
   python3 docs/_tools/entries.py --check --area rules-arrays
+  python3 docs/_tools/entries.py --write --area rules-hashing
+  python3 docs/_tools/entries.py --check --area rules-hashing
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -1488,6 +1490,117 @@ def render_rules_arrays_page():
     return "\n".join(out) + "\n"
 
 
+# Display order of the DX2-010 function entries (hashing).
+RULES_HASHING_FUNCTIONS = [
+    "sha",
+    "hash",
+    "hash_to_range",
+    "map_to_range",
+]
+
+# One signature line per DX2-010 stem, taken from the broker code.
+RULES_HASHING_SYNTAX = {
+    "fn-sha": "`sha(<s>)`",
+    "fn-hash": "`hash(<algo>, <data>)`",
+    "fn-hash_to_range": "`hash_to_range(<key>, <min>, <max>)`",
+    "fn-map_to_range": "`map_to_range(<value>, <min>, <max>)`",
+}
+
+# Extra note lines per DX2-010 stem. Each states an observed limit.
+RULES_HASHING_NOTES = {
+    "fn-sha": [
+        "The digest is SHA-1 in lower-case hex. An empty text returns the empty digest.",
+        "A null value returns null. A wrong argument count returns null.",
+    ],
+    "fn-hash": [
+        "The name ignores case and edge space. Supported names are `md5`, `sha`, `sha1`, `sha224`, `sha256`, `sha384` and `sha512`.",
+        "Any other name fails closed. A null value returns null. A wrong argument count returns null.",
+    ],
+    "fn-hash_to_range": [
+        "The broker hashes the key with SHA-256 and returns `min` plus the remainder modulo the span (`max` minus `min` plus one).",
+        "An empty key, a non-text key, or a `min` above `max` returns null. A wrong argument count returns null.",
+    ],
+    "fn-map_to_range": [
+        "A number maps by its value modulo the span (`max` minus `min` plus one). A text maps by its first 16 bytes as an unsigned big-endian number modulo the span.",
+        "An empty text, a value that is not a number or text, or a `min` above `max` returns null. A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rules_hashing_page():
+    """Render the hashing function page (DX2-010)."""
+    out = [
+        "---",
+        "title: Rule functions: hashing",
+        "description: Verified entries for the hashing functions.",
+        "sidebar:",
+        "  order: 51",
+        "---",
+        "",
+        "# Rule functions: hashing",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A hashing function digests a value or maps a key into a range. "
+        "Use this page when a rule must hash a field or pick a shard. You "
+        "get one entry per function, each with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Txt["text value"] -- "sha or hash" --> Hex["hex digest"]',
+                '    Key["text key"] -- "hash_to_range" --> N["integer in range"]',
+                '    Val["number or text"] -- "map_to_range" --> M["integer in range"]',
+                '    Hex -- "SELECT AS" --> Sel["result column"]',
+                '    N -- "SELECT AS" --> Sel',
+                '    M -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A wrong argument count reads as null. A value the call cannot "
+        "use reads as null. A null value never stops the rule.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_HASHING_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` hashes a value."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_HASHING_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_HASHING_SYNTAX,
+            RULES_HASHING_NOTES,
+            "`{name}` hashes a value.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -1726,6 +1839,32 @@ def main(argv):
                 )
                 return 1
             print("entries match: docs/rules/functions-arrays.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-hashing":
+        fresh = render_rules_hashing_page()
+        path = ROOT / "docs" / "rules" / "functions-hashing.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-hashing.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-hashing.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-hashing.md")
             return 0
         parser.print_help()
         return 2

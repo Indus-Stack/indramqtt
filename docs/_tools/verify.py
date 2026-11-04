@@ -424,6 +424,15 @@ DX2_009_ITEMS = {
 }
 
 
+# Rule function stems owned by DX2-010 (hashing).
+DX2_010_ITEMS = {
+    "fn-sha",
+    "fn-hash",
+    "fn-hash_to_range",
+    "fn-map_to_range",
+}
+
+
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
     if item.startswith(("clause-", "op-")):
@@ -440,6 +449,8 @@ def failure_marker(item):
         return "DX2-006"
     if item in DX2_009_ITEMS:
         return "DX2-009"
+    if item in DX2_010_ITEMS:
+        return "DX2-010"
     return "DX-01"
 
 
