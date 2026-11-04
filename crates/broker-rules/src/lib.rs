@@ -6,7 +6,7 @@ use broker_protocol::{QoS, Topic, TopicFilter};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use rekuiper_core::{RuleCounters, StreamBus, StreamReceiver, StreamSender};
-use rekuiper_sql::{Evaluator, SelectStmt, TimeUnit, WindowDef};
+use rekuiper_sql::{Evaluator, Expr, SelectStmt, TimeUnit, WindowDef};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -4774,6 +4774,192 @@ fn apply_implicit_group_window(stmt: &mut SelectStmt) {
     });
 }
 
+/// Function names the broker never serves (the deferred schema-registry
+/// family, out of the MVP). A static call fails rule creation with
+/// `InvalidRule` naming the function; the API answers 400.
+const REFUSED_SQL_FUNCTIONS: &[&str] = &["schema_encode", "schema_decode"];
+
+/// True when `expr` is a string literal; returns its text.
+fn literal_text(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(serde_json::Value::String(text)) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// Reject one call that the broker statically knows it cannot serve:
+/// a deferred function name, a D4 hash algorithm literal or a D4 named-zone
+/// literal. Dynamic (non-literal) arguments skip this check and fail closed
+/// at execution instead, where the run counts as failed.
+fn check_one_call(name: &str, args: &[Expr]) -> Result<(), String> {
+    let lower = name.to_ascii_lowercase();
+    if REFUSED_SQL_FUNCTIONS.contains(&lower.as_str()) {
+        return Err(format!("unsupported function {name:?} (field `sql_query`)"));
+    }
+    if lower == "hash" {
+        if let Some(algo) = args.first().and_then(literal_text) {
+            if stdlib::refused_hash_algorithm(algo) {
+                return Err(format!(
+                    "unsupported hash algorithm {algo:?} (field `sql_query`)"
+                ));
+            }
+        }
+    }
+    if lower == "timezone_to_second" || lower == "timezone_to_offset_seconds" {
+        if let Some(zone) = args.first().and_then(literal_text) {
+            if stdlib::is_named_zone(zone) {
+                return Err(format!(
+                    "unsupported time zone {zone:?} (field `sql_query`)"
+                ));
+            }
+        }
+    }
+    if lower == "date_to_unix_ts" && args.len() == 4 {
+        if let Some(zone) = args.get(1).and_then(literal_text) {
+            if stdlib::is_named_zone(zone) {
+                return Err(format!(
+                    "unsupported time zone {zone:?} (field `sql_query`)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk one expression and refuse every statically unsupported call inside
+/// it. Window definitions carry no calls and need no walk.
+fn check_expr_calls(expr: &Expr) -> Result<(), String> {
+    match expr {
+        Expr::Call { name, args } => {
+            check_one_call(name, args)?;
+            for arg in args {
+                check_expr_calls(arg)?;
+            }
+            Ok(())
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_expr_calls(left)?;
+            check_expr_calls(right)
+        }
+        Expr::UnaryOp { expr, .. } => check_expr_calls(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            check_expr_calls(expr)?;
+            check_expr_calls(low)?;
+            check_expr_calls(high)
+        }
+        Expr::InList { expr, list, .. } => {
+            check_expr_calls(expr)?;
+            for item in list {
+                check_expr_calls(item)?;
+            }
+            Ok(())
+        }
+        Expr::IsNull { expr, .. } => check_expr_calls(expr),
+        Expr::FieldAccess { parent, .. } => check_expr_calls(parent),
+        Expr::Index { base, index } => {
+            check_expr_calls(base)?;
+            check_expr_calls(index)
+        }
+        Expr::Slice { base, lo, hi } => {
+            check_expr_calls(base)?;
+            if let Some(lo) = lo {
+                check_expr_calls(lo)?;
+            }
+            if let Some(hi) = hi {
+                check_expr_calls(hi)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                check_expr_calls(operand)?;
+            }
+            for (cond, result) in when_clauses {
+                check_expr_calls(cond)?;
+                check_expr_calls(result)?;
+            }
+            if let Some(other) = else_clause {
+                check_expr_calls(other)?;
+            }
+            Ok(())
+        }
+        Expr::Over {
+            call, partition_by, ..
+        } => {
+            check_expr_calls(call)?;
+            if let Some(partition_by) = partition_by {
+                check_expr_calls(partition_by)?;
+            }
+            Ok(())
+        }
+        Expr::Wildcard | Expr::WildcardModified { .. } | Expr::Identifier(_) | Expr::Literal(_) => {
+            Ok(())
+        }
+    }
+}
+
+/// Refuse every statically unsupported call in one parsed rule. The walk
+/// covers the SELECT list, WHERE, GROUP BY, HAVING, ORDER BY, JOIN ON,
+/// window filter, trigger, partition, UNION branches and FOREACH plan. A
+/// refusal names the function, algorithm or zone so the API can answer 400
+/// with it. Dynamic values are not literals and stay for execution, where
+/// they fail closed and count as a failed run.
+fn refuse_unsupported_sql_calls(
+    stmt: &SelectStmt,
+    foreach: Option<&ForeachPlan>,
+) -> Result<(), String> {
+    for field in &stmt.fields {
+        check_expr_calls(field)?;
+    }
+    if let Some(where_clause) = stmt.where_clause.as_ref() {
+        check_expr_calls(where_clause)?;
+    }
+    for item in &stmt.group_by {
+        check_expr_calls(item)?;
+    }
+    if let Some(having) = stmt.having.as_ref() {
+        check_expr_calls(having)?;
+    }
+    for item in &stmt.order_by {
+        check_expr_calls(&item.expr)?;
+    }
+    for join in &stmt.joins {
+        if let Some(on) = join.on.as_ref() {
+            check_expr_calls(on)?;
+        }
+    }
+    if let Some(filter) = stmt.window_filter.as_ref() {
+        check_expr_calls(filter)?;
+    }
+    if let Some(trigger) = stmt.window_trigger_condition.as_ref() {
+        check_expr_calls(trigger)?;
+    }
+    if let Some(partition) = stmt.window_partition_by.as_ref() {
+        check_expr_calls(partition)?;
+    }
+    if let Some((_, next)) = stmt.set_op.as_ref() {
+        refuse_unsupported_sql_calls(next, None)?;
+    }
+    if let Some(plan) = foreach {
+        check_expr_calls(&plan.array)?;
+        if let Some(fields) = plan.fields.as_ref() {
+            for (expr, _) in fields {
+                check_expr_calls(expr)?;
+            }
+        }
+        if let Some(incase) = plan.incase.as_ref() {
+            check_expr_calls(incase)?;
+        }
+    }
+    Ok(())
+}
+
 /// Parse one rule SQL string through the standard front end first, with a
 /// fallback to the streaming parser for rekuiper-only syntax beyond the
 /// standard window extension.
@@ -4798,6 +4984,8 @@ fn parse_rule_sql(sql: &str) -> Result<ParsedStdRule, RuleEngineError> {
             if std_rule.foreach.is_none() {
                 apply_implicit_group_window(&mut stmt);
             }
+            refuse_unsupported_sql_calls(&stmt, std_rule.foreach.as_ref())
+                .map_err(RuleEngineError::InvalidRule)?;
             Ok((
                 stmt,
                 std_rule.foreach.clone(),
@@ -4811,6 +4999,8 @@ fn parse_rule_sql(sql: &str) -> Result<ParsedStdRule, RuleEngineError> {
             match rekuiper_sql::Parser::new(&normalized).parse_select() {
                 Ok(mut stmt) => {
                     apply_implicit_group_window(&mut stmt);
+                    refuse_unsupported_sql_calls(&stmt, None)
+                        .map_err(RuleEngineError::InvalidRule)?;
                     let (has_wildcard, explicit_keys) = projection_metadata(&stmt);
                     Ok((stmt, None, Vec::new(), has_wildcard, explicit_keys))
                 }
@@ -5463,6 +5653,7 @@ fn parse_rule_sql_for_tester(sql: &str) -> Result<ParsedStdRule, String> {
             if std_rule.foreach.is_none() {
                 apply_implicit_group_window(&mut stmt);
             }
+            refuse_unsupported_sql_calls(&stmt, std_rule.foreach.as_ref())?;
             Ok((
                 stmt,
                 std_rule.foreach.clone(),
@@ -5476,6 +5667,7 @@ fn parse_rule_sql_for_tester(sql: &str) -> Result<ParsedStdRule, String> {
             match rekuiper_sql::Parser::new(&normalized).parse_select() {
                 Ok(mut stmt) => {
                     apply_implicit_group_window(&mut stmt);
+                    refuse_unsupported_sql_calls(&stmt, None)?;
                     let (has_wildcard, explicit_keys) = projection_metadata(&stmt);
                     Ok((stmt, None, Vec::new(), has_wildcard, explicit_keys))
                 }

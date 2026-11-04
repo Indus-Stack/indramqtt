@@ -15,6 +15,7 @@
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic, TopicFilter};
 use broker_rules::stdlib::ensure_stdlib_registered;
+use broker_rules::stdlib::jq_timeout_count;
 use broker_rules::{BackpressurePolicy, BrokerSink, RuleAction, RuleEngine, RuleEngineError};
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -1612,4 +1613,333 @@ async fn std_broker_path_colliding() {
     assert_eq!(row.get("b64"), Some(&s("aGVsbG8")));
     assert_eq!(row.get("plain"), Some(&s("hello")));
     assert_eq!(row.get("trimmed"), Some(&s("xxhello")));
+}
+
+// ---------------------------------------------------------------------------
+// MV-12b: jq timeout, D4 execution fail-closed and static refusal
+// ---------------------------------------------------------------------------
+
+#[test]
+fn std_jq_timeout_applied() {
+    // A valid per-call timeout (unit: milliseconds) keeps the 2-arg result.
+    table(
+        "jq",
+        vec![
+            (vec![s(".a"), s("{\"a\":1}"), json!(5000)], json!([1])),
+            (vec![s(".missing"), s("{\"a\":1}"), json!(5000)], json!([])),
+            (vec![s("."), json!({"a": 1}), s("5000")], json!([{"a": 1}])),
+        ],
+    );
+    // Out-of-range or mistyped timeouts fail closed.
+    table(
+        "jq",
+        vec![
+            (vec![s(".a"), s("{\"a\":1}"), json!(0)], Value::Null),
+            (vec![s(".a"), s("{\"a\":1}"), json!(-1)], Value::Null),
+            (vec![s(".a"), s("{\"a\":1}"), json!(3_600_001)], Value::Null),
+            (vec![s(".a"), s("{\"a\":1}"), s("soon")], Value::Null),
+            (vec![s(".a"), s("{\"a\":1}"), json!(true)], Value::Null),
+            (vec![s(".a"), s("{\"a\":1}"), Value::Null], Value::Null),
+        ],
+    );
+    // A program past the step budget stops and counts exactly once.
+    let deep = format!(".{}", vec!["a"; 65].join("."));
+    let before = jq_timeout_count();
+    assert_eq!(call("jq", vec![s(&deep), s("{\"a\":1}")]), Value::Null);
+    assert_eq!(jq_timeout_count(), before + 1, "one stopped run");
+    let before = jq_timeout_count();
+    assert_eq!(
+        call("jq", vec![s(&deep), s("{\"a\":1}"), json!(5000)]),
+        Value::Null
+    );
+    assert_eq!(jq_timeout_count(), before + 1, "one stopped run");
+    // A short program inside the budget never counts.
+    let before = jq_timeout_count();
+    assert_eq!(
+        call("jq", vec![s(".a"), s("{\"a\":1}"), json!(5000)]),
+        json!([1])
+    );
+    assert_eq!(jq_timeout_count(), before, "no stop in budget");
+}
+
+#[test]
+fn std_d4_refused_at_execution() {
+    // D4 hash algorithms fail closed at execution (creation refuses them).
+    table(
+        "hash",
+        vec![
+            (vec![s("sha3_256"), s("abc")], Value::Null),
+            (vec![s("SHA3-512"), s("abc")], Value::Null),
+            (vec![s("blake2b"), s("abc")], Value::Null),
+            (vec![s("blake2s"), s("abc")], Value::Null),
+        ],
+    );
+    // Named zones fail closed at execution (creation refuses literals).
+    table(
+        "date_to_unix_ts",
+        vec![
+            (
+                vec![
+                    s("second"),
+                    s("+08:00"),
+                    s("yyyy-MM-dd HH:mm:ss"),
+                    s("1970-01-01 08:00:00"),
+                ],
+                json!(0),
+            ),
+            (
+                vec![
+                    s("second"),
+                    s("Europe/Berlin"),
+                    s("yyyy-MM-dd"),
+                    s("1970-01-02"),
+                ],
+                Value::Null,
+            ),
+        ],
+    );
+}
+
+#[test]
+fn std_create_refuses_unsupported_static_calls() {
+    let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+    // Each refused call fails creation and names itself; nothing is stored.
+    for (sql, want) in [
+        ("SELECT schema_encode(a) AS v FROM s", "schema_encode"),
+        ("SELECT SCHEMA_DECODE(a) AS v FROM s", "SCHEMA_DECODE"),
+        ("SELECT hash('sha3_256', a) AS v FROM s", "sha3_256"),
+        ("SELECT hash('blake2b', a) AS v FROM s", "blake2b"),
+        (
+            "SELECT timezone_to_offset_seconds('Europe/Berlin') AS v FROM s",
+            "Europe/Berlin",
+        ),
+        (
+            "SELECT timezone_to_second('Mars/Olympus Base') AS v FROM s",
+            "Mars/Olympus Base",
+        ),
+        (
+            "SELECT date_to_unix_ts('second', 'Europe/Berlin', 'yyyy-MM-dd', d) AS v FROM s",
+            "Europe/Berlin",
+        ),
+        (
+            "SELECT a AS v FROM s WHERE schema_encode(a) = 'x'",
+            "schema_encode",
+        ),
+        (
+            "SELECT count(*) AS n FROM s GROUP BY hash('sha3_256', a)",
+            "sha3_256",
+        ),
+        (
+            "FOREACH payload.items DO item AS v INCASE schema_encode(item) = 'x' FROM \"t/#\"",
+            "schema_encode",
+        ),
+        (
+            "SELECT a AS v FROM s ORDER BY schema_encode(a)",
+            "schema_encode",
+        ),
+        (
+            "SELECT * FROM s JOIN t ON schema_encode(a) = t.id",
+            "schema_encode",
+        ),
+    ] {
+        let err = engine
+            .create_rule_with_id(
+                "refused-probe".to_string(),
+                "probe".to_string(),
+                TopicFilter::new("s/r").unwrap(),
+                Some(sql.to_string()),
+                true,
+                vec![],
+            )
+            .expect_err("refused call must fail creation");
+        let message = match err {
+            RuleEngineError::InvalidRule(message) => message,
+            other => panic!("wrong error kind for {sql:?}: {other:?}"),
+        };
+        assert!(
+            message.contains(want),
+            "error names {want:?} for {sql:?}: {message:?}"
+        );
+        assert!(
+            engine.get_rule("refused-probe").is_none(),
+            "no refused rule is stored for {sql:?}"
+        );
+    }
+    // UTC and fixed offsets keep working; a dynamic value also creates.
+    engine
+        .create_rule_with_id(
+            "utc-ok".to_string(),
+            "probe".to_string(),
+            TopicFilter::new("s/r").unwrap(),
+            Some("SELECT timezone_to_offset_seconds('+08:00') AS v FROM s".to_string()),
+            true,
+            vec![],
+        )
+        .expect("fixed offset creates");
+    engine
+        .create_rule_with_id(
+            "dynamic-ok".to_string(),
+            "probe".to_string(),
+            TopicFilter::new("s/r").unwrap(),
+            Some("SELECT hash(alg, 'abc') AS h FROM s".to_string()),
+            true,
+            vec![],
+        )
+        .expect("dynamic value creates; execution fails closed");
+    // The tester refuses the same static calls.
+    let err = broker_rules::try_evaluate(
+        Some("SELECT schema_encode(a) AS v FROM s"),
+        None,
+        "t/a",
+        &json!({"a": 1}),
+    )
+    .expect_err("tester refuses too");
+    assert!(err.contains("schema_encode"), "tester names it: {err:?}");
+    // A stored snapshot with a refused call fails loading loudly.
+    let conf = broker_config::RulesConf {
+        rules: vec![broker_config::RuleEntry {
+            id: "bad-file".to_string(),
+            name: "bad".to_string(),
+            tenant: "default".to_string(),
+            topic_filter: "s/r".to_string(),
+            sql_query: Some("SELECT schema_encode(a) AS v FROM s".to_string()),
+            enabled: true,
+            actions: vec![],
+        }],
+    };
+    let err = match RuleEngine::from_snapshot(&conf) {
+        Ok(_) => panic!("file load must refuse the static call"),
+        Err(err) => err,
+    };
+    let message = match err {
+        RuleEngineError::InvalidRule(message) => message,
+        other => panic!("wrong error kind for file load: {other:?}"),
+    };
+    assert!(
+        message.contains("schema_encode"),
+        "file load names it: {message:?}"
+    );
+}
+
+#[tokio::test]
+async fn std_refused_update_keeps_old_rule() {
+    // A refused update fails and leaves the live rule working.
+    let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+    engine
+        .create_rule_with_id(
+            "live".to_string(),
+            "live".to_string(),
+            TopicFilter::new("s/live").unwrap(),
+            Some("SELECT a AS v FROM s".to_string()),
+            true,
+            vec![RuleAction::Republish {
+                topic: Topic::new("out/live").unwrap(),
+                qos: QoS::AtMostOnce,
+            }],
+        )
+        .expect("live rule creates");
+    let err = engine
+        .replace_rule_in_tenant(
+            "live",
+            "default".to_string(),
+            "live".to_string(),
+            TopicFilter::new("s/live").unwrap(),
+            Some("SELECT schema_encode(a) AS v FROM s".to_string()),
+            true,
+            vec![],
+        )
+        .expect_err("refused update must fail");
+    let message = match err {
+        RuleEngineError::InvalidRule(message) => message,
+        other => panic!("wrong error kind for update: {other:?}"),
+    };
+    assert!(
+        message.contains("schema_encode"),
+        "update names it: {message:?}"
+    );
+    let sink = Arc::new(RecordingSink::default());
+    let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+    engine
+        .dispatch_ingress(
+            &Topic::new("s/live").unwrap(),
+            &Bytes::from_static(br#"{"a": 7}"#),
+            QoS::AtMostOnce,
+            &sink_obj,
+        )
+        .await;
+    let published = sink.published.lock().unwrap();
+    assert_eq!(published.len(), 1, "old rule still fires");
+    let row: Value = serde_json::from_slice(&published[0].1).expect("row is JSON");
+    assert_eq!(row.get("v"), Some(&json!(7)));
+}
+
+#[tokio::test]
+async fn std_jq_timeout_counts_failed_rule_run() {
+    // A stopped jq program fails the run through the broker entry.
+    let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
+    let deep = format!(".{}", vec!["a"; 65].join("."));
+    engine
+        .create_rule_with_id(
+            "jq-ok".to_string(),
+            "ok".to_string(),
+            TopicFilter::new("s/ok").unwrap(),
+            Some("SELECT jq('.a', payload) AS v FROM \"s/ok\"".to_string()),
+            true,
+            vec![RuleAction::Republish {
+                topic: Topic::new("out/ok").unwrap(),
+                qos: QoS::AtMostOnce,
+            }],
+        )
+        .expect("control rule creates");
+    engine
+        .create_rule_with_id(
+            "jq-slow".to_string(),
+            "slow".to_string(),
+            TopicFilter::new("s/slow").unwrap(),
+            Some(format!(
+                "SELECT jq('.a', payload) AS v FROM \"s/slow\" WHERE jq('{deep}', payload) IS NOT NULL"
+            )),
+            true,
+            vec![RuleAction::Republish {
+                topic: Topic::new("out/slow").unwrap(),
+                qos: QoS::AtMostOnce,
+            }],
+        )
+        .expect("timeout rule creates; the stop happens at run time");
+    let sink = Arc::new(RecordingSink::default());
+    let sink_obj: Arc<dyn BrokerSink> = sink.clone();
+    engine
+        .dispatch_ingress(
+            &Topic::new("s/ok").unwrap(),
+            &Bytes::from_static(br#"{"a": 1}"#),
+            QoS::AtMostOnce,
+            &sink_obj,
+        )
+        .await;
+    let before = jq_timeout_count();
+    engine
+        .dispatch_ingress(
+            &Topic::new("s/slow").unwrap(),
+            &Bytes::from_static(br#"{"a": 1}"#),
+            QoS::AtMostOnce,
+            &sink_obj,
+        )
+        .await;
+    assert_eq!(jq_timeout_count(), before + 1, "one stopped run");
+    let slow = engine.get_rule("jq-slow").expect("rule is stored");
+    assert_eq!(
+        slow.matched_cnt.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        slow.passed_cnt.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        slow.failed_cnt.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    let published = sink.published.lock().unwrap();
+    assert_eq!(published.len(), 1, "only the control rule fires");
+    assert_eq!(published[0].0.as_str(), "out/ok");
 }
