@@ -4891,3 +4891,403 @@ async fn mv00_api_error_missing_probe_keeps_store_empty() {
         "absent-rule probe codes: {codes:?}"
     );
 }
+
+/// CASE WHEN/THEN/ELSE evaluates per-message through MQTT ingress.
+#[tokio::test]
+async fn mv00_case_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let id = "case";
+    let sql =
+        "SELECT CASE WHEN temperature > 40 THEN 'hot' ELSE 'ok' END AS state FROM \"mv00/in/case\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "CASE create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-case-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-case-pub").await;
+
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"temperature": 72.5}"#,
+        &[r#"{"state":"hot"}"#],
+    )
+    .await;
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"temperature": 20.0}"#,
+        &[r#"{"state":"ok"}"#],
+    )
+    .await;
+
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "message_publish", "topic": "mv00/in/case", "payload": r#"{"temperature": 72.5}"#},
+    })).await;
+    assert_eq!(status, 200, "CASE HTTP: {body}");
+    assert_eq!(body["projected"].to_string(), r#"{"state":"hot"}"#);
+
+    kernel.finish().await;
+}
+
+/// Nested expressions (parenthesised arithmetic) evaluate per-message through MQTT.
+#[tokio::test]
+async fn mv00_nested_expressions_through_mqtt() {
+    let kernel = spawn_kernel("").await;
+    let id = "nested";
+    let sql = "SELECT (a + b) * 2 AS x, abs(a - b) AS d FROM \"mv00/in/nested\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql),
+    )
+    .await;
+    assert_eq!(status, 201, "nested create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-nested-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-nested-pub").await;
+
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"a":3,"b":5}"#,
+        &[r#"{"x":16,"d":2}"#],
+    )
+    .await;
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"a":10,"b":3}"#,
+        &[r#"{"x":26,"d":7}"#],
+    )
+    .await;
+
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "message_publish", "topic": "mv00/in/nested", "payload": r#"{"a":3,"b":5}"#},
+    })).await;
+    assert_eq!(status, 200, "nested HTTP: {body}");
+    assert_eq!(body["projected"].to_string(), r#"{"x":16,"d":2}"#);
+
+    kernel.finish().await;
+}
+
+/// `$events/client_connected` is accepted as a rule source and evaluates via rule_test.
+#[tokio::test]
+async fn mv00_events_client_connected_rule_test() {
+    let kernel = spawn_kernel("").await;
+    let sql = "SELECT clientid, username FROM \"$events/client_connected\"";
+    let (status, body) = mv00_api(&kernel, reqwest::Method::POST, "/api/v5/rule_test", serde_json::json!({
+        "sql": sql,
+        "context": {"event_type": "client_connected", "topic": "$events/client_connected", "payload": r#"{"clientid":"c1","username":"u1"}"#},
+    })).await;
+    assert_eq!(status, 200, "$events rule_test: {body}");
+    assert_eq!(
+        body["projected"].to_string(),
+        r#"{"clientid":"c1","username":"u1"}"#
+    );
+    kernel.finish().await;
+}
+
+/// FOREACH survives a rule replace (same shape) and a kernel restart.
+#[tokio::test]
+async fn mv00_foreach_update_and_restart_keep_state() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "foreach-update";
+    let sql_v1 = "FOREACH payload.items DO item.b AS z, item.a FROM \"mv00/in/foreach-update\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql_v1),
+    )
+    .await;
+    assert_eq!(status, 201, "FOREACH v1 create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-foreach-upd-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-foreach-upd-pub").await;
+
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"items":[{"b":2,"a":1},{"b":4,"a":3}]}"#,
+        &[r#"{"z":2,"a":1}"#, r#"{"z":4,"a":3}"#],
+    )
+    .await;
+
+    // Replace with same-shape FOREACH (alias change only): accepted, output keeps flowing.
+    let sql_v2 =
+        "FOREACH payload.items DO item.b AS x, item.a AS y FROM \"mv00/in/foreach-update\"";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/foreach-update",
+        mv00_rule(id, sql_v2),
+    )
+    .await;
+    assert_eq!(status, 200, "FOREACH replace: {body}");
+    mv00_assert_publish(
+        &mut publisher,
+        &mut subscriber,
+        id,
+        r#"{"items":[{"b":8,"a":5}]}"#,
+        &[r#"{"x":8,"y":5}"#],
+    )
+    .await;
+
+    // Restart: rule is restored from durable state and still fires.
+    mv00_restart(&mut kernel).await;
+    let mut subscriber2 = mv00_connect(&kernel, "mv00-foreach-upd-sub2").await;
+    mv00_subscribe(&mut subscriber2).await;
+    let mut publisher2 = mv00_connect(&kernel, "mv00-foreach-upd-pub2").await;
+    mv00_assert_publish(
+        &mut publisher2,
+        &mut subscriber2,
+        id,
+        r#"{"items":[{"b":1,"a":9}]}"#,
+        &[r#"{"x":1,"y":9}"#],
+    )
+    .await;
+
+    kernel.finish().await;
+}
+
+/// Window (GROUP BY COUNTWINDOW) survives a rule replace and a kernel restart.
+#[tokio::test]
+async fn mv00_window_update_and_restart_keep_state() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "window-update";
+    let sql_v1 =
+        "SELECT sum(v) AS s, count(*) AS n FROM \"mv00/in/window-update\" GROUP BY COUNTWINDOW(2)";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql_v1),
+    )
+    .await;
+    assert_eq!(status, 201, "window v1 create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-window-upd-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-window-upd-pub").await;
+
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":1}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":3}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"s":4,"n":2}"#.as_bytes());
+
+    // Replace with same-shape window: accepted.
+    let sql_v2 = "SELECT sum(v) AS total, count(*) AS cnt FROM \"mv00/in/window-update\" GROUP BY COUNTWINDOW(2)";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/window-update",
+        mv00_rule(id, sql_v2),
+    )
+    .await;
+    assert_eq!(status, 200, "window replace: {body}");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":2}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":4}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"total":6,"cnt":2}"#.as_bytes());
+
+    // Restart: rule restored and still aggregates.
+    mv00_restart(&mut kernel).await;
+    let mut subscriber2 = mv00_connect(&kernel, "mv00-window-upd-sub2").await;
+    mv00_subscribe(&mut subscriber2).await;
+    let mut publisher2 = mv00_connect(&kernel, "mv00-window-upd-pub2").await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":5}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"v":7}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber2).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"total":12,"cnt":2}"#.as_bytes());
+
+    kernel.finish().await;
+}
+
+/// GROUP BY survives a rule replace and a kernel restart.
+#[tokio::test]
+async fn mv00_group_update_and_restart_keep_state() {
+    let mut kernel = spawn_kernel("").await;
+    let id = "group-update";
+    let sql_v1 = "SELECT k AS key, sum(v) AS s FROM \"mv00/in/group-update\" GROUP BY k";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::POST,
+        "/api/v5/rules",
+        mv00_rule(id, sql_v1),
+    )
+    .await;
+    assert_eq!(status, 201, "group v1 create: {body}");
+    let mut subscriber = mv00_connect(&kernel, "mv00-group-upd-sub").await;
+    mv00_subscribe(&mut subscriber).await;
+    let mut publisher = mv00_connect(&kernel, "mv00-group-upd-pub").await;
+
+    for input in [
+        r#"{"k":"x","v":1}"#,
+        r#"{"k":"y","v":2}"#,
+        r#"{"k":"x","v":3}"#,
+    ] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+        )
+        .await;
+    }
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30);
+        let message = sy02_parse_publish_classic(head, &body);
+        assert_eq!(message.topic, format!("mv00/out/{id}"));
+        got.push(String::from_utf8(message.payload).expect("group JSON bytes"));
+    }
+    got.sort();
+    assert_eq!(got, vec![r#"{"key":"x","s":4}"#, r#"{"key":"y","s":2}"#]);
+
+    // Replace with same-shape group: accepted.
+    let sql_v2 = "SELECT k AS key, sum(v) AS total FROM \"mv00/in/group-update\" GROUP BY k";
+    let (status, body) = mv00_api(
+        &kernel,
+        reqwest::Method::PUT,
+        "/api/v5/rules/group-update",
+        mv00_rule(id, sql_v2),
+    )
+    .await;
+    assert_eq!(status, 200, "group replace: {body}");
+    for input in [r#"{"k":"x","v":10}"#, r#"{"k":"z","v":5}"#] {
+        send_mqtt(
+            &mut publisher,
+            &sy02_publish311(&format!("mv00/in/{id}"), 0, 0, false, input.as_bytes()),
+        )
+        .await;
+    }
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let (head, body) = recv_mqtt(&mut subscriber).await;
+        assert_eq!(head & 0xf0, 0x30);
+        let message = sy02_parse_publish_classic(head, &body);
+        assert_eq!(message.topic, format!("mv00/out/{id}"));
+        got.push(String::from_utf8(message.payload).expect("group JSON bytes"));
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec![r#"{"key":"x","total":10}"#, r#"{"key":"z","total":5}"#]
+    );
+
+    // Restart: rule restored and still groups.
+    mv00_restart(&mut kernel).await;
+    let mut subscriber2 = mv00_connect(&kernel, "mv00-group-upd-sub2").await;
+    mv00_subscribe(&mut subscriber2).await;
+    let mut publisher2 = mv00_connect(&kernel, "mv00-group-upd-pub2").await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"k":"x","v":1}"#.as_bytes(),
+        ),
+    )
+    .await;
+    send_mqtt(
+        &mut publisher2,
+        &sy02_publish311(
+            &format!("mv00/in/{id}"),
+            0,
+            0,
+            false,
+            r#"{"k":"x","v":2}"#.as_bytes(),
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut subscriber2).await;
+    assert_eq!(head & 0xf0, 0x30);
+    let message = sy02_parse_publish_classic(head, &body);
+    assert_eq!(message.topic, format!("mv00/out/{id}"));
+    assert_eq!(message.payload, r#"{"key":"x","total":3}"#.as_bytes());
+
+    kernel.finish().await;
+}

@@ -1027,11 +1027,11 @@ impl EventInput for BoundedEventInput {
 /// One native stream rule: match ingress by topic filter, run actions.
 ///
 /// Open-core licensing tier of a rule, derived from its SQL at creation:
-/// any `GROUP BY` window clause (`TUMBLINGWINDOW`, `HOPPINGWINDOW`,
-/// `SLIDINGWINDOW`, `COUNTWINDOW`) makes a rule Enterprise; everything
-/// else is Community. Tier labels stay for display but never select the
-/// execution path: every window rule runs on rekuiper's runtime
-/// (see [`runtime`]).
+/// Any window clause makes a rule Enterprise. Plain `GROUP BY` with
+/// no window also runs as a session window, so it is Enterprise.
+/// Everything else is Community. Tier labels stay for display but never
+/// select the execution path: every window rule runs on rekuiper's
+/// runtime (see [`runtime`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleTier {
@@ -1666,6 +1666,17 @@ impl runtime::RuleOutputSink for BrokerRuleSink {
 /// [`RuleEngine::with_window_channel_depth`]. Same value as
 /// [`runtime::RULE_TASK_FEED_DEPTH`]: the rule-task feed bound.
 pub const DEFAULT_WINDOW_CHANNEL_DEPTH: usize = 65_536;
+
+/// Idle gap that closes an implicit plain-`GROUP BY` session (500ms).
+/// Reason: burst publishes arrive microseconds apart, so 500ms groups
+/// each burst into one session while keeping added latency well under
+/// the 10s management-test bound.
+pub const IMPLICIT_GROUP_SESSION_TIMEOUT_MS: u64 = 500;
+
+/// Longest one implicit plain-`GROUP BY` session runs (30s).
+/// Reason: caps the session buffer so a continuous stream flushes
+/// at least every 30s; the bounded feed drops surplus with a counter.
+pub const IMPLICIT_GROUP_SESSION_MAX_MS: u64 = 30_000;
 
 /// True for system-message topics (`$SYS` and `$SYS/...`), which the rule
 /// engine skips while `ignore_sys_message` holds (W3-10). Pure prefix test
@@ -4743,6 +4754,26 @@ fn group_key(
         .join("\x1f")
 }
 
+/// Give plain `GROUP BY` (no window clause) a session window so it
+/// aggregates per group instead of projecting each message alone.
+///
+/// A plain `GROUP BY k` with no window arrives here with `window: None`
+/// and runs per message, so `sum(v)` returns the single row value. The
+/// session groups each burst (gap `IMPLICIT_GROUP_SESSION_TIMEOUT_MS`,
+/// cap `IMPLICIT_GROUP_SESSION_MAX_MS`) into one batch; the flush
+/// partitions by key and evaluates aggregates per group. Skips `FOREACH`
+/// rules: their expansion path never enters the window feed.
+fn apply_implicit_group_window(stmt: &mut SelectStmt) {
+    if stmt.group_by.is_empty() || stmt.window.is_some() {
+        return;
+    }
+    stmt.window = Some(WindowDef::Session {
+        unit: TimeUnit::Ms,
+        max_duration: IMPLICIT_GROUP_SESSION_MAX_MS,
+        timeout: IMPLICIT_GROUP_SESSION_TIMEOUT_MS,
+    });
+}
+
 /// Parse one rule SQL string through the standard front end first, with a
 /// fallback to the streaming parser for rekuiper-only syntax beyond the
 /// standard window extension.
@@ -4762,17 +4793,24 @@ fn group_key(
 fn parse_rule_sql(sql: &str) -> Result<ParsedStdRule, RuleEngineError> {
     let rewritten = rewrite_colliding_functions(sql);
     match std_sql::parse_std_rule(&rewritten) {
-        Ok(std_rule) => Ok((
-            std_rule.stmt.clone(),
-            std_rule.foreach.clone(),
-            std_rule.sources.clone(),
-            std_rule.has_wildcard,
-            std_rule.explicit_keys.clone(),
-        )),
+        Ok(std_rule) => {
+            let mut stmt = std_rule.stmt.clone();
+            if std_rule.foreach.is_none() {
+                apply_implicit_group_window(&mut stmt);
+            }
+            Ok((
+                stmt,
+                std_rule.foreach.clone(),
+                std_rule.sources.clone(),
+                std_rule.has_wildcard,
+                std_rule.explicit_keys.clone(),
+            ))
+        }
         Err(std_err) => {
             let normalized = normalize_from_target(&rewritten);
             match rekuiper_sql::Parser::new(&normalized).parse_select() {
-                Ok(stmt) => {
+                Ok(mut stmt) => {
+                    apply_implicit_group_window(&mut stmt);
                     let (has_wildcard, explicit_keys) = projection_metadata(&stmt);
                     Ok((stmt, None, Vec::new(), has_wildcard, explicit_keys))
                 }
@@ -5420,17 +5458,24 @@ pub fn try_evaluate(
 fn parse_rule_sql_for_tester(sql: &str) -> Result<ParsedStdRule, String> {
     let rewritten = rewrite_colliding_functions(sql);
     match std_sql::parse_std_rule(&rewritten) {
-        Ok(std_rule) => Ok((
-            std_rule.stmt.clone(),
-            std_rule.foreach.clone(),
-            std_rule.sources.clone(),
-            std_rule.has_wildcard,
-            std_rule.explicit_keys.clone(),
-        )),
+        Ok(std_rule) => {
+            let mut stmt = std_rule.stmt.clone();
+            if std_rule.foreach.is_none() {
+                apply_implicit_group_window(&mut stmt);
+            }
+            Ok((
+                stmt,
+                std_rule.foreach.clone(),
+                std_rule.sources.clone(),
+                std_rule.has_wildcard,
+                std_rule.explicit_keys.clone(),
+            ))
+        }
         Err(std_err) => {
             let normalized = normalize_from_target(&rewritten);
             match rekuiper_sql::Parser::new(&normalized).parse_select() {
-                Ok(stmt) => {
+                Ok(mut stmt) => {
+                    apply_implicit_group_window(&mut stmt);
                     let (has_wildcard, explicit_keys) = projection_metadata(&stmt);
                     Ok((stmt, None, Vec::new(), has_wildcard, explicit_keys))
                 }
@@ -5593,7 +5638,9 @@ fn apply_rule(rule: &Rule, topic: &Topic, payload: &Bytes, qos: QoS) -> Vec<Byte
         None => return vec![payload.clone()],
     };
     if let Some(plan) = rule.std_foreach.as_ref() {
-        // TODO(parity): Does FOREACH WHERE evaluate per element with item bound?
+        // FOREACH WHERE evaluates per element with `item` bound
+        // (expand_foreach_rows applies `stmt.where_clause` to the
+        // extended record carrying `item`).
         let (base, _) = build_std_record(topic, payload, qos);
         let rows = expand_foreach_rows(stmt, plan, &base);
         let mut out = Vec::with_capacity(rows.len());
@@ -7101,17 +7148,18 @@ mod tests {
                 .expect("rule creates")
                 .tier
         };
-        // No SQL, plain SELECT, and GROUP BY without a window: Community.
+        // No SQL and plain SELECT: Community.
         assert_eq!(mk(None), RuleTier::Community);
         assert_eq!(
             mk(Some(r#"SELECT temperature FROM "sensors/+""#)),
             RuleTier::Community
         );
+        // Plain GROUP BY runs as an implicit session window: Enterprise.
         assert_eq!(
             mk(Some(
                 r#"SELECT sensor_id, avg(temperature) AS a FROM "sensors/+" GROUP BY sensor_id"#
             )),
-            RuleTier::Community
+            RuleTier::Enterprise
         );
         // Any window clause makes the rule Enterprise — even disabled.
         assert_eq!(
