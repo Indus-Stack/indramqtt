@@ -7,7 +7,7 @@
 //! [`TokenInfo`] into request extensions for handlers.
 
 use axum::{
-    extract::{Request, State},
+    extract::{Extension, Request},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -415,7 +415,11 @@ fn is_mfa_self_service(method: &axum::http::Method, path: &str) -> bool {
 /// change while `must_change_password` is set, and GET-only access for
 /// viewers. A viewer can also call the three MFA enrolment routes for
 /// that viewer.
-pub async fn require_api_auth(State(state): State<ApiState>, req: Request, next: Next) -> Response {
+pub async fn require_api_auth(
+    Extension(state): Extension<ApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
     let Some(identity) = resolve_credentials(&state, req.headers()) else {
         return unauthorized("missing or invalid credentials");
     };

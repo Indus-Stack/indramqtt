@@ -39,7 +39,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `getting-started/install.md` | 66 | `indramqtt 0.1.0` |
 | `getting-started/install.md` | 74 | `indra 0.1.0` |
 | `index.md` | 54 | `OK` |
-| `mcp.md` | 314 | `401` |
+| `mcp.md` | 321 | `401` |
 | `migration.md` | 90 | `OK` |
 | `multi-tenancy/index.md` | 100 | `isolated` |
 | `multi-tenancy/quotas.md` | 102 | `ok` |

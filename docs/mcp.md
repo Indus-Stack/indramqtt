@@ -182,14 +182,18 @@ names the groups with their tool counts.
   always present, for every key and every query.
 - Every other tool maps to one HTTP operation. The build scans the
   router source and emits one row per `(method, path)` pair. The tool
-  list derives from that table at startup. No hand-written copy of a
-  schema exists.
+  list derives from that table. One shared route table serves every
+  call. The first call builds it; later calls clone it and set the
+  live state. Authentication still runs per request. No hand-written copy
+  of a schema exists.
 - The tool name derives from the method and the path in snake case,
   for example `get_api_v5_clients_by_clientid`. Names stay stable while
   routes stay stable.
-- The tool description reuses the first doc line of the handler. A
-  route without docs falls back to `METHOD path`. Descriptions never
-  copy the reference text.
+- The tool description keeps the first doc line of the handler and
+  names the route after it, for example
+  `List all clients. (GET /api/v5/clients)`. A route without docs
+  falls back to `METHOD path`. Descriptions never copy the reference
+  text.
 - `inputSchema` derives from the path template and the method:
   path segments become required string fields, `query` carries query
   keys, `body` carries the JSON body, `body_base64` carries raw bytes
@@ -255,6 +259,9 @@ The code holds one exclusion table with a reason for each entry:
   not sign-in flows.
 - Console pages, assets, probes and the transport itself: these are
   not management operations.
+- Gateways: gateways are not in the MVP. The router exposes no gateway
+  operation, so the catalog holds no gateway tool and `list_toolsets`
+  omits the empty `gateways` set.
 
 ## Limits
 

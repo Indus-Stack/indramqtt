@@ -9,6 +9,10 @@
 //! schema exists anywhere here.
 
 use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    OnceLock,
+};
 
 use super::route_scan::path_params;
 
@@ -83,6 +87,11 @@ pub const EXCLUSIONS: &[Exclusion] = &[
     },
     Exclusion {
         method: "GET",
+        path: "/version",
+        reason: "dashboard version file; not a management operation",
+    },
+    Exclusion {
+        method: "GET",
         path: "/healthz",
         reason: "load-balancer probe with a plain-text answer; not a management operation",
     },
@@ -122,6 +131,23 @@ pub const EXCLUSIONS: &[Exclusion] = &[
         method: "GET",
         path: "/api/v5/api_key_scopes",
         reason: "API key management stays operator-only; agents authenticate with a key",
+    },
+    // Installation licence: agents authenticate with a key, so
+    // licence installation stays operator-only.
+    Exclusion {
+        method: "GET",
+        path: "/api/v1/licence/request",
+        reason: "licence installation stays operator-only; agents authenticate with a key",
+    },
+    Exclusion {
+        method: "POST",
+        path: "/api/v1/licence/install",
+        reason: "licence installation stays operator-only; agents authenticate with a key",
+    },
+    Exclusion {
+        method: "GET",
+        path: "/api/v1/licence/status",
+        reason: "licence installation stays operator-only; agents authenticate with a key",
     },
     // Interactive sign-in: agents authenticate with a key.
     Exclusion {
@@ -210,7 +236,8 @@ pub struct ToolDef {
     pub method: &'static str,
     /// Path template of the operation.
     pub path: &'static str,
-    /// Short description (handler doc line, else `METHOD path`).
+    /// Short description: the handler doc line plus the route
+    /// (`METHOD path` in parentheses), else `METHOD path` alone.
     pub summary: &'static str,
     /// True for GET operations.
     pub read_only: bool,
@@ -376,6 +403,10 @@ pub const TOOLSETS: &[ToolsetDef] = &[
         name: "gateways",
         description: "Protocol gateways.",
     },
+    // TODO(parity): the router exposes no gateway operation, so this
+    // set stays empty and `list_toolsets` omits it. Gateways are not
+    // in the MVP. Add the probe tool once gateway routes land, with a
+    // live check behind it.
     ToolsetDef {
         name: "license",
         description: "Licence document and settings.",
@@ -411,7 +442,7 @@ pub fn build_catalog() -> Vec<ToolDef> {
         name: BROKER_STATUS_TOOL.to_string(),
         method: "GET",
         path: "/api/v5/status",
-        summary: "Read the version, uptime and node name of this node.",
+        summary: "Read the version, uptime and node name of this node. (GET /api/v5/status)",
         read_only: true,
         destructive: false,
         toolset: "status",
@@ -431,6 +462,27 @@ pub fn build_catalog() -> Vec<ToolDef> {
         });
     }
     tools
+}
+
+/// Shared tool catalog, built one time. The table is static, so every
+/// request and every concurrent call shares it. No state lives here.
+static CATALOG: OnceLock<Vec<ToolDef>> = OnceLock::new();
+
+/// Count of catalog builds. Tests read this; production ignores it.
+static CATALOG_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// The shared catalog. The first call builds it; later calls share it.
+pub fn catalog() -> &'static [ToolDef] {
+    CATALOG.get_or_init(|| {
+        CATALOG_BUILDS.fetch_add(1, Ordering::Relaxed);
+        build_catalog()
+    })
+}
+
+/// Count of catalog builds. Tests read this; production ignores it.
+#[cfg(test)]
+pub(crate) fn catalog_builds() -> usize {
+    CATALOG_BUILDS.load(Ordering::Relaxed)
 }
 
 /// The built-in status tool (proves the path end to end).

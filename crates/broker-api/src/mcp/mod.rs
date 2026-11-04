@@ -7,7 +7,8 @@
 //! tokens: an agent authenticates with a key. A key reaches `/mcp`
 //! itself with the `monitoring` scope or the `publish` scope. Each tool call then re-enters
 //! the live axum router in process with the same `Authorization`
-//! header. Per-operation scopes and the viewer rule apply exactly as
+//! header. The route table is built one time and shared; each call
+//! sets the live state, so authentication runs per request. Per-operation scopes and the viewer rule apply exactly as
 //! over HTTP. One request body holds one JSON-RPC object or one batch
 //! array. Tools form groups selected with `toolsets=a,b` on `/mcp`:
 //! no parameter selects the `core` set, `all` selects every tool, and
@@ -35,7 +36,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use catalog::{build_catalog, list_entry_for, tool_by_name, ToolDef};
+use catalog::{catalog, list_entry_for, tool_by_name, ToolDef};
 
 pub use collect::CollectRegistry;
 
@@ -189,9 +190,11 @@ fn key_caller(name: String, grant: KeyGrant) -> Caller {
     }
 }
 
-/// True when the caller may see and call the tool. Read-only mode
-/// and the viewer role keep read tools only. A key-store key keeps
-/// only the paths its scopes allow (exactly as over HTTP).
+/// True when the caller may see and call the tool.
+/// Read-only mode and the viewer role keep read tools only.
+/// A key-store key keeps the paths its scopes allow and the
+/// bearer-only paths (exactly as over HTTP). The router refuses
+/// a bearer-only call with FORBIDDEN.
 /// `list_toolsets` is always allowed: every key sees it.
 fn caller_may_call(state: &ApiState, caller: &Caller, tool: &ToolDef) -> bool {
     if tool.name == catalog::LIST_TOOLSETS_TOOL {
@@ -201,7 +204,10 @@ fn caller_may_call(state: &ApiState, caller: &Caller, tool: &ToolDef) -> bool {
         return false;
     }
     match &caller.grant {
-        Some(grant) => key_decision(grant, tool.path) == KeyDecision::Allowed,
+        Some(grant) => {
+            let decision = key_decision(grant, tool.path);
+            decision == KeyDecision::Allowed || decision == KeyDecision::LoginOnly
+        }
         None => true,
     }
 }
@@ -495,10 +501,11 @@ fn visible_tools(state: &ApiState, caller: &Caller, query: &ToolsetQuery) -> Vec
     }
     let mut out = vec![list_toolsets_def()];
     out.extend(
-        build_catalog()
-            .into_iter()
-            .filter(|tool| selected.contains(&tool.toolset))
-            .filter(|tool| caller_may_call(state, caller, tool)),
+        catalog()
+            .iter()
+            .filter(|&tool| selected.contains(&tool.toolset))
+            .filter(|&tool| caller_may_call(state, caller, tool))
+            .cloned(),
     );
     let collect = subscribe_collect_def();
     if selected.contains(&collect.toolset) && caller_may_call(state, caller, &collect) {
@@ -662,6 +669,12 @@ fn rpc_error(code: i32, message: &str) -> Value {
 /// audit record, the `result`/`error` body and the tool name.
 /// The audit record carries the tool name and the result only: tool
 /// arguments may carry secrets and are never logged.
+///
+/// The inner dispatch reuses the one-time route table from
+/// [`inner_routes`]: the table is built once per process, and each
+/// call sets the live state. Authentication and permission checks run
+/// per request against the current stores. A key change, a scope
+/// change or a configuration change applies to the next call.
 async fn call_tool(
     state: &ApiState,
     caller: &Caller,
@@ -690,8 +703,7 @@ async fn call_tool(
         return (200, list_toolsets_result(state, caller), name.to_string());
     }
     if name == catalog::BROKER_STATUS_TOOL {
-        let catalog = build_catalog();
-        let status_tool = tool_by_name(&catalog, catalog::BROKER_STATUS_TOOL)
+        let status_tool = tool_by_name(catalog(), catalog::BROKER_STATUS_TOOL)
             .cloned()
             .expect("status tool");
         if !caller_may_call(state, caller, &status_tool) {
@@ -703,7 +715,6 @@ async fn call_tool(
         }
         return (200, broker_status_result(), name.to_string());
     }
-    let catalog = build_catalog();
     if name == SUBSCRIBE_COLLECT_TOOL {
         let def = subscribe_collect_def();
         if state.mcp.read_only() && !def.read_only {
@@ -726,7 +737,7 @@ async fn call_tool(
         let (status, result) = call_collect(state, &arguments).await;
         return (status, result, name.to_string());
     }
-    let tool = match tool_by_name(&catalog, name) {
+    let tool = match tool_by_name(catalog(), name) {
         Some(tool) => tool.clone(),
         None => {
             if is_excluded_tool_name(name) {
@@ -773,8 +784,10 @@ async fn call_tool(
     use tower::ServiceExt as _;
     // The outer handler already caps the MCP body at 8 MiB.
     // Disable the default 2 MiB cap for the inner dispatch,
-    // so a body up to 8 MiB reaches the handler.
-    let app = crate::router(state.clone()).layer(axum::extract::DefaultBodyLimit::disable());
+    // so a body up to 8 MiB reaches the handler. The table is built
+    // one time and shared; each call sets the live state, so
+    // authentication runs per request against the current stores.
+    let app = inner_routes(state).layer(axum::extract::DefaultBodyLimit::disable());
     let response = match app.oneshot(request).await {
         Ok(response) => response,
         Err(never) => match never {},
@@ -782,6 +795,29 @@ async fn call_tool(
     let status = response.status().as_u16();
     let result = tool_result(response).await;
     (status, result, name.to_string())
+}
+
+/// Inner dispatch table for `tools/call`: the live management
+/// route table, built one time and shared by every call.
+///
+/// The table holds no state. Each call sets the live `ApiState` with
+/// `with_state`, so authentication runs per request against the
+/// current stores and concurrent calls share the table. No cycle
+/// exists: the table never points back at the state or the outer
+/// router. Tests read the build count through
+/// [`inner_route_builds`].
+fn inner_routes(state: &ApiState) -> axum::Router {
+    crate::router_routes()
+        .layer(axum::Extension(state.clone()))
+        .with_state(state.clone())
+}
+
+/// Count of inner route table builds. Tests read this; production
+/// ignores it. The table behind [`inner_routes`] is shared, so the
+/// count stays at one after the first call.
+#[cfg(test)]
+pub(crate) fn inner_route_builds() -> u64 {
+    crate::router_route_builds()
 }
 
 /// Run the `subscribe_collect` tool: register a temporary internal
@@ -1026,11 +1062,11 @@ fn broker_status_result() -> Value {
 /// The built-in toolset listing: groups with tool counts for the
 /// caller permission: a key sees only the tools it may call.
 fn list_toolsets_result(state: &ApiState, caller: &Caller) -> Value {
-    let catalog = build_catalog();
+    let shared = catalog();
     let collect = subscribe_collect_def();
     let mut sets: Vec<Value> = Vec::new();
     for set in catalog::TOOLSETS {
-        let mut tools: Vec<&ToolDef> = catalog
+        let mut tools: Vec<&ToolDef> = shared
             .iter()
             .filter(|tool| tool.toolset == set.name)
             .filter(|tool| caller_may_call(state, caller, tool))
@@ -1829,5 +1865,238 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "disabled answers 404");
+    }
+
+    /// One `tools/call` of the status tool through the socket.
+    async fn call_status_tool(client: &McpClient, token: &str, id: i64) -> (StatusCode, Value) {
+        client
+            .post(
+                "/mcp",
+                Some(token),
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {"name": catalog::BROKER_STATUS_TOOL, "arguments": {}}
+                }),
+            )
+            .await
+    }
+
+    /// The shared route table and the shared catalog are built one
+    /// time: 32 concurrent calls add at most one build each, and every
+    /// call answers. Concurrent calls share the table.
+    #[tokio::test]
+    async fn shared_table_builds_once_for_many_concurrent_calls() {
+        let (state, token) = keyed_state();
+        let server = McpServer::start(state).await;
+        let routes_before = inner_route_builds();
+        let catalog_before = catalog::catalog_builds();
+        let mut tasks = Vec::new();
+        for id in 0..32i64 {
+            let client = server.client;
+            let call_token = token.clone();
+            tasks.push(tokio::spawn(async move {
+                if id % 2 == 0 {
+                    client
+                        .post(
+                            "/mcp",
+                            Some(&call_token),
+                            &serde_json::json!({
+                                "jsonrpc": "2.0", "id": id, "method": "tools/list"
+                            }),
+                        )
+                        .await
+                } else {
+                    call_status_tool(&client, &call_token, id).await
+                }
+            }));
+        }
+        for task in tasks {
+            let (status, _) = task.await.expect("call ends");
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert!(
+            inner_route_builds() - routes_before <= 1,
+            "one route table build at most"
+        );
+        assert!(
+            catalog::catalog_builds() - catalog_before <= 1,
+            "one catalog build at most"
+        );
+    }
+
+    /// The shared table reads live state on each call. A removed key
+    /// fails on the next call, and a new key passes. A read-only switch
+    /// refuses writes on the next call. It allows them again after the
+    /// switch is cleared. The table is built once, not per request.
+    #[tokio::test]
+    async fn shared_table_sees_key_and_mode_changes_on_next_call() {
+        let (state, token) = keyed_state();
+        let server = McpServer::start(state.clone()).await;
+        let (status, _) = call_status_tool(&server.client, &token, 1).await;
+        assert_eq!(status, StatusCode::OK);
+        state.api_keys.remove("mcp-admin").expect("key removes");
+        let (status, _) = call_status_tool(&server.client, &token, 2).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "removed key fails");
+        let fresh = mint_key(
+            &state,
+            "mcp-admin-2",
+            crate::v5::api_keys::KeyRole::Administrator,
+        );
+        let (status, body) = call_status_tool(&server.client, &fresh, 3).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("error").is_none(), "{body}");
+        state.mcp.set_read_only(true);
+        let (status, refused) = server
+            .client
+            .post(
+                "/mcp",
+                Some(&fresh),
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {"name": "post_api_v5_publish",
+                               "arguments": {"body": {"topic": "mcp/ro", "payload": "x"}}}
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(refused["result"]["isError"], serde_json::json!(true));
+        state.mcp.set_read_only(false);
+        let (status, body) = server
+            .client
+            .post(
+                "/mcp",
+                Some(&fresh),
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {"name": "post_api_v5_publish",
+                               "arguments": {"body": {"topic": "mcp/ro", "payload": "x"}}}
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.get("error").is_none(), "{body}");
+    }
+
+    /// `tools/list` with `toolsets=all` names each catalog tool exactly
+    /// once, plus each custom tool once. Each catalog description names
+    /// its route. No tool carries the `gateways` toolset: gateways are
+    /// not in the MVP and the router exposes no gateway operation.
+    #[tokio::test]
+    async fn all_list_names_each_catalog_tool_once() {
+        let (state, token) = keyed_state();
+        let server = McpServer::start(state).await;
+        let (status, body) = server
+            .client
+            .post(
+                "/mcp?toolsets=all",
+                Some(&token),
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"].as_array().expect("tools list");
+        let names: Vec<String> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name").to_string())
+            .collect();
+        for tool in catalog() {
+            let count = names.iter().filter(|name| **name == tool.name).count();
+            assert_eq!(count, 1, "tool {} is listed once", tool.name);
+            let entry = tools
+                .iter()
+                .find(|item| item["name"] == tool.name)
+                .expect("listed tool has an entry");
+            let description = entry["description"].as_str().expect("description");
+            let route = format!("{} {}", tool.method, tool.path);
+            assert!(
+                description.contains(&route),
+                "tool {} names its route {route}",
+                tool.name
+            );
+        }
+        for custom in [
+            catalog::BROKER_STATUS_TOOL,
+            catalog::LIST_TOOLSETS_TOOL,
+            SUBSCRIBE_COLLECT_TOOL,
+        ] {
+            let count = names.iter().filter(|name| **name == *custom).count();
+            assert_eq!(count, 1, "custom tool {custom} is listed once");
+        }
+        assert!(
+            !catalog().iter().any(|tool| tool.toolset == "gateways"),
+            "no gateway tool exists"
+        );
+        let (_, body) = server
+            .client
+            .post(
+                "/mcp",
+                Some(&token),
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": catalog::LIST_TOOLSETS_TOOL, "arguments": {}}
+                }),
+            )
+            .await;
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(!text.contains("\"gateways\""), "empty set stays out");
+    }
+
+    /// Every generated forwarding tool answers through the endpoint:
+    /// each call reaches its live handler, never `unknown tool` and
+    /// never `this operation has no tool`. Path fields take a dummy
+    /// value, `query` and `body` take empty objects. A handler that
+    /// cannot serve the dummy input answers with its own error, which
+    /// still proves the dispatch.
+    #[tokio::test]
+    async fn every_forwarding_tool_answers_through_the_endpoint() {
+        let (state, token) = keyed_state();
+        let server = McpServer::start(state).await;
+        for tool in catalog() {
+            let mut arguments = serde_json::Map::new();
+            for param in route_scan::path_params(tool.path) {
+                arguments.insert(param, serde_json::json!("test"));
+            }
+            arguments.insert("query".to_string(), serde_json::json!({}));
+            if tool.method != "GET" && tool.method != "DELETE" {
+                arguments.insert("body".to_string(), serde_json::json!({}));
+            }
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool.name, "arguments": arguments}
+            });
+            let answer = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                server
+                    .client
+                    .post("/mcp?toolsets=all", Some(&token), &payload),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("tool {} answers in time", tool.name));
+            let (status, body) = answer;
+            assert_eq!(status, StatusCode::OK, "tool {}", tool.name);
+            let text = body.to_string();
+            assert!(
+                !text.contains("unknown tool"),
+                "tool {} dispatches",
+                tool.name
+            );
+            assert!(
+                !text.contains("this operation has no tool"),
+                "tool {} dispatches",
+                tool.name
+            );
+        }
     }
 }

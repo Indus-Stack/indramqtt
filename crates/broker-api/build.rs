@@ -9,8 +9,9 @@
 //! row per `(method, path)` pair scanned out of the router source with
 //! the shared scanner in `src/mcp/route_scan.rs`. The MCP tool list and
 //! the coverage test both read this table, so the tools track the HTTP
-//! routes with no hand-written copy. A tool description reuses the first
-//! doc-comment line of its handler; a route without docs falls back to
+//! routes with no hand-written copy. A tool description keeps the first
+//! doc-comment line of its handler and names the route after it
+//! (`METHOD path` in parentheses); a route without docs falls back to
 //! `METHOD path`. The script never fails a row: a missing file or a
 //! missing doc comment gives the fallback text.
 
@@ -85,7 +86,9 @@ fn emit_mcp_tool_table() {
     }
 }
 
-/// Tool description: handler doc line, else `METHOD path`.
+/// Tool description: the handler doc line plus the route
+/// (`METHOD path` in parentheses), else `METHOD path` alone. The
+/// route name is added to the purpose, never used in its place.
 fn describe_route(
     manifest: &Path,
     route: &ScannedRoute,
@@ -102,7 +105,7 @@ fn describe_route(
         if !content.is_empty() {
             if let Some(summary) = find_doc_summary(&content, &name) {
                 if !summary.is_empty() {
-                    return summary;
+                    return format!("{summary} ({} {})", route.method, route.path);
                 }
             }
         }

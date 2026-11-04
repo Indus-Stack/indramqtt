@@ -15,7 +15,7 @@ use broker_session::SessionManager;
 use brokerlink::BrokerFrame;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::admin_users::AdminUsers;
@@ -772,10 +772,40 @@ fn defaults_registry() -> Arc<ConfigRegistry> {
     Arc::new(ConfigRegistry::load(&dir).expect("validated defaults always load"))
 }
 
+/// One-time route table, shared by every caller. Built on first
+/// use; every later call clones it. A test-only counter tracks builds.
+static SHARED_ROUTES: OnceLock<Router<ApiState>> = OnceLock::new();
+
+/// Count of route table builds. Tests read this; production ignores it.
+static ROUTE_BUILDS: AtomicU64 = AtomicU64::new(0);
+
 /// Public routes (dashboard assets, health, login, MQTT-over-WebSocket)
 /// stay outside the authentication layer; every other route requires a
 /// bearer token enforced by [`api_auth::require_api_auth`].
-pub fn router(state: ApiState) -> Router {
+///
+/// The table holds no state. [`router`] sets the live state per call
+/// with `with_state`. The MCP endpoint reuses this table through its
+/// own one-time cache. Authentication runs per request against the
+/// current stores. Concurrent calls share the table. No cycle exists:
+/// the table never points back at the outer router or the state.
+pub(crate) fn router_routes() -> Router<ApiState> {
+    SHARED_ROUTES
+        .get_or_init(|| {
+            ROUTE_BUILDS.fetch_add(1, Ordering::Relaxed);
+            build_router_routes()
+        })
+        .clone()
+}
+
+/// Count of route table builds. Tests read this; production ignores it.
+#[cfg(test)]
+pub(crate) fn router_route_builds() -> u64 {
+    ROUTE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Build the full route table: protected routes behind the auth
+/// layer plus the public routes. Holds no state.
+fn build_router_routes() -> Router<ApiState> {
     let protected: Router<ApiState> = Router::new()
         .route("/schemas", get(v5::schemas::list_schemas))
         .route("/schemas/:name", get(v5::schemas::get_schema))
@@ -820,10 +850,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/licence/request", get(licence::get_request))
         .route("/api/v1/licence/install", post(licence::install_licence))
         .route("/api/v1/licence/status", get(licence::get_status))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            api_auth::require_api_auth,
-        ));
+        .layer(axum::middleware::from_fn(api_auth::require_api_auth));
     let public: Router<ApiState> = Router::new()
         .route("/", get(redirect_to_dashboard))
         .route("/dashboard", get(get_dashboard))
@@ -857,7 +884,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/status", get(v5::status::get_status))
         .nest("/api/v5", v5::public_router())
         .merge(protected);
-    public.with_state(state)
+    public
+}
+
+/// Serve-ready router: the shared route table with the live state set.
+/// Each call clones the table, so no caller rebuilds the routes.
+pub fn router(state: ApiState) -> Router {
+    router_routes()
+        .layer(axum::Extension(state.clone()))
+        .with_state(state)
 }
 
 /// Serve the management API on an already-bound listener.
