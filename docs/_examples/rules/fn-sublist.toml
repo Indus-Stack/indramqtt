@@ -1,0 +1,39 @@
+[example]
+area = "rules"
+item = "fn-sublist"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT sublist(2, nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": [10, 20]}'
+
+[[case]]
+sql = "SELECT sublist(2, 2, nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": [20, 30]}'
+
+[[case]]
+sql = "SELECT sublist(5, nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": [10, 20, 30]}'
+
+[[case]]
+sql = "SELECT sublist(8, 5, nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": []}'
+
+[[case]]
+sql = "SELECT sublist(-1, nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": null}'

@@ -1,0 +1,25 @@
+[example]
+area = "rules"
+item = "fn-std_length"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT std_length(nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": 3}'
+
+[[case]]
+sql = "SELECT std_length('hello') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": 5}'
+
+[[case]]
+sql = "SELECT std_length(5) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": null}'

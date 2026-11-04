@@ -23,6 +23,8 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --check --area rules-type-conversion
   python3 docs/_tools/entries.py --write --area rules-type-checks
   python3 docs/_tools/entries.py --check --area rules-type-checks
+  python3 docs/_tools/entries.py --write --area rules-arrays
+  python3 docs/_tools/entries.py --check --area rules-arrays
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -1351,6 +1353,141 @@ def render_rules_type_checks_page():
     return "\n".join(out) + "\n"
 
 
+# Display order of the DX2-009 function entries (arrays).
+RULES_ARRAY_FUNCTIONS = [
+    "nth",
+    "length",
+    "sublist",
+    "first",
+    "last",
+    "contains",
+    "std_length",
+]
+
+# One signature line per DX2-009 stem, taken from the broker code.
+RULES_ARRAY_SYNTAX = {
+    "fn-nth": "`nth(<n>, <list>)`",
+    "fn-length": "`length(<value>)`",
+    "fn-sublist": "`sublist(<len>, <list>)` or `sublist(<start>, <len>, <list>)`",
+    "fn-first": "`first(<list>)`",
+    "fn-last": "`last(<list>)`",
+    "fn-contains": "`contains(<element>, <list>)`",
+    "fn-std_length": "`std_length(<value>)`",
+}
+
+# Extra note lines per DX2-009 stem. Each states an observed limit.
+RULES_ARRAY_NOTES = {
+    "fn-nth": [
+        "The position counts from 1. A position below 1 and a position past the end return an empty text, not null.",
+        "A value that is not a list returns null. A wrong argument count returns null.",
+    ],
+    "fn-length": [
+        "A list returns its element count; a text returns its character count. Any other value returns null.",
+        "The engine rewrites `length` to `std_length` before it parses the query, so the standard semantics apply.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-sublist": [
+        "The two-argument form takes the first `len` elements. The three-argument form counts from 1 and clamps at the end of the list.",
+        "A negative count, or a `start` below 1, returns null. A wrong argument count returns null.",
+    ],
+    "fn-first": [
+        "An empty list returns null. A value that is not a list returns null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-last": [
+        "An empty list returns null. A value that is not a list returns null.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-contains": [
+        "The argument order is `(element, list)`.",
+        "Equality is strict: the integer `1` and the float `1.0` are different values.",
+        "A value that is not a list returns null. A wrong argument count returns null.",
+    ],
+    "fn-std_length": [
+        "The call reads the same as `length`.",
+        "A list returns its element count; a text returns its character count. Any other value returns null.",
+        "A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rules_arrays_page():
+    """Render the array function page (DX2-009)."""
+    out = [
+        "---",
+        "title: Rule functions: arrays",
+        "description: Verified entries for the array functions.",
+        "sidebar:",
+        "  order: 50",
+        "---",
+        "",
+        "# Rule functions: arrays",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "An array function reads or changes a JSON list. It returns an "
+        "element, a shorter list, a count, or a boolean. Use this page "
+        "when a rule must pick or measure a field that holds a list. You "
+        "get one entry per function, each with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    In["list value"] -- "nth or first or last" --> El["element"]',
+                '    In -- "length or std_length" --> N["count"]',
+                '    In -- "sublist" --> Slice["shorter list"]',
+                '    El -- "SELECT AS" --> Sel["result column"]',
+                '    N -- "SELECT AS" --> Sel',
+                '    Slice -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A wrong argument count reads as null. A value that is not a list "
+        "reads as null where the function needs a list. A null value "
+        "never stops the rule. The `length` row also counts the "
+        "characters of a text.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_ARRAY_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` reads a list."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_ARRAY_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_ARRAY_SYNTAX,
+            RULES_ARRAY_NOTES,
+            "`{name}` reads a list.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -1563,6 +1700,32 @@ def main(argv):
                 )
                 return 1
             print("entries match: docs/rules/functions-type-checks.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-arrays":
+        fresh = render_rules_arrays_page()
+        path = ROOT / "docs" / "rules" / "functions-arrays.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-arrays.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-arrays.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-arrays.md")
             return 0
         parser.print_help()
         return 2

@@ -1,0 +1,112 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": 20
+      },
+      "sql": "SELECT nth(2, nums) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": ""
+      },
+      "sql": "SELECT nth(5, nums) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT nth(1, 'notalist') AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "count": 3,
+        "flag": null,
+        "items": {
+          "a": 1
+        },
+        "name": "",
+        "nums": [
+          10,
+          20,
+          30
+        ],
+        "tags": [
+          1,
+          2
+        ],
+        "temperature": 72.5
+      },
+      "projected": {
+        "v": null
+      },
+      "sql": "SELECT nth(1) AS v FROM \"sensors/+\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "fn-nth",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

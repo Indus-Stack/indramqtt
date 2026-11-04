@@ -1,0 +1,25 @@
+[example]
+area = "rules"
+item = "fn-contains"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT contains(20, nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": true}'
+
+[[case]]
+sql = "SELECT contains(99, nums) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": false}'
+
+[[case]]
+sql = "SELECT contains(1, 'notalist') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5, "count": 3, "items": {"a": 1}, "tags": [1, 2], "name": "", "flag": null, "nums": [10, 20, 30]}'
+expect_matched = true
+expect_projected = '{"v": null}'

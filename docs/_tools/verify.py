@@ -412,6 +412,18 @@ DX2_006_ITEMS = {
 }
 
 
+# Rule function stems owned by DX2-009 (arrays).
+DX2_009_ITEMS = {
+    "fn-nth",
+    "fn-length",
+    "fn-sublist",
+    "fn-first",
+    "fn-last",
+    "fn-contains",
+    "fn-std_length",
+}
+
+
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
     if item.startswith(("clause-", "op-")):
@@ -426,6 +438,8 @@ def failure_marker(item):
         return "DX2-005"
     if item in DX2_006_ITEMS:
         return "DX2-006"
+    if item in DX2_009_ITEMS:
+        return "DX2-009"
     return "DX-01"
 
 

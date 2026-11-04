@@ -38,6 +38,7 @@ flowchart LR
 | [Bit and byte functions](./functions-bits-bytes.md) | One verified entry per bit and byte function. |
 | [Type conversion functions](./functions-type-conversion.md) | One verified entry per type conversion function. |
 | [Type check functions](./functions-type-checks.md) | One verified entry per type check function. |
+| [Array functions](./functions-arrays.md) | One verified entry per array function. |
 | [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
 
 > [!NOTE]
