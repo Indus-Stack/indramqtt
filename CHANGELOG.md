@@ -80,6 +80,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Fixed
 - **Subscribe cover check**: a narrow allow rule no longer covers a wider request. `a/+` does not cover `a/#`, and `+` does not cover `#`. A deny rule applies when it overlaps the request, so deny `secret/#` denies a subscribe to `#`. A `#` or `+` at the first level no longer matches `$` topics. A subscribe that was allowed before and is denied now is correct here.
 - Rule API errors follow the reference API: duplicate rule creation returns `400 BAD_REQUEST`; a stored-rule test for an absent id returns `404 RULE_NOT_FOUND`. A refused duplicate keeps the existing rule and its stored settings.
+- **Management API disable flag**: `listeners.api.enabled = false` in `indra.toml` (or `INDRA_LISTENERS__API__ENABLED`) now opens no API socket, while MQTT still serves from the same file. Before this change the broker accepted the flag and kept serving the API.
+- **Legacy licence file path**: an explicit non-default `licence.license_file` is refused at load with a native error naming the file and the key. The broker keeps the stored licence and never reads this path. The default path keeps booting unchanged.
+- **Node identity at boot**: the kernel fixes the node name from the resolved configuration before any component reads it. `node_status` of a stored connector reports the configured id after a restart instead of the default.
 - **Messages that did not arrive in a large fan-out**: the kernel wrote one batch for each wake of a link and then waited. A publish to more subscribers than one batch holds left messages in the queues, and the kernel counted them as delivered. The kernel now writes until the queues are empty.
 
 ---

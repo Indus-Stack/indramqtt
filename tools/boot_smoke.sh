@@ -2173,6 +2173,82 @@ PY
 kill "$SESSION_KERNEL_PID" 2>/dev/null
 wait "$SESSION_KERNEL_PID" 2>/dev/null
 
+# --- 13. A disabled API listener opens no socket ---
+# An operator sets listeners.api.enabled to false in indra.toml. MQTT
+# still serves from the same file, but the API port refuses. The API
+# bind runs before the MQTT binds. An MQTT accept proves the boot
+# reached the API decision: a refusal then means no socket, not a slow
+# boot. A second MQTT accept proves the kernel is still alive. This
+# kernel runs its own config and ports so it does not disturb the
+# checks above.
+read -r NOAPI_MQTT_PORT NOAPI_API_PORT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/cfg-noapi" "$ROOT/data-noapi"
+cat > "$ROOT/cfg-noapi/indra.toml" <<EOF
+[node]
+id = "boot-smoke-noapi"
+data_dir = "$ROOT/data-noapi"
+
+[listeners.tcp]
+bind = "127.0.0.1:$NOAPI_MQTT_PORT"
+
+[listeners.api]
+bind = "127.0.0.1:$NOAPI_API_PORT"
+enabled = false
+
+# The check connects without credentials: this kernel opts into
+# anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+EOF
+"$KERNEL" --config-dir "$ROOT/cfg-noapi" > "$ROOT/kernel-noapi.log" 2>&1 &
+NOAPI_KERNEL_PID=$!
+python3 - "$NOAPI_MQTT_PORT" "$NOAPI_API_PORT" <<'PY'
+import socket, sys, time
+mqtt_port, api_port = sys.argv[1:3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def wait_port(port):
+    for _ in range(200):
+        try:
+            sock = socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+            sock.close()
+            return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+report("the no-API kernel serves MQTT from indra.toml", wait_port(mqtt_port))
+try:
+    sock = socket.create_connection(("127.0.0.1", int(api_port)), timeout=5)
+    sock.close()
+    refused = False
+except OSError:
+    refused = True
+report("listeners.api.enabled = false from indra.toml opens no socket", refused)
+report("the no-API kernel is still alive after the refused API dial",
+       wait_port(mqtt_port))
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+kill "$NOAPI_KERNEL_PID" 2>/dev/null
+wait "$NOAPI_KERNEL_PID" 2>/dev/null
+
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"
     exit 0

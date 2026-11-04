@@ -11262,6 +11262,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Any other start returns the error and exits 1.
         return Err(err.into());
     }
+    // Fix the node name before any component reads it. The name has
+    // process scope and the first read wins. Late init lets a restart
+    // with stored connectors cache the default name instead.
+    broker_api::node_scope::init_local_node_name(&args.node_id);
     let cfg = layered.config().clone();
     // Start the log output after the configuration is resolved. Thus
     // `logging.level` applies. If the configuration has an error, `main`
@@ -12113,7 +12117,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    if !args.api_bind.is_empty() {
+    // A disabled API listener opens no socket. The bind flag alone
+    // never enables it. No flag sets `enabled`, so a file or variable
+    // with `enabled = false` wins over a bind value (fail closed).
+    if cfg.listeners.api.enabled && !args.api_bind.is_empty() {
         let listener = tokio::net::TcpListener::bind(&args.api_bind).await?;
         info!("Management API listening on {}", args.api_bind);
         // Cluster text (AP-03): name the kept description once at boot,

@@ -119,7 +119,7 @@ burst_multiplier=1.0
 '''
         (self.cfg / "indra.toml").write_text(text + extra)
 
-    def start(self):
+    def start(self, wait_for_api=True):
         env = {key: value for key, value in os.environ.items() if not key.startswith("INDRA_")}
         env["INDRA_API_KEYS"] = self.key
         env.update(self.extra_env)
@@ -136,8 +136,13 @@ burst_multiplier=1.0
                         raw = raw.replace(secret, "[redacted]")
                 raise AssertionError("broker exited at boot: " + raw[-3000:])
             try:
-                status, _ = self.http("GET", "/healthz", auth=False)
-                if status == 200:
+                if wait_for_api:
+                    status, _ = self.http("GET", "/healthz", auth=False)
+                    if status == 200:
+                        return
+                else:
+                    probe = socket.create_connection(("127.0.0.1", self.mqtt), timeout=10)
+                    probe.close()
                     return
             except (OSError, urllib.error.URLError):
                 pass
@@ -1188,20 +1193,22 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(source["inventory_unknown"], config["inventory_unknown"])
 
     # // AZ-01 inventory: current behaviour; owner MV-10
-    def test_disabled_api_listener_still_serves_http(self):
+    def test_disabled_api_listener_serves_nothing(self):
         b = self.broker
         b.configure()
         path = b.cfg / "indra.toml"
         path.write_text(path.read_text().replace("[listeners.api]\n", "[listeners.api]\nenabled=false\n"))
-        b.start()
-        status, _ = b.http("GET", "/api/v5/listeners")
-        self.assertEqual(status, 200)
+        b.start(wait_for_api=False)
         _, ack = b.connect("disabled-api")
         self.assertEqual(ack, "0000")
+        with self.assertRaises(OSError):
+            b.http("GET", "/api/v5/listeners")
         b.stop()
-        b.start()
-        status, _ = b.http("GET", "/api/v5/metrics")
-        self.assertEqual(status, 200)
+        b.start(wait_for_api=False)
+        _, ack = b.connect("disabled-api-restart")
+        self.assertEqual(ack, "0000")
+        with self.assertRaises(OSError):
+            b.http("GET", "/api/v5/metrics")
 
     # // AZ-01 inventory: current behaviour; owner MV-11c
     def test_metrics_settings_do_not_change_scrape_policy(self):
@@ -1680,7 +1687,7 @@ class InventoryEntry(unittest.TestCase):
         output()
 
     # // AZ-01 inventory: current behaviour; owner MV-10
-    def test_stored_connector_boot_caches_the_default_node_identity(self):
+    def test_stored_connector_boot_keeps_the_configured_node_identity(self):
         b = self.boot()
         status, first = b.http("POST", "/api/v5/connectors",
                                {"type": "console", "name": "identityconnector"})
@@ -1690,7 +1697,7 @@ class InventoryEntry(unittest.TestCase):
         b.start()
         status, current = b.http("GET", "/api/v5/connectors/identityconnector")
         self.assertEqual(status, 200)
-        self.assertEqual(current["node_status"][0]["node"].split("@")[0], "indra-node-1")
+        self.assertEqual(current["node_status"][0]["node"].split("@")[0], "az-01-entry")
         status, loaded = b.http("GET", "/api/v1/config/explain?key=node.id")
         self.assertEqual(status, 200)
         self.assertEqual(loaded["value"], '"az-01-entry"')
@@ -2276,12 +2283,23 @@ class InventoryEntry(unittest.TestCase):
         invalid.write_text("invalid licence document")
         legacy = '[licence]\nlicense_file="' + str(invalid) + '"\nexpiry_warn_days=9\n'
         b.configure(extra=legacy)
+        # An explicit path is refused at load: the broker never reads it.
+        # The error names the file and the setting.
+        try:
+            b.start()
+        except AssertionError as failure:
+            self.assertIn("licence.license_file", str(failure))
+        else:
+            self.fail("boot with an explicit licence file must fail")
+        b.child = None
+        warned = '[licence]\nexpiry_warn_days=9\n'
+        b.configure(extra=warned)
         b.start()
         _, ack = b.connect("licence-file")
         self.assertEqual(ack, "0000")
         status, loaded = b.http("GET", "/api/v1/config/explain?key=licence.license_file")
         self.assertEqual(status, 200)
-        self.assertEqual(loaded["value"], json.dumps(str(invalid)))
+        self.assertEqual(loaded["value"], json.dumps("/etc/indramqtt/license.key"))
         status, licence = b.http("GET", "/api/v1/licence/status")
         self.assertEqual(status, 200)
         self.assertEqual(licence["expiry_warn_days"], 9)
@@ -2316,7 +2334,7 @@ class InventoryEntry(unittest.TestCase):
                 False, "cannot load trusted licence keys")
         command("install_file=" + json.dumps(str(invalid)) + "\n",
                 False, "licence install refused")
-        b.configure(extra=legacy)
+        b.configure(extra=warned)
         b.start()
         status, restored = b.http("GET", "/api/v1/licence/status")
         self.assertEqual(status, 200)
