@@ -563,22 +563,100 @@ class InventoryEntry(unittest.TestCase):
         b.start()
         _, ack = b.connect("anonymous-after-restart")
         self.assertEqual(ack, "0005", "anonymous is still refused after a restart")
+        # The file selects bcrypt: a user created through the API gets a
+        # bcrypt verifier, and the credential binds through the socket.
         status, _ = b.http("POST", "/api/v1/auth/users",
                            {"username": "audituser", "password": b.password})
         self.assertEqual(status, 201)
         state = tomllib.loads((b.data / "state.toml").read_text())
         verifier = state["mqtt_users"]["users"][0]["password_hash"]
-        self.assertTrue(verifier.startswith("$argon2id$"), "default only; file value not applied (SA-21 owns it)")
+        self.assertTrue(verifier.startswith("$2b$"), "bcrypt file value applies to new verifiers")
+        self.assertNotIn(b.password, verifier, "the stored verifier is not plaintext")
+        status, listed = b.http("GET", "/api/v1/auth/users")
+        self.assertEqual(status, 200)
+        self.assertNotIn("password_hash", json.dumps(listed), "the user list carries no hash")
+        _, ack = b.connect("bcrypt-ok", True)
+        self.assertEqual(ack, "0000", "the bcrypt credential binds")
+        raw = socket.create_connection(("127.0.0.1", b.mqtt), timeout=10)
+        b.sockets.append(raw)
+        flags = 2 | 192
+        body = b"\x00\x04MQTT\x04" + bytes([flags]) + struct.pack("!H", 60) + word("bcrypt-bad")
+        body += word("audituser") + word("wrong-password-value")
+        raw.sendall(frame(16, body))
+        _, bad_ack = packet(raw)
+        self.assertEqual(bad_ack.hex(), "0004", "a wrong password is refused")
         _, ack = b.connect("anonymous-with-users")
         self.assertEqual(ack, "0005")
+        # Version 5.0 still refuses anonymous while users exist.
+        sock = socket.create_connection(("127.0.0.1", b.mqtt), timeout=10)
+        try:
+            sock.sendall(frame(16, b"\x00\x04MQTT\x05\x02\x00\x3c\x00" + word("anonymous-v5-users")))
+            head, ack = packet(sock)
+            self.assertEqual(head, 32, "the kernel answers a refused v5 CONNECT")
+            self.assertEqual(ack[1], 0x87, "v5 anonymous CONNECT is refused with 0x87")
+        finally:
+            sock.close()
+        # The flag toggles: an empty store with the flag on accepts.
+        probe_base = Path(self.scratch.name) / "allow-on"
+        probe_base.mkdir()
+        probe = Broker(probe_base)
+        probe.configure(anonymous=True)
+        probe.start()
+        try:
+            _, ack = probe.connect("anonymous-allowed")
+            self.assertEqual(ack, "0000", "anonymous binds with the flag on and no users")
+        finally:
+            probe.stop()
+        # The file selects sha256: a new user gets a 64-char hex verifier.
+        # The old bcrypt verifier still binds after the switch and restart.
+        b.stop()
+        text = (b.cfg / "indra.toml").read_text()
+        text = text.replace('password_hash="bcrypt"', 'password_hash="sha256"')
+        (b.cfg / "indra.toml").write_text(text)
+        b.start()
+        _, ack = b.connect("bcrypt-after-switch", True)
+        self.assertEqual(ack, "0000", "an old verifier keeps working after the switch")
+        status, _ = b.http("POST", "/api/v1/auth/users",
+                           {"username": "sha-user", "password": b.password})
+        self.assertEqual(status, 201)
+        state = tomllib.loads((b.data / "state.toml").read_text())
+        rows = {row["username"]: row["password_hash"] for row in state["mqtt_users"]["users"]}
+        sha_verifier = rows["sha-user"]
+        self.assertEqual(len(sha_verifier), 64, "sha256 selection stores 64 hex chars")
+        self.assertNotIn(b.password, sha_verifier, "the stored verifier is not plaintext")
+        _, ack = b.connect("sha-ok", True, username="sha-user")
+        self.assertEqual(ack, "0000", "the sha256 credential binds")
+        b.stop()
+        b.start()
+        _, ack = b.connect("sha-after-restart", True, username="sha-user")
+        self.assertEqual(ack, "0000", "the sha256 credential binds after a restart")
+        _, ack = b.connect("bcrypt-after-restart", True)
+        self.assertEqual(ack, "0000", "the bcrypt credential binds after a restart")
+        # An unreadable verifier never grants access (fail closed).
+        b.stop()
+        raw_state = (b.data / "state.toml").read_text()
+        self.assertIn(sha_verifier, raw_state, "the sha verifier is stored")
+        raw_state = raw_state.replace(sha_verifier, "$bogus$unreadable-verifier")
+        (b.data / "state.toml").write_text(raw_state)
+        b.start()
+        raw = socket.create_connection(("127.0.0.1", b.mqtt), timeout=10)
+        b.sockets.append(raw)
+        body = b"\x00\x04MQTT\x04" + bytes([flags]) + struct.pack("!H", 60) + word("locked-client")
+        body += word("sha-user") + word(b.password)
+        raw.sendall(frame(16, body))
+        _, locked_ack = packet(raw)
+        self.assertEqual(locked_ack.hex(), "0004", "an unreadable verifier is refused")
+        _, ack = b.connect("bcrypt-still-ok", True)
+        self.assertEqual(ack, "0000", "a valid credential still binds")
         # Unsupported algorithm fails the start, fail closed.
         b.stop()
         bad = (b.cfg / "indra.toml").read_text().replace(
-            'password_hash="bcrypt"', 'password_hash="argon2id"')
+            'password_hash="sha256"', 'password_hash="argon2id"')
         (b.cfg / "indra.toml").write_text(bad)
         with self.assertRaises(AssertionError) as ctx:
             b.start()
         self.assertIn("must be one of", str(ctx.exception))
+        self.assertIn("auth.password_hash", str(ctx.exception))
         b.child = None
 
     # // AZ-01 inventory: current behaviour; owner MV-09a

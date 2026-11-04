@@ -11457,9 +11457,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .auth
         .seed_from_registry(&shared.config)
         .map_err(|e| format!("seeding MQTT users from the config registry failed: {e}"))?;
-    // Authentication hashing policy stays at the compiled default
-    // (Argon2id for new verifiers, owned by SA-21). The file value is
-    // validated and stored only; this task applies nothing from it.
+    // Authentication hashing policy (SA-21): apply the file value to
+    // new and changed verifiers. Supported values come from the
+    // validated schema (`sha256`, `bcrypt`); any other value fails
+    // the start at validation, so the match below stays exhaustive.
+    // Existing verifiers keep verifying and migrate lazily on login.
+    let hash_algorithm = match cfg.auth.password_hash.as_str() {
+        "sha256" => broker_auth::PasswordAlgorithm::Sha256Legacy,
+        "bcrypt" => broker_auth::PasswordAlgorithm::Bcrypt,
+        other => {
+            return Err(format!(
+                "auth.password_hash {other:?} is not supported: must be one of sha256, bcrypt (field `auth.password_hash`)"
+            )
+            .into());
+        }
+    };
+    let hash_policy = broker_auth::PasswordHashPolicy {
+        default_algorithm: hash_algorithm,
+        ..Default::default()
+    };
+    shared.auth.set_policy(hash_policy);
     // Superusers (MV-09a): apply the configured list from boot.
     // An empty list keeps current behaviour with no bypass.
     shared.auth.set_superusers(cfg.auth.superusers.clone());
