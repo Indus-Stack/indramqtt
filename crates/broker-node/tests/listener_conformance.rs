@@ -6,7 +6,11 @@
 //! levels, timeouts, limits, QoS replay, will, takeover, retained,
 //! malformed input, aliases, receive maximum, packet size, subscription
 //! options, shared subscriptions, ban and kick, empty client ids and
-//! the WebSocket transport.
+//! the WebSocket transport. The SA-08 set adds protocol-error detail:
+//! second CONNECT, QoS 0 with DUP, packet id 0, wildcard topic names,
+//! empty ids without clean start, receive maximum 0, reserved
+//! subscription options, no-local on shared filters, session-present
+//! in both versions and unknown unsubscribe filters.
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -426,6 +430,20 @@ fn publish5(
     }
     rest.extend_from_slice(payload);
     let mut packet = vec![0x30 | (qos << 1) | u8::from(retain)];
+    packet.extend_from_slice(&rl(rest.len()));
+    packet.extend_from_slice(&rest);
+    packet
+}
+
+/// Builds an MQTT 5 UNSUBSCRIBE.
+fn unsubscribe_v5(packet_id: u16, filters: &[&str]) -> Vec<u8> {
+    let mut rest = Vec::new();
+    rest.extend_from_slice(&packet_id.to_be_bytes());
+    rest.push(0x00);
+    for filter in filters {
+        rest.extend_from_slice(&mqtt_str(filter));
+    }
+    let mut packet = vec![0xA2];
     packet.extend_from_slice(&rl(rest.len()));
     packet.extend_from_slice(&rest);
     packet
@@ -1542,5 +1560,315 @@ async fn lc_websocket_keepalive_and_ping() {
         closed.is_err() || matches!(&closed, Ok((0x8, _))),
         "idle WS socket closes"
     );
+    kernel.finish().await;
+}
+
+/// A second CONNECT is a protocol error. It ends only that connection.
+/// A v5 client gets DISCONNECT 0x82 first. A 3.1.1 client gets no
+/// packet. A sibling connection stays open throughout.
+#[tokio::test]
+async fn lc_sa08_second_connect_refused() {
+    let kernel = spawn_kernel("sa08-twice", None).await;
+    let mut sibling = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut sibling, "lc-sa08-sib", true, 60).await);
+
+    let mut v5 = dial(kernel.mqtt_port).await;
+    send(&mut v5, &connect5("lc-sa08-twice5", true, 60, 0)).await;
+    let (head, body) = recv(&mut v5).await;
+    assert_eq!(head & 0xF0, 0x20);
+    let (_, reason, _) = parse_connack5(&body);
+    assert_eq!(reason, 0);
+    send(&mut v5, &connect5("lc-sa08-twice5-again", true, 60, 0)).await;
+    let (head, body) = recv(&mut v5).await;
+    assert_eq!(head, 0xE0, "v5 protocol error gets DISCONNECT");
+    assert_eq!(body, vec![0x82], "reason is 0x82");
+    let closed = tokio::time::timeout(STEP, read_mqtt_packet(&mut v5)).await;
+    assert!(
+        closed.is_err() || matches!(&closed, Ok(Err(_))),
+        "socket closes after DISCONNECT"
+    );
+
+    let mut v4 = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut v4, "lc-sa08-twice4", true, 60).await);
+    send(&mut v4, &connect311("lc-sa08-twice4-again", true, 60)).await;
+    let closed = tokio::time::timeout(STEP, read_mqtt_packet(&mut v4)).await;
+    assert!(
+        closed.is_err() || matches!(&closed, Ok(Err(_))),
+        "second CONNECT closes the 3.1.1 socket"
+    );
+
+    send(&mut sibling, &subscribe(1, &[("lc/sa08/alive", 0)])).await;
+    let (head, _) = recv(&mut sibling).await;
+    assert_eq!(head, 0x90, "sibling stays open");
+    kernel.finish().await;
+}
+
+/// Publish protocol errors end only that connection. QoS 0 with DUP
+/// set, a QoS 1 packet id of 0 and a wildcard topic name are all
+/// refused. A v5 client gets DISCONNECT 0x82 first.
+#[tokio::test]
+async fn lc_sa08_publish_protocol_errors_close_only_that_client() {
+    let kernel = spawn_kernel("sa08-puberr", None).await;
+    let mut sibling = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut sibling, "lc-sa08-pub-sib", true, 60).await);
+
+    let mut dup = dial(kernel.mqtt_port).await;
+    send(&mut dup, &connect5("lc-sa08-dup", true, 60, 0)).await;
+    let (head, body) = recv(&mut dup).await;
+    assert_eq!(head & 0xF0, 0x20);
+    let (_, reason, _) = parse_connack5(&body);
+    assert_eq!(reason, 0);
+    let mut bad = publish5("lc/sa08/dup", 0, 0, false, None, b"dup-qos0");
+    bad[0] |= 0x08;
+    send(&mut dup, &bad).await;
+    let (head, body) = recv(&mut dup).await;
+    assert_eq!(head, 0xE0, "DUP with QoS 0 gets DISCONNECT");
+    assert_eq!(body, vec![0x82], "reason is 0x82");
+    let closed = tokio::time::timeout(STEP, read_mqtt_packet(&mut dup)).await;
+    assert!(
+        closed.is_err() || matches!(&closed, Ok(Err(_))),
+        "socket closes after DISCONNECT"
+    );
+
+    let mut zero = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut zero, "lc-sa08-zero", true, 60).await);
+    send(&mut zero, &publish311("lc/sa08/zero", 0, 1, false, b"x")).await;
+    let closed = tokio::time::timeout(STEP, read_mqtt_packet(&mut zero)).await;
+    assert!(
+        closed.is_err() || matches!(&closed, Ok(Err(_))),
+        "packet id 0 closes"
+    );
+
+    let mut wild = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut wild, "lc-sa08-wild", true, 60).await);
+    send(&mut wild, &publish311("lc/sa08/#", 0, 0, false, b"x")).await;
+    let closed = tokio::time::timeout(STEP, read_mqtt_packet(&mut wild)).await;
+    assert!(
+        closed.is_err() || matches!(&closed, Ok(Err(_))),
+        "wildcard topic name closes"
+    );
+
+    send(&mut sibling, &subscribe(1, &[("lc/sa08/alive", 0)])).await;
+    let (head, _) = recv(&mut sibling).await;
+    assert_eq!(head, 0x90, "sibling stays open");
+    kernel.finish().await;
+}
+
+/// An empty client id without clean start is refused. 3.1.1 answers
+/// code 2 and v5 answers 0x85. An empty id with clean start stays
+/// accepted in both versions. No session is stored for the refusal.
+#[tokio::test]
+async fn lc_sa08_empty_client_id_needs_clean_start() {
+    let kernel = spawn_kernel("sa08-empty", None).await;
+    let mut v4 = dial(kernel.mqtt_port).await;
+    send(&mut v4, &connect311("", false, 60)).await;
+    let (head, body) = recv(&mut v4).await;
+    assert_eq!(head, 0x20);
+    assert_eq!(parse_connack311(&body), (false, 2));
+
+    let mut v5 = dial(kernel.mqtt_port).await;
+    send(&mut v5, &connect5("", false, 60, 0)).await;
+    let (head, body) = recv(&mut v5).await;
+    assert_eq!(head & 0xF0, 0x20);
+    let (present, reason, _) = parse_connack5(&body);
+    assert!(!present);
+    assert_eq!(reason, 0x85);
+
+    let mut v4clean = dial(kernel.mqtt_port).await;
+    send(&mut v4clean, &connect311("", true, 60)).await;
+    let (head, body) = recv(&mut v4clean).await;
+    assert_eq!(head, 0x20);
+    assert_eq!(parse_connack311(&body), (false, 0));
+
+    let mut v5clean = dial(kernel.mqtt_port).await;
+    send(&mut v5clean, &connect5("", true, 60, 0)).await;
+    let (head, body) = recv(&mut v5clean).await;
+    assert_eq!(head & 0xF0, 0x20);
+    let (_, reason, _) = parse_connack5(&body);
+    assert_eq!(reason, 0);
+
+    let mut sibling = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut sibling, "lc-sa08-empty-sib", true, 60).await);
+    kernel.finish().await;
+}
+
+/// A v5 CONNECT with receive maximum 0 never reaches the session.
+/// The wire codec refuses it, so the socket closes with no CONNACK
+/// and no session is stored. The sibling connection stays open.
+#[tokio::test]
+async fn lc_sa08_receive_maximum_zero_refused() {
+    let kernel = spawn_kernel("sa08-recv0", None).await;
+    let mut sibling = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut sibling, "lc-sa08-r0-sib", true, 60).await);
+
+    let mut refused = dial(kernel.mqtt_port).await;
+    send(&mut refused, &connect5_recvmax("lc-sa08-r0", 60, 0)).await;
+    let closed = tokio::time::timeout(STEP, read_mqtt_packet(&mut refused)).await;
+    assert!(
+        closed.is_err() || matches!(&closed, Ok(Err(_))),
+        "receive maximum 0 closes with no CONNACK"
+    );
+
+    send(&mut sibling, &subscribe(1, &[("lc/sa08/r0-alive", 0)])).await;
+    let (head, _) = recv(&mut sibling).await;
+    assert_eq!(head, 0x90, "sibling stays open");
+    kernel.finish().await;
+}
+
+/// Reserved SUBSCRIBE option bits fail only that filter with 0x8F.
+/// The valid filter is granted and the connection stays open.
+#[tokio::test]
+async fn lc_sa08_reserved_subscribe_options_fail_one_filter() {
+    let kernel = spawn_kernel("sa08-subopt", None).await;
+    let mut sub = dial(kernel.mqtt_port).await;
+    send(&mut sub, &connect5("lc-sa08-subopt", true, 60, 0)).await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x20);
+    let (_, reason, _) = parse_connack5(&body);
+    assert_eq!(reason, 0);
+    send(
+        &mut sub,
+        &subscribe_v5(9, &[("lc/sa08/bad", 0xC1), ("lc/sa08/good", 0)], 0),
+    )
+    .await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head, 0x90);
+    assert_eq!(&body[..2], &[0x00, 0x09]);
+    assert_eq!(&body[3..], &[0x8F, 0x00]);
+
+    let mut publisher = dial(kernel.mqtt_port).await;
+    assert!(!connect_client(&mut publisher, "lc-sa08-subopt-pub", true, 60).await);
+    send(
+        &mut publisher,
+        &publish311("lc/sa08/good", 0, 0, false, b"granted-bytes"),
+    )
+    .await;
+    let (head, body) = recv(&mut sub).await;
+    let got = parse_publish5(head, &body);
+    assert_eq!(got.payload, b"granted-bytes");
+    kernel.finish().await;
+}
+
+/// No-local on a shared subscription fails only that filter with
+/// 0x8F. The connection stays open.
+#[tokio::test]
+async fn lc_sa08_no_local_on_shared_fails_filter() {
+    let kernel = spawn_kernel("sa08-nlshared", None).await;
+    let mut sub = dial(kernel.mqtt_port).await;
+    send(&mut sub, &connect5("lc-sa08-nlshared", true, 60, 0)).await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x20);
+    let (_, reason, _) = parse_connack5(&body);
+    assert_eq!(reason, 0);
+    let filter = "$share/lcgroup08/lc/sa08/nlshared";
+    send(&mut sub, &subscribe_v5(10, &[(filter, 0x04)], 0)).await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head, 0x90);
+    assert_eq!(&body[..2], &[0x00, 0x0A]);
+    assert_eq!(&body[3..], &[0x8F]);
+    send(&mut sub, &[0xC0, 0x00]).await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head, 0xD0, "connection stays open");
+    assert!(body.is_empty());
+    kernel.finish().await;
+}
+
+/// Session-present works in both versions. A first durable CONNECT
+/// reports absent. A reconnect without clean start reports present.
+/// A clean start reports absent again.
+#[tokio::test]
+async fn lc_sa08_session_present_both_versions() {
+    let kernel = spawn_kernel("sa08-present", None).await;
+    let mut first = dial(kernel.mqtt_port).await;
+    send(&mut first, &connect311("lc-sa08-present4", false, 60)).await;
+    let (head, body) = recv(&mut first).await;
+    assert_eq!(head, 0x20);
+    assert_eq!(parse_connack311(&body), (false, 0));
+    send(&mut first, &subscribe(1, &[("lc/sa08/present4", 0)])).await;
+    let (head, _) = recv(&mut first).await;
+    assert_eq!(head, 0x90);
+    drop(first);
+
+    let mut resume = dial(kernel.mqtt_port).await;
+    send(&mut resume, &connect311("lc-sa08-present4", false, 60)).await;
+    let (head, body) = recv(&mut resume).await;
+    assert_eq!(head, 0x20);
+    assert_eq!(
+        parse_connack311(&body),
+        (true, 0),
+        "durable session resumes"
+    );
+
+    let mut clean = dial(kernel.mqtt_port).await;
+    send(&mut clean, &connect311("lc-sa08-present4", true, 60)).await;
+    let (head, body) = recv(&mut clean).await;
+    assert_eq!(head, 0x20);
+    assert_eq!(parse_connack311(&body), (false, 0), "clean start drops it");
+
+    let mut v5first = dial(kernel.mqtt_port).await;
+    // Session Expiry 3600 keeps the detached session past the drop.
+    // Without it v5 defaults to 0, which drops at disconnect.
+    let props = [17, 0, 0, 0x0E, 0x10];
+    send(
+        &mut v5first,
+        &connect5_with_props("lc-sa08-present5", false, 60, &props),
+    )
+    .await;
+    let (head, body) = recv(&mut v5first).await;
+    assert_eq!(head & 0xF0, 0x20);
+    let (present, reason, _) = parse_connack5(&body);
+    assert_eq!(reason, 0);
+    assert!(!present);
+    send(
+        &mut v5first,
+        &subscribe_v5(1, &[("lc/sa08/present5", 0)], 0),
+    )
+    .await;
+    let (head, _) = recv(&mut v5first).await;
+    assert_eq!(head, 0x90);
+    drop(v5first);
+
+    let mut v5resume = dial(kernel.mqtt_port).await;
+    send(
+        &mut v5resume,
+        &connect5_with_props("lc-sa08-present5", false, 60, &props),
+    )
+    .await;
+    let (head, body) = recv(&mut v5resume).await;
+    assert_eq!(head & 0xF0, 0x20);
+    let (present, reason, _) = parse_connack5(&body);
+    assert_eq!(reason, 0);
+    assert!(present, "v5 durable session resumes");
+    kernel.finish().await;
+}
+
+/// An UNSUBSCRIBE for a filter with no subscription answers 0x11.
+/// The connection stays open.
+#[tokio::test]
+async fn lc_sa08_unsubscribe_unknown_filter_answers_11() {
+    let kernel = spawn_kernel("sa08-unsub", None).await;
+    let mut sub = dial(kernel.mqtt_port).await;
+    send(&mut sub, &connect5("lc-sa08-unsub", true, 60, 0)).await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x20);
+    let (_, reason, _) = parse_connack5(&body);
+    assert_eq!(reason, 0);
+    send(&mut sub, &subscribe_v5(1, &[("lc/sa08/unsub/held", 0)], 0)).await;
+    let (head, _) = recv(&mut sub).await;
+    assert_eq!(head, 0x90);
+    send(
+        &mut sub,
+        &unsubscribe_v5(21, &["lc/sa08/unsub/held", "lc/sa08/unsub/missing"]),
+    )
+    .await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head, 0xB0);
+    assert_eq!(&body[..2], &[0x00, 0x15]);
+    assert_eq!(body[2], 0x00, "property length");
+    assert_eq!(&body[3..], &[0x00, 0x11], "held ok, missing is 0x11");
+    send(&mut sub, &[0xC0, 0x00]).await;
+    let (head, body) = recv(&mut sub).await;
+    assert_eq!(head, 0xD0, "connection stays open");
+    assert!(body.is_empty());
     kernel.finish().await;
 }

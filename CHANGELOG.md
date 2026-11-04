@@ -84,6 +84,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Legacy licence file path**: an explicit non-default `licence.license_file` is refused at load with a native error naming the file and the key. The broker keeps the stored licence and never reads this path. The default path keeps booting unchanged.
 - **Node identity at boot**: the kernel fixes the node name from the resolved configuration before any component reads it. `node_status` of a stored connector reports the configured id after a restart instead of the default.
 - **Messages that did not arrive in a large fan-out**: the kernel wrote one batch for each wake of a link and then waited. A publish to more subscribers than one batch holds left messages in the queues, and the kernel counted them as delivered. The kernel now writes until the queues are empty.
+- **MQTT protocol refusals**: an empty client id without clean start is refused (3.1.1 code 2, v5 code 0x85). A v5 CONNECT with receive maximum 0 closes with no session created. After an accepted CONNECT, a protocol error (second CONNECT, QoS 0 with DUP set, packet id 0, wildcard topic name) closes only that connection, and a v5 client gets DISCONNECT 0x82 first. Reserved SUBSCRIBE option bits and no-local on a shared filter fail only that filter with SUBACK 0x8F.
 
 ---
 

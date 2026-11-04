@@ -564,6 +564,11 @@ const V5_RC_PACKET_TOO_LARGE: u8 = 0x95;
 /// session created.
 const V5_RC_PROTOCOL_ERROR: u8 = 0x82;
 
+/// v5 bind refusal: empty client id without clean start. Reason: the
+/// specification forbids that combination (section 3.1.3.1). Fail
+/// closed with no session created.
+const V5_RC_CLIENT_ID_REJECTED: u8 = 0x85;
+
 /// v5 quota refusal on CONNECT (too many connections for the user).
 /// Version-4 binds keep the existing `0x8B` byte unchanged; version-5
 /// binds carry the documented quota code below with a reason string.
@@ -791,6 +796,25 @@ fn bind_connection_reply(frame: &BrokerFrame, sessions: &SessionManager) -> Brok
                     );
                 }
             };
+            // An empty client id without a clean start is refused
+            // with no session created. Reason: the specification
+            // forbids it ([MQTT-3.1.3-8] for 3.1.1, section 3.1.3.1
+            // for v5 with code 0x85). An empty id with a clean start
+            // stays accepted, as before.
+            if req.client_id.is_empty() && !req.clean_start {
+                let rc = if req.protocol_version == 5 {
+                    V5_RC_CLIENT_ID_REJECTED
+                } else {
+                    2u8
+                };
+                return refusal_for_req(
+                    frame,
+                    &req,
+                    rc,
+                    sessions.max_topic_alias(),
+                    server_max_pkt,
+                );
+            }
             // X1-02: a Receive Maximum of 0 is a protocol error on the
             // wire (the client would accept no QoS 1/2 downlink at
             // all). Fail closed with no session created.
@@ -2480,6 +2504,19 @@ async fn apply_bind_request_inner(
                     ));
                 }
             };
+            // An empty client id without a clean start is refused
+            // with no session created. Reason: the specification
+            // forbids it ([MQTT-3.1.3-8] for 3.1.1, section 3.1.3.1
+            // for v5 with code 0x85). An empty id with a clean start
+            // stays accepted, as before.
+            if req.client_id.is_empty() && !req.clean_start {
+                let rc = if req.protocol_version == 5 {
+                    V5_RC_CLIENT_ID_REJECTED
+                } else {
+                    2u8
+                };
+                return Some(refusal_for_req(frame, &req, rc, alias_max, server_max_pkt));
+            }
             // X1-02: a Receive Maximum of 0 is a protocol error on the
             // wire. Fail closed with no session created (see the
             // synchronous path for the code-choice rationale).

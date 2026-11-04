@@ -2274,6 +2274,16 @@ where
                     }
                     Err(reason) => {
                         debug!("Kernel MQTT connection {}: {}", conn_id, reason);
+                        // A v5 client with an accepted CONNECT gets a
+                        // DISCONNECT with code 0x82 before the close.
+                        // Reason: the specification requires the server
+                        // to send that code on a protocol error, and a
+                        // 3.1.1 client gets no packet. The close stays
+                        // abnormal, so the will still fires.
+                        if conn.connected && conn.level == 5 {
+                            wire::encode_disconnect_v5(0x82, &mut sink.out.lock());
+                            let _ = flush(&sink, &mut io).await;
+                        }
                         break Stop::Abnormal;
                     }
                 }
