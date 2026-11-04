@@ -401,9 +401,9 @@
     },
     {
       "default": "false",
-      "doc": "Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.",
+      "doc": "Refused clustering switch. The broker fails boot when true.",
       "path": "cluster.enabled",
-      "range": "true | false",
+      "range": "false only",
       "type": "bool"
     },
     {
@@ -429,9 +429,9 @@
     },
     {
       "default": "[]",
-      "doc": "Seed node addresses to join an existing cluster.",
+      "doc": "Refused seed list. The broker fails boot when not empty.",
       "path": "cluster.seed_nodes",
-      "range": "0..=64 entries, each host:port",
+      "range": "must stay empty",
       "type": "string list"
     },
     {

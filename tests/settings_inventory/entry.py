@@ -2373,43 +2373,19 @@ class InventoryEntry(unittest.TestCase):
         b.start()
         traffic("-restart")
 
-    # // AZ-01 inventory: current behaviour; owner MV-11b
+    # MV-11b replaces the inventory: the schema refuses the entry.
     def test_cluster_seeds_start_udp_even_when_enabled_is_false(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as seed:
-            seed.bind(("127.0.0.1", 0))
-            seed.settimeout(10)
-            ports = set()
-            while len(ports) < 3:
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-                    probe.bind(("127.0.0.1", 0))
-                    ports.add(probe.getsockname()[1])
-            cluster_port, gossip_port, quic_port = ports
-            b = self.boot(extra='[cluster]\nenabled=false\nbind="127.0.0.1:' + str(cluster_port)
-                          + '"\ngossip_bind="127.0.0.1:' + str(gossip_port)
-                          + '"\nquic_bind="127.0.0.1:' + str(quic_port)
-                          + '"\nseed_nodes=["127.0.0.1:' + str(seed.getsockname()[1]) + '"]\n')
-            packet_bytes, source = seed.recvfrom(65535)
-            self.assertTrue(packet_bytes)
-            self.assertEqual(source, ("127.0.0.1", cluster_port))
-            for unused in [gossip_port, quic_port]:
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-                    probe.bind(("127.0.0.1", unused))
-            _, ack = b.connect("cluster-inventory")
-            self.assertEqual(ack, "0000")
-            b.stop()
-            config_path = b.cfg / "indra.toml"
-            candidate = secrets.token_hex(32)
-            enabled_config = config_path.read_text().replace("[cluster]\nenabled=false", "[cluster]\nenabled=true")
-            config_path.write_text(enabled_config +
-                                   "[licence]\nlicense_key=" + json.dumps(candidate) + "\n")
+        b = self.broker
+        b.configure(extra='[cluster]\nseed_nodes=["127.0.0.1:1"]\n')
+        with self.assertRaises(AssertionError) as ctx:
             b.start()
-            _, ack = b.connect("cluster-invalid-license-fallback")
-            self.assertEqual(ack, "0000")
-            b.stop()
-            self.assertTrue(b"[LICENSE ERROR]" in b"".join(b.last_output),
-                            "configured cluster key did not reach verification")
-            # The selected fallback key is evaluated only for clustering.
-            # It does not impose a paid MQTT connection cap.
+        self.assertIn("cluster.seed_nodes", str(ctx.exception))
+        b.child = None
+        b.configure(extra='[cluster]\nenabled=true\n')
+        with self.assertRaises(AssertionError) as ctx:
+            b.start()
+        self.assertIn("cluster.enabled", str(ctx.exception))
+        b.child = None
 
 
     # // AZ-01 inventory: current behaviour; owner MV-14

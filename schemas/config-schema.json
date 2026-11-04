@@ -47,7 +47,7 @@
         },
         "enabled": {
           "default": false,
-          "description": "Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.",
+          "description": "Refused clustering switch. The broker fails boot when true.",
           "type": "boolean"
         },
         "gossip_bind": {
@@ -62,7 +62,7 @@
         },
         "seed_nodes": {
           "default": [],
-          "description": "Seed node addresses to join an existing cluster.",
+          "description": "Refused seed list. The broker fails boot when not empty.",
           "items": {
             "type": "string"
           },

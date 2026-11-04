@@ -2575,6 +2575,468 @@ async fn mt07_same_client_id_in_two_tenants_stays_connected() {
     kernel.finish().await;
 }
 
+/// SA-09: shared subscriptions keep the tenant.
+///
+/// The kernel boots with one tenant rule. Each tenant holds one
+/// shared subscription on the same group and topic. A publish in
+/// tenant A reaches only the member in tenant A. A publish in
+/// tenant B reaches only the member in tenant B. The test uses
+/// real sockets through the broker, never the store.
+#[tokio::test]
+async fn sa09_shared_subscriptions_stay_in_tenant() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let mut a_sub = dial_mqtt(kernel.mqtt_port).await;
+    let mut b_sub = dial_mqtt(kernel.mqtt_port).await;
+    let mut a_pub = dial_mqtt(kernel.mqtt_port).await;
+    let mut b_pub = dial_mqtt(kernel.mqtt_port).await;
+    for (sock, id, user) in [
+        (&mut a_sub, "sa09-a-sub", "user-a"),
+        (&mut b_sub, "sa09-b-sub", "user-b"),
+        (&mut a_pub, "sa09-a-pub", "user-a"),
+        (&mut b_pub, "sa09-b-pub", "user-b"),
+    ] {
+        send_mqtt(sock, &sy02_connect311(id, true, 60, Some((user, b"pw")))).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x20, "kernel answers with CONNACK");
+        assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    }
+    // Both tenants share one group name and one topic string.
+    // Each group balances inside its own tenant only.
+    for sock in [&mut a_sub, &mut b_sub] {
+        send_mqtt(sock, &sy02_subscribe(1, &[("$share/g/sa09/shared", 1)])).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    }
+    // A publish in tenant A reaches A only. B stays silent.
+    send_mqtt(
+        &mut a_pub,
+        &sy02_publish311("sa09/shared", 1, 1, false, b"from-a"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut a_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.topic, "sa09/shared");
+    assert_eq!(downlink.payload, b"from-a");
+    send_mqtt(&mut a_sub, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A shared publish");
+    // A publish in tenant B reaches B only. A stays silent.
+    send_mqtt(
+        &mut b_pub,
+        &sy02_publish311("sa09/shared", 2, 1, false, b"from-b"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut b_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.topic, "sa09/shared");
+    assert_eq!(downlink.payload, b"from-b");
+    send_mqtt(&mut b_sub, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B shared publish");
+
+    kernel.finish().await;
+}
+
+/// SA-09: the last will keeps the tenant.
+///
+/// The kernel boots with one tenant rule. Each tenant subscribes
+/// to one will topic. A publisher in tenant A drops without
+/// DISCONNECT. Only tenant A receives the will. Then a publisher
+/// in tenant B drops. Only tenant B receives the will. The test
+/// uses real sockets through the broker, never the store.
+#[tokio::test]
+async fn sa09_will_stays_in_tenant() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let mut a_sub = dial_mqtt(kernel.mqtt_port).await;
+    let mut b_sub = dial_mqtt(kernel.mqtt_port).await;
+    for (sock, id, user) in [
+        (&mut a_sub, "sa09-will-a-sub", "user-a"),
+        (&mut b_sub, "sa09-will-b-sub", "user-b"),
+    ] {
+        send_mqtt(sock, &sy02_connect311(id, true, 60, Some((user, b"pw")))).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x20, "kernel answers with CONNACK");
+        assert_eq!(sy02_parse_connack311(&body), (false, 0));
+        send_mqtt(sock, &sy02_subscribe(1, &[("sa09/will", 0)])).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![0]));
+    }
+    // Tenant A publisher drops. Only tenant A receives the will.
+    let mut a_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_pub,
+        &sy02_connect5(
+            "sa09-will-a-pub",
+            true,
+            60,
+            Some(("user-a", b"pw")),
+            Some(("sa09/will", b"will-a")),
+            0,
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head & 0xF0, 0x20, "publisher gets CONNACK");
+    assert_eq!(sy02_parse_connack5(&body).1, 0);
+    drop(a_pub);
+    let (head, body) = recv_mqtt(&mut a_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let first = sy02_parse_publish_classic(head, &body);
+    assert_eq!(first.topic, "sa09/will");
+    assert_eq!(first.payload, b"will-a");
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A will");
+    // Tenant B publisher drops. Only tenant B receives the will.
+    let mut b_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut b_pub,
+        &sy02_connect5(
+            "sa09-will-b-pub",
+            true,
+            60,
+            Some(("user-b", b"pw")),
+            Some(("sa09/will", b"will-b")),
+            0,
+        ),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head & 0xF0, 0x20, "publisher gets CONNACK");
+    assert_eq!(sy02_parse_connack5(&body).1, 0);
+    drop(b_pub);
+    let (head, body) = recv_mqtt(&mut b_sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let second = sy02_parse_publish_classic(head, &body);
+    assert_eq!(second.topic, "sa09/will");
+    assert_eq!(second.payload, b"will-b");
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sub),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B will");
+
+    kernel.finish().await;
+}
+
+/// SA-09: a reconnect in another tenant keeps both sessions.
+///
+/// The kernel boots with one tenant rule. One client id connects
+/// in tenant A and again in tenant B. Both connects succeed and
+/// both sessions stay live. Each publish reaches only its own
+/// tenant. A new connect in tenant A resumes A and leaves B live.
+/// The test uses real sockets through the broker, never the store.
+#[tokio::test]
+async fn sa09_reconnect_in_other_tenant_keeps_both_sessions() {
+    let kernel = spawn_kernel("[[tenants.rules]]\nexpression = \"t-${username}\"\n").await;
+    let mut a_sock = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_sock,
+        &sy02_connect311("sa09-dup", false, 60, Some(("user-a", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut a_sock).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    let mut b_sock = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut b_sock,
+        &sy02_connect311("sa09-dup", false, 60, Some(("user-b", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut b_sock).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (false, 0),
+        "other tenant starts a fresh session"
+    );
+    // Both sessions subscribe to one topic string.
+    for sock in [&mut a_sock, &mut b_sock] {
+        send_mqtt(sock, &sy02_subscribe(1, &[("sa09/dup", 1)])).await;
+        let (head, body) = recv_mqtt(sock).await;
+        assert_eq!(head, 0x90, "kernel answers with SUBACK");
+        assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    }
+    let mut a_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_pub,
+        &sy02_connect311("sa09-dup-a-pub", true, 60, Some(("user-a", b"pw"))),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head, 0x20, "publisher gets CONNACK");
+    let mut b_pub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut b_pub,
+        &sy02_connect311("sa09-dup-b-pub", true, 60, Some(("user-b", b"pw"))),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x20, "publisher gets CONNACK");
+    // A publish in tenant A reaches A only. B stays silent.
+    send_mqtt(
+        &mut a_pub,
+        &sy02_publish311("sa09/dup", 1, 1, false, b"a-1"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut a_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut a_sock).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.payload, b"a-1");
+    send_mqtt(&mut a_sock, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut b_sock),
+    )
+    .await;
+    assert!(silent.is_err(), "B holds none of A publish");
+    // A publish in tenant B reaches B only. A stays silent.
+    send_mqtt(
+        &mut b_pub,
+        &sy02_publish311("sa09/dup", 2, 1, false, b"b-1"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut b_sock).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.payload, b"b-1");
+    send_mqtt(&mut b_sock, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_sock),
+    )
+    .await;
+    assert!(silent.is_err(), "A holds none of B publish");
+    // A new connect in tenant A resumes A and leaves B live.
+    let mut a_re = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut a_re,
+        &sy02_connect311("sa09-dup", false, 60, Some(("user-a", b"pw"))),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut a_re).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(
+        sy02_parse_connack311(&body),
+        (true, 0),
+        "same tenant resumes its session"
+    );
+    send_mqtt(
+        &mut b_pub,
+        &sy02_publish311("sa09/dup", 3, 1, false, b"b-2"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut b_pub).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut b_sock).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    let downlink = sy02_parse_publish_classic(head, &body);
+    assert_eq!(downlink.payload, b"b-2");
+    send_mqtt(&mut b_sock, &sy02_puback(downlink.packet_id)).await;
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut a_re),
+    )
+    .await;
+    assert!(silent.is_err(), "resumed A holds none of B publish");
+
+    kernel.finish().await;
+}
+
+/// SA-09: the cluster entry is refused and the node stays single.
+///
+/// The loader refuses each cluster entry at schema load. The boot
+/// with a file entry exits. The single node binds no UDP socket.
+/// A default tenant publish reaches its own subscriber only, so
+/// no message crosses nodes. The test uses file, flag and socket
+/// entries, never the store.
+#[tokio::test]
+async fn sa09_cluster_entry_stays_single_node() {
+    // The schema refuses each entry. Each load must fail.
+    // On the base each load succeeds, so each assert fails there.
+    {
+        use broker_config::layers::{load_layered_with_env, CliOverrides};
+        let tag = format!(
+            "sa09-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        // The file seed_nodes leg must fail.
+        {
+            let dir = std::env::temp_dir().join(format!("indramqtt-{tag}-seeds"));
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            std::fs::write(
+                dir.join("indra.toml"),
+                "[cluster]\nseed_nodes = [\"127.0.0.1:19883\"]\n",
+            )
+            .expect("write indra.toml");
+            let err = load_layered_with_env(&dir, &[], &CliOverrides::default())
+                .expect_err("seed_nodes file must fail");
+            assert!(
+                err.to_string().contains("cluster.seed_nodes"),
+                "error names the seed entry, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // The file enabled leg must fail.
+        {
+            let dir = std::env::temp_dir().join(format!("indramqtt-{tag}-enabled"));
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            std::fs::write(dir.join("indra.toml"), "[cluster]\nenabled = true\n")
+                .expect("write indra.toml");
+            let err = load_layered_with_env(&dir, &[], &CliOverrides::default())
+                .expect_err("enabled file must fail");
+            assert!(
+                err.to_string().contains("cluster.enabled"),
+                "error names the enabled entry, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // The --cluster-seeds flag leg must fail.
+        {
+            let dir = std::env::temp_dir().join(format!("indramqtt-{tag}-flag"));
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            let cli = CliOverrides {
+                cluster_seeds: Some("127.0.0.1:19883".to_string()),
+                ..CliOverrides::default()
+            };
+            let err =
+                load_layered_with_env(&dir, &[], &cli).expect_err("--cluster-seeds flag must fail");
+            assert!(
+                err.to_string().contains("cluster.seed_nodes"),
+                "error names the seed entry, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    // The boot with a file entry exits. The file is the production entry.
+    // On the base the kernel boots, so the exit assert fails there.
+    {
+        let tag = format!(
+            "sa09-boot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let scratch = std::env::temp_dir().join(format!("indramqtt-{tag}-data"));
+        let config_dir = std::env::temp_dir().join(format!("indramqtt-{tag}-cfg"));
+        std::fs::create_dir_all(&config_dir).expect("create temp config dir");
+        let bl_port = ephemeral_port();
+        let mqtt_port = ephemeral_port();
+        let ws_port = ephemeral_port();
+        let api_port = ephemeral_port();
+        std::fs::write(
+            config_dir.join("indra.toml"),
+            format!(
+                "[node]\nid = \"sa09-refuse\"\ndata_dir = \"{}\"\nbrokerlink_bind = \"127.0.0.1:{bl_port}\"\n[listeners.tcp]\nbind = \"127.0.0.1:{mqtt_port}\"\n[listeners.tls]\nenabled = false\n[listeners.ws]\nbind = \"127.0.0.1:{ws_port}\"\n[listeners.wss]\nenabled = false\n[listeners.api]\nbind = \"127.0.0.1:{api_port}\"\n[logging]\nlevel = \"warn\"\n[cluster]\nseed_nodes = [\"127.0.0.1:19883\"]\n",
+                scratch.display(),
+            ),
+        )
+        .expect("write indra.toml");
+        let mut child = tokio::process::Command::new(shard_kernel_binary())
+            .arg("--config-dir")
+            .arg(&config_dir)
+            .arg("--allow-anonymous")
+            .env("INDRA_API_KEYS", API_KEY)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn real kernel");
+        let mut exited = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if let Ok(Some(_)) = child.try_wait() {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "kernel with cluster entry exits");
+        let _ = child.kill().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+    // The single node binds no UDP socket and forwards no default message.
+    // The default tenant publish goes through forward_cluster with no plane.
+    let kernel = spawn_kernel("").await;
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:19883")
+        .await
+        .expect("cluster UDP stays free");
+    drop(udp);
+    let mut sub = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut sub,
+        &sy02_connect311("sa09-cl-def-sub", true, 60, None),
+    )
+    .await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x20, "kernel answers with CONNACK");
+    assert_eq!(sy02_parse_connack311(&body), (false, 0));
+    send_mqtt(&mut sub, &sy02_subscribe(1, &[("sa09/cluster", 1)])).await;
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head, 0x90, "kernel answers with SUBACK");
+    assert_eq!(sy02_parse_suback(&body), (1, vec![1]));
+    let mut publisher = dial_mqtt(kernel.mqtt_port).await;
+    send_mqtt(
+        &mut publisher,
+        &sy02_connect311("sa09-cl-def-pub", true, 60, None),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut publisher).await;
+    assert_eq!(head, 0x20, "publisher gets CONNACK");
+    send_mqtt(
+        &mut publisher,
+        &sy02_publish311("sa09/cluster", 1, 1, false, b"default-only"),
+    )
+    .await;
+    let (head, _) = recv_mqtt(&mut publisher).await;
+    assert_eq!(head, 0x40, "publisher sees PUBACK");
+    let (head, body) = recv_mqtt(&mut sub).await;
+    assert_eq!(head & 0xF0, 0x30, "downlink is PUBLISH");
+    assert_eq!(
+        sy02_parse_publish_classic(head, &body).payload,
+        b"default-only"
+    );
+    let silent = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_mqtt_packet(&mut sub),
+    )
+    .await;
+    assert!(silent.is_err(), "default publish forwards nothing extra");
+
+    kernel.finish().await;
+}
+
 /// MV-05: the tenant session limit applies at the MQTT entry.
 ///
 /// The kernel boots with one tenant rule. A management write sets

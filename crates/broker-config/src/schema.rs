@@ -512,8 +512,8 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 path: "cluster.enabled",
                 setting_type: "bool",
                 default: "false",
-                range: "true | false",
-                doc: "Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.",
+                range: "false only",
+                doc: "Refused clustering switch. The broker fails boot when true.",
             requires_restart: None,
             },
             FieldDoc {
@@ -544,8 +544,8 @@ pub fn field_docs() -> Vec<FieldDoc> {
                 path: "cluster.seed_nodes",
                 setting_type: "string list",
                 default: "[]",
-                range: "0..=64 entries, each host:port",
-                doc: "Seed node addresses to join an existing cluster.",
+                range: "must stay empty",
+                doc: "Refused seed list. The broker fails boot when not empty.",
             requires_restart: None,
             },
             FieldDoc {
@@ -2145,7 +2145,7 @@ impl TenantsConf {
 /// Distributed clustering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterConf {
-    /// Whether multi-node distributed clustering is enabled.
+    /// Refused clustering switch. The broker fails boot when true.
     #[serde(default = "default_false")]
     pub enabled: bool,
     /// Cluster SWIM UDP bind address for peer discovery and membership.
@@ -2157,7 +2157,7 @@ pub struct ClusterConf {
     /// Multiplexed data plane bind address for inter-broker message routing.
     #[serde(default = "default_quic_bind")]
     pub quic_bind: String,
-    /// Seed node addresses to join an existing cluster.
+    /// Refused seed list. The broker fails boot when not empty.
     #[serde(default)]
     pub seed_nodes: Vec<String>,
 }
@@ -2189,23 +2189,27 @@ impl Default for ClusterConf {
 }
 
 impl ClusterConf {
-    /// Validates cluster addresses.
+    /// Validates the cluster entry.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        check_bind("cluster.bind", &self.bind, false)?;
-        check_bind("cluster.gossip_bind", &self.gossip_bind, false)?;
-        check_bind("cluster.quic_bind", &self.quic_bind, false)?;
-        if self.seed_nodes.len() > 64 {
+        // Clustering stays out of the MVP. The broker refuses its entry.
+        // Reason: the cluster path cannot keep tenants apart.
+        if self.enabled {
+            return Err(invalid(
+                "cluster.enabled",
+                "true",
+                "clustering is not in the MVP: remove the entry and run single-node",
+            ));
+        }
+        if !self.seed_nodes.is_empty() {
             return Err(invalid(
                 "cluster.seed_nodes",
                 &format!("{} entries", self.seed_nodes.len()),
-                "must hold at most 64 entries",
+                "clustering is not in the MVP: remove the entry and run single-node",
             ));
         }
-        for seed in &self.seed_nodes {
-            // TODO(parity): the canonical seed address form (host:port vs
-            // URL) is undecided; host:port is accepted conservatively.
-            check_bind("cluster.seed_nodes", seed, false)?;
-        }
+        check_bind("cluster.bind", &self.bind, false)?;
+        check_bind("cluster.gossip_bind", &self.gossip_bind, false)?;
+        check_bind("cluster.quic_bind", &self.quic_bind, false)?;
         Ok(())
     }
 }
@@ -3552,7 +3556,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 bool_field(
                     "enabled",
                     false,
-                    "Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.",
+                    "Refused clustering switch. The broker fails boot when true.",
                 ),
                 str_field(
                     "bind",
@@ -3571,7 +3575,7 @@ fn schema_sections() -> Vec<(&'static str, Vec<SchemaField>)> {
                 ),
                 list_field(
                     "seed_nodes",
-                    "Seed node addresses to join an existing cluster.",
+                    "Refused seed list. The broker fails boot when not empty.",
                 ),
             ],
         ),

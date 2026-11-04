@@ -103,11 +103,11 @@ Each setting owns one entry below with a verified example line. Each example lin
 | `auth.allow_anonymous` | bool | `false` | true \| false | Whether anonymous connections are accepted while no users are configured. |  |
 | `auth.superusers` | string list | `["admin", "root"]` | 0..=100 entries | Superuser usernames bypassing ACL rules. |  |
 | **cluster** | | | | | |
-| `cluster.enabled` | bool | `false` | true \| false | Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only. |  |
+| `cluster.enabled` | bool | `false` | false only | Refused clustering switch. The broker fails boot when true. |  |
 | `cluster.bind` | socket address string | `"127.0.0.1:19883"` | valid host:port, port 1..=65535 | Cluster SWIM UDP bind address for peer discovery and membership. |  |
 | `cluster.gossip_bind` | socket address string | `"0.0.0.0:7946"` | valid host:port, port 1..=65535 | Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only. |  |
 | `cluster.quic_bind` | socket address string | `"0.0.0.0:9092"` | valid host:port, port 1..=65535 | Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only. |  |
-| `cluster.seed_nodes` | string list | `[]` | 0..=64 entries, each host:port | Seed node addresses to join an existing cluster. |  |
+| `cluster.seed_nodes` | string list | `[]` | must stay empty | Refused seed list. The broker fails boot when not empty. |  |
 | **licence** | | | | | |
 | `licence.license_file` | path string | `"/etc/indramqtt/license.key"` | any path; empty means none installed | Path to the enterprise cryptographic license key file. |  |
 | `licence.license_key` | string | `""` | any string; empty means use stored token or environment | Enterprise commercial license key for multi-node clustering. |  |
@@ -1159,16 +1159,15 @@ Join nodes into one cluster.
 
 ### `cluster.enabled`
 
-Accepted clustering switch. The broker stores it. It starts clustering from --cluster-seeds only.
+Refused clustering switch. The broker fails boot when true.
 
-Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+Type: `bool`. Default: `false`. Range: `false only`. Restart: `not proven`.
 
 Example: `enabled = false` in the `[cluster]` table of the group file below.
 
 Notes:
 
 - A bad value fails validation. Boot keeps the old file.
-- The broker stores this value. It does not apply it.
 - Related settings sit in the same group file.
 
 ### `cluster.bind`
@@ -1214,9 +1213,9 @@ Notes:
 
 ### `cluster.seed_nodes`
 
-Seed node addresses to join an existing cluster.
+Refused seed list. The broker fails boot when not empty.
 
-Type: `string list`. Default: `[]`. Range: `0..=64 entries, each host:port`. Restart: `not proven`.
+Type: `string list`. Default: `[]`. Range: `must stay empty`. Restart: `not proven`.
 
 Example: `seed_nodes = []` in the `[cluster]` table of the group file below.
 

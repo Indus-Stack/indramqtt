@@ -5,9 +5,7 @@ use broker_auth::{
     KerberosAuthenticator, KerberosConfig, LdapAuthenticator, LdapConfig, MemoryAuth,
     NodeAuthCache, WebhookAuth, WebhookConfig,
 };
-use broker_cluster::{
-    ClusterLicense, ClusterMessage, InstallationState, RoutingPlane, TrustedKeys,
-};
+use broker_cluster::{ClusterMessage, InstallationState, RoutingPlane, TrustedKeys};
 use broker_config::{CliOverrides, ConfigError, ConfigRegistry, LayeredConfig};
 use broker_delayed::{DelayedEntry, DelayedScheduler, DEFAULT_MAX_DELAYED_SECS, DELAYED_TICK_MS};
 use broker_gateway::coap::{CoapCode, CoapGatewayHandler, CoapMessage};
@@ -12085,75 +12083,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     log_licence_lifecycle(&licence_state, args.licence_expiry_warn_days);
     shared.licence.refresh_alarms(&shared.alarms, now_licence);
-    if let Some(seeds) = &args.cluster_seeds {
-        info!("Cluster mode enabled with seeds: {}", seeds);
-        // The licence binds to the stable cluster identity (one licence
-        // covers the whole cluster): the stored token wins when present,
-        // otherwise the explicit flag or environment provides it. Joiners
-        // adopt the cluster identity and receive the licence as part of
-        // joining, so adding a node never needs another round trip.
-        let cluster_id = shared
-            .licence
-            .cluster_identity()
-            .unwrap_or_else(|| args.node_id.clone());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let license_key = shared
-            .licence
-            .stored_token()
-            .or_else(|| args.license_key.clone())
-            .or_else(|| std::env::var("INDRA_LICENSE_KEY").ok());
-        let status =
-            ClusterLicense::evaluate(license_key.as_deref(), 1, now, &cluster_id, &trusted_keys);
-        ClusterLicense::log_status_banner(&status);
-
-        let local_node = broker_cluster::NodeId::new(&args.node_id);
-        if let Ok(bind_addr) = args.cluster_bind.parse::<std::net::SocketAddr>() {
-            match broker_cluster::UdpSwimTransport::bind(local_node.clone(), bind_addr).await {
-                Ok(transport) => {
-                    let swim = broker_cluster::SwimMembership::new(
-                        local_node.clone(),
-                        Some(args.cluster_bind.clone()),
-                        broker_cluster::SwimConfig::default(),
-                        transport.clone(),
-                    );
-                    swim.set_license_key(license_key);
-                    swim.set_trusted_keys(trusted_keys.clone());
-                    swim.set_cluster_identity(
-                        cluster_id.clone(),
-                        shared.licence.cluster_trial_started_at(),
-                    );
-                    let route_table =
-                        Arc::new(broker_cluster::ClusterRouteTable::new(local_node.clone()));
-                    swim.attach_route_table(route_table);
-                    swim.clone().run_background();
-
-                    for seed_str in seeds.split(',') {
-                        let seed_str = seed_str.trim();
-                        if !seed_str.is_empty() {
-                            if let Ok(seed_addr) = seed_str.parse::<std::net::SocketAddr>() {
-                                let seed_node =
-                                    broker_cluster::NodeId::new(format!("seed-{}", seed_addr));
-                                transport.register_peer(seed_node.clone(), seed_addr);
-                                let _ = swim.join_seed(&seed_node).await;
-                            }
-                        }
-                    }
-                    info!(
-                        "SWIM gossip cluster engine initialized for node {}",
-                        args.node_id
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to bind cluster UDP socket on {}: {}",
-                        args.cluster_bind, e
-                    );
-                }
-            }
-        }
+    // MV-11b: clustering stays out of the MVP. The schema refuses its entry.
+    // The broker never binds a cluster socket. This check fails closed.
+    // Reason: the cluster path cannot keep tenants apart.
+    let cluster_flag = args
+        .cluster_seeds
+        .as_ref()
+        .is_some_and(|seeds| !seeds.trim().is_empty());
+    let cluster_file = cfg.cluster.enabled || !cfg.cluster.seed_nodes.is_empty();
+    if cluster_flag || cluster_file {
+        return Err("clustering is not in the MVP: remove cluster.enabled, cluster.seed_nodes and --cluster-seeds and run single-node"
+            .to_string()
+            .into());
     }
     // A disabled API listener opens no socket. The bind flag alone
     // never enables it. No flag sets `enabled`, so a file or variable
@@ -12285,7 +12226,6 @@ mod tests {
              [listeners.api]\nbind = \"127.0.0.1:28099\"\n\
              [session]\nmax_qos0_backlog = 7\n\
              [auth]\nallow_anonymous = true\n\
-             [cluster]\nseed_nodes = [\"a:1\", \"b:2\"]\n\
              [webhook]\nbreaker_threshold = 9\n",
         )
         .expect("write indra.toml");
@@ -12296,7 +12236,6 @@ mod tests {
         assert_eq!(args.api_bind, "127.0.0.1:28099");
         assert_eq!(args.qos0_backlog, 7);
         assert!(args.allow_anonymous);
-        assert_eq!(args.cluster_seeds.as_deref(), Some("a:1,b:2"));
         assert_eq!(args.webhook_breaker_threshold, 9);
 
         // A typed flag overrides the file. The file sets the other values.

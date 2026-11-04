@@ -36,6 +36,10 @@ flowchart LR
 | Connectors | A forwarding action sends only rows of the rule tenant. |
 | Sessions | Sessions are keyed by tenant plus client id. Two tenants hold the same client id at once. |
 | Retained | Retained messages are stored per tenant. |
+| Shared | One group name balances inside each tenant. No member gets another tenant. |
+| Will | The will fires inside its own tenant only. No other tenant gets it. |
+| Reconnect | A reconnect in another tenant starts a fresh session. It never takes over. |
+| Cluster | The broker fails boot on a cluster entry. It binds no socket. No message crosses nodes. |
 | Users | Credentials and access rules live in per-tenant tables. |
 
 Tenant rules render an expression against the connect context:

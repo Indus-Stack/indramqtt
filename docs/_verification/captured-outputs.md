@@ -41,7 +41,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `index.md` | 54 | `OK` |
 | `mcp.md` | 314 | `401` |
 | `migration.md` | 90 | `OK` |
-| `multi-tenancy/index.md` | 96 | `isolated` |
+| `multi-tenancy/index.md` | 100 | `isolated` |
 | `multi-tenancy/quotas.md` | 102 | `ok` |
 | `operations/backup.md` | 90 | `ok` |
 | `operations/deployment.md` | 118 | `ok` |
@@ -79,8 +79,8 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/api/rule-engine.md` | 516 | `OK` |
 | `reference/cli.md` | 2330 | `OK` |
 | `reference/cli.md` | 2346 | `OK` |
-| `reference/configuration.md` | 2382 | `OK` |
-| `reference/configuration.md` | 2398 | `OK` |
+| `reference/configuration.md` | 2381 | `OK` |
+| `reference/configuration.md` | 2397 | `OK` |
 | `reference/index.md` | 41 | `OK` |
 | `reference/metrics.md` | 118 | `OK` |
 | `reference/metrics.md` | 134 | `OK` |

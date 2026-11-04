@@ -1866,67 +1866,71 @@ mod tests {
         let _serial = ENV_SERIAL.lock().expect("env serial");
         let _ambient = EnvGuard::clear_all_indra();
         let dir = unique_dir("listlayers");
-        write(&dir, "indra.toml", "[cluster]\nseed_nodes = [\"f:1\"]\n");
+        // Clustering is refused, so the order proof uses another list.
+        write(&dir, "indra.toml", "[kerberos]\nallowed_realms = [\"f\"]\n");
         let fragments = dir.join("conf.d");
         write(
             &fragments,
             "10-base.toml",
-            "[cluster]\nseed_nodes = [\"g:1\"]\n",
+            "[kerberos]\nallowed_realms = [\"g\"]\n",
         );
-        let _env = EnvGuard::set(&[("INDRA_CLUSTER__SEED_NODES", "h:1, i:1")]);
+        let _env = EnvGuard::set(&[("INDRA_KERBEROS__ALLOWED_REALMS", "h, i")]);
         let cli = CliOverrides {
-            cluster_seeds: Some("j:1,, k:1".to_string()),
+            kerberos_allowed_realms: Some("j,, k".to_string()),
             ..Default::default()
         };
 
         // The flag list drops empty entries, like the environment list.
         let resolved = load_layered(&dir, &cli).expect("layered load");
         assert_eq!(
-            resolved.config().cluster.seed_nodes,
-            vec!["j:1".to_string(), "k:1".to_string()]
+            resolved.config().kerberos.allowed_realms,
+            vec!["j".to_string(), "k".to_string()]
         );
         assert_eq!(
-            resolved.layer_of("cluster.seed_nodes"),
-            Layer::Flag("--cluster-seeds".to_string())
+            resolved.layer_of("kerberos.allowed_realms"),
+            Layer::Flag("--kerberos-allowed-realms".to_string())
         );
 
         let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
         assert_eq!(
-            resolved.config().cluster.seed_nodes,
-            vec!["h:1".to_string(), "i:1".to_string()]
+            resolved.config().kerberos.allowed_realms,
+            vec!["h".to_string(), "i".to_string()]
         );
         assert_eq!(
-            resolved.layer_of("cluster.seed_nodes"),
-            Layer::Env("INDRA_CLUSTER__SEED_NODES".to_string())
+            resolved.layer_of("kerberos.allowed_realms"),
+            Layer::Env("INDRA_KERBEROS__ALLOWED_REALMS".to_string())
         );
         drop(_env);
 
-        let _cleared = EnvGuard::clear(&["INDRA_CLUSTER__SEED_NODES"]);
+        let _cleared = EnvGuard::clear(&["INDRA_KERBEROS__ALLOWED_REALMS"]);
         let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
         assert_eq!(
-            resolved.config().cluster.seed_nodes,
-            vec!["g:1".to_string()]
+            resolved.config().kerberos.allowed_realms,
+            vec!["g".to_string()]
         );
         assert!(matches!(
-            resolved.layer_of("cluster.seed_nodes"),
+            resolved.layer_of("kerberos.allowed_realms"),
             Layer::Fragment(_)
         ));
 
         std::fs::remove_dir_all(&fragments).expect("remove conf.d");
         let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
         assert_eq!(
-            resolved.config().cluster.seed_nodes,
-            vec!["f:1".to_string()]
+            resolved.config().kerberos.allowed_realms,
+            vec!["f".to_string()]
         );
         assert!(matches!(
-            resolved.layer_of("cluster.seed_nodes"),
+            resolved.layer_of("kerberos.allowed_realms"),
             Layer::MainFile(_)
         ));
 
         std::fs::remove_file(dir.join("indra.toml")).expect("remove main file");
         let resolved = load_layered(&dir, &CliOverrides::default()).expect("layered load");
-        assert!(resolved.config().cluster.seed_nodes.is_empty());
-        assert_eq!(resolved.layer_of("cluster.seed_nodes"), Layer::Defaults);
+        assert!(resolved.config().kerberos.allowed_realms.is_empty());
+        assert_eq!(
+            resolved.layer_of("kerberos.allowed_realms"),
+            Layer::Defaults
+        );
         scrub(&dir);
     }
 
@@ -2212,15 +2216,15 @@ mod tests {
             ("INDRA_AUTH__ALLOW_ANONYMOUS", "true"),
             ("INDRA_SESSION__MAX_QOS0_BACKLOG", "7"),
             ("INDRA_QUOTAS__BURST_MULTIPLIER", "3.5"),
-            ("INDRA_CLUSTER__SEED_NODES", "host1:19883, host2:19883"),
+            ("INDRA_KERBEROS__ALLOWED_REALMS", "EXAMPLE, OTHER"),
         ]);
         let resolved = load_layered(&dir, &CliOverrides::default()).expect("typed env loads");
         assert!(resolved.config().auth.allow_anonymous);
         assert_eq!(resolved.config().session.max_qos0_backlog, 7);
         assert_eq!(resolved.config().quotas.burst_multiplier, 3.5);
         assert_eq!(
-            resolved.config().cluster.seed_nodes,
-            vec!["host1:19883".to_string(), "host2:19883".to_string()]
+            resolved.config().kerberos.allowed_realms,
+            vec!["EXAMPLE".to_string(), "OTHER".to_string()]
         );
         scrub(&dir);
     }
