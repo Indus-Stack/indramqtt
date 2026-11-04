@@ -9,7 +9,7 @@
 #   tools/boot_smoke.sh <dir with indramqtt and indra>
 #
 # Build the input first:
-#   cargo build -p broker-node --bins
+#   cargo build -p broker-node --features full --bins
 #
 # The script exits with 0 if all the checks are satisfactory. It prints
 # one line for each check.
@@ -2280,6 +2280,134 @@ PY
 [ $? = 0 ] || failures=$((failures + 1))
 kill "$NOAPI_KERNEL_PID" 2>/dev/null
 wait "$NOAPI_KERNEL_PID" 2>/dev/null
+
+# --- 14. A disabled MCP endpoint answers 404 ---
+# The kernel boots with `[mcp] enabled = false`. It still serves
+# `/healthz` and MQTT. Each `POST /mcp` call answers 404.
+# A key and no key both get 404: disabled wins over auth.
+# This kernel uses its own config and ports. It does not disturb
+# the checks above.
+read -r MCP_OFF_MQTT_PORT MCP_OFF_API_PORT <<EOF
+$(python3 - <<'PY'
+import socket
+socks = [socket.socket() for _ in range(2)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+for s in socks:
+    s.close()
+PY
+)
+EOF
+mkdir -p "$ROOT/cfg-mcp-off" "$ROOT/data-mcp-off"
+cat > "$ROOT/cfg-mcp-off/indra.toml" <<EOF
+[node]
+id = "boot-smoke-mcp-off"
+data_dir = "$ROOT/data-mcp-off"
+
+[listeners.tcp]
+bind = "127.0.0.1:$MCP_OFF_MQTT_PORT"
+
+[listeners.api]
+bind = "127.0.0.1:$MCP_OFF_API_PORT"
+
+[mcp]
+enabled = false
+
+# The check connects without credentials: this kernel opts into
+# anonymous access explicitly (the documented default is refuse).
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+EOF
+INDRA_API_KEYS=$API_KEY_GOOD INDRA_API_KEY=$API_KEY_GOOD \
+    "$KERNEL" --config-dir "$ROOT/cfg-mcp-off" > "$ROOT/kernel-mcp-off.log" 2>&1 &
+MCP_OFF_KERNEL_PID=$!
+for _ in $(seq 1 50); do
+    if python3 - "$MCP_OFF_API_PORT" >/dev/null 2>&1 <<'PY'
+import sys, urllib.request
+urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/healthz", timeout=1)
+PY
+    then
+        break
+    fi
+    kill -0 "$MCP_OFF_KERNEL_PID" 2>/dev/null || break
+    sleep 0.2
+done
+python3 - "$MCP_OFF_MQTT_PORT" "$MCP_OFF_API_PORT" "$API_KEY_GOOD" <<'PY'
+import json, os, socket, struct, sys, time, urllib.request, urllib.error
+mqtt_port, api_port, key = sys.argv[1], sys.argv[2], sys.argv[3]
+failures = 0
+def report(name, good):
+    global failures
+    print(("ok   " if good else "FAIL ") + name)
+    failures += 0 if good else 1
+def wait_port(port):
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", int(port)), timeout=5)
+        except OSError:
+            time.sleep(0.1)
+    raise SystemExit("FAIL the disabled-MCP kernel listener does not listen")
+def packet(kind, body):
+    return bytes([kind, len(body)]) + body
+def field(data):
+    return struct.pack(">H", len(data)) + data
+try:
+    healthz = urllib.request.urlopen(
+        f"http://127.0.0.1:{api_port}/healthz", timeout=5).read().decode()
+except OSError:
+    healthz = ""
+report("the disabled-MCP kernel serves /healthz from indra.toml",
+       healthz == "OK")
+sub = wait_port(mqtt_port)
+sub.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-mcp-off-sub")))
+sub_ok = sub.recv(4) == b"\x20\x02\x00\x00"
+topic = b"smoke/mcp-off/check"
+token = os.urandom(6).hex().encode()
+sub.sendall(packet(0x82, b"\x00\x01" + field(topic) + b"\x00"))
+suback_ok = sub.recv(5)[:1] == b"\x90"
+pub = wait_port(mqtt_port)
+pub.sendall(packet(0x10, b"\x00\x04MQTT\x04\x02\x00\x3c" + field(b"smoke-mcp-off-pub")))
+pub_ok = pub.recv(4) == b"\x20\x02\x00\x00"
+pub.sendall(packet(0x30, field(topic) + token))
+sub.settimeout(5)
+try:
+    delivered = sub.recv(100)
+except OSError:
+    delivered = b""
+report("a publish goes to a subscriber when MCP is disabled",
+       sub_ok and suback_ok and pub_ok and delivered.endswith(token))
+def post(body, auth):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{api_port}/mcp", data=data, method="POST",
+        headers={"Content-Type": "application/json"})
+    if auth is not None:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return res.status, json.loads(res.read().decode())
+    except urllib.error.HTTPError as err:
+        try:
+            return err.code, json.loads(err.read().decode())
+        except ValueError:
+            return err.code, {}
+    except OSError:
+        return 0, {}
+status, body = post({"jsonrpc": "2.0", "method": "tools/list", "id": 1},
+                    f"Bearer {key}")
+report("the disabled MCP endpoint answers 404 with a key",
+       status == 404 and body.get("code") == "NOT_FOUND")
+status, _ = post({"jsonrpc": "2.0", "method": "ping", "id": 2}, None)
+report("the disabled MCP endpoint answers 404 with no key", status == 404)
+sys.exit(1 if failures else 0)
+PY
+[ $? = 0 ] || failures=$((failures + 1))
+kill "$MCP_OFF_KERNEL_PID" 2>/dev/null
+wait "$MCP_OFF_KERNEL_PID" 2>/dev/null
 
 if [ "$failures" = 0 ]; then
     echo "boot smoke: all checks are satisfactory"
