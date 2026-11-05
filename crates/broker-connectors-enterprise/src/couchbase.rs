@@ -1573,7 +1573,7 @@ mod tests {
     /// Run with e.g.:
     /// `COUCHBASE_URL=couchbase://127.0.0.1 COUCHBASE_USERNAME=qual \
     ///  COUCHBASE_PASSWORD=qualpass1 COUCHBASE_BUCKET=qual \
-    ///  cargo test -p broker-connectors-enterprise --lib couchbase::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
+    ///  cargo test -p broker-connectors-enterprise --features couchbase --lib couchbase::tests::test_qualify_driver_write_path -- --ignored --nocapture --test-threads=1`
     ///
     /// The bucket is created by the qualification setup; the test
     /// creates the scope and collection itself through the driver's

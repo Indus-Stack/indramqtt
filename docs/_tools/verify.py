@@ -721,8 +721,115 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-def run_area(area, write):
+# Qual mapping for connectors (DX2-019).
+# Each entry names the Rust qual test and its required env.
+CONNECTOR_QUALS = {
+    "couchbase": {
+        "crate": "broker-connectors-enterprise",
+        "test": "couchbase::tests::test_qualify_driver_write_path",
+        "env": [
+            "COUCHBASE_URL",
+            "COUCHBASE_USERNAME",
+            "COUCHBASE_PASSWORD",
+            "COUCHBASE_BUCKET",
+        ],
+    },
+}
+
+# Timeout for the qual subprocess (secs).
+# 2400 secs matches QUAL-TIMEOUT in the DX2-019 ticket.
+QUAL_TIMEOUT_SECS = 2400
+
+
+def run_connectors_item(item, write):
+    """Run one connectors qual test. Return exit code."""
+    spec = CONNECTOR_QUALS.get(item)
+    if spec is None:
+        print(f"unknown connectors item `{item}`")
+        return 1
+    for name in spec["env"]:
+        if not os.environ.get(name):
+            raise SystemExit(
+                f"qual {name} must be set for qualification; failing closed"
+            )
+    cmd = [
+        "cargo",
+        "test",
+        "-p",
+        spec["crate"],
+        "--features",
+        "couchbase",
+        "--lib",
+        spec["test"],
+        "--",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]
+    print(f"command: {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=QUAL_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"qual {item} timed out after {QUAL_TIMEOUT_SECS} secs")
+        return 1
+    out = (proc.stdout + proc.stderr)[-20000:]
+    print(out)
+    if proc.returncode != 0:
+        print(f"area=connectors items=1 verified=0 failed=1")
+        return 1
+    # An empty filter exits 0 with no test. Fail that run.
+    # The empty run prints `0 passed; 0 failed`.
+    if "0 passed; 0 failed" in out:
+        print(f"area=connectors items=1 verified=0 failed=1")
+        print("qual failed: filter matched 0 tests")
+        return 1
+    if "0 passed" in out and "1 passed" not in out:
+        print(f"area=connectors items=1 verified=0 failed=1")
+        print("qual failed: no test passed")
+        return 1
+    # The qual test proves the broker rule path. Require its markers.
+    if "qual rows asserted" not in out or "qual expiry asserted" not in out:
+        print(f"area=connectors items=1 verified=0 failed=1")
+        print("qual failed: broker rule path proof is missing")
+        return 1
+    if write:
+        target = VERIFIED / "connectors" / (item + ".json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(
+                {
+                    "item": item,
+                    "command": cmd,
+                    "returncode": 0,
+                    "output": out[-4000:],
+                    "verified": True,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    print(f"area=connectors items=1 verified=1 failed=0")
+    return 0
+
+
+def run_area(area, write, only_item=""):
     """Verify every example of one area. Print counts."""
+    if area == "connectors":
+        if only_item:
+            return run_connectors_item(only_item, write)
+        code = 0
+        for name in sorted(CONNECTOR_QUALS):
+            if run_connectors_item(name, write):
+                code = 1
+        return code
     items = verified = failed = 0
     area_dir = EXAMPLES / area
     if not area_dir.is_dir():
@@ -744,6 +851,8 @@ def run_area(area, write):
             return 1
     try:
         for path in sorted(area_dir.glob("*.toml")):
+            if only_item and path.stem != only_item:
+                continue
             items += 1
             ex = load_example(path)
             if ex["kind"] == "rule-test":
@@ -778,6 +887,8 @@ def run_area(area, write):
     # Fail when an item has neither a verified file nor a record.
     missing = 0
     for path in sorted(area_dir.glob("*.toml")):
+        if only_item and path.stem != only_item:
+            continue
         ex = load_example(path)
         target = VERIFIED / area / (path.stem + ".json")
         has_file = target.is_file() if not write else None
@@ -786,6 +897,9 @@ def run_area(area, write):
         if not has_file and not failure_recorded(ex["item"]):
             print(f"missing: {ex['item']} has no verified file or record")
             missing += 1
+    if only_item and items == 0:
+        print(f"unknown item `{only_item}` in area `{area}`")
+        return 1
     return 1 if missing else 0
 
 
@@ -793,6 +907,7 @@ def main(argv):
     """Run the verifier. --write stores verified files."""
     parser = argparse.ArgumentParser(description="Verify doc examples.")
     parser.add_argument("--area", default="", help="one area only")
+    parser.add_argument("--item", default="", help="one item only")
     parser.add_argument("--all", action="store_true", help="every area")
     parser.add_argument("--write", action="store_true", help="store results")
     args = parser.parse_args(argv)
@@ -805,7 +920,7 @@ def main(argv):
         return 2
     code = 0
     for area in areas:
-        if run_area(area, args.write):
+        if run_area(area, args.write, args.item):
             code = 1
     return code
 

@@ -95,6 +95,14 @@ flowchart LR
 - Broker gave: 201 on creation (or 400 naming the `s3` feature without the feature build). No object reached a store. No store ran in the docs run.
 - State: not verified.
 
+### Couchbase send path (2026-11-05)
+
+- Item: `couchbase` connector send path.
+- Input: `POST /api/v1/connectors` with `connection_string` `couchbase://127.0.0.1`, bucket `telemetry`, then a publish through a forwarding rule.
+- Expected from: the Couchbase page of this documentation.
+- Broker gave: 201 on creation (or 400 naming the `couchbase` feature without the feature build). No document reached a cluster. No cluster ran in the docs run.
+- State: not verified.
+
 ## Rule function evaluation records (DOC-04)
 
 ### Function call shapes (2026-10-15)
@@ -267,4 +275,11 @@ areas. Their counts come from `entries.py --coverage`.
 - Input: POST /api/v5/actions type `test` name `dx2-action-test` wants 201; POST /api/v5/actions type `test` name `dx2-action-test` wants 400.
 - Expected: the cased create results in the example.
 - Broker gave: `create test/dx2-action-test gave 400: {'code': 'BAD_REQUEST', 'message': 'unknown action type: test'}`.
+- Date: 2026-11-05.
+
+## DX2-019 item `couchbase`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item couchbase` with `COUCHBASE_URL`, `COUCHBASE_USERNAME`, `COUCHBASE_PASSWORD`, `COUCHBASE_BUCKET` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/couchbase.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-05.
