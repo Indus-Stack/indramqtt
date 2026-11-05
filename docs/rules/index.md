@@ -43,6 +43,7 @@ flowchart LR
 | [Compression functions](./functions-compression.md) | One verified entry per compression function. |
 | [Rule state functions](./functions-state.md) | One verified entry per rule state function. |
 | [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
+| [Rule actions A](./actions-a.md) | One verified entry per action from alloydb to dynamodb. |
 
 > [!NOTE]
 > A rule keeps the tenant of its input message. A rule of tenant A never fires for a publish of tenant B. See [Multi-tenancy](../multi-tenancy/index.md).

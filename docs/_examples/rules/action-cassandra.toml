@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-cassandra"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-cassandra"
+type = "cassandra"
+expect_status = 201
+expect_type = "cassandra"
+
+[[case]]
+name = "dx2-action-cassandra"
+type = "cassandra"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

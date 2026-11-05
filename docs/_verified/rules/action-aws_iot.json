@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "aws_iot"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-aws_iot",
+        "name": "dx2-action-aws_iot",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "aws_iot"
+      },
+      "name": "dx2-action-aws_iot",
+      "status": 201,
+      "type": "aws_iot"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-aws_iot\" already exists"
+      },
+      "name": "dx2-action-aws_iot",
+      "status": 400,
+      "type": "aws_iot"
+    }
+  ],
+  "item": "action-aws_iot",
+  "listed_in_action_types": false,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

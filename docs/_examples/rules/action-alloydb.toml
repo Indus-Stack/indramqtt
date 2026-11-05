@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-alloydb"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-alloydb"
+type = "alloydb"
+expect_status = 201
+expect_type = "alloydb"
+
+[[case]]
+name = "dx2-action-alloydb"
+type = "alloydb"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

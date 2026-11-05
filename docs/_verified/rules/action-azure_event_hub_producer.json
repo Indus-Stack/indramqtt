@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "azure_event_hub_producer"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-azure_event_hub_producer",
+        "name": "dx2-action-azure_event_hub_producer",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "azure_event_hub_producer"
+      },
+      "name": "dx2-action-azure_event_hub_producer",
+      "status": 201,
+      "type": "azure_event_hub_producer"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-azure_event_hub_producer\" already exists"
+      },
+      "name": "dx2-action-azure_event_hub_producer",
+      "status": 400,
+      "type": "azure_event_hub_producer"
+    }
+  ],
+  "item": "action-azure_event_hub_producer",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

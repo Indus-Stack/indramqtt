@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-confluent_producer"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-confluent_producer"
+type = "confluent_producer"
+expect_status = 201
+expect_type = "confluent_producer"
+
+[[case]]
+name = "dx2-action-confluent_producer"
+type = "confluent_producer"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

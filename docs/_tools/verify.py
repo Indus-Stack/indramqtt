@@ -104,6 +104,17 @@ def load_example(path):
                 except ValueError:
                     raise SystemExit(f"{path}: expect_projected is not JSON")
         ex["cases"] = cases
+    elif ex["kind"] == "action-create":
+        cases = data.get("case", [])
+        if not cases:
+            raise SystemExit(f"{path}: action-create needs at least one [[case]]")
+        for case in cases:
+            for key in ("name", "type", "expect_status"):
+                if key not in case:
+                    raise SystemExit(f"{path}: case misses {key}")
+            if not isinstance(case["expect_status"], int):
+                raise SystemExit(f"{path}: expect_status is not a number")
+        ex["cases"] = cases
     else:
         for key in ("binary", "args"):
             if key not in ex:
@@ -263,6 +274,34 @@ class RuleBroker:
                 return res.status, json.load(res)
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read().decode()[:500]
+        except OSError as exc:
+            return -1, f"request failed: {exc}"[:300]
+
+    def api_call(self, method, path, body):
+        """Run one management API call. Return (status, body or text)."""
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(  # noqa: S310
+            f"http://127.0.0.1:{self.api}{path}",
+            data=data,
+            method=method,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.key}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:  # noqa: S310
+                raw = res.read().decode()
+                try:
+                    return res.status, json.loads(raw)
+                except ValueError:
+                    return res.status, raw[:500]
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode()[:500]
+            try:
+                return exc.code, json.loads(raw)
+            except ValueError:
+                return exc.code, raw
         except OSError as exc:
             return -1, f"request failed: {exc}"[:300]
 
@@ -457,6 +496,83 @@ DX2_014_ITEMS = {
 }
 
 
+# Rule action stems owned by DX2-015 (actions A: alloydb to dynamodb).
+DX2_015_ITEMS = {
+    "action-alloydb",
+    "action-aws_iot",
+    "action-aws_timestream",
+    "action-azure_blob",
+    "action-azure_blob_storage",
+    "action-azure_event_grid",
+    "action-azure_event_hub_producer",
+    "action-azure_eventhubs",
+    "action-azure_iot",
+    "action-bigquery",
+    "action-cassandra",
+    "action-clickhouse",
+    "action-cockroachdb",
+    "action-confluent",
+    "action-confluent_producer",
+    "action-console",
+    "action-couchbase",
+    "action-databricks",
+    "action-datalayers",
+    "action-disk_log",
+    "action-doris",
+    "action-dynamo",
+    "action-dynamodb",
+}
+
+
+def verify_action_create(ex, broker):
+    """Create one action through the management API. Return (ok, record)."""
+    if broker is None:
+        return False, {"item": ex["item"], "error": "rule broker is missing"}
+    _, listed = broker.api_call("GET", "/api/v5/action_types", None)
+    listed_names = listed if isinstance(listed, list) else []
+    ran = []
+    for case in ex["cases"]:
+        name, kind = case["name"], case["type"]
+        status, body = broker.api_call(
+            "POST", "/api/v5/actions", {"type": kind, "name": name}
+        )
+        if status != case["expect_status"]:
+            return False, {
+                "item": ex["item"],
+                "error": f"create {kind}/{name} gave {status}: {body}",
+                "request": "POST /api/v5/actions",
+            }
+        if isinstance(body, dict):
+            if "expect_type" in case and body.get("type") != case["expect_type"]:
+                return False, {
+                    "item": ex["item"],
+                    "error": (
+                        f"type is {body.get('type')}, "
+                        f"wanted {case['expect_type']}"
+                    ),
+                    "request": "POST /api/v5/actions",
+                }
+            if "expect_code" in case and body.get("code") != case["expect_code"]:
+                return False, {
+                    "item": ex["item"],
+                    "error": (
+                        f"code is {body.get('code')}, "
+                        f"wanted {case['expect_code']}"
+                    ),
+                    "request": "POST /api/v5/actions",
+                }
+        ran.append({"name": name, "type": kind, "status": status, "body": body})
+    kinds = sorted({row["type"] for row in ran})
+    return True, {
+        "item": ex["item"],
+        "request": "POST /api/v5/actions",
+        "returncode": 0,
+        "cases": ran,
+        "action_types": kinds,
+        "listed_in_action_types": all(k in listed_names for k in kinds),
+    }
+
+
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
     if item.startswith(("clause-", "op-")):
@@ -479,6 +595,8 @@ def failure_marker(item):
         return "DX2-011"
     if item in DX2_014_ITEMS:
         return "DX2-014"
+    if item in DX2_015_ITEMS:
+        return "DX2-015"
     return "DX-01"
 
 
@@ -495,6 +613,19 @@ def append_failure(item, ex, record):
             f"\n## {task} item `{item}`\n\n"
             f"- Input: {inputs}.\n"
             f"- Expected: the cased match results in the example.\n"
+            f"- Broker gave: `{record.get('error', record)}`.\n"
+            f"- Date: {day}.\n"
+        )
+    elif ex.get("kind") == "action-create":
+        inputs = "; ".join(
+            f"POST /api/v5/actions type `{c.get('type', '')}` "
+            f"name `{c.get('name', '')}` wants {c.get('expect_status', '')}"
+            for c in ex.get("cases", [])
+        )
+        block = (
+            f"\n## {task} item `{item}`\n\n"
+            f"- Input: {inputs}.\n"
+            f"- Expected: the cased create results in the example.\n"
             f"- Broker gave: `{record.get('error', record)}`.\n"
             f"- Date: {day}.\n"
         )
@@ -537,6 +668,8 @@ def run_area(area, write):
             ex = load_example(path)
             if ex["kind"] == "rule-test":
                 ok, record = verify_rule_test(ex, broker)
+            elif ex["kind"] == "action-create":
+                ok, record = verify_action_create(ex, broker)
             else:
                 ok, record = verify_one(ex)
             target = VERIFIED / area / (path.stem + ".json")

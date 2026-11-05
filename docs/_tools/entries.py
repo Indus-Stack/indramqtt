@@ -14,6 +14,8 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --write --area rules
   python3 docs/_tools/entries.py --check --area rules
   python3 docs/_tools/entries.py --coverage --area rules
+  python3 docs/_tools/entries.py --write --area rules-actions-a
+  python3 docs/_tools/entries.py --check --area rules-actions-a
   python3 docs/_tools/entries.py --write --area rules-functions
   python3 docs/_tools/entries.py --check --area rules-functions
   python3 docs/_tools/entries.py --write --area rules-math-bitwise
@@ -1870,6 +1872,329 @@ def render_rules_state_page():
     return "\n".join(out) + "\n"
 
 
+# Display order of the DX2-015 action entries (actions A).
+RULES_ACTIONS_A = [
+    "alloydb",
+    "aws_iot",
+    "aws_timestream",
+    "azure_blob",
+    "azure_blob_storage",
+    "azure_event_grid",
+    "azure_event_hub_producer",
+    "azure_eventhubs",
+    "azure_iot",
+    "bigquery",
+    "cassandra",
+    "clickhouse",
+    "cockroachdb",
+    "confluent",
+    "confluent_producer",
+    "console",
+    "couchbase",
+    "databricks",
+    "datalayers",
+    "disk_log",
+    "doris",
+    "dynamo",
+    "dynamodb",
+]
+
+# One signature line per DX2-015 stem: the verified management call.
+RULES_ACTIONS_A_SYNTAX = {
+    rules_stem("action", name): (
+        f"`POST /api/v5/actions` with "
+        f"`{{\"type\": \"{name}\", \"name\": \"<id>\"}}`"
+    )
+    for name in RULES_ACTIONS_A
+}
+
+# Extra note lines per DX2-015 stem. Each states an observed fact.
+RULES_ACTIONS_A_NOTES = {
+    "action-alloydb": [
+        "The type catalogue lists this name.",
+        "The connector config names `table` and `column_mappings`.",
+        "The tier is enterprise.",
+    ],
+    "action-aws_iot": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `endpoint`, `region` and `topic_mappings`.",
+        "The tier is enterprise.",
+    ],
+    "action-aws_timestream": [
+        "The type catalogue lists this name. It is the console name for the `timestream` runtime.",
+        "The connector config names the database, the table and `dimensions`.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_blob": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `azure_blob_storage` for the same runtime.",
+        "The connector config names `container_name` and `blob_path_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_blob_storage": [
+        "The type catalogue lists this name. It is the console name for the `azure_blob` runtime.",
+        "The connector config names `container_name` and `blob_path_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_event_grid": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "No send runtime stands behind this name in this build. No rows leave the broker through it.",
+    ],
+    "action-azure_event_hub_producer": [
+        "The type catalogue lists this name. It is the console name for the `azure_eventhubs` runtime.",
+        "The connector config names `namespace`, `event_hub` and `partition_key_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_eventhubs": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `azure_event_hub_producer` for the same runtime.",
+        "The tier is enterprise.",
+    ],
+    "action-azure_iot": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `iot_hub_name` and `device_id`.",
+        "The tier is enterprise.",
+    ],
+    "action-bigquery": [
+        "The type catalogue lists this name.",
+        "The connector config names `project_id`, `dataset_id` and `table_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-cassandra": [
+        "The type catalogue lists this name.",
+        "The connector config names `contact_points`, `keyspace` and `cql_statement_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-clickhouse": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint`, `database` and `table`.",
+        "The tier is community.",
+    ],
+    "action-cockroachdb": [
+        "The type catalogue lists this name.",
+        "The connector config names `connection_string` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-confluent": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `confluent_producer` for the same runtime.",
+        "The tier is enterprise.",
+    ],
+    "action-confluent_producer": [
+        "The type catalogue lists this name. It is the console name for the `confluent` runtime.",
+        "The connector config names `bootstrap_servers` and `topic_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-console": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "A created row reads `connected` when enabled. The broker runs no probe behind it.",
+        "The tier is community.",
+    ],
+    "action-couchbase": [
+        "The type catalogue lists this name.",
+        "The connector config names `connection_string`, `bucket` and `doc_id_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-databricks": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `host`, `catalog` and `table_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-datalayers": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint`, `database` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-disk_log": [
+        "The type catalogue lists this name.",
+        "The connector config names `directory` and `filename_prefix`.",
+        "The tier is community.",
+    ],
+    "action-doris": [
+        "The type catalogue lists this name.",
+        "The connector config names `fe_host`, `database` and `table_template`.",
+        "The tier is enterprise.",
+    ],
+    "action-dynamo": [
+        "The type catalogue lists this name. It is the console name for the `dynamodb` runtime.",
+        "The connector config names `table_name` and the key mapping.",
+        "The tier is enterprise.",
+    ],
+    "action-dynamodb": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `dynamo` for the same runtime.",
+        "The tier is enterprise.",
+    ],
+}
+
+
+def render_rule_action_entry(name, stem, syntax_map, notes_map):
+    """Render one rule action entry from text and verified output."""
+    out = [f"### `{name}`", ""]
+    text = read_text("rules", stem)
+    if text:
+        out.append(text)
+    else:
+        out.append(f"`{name}` names one rule action.")
+    out.append("")
+    syntax = syntax_map.get(stem)
+    if syntax:
+        out.append(f"Signature: {syntax}.")
+        out.append("")
+    record = read_verified("rules", stem)
+    if record and record.get("verified"):
+        cases = record.get("cases", [])
+        if cases:
+            first = cases[0]
+            body = first.get("body", {})
+            out.append("Example (verified through `POST /api/v5/actions`):")
+            out.append("")
+            out.append("```json no-test")
+            out.append(
+                json.dumps(
+                    {"type": first.get("type"), "name": first.get("name")},
+                    sort_keys=True,
+                )
+            )
+            out.append("```")
+            out.append("")
+            out.append(
+                f"The broker answered `{first.get('status')}` with "
+                f"`\"type\": \"{body.get('type')}\"` and "
+                f"`\"status\": \"{body.get('status')}\"`."
+            )
+            for extra in cases[1:]:
+                ebody = extra.get("body", {})
+                if extra.get("status") == 400:
+                    out.append(
+                        f"Another create with the same name answered `400` "
+                        f"with code `{ebody.get('code')}`."
+                    )
+                else:
+                    out.append(
+                        f"Another create answered `{extra.get('status')}` "
+                        f"with `\"type\": \"{ebody.get('type')}\"`."
+                    )
+            out.append("")
+            if record.get("listed_in_action_types"):
+                out.append("`GET /api/v5/action_types` lists this name.")
+            else:
+                out.append("`GET /api/v5/action_types` omits this name.")
+            out.append("")
+            out.append(
+                f"Verified: `POST /api/v5/actions` exits 0. "
+                f"See `../_verified/rules/{stem}.json`."
+            )
+        else:
+            out.append(
+                f"Verified: `POST /api/v5/actions` exits 0. "
+                f"See `../_verified/rules/{stem}.json`."
+            )
+    else:
+        out.append(f"> **{NOT_VERIFIED}**")
+    out.append("")
+    out.append("Notes:")
+    out.append("")
+    for note in notes_map.get(stem, []):
+        out.append(f"- {note}")
+    out.append("- The docs run verifies creation only. No external server runs, so no rows reach the backend.")
+    out.append("- Repeat the check with the same call against a live broker.")
+    out.append("")
+    return out
+
+
+def render_rules_actions_a_page():
+    """Render the rule actions A page (DX2-015)."""
+    out = [
+        "---",
+        "title: Rule actions A: alloydb to dynamodb",
+        "description: Verified entries for each rule action from alloydb to dynamodb.",
+        "sidebar:",
+        "  order: 54",
+        "---",
+        "",
+        "# Rule actions A: alloydb to dynamodb",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "An action sends each result row to a backend. You create it "
+        "through the management API and you point a rule at it. Use this "
+        "page when a rule must reach a database, a cloud service or a "
+        "log. You get one entry per action, each with a run against the "
+        "broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Row["result row"] -- "forward" --> Act["action store"]',
+                '    Act -- "connector id" --> Conn["connector"]',
+                '    Conn -- "batch send" --> Ext["external system"]',
+                '    Row -- "republish" --> T["fixed topic"]',
+                '    Row -- "console" --> Log["broker log"]',
+                '    T -- "deliver" --> Sub["subscriber"]',
+            ]
+        ),
+        "",
+        "Create the connector first, then the action, then the rule. "
+        "A created action reads `connected` when enabled. The broker "
+        "runs no probe behind that status; the status mirrors the "
+        "enable flag. The docs run verifies creation only; no external "
+        "server runs, so no rows reach a backend here.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Create each connector before an action names it. See [Connectors](../connectors/index.md).",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v5/actions`.",
+        "",
+        "## Actions",
+        "",
+        "| Action | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_ACTIONS_A:
+        stem = rules_stem("action", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` sends rows out."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Actions in detail", ""]
+    for name in RULES_ACTIONS_A:
+        out += render_rule_action_entry(
+            name,
+            rules_stem("action", name),
+            RULES_ACTIONS_A_SYNTAX,
+            RULES_ACTIONS_A_NOTES,
+        )
+    out += [
+        "## Check that it works",
+        "",
+        "Create one action and read it back:",
+        "",
+        "```sh no-test",
+        "# Needs a live broker and an operator key. Use your own name.",
+        'curl -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\',
+        '  -d \'{"type": "disk_log", "name": "dx-check"}\' \\',
+        "  http://127.0.0.1:18083/api/v5/actions",
+        "```",
+        "",
+        "The answer is `201` with the stored shape. A second create "
+        "with the same name answers `400` with code `ALREADY_EXISTS`.",
+        "",
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- Shape payloads with [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -2186,6 +2511,26 @@ def main(argv):
                 )
                 return 1
             print("entries match: docs/rules/functions-state.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-actions-a":
+        fresh = render_rules_actions_a_page()
+        path = ROOT / "docs" / "rules" / "actions-a.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print("drift: docs/rules/actions-a.md is missing: run --write")
+                return 1
+            if have != fresh:
+                print("drift: docs/rules/actions-a.md differs: run --write")
+                return 1
+            print("entries match: docs/rules/actions-a.md")
             return 0
         parser.print_help()
         return 2
