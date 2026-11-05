@@ -524,6 +524,33 @@ DX2_015_ITEMS = {
 }
 
 
+# Rule action stems owned by DX2-016 (actions B: elasticsearch to opentsdb).
+DX2_016_ITEMS = {
+    "action-elasticsearch",
+    "action-gcp_iot",
+    "action-gcp_pubsub",
+    "action-gcp_pubsub_consumer",
+    "action-gcp_pubsub_producer",
+    "action-greptimedb",
+    "action-http",
+    "action-influxdb",
+    "action-iotdb",
+    "action-kafka",
+    "action-kafka_consumer",
+    "action-kafka_producer",
+    "action-kinesis",
+    "action-mongodb",
+    "action-mqtt",
+    "action-mqtt_bridge",
+    "action-mssql",
+    "action-mysql",
+    "action-oci_streaming",
+    "action-opc_ua",
+    "action-opents",
+    "action-opentsdb",
+}
+
+
 def verify_action_create(ex, broker):
     """Create one action through the management API. Return (ok, record)."""
     if broker is None:
@@ -597,6 +624,8 @@ def failure_marker(item):
         return "DX2-014"
     if item in DX2_015_ITEMS:
         return "DX2-015"
+    if item in DX2_016_ITEMS:
+        return "DX2-016"
     return "DX-01"
 
 

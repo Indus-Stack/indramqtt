@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-opc_ua"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-opc_ua"
+type = "opc_ua"
+expect_status = 201
+expect_type = "opc_ua"
+
+[[case]]
+name = "dx2-action-opc_ua"
+type = "opc_ua"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

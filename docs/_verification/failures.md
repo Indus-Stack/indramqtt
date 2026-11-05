@@ -254,3 +254,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the cased match results in the example.
 - Broker gave: `rules/test gave 400: {"error":"invalid sql_query: line 1, column 12: expected keyword FROM"}`.
 - Date: 2026-10-17.
+
+## DX2-016 item `action-gcp_pubsub_consumer`
+
+- Input: POST /api/v5/actions type `gcp_pubsub_consumer` name `dx2-action-gcp_pubsub_consumer` wants 201; POST /api/v5/actions type `gcp_pubsub_consumer` name `dx2-action-gcp_pubsub_consumer` wants 400.
+- Expected: the cased create results in the example.
+- Broker gave: `create gcp_pubsub_consumer/dx2-action-gcp_pubsub_consumer gave 400: {'code': 'BAD_REQUEST', 'message': 'unknown action type: gcp_pubsub_consumer'}`.
+- Date: 2026-11-05.

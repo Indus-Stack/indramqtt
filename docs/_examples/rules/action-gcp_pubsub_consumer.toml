@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-gcp_pubsub_consumer"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-gcp_pubsub_consumer"
+type = "gcp_pubsub_consumer"
+expect_status = 201
+expect_type = "gcp_pubsub_consumer"
+
+[[case]]
+name = "dx2-action-gcp_pubsub_consumer"
+type = "gcp_pubsub_consumer"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"
