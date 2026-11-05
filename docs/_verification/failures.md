@@ -119,6 +119,14 @@ flowchart LR
 - Broker gave: 201 on creation (or 400 naming the `gcp_pubsub` feature without the feature build). No message reached a topic. No server ran in the docs run.
 - State: not verified.
 
+### GreptimeDB send path (2026-11-05)
+
+- Item: `greptimedb` connector send path.
+- Input: `POST /api/v1/connectors` with `endpoint` `http://127.0.0.1:4000/v1`, `database` `public`, `table_template` `metrics_${topic_segment_1}`, then a publish through a forwarding rule.
+- Expected from: the GreptimeDB page of this documentation.
+- Broker gave: 201 on creation. No row reached a server. No server ran in the docs run.
+- State: not verified.
+
 ## Rule function evaluation records (DOC-04)
 
 ### Function call shapes (2026-10-15)
@@ -311,5 +319,12 @@ areas. Their counts come from `entries.py --coverage`.
 
 - Input: `python3 docs/_tools/verify.py --area connectors --item gcp_pubsub` with `PUBSUB_EMULATOR_HOST`, `PUBSUB_PROJECT`, `PUBSUB_TOPIC`, `PUBSUB_SUBSCRIPTION` from a real server.
 - Expected: the docs run writes `docs/_verified/connectors/gcp_pubsub.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-05.
+
+## DX2-022 item `greptimedb`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item greptimedb` with `GREPTIMEDB_ENDPOINT`, `GREPTIMEDB_DATABASE`, `GREPTIMEDB_TABLE` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/greptimedb.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-05.

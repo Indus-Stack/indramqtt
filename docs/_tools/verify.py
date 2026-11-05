@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019, DX2-020, DX2-021).
+# Qual mapping for connectors (DX2-019, DX2-020, DX2-021, DX2-022).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -761,6 +761,17 @@ CONNECTOR_QUALS = {
         "timeout": 1800,
         "markers": ["qual rows asserted"],
     },
+    "greptimedb": {
+        "crate": "broker-connectors",
+        "test": "greptimedb::tests::test_qualify_write_path",
+        "env": [
+            "GREPTIMEDB_ENDPOINT",
+            "GREPTIMEDB_DATABASE",
+            "GREPTIMEDB_TABLE",
+        ],
+        "timeout": 1800,
+        "markers": ["qual rows asserted", "qual precision asserted"],
+    },
 }
 
 # Default timeout for the qual subprocess (secs).
@@ -779,15 +790,19 @@ def run_connectors_item(item, write):
             raise SystemExit(
                 f"qual {name} must be set for qualification; failing closed"
             )
-    feature = spec.get("feature", item)
+    feature = spec.get("feature")
     timeout = int(spec.get("timeout", QUAL_TIMEOUT_SECS))
     cmd = [
         "cargo",
         "test",
         "-p",
         spec["crate"],
-        "--features",
-        feature,
+    ]
+    # Kinds without a feature flag ship in the default build.
+    # The command then carries no --features flag.
+    if feature:
+        cmd += ["--features", feature]
+    cmd += [
         "--lib",
         spec["test"],
         "--",
