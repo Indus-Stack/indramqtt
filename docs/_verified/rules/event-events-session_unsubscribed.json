@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "topic": "sensors/+"
+      },
+      "projected": {
+        "topic": "sensors/+"
+      },
+      "sql": "SELECT topic FROM \"$events/session_unsubscribed\"",
+      "topic": "$events/session_unsubscribed"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "topic": "sensors/+"
+      },
+      "projected": null,
+      "sql": "SELECT topic FROM \"$events/session_unsubscribed\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "event-events-session_unsubscribed",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

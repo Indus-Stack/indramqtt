@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "return_code": 0
+      },
+      "projected": {
+        "return_code": 0
+      },
+      "sql": "SELECT return_code FROM \"$events/client_connack\"",
+      "topic": "$events/client_connack"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "return_code": 0
+      },
+      "projected": null,
+      "sql": "SELECT return_code FROM \"$events/client_connack\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "event-events-client_connack",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

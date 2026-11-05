@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "event-events-client_connack"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT return_code FROM "$events/client_connack"'
+topic = "$events/client_connack"
+payload = '{"return_code": 0}'
+expect_matched = true
+expect_projected = '{"return_code": 0}'
+
+[[case]]
+sql = 'SELECT return_code FROM "$events/client_connack"'
+topic = "sensors/kitchen"
+payload = '{"return_code": 0}'
+expect_matched = false

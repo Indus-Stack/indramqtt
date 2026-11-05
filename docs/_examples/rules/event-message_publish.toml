@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "event-message_publish"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT temp FROM message_publish'
+topic = "sensors/kitchen"
+payload = '{"temp": 21.5}'
+expect_matched = true
+expect_projected = '{"temp": 21.5}'
+
+[[case]]
+sql = 'SELECT temp FROM message_publish'
+topic = "factory/line1"
+payload = '{"temp": 21.5}'
+expect_matched = true
+expect_projected = '{"temp": 21.5}'

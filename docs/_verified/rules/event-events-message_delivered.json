@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "retain": false
+      },
+      "projected": {
+        "retain": false
+      },
+      "sql": "SELECT retain FROM \"$events/message_delivered\"",
+      "topic": "$events/message_delivered"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "retain": false
+      },
+      "projected": null,
+      "sql": "SELECT retain FROM \"$events/message_delivered\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "event-events-message_delivered",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

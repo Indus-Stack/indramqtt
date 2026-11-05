@@ -627,6 +627,26 @@ def verify_action_create(ex, broker):
     }
 
 
+# Rule event stems owned by DX2-018 (event sources as FROM names).
+DX2_018_ITEMS = {
+    "event-events-client_check_authz_complete",
+    "event-events-client_connack",
+    "event-events-client_connected",
+    "event-events-client_disconnected",
+    "event-events-delivery_dropped",
+    "event-events-message_acked",
+    "event-events-message_delivered",
+    "event-events-message_dropped",
+    "event-events-message_publish",
+    "event-events-no_such_event",
+    "event-events-session_subscribed",
+    "event-events-session_unsubscribed",
+    "event-description",
+    "event-event",
+    "event-message_publish",
+}
+
+
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
     if item.startswith(("clause-", "op-")):
@@ -655,6 +675,8 @@ def failure_marker(item):
         return "DX2-016"
     if item in DX2_017_ITEMS:
         return "DX2-017"
+    if item in DX2_018_ITEMS:
+        return "DX2-018"
     return "DX-01"
 
 

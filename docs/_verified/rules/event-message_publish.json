@@ -1,0 +1,30 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "temp": 21.5
+      },
+      "projected": {
+        "temp": 21.5
+      },
+      "sql": "SELECT temp FROM message_publish",
+      "topic": "sensors/kitchen"
+    },
+    {
+      "matched": true,
+      "payload": {
+        "temp": 21.5
+      },
+      "projected": {
+        "temp": 21.5
+      },
+      "sql": "SELECT temp FROM message_publish",
+      "topic": "factory/line1"
+    }
+  ],
+  "item": "event-message_publish",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}

@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "event-events-client_connected"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT clientid FROM "$events/client_connected"'
+topic = "$events/client_connected"
+payload = '{"clientid": "sensor-1"}'
+expect_matched = true
+expect_projected = '{"clientid": "sensor-1"}'
+
+[[case]]
+sql = 'SELECT clientid FROM "$events/client_connected"'
+topic = "sensors/kitchen"
+payload = '{"clientid": "sensor-1"}'
+expect_matched = false

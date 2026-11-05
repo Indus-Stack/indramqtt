@@ -1,0 +1,17 @@
+[example]
+area = "rules"
+item = "event-events-session_unsubscribed"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT topic FROM "$events/session_unsubscribed"'
+topic = "$events/session_unsubscribed"
+payload = '{"topic": "sensors/+"}'
+expect_matched = true
+expect_projected = '{"topic": "sensors/+"}'
+
+[[case]]
+sql = 'SELECT topic FROM "$events/session_unsubscribed"'
+topic = "sensors/kitchen"
+payload = '{"topic": "sensors/+"}'
+expect_matched = false

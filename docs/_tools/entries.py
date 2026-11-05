@@ -35,8 +35,10 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --check --area rules-hashing
   python3 docs/_tools/entries.py --write --area rules-compression
   python3 docs/_tools/entries.py --check --area rules-compression
-  python3 docs/_tools/entries.py --write --area rules-state
-  python3 docs/_tools/entries.py --check --area rules-state
+   python3 docs/_tools/entries.py --write --area rules-state
+   python3 docs/_tools/entries.py --check --area rules-state
+   python3 docs/_tools/entries.py --write --area rules-events
+   python3 docs/_tools/entries.py --check --area rules-events
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -341,8 +343,9 @@ def rules_stem(kind, name):
     Clauses and operators own short stems (clause-select, op-and).
     Later waves add function, action and event stems. The rulebook
     does not decide the shape, so this mapping is the choice:
-    lowercase, spaces to dashes (TODO(parity): keep one shape
-    across every DX2 task).
+    lowercase, spaces to dashes. Event stems also replace `$events/`
+    with `events-` and drop any other `$` or `/`, so each stem is
+    one flat file name (DX2-018 keeps one shape across every task).
     """
     slug = name.lower().replace(" ", "-")
     if kind == "clause":
@@ -353,6 +356,7 @@ def rules_stem(kind, name):
         return "fn-" + slug
     if kind == "action":
         return "action-" + slug
+    slug = slug.replace("$events/", "events-").replace("$", "").replace("/", "-")
     return "event-" + slug
 
 
@@ -392,6 +396,22 @@ RULES_SYNTAX = {
     "op-in": "`<value> IN (<member> [, ...])`",
     "op-like": "`<text> LIKE '<pattern>'` with `%` and `_`",
     "op-not": "`NOT <test>`, `NOT BETWEEN`, `NOT IN`, `NOT LIKE`",
+    # DX2-018 event stems: one FROM source per inventory name.
+    "event-events-client_check_authz_complete": '`FROM "$events/client_check_authz_complete"`',
+    "event-events-client_connack": '`FROM "$events/client_connack"`',
+    "event-events-client_connected": '`FROM "$events/client_connected"`',
+    "event-events-client_disconnected": '`FROM "$events/client_disconnected"`',
+    "event-events-delivery_dropped": '`FROM "$events/delivery_dropped"`',
+    "event-events-message_acked": '`FROM "$events/message_acked"`',
+    "event-events-message_delivered": '`FROM "$events/message_delivered"`',
+    "event-events-message_dropped": '`FROM "$events/message_dropped"`',
+    "event-events-message_publish": '`FROM "$events/message_publish"` (no producer fires it)',
+    "event-events-no_such_event": '`FROM "$events/no_such_event"` (no producer fires it)',
+    "event-events-session_subscribed": '`FROM "$events/session_subscribed"`',
+    "event-events-session_unsubscribed": '`FROM "$events/session_unsubscribed"`',
+    "event-description": "`FROM description` (a bare stream name, not an event)",
+    "event-event": "`FROM event` (a bare stream name, not an event)",
+    "event-message_publish": "`FROM message_publish` (a bare stream name, not an event)",
 }
 
 # Extra note lines per DX2-001 stem. Each states an observed limit.
@@ -413,6 +433,67 @@ RULES_NOTES = {
     ],
     "op-in": [
         "An empty list matches nothing.",
+    ],
+    # DX2-018 event stems. Each states an observed fact about the source.
+    "event-events-client_check_authz_complete": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row omits `retain` for a subscribe check.",
+    ],
+    "event-events-client_connack": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the answer code in `return_code`.",
+    ],
+    "event-events-client_connected": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the connect arguments `keepalive`, `proto_ver` and `clean_start`.",
+    ],
+    "event-events-client_disconnected": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row omits `disconnect_code` when the edge sends none.",
+    ],
+    "event-events-delivery_dropped": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The kernel fires it at route failure for dead connections.",
+    ],
+    "event-events-message_acked": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the packet id in `msg_id`.",
+    ],
+    "event-events-message_delivered": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the delivered bytes in `payload`.",
+    ],
+    "event-events-message_dropped": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The kernel fires it at quota shed and at detached clean sessions.",
+    ],
+    "event-events-message_publish": [
+        "`GET /api/v1/rules/sources` omits this name.",
+        "No kernel producer fires it. A rule that names it never runs in production.",
+    ],
+    "event-events-no_such_event": [
+        "`GET /api/v1/rules/sources` omits this name.",
+        "No kernel producer fires it. A rule that names it never runs in production.",
+    ],
+    "event-events-session_subscribed": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the subscribe options `nl`, `rap` and `rh`.",
+    ],
+    "event-events-session_unsubscribed": [
+        "`GET /api/v1/rules/sources` lists this name.",
+        "The row carries the filter in `topic`.",
+    ],
+    "event-description": [
+        "This name selects no event.",
+        "As a bare stream name it constrains nothing. The rule matches every message.",
+    ],
+    "event-event": [
+        "This name selects no event.",
+        "As a bare stream name it constrains nothing. The rule matches every message.",
+    ],
+    "event-message_publish": [
+        "This name selects no event.",
+        "As a bare stream name it constrains nothing. The rule matches every message.",
     ],
 }
 
@@ -682,6 +763,141 @@ def render_rules_page():
             f"operator {operator}", rules_stem("operator", operator)
         )
     out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- Shape payloads with [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
+# Display order of the DX2-018 event entries: produced sources first,
+# then inventory names that select no event.
+RULES_EVENT_ORDER = [
+    "$events/client_check_authz_complete",
+    "$events/client_connack",
+    "$events/client_connected",
+    "$events/client_disconnected",
+    "$events/delivery_dropped",
+    "$events/message_acked",
+    "$events/message_delivered",
+    "$events/message_dropped",
+    "$events/session_subscribed",
+    "$events/session_unsubscribed",
+]
+
+# Inventory names that select no event (DX2-018).
+RULES_EVENT_NON_SOURCES = [
+    "$events/message_publish",
+    "$events/no_such_event",
+    "description",
+    "event",
+    "message_publish",
+]
+
+
+def render_rules_events_page():
+    """Render the rule events page (DX2-018)."""
+    out = [
+        "---",
+        "title: Rule events",
+        "description: Verified entries for each rule event source.",
+        "sidebar:",
+        "  order: 57",
+        "---",
+        "",
+        "# Rule events",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "An event source turns a broker event into one rule row. A "
+        "connect, a subscribe, a delivery and a drop each fire one row. "
+        "Use this page when a rule must react to the broker itself and "
+        "not to a message. You get one entry per inventory name, each "
+        "with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Con["CONNECT :1883"] -- "bind" --> Eng["rule engine"]',
+                '    Sub["SUBSCRIBE"] -- "subscribe" --> Eng',
+                '    Pub["PUBLISH"] -- "fan-out or drop" --> Eng',
+                '    Eng -- "fire event record" --> Rec["$events/... row"]',
+                '    Rec -- "FROM event source" --> Sel["SELECT shape"]',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "Name the source in `FROM`. The kernel fires the source on the "
+        "publish-path drain. An event source never matches an MQTT "
+        "message. The engine drops such a message before evaluation. "
+        "The docs run checks source selection only through "
+        "`POST /api/v1/rules/test`. No client connects during the run.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- List the live sources with `GET /api/v1/rules/sources`.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Events",
+        "",
+        "| Event | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_EVENT_ORDER:
+        stem = rules_stem("event", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` fires one row per broker event."
+        out.append(f"| `{name}` | {first} |")
+    out += [
+        "",
+        "## Names that select no event",
+        "",
+        "These inventory names select no event. A `$events/...` name "
+        "here has no producer. A bare name here is a stream and "
+        "constrains nothing.",
+        "",
+        "| Name | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_EVENT_NON_SOURCES:
+        stem = rules_stem("event", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` selects no event."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Events in detail", ""]
+    for name in RULES_EVENT_ORDER:
+        out += render_rules_entry(f"event {name}", rules_stem("event", name))
+    out += ["## Names that select no event in detail", ""]
+    for name in RULES_EVENT_NON_SOURCES:
+        out += render_rules_entry(f"event {name}", rules_stem("event", name))
+    out += [
+        "## Check that it works",
+        "",
+        "Dry-run one event source and one miss:",
+        "",
+        "```sh no-test",
+        "# Needs a live broker and an operator key. Use your own values.",
+        'curl -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\',
+        '  -d \'{"sql_query": "SELECT clientid FROM \\"$events/client_connected\\"", "topic": "$events/client_connected", "payload": {"clientid": "sensor-1"}}\' \\',
+        "  http://127.0.0.1:18083/api/v1/rules/test",
+        "```",
+        "",
+        "The answer is `matched: true` with "
+        "`projected: {\"clientid\": \"sensor-1\"}`. The same call with "
+        "`\"topic\": \"sensors/kitchen\"` answers `matched: false`.",
+        "",
         "## Next steps",
         "",
         "- Write the query with [Rule SQL](./sql.md).",
@@ -3070,6 +3286,26 @@ def main(argv):
                 print("drift: docs/rules/actions-c.md differs: run --write")
                 return 1
             print("entries match: docs/rules/actions-c.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-events":
+        fresh = render_rules_events_page()
+        path = ROOT / "docs" / "rules" / "events.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print("drift: docs/rules/events.md is missing: run --write")
+                return 1
+            if have != fresh:
+                print("drift: docs/rules/events.md differs: run --write")
+                return 1
+            print("entries match: docs/rules/events.md")
             return 0
         parser.print_help()
         return 2

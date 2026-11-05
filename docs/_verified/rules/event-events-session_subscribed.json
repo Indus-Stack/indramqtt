@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "matched": true,
+      "payload": {
+        "qos": 1
+      },
+      "projected": {
+        "qos": 1
+      },
+      "sql": "SELECT qos FROM \"$events/session_subscribed\"",
+      "topic": "$events/session_subscribed"
+    },
+    {
+      "matched": false,
+      "payload": {
+        "qos": 1
+      },
+      "projected": null,
+      "sql": "SELECT qos FROM \"$events/session_subscribed\"",
+      "topic": "sensors/kitchen"
+    }
+  ],
+  "item": "event-events-session_subscribed",
+  "request": "POST /api/v1/rules/test",
+  "returncode": 0,
+  "verified": true
+}
