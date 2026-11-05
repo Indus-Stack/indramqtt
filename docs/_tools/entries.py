@@ -29,6 +29,8 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --check --area rules-hashing
   python3 docs/_tools/entries.py --write --area rules-compression
   python3 docs/_tools/entries.py --check --area rules-compression
+  python3 docs/_tools/entries.py --write --area rules-state
+  python3 docs/_tools/entries.py --check --area rules-state
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -1738,6 +1740,136 @@ def render_rules_compression_page():
     return "\n".join(out) + "\n"
 
 
+# Display order of the DX2-014 function entries (rule state).
+RULES_STATE_FUNCTIONS = [
+    "proc_dict_get",
+    "proc_dict_put",
+    "proc_dict_del",
+    "kv_store_get",
+    "kv_store_put",
+    "kv_store_del",
+]
+
+# One signature line per DX2-014 stem, taken from the broker code.
+RULES_STATE_SYNTAX = {
+    "fn-proc_dict_get": "`proc_dict_get(<key>)`",
+    "fn-proc_dict_put": "`proc_dict_put(<key>, <value>)`",
+    "fn-proc_dict_del": "`proc_dict_del(<key>)`",
+    "fn-kv_store_get": "`kv_store_get(<key> [, <default>])`",
+    "fn-kv_store_put": "`kv_store_put(<key>, <value>)`",
+    "fn-kv_store_del": "`kv_store_del(<key>)`",
+}
+
+# Extra note lines per DX2-014 stem. Each states an observed limit.
+# TODO(parity, DX2-014): Check tenant scope. The code keys the shared
+# map by key only. One tenant may read the key of another tenant.
+RULES_STATE_NOTES = {
+    "fn-proc_dict_get": [
+        "The map is rule-local. One rule cannot read the slot of another rule.",
+        "A missing key reads as null. A wrong argument count returns null.",
+    ],
+    "fn-proc_dict_put": [
+        "The test entry never writes. It returns null and keeps the old state.",
+        "A key longer than 4096 characters reads as null. The map holds 10000 entries at most.",
+        "A put past the cap returns null. A wrong argument count returns null.",
+    ],
+    "fn-proc_dict_del": [
+        "The test entry never deletes. It returns null and keeps the old state.",
+        "A missing key reads as null. A wrong argument count returns null.",
+    ],
+    "fn-kv_store_get": [
+        "The map is node-global. All rules share the same map.",
+        "A missing key without a default reads as null. A missing key with a default returns the default.",
+        "A wrong argument count returns null.",
+    ],
+    "fn-kv_store_put": [
+        "The test entry never writes. It returns null and keeps the old state.",
+        "A key longer than 4096 characters reads as null. The map holds 10000 entries at most.",
+        "A put past the cap returns null. A wrong argument count returns null.",
+    ],
+    "fn-kv_store_del": [
+        "The test entry never deletes. It returns null and keeps the old state.",
+        "A missing key reads as null. A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rules_state_page():
+    """Render the rule state function page (DX2-014)."""
+    out = [
+        "---",
+        "title: Rule functions: rule state",
+        "description: Verified entries for the rule state functions.",
+        "sidebar:",
+        "  order: 53",
+        "---",
+        "",
+        "# Rule functions: rule state",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A rule state function reads or writes a key slot outside the "
+        "message. Use this page when a rule must keep a value across "
+        "messages. You get one entry per function, each with a run "
+        "against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Msg["message field"] -- "proc_dict_put or kv_store_put" --> Slot["key slot"]',
+                '    Slot -- "proc_dict_get or kv_store_get" --> Val["stored value"]',
+                '    Slot -- "proc_dict_del or kv_store_del" --> Gone["removed slot"]',
+                '    Val -- "SELECT AS" --> Sel["result column"]',
+                '    Gone -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "The `proc_dict` map is rule-local. The `kv_store` map is "
+        "node-global. The test entry never writes: a put or a delete "
+        "through it returns null and keeps the old state. A wrong "
+        "argument count reads as null. A null value never stops the rule.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_STATE_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` keeps state."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_STATE_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_STATE_SYNTAX,
+            RULES_STATE_NOTES,
+            "`{name}` keeps state across messages.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -2028,6 +2160,32 @@ def main(argv):
                 )
                 return 1
             print("entries match: docs/rules/functions-compression.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-state":
+        fresh = render_rules_state_page()
+        path = ROOT / "docs" / "rules" / "functions-state.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-state.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-state.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-state.md")
             return 0
         parser.print_help()
         return 2

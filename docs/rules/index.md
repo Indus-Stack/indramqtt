@@ -41,6 +41,7 @@ flowchart LR
 | [Array functions](./functions-arrays.md) | One verified entry per array function. |
 | [Hashing functions](./functions-hashing.md) | One verified entry per hashing function. |
 | [Compression functions](./functions-compression.md) | One verified entry per compression function. |
+| [Rule state functions](./functions-state.md) | One verified entry per rule state function. |
 | [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
 
 > [!NOTE]

@@ -446,6 +446,17 @@ DX2_011_ITEMS = {
 }
 
 
+# Rule function stems owned by DX2-014 (rule state).
+DX2_014_ITEMS = {
+    "fn-proc_dict_get",
+    "fn-proc_dict_put",
+    "fn-proc_dict_del",
+    "fn-kv_store_get",
+    "fn-kv_store_put",
+    "fn-kv_store_del",
+}
+
+
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
     if item.startswith(("clause-", "op-")):
@@ -466,6 +477,8 @@ def failure_marker(item):
         return "DX2-010"
     if item in DX2_011_ITEMS:
         return "DX2-011"
+    if item in DX2_014_ITEMS:
+        return "DX2-014"
     return "DX-01"
 
 
