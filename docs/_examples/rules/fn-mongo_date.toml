@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-mongo_date"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT mongo_date(0) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "1970-01-01T00:00:00Z"}'
+
+[[case]]
+sql = "SELECT mongo_date('x') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

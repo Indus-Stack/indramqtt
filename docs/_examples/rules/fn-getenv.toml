@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-getenv"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT getenv('DX2_013_SENTINEL_MISSING_7Q3Z') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": ""}'
+
+[[case]]
+sql = 'SELECT getenv() AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

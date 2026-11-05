@@ -1,0 +1,18 @@
+[example]
+area = "rules"
+item = "fn-unix_ts_to_rfc3339"
+kind = "rule-test"
+
+[[case]]
+sql = 'SELECT unix_ts_to_rfc3339(0) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "1970-01-01T00:00:00Z"}'
+
+[[case]]
+sql = "SELECT unix_ts_to_rfc3339(0, 'bogus') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

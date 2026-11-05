@@ -1,0 +1,25 @@
+[example]
+area = "rules"
+item = "fn-timezone_to_offset_seconds"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT timezone_to_offset_seconds('+08:00') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": 28800}'
+
+[[case]]
+sql = 'SELECT timezone_to_offset_seconds(zone) AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"zone": "Mars/Olympus"}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = 'SELECT timezone_to_offset_seconds() AS v FROM "sensors/+"'
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
