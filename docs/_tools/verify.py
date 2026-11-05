@@ -433,6 +433,19 @@ DX2_010_ITEMS = {
 }
 
 
+# Rule function stems owned by DX2-011 (compression).
+DX2_011_ITEMS = {
+    "fn-zip",
+    "fn-unzip",
+    "fn-gzip",
+    "fn-gunzip",
+    "fn-zip_compress",
+    "fn-zip_uncompress",
+    "fn-lz4_compress",
+    "fn-lz4_uncompress",
+}
+
+
 def failure_marker(item):
     """Name the wave task that owns one failure record."""
     if item.startswith(("clause-", "op-")):
@@ -451,6 +464,8 @@ def failure_marker(item):
         return "DX2-009"
     if item in DX2_010_ITEMS:
         return "DX2-010"
+    if item in DX2_011_ITEMS:
+        return "DX2-011"
     return "DX-01"
 
 

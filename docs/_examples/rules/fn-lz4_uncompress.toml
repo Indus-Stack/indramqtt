@@ -1,0 +1,25 @@
+[example]
+area = "rules"
+item = "fn-lz4_uncompress"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT lz4_uncompress(lz4_compress('hello lz4u')) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "hello lz4u"}'
+
+[[case]]
+sql = "SELECT lz4_uncompress('!!!not-base64!!!') AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT lz4_uncompress() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'

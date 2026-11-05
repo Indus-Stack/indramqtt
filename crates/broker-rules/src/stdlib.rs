@@ -2516,6 +2516,12 @@ fn func_zip(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Null;
     }
+    // Fail fast on huge text. Copying past the cap wastes memory.
+    if let Some(Value::String(s)) = args.first() {
+        if s.len() > MAX_STDLIB_STRING_BYTES {
+            return Value::Null;
+        }
+    }
     let Some(raw) = bytes_arg(args, 0) else {
         return Value::Null;
     };
@@ -2537,7 +2543,13 @@ fn zlib_decode_input(args: &[Value]) -> Option<Vec<u8>> {
         return None;
     }
     match &args[0] {
-        Value::String(s) => b64_to_bytes(s).or_else(|| Some(s.as_bytes().to_vec())),
+        Value::String(s) => {
+            // Fail fast on huge text. Base64 text past this size decodes past the 4 MiB cap. Raw bytes past this size also exceed the cap.
+            if s.len() > MAX_STDLIB_STRING_BYTES * 4 * 4 / 3 + 4 {
+                return None;
+            }
+            b64_to_bytes(s).or_else(|| Some(s.as_bytes().to_vec()))
+        }
         _ => bytes_arg(args, 0),
     }
 }
@@ -2580,6 +2592,12 @@ fn func_zip_uncompress(args: &[Value]) -> Value {
 fn func_gzip(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Null;
+    }
+    // Fail fast on huge text. Copying past the cap wastes memory.
+    if let Some(Value::String(s)) = args.first() {
+        if s.len() > MAX_STDLIB_STRING_BYTES {
+            return Value::Null;
+        }
     }
     let Some(raw) = bytes_arg(args, 0) else {
         return Value::Null;
@@ -2624,6 +2642,12 @@ fn func_gunzip(args: &[Value]) -> Value {
 fn func_lz4_compress(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::Null;
+    }
+    // Fail fast on huge text. Copying past the cap wastes memory.
+    if let Some(Value::String(s)) = args.first() {
+        if s.len() > MAX_STDLIB_STRING_BYTES {
+            return Value::Null;
+        }
     }
     let Some(raw) = bytes_arg(args, 0) else {
         return Value::Null;

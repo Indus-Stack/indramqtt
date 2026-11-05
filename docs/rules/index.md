@@ -40,6 +40,7 @@ flowchart LR
 | [Type check functions](./functions-type-checks.md) | One verified entry per type check function. |
 | [Array functions](./functions-arrays.md) | One verified entry per array function. |
 | [Hashing functions](./functions-hashing.md) | One verified entry per hashing function. |
+| [Compression functions](./functions-compression.md) | One verified entry per compression function. |
 | [Actions](./actions.md) | Built-in actions, a tested republish example, how to test a rule, limits. |
 
 > [!NOTE]

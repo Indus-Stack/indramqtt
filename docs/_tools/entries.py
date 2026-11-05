@@ -27,6 +27,8 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --check --area rules-arrays
   python3 docs/_tools/entries.py --write --area rules-hashing
   python3 docs/_tools/entries.py --check --area rules-hashing
+  python3 docs/_tools/entries.py --write --area rules-compression
+  python3 docs/_tools/entries.py --check --area rules-compression
 Coverage prints items, verified, failed per area.
 """
 import argparse
@@ -1601,6 +1603,141 @@ def render_rules_hashing_page():
     return "\n".join(out) + "\n"
 
 
+# Display order of the DX2-011 function entries (compression).
+RULES_COMPRESSION_FUNCTIONS = [
+    "zip",
+    "unzip",
+    "gzip",
+    "gunzip",
+    "zip_compress",
+    "zip_uncompress",
+    "lz4_compress",
+    "lz4_uncompress",
+]
+
+# One signature line per DX2-011 stem, taken from the broker code.
+RULES_COMPRESSION_SYNTAX = {
+    "fn-zip": "`zip(<v>)`",
+    "fn-unzip": "`unzip(<s>)`",
+    "fn-gzip": "`gzip(<v>)`",
+    "fn-gunzip": "`gunzip(<s>)`",
+    "fn-zip_compress": "`zip_compress(<v>)`",
+    "fn-zip_uncompress": "`zip_uncompress(<s>)`",
+    "fn-lz4_compress": "`lz4_compress(<v>)`",
+    "fn-lz4_uncompress": "`lz4_uncompress(<s>)`",
+}
+
+# Extra note lines per DX2-011 stem. Each states an observed limit.
+RULES_COMPRESSION_NOTES = {
+    "fn-zip": [
+        "The result is base64 text of the zlib bytes. Decode it with `unzip(<s>)`.",
+        "An input above one mebibyte reads as null. A wrong argument count returns null.",
+    ],
+    "fn-unzip": [
+        "The call accepts base64 text first and raw bytes next. A base64 string of zlib bytes returns the source text.",
+        "Bad bytes, non-text bytes, and an output above one mebibyte return null. A wrong argument count returns null.",
+    ],
+    "fn-gzip": [
+        "The result is base64 text of the gzip bytes. Decode it with `gunzip(<s>)`.",
+        "An input above one mebibyte reads as null. A wrong argument count returns null.",
+    ],
+    "fn-gunzip": [
+        "The call accepts base64 text first and raw bytes next. A base64 string of gzip bytes returns the source text.",
+        "Bad bytes, non-text bytes, and an output above one mebibyte return null. A wrong argument count returns null.",
+    ],
+    "fn-zip_compress": [
+        "The call is an alias of `zip(<v>)`. The wire form is the same base64 zlib text.",
+        "An input above one mebibyte reads as null. A wrong argument count returns null.",
+    ],
+    "fn-zip_uncompress": [
+        "The call is an alias of `unzip(<s>)`. It accepts base64 text first and raw bytes next.",
+        "Bad bytes, non-text bytes, and an output above one mebibyte return null. A wrong argument count returns null.",
+    ],
+    "fn-lz4_compress": [
+        "The result is base64 text of the LZ4 frame bytes. Decode it with `lz4_uncompress(<s>)`.",
+        "An input above one mebibyte reads as null. A wrong argument count returns null.",
+    ],
+    "fn-lz4_uncompress": [
+        "The call accepts base64 text first and raw bytes next. An empty input reads as null.",
+        "Bad bytes, non-text bytes, and an output above one mebibyte return null. A wrong argument count returns null.",
+    ],
+}
+
+
+def render_rules_compression_page():
+    """Render the compression function page (DX2-011)."""
+    out = [
+        "---",
+        "title: Rule functions: compression",
+        "description: Verified entries for the compression functions.",
+        "sidebar:",
+        "  order: 52",
+        "---",
+        "",
+        "# Rule functions: compression",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "A compression function shrinks a value for transport and restores "
+        "it on read. Use this page when a rule must pack a field before it "
+        "forwards it. You get one entry per function, each with a run "
+        "against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Txt["text value"] -- "zip or gzip or lz4_compress" --> B64["base64 bytes"]',
+                '    B64 -- "unzip or gunzip or lz4_uncompress" --> Back["source text"]',
+                '    B64 -- "SELECT AS" --> Sel["result column"]',
+                '    Back -- "SELECT AS" --> Sel',
+                '    Sel -- "republish action" --> Out["out/topic"]',
+            ]
+        ),
+        "",
+        "A wrong argument count reads as null. A value the call cannot "
+        "use reads as null. A null value never stops the rule. Each "
+        "compress call returns base64 text. Each expand call returns text.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v1/rules/test`.",
+        "",
+        "## Functions",
+        "",
+        "| Function | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_COMPRESSION_FUNCTIONS:
+        stem = rules_stem("function", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` packs a value."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Functions in detail", ""]
+    for name in RULES_COMPRESSION_FUNCTIONS:
+        out += render_rule_function_entry(
+            name,
+            rules_stem("function", name),
+            RULES_COMPRESSION_SYNTAX,
+            RULES_COMPRESSION_NOTES,
+            "`{name}` packs a value.",
+        )
+    out += [
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- See every function in [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -1865,6 +2002,32 @@ def main(argv):
                 )
                 return 1
             print("entries match: docs/rules/functions-hashing.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-compression":
+        fresh = render_rules_compression_page()
+        path = ROOT / "docs" / "rules" / "functions-compression.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print(
+                    "drift: docs/rules/functions-compression.md is missing: "
+                    "run --write"
+                )
+                return 1
+            if have != fresh:
+                print(
+                    "drift: docs/rules/functions-compression.md differs: "
+                    "run --write"
+                )
+                return 1
+            print("entries match: docs/rules/functions-compression.md")
             return 0
         parser.print_help()
         return 2

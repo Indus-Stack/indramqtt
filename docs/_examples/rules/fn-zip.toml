@@ -1,0 +1,25 @@
+[example]
+area = "rules"
+item = "fn-zip"
+kind = "rule-test"
+
+[[case]]
+sql = "SELECT unzip(zip('hello zip')) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": "hello zip"}'
+
+[[case]]
+sql = "SELECT zip(NULL) AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
+
+[[case]]
+sql = "SELECT zip() AS v FROM \"sensors/+\""
+topic = "sensors/kitchen"
+payload = '{"temperature": 72.5}'
+expect_matched = true
+expect_projected = '{"v": null}'
