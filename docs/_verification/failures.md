@@ -103,6 +103,14 @@ flowchart LR
 - Broker gave: 201 on creation (or 400 naming the `couchbase` feature without the feature build). No document reached a cluster. No cluster ran in the docs run.
 - State: not verified.
 
+### GCP IoT send path (2026-11-05)
+
+- Item: `gcp_iot` connector send path.
+- Input: `POST /api/v1/connectors` with `project_id` `my-iot-project`, `device_id` `edge-7`, then a publish through a forwarding rule.
+- Expected from: the GCP IoT page of this documentation.
+- Broker gave: 201 on creation (or 400 naming the `gcp_iot` feature without the feature build). No telemetry reached an endpoint. No endpoint ran in the docs run.
+- State: not verified.
+
 ## Rule function evaluation records (DOC-04)
 
 ### Function call shapes (2026-10-15)
@@ -281,5 +289,12 @@ areas. Their counts come from `entries.py --coverage`.
 
 - Input: `python3 docs/_tools/verify.py --area connectors --item couchbase` with `COUCHBASE_URL`, `COUCHBASE_USERNAME`, `COUCHBASE_PASSWORD`, `COUCHBASE_BUCKET` from a real server.
 - Expected: the docs run writes `docs/_verified/connectors/couchbase.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-05.
+
+## DX2-020 item `gcp_iot`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item gcp_iot` with `GCP_IOT_MQTT_URL`, `GCP_IOT_PRIVATE_KEY_FILE` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/gcp_iot.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-05.

@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019).
+# Qual mapping for connectors (DX2-019, DX2-020).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -733,11 +733,25 @@ CONNECTOR_QUALS = {
             "COUCHBASE_PASSWORD",
             "COUCHBASE_BUCKET",
         ],
+        "feature": "couchbase",
+        "timeout": 2400,
+        "markers": ["qual rows asserted", "qual expiry asserted"],
+    },
+    "gcp_iot": {
+        "crate": "broker-connectors-enterprise",
+        "test": "gcp_iot::tests::test_qualify_tls_write_path",
+        "env": [
+            "GCP_IOT_MQTT_URL",
+            "GCP_IOT_PRIVATE_KEY_FILE",
+        ],
+        "feature": "gcp_iot",
+        "timeout": 1800,
+        "markers": ["qual rows asserted"],
     },
 }
 
-# Timeout for the qual subprocess (secs).
-# 2400 secs matches QUAL-TIMEOUT in the DX2-019 ticket.
+# Default timeout for the qual subprocess (secs).
+# Each entry above overrides it with its ticket QUAL-TIMEOUT.
 QUAL_TIMEOUT_SECS = 2400
 
 
@@ -752,13 +766,15 @@ def run_connectors_item(item, write):
             raise SystemExit(
                 f"qual {name} must be set for qualification; failing closed"
             )
+    feature = spec.get("feature", item)
+    timeout = int(spec.get("timeout", QUAL_TIMEOUT_SECS))
     cmd = [
         "cargo",
         "test",
         "-p",
         spec["crate"],
         "--features",
-        "couchbase",
+        feature,
         "--lib",
         spec["test"],
         "--",
@@ -773,10 +789,10 @@ def run_connectors_item(item, write):
             cwd=str(ROOT),
             capture_output=True,
             text=True,
-            timeout=QUAL_TIMEOUT_SECS,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        print(f"qual {item} timed out after {QUAL_TIMEOUT_SECS} secs")
+        print(f"qual {item} timed out after {timeout} secs")
         return 1
     out = (proc.stdout + proc.stderr)[-20000:]
     print(out)
@@ -794,7 +810,8 @@ def run_connectors_item(item, write):
         print("qual failed: no test passed")
         return 1
     # The qual test proves the broker rule path. Require its markers.
-    if "qual rows asserted" not in out or "qual expiry asserted" not in out:
+    markers = spec.get("markers", ["qual rows asserted"])
+    if any(m not in out for m in markers):
         print(f"area=connectors items=1 verified=0 failed=1")
         print("qual failed: broker rule path proof is missing")
         return 1
