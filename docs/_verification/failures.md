@@ -111,6 +111,14 @@ flowchart LR
 - Broker gave: 201 on creation (or 400 naming the `gcp_iot` feature without the feature build). No telemetry reached an endpoint. No endpoint ran in the docs run.
 - State: not verified.
 
+### GCP Pub/Sub send path (2026-11-05)
+
+- Item: `gcp_pubsub` connector send path.
+- Input: `POST /api/v1/connectors` with `project_id` `my-iot-project`, `topic_id` `telemetry-events`, then a publish through a forwarding rule.
+- Expected from: the GCP Pub/Sub page of this documentation.
+- Broker gave: 201 on creation (or 400 naming the `gcp_pubsub` feature without the feature build). No message reached a topic. No server ran in the docs run.
+- State: not verified.
+
 ## Rule function evaluation records (DOC-04)
 
 ### Function call shapes (2026-10-15)
@@ -296,5 +304,12 @@ areas. Their counts come from `entries.py --coverage`.
 
 - Input: `python3 docs/_tools/verify.py --area connectors --item gcp_iot` with `GCP_IOT_MQTT_URL`, `GCP_IOT_PRIVATE_KEY_FILE` from a real server.
 - Expected: the docs run writes `docs/_verified/connectors/gcp_iot.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-05.
+
+## DX2-021 item `gcp_pubsub`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item gcp_pubsub` with `PUBSUB_EMULATOR_HOST`, `PUBSUB_PROJECT`, `PUBSUB_TOPIC`, `PUBSUB_SUBSCRIPTION` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/gcp_pubsub.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-05.

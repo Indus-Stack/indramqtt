@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019, DX2-020).
+# Qual mapping for connectors (DX2-019, DX2-020, DX2-021).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -745,6 +745,19 @@ CONNECTOR_QUALS = {
             "GCP_IOT_PRIVATE_KEY_FILE",
         ],
         "feature": "gcp_iot",
+        "timeout": 1800,
+        "markers": ["qual rows asserted"],
+    },
+    "gcp_pubsub": {
+        "crate": "broker-connectors-enterprise",
+        "test": "gcp_pubsub::tests::test_qualify_driver_write_path",
+        "env": [
+            "PUBSUB_EMULATOR_HOST",
+            "PUBSUB_PROJECT",
+            "PUBSUB_TOPIC",
+            "PUBSUB_SUBSCRIPTION",
+        ],
+        "feature": "gcp_pubsub",
         "timeout": 1800,
         "markers": ["qual rows asserted"],
     },
