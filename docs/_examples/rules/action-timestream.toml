@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-timestream"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-timestream"
+type = "timestream"
+expect_status = 201
+expect_type = "timestream"
+
+[[case]]
+name = "dx2-action-timestream"
+type = "timestream"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

@@ -87,7 +87,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `rules/actions.md` | 64 | `delivered` |
 | `rules/functions.md` | 506 | `ok` |
 | `rules/functions.md` | 531 | `ok` |
-| `rules/index.md` | 76 | `OK` |
+| `rules/index.md` | 77 | `OK` |
 | `rules/sql.md` | 197 | `matched<br>unmatched` |
 | `security/audit-log.md` | 53 | `ok` |
 | `security/audit-log.md` | 65 | `200` |

@@ -551,6 +551,33 @@ DX2_016_ITEMS = {
 }
 
 
+# Rule action stems owned by DX2-017 (actions C: oracle to webhook).
+DX2_017_ITEMS = {
+    "action-oracle",
+    "action-pgsql",
+    "action-postgres",
+    "action-pulsar",
+    "action-rabbitmq",
+    "action-redis",
+    "action-redshift",
+    "action-rocketmq",
+    "action-s3",
+    "action-s3_tables",
+    "action-s3tables",
+    "action-snowflake",
+    "action-snowflake_streaming",
+    "action-sparkplug_b",
+    "action-sqlserver",
+    "action-tablestore",
+    "action-tdengine",
+    "action-test",
+    "action-timescale",
+    "action-timescaledb",
+    "action-timestream",
+    "action-webhook",
+}
+
+
 def verify_action_create(ex, broker):
     """Create one action through the management API. Return (ok, record)."""
     if broker is None:
@@ -626,6 +653,8 @@ def failure_marker(item):
         return "DX2-015"
     if item in DX2_016_ITEMS:
         return "DX2-016"
+    if item in DX2_017_ITEMS:
+        return "DX2-017"
     return "DX-01"
 
 

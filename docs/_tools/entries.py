@@ -16,9 +16,11 @@ Standard library only. Run from the workspace root:
   python3 docs/_tools/entries.py --coverage --area rules
    python3 docs/_tools/entries.py --write --area rules-actions-a
    python3 docs/_tools/entries.py --check --area rules-actions-a
-   python3 docs/_tools/entries.py --write --area rules-actions-b
-   python3 docs/_tools/entries.py --check --area rules-actions-b
-  python3 docs/_tools/entries.py --write --area rules-functions
+    python3 docs/_tools/entries.py --write --area rules-actions-b
+    python3 docs/_tools/entries.py --check --area rules-actions-b
+    python3 docs/_tools/entries.py --write --area rules-actions-c
+    python3 docs/_tools/entries.py --check --area rules-actions-c
+   python3 docs/_tools/entries.py --write --area rules-functions
   python3 docs/_tools/entries.py --check --area rules-functions
   python3 docs/_tools/entries.py --write --area rules-math-bitwise
   python3 docs/_tools/entries.py --write --area rules-bits-bytes
@@ -2445,6 +2447,253 @@ def render_rules_actions_b_page():
     return "\n".join(out) + "\n"
 
 
+# Display order of the DX2-017 action entries (actions C).
+RULES_ACTIONS_C = [
+    "oracle",
+    "pgsql",
+    "postgres",
+    "pulsar",
+    "rabbitmq",
+    "redis",
+    "redshift",
+    "rocketmq",
+    "s3",
+    "s3_tables",
+    "s3tables",
+    "snowflake",
+    "snowflake_streaming",
+    "sparkplug_b",
+    "sqlserver",
+    "tablestore",
+    "tdengine",
+    "test",
+    "timescale",
+    "timescaledb",
+    "timestream",
+    "webhook",
+]
+
+# One signature line per DX2-017 stem: the verified management call.
+RULES_ACTIONS_C_SYNTAX = {
+    rules_stem("action", name): (
+        f"`POST /api/v5/actions` with "
+        f"`{{\"type\": \"{name}\", \"name\": \"<id>\"}}`"
+    )
+    for name in RULES_ACTIONS_C
+}
+
+# Extra note lines per DX2-017 stem. Each states an observed fact.
+RULES_ACTIONS_C_NOTES = {
+    "action-oracle": [
+        "The type catalogue lists this name.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-pgsql": [
+        "The type catalogue lists this name.",
+        "The connector config names `server`, `database`, `username` and `password`.",
+        "The historic name `postgres` runs on the same runtime.",
+        "The tier is community.",
+    ],
+    "action-postgres": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `pgsql` for the same runtime.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is community.",
+    ],
+    "action-pulsar": [
+        "The type catalogue lists this name.",
+        "The connector config names `service_url` and `topic`.",
+        "The tier is enterprise.",
+    ],
+    "action-rabbitmq": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint`, `exchange` and `routing_key`.",
+        "The tier is community.",
+    ],
+    "action-redis": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint` and `key`.",
+        "The tier is community.",
+    ],
+    "action-redshift": [
+        "The type catalogue lists this name.",
+        "The connector config names `url`, `table`, `user` and `password`.",
+        "The tier is enterprise.",
+    ],
+    "action-rocketmq": [
+        "The type catalogue lists this name.",
+        "The connector config names `name_server` and `topic`.",
+        "The tier is enterprise.",
+    ],
+    "action-s3": [
+        "The type catalogue lists this name.",
+        "The connector config names `bucket`, `region` and `key_template`.",
+        "The tier is community.",
+    ],
+    "action-s3_tables": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `s3tables` for the same runtime.",
+        "The connector config names `table_bucket_arn` and `table_name`.",
+        "The tier is enterprise.",
+    ],
+    "action-s3tables": [
+        "The type catalogue lists this name. It is the console name for the `s3_tables` runtime.",
+        "The connector config names `table_bucket_arn` and `table_name`.",
+        "The tier is enterprise.",
+    ],
+    "action-snowflake": [
+        "The type catalogue lists this name.",
+        "The connector config names `account`, `database` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-snowflake_streaming": [
+        "The type catalogue lists this name. It is the console name for the `snowflake` runtime.",
+        "The connector config names `account`, `database` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-sparkplug_b": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The connector config names `group_id`, `edge_node_id` and `device_id`.",
+        "The tier is enterprise.",
+    ],
+    "action-sqlserver": [
+        "The type catalogue lists this name. It is the console name for the `mssql` runtime.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-tablestore": [
+        "The type catalogue lists this name.",
+        "The connector config names `endpoint`, `instance` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-tdengine": [
+        "The type catalogue lists this name.",
+        "The connector config names `url`, `database` and `table`.",
+        "The tier is enterprise.",
+    ],
+    "action-test": [
+        "The type catalogue omits this name. The action store rejects it.",
+        "It is a unit-test helper with no send path. Use `console` for the log path.",
+    ],
+    "action-timescale": [
+        "The type catalogue lists this name. It is the console name for the `timescaledb` runtime.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is community.",
+    ],
+    "action-timescaledb": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `timescale` for the same runtime.",
+        "The connector config names `connection_url` and `table`.",
+        "The tier is community.",
+    ],
+    "action-timestream": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `aws_timestream` for the same runtime.",
+        "The connector config names `database`, `table` and `region`.",
+        "The tier is enterprise.",
+    ],
+    "action-webhook": [
+        "The type catalogue omits this name. The store still accepts it.",
+        "The console sends `http` for the same runtime.",
+        "The connector config names `url`.",
+        "The tier is community.",
+    ],
+}
+
+
+def render_rules_actions_c_page():
+    """Render the rule actions C page (DX2-017)."""
+    out = [
+        "---",
+        "title: Rule actions C: oracle to webhook",
+        "description: Verified entries for each rule action from oracle to webhook.",
+        "sidebar:",
+        "  order: 56",
+        "---",
+        "",
+        "# Rule actions C: oracle to webhook",
+        "",
+        GENERATED,
+        "",
+        gen.POSITIONING,
+        "",
+        "An action sends each result row to a backend. You create it "
+        "through the management API and you point a rule at it. Use this "
+        "page when a rule must reach a relational store, a stream, a "
+        "lake, a warehouse or a webhook. You get one entry per action, "
+        "each with a run against the broker.",
+        "",
+        gen.mermaid_fence(
+            [
+                "flowchart LR",
+                '    Row["result row"] -- "forward" --> Act["action store"]',
+                '    Act -- "connector id" --> Conn["connector"]',
+                '    Conn -- "batch send" --> Ext["external system"]',
+                '    Row -- "alias create" --> Same["shared runtime"]',
+                '    Same -- "batch send" --> Ext',
+                '    Row -- "webhook" --> Http["HTTP target"]',
+            ]
+        ),
+        "",
+        "Create the connector first, then the action, then the rule. "
+        "A created action reads `connected` when enabled. The broker "
+        "runs no probe behind that status; the status mirrors the "
+        "enable flag. The docs run verifies creation only; no external "
+        "server runs, so no rows reach a backend here.",
+        "",
+        "## Before you start",
+        "",
+        "- Read [Rule SQL](./sql.md) for the query shape.",
+        "- Create each connector before an action names it. See [Connectors](../connectors/index.md).",
+        "- Each entry below ran against the built broker through "
+        "`POST /api/v5/actions`.",
+        "",
+        "## Actions",
+        "",
+        "| Action | What it does |",
+        "|---|---|",
+    ]
+    for name in RULES_ACTIONS_C:
+        stem = rules_stem("action", name)
+        text = read_text("rules", stem)
+        line = next(
+            (part.strip() for part in text.splitlines() if part.strip()), ""
+        ) if text else ""
+        first = line if line else f"`{name}` sends rows out."
+        out.append(f"| `{name}` | {first} |")
+    out += ["", "## Actions in detail", ""]
+    for name in RULES_ACTIONS_C:
+        out += render_rule_action_entry(
+            name,
+            rules_stem("action", name),
+            RULES_ACTIONS_C_SYNTAX,
+            RULES_ACTIONS_C_NOTES,
+        )
+    out += [
+        "## Check that it works",
+        "",
+        "Create one action and read it back:",
+        "",
+        "```sh no-test",
+        "# Needs a live broker and an operator key. Use your own name.",
+        'curl -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\',
+        '  -d \'{"type": "redis", "name": "dx-check"}\' \\',
+        "  http://127.0.0.1:18083/api/v5/actions",
+        "```",
+        "",
+        "The answer is `201` with the stored shape. A second create "
+        "with the same name answers `400` with code `ALREADY_EXISTS`.",
+        "",
+        "## Next steps",
+        "",
+        "- Write the query with [Rule SQL](./sql.md).",
+        "- Shape payloads with [Functions](./functions.md).",
+        "- Send results with [Actions](./actions.md).",
+    ]
+    return "\n".join(out) + "\n"
+
+
 def area_counts(area):
     """Count items, verified and failed of one area."""
     data = json.loads((INVENTORY / (area + ".json")).read_text(encoding="utf-8"))
@@ -2801,6 +3050,26 @@ def main(argv):
                 print("drift: docs/rules/actions-b.md differs: run --write")
                 return 1
             print("entries match: docs/rules/actions-b.md")
+            return 0
+        parser.print_help()
+        return 2
+    if args.area == "rules-actions-c":
+        fresh = render_rules_actions_c_page()
+        path = ROOT / "docs" / "rules" / "actions-c.md"
+        if args.write:
+            path.write_text(fresh, encoding="utf-8")
+            print(f"wrote {path}")
+            return 0
+        if args.check:
+            try:
+                have = path.read_text(encoding="utf-8")
+            except OSError:
+                print("drift: docs/rules/actions-c.md is missing: run --write")
+                return 1
+            if have != fresh:
+                print("drift: docs/rules/actions-c.md differs: run --write")
+                return 1
+            print("entries match: docs/rules/actions-c.md")
             return 0
         parser.print_help()
         return 2

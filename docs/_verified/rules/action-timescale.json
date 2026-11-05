@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "timescale"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-timescale",
+        "name": "dx2-action-timescale",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "timescale"
+      },
+      "name": "dx2-action-timescale",
+      "status": 201,
+      "type": "timescale"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-timescale\" already exists"
+      },
+      "name": "dx2-action-timescale",
+      "status": 400,
+      "type": "timescale"
+    }
+  ],
+  "item": "action-timescale",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

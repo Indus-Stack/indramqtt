@@ -1,0 +1,42 @@
+{
+  "action_types": [
+    "pulsar"
+  ],
+  "cases": [
+    {
+      "body": {
+        "connector": "",
+        "enable": true,
+        "id": "dx2-action-pulsar",
+        "name": "dx2-action-pulsar",
+        "node_status": [
+          {
+            "node": "dxrules@275bfdc54e7c",
+            "status": "connected"
+          }
+        ],
+        "parameters": {},
+        "resource_opts": {},
+        "status": "connected",
+        "type": "pulsar"
+      },
+      "name": "dx2-action-pulsar",
+      "status": 201,
+      "type": "pulsar"
+    },
+    {
+      "body": {
+        "code": "ALREADY_EXISTS",
+        "message": "action \"dx2-action-pulsar\" already exists"
+      },
+      "name": "dx2-action-pulsar",
+      "status": 400,
+      "type": "pulsar"
+    }
+  ],
+  "item": "action-pulsar",
+  "listed_in_action_types": true,
+  "request": "POST /api/v5/actions",
+  "returncode": 0,
+  "verified": true
+}

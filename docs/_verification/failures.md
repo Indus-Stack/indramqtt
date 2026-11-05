@@ -261,3 +261,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the cased create results in the example.
 - Broker gave: `create gcp_pubsub_consumer/dx2-action-gcp_pubsub_consumer gave 400: {'code': 'BAD_REQUEST', 'message': 'unknown action type: gcp_pubsub_consumer'}`.
 - Date: 2026-11-05.
+
+## DX2-017 item `action-test`
+
+- Input: POST /api/v5/actions type `test` name `dx2-action-test` wants 201; POST /api/v5/actions type `test` name `dx2-action-test` wants 400.
+- Expected: the cased create results in the example.
+- Broker gave: `create test/dx2-action-test gave 400: {'code': 'BAD_REQUEST', 'message': 'unknown action type: test'}`.
+- Date: 2026-11-05.

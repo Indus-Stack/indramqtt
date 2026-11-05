@@ -1,0 +1,16 @@
+[example]
+area = "rules"
+item = "action-snowflake"
+kind = "action-create"
+
+[[case]]
+name = "dx2-action-snowflake"
+type = "snowflake"
+expect_status = 201
+expect_type = "snowflake"
+
+[[case]]
+name = "dx2-action-snowflake"
+type = "snowflake"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"
