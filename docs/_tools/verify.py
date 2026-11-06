@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-030).
+# Qual mapping for connectors (DX2-019 through DX2-031).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -870,6 +870,17 @@ CONNECTOR_QUALS = {
         "feature": "opc_ua",
         "timeout": 1800,
         "markers": ["qual rows asserted", "qual fault asserted"],
+    },
+    "opentsdb": {
+        "crate": "broker-connectors",
+        "test": "opentsdb::tests::test_qualify_write_path",
+        "env": [
+            "OPENTSDB_HTTP_URL",
+            "OPENTSDB_TELNET_ADDR",
+            "OPENTSDB_QUERY_URL",
+        ],
+        "timeout": 1800,
+        "markers": ["qual rows asserted"],
     },
 }
 
