@@ -39,7 +39,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/postgres.md` | 82 | `postgres` |
 | `connectors/pulsar.md` | 98 | `pulsar` |
 | `connectors/rabbitmq.md` | 80 | `ok` |
-| `connectors/redis.md` | 81 | `redis` |
+| `connectors/redis.md` | 86 | `redis` |
 | `connectors/s3.md` | 88 | `ok` |
 | `getting-started/console.md` | 48 | `200` |
 | `getting-started/first-publish.md` | 49 | `hello-docs` |
