@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-028).
+# Qual mapping for connectors (DX2-019 through DX2-029).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -842,6 +842,21 @@ CONNECTOR_QUALS = {
             "MSSQL_PASSWORD",
         ],
         "timeout": 2400,
+        "markers": ["qual rows asserted", "qual auth asserted"],
+    },
+    "mysql": {
+        "crate": "broker-connectors",
+        "test": "mysql::tests::test_qualify_driver_write_path",
+        "env": [
+            "MYSQL_HOST",
+            "MYSQL_PORT",
+            "MYSQL_DATABASE",
+            "MYSQL_TABLE",
+            "MYSQL_USER",
+            "MYSQL_PASSWORD",
+            "MYSQL_NATIVE_USER",
+        ],
+        "timeout": 1800,
         "markers": ["qual rows asserted", "qual auth asserted"],
     },
 }

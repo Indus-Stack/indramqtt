@@ -370,3 +370,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/mssql.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-06.
+
+## DX2-029 item `mysql`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item mysql` with `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_TABLE`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_NATIVE_USER` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/mysql.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-06.

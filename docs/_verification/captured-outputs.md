@@ -32,7 +32,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/mongodb.md` | 94 | `ok` |
 | `connectors/mqtt-bridge.md` | 94 | `mqtt_bridge` |
 | `connectors/mssql.md` | 99 | `mssql` |
-| `connectors/mysql.md` | 79 | `mysql` |
+| `connectors/mysql.md` | 82 | `mysql` |
 | `connectors/postgres.md` | 79 | `postgres` |
 | `connectors/redis.md` | 81 | `redis` |
 | `connectors/s3.md` | 88 | `ok` |
