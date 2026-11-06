@@ -356,3 +356,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/mongodb.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-06.
+
+## DX2-027 item `mqtt_bridge`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item mqtt_bridge` with `MQTT_BRIDGE_URL`, `MQTT_BRIDGE_TOPIC`, `MQTT_BRIDGE_CLIENT_ID` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/mqtt_bridge.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-06.

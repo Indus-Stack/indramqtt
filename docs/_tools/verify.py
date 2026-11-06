@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-026).
+# Qual mapping for connectors (DX2-019 through DX2-027).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -818,6 +818,17 @@ CONNECTOR_QUALS = {
         "feature": "mongodb",
         "timeout": 1800,
         "markers": ["qual rows asserted", "qual duplicate-key asserted"],
+    },
+    "mqtt_bridge": {
+        "crate": "broker-connectors",
+        "test": "mqtt_bridge::tests::test_qualify_bridge_write_path",
+        "env": [
+            "MQTT_BRIDGE_URL",
+            "MQTT_BRIDGE_TOPIC",
+            "MQTT_BRIDGE_CLIENT_ID",
+        ],
+        "timeout": 1800,
+        "markers": ["qual rows asserted"],
     },
 }
 
