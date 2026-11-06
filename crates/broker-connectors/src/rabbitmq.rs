@@ -28,6 +28,9 @@ pub struct RabbitMqSinkConfig {
     pub delivery_mode: u8,
 }
 
+/// Longest accepted exchange name in bytes. Reason: AMQP shortstr holds at most 255 bytes.
+const MAX_EXCHANGE_LEN: usize = 255;
+
 impl RabbitMqSinkConfig {
     pub fn validate(&self) -> Result<()> {
         if self.endpoint.trim().is_empty() {
@@ -35,9 +38,11 @@ impl RabbitMqSinkConfig {
                 "rabbitmq endpoint must not be empty".to_string(),
             ));
         }
-        if self.exchange.is_empty() || self.exchange.len() > 255 {
+        // Empty exchange selects the default exchange. The schema sets
+        // the default to empty. See #components/schemas/bridge_rabbitmq.action_parameters.
+        if self.exchange.len() > MAX_EXCHANGE_LEN {
             return Err(ConnectorError::Dispatch(
-                "rabbitmq exchange must be 1..=255 bytes".to_string(),
+                "rabbitmq exchange must be 0..=255 bytes".to_string(),
             ));
         }
         if self.routing_key_template.trim().is_empty() {
@@ -724,7 +729,12 @@ mod tests {
         assert!(config.validate().is_err());
         config.endpoint = "amqp://h".to_string();
 
+        // Empty exchange is valid. It selects the default exchange.
+        // See #components/schemas/bridge_rabbitmq.action_parameters.
+        // Old code refused empty. New code accepts empty.
         config.exchange.clear();
+        assert!(config.validate().is_ok());
+        config.exchange = "e".repeat(256);
         assert!(config.validate().is_err());
         config.exchange = "telemetry".to_string();
 

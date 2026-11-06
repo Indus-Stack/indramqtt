@@ -6383,6 +6383,287 @@ connector_id = "pending-good"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(feature = "rabbitmq")]
+    #[derive(Clone)]
+    struct Dr01RabbitPublished {
+        exchange: String,
+        routing_key: String,
+        body: Vec<u8>,
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    struct Dr01RabbitFake {
+        port: u16,
+        published: Arc<std::sync::Mutex<Vec<Dr01RabbitPublished>>>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    impl Drop for Dr01RabbitFake {
+        fn drop(&mut self) {
+            self._task.abort();
+        }
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    /// Largest fake frame in bytes. Reason: blocks a huge allocation.
+    const DR01_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+    #[cfg(feature = "rabbitmq")]
+    /// Fake poll rounds. Reason: waits 30 seconds for delivery.
+    const DR01_WAIT_ROUNDS: usize = 300;
+    #[cfg(feature = "rabbitmq")]
+    /// Fake poll step in millis. Reason: polls without a busy wait.
+    const DR01_WAIT_STEP_MS: u64 = 100;
+
+    #[cfg(feature = "rabbitmq")]
+    async fn rabbit_fake_send_method(
+        stream: &mut tokio::net::TcpStream,
+        channel: u16,
+        class_id: u16,
+        method_id: u16,
+        args: &[u8],
+    ) {
+        let mut payload = class_id.to_be_bytes().to_vec();
+        payload.extend_from_slice(&method_id.to_be_bytes());
+        payload.extend_from_slice(args);
+        let frame = broker_connectors::rabbitmq::AmqpFrame {
+            frame_type: broker_connectors::rabbitmq::FRAME_METHOD,
+            channel,
+            payload,
+        };
+        stream
+            .write_all(&frame.encode())
+            .await
+            .expect("fake writes a frame");
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    async fn rabbit_fake_read_frame(
+        stream: &mut tokio::net::TcpStream,
+    ) -> Option<(u8, u16, Vec<u8>)> {
+        let mut head = [0u8; 7];
+        if stream.read_exact(&mut head).await.is_err() {
+            return None;
+        }
+        let size = u32::from_be_bytes([head[3], head[4], head[5], head[6]]) as usize;
+        if size > DR01_MAX_FRAME_BYTES {
+            return None;
+        }
+        let mut payload = vec![0u8; size];
+        if stream.read_exact(&mut payload).await.is_err() {
+            return None;
+        }
+        let mut end = [0u8; 1];
+        if stream.read_exact(&mut end).await.is_err() {
+            return None;
+        }
+        if end[0] != broker_connectors::rabbitmq::FRAME_END {
+            return None;
+        }
+        let channel = u16::from_be_bytes([head[1], head[2]]);
+        Some((head[0], channel, payload))
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    async fn rabbit_fake_read_method(
+        stream: &mut tokio::net::TcpStream,
+    ) -> Option<(u16, (u16, u16), Vec<u8>)> {
+        let (frame_type, channel, payload) = rabbit_fake_read_frame(stream).await?;
+        if frame_type != broker_connectors::rabbitmq::FRAME_METHOD || payload.len() < 4 {
+            return None;
+        }
+        let class_id = u16::from_be_bytes([payload[0], payload[1]]);
+        let method_id = u16::from_be_bytes([payload[2], payload[3]]);
+        Some((channel, (class_id, method_id), payload[4..].to_vec()))
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    fn rabbit_fake_longstr(text: &[u8]) -> Vec<u8> {
+        let mut out = (text.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(text);
+        out
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    fn rabbit_fake_parse_publish(args: &[u8]) -> Option<(String, String)> {
+        if args.len() < 4 {
+            return None;
+        }
+        let mut pos = 2;
+        let exchange_len = *args.get(pos)? as usize;
+        pos += 1;
+        let exchange = std::str::from_utf8(args.get(pos..pos + exchange_len)?)
+            .ok()?
+            .to_string();
+        pos += exchange_len;
+        let key_len = *args.get(pos)? as usize;
+        pos += 1;
+        let routing_key = std::str::from_utf8(args.get(pos..pos + key_len)?)
+            .ok()?
+            .to_string();
+        Some((exchange, routing_key))
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    async fn dr01_handshake(stream: &mut tokio::net::TcpStream) -> Option<()> {
+        let mut header = [0u8; 8];
+        if stream.read_exact(&mut header).await.is_err() {
+            return None;
+        }
+        if &header != b"AMQP\x00\x00\x09\x01" {
+            return None;
+        }
+        let mut start = vec![0u8, 9];
+        start.extend_from_slice(&0u32.to_be_bytes());
+        start.extend_from_slice(&rabbit_fake_longstr(b"PLAIN"));
+        start.extend_from_slice(&rabbit_fake_longstr(b"en_US"));
+        rabbit_fake_send_method(stream, 0, 10, 10, &start).await;
+        let (_, method, args) = rabbit_fake_read_method(stream).await?;
+        if method != (10, 11) {
+            return None;
+        }
+        if !args.windows(5).any(|w| w == b"PLAIN") {
+            return None;
+        }
+        // Tune bounds the connection. Reason: frame-max 0 means no limit and the driver allocates 32 frames, which exhausts memory. RabbitMQ uses 131072.
+        let tune: &[u8] = &[0x07, 0xFF, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00];
+        rabbit_fake_send_method(stream, 0, 10, 30, tune).await;
+        let _ = rabbit_fake_read_method(stream).await?;
+        let (_, method, _) = rabbit_fake_read_method(stream).await?;
+        if method != (10, 40) {
+            return None;
+        }
+        // Open-Ok carries a short string. Reason: the driver parses one short string.
+        rabbit_fake_send_method(stream, 0, 10, 41, &[0x00]).await;
+        let (channel, method, _) = rabbit_fake_read_method(stream).await?;
+        if method != (20, 10) {
+            return None;
+        }
+        // Channel Open-Ok carries a long string. Reason: the driver parses one long string.
+        rabbit_fake_send_method(stream, channel, 20, 11, &[0x00, 0x00, 0x00, 0x00]).await;
+        Some(())
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    async fn dr01_read_publish(stream: &mut tokio::net::TcpStream) -> Option<Dr01RabbitPublished> {
+        // Publish triple: capture the method, header and
+        // body frames. This matches the loopback fake pattern.
+        // One triple proves delivery with the exact routing key.
+        let (_, method, args) = rabbit_fake_read_method(stream).await?;
+        if method != (60, 40) {
+            return None;
+        }
+        let (exchange, routing_key) = rabbit_fake_parse_publish(&args)?;
+        let (header_type, _, _) = rabbit_fake_read_frame(stream).await?;
+        if header_type != 2 {
+            return None;
+        }
+        let (body_type, _, body) = rabbit_fake_read_frame(stream).await?;
+        if body_type != 3 {
+            return None;
+        }
+        Some(Dr01RabbitPublished {
+            exchange,
+            routing_key,
+            body,
+        })
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    impl Dr01RabbitFake {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake");
+            Self::serve(listener).await
+        }
+
+        async fn serve(listener: tokio::net::TcpListener) -> Self {
+            let port = listener.local_addr().expect("fake addr").port();
+            let published = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_published = Arc::clone(&published);
+            // Single accept and single publish. Reason: the test
+            // publishes once, so one handshake and one triple prove
+            // delivery. A single task keeps the future small.
+            let task = tokio::spawn(async move {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                if dr01_handshake(&mut stream).await.is_none() {
+                    return;
+                }
+                let Some(item) = dr01_read_publish(&mut stream).await else {
+                    return;
+                };
+                task_published.lock().expect("fake records").push(item);
+            });
+            Self {
+                port,
+                published,
+                _task: task,
+            }
+        }
+
+        async fn wait_for(&self, count: usize) -> Vec<Dr01RabbitPublished> {
+            for _ in 0..DR01_WAIT_ROUNDS {
+                let got = self.published.lock().expect("fake reads").clone();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(DR01_WAIT_STEP_MS)).await;
+            }
+            panic!(
+                "rabbit fake got {} publishes, wanted {count}",
+                self.published.lock().expect("fake reads").len()
+            );
+        }
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    #[tokio::test]
+    async fn dr01_rabbitmq_default_exchange_delivers_through_the_broker() {
+        // Empty exchange selects the default exchange.
+        // See #components/schemas/bridge_rabbitmq.action_parameters.
+        // The v1 entries accept rabbitmq while the kind is pending,
+        // so the test delivers through the broker now.
+        let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
+        let dir = unique_data_dir("dr01-rabbit");
+        let registry = Arc::new(ConfigRegistry::load(&dir).expect("fresh data dir loads defaults"));
+        let fake = Dr01RabbitFake::start().await;
+        let (server, _state) = TestServer::start_with_registry(Arc::clone(&registry)).await;
+        let token = server.login_as_admin().await;
+        let endpoint = format!("amqp://u:p@127.0.0.1:{}/%2f", fake.port);
+        let (status, _) = server
+            .post_auth(
+                "/api/v1/connectors",
+                json!({"id": "dr01-rb", "kind": "rabbitmq",
+                       "config": {"endpoint": endpoint, "exchange": "",
+                                  "routing_key_template": "dr01queue.${topic}",
+                                  "delivery_mode": 2}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v1/rules",
+                json!({"name": "dr01-rb-rule", "topic_filter": "dr01/rabbit",
+                       "actions": [{"type": "forwardconnector",
+                                    "connector_id": "dr01-rb"}]}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        mv02b_publish(&server, &token, "dr01/rabbit", "{\"v\":1}").await;
+        let got = fake.wait_for(1).await;
+        assert!(got[0].exchange.is_empty(), "default exchange is empty");
+        assert_eq!(got[0].routing_key, "dr01queue.dr01.rabbit");
+        assert_eq!(got[0].body, b"{\"v\":1}", "payload reaches the server");
+        drop(server);
+        drop(registry);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn mv02b_influxdb_escapes_specials_through_the_broker() {
         let _connector_guard = CONNECTOR_TEST_SERIAL.lock().await;
@@ -18813,15 +19094,15 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         }
 
         // Unknown kinds and invalid configs are 400s that store nothing.
+        // Empty exchange is valid. It selects the default exchange.
+        // See #components/schemas/bridge_rabbitmq.action_parameters.
+        // Old code refused empty exchange with 400. New code accepts it.
         for payload in [
             json!({"id": "x", "kind": "pigeon", "config": {}}),
             json!({"id": "", "kind": "logger", "config": {}}),
             json!({"id": "bad-k", "kind": "kafka",
                    "config": {"bootstrap_servers": "", "topic_template": "t",
                               "client_id": "c", "acks": "all"}}),
-            json!({"id": "bad-r", "kind": "rabbitmq",
-                   "config": {"endpoint": "amqp://h", "exchange": "",
-                              "routing_key_template": "k", "delivery_mode": 2}}),
             json!({"id": "bad-pg", "kind": "postgres",
                    "config": {"connection_url": "postgresql://h/db",
                               "sql_template": "INSERT INTO t VALUES ($9)"}}),

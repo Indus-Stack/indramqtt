@@ -419,6 +419,7 @@ pub(crate) fn canonical_action_kind(kind: &str) -> &str {
         "minio" => "s3",
         "azure_blob_storage" => "azure_blob",
         "dynamo" | "ddb" => "dynamodb",
+        "rabbit" | "amqp" => "rabbitmq",
         "bq" | "gbq" => "bigquery",
         "snowflake_streaming" | "snowflake_aggregated" => "snowflake",
         "ots" => "tablestore",
@@ -466,6 +467,7 @@ pub(crate) fn action_owned_kind(kind: &str) -> bool {
             | "disk_log"
             | "snowflake"
             | "tablestore"
+            | "rabbitmq"
     )
 }
 
@@ -1310,6 +1312,7 @@ pub(crate) fn build_action_sink_with_dir(
         "s3" => build_s3_object_sink(record, connector_doc, opts).map(Some),
         "azure_blob" => build_azure_blob_sink(record, connector_doc, opts).map(Some),
         "dynamodb" => build_dynamodb_action_sink(record, connector_doc, opts).map(Some),
+        "rabbitmq" => build_rabbitmq_sink(record, connector_doc).map(Some),
         "bigquery" => build_bigquery_sink(record, connector_doc, opts).map(Some),
         "disk_log" => build_disk_log_action_sink_with_dir(record, connector_doc, data_dir, opts)
             .map(|sink| Some(sink as Arc<dyn broker_connectors::Sink>)),
@@ -4672,6 +4675,135 @@ pub(crate) fn build_dynamodb_action_sink(
 ) -> Result<Arc<dyn broker_connectors::Sink>, String> {
     Err(format!(
         "action {:?} needs cargo feature `dynamodb` (disabled in this build)",
+        record.id
+    ))
+}
+
+/// Default delivery mode. Reason: the reference action default is non-persistent.
+#[cfg(feature = "rabbitmq")]
+const RABBITMQ_NON_PERSISTENT: u8 = 1;
+/// Durable delivery mode. Reason: the reference action names persistent as durable.
+#[cfg(feature = "rabbitmq")]
+const RABBITMQ_PERSISTENT: u8 = 2;
+
+/// Build the action's `rabbitmq` config. The connection comes from
+/// the connector. The exchange and routing key come from the action.
+///
+/// Values and defaults:
+/// - `servers`: the connector target. It is required. It has no default.
+/// - `username` and `password`: the connector pair. Each defaults to `guest`.
+/// - `exchange`: the action exchange. Empty selects the default exchange.
+/// - `routing_key`: the action template. It is required. Slashes become dots.
+/// - `delivery_mode`: `persistent` writes durable. Default is non-persistent.
+///
+/// Empty exchange is valid. See #components/schemas/bridge_rabbitmq.action_parameters.
+#[cfg(feature = "rabbitmq")]
+pub(crate) fn rabbitmq_sink_config(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<broker_connectors::rabbitmq::RabbitMqSinkConfig, String> {
+    let connector = record.connector.trim().to_string();
+    let servers = first_string(connector_doc, &["servers", "server", "endpoint"])
+        .map(|value| value.into_owned())
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: servers (action {:?})",
+                record.id
+            )
+        })?;
+    let username = first_string(connector_doc, &["username", "user"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "guest".to_string());
+    let password = first_string(connector_doc, &["password", "pass"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "guest".to_string());
+    let endpoint = if servers.trim().starts_with("amqp://") {
+        servers.trim().to_string()
+    } else {
+        format!(
+            "amqp://{username}:{password}@{}/%2f",
+            servers.trim().trim_end_matches('/')
+        )
+    };
+    let routing_key = param_string(record, "routing_key")
+        .or_else(|| param_string(record, "routing_key_template"))
+        .ok_or_else(|| {
+            format!(
+                "action {:?} is missing required field: routing_key (field `parameters.routing_key`)",
+                record.id
+            )
+        })?;
+    let delivery_mode = match param_value(record, "delivery_mode") {
+        None => RABBITMQ_NON_PERSISTENT,
+        Some(serde_json::Value::Number(value)) => match value.as_u64() {
+            Some(1) => RABBITMQ_NON_PERSISTENT,
+            Some(2) => RABBITMQ_PERSISTENT,
+            _ => {
+                return Err(format!(
+                    "action {:?} field `parameters.delivery_mode` must be one of non_persistent, persistent",
+                    record.id
+                ));
+            }
+        },
+        Some(serde_json::Value::String(text)) => match text.trim() {
+            "non_persistent" | "1" => RABBITMQ_NON_PERSISTENT,
+            "persistent" | "2" => RABBITMQ_PERSISTENT,
+            _ => {
+                return Err(format!(
+                    "action {:?} field `parameters.delivery_mode` must be one of non_persistent, persistent",
+                    record.id
+                ));
+            }
+        },
+        Some(_) => {
+            return Err(format!(
+                "action {:?} field `parameters.delivery_mode` must be one of non_persistent, persistent",
+                record.id
+            ));
+        }
+    };
+    Ok(broker_connectors::rabbitmq::RabbitMqSinkConfig {
+        endpoint,
+        exchange: param_string(record, "exchange").unwrap_or_default(),
+        routing_key_template: routing_key,
+        delivery_mode,
+    })
+}
+
+/// Build the action's `rabbitmq` sink from its config. The config
+/// carries the applied defaults. The transport and sink add no values.
+#[cfg(feature = "rabbitmq")]
+pub(crate) fn build_rabbitmq_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors::rabbitmq::{LapinRabbitTransport, RabbitMqSink};
+    let config = rabbitmq_sink_config(record, connector_doc)?;
+    let transport = LapinRabbitTransport::new(&config.endpoint).map_err(|error| {
+        format!(
+            "action {:?} cannot build its rabbitmq transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = RabbitMqSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its rabbitmq sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// The default build compiles the RabbitMQ driver out. The kind is
+/// known but the runtime is absent. The build fails closed and names
+/// the missing feature.
+#[cfg(not(feature = "rabbitmq"))]
+pub(crate) fn build_rabbitmq_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `rabbitmq` (disabled in this build)",
         record.id
     ))
 }
@@ -8184,6 +8316,34 @@ mod tests {
         let sink = build_tablestore_sink(&rec, &doc, &ActionResourceOpts::default())
             .expect("a full tablestore pair builds");
         assert_eq!(sink.kind(), "tablestore");
+    }
+
+    #[cfg(feature = "rabbitmq")]
+    #[tokio::test]
+    async fn rabbitmq_sink_builds_with_empty_exchange_for_default_exchange() {
+        // Empty exchange selects the default exchange.
+        // See #components/schemas/bridge_rabbitmq.action_parameters.
+        let rec = mv02b_record(
+            "act",
+            "rabbitmq",
+            "rabbitmq:up",
+            serde_json::json!({"routing_key": "queue.${topic}"}),
+        );
+        let doc = serde_json::json!({
+            "servers": "127.0.0.1:5672",
+            "username": "u",
+            "password": "p",
+        });
+        let config = rabbitmq_sink_config(&rec, &doc).expect("empty exchange builds a config");
+        assert_eq!(config.exchange, "");
+        assert_eq!(config.routing_key_template, "queue.${topic}");
+        let sink = build_rabbitmq_sink(&rec, &doc).expect("empty exchange builds a sink");
+        assert_eq!(sink.kind(), "rabbitmq");
+        let bare = mv02b_record("act", "rabbitmq", "rabbitmq:up", serde_json::json!({}));
+        let error = build_rabbitmq_sink(&bare, &doc)
+            .err()
+            .expect("a missing routing key refuses");
+        assert!(error.contains("routing_key"), "{error}");
     }
 
     #[tokio::test]
