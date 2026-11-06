@@ -363,3 +363,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/mqtt_bridge.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-06.
+
+## DX2-028 item `mssql`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item mssql` with `MSSQL_HOST`, `MSSQL_PORT`, `MSSQL_DATABASE`, `MSSQL_TABLE`, `MSSQL_USER`, `MSSQL_PASSWORD` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/mssql.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-06.
