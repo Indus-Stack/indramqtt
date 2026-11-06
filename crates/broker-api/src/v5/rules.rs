@@ -1775,6 +1775,11 @@ static CONNECTOR_GATES: &[ConnectorGate] = &[
         feature: "gcp_iot",
         enabled: cfg!(feature = "gcp_iot"),
     },
+    ConnectorGate {
+        kinds: &["opc_ua", "opcua"],
+        feature: "opc_ua",
+        enabled: cfg!(feature = "opc_ua"),
+    },
 ];
 
 pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str> {
@@ -3720,6 +3725,7 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
+        #[cfg(feature = "opc_ua")]
         "opc_ua" | "opcua" => {
             let endpoint_url = body
                 .get("endpoint_url")
@@ -3778,6 +3784,10 @@ pub(crate) async fn register_live_sink(
                         .register(format!("opcua:{}", name), sink);
                 }
             }
+        }
+        #[cfg(not(feature = "opc_ua"))]
+        "opc_ua" | "opcua" => {
+            return Err(refuse_disabled_kind(conn_type, "opc_ua"));
         }
         "sparkplug_b" | "sparkplug" => {
             let topic_prefix = body

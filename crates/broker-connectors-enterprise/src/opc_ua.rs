@@ -2003,11 +2003,11 @@ mod tests {
     /// Uses the existing `SlowUInt1` slow node. The server
     /// rejects AddNodes with BadServiceUnsupported, so the run
     /// creates no nodes. It freezes the slow simulation, streams
-    /// 500 rows through [`OpcUaSink`] on
-    /// [`DriverOpcUaTransport`], asserts each write through an
-    /// independent session, proves an unknown node fails with the
-    /// server text, then restores the simulation. Panics when its
-    /// environment is missing (fail closed, never skips).
+    /// 500 rows through [`broker_connectors::ConnectorManager`] to
+    /// [`OpcUaSink`] on [`DriverOpcUaTransport`], asserts each write
+    /// through an independent session, proves an unknown node fails
+    /// with the server text, then restores the simulation. Panics
+    /// when its environment is missing (fail closed, never skips).
     #[tokio::test]
     #[ignore = "needs a real OPC-UA server (see OPCUA_* env)"]
     async fn test_qualify_driver_write_path() {
@@ -2175,14 +2175,24 @@ mod tests {
             Arc::new(DriverOpcUaTransport::new(&config).expect("qual transport builds"));
         let sink = Arc::new(OpcUaSink::new(config, transport).expect("qual sink builds"));
         assert_eq!(sink.kind(), "opc_ua");
+        // Broker path: rule actions send through the shared manager.
+        // The qual sends through it, never `sink.send` direct.
+        let manager = Arc::new(broker_connectors::ConnectorManager::new());
+        manager.register("qual-opcua", sink.clone());
 
-        // Drive: send 500 integers through the sink. The transport
+        // Drive: send 500 integers through the manager. The transport
         // coerces Int64 to the UInt32 server type when it fits.
         // Reason: each write reads back at once, so the count is exact.
         let topic = Topic::new("qual/opcua/w/0").expect("qual topic builds");
         let mut verified: usize = 0;
         for seq in 0..ROWS {
-            sink.send(&topic, &Bytes::from(seq.to_string()), QoS::AtLeastOnce)
+            manager
+                .send(
+                    "qual-opcua",
+                    &topic,
+                    &Bytes::from(seq.to_string()),
+                    QoS::AtLeastOnce,
+                )
                 .await
                 .expect("qual send");
             sink.flush().await.expect("qual flush");
@@ -2248,8 +2258,11 @@ mod tests {
             Arc::new(DriverOpcUaTransport::new(&bad_config).expect("qual bad transport builds"));
         let bad_sink =
             Arc::new(OpcUaSink::new(bad_config, bad_transport).expect("qual bad sink builds"));
-        bad_sink
+        let bad_manager = Arc::new(broker_connectors::ConnectorManager::new());
+        bad_manager.register("qual-opcua-bad", bad_sink.clone());
+        bad_manager
             .send(
+                "qual-opcua-bad",
                 &Topic::new("qual/opcua/bad/0").expect("qual bad topic builds"),
                 &Bytes::from_static(b"7"),
                 QoS::AtLeastOnce,

@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-029).
+# Qual mapping for connectors (DX2-019 through DX2-030).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -858,6 +858,18 @@ CONNECTOR_QUALS = {
         ],
         "timeout": 1800,
         "markers": ["qual rows asserted", "qual auth asserted"],
+    },
+    "opc_ua": {
+        "crate": "broker-connectors-enterprise",
+        "test": "opc_ua::tests::test_qualify_driver_write_path",
+        "env": [
+            "OPCUA_ENDPOINT",
+            "OPCUA_USERNAME",
+            "OPCUA_PASSWORD",
+        ],
+        "feature": "opc_ua",
+        "timeout": 1800,
+        "markers": ["qual rows asserted", "qual fault asserted"],
     },
 }
 

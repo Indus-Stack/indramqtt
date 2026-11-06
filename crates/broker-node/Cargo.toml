@@ -123,6 +123,7 @@ couchbase = ["broker-api/couchbase"]
 mongodb = ["broker-api/mongodb"]
 gcp_pubsub = ["broker-api/gcp_pubsub"]
 kinesis = ["broker-api/kinesis"]
+opc_ua = ["broker-api/opc_ua"]
 full = [
     "s3",
     "aws_iot",
@@ -142,6 +143,7 @@ full = [
     "mongodb",
     "gcp_pubsub",
     "kinesis",
+    "opc_ua",
 ]
 
 [dev-dependencies]

@@ -377,3 +377,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/mysql.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-06.
+
+## DX2-030 item `opc_ua`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item opc_ua` with `OPCUA_ENDPOINT`, `OPCUA_USERNAME`, `OPCUA_PASSWORD` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/opc_ua.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-06.

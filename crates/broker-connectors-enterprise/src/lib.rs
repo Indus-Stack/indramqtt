@@ -59,6 +59,7 @@ pub mod kinesis;
 pub mod mongodb;
 pub mod mssql;
 pub mod oci_streaming;
+#[cfg(feature = "opc_ua")]
 pub mod opc_ua;
 pub mod oracle;
 pub mod pulsar;
@@ -222,6 +223,7 @@ pub use oci_streaming::{
     MockOciPutMessages, MockOciStreamingTransport, OciAuthHeaders, OciMessage,
     OciStreamingConnector, OciStreamingSink, OciStreamingSinkConfig, OciStreamingTransport,
 };
+#[cfg(feature = "opc_ua")]
 pub use opc_ua::{
     datetime_from_millis, datetime_to_rfc3339, decode_chunk, decode_data_value, decode_variant,
     encode_chunk, encode_data_value, encode_variant, encode_write_request, notification_to_json,

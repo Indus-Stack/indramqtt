@@ -2033,6 +2033,12 @@ async fn build_connector(
                 Ok(("gcp_iot".to_string(), std::sync::Arc::new(sink)
                     as std::sync::Arc<dyn broker_connectors::Sink>))
             }
+            #[cfg(not(feature = "opc_ua"))]
+            "opc_ua" | "opcua" => Err(
+                "connector kind 'opc_ua' needs cargo feature 'opc_ua' (disabled in this build)"
+                    .to_string(),
+            ),
+            #[cfg(feature = "opc_ua")]
             "opc_ua" | "opcua" => {
                 let config: broker_connectors_enterprise::OpcUaSinkConfig =
                     serde_json::from_value(req.config.clone())
@@ -12340,7 +12346,8 @@ mod tests {
         feature = "confluent",
         feature = "gcp_pubsub",
         feature = "bigquery",
-        feature = "kinesis"
+        feature = "kinesis",
+        feature = "opc_ua"
     ))]
     #[tokio::test]
     async fn test_connectors_create_kafka_rabbitmq_logger() {

@@ -33,6 +33,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/mqtt-bridge.md` | 94 | `mqtt_bridge` |
 | `connectors/mssql.md` | 99 | `mssql` |
 | `connectors/mysql.md` | 82 | `mysql` |
+| `connectors/opc_ua.md` | 97 | `ok` |
 | `connectors/postgres.md` | 79 | `postgres` |
 | `connectors/redis.md` | 81 | `redis` |
 | `connectors/s3.md` | 88 | `ok` |
@@ -117,4 +118,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 101 blocks. Each output matches its page.
+The run captured 102 blocks. Each output matches its page.

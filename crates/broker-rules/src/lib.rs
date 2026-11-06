@@ -8706,8 +8706,13 @@ mod tests {
     /// ingress forwards (no SQL projection, bytes verbatim) into the
     /// OPC-UA memory transport as a typed node write. All transports
     /// are in-memory; the RSA key is a fixed test key (never deployed).
-    /// X1-09: needs the `aws_iot`, `azure_iot` and `gcp_iot` features.
-    #[cfg(all(feature = "aws_iot", feature = "azure_iot", feature = "gcp_iot"))]
+    /// X1-09: needs the `aws_iot`, `azure_iot`, `gcp_iot` and `opc_ua` features.
+    #[cfg(all(
+        feature = "aws_iot",
+        feature = "azure_iot",
+        feature = "gcp_iot",
+        feature = "opc_ua"
+    ))]
     #[tokio::test]
     async fn test_into_fans_out_to_iot_industrial_sinks() {
         use broker_connectors_enterprise::{
