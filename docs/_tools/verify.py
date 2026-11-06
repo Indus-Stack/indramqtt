@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-023).
+# Qual mapping for connectors (DX2-019 through DX2-024).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -783,6 +783,18 @@ CONNECTOR_QUALS = {
         ],
         "timeout": 1800,
         "markers": ["qual rows asserted", "qual auth failure asserted"],
+    },
+    "iotdb": {
+        "crate": "broker-connectors-enterprise",
+        "test": "iotdb::tests::test_qualify_write_path",
+        "env": [
+            "IOTDB_ENDPOINT",
+            "IOTDB_USER",
+            "IOTDB_PASSWORD",
+            "IOTDB_DEVICE",
+        ],
+        "timeout": 2400,
+        "markers": ["qual rows asserted", "qual fault asserted"],
     },
 }
 

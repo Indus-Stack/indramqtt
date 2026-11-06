@@ -2962,7 +2962,7 @@ pub(crate) async fn register_live_sink(
                     .register(format!("greptime:{}", name), sink);
             }
         }
-        "iotdb" => {
+        "iotdb" | "iot_db" => {
             let server = body
                 .get("endpoint")
                 .or_else(|| body.get("server"))
@@ -2980,19 +2980,134 @@ pub(crate) async fn register_live_sink(
                 .or_else(|| body.get("device_path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("root.factory.${payload.plant_id}.${client_id}");
-            let username = body
-                .get("username")
+            // Documented auth first (DX2-024). The page names an object
+            // with username and password. Flat fields stay for the old
+            // entry shape.
+            let nested_auth = body.get("auth");
+            let username = nested_auth
+                .and_then(|auth| auth.get("username"))
                 .and_then(|v| v.as_str())
+                .or_else(|| body.get("username").and_then(|v| v.as_str()))
                 .unwrap_or("root");
-            let password = body
-                .get("password")
+            let password = nested_auth
+                .and_then(|auth| auth.get("password"))
                 .and_then(|v| v.as_str())
+                .or_else(|| body.get("password").and_then(|v| v.as_str()))
                 .unwrap_or("root");
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
+
+            // One path for each shape (DX2-024). Flat fields and the
+            // documented object share defaults and validation.
+            // Reason: docs default 200 rows per flush.
+            let batch_size = match body.get("batch_size") {
+                None => Some(200),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v as usize),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: batch_size must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 2 MiB per batch.
+            let batch_bytes = match body.get("batch_bytes") {
+                None => Some(2_097_152),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v as usize),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: batch_bytes must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 10 ms linger.
+            let linger_ms = match body.get("linger_ms") {
+                None => Some(10),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: linger_ms must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 3 retries on 305 and 5xx.
+            let max_retries = match body.get("max_retries") {
+                None => Some(3),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v as usize),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: max_retries must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 100 ms first retry delay.
+            let initial_backoff_ms = match body.get("initial_backoff_ms") {
+                None => Some(100),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: initial_backoff_ms must be an integer"
+                                .to_string(),
+                        );
+                    }
+                },
+            };
+            // Reason: docs default 2000 ms retry ceiling.
+            let max_backoff_ms = match body.get("max_backoff_ms") {
+                None => Some(2_000),
+                Some(value) if value.is_null() => None,
+                Some(value) => match value.as_u64() {
+                    Some(v) => Some(v),
+                    None => {
+                        return Err(
+                            "invalid iotdb config: max_backoff_ms must be an integer".to_string()
+                        );
+                    }
+                },
+            };
+            let is_aligned = body
+                .get("is_aligned")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let measurements: Vec<String> = body
+                .get("measurements")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let data_types = match body.get("data_types") {
+                None => Vec::new(),
+                Some(value) => {
+                    let parsed: Result<Vec<broker_connectors_enterprise::iotdb::IotDbDataType>, _> =
+                        serde_json::from_value(value.clone());
+                    match parsed {
+                        Ok(items) => items,
+                        Err(error) => {
+                            return Err(format!("invalid iotdb config: {error}"));
+                        }
+                    }
+                }
+            };
 
             let config = broker_connectors_enterprise::iotdb::IotDbSinkConfig {
                 endpoint,
@@ -3001,15 +3116,15 @@ pub(crate) async fn register_live_sink(
                     username: username.to_string(),
                     password: password.to_string(),
                 },
-                is_aligned: false,
-                measurements: vec!["temperature".to_string()],
-                data_types: vec![broker_connectors_enterprise::iotdb::IotDbDataType::Float],
-                batch_size: Some(1),
-                batch_bytes: Some(2_097_152),
-                linger_ms: Some(10),
-                max_retries: Some(3),
-                initial_backoff_ms: Some(100),
-                max_backoff_ms: Some(2_000),
+                is_aligned,
+                measurements,
+                data_types,
+                batch_size,
+                batch_bytes,
+                linger_ms,
+                max_retries,
+                initial_backoff_ms,
+                max_backoff_ms,
                 timeout_ms,
             };
             let client = reqwest::Client::builder()
@@ -3027,7 +3142,10 @@ pub(crate) async fn register_live_sink(
                     engine.connectors().register(name, sink.clone());
                     engine
                         .connectors()
-                        .register(format!("iotdb:{}", name), sink);
+                        .register(format!("iotdb:{}", name), sink.clone());
+                    engine
+                        .connectors()
+                        .register(format!("iot_db:{}", name), sink);
                 }
             }
         }

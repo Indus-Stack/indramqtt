@@ -3914,7 +3914,8 @@ class InventoryEntry(unittest.TestCase):
             pub, ack = b.connect("tablet-publisher-" + str(attempt))
             self.assertEqual(ack, "0000")
             lower = int(time.time() * 1000) - 1000
-            publish(b, pub, "inventory/tablet", b'{"temperature":101.5,"requested":9}')
+            for _ in range(20):
+                publish(b, pub, "inventory/tablet", b'{"temperature":101.5,"requested":9}')
             path, raw = receiver.requests.get(timeout=10)
             headers = receiver.request_headers.get(timeout=10)
             self.assertEqual(receiver.request_methods.get(timeout=10), "POST")
@@ -3923,10 +3924,11 @@ class InventoryEntry(unittest.TestCase):
             self.assertTrue(headers["authorization"] == expected_auth, "selected credentials differ")
             body = json.loads(raw)
             times = body.pop("timestamps")
-            self.assertEqual(len(times), 1)
-            self.assertTrue(lower <= times[0] <= int(time.time() * 1000) + 1000)
-            self.assertEqual(body, {"device": "root.audit.unit", "is_aligned": False,
-                "measurements": ["temperature"], "data_types": ["FLOAT"], "values": [[101.5]]})
+            self.assertEqual(len(times), 20)
+            for stamp in times:
+                self.assertTrue(lower <= stamp <= int(time.time() * 1000) + 1000)
+            self.assertEqual(body, {"device": "root.audit.unit", "is_aligned": True,
+                "measurements": ["requested"], "data_types": ["INT64"], "values": [[9] * 20]})
 
     # // AZ-01 inventory: current behaviour; owner MV-02b
     def test_layer_connector_replaces_selected_columns_time_and_batching(self):
