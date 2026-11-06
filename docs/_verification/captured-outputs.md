@@ -36,7 +36,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/opc_ua.md` | 97 | `ok` |
 | `connectors/opentsdb.md` | 93 | `opentsdb` |
 | `connectors/oracle.md` | 91 | `oracle` |
-| `connectors/postgres.md` | 79 | `postgres` |
+| `connectors/postgres.md` | 82 | `postgres` |
 | `connectors/redis.md` | 81 | `redis` |
 | `connectors/s3.md` | 88 | `ok` |
 | `getting-started/console.md` | 48 | `200` |

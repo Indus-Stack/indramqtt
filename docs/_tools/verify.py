@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-032).
+# Qual mapping for connectors (DX2-019 through DX2-033).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -895,6 +895,22 @@ CONNECTOR_QUALS = {
         ],
         "timeout": 2400,
         "markers": ["qual rows asserted", "qual fault asserted"],
+    },
+    "postgres": {
+        "crate": "broker-connectors",
+        "test": "postgres::tests::test_qualify_driver_write_path",
+        "env": [
+            "POSTGRES_HOST",
+            "POSTGRES_PORT",
+            "POSTGRES_DATABASE",
+            "POSTGRES_USER",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_MD5_USER",
+            "POSTGRES_MD5_PASSWORD",
+            "POSTGRES_TABLE",
+        ],
+        "timeout": 1800,
+        "markers": ["qual rows asserted", "qual auth asserted"],
     },
 }
 
