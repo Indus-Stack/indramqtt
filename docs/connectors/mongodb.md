@@ -7,15 +7,18 @@ sidebar:
 
 # MongoDB connector
 
-The MongoDB connector bulk-inserts rule results as documents. It routes collections with a template. It uses the maintained MongoDB driver with acknowledged writes.
+The MongoDB connector writes each rule result as one document. It groups rows by collection and bulk-inserts them. It uses the maintained driver with acknowledged writes.
 
-Use it when documents must hold telemetry with changing shape. You get one bulk insert per batch.
+Use it when documents must hold telemetry with changing shape. You get one bulk insert per batch with your own collection mapping.
 
 ```mermaid
 flowchart LR
     Rule["rule engine"] -- "INTO connector id" --> Sink["mongodb sink"]
-    Sink -- "bulk insert" --> Coll["templated collection"]
-    Coll -- "acknowledged" --> Db["database"]
+    Sink -- "batch by collection" --> Bulk["bulk insert"]
+    Bulk -- "w=1 acknowledged" --> Db["MongoDB database"]
+    Bulk -- "retryable" --> Back["backoff retry"]
+    Back -- "retry" --> Bulk
+    Bulk -- "terminal" --> Drop["fail closed"]
 ```
 
 ## Before you start
@@ -26,18 +29,21 @@ flowchart LR
 
 ## Settings
 
-Set `kind` to `mongodb`.
+Set `kind` to `mongodb`. The broker also accepts the aliases `mongo` and `documentdb`.
 
 | Setting | Required | Meaning |
 |---|---|---|
-| `connection_string` | yes | Connection URI, `mongodb://` or `mongodb+srv://`. |
-| `database` | yes | Target database name. |
-| `collection_template` | yes | Collection name with `${topic}` substitution. |
-| `operation` | no | Write operation; default inserts one document. |
-| `batch_size` | no | Documents per bulk batch; default 500. |
-| `batch_bytes` | no | Batch byte limit over BSON; default 4 MiB. |
-| `linger_ms` | no | Linger before a partial batch flushes; default 20. |
-| `max_retries` | no | Retries on transient faults; default 4. |
+| `connection_string` | yes | URI, `mongodb://` or `mongodb+srv://`. A missing host or port text is refused. A missing port reads as 27017. Auth source defaults to `admin`. |
+| `database` | yes | Target database name. An empty name, `/`, a space, or NUL is refused. |
+| `collection_template` | yes | Collection name with `${topic}`, `${client_id}`, `${qos}`, `${timestamp}`. An unknown or unclosed variable is refused. An empty result, NUL, or `system.` prefix is refused. |
+| `operation` | no | Write operation. Default inserts one document. `update_one` and `replace_one` need `filter_template` and `upsert`. The filter must render JSON. |
+| `batch_size` | no | Documents per bulk batch. Default 500. A value of 0 is refused. `null` means no count bound. |
+| `batch_bytes` | no | Batch byte limit over BSON. Default 4194304. A value of 0 is refused. `null` means no byte bound. |
+| `linger_ms` | no | Linger before a partial batch flushes. Default 20. `null` means no time bound. |
+| `max_retries` | no | Retries on transient faults. Default 4. `null` means no bound. A value of 0 means no retry. |
+| `initial_backoff_ms` | no | First retry delay in ms. Default 100. A value below 1 reads as 1. |
+| `max_backoff_ms` | no | Retry delay ceiling in ms. Default 3000. A value below 1 reads as 1. |
+| `timeout_ms` | no | Socket and request deadline in ms. Default 5000. A value below 1 reads as 1. Reads use twice the value. Writes use four times the value. |
 
 Example:
 
@@ -55,7 +61,8 @@ Example:
     "linger_ms": 20,
     "max_retries": 2,
     "initial_backoff_ms": 10,
-    "max_backoff_ms": 100
+    "max_backoff_ms": 100,
+    "timeout_ms": 5000
   }
 }
 ```
@@ -86,7 +93,7 @@ allow_anonymous = true
 
 ```sh test
 python3 - <<'PY'
-import json, os, urllib.request
+import json, os, urllib.request, urllib.error
 port = os.environ.get("API_PORT", "18083")
 key = os.environ["API_KEY"]
 body = json.dumps({"id": "mongo-1", "kind": "mongodb",
@@ -97,7 +104,8 @@ body = json.dumps({"id": "mongo-1", "kind": "mongodb",
                               "batch_size": 50, "batch_bytes": 65536,
                               "linger_ms": 20, "max_retries": 2,
                               "initial_backoff_ms": 10,
-                              "max_backoff_ms": 100}}).encode()
+                              "max_backoff_ms": 100,
+                              "timeout_ms": 5000}}).encode()
 req = urllib.request.Request(
     f"http://127.0.0.1:{port}/api/v1/connectors", data=body, method="POST",
     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
@@ -122,8 +130,14 @@ ok
 ## Limits
 
 - An empty `connection_string`, `database`, or `collection_template` is refused with 400.
-- Writes use acknowledged write concern. A lost acknowledgement retries the batch.
+- A payload that is not UTF-8 or not JSON is refused. An object merges its fields. A scalar rides under `value`.
+- Each document carries `_mqtt` with `topic`, `client_id`, `qos`, and `timestamp`. An insert adds an `_id` when the payload holds none. An explicit `_id` stays verbatim.
+- Codes 11000, 11001, 12582, and 121 are terminal. They fail fast and keep the row.
+- Other faults retry with backoff. The delay doubles from the initial value to the ceiling, plus jitter.
+- A failed flush restores rows and engages backoff. Flushes fail fast during backoff.
+- Writes use acknowledged write concern. A short count fails the batch as a connection fault.
 - The bounded queue sheds past its bound. A slow cluster never stalls publishers.
+- The tier is enterprise. The kind needs the `mongodb` feature build.
 
 ## Next steps
 

@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-025).
+# Qual mapping for connectors (DX2-019 through DX2-026).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -806,6 +806,18 @@ CONNECTOR_QUALS = {
         "feature": "kafka",
         "timeout": 1800,
         "markers": ["qual rows asserted"],
+    },
+    "mongodb": {
+        "crate": "broker-connectors-enterprise",
+        "test": "mongodb::tests::test_qualify_driver_write_path",
+        "env": [
+            "MONGODB_URL",
+            "MONGODB_DATABASE",
+            "MONGODB_COLLECTION",
+        ],
+        "feature": "mongodb",
+        "timeout": 1800,
+        "markers": ["qual rows asserted", "qual duplicate-key asserted"],
     },
 }
 

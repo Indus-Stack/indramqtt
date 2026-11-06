@@ -349,3 +349,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/kafka.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-06.
+
+## DX2-026 item `mongodb`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item mongodb` with `MONGODB_URL`, `MONGODB_DATABASE`, `MONGODB_COLLECTION` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/mongodb.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-06.
