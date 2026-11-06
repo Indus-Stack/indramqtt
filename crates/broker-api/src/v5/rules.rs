@@ -2327,16 +2327,24 @@ pub(crate) async fn register_live_sink(
                 }
             }
         }
-        "influxdb" => {
-            let url = body
-                .get("url")
-                .and_then(|v| v.as_str())
-                .or_else(|| body.get("server").and_then(|v| v.as_str()))
-                .unwrap_or("http://127.0.0.1:8086");
-            let endpoint = if url.starts_with("http://") || url.starts_with("https://") {
-                url.to_string()
+        "influxdb" | "influx" => {
+            // Documented `endpoint` first (DX2-023): it must already name
+            // `http(s)` or the sink refuses it. Legacy `url` and `server`
+            // carry `host:port` and keep the historic prefix for the
+            // stored canonical parameters.
+            let endpoint = if let Some(explicit) = body.get("endpoint").and_then(|v| v.as_str()) {
+                explicit.to_string()
             } else {
-                format!("http://{}", url)
+                let url = body
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| body.get("server").and_then(|v| v.as_str()))
+                    .unwrap_or("http://127.0.0.1:8086");
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    url.to_string()
+                } else {
+                    format!("http://{url}")
+                }
             };
             let bucket = body
                 .get("bucket")
@@ -2357,15 +2365,29 @@ pub(crate) async fn register_live_sink(
                 .or_else(|| body.get("timeout_ms"))
                 .or_else(|| body.get("timeout"))
                 .and_then(|v| v.as_u64());
+            // Documented settings (DX2-023): the sink applies each one.
+            // Missing precision, batch size and linger keep the historic
+            // defaults so stored canonical parameters still send the
+            // default v2 request.
+            let precision = body
+                .get("precision")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ms");
+            let batch_size = body.get("batch_size").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let batch_timeout_ms = body
+                .get("batch_timeout_ms")
+                .or_else(|| body.get("linger_ms"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100);
             let config = broker_connectors::InfluxDbSinkConfig {
                 endpoint,
                 bucket: bucket.to_string(),
                 org: org.to_string(),
                 token: token.to_string(),
                 measurement_template: measurement.to_string(),
-                precision: "ms".to_string(),
-                batch_size: 1,
-                batch_timeout_ms: 100,
+                precision: precision.to_string(),
+                batch_size,
+                batch_timeout_ms,
                 request_timeout_ms,
             };
             if let Some(sink) = record_sink_error!(broker_connectors::InfluxDbSink::new(
@@ -2376,7 +2398,10 @@ pub(crate) async fn register_live_sink(
                 engine.connectors().register(name, sink.clone());
                 engine
                     .connectors()
-                    .register(format!("influxdb:{}", name), sink);
+                    .register(format!("influxdb:{}", name), sink.clone());
+                engine
+                    .connectors()
+                    .register(format!("influx:{}", name), sink);
             }
         }
         #[cfg(feature = "mongodb")]

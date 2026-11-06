@@ -26,7 +26,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/greptimedb.md` | 90 | `greptimedb` |
 | `connectors/http.md` | 93 | `delivered` |
 | `connectors/index.md` | 127 | `ok` |
-| `connectors/influxdb.md` | 86 | `influxdb` |
+| `connectors/influxdb.md` | 89 | `influxdb` |
 | `connectors/kafka.md` | 83 | `ok` |
 | `connectors/mongodb.md` | 87 | `ok` |
 | `connectors/mqtt-bridge.md` | 91 | `mqtt_bridge` |

@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019, DX2-020, DX2-021, DX2-022).
+# Qual mapping for connectors (DX2-019 through DX2-023).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -771,6 +771,18 @@ CONNECTOR_QUALS = {
         ],
         "timeout": 1800,
         "markers": ["qual rows asserted", "qual precision asserted"],
+    },
+    "influxdb": {
+        "crate": "broker-connectors",
+        "test": "influxdb::tests::test_qualify_write_path",
+        "env": [
+            "INFLUXDB_ENDPOINT",
+            "INFLUXDB_ORG",
+            "INFLUXDB_BUCKET",
+            "INFLUXDB_TOKEN",
+        ],
+        "timeout": 1800,
+        "markers": ["qual rows asserted", "qual auth failure asserted"],
     },
 }
 

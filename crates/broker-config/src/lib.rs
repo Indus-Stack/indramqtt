@@ -106,6 +106,7 @@ pub const KNOWN_CONNECTOR_TYPES: &[&str] = &[
     "sqlserver",
     "dynamo",
     "timescale",
+    "influx",
 ];
 
 /// Returns true for a connector type the kernel can instantiate.
@@ -191,6 +192,7 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "azure_event_grid",
     "aws_timestream",
     "snowflake_streaming",
+    "influx",
 ];
 
 /// Returns true for an action kind the kernel can execute.
@@ -265,6 +267,7 @@ pub const KNOWN_SOURCE_TYPES: &[&str] = &[
     "gcp_pubsub_producer",
     "azure_event_hub_producer",
     "azure_event_grid",
+    "influx",
 ];
 
 /// Returns true for a source kind the kernel can instantiate.

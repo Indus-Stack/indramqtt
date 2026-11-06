@@ -328,3 +328,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/greptimedb.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-05.
+
+## DX2-023 item `influxdb`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item influxdb` with `INFLUXDB_ENDPOINT`, `INFLUXDB_ORG`, `INFLUXDB_BUCKET`, `INFLUXDB_TOKEN` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/influxdb.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-05.

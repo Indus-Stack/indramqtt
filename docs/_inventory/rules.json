@@ -30,6 +30,7 @@
     "gcp_pubsub_producer",
     "greptimedb",
     "http",
+    "influx",
     "influxdb",
     "iotdb",
     "kafka",
