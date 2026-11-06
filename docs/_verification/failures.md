@@ -405,3 +405,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/postgres.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-06.
+
+## DX2-034 item `pulsar`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item pulsar` with `PULSAR_URL`, `PULSAR_HTTP_URL`, `PULSAR_TOPIC`, `PULSAR_SUBSCRIPTION` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/pulsar.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-06.

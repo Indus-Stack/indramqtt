@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-033).
+# Qual mapping for connectors (DX2-019 through DX2-034).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -911,6 +911,18 @@ CONNECTOR_QUALS = {
         ],
         "timeout": 1800,
         "markers": ["qual rows asserted", "qual auth asserted"],
+    },
+    "pulsar": {
+        "crate": "broker-connectors-enterprise",
+        "test": "pulsar::tests::test_qualify_driver_write_path",
+        "env": [
+            "PULSAR_URL",
+            "PULSAR_HTTP_URL",
+            "PULSAR_TOPIC",
+            "PULSAR_SUBSCRIPTION",
+        ],
+        "timeout": 2400,
+        "markers": ["qual rows asserted", "qual fault asserted"],
     },
 }
 
