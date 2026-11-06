@@ -412,3 +412,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/pulsar.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-06.
+
+## DX2-035 item `rabbitmq`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item rabbitmq` with `RABBITMQ_HOST`, `RABBITMQ_PORT`, `RABBITMQ_USERNAME`, `RABBITMQ_PASSWORD`, `RABBITMQ_EXCHANGE`, `RABBITMQ_QUEUE` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/rabbitmq.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-06.

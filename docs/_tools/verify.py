@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-034).
+# Qual mapping for connectors (DX2-019 through DX2-035).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -923,6 +923,21 @@ CONNECTOR_QUALS = {
         ],
         "timeout": 2400,
         "markers": ["qual rows asserted", "qual fault asserted"],
+    },
+    "rabbitmq": {
+        "crate": "broker-connectors",
+        "test": "rabbitmq::tests::test_qualify_driver_write_path",
+        "env": [
+            "RABBITMQ_HOST",
+            "RABBITMQ_PORT",
+            "RABBITMQ_USERNAME",
+            "RABBITMQ_PASSWORD",
+            "RABBITMQ_EXCHANGE",
+            "RABBITMQ_QUEUE",
+        ],
+        "feature": "rabbitmq",
+        "timeout": 1800,
+        "markers": ["qual rows asserted"],
     },
 }
 
