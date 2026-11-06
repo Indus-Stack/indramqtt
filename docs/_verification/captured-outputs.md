@@ -28,7 +28,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/index.md` | 127 | `ok` |
 | `connectors/influxdb.md` | 89 | `influxdb` |
 | `connectors/iotdb.md` | 98 | `iotdb` |
-| `connectors/kafka.md` | 83 | `ok` |
+| `connectors/kafka.md` | 88 | `ok` |
 | `connectors/mongodb.md` | 87 | `ok` |
 | `connectors/mqtt-bridge.md` | 91 | `mqtt_bridge` |
 | `connectors/mysql.md` | 79 | `mysql` |

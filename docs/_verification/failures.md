@@ -342,3 +342,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/iotdb.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-06.
+
+## DX2-025 item `kafka`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item kafka` with `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/kafka.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-06.
