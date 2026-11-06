@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-031).
+# Qual mapping for connectors (DX2-019 through DX2-032).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -881,6 +881,20 @@ CONNECTOR_QUALS = {
         ],
         "timeout": 1800,
         "markers": ["qual rows asserted"],
+    },
+    "oracle": {
+        "crate": "broker-connectors-enterprise",
+        "test": "oracle::tests::test_qualify_driver_write_path",
+        "env": [
+            "ORACLE_HOST",
+            "ORACLE_PORT",
+            "ORACLE_SERVICE",
+            "ORACLE_USER",
+            "ORACLE_PASSWORD",
+            "ORACLE_TABLE",
+        ],
+        "timeout": 2400,
+        "markers": ["qual rows asserted", "qual fault asserted"],
     },
 }
 
