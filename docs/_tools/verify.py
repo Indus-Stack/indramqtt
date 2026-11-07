@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-036).
+# Qual mapping for connectors (DX2-019 through DX2-038).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -950,6 +950,17 @@ CONNECTOR_QUALS = {
         ],
         "timeout": 1800,
         "markers": ["qual rows asserted", "qual auth asserted"],
+    },
+    "sparkplug_b": {
+        "crate": "broker-connectors",
+        "test": "sparkplug_b::tests::test_qualify_birth_data_write_path",
+        "env": [
+            "SPARKPLUG_MQTT_URL",
+            "SPARKPLUG_GROUP_ID",
+            "SPARKPLUG_NODE_ID",
+        ],
+        "timeout": 1800,
+        "markers": ["qual rows asserted"],
     },
 }
 
