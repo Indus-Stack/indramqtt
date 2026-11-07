@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-038).
+# Qual mapping for connectors (DX2-019 through DX2-039).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -961,6 +961,18 @@ CONNECTOR_QUALS = {
         ],
         "timeout": 1800,
         "markers": ["qual rows asserted"],
+    },
+    "tdengine": {
+        "crate": "broker-connectors",
+        "test": "tdengine::tests::test_qualify_driver_write_path",
+        "env": [
+            "TDENGINE_URL",
+            "TDENGINE_USER",
+            "TDENGINE_PASSWORD",
+            "TDENGINE_DATABASE",
+        ],
+        "timeout": 1800,
+        "markers": ["qual rows asserted", "qual auth asserted"],
     },
 }
 
