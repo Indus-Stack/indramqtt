@@ -31,7 +31,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The workspace manifest refers to targets in tests/. Cargo cannot read
 # the manifest if that directory is absent.
 COPY Cargo.toml Cargo.lock ./
-COPY proto ./proto
 COPY crates ./crates
 COPY tests ./tests
 

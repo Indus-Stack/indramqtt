@@ -1,9 +1,9 @@
 # Keep the build context to what the image builds: the Rust workspace
-# (Cargo manifests, the Protobuf contract, all crates) and the image
-# files themselves. Everything else only costs upload time and risks
-# stale bytes in the build cache.
+# (Cargo manifests, all crates) and the image files themselves.
+# Everything else only costs upload time and risks stale bytes
+# in the build cache.
 #
-# Never ignore: Dockerfile, proto, crates, Cargo.toml, Cargo.lock.
+# Never ignore: Dockerfile, crates, Cargo.toml, Cargo.lock.
 
 # Rust build artefacts (never build inside the tree; the builder stage
 # compiles inside the container only).
