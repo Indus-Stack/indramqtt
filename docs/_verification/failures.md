@@ -510,3 +510,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a real IoT Hub accepts the device-to-cloud publish through the broker rule path.
 - Broker gave: not run. No IoT Hub ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-08.
+
+## DX2-044 item `bigquery`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `bigquery` with the full config. No live server ran in this task.
+- Expected: a real BigQuery dataset accepts the rows through the broker rule path.
+- Broker gave: not run. No BigQuery dataset ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-044 item `cassandra`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `cassandra` with the full config. No live server ran in this task.
+- Expected: a real Cassandra cluster accepts the rows through the broker rule path.
+- Broker gave: not run. No Cassandra cluster ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-044 item `clickhouse`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `clickhouse` with the full config. No live server ran in this task.
+- Expected: a real ClickHouse server accepts the rows through the broker rule path.
+- Broker gave: not run. No ClickHouse server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.

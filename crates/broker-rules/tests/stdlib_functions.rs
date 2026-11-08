@@ -21,6 +21,11 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex as StdMutex};
 
+// The `jq` stop counter is process-global. The tests that measure its
+// delta must not overlap, or a stop from the other test lands in the
+// delta. This lock holds no production state; it only orders the tests.
+static JQ_COUNTER_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn call(name: &str, args: Vec<Value>) -> Value {
     ensure_stdlib_registered();
     rekuiper_core::plugin::get_global_udf_registry()
@@ -1621,6 +1626,7 @@ async fn std_broker_path_colliding() {
 
 #[test]
 fn std_jq_timeout_applied() {
+    let _counter_guard = JQ_COUNTER_TEST_SERIAL.blocking_lock();
     // A valid per-call timeout (unit: milliseconds) keeps the 2-arg result.
     table(
         "jq",
@@ -1875,6 +1881,7 @@ async fn std_refused_update_keeps_old_rule() {
 
 #[tokio::test]
 async fn std_jq_timeout_counts_failed_rule_run() {
+    let _counter_guard = JQ_COUNTER_TEST_SERIAL.lock().await;
     // A stopped jq program fails the run through the broker entry.
     let engine = RuleEngine::new(16, BackpressurePolicy::DropOldest);
     let deep = format!(".{}", vec!["a"; 65].join("."));

@@ -28,7 +28,9 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/azure_event_hub_producer.md` | 97 | `ok` |
 | `connectors/azure_eventhubs.md` | 118 | `ok` |
 | `connectors/azure_iot.md` | 110 | `ok` |
-| `connectors/clickhouse.md` | 84 | `ok` |
+| `connectors/bigquery.md` | 103 | `ok` |
+| `connectors/cassandra.md` | 103 | `ok` |
+| `connectors/clickhouse.md` | 91 | `ok` |
 | `connectors/couchbase.md` | 99 | `ok` |
 | `connectors/gcp_iot.md` | 98 | `ok` |
 | `connectors/gcp_pubsub.md` | 99 | `ok` |
@@ -134,4 +136,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 118 blocks. Each output matches its page.
+The run captured 120 blocks. Each output matches its page.
