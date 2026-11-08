@@ -1,0 +1,16 @@
+[example]
+area = "connectors"
+item = "snowflake_streaming"
+kind = "action-create"
+
+[[case]]
+name = "snowflake-streaming-normal"
+type = "snowflake_streaming"
+expect_status = 201
+expect_type = "snowflake_streaming"
+
+[[case]]
+name = "snowflake-streaming-normal"
+type = "snowflake_streaming"
+expect_status = 400
+expect_code = "ALREADY_EXISTS"

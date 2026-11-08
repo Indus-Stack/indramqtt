@@ -75,6 +75,9 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/redshift.md` | 116 | `delivered` |
 | `connectors/s3.md` | 97 | `ok` |
 | `connectors/s3_tables.md` | 115 | `delivered` |
+| `connectors/s3tables.md` | 105 | `delivered` |
+| `connectors/snowflake.md` | 117 | `delivered` |
+| `connectors/snowflake_streaming.md` | 89 | `snowflake_streaming` |
 | `connectors/sparkplug_b.md` | 84 | `sparkplug_b` |
 | `connectors/tdengine.md` | 101 | `tdengine` |
 | `connectors/timescaledb.md` | 85 | `timescaledb` |
@@ -159,4 +162,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 143 blocks. Each output matches its page.
+The run captured 146 blocks. Each output matches its page.

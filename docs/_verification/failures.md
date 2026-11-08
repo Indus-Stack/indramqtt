@@ -699,3 +699,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a real S3 Tables table accepts the gzip data files and the table commit through the broker rule path. Source: the S3 Tables sink module comment in `crates/broker-connectors-enterprise/src/s3_tables.rs`.
 - Broker gave: the docs run sends one signed gzip data file to a local receiver and prints `delivered`. The receiver checks the partition path, the gzip body, the content type, and the signature header. The real service, the table commit, and its signature check stay not verified.
 - Date: 2026-11-08.
+
+## DX2-053 item `s3tables`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `s3tables` and `POST /api/v5/connectors` type `s3tables`. It sends one publish through a forwarding rule to a local S3 receiver. No S3 Tables service ran in this task.
+- Expected: a real S3 Tables table accepts the gzip data files and the table commit through the broker rule path. Source: the S3 Tables sink module comment in `crates/broker-connectors-enterprise/src/s3_tables.rs`.
+- Broker gave: the docs run sends one signed gzip data file to a local receiver and prints `delivered`. The receiver checks the partition path, the gzip body, the content type, and the signature header. The real service, the table commit, and its signature check stay not verified.
+- Date: 2026-11-08.
+
+## DX2-053 item `snowflake`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `snowflake` and `POST /api/v5/connectors` type `snowflake`. It sends one publish through a forwarding rule to a local rows receiver. No Snowflake account ran in this task.
+- Expected: a real Snowflake account accepts the JSON row arrays and commits the offset token through the broker rule path. Source: the Snowflake sink module comment in `crates/broker-connectors-enterprise/src/snowflake.rs`.
+- Broker gave: the docs run sends one rows request to a local receiver and prints `delivered`. The receiver checks the channel path, the RS256 JWT issuer and subject, the role header, and the row body. The real service, its authentication, and its row ingest stay not verified.
+- Date: 2026-11-08.
+
+## DX2-053 item `snowflake_streaming`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `snowflake_streaming` and `POST /api/v5/connectors` type `snowflake_streaming`. No Snowflake account ran in this task.
+- Expected: a connector create stores the name through the broker management route. Source: the connector type registry in `crates/broker-config/src/lib.rs`.
+- Broker gave: not run. Both connector routes refuse the name with 400 because it is not a connector type. The v5 actions route accepts the name, stores the posted type, and registers no live sink. The page checks the refusals and the action create only. The send path stays not verified.
+- Date: 2026-11-08.
