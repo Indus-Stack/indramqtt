@@ -31,6 +31,9 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/bigquery.md` | 103 | `ok` |
 | `connectors/cassandra.md` | 103 | `ok` |
 | `connectors/clickhouse.md` | 91 | `ok` |
+| `connectors/cockroachdb.md` | 90 | `ok` |
+| `connectors/confluent.md` | 105 | `ok` |
+| `connectors/confluent_producer.md` | 94 | `ok` |
 | `connectors/couchbase.md` | 99 | `ok` |
 | `connectors/gcp_iot.md` | 98 | `ok` |
 | `connectors/gcp_pubsub.md` | 99 | `ok` |
@@ -136,4 +139,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 120 blocks. Each output matches its page.
+The run captured 123 blocks. Each output matches its page.

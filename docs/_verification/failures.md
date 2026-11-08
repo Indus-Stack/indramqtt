@@ -531,3 +531,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a real ClickHouse server accepts the rows through the broker rule path.
 - Broker gave: not run. No ClickHouse server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-08.
+
+## DX2-045 item `cockroachdb`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `cockroachdb` with the full config, and `POST /api/v5/connectors` type `cockroachdb`. No live server ran in this task.
+- Expected: a real CockroachDB cluster accepts the rows through the broker rule path.
+- Broker gave: not run. No CockroachDB cluster ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-045 item `confluent`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `confluent` with the full config, and `POST /api/v5/connectors` type `confluent`. No live server ran in this task.
+- Expected: a real Confluent cluster accepts the records through the broker rule path.
+- Broker gave: not run. No Confluent cluster ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-045 item `confluent_producer`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `confluent_producer` and `POST /api/v5/connectors` type `confluent_producer`. No live server ran in this task.
+- Expected: a real Confluent cluster accepts the records through the broker rule path.
+- Broker gave: not run. No Confluent cluster ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
