@@ -657,3 +657,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a remote MQTT broker accepts the PUBLISH frames through the broker rule path. Source: the `mqtt_bridge` sink code comment in `crates/broker-connectors/src/mqtt_bridge.rs`.
 - Broker gave: not run. The v1 route refuses `mqtt`; it accepts `mqtt_bridge`. The v5 route maps `mqtt` to the `mqtt_bridge` runtime and creates the connector in the default build. No message reached a remote broker. The page checks the refusal and the creation only. The send path stays not verified.
 - Date: 2026-11-08.
+
+## DX2-051 item `oci_streaming`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `oci_streaming` and `POST /api/v5/connectors` type `oci_streaming`, then one publish through a forwarding rule to a local loopback receiver. No OCI tenancy ran in this task.
+- Expected: a real OCI Streaming stream accepts the signed `PutMessages` bodies through the broker rule path. Source: the OCI Streaming sink module comment in `crates/broker-connectors-enterprise/src/oci_streaming.rs`.
+- Broker gave: the docs run sends one signed `PutMessages` body to a local receiver and prints `delivered`. The receiver checks the stream path, the signature header, and the base64 key and value. The real service, its signature check, offset commit, and key rotation stay not verified.
+- Date: 2026-11-08.
+
+## DX2-051 item `opents`
+
+- Input: docs check `POST /api/v1/connectors` kind `opents` (refused) and `POST /api/v5/connectors` type `opents`, then one publish through a forwarding rule to a local HTTP receiver. No external OpenTSDB server ran in this task.
+- Expected: a real OpenTSDB server stores the points through the broker rule path. Source: the OpenTSDB sink module comment in `crates/broker-connectors/src/opentsdb.rs`.
+- Broker gave: the docs run sends one `/api/put?summary` point to a local receiver and prints `delivered`. The receiver checks the metric, the value, and the tag. The real server stays not verified.
+- Date: 2026-11-08.
+
+## DX2-051 item `pgsql`
+
+- Input: docs check `POST /api/v1/connectors` kind `pgsql` (refused) and `POST /api/v5/connectors` type `pgsql`, then one publish through a forwarding rule to a local TCP listener. No PostgreSQL server ran in this task.
+- Expected: a real PostgreSQL server accepts the fixed insert through the broker rule path. Source: the PostgreSQL sink module comment and the v5 `pgsql` branch in `crates/broker-api/src/v5/rules.rs`.
+- Broker gave: the docs run reads the PostgreSQL startup message from a local listener and prints `connected`. The listener checks the user and the database. No server completes authentication or the insert. The insert stays not verified.
+- Date: 2026-11-08.

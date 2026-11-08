@@ -62,9 +62,12 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/mqtt.md` | 97 | `ok` |
 | `connectors/mssql.md` | 99 | `mssql` |
 | `connectors/mysql.md` | 82 | `mysql` |
+| `connectors/oci_streaming.md` | 107 | `delivered` |
 | `connectors/opc_ua.md` | 97 | `ok` |
+| `connectors/opents.md` | 91 | `delivered` |
 | `connectors/opentsdb.md` | 93 | `opentsdb` |
 | `connectors/oracle.md` | 91 | `oracle` |
+| `connectors/pgsql.md` | 96 | `connected` |
 | `connectors/postgres.md` | 82 | `postgres` |
 | `connectors/pulsar.md` | 98 | `pulsar` |
 | `connectors/rabbitmq.md` | 80 | `ok` |
@@ -154,4 +157,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 138 blocks. Each output matches its page.
+The run captured 141 blocks. Each output matches its page.
