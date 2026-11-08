@@ -440,3 +440,10 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/tdengine.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-07.
+
+## DX2-040 item `timescaledb`
+
+- Input: `python3 docs/_tools/verify.py --area connectors --item timescaledb` with `TIMESCALEDB_HOST`, `TIMESCALEDB_PORT`, `TIMESCALEDB_DATABASE`, `TIMESCALEDB_USER`, `TIMESCALEDB_PASSWORD`, `TIMESCALEDB_TABLE` from a real server.
+- Expected: the docs run writes `docs/_verified/connectors/timescaledb.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.

@@ -43,6 +43,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/s3.md` | 88 | `ok` |
 | `connectors/sparkplug_b.md` | 84 | `sparkplug_b` |
 | `connectors/tdengine.md` | 101 | `tdengine` |
+| `connectors/timescaledb.md` | 85 | `timescaledb` |
 | `getting-started/console.md` | 48 | `200` |
 | `getting-started/first-publish.md` | 49 | `hello-docs` |
 | `getting-started/first-start.md` | 43 | `ok` |
@@ -124,4 +125,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 108 blocks. Each output matches its page.
+The run captured 109 blocks. Each output matches its page.

@@ -721,7 +721,7 @@ def append_failure(item, ex, record):
         handle.write(block)
 
 
-# Qual mapping for connectors (DX2-019 through DX2-039).
+# Qual mapping for connectors (DX2-019 through DX2-040).
 # Each entry names the Rust qual test and its required env.
 CONNECTOR_QUALS = {
     "couchbase": {
@@ -970,6 +970,20 @@ CONNECTOR_QUALS = {
             "TDENGINE_USER",
             "TDENGINE_PASSWORD",
             "TDENGINE_DATABASE",
+        ],
+        "timeout": 1800,
+        "markers": ["qual rows asserted", "qual auth asserted"],
+    },
+    "timescaledb": {
+        "crate": "broker-connectors",
+        "test": "timescaledb::tests::test_qualify_driver_write_path",
+        "env": [
+            "TIMESCALEDB_HOST",
+            "TIMESCALEDB_PORT",
+            "TIMESCALEDB_DATABASE",
+            "TIMESCALEDB_USER",
+            "TIMESCALEDB_PASSWORD",
+            "TIMESCALEDB_TABLE",
         ],
         "timeout": 1800,
         "markers": ["qual rows asserted", "qual auth asserted"],
