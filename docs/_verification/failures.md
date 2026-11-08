@@ -447,3 +447,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/timescaledb.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-08.
+
+## DX2-041 item `alloydb`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `alloydb`. No live server ran in this task.
+- Expected: the docs run writes `docs/_verified/connectors/alloydb.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-041 item `aws_iot`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `aws_iot`. No live server ran in this task.
+- Expected: the docs run writes `docs/_verified/connectors/aws_iot.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-041 item `aws_timestream`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `aws_timestream`. No live server ran in this task.
+- Expected: the docs run writes `docs/_verified/connectors/aws_timestream.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.

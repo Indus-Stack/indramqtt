@@ -19,6 +19,9 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `concepts/index.md` | 85 | `hello-docs` |
 | `concepts/listeners.md` | 78 | `ok` |
 | `concepts/listeners.md` | 88 | `hello-listeners` |
+| `connectors/alloydb.md` | 93 | `alloydb` |
+| `connectors/aws_iot.md` | 100 | `ok` |
+| `connectors/aws_timestream.md` | 103 | `timestream` |
 | `connectors/clickhouse.md` | 84 | `ok` |
 | `connectors/couchbase.md` | 99 | `ok` |
 | `connectors/gcp_iot.md` | 98 | `ok` |
@@ -125,4 +128,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 109 blocks. Each output matches its page.
+The run captured 112 blocks. Each output matches its page.
