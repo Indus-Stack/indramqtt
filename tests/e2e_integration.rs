@@ -8924,8 +8924,8 @@ async fn mv01_action_readiness_refusals_keep_the_documented_codes() {
         reqwest::Method::POST,
         "/api/v5/actions",
         serde_json::json!({
-            "name": "mv01-http-not-ready",
-            "type": "http",
+            "name": "mv01-mqtt-not-ready",
+            "type": "mqtt",
             "connector": "mv01-missing-link",
         }),
     )
@@ -8963,7 +8963,7 @@ async fn mv01_action_readiness_refusals_keep_the_documented_codes() {
         "/api/v5/actions/mv01-ready-action",
         serde_json::json!({
             "name": "mv01-ready-action",
-            "type": "http",
+            "type": "mqtt",
             "connector": "mv01-ready-link",
         }),
     )

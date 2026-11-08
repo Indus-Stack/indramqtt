@@ -967,7 +967,8 @@ impl ConnectorStore {
                             // target that is down now reads `disconnected`
                             // and stays persist-only until a send retries.
                             let has_target = extract_target_host_port(&params).is_some();
-                            let lazy_http = matches!(conn_type.as_str(), "webhook" | "http");
+                            let lazy_http =
+                                matches!(canonical_connector_kind(conn_type.as_str()), "webhook");
                             let reachable = if unavailable {
                                 false
                             } else if lazy_http {
@@ -1477,6 +1478,27 @@ fn missing_connector_field(
         }
         // MV-02d object, file and cloud kinds: every target value is
         // operator-supplied. A missing field answers 400 with its name.
+        "webhook" | "http" | "rest" => {
+            if !present(body, &["url", "endpoint"]) {
+                return Some("url");
+            }
+            None
+        }
+        "opc_ua" | "opcua" => {
+            if !present(body, &["endpoint_url", "server", "url", "endpoint"]) {
+                return Some("endpoint_url");
+            }
+            None
+        }
+        "sparkplug_b" | "sparkplug" | "spb" => {
+            if !present(
+                body,
+                &["mqtt_url", "broker_address", "server", "endpoint", "url"],
+            ) {
+                return Some("mqtt_url");
+            }
+            None
+        }
         "s3" | "minio" => {
             if !present(body, &["endpoint", "host", "url", "server"]) {
                 return Some("host");
@@ -2316,11 +2338,24 @@ fn live_sink_kind(conn_type: &str) -> &str {
 /// connector `http`; the tree runs it in the `webhook` arm.
 fn canonical_connector_kind(conn_type: &str) -> &str {
     match conn_type {
-        "http" => "webhook",
+        "http" | "rest" => "webhook",
+        "logger" => "console",
         "mongo" | "documentdb" => "mongodb",
         "couch" | "cb" => "couchbase",
         "elastic" | "es" | "opensearch" => "elasticsearch",
+        "opcua" => "opc_ua",
+        "sparkplug" | "spb" => "sparkplug_b",
         _ => conn_type,
+    }
+}
+
+/// Type stored and returned in a connector document. The reference names
+/// its HTTP connector `http`, and `rest` is the legacy alias of the same
+/// kind. The runtime still executes both in the `webhook` arm.
+fn stored_connector_kind(conn_type: &str) -> &str {
+    match conn_type {
+        "http" | "rest" => "http",
+        other => canonical_connector_kind(other),
     }
 }
 
@@ -2443,7 +2478,7 @@ fn normalize_connector_document(conn_type: &str, body: &mut serde_json::Value) {
     };
     obj.insert(
         "type".to_string(),
-        serde_json::Value::String(canonical.to_string()),
+        serde_json::Value::String(stored_connector_kind(conn_type).to_string()),
     );
     match crate::v5::action_sinks::canonical_action_kind(conn_type) {
         "s3" => normalize_s3_host_port(obj),
@@ -4583,65 +4618,39 @@ pub(crate) async fn register_live_sink(
             }
         }
         "opc_ua" | "opcua" => {
-            let endpoint_url = body
+            // No invented endpoint or node: a missing target stays
+            // persist-only with no live sink. The v5 action owns the
+            // node id; the connector only holds the server.
+            let Some(raw_endpoint) = body
                 .get("endpoint_url")
                 .or_else(|| body.get("server"))
                 .or_else(|| body.get("url"))
                 .or_else(|| body.get("endpoint"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("opc.tcp://127.0.0.1:4840");
-            let endpoint_url = if endpoint_url.starts_with("opc.tcp://") {
-                endpoint_url.to_string()
-            } else {
-                format!("opc.tcp://{}", endpoint_url.trim_start_matches("tcp://"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Ok(());
             };
-            let node_id = body
-                .get("node_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("ns=1;i=1001");
+            let endpoint_url = if raw_endpoint.starts_with("opc.tcp://") {
+                raw_endpoint.to_string()
+            } else {
+                format!("opc.tcp://{}", raw_endpoint.trim_start_matches("tcp://"))
+            };
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
                 .or_else(|| body.get("request_timeout_ms"))
                 .and_then(|v| v.as_u64());
 
-            let config = broker_connectors_enterprise::opc_ua::OpcUaSinkConfig {
-                endpoint_url,
-                security_policy: broker_connectors_enterprise::opc_ua::OpcUaSecurityPolicy::None,
-                security_mode: broker_connectors_enterprise::opc_ua::OpcUaSecurityMode::None,
-                auth: broker_connectors_enterprise::opc_ua::OpcUaAuth::Anonymous,
-                node_subscriptions: vec![
-                    broker_connectors_enterprise::opc_ua::NodeSubscriptionConfig {
-                        node_id: node_id.to_string(),
-                        sampling_interval_ms: 1000,
-                        publish_topic_template: "opcua/${node.sanitized_id}".to_string(),
-                        write_topic_pattern: Some("#".to_string()),
-                    },
-                ],
-                buffer_capacity: None,
-                batch_size: Some(1),
-                linger_ms: Some(10),
-                timeout_ms,
-            };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::opc_ua::DriverOpcUaTransport::new(&config)
-            ) {
-                let transport = Arc::new(transport);
-                if let Some(sink) = record_sink_error!(
-                    broker_connectors_enterprise::opc_ua::OpcUaSink::new(config, transport)
-                ) {
-                    let sink = Arc::new(sink);
-                    engine.connectors().register(name, sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("opc_ua:{}", name), sink.clone());
-                    engine
-                        .connectors()
-                        .register(format!("opcua:{}", name), sink);
-                }
-            }
+            // TODO(parity): the connector alone carries no node id. Which
+            // subscription should a connector-only row register? The
+            // current choice registers nothing and leaves the row
+            // persist-only; the v5 action owns the node id.
+            let _ = (endpoint_url, timeout_ms);
+            return Ok(());
         }
-        "sparkplug_b" | "sparkplug" => {
+        "sparkplug_b" | "sparkplug" | "spb" => {
             let topic_prefix = body
                 .get("topic_prefix")
                 .and_then(|v| v.as_str())
@@ -6444,9 +6453,9 @@ pub async fn create_connector(
         }
     }
     // The reference names its HTTP connector `http`. The tree runs
-    // that connector in the `webhook` arm. Canonicalize before every
-    // check so the readiness gate and the stored row see the runtime
-    // that executes.
+    // that connector in the `webhook` arm. Canonicalize for the runtime
+    // and the readiness gate. The stored document keeps the documented
+    // type through `normalize_connector_document`.
     let conn_type = canonical_connector_kind(conn_type.as_str()).to_string();
     if let Some(message) = crate::removed_connector_refusal(&conn_type) {
         return ApiError::AlreadyExists(message.to_string()).into_response();
@@ -6485,10 +6494,11 @@ pub async fn create_connector(
     if let Some(missing) = missing {
         let message = format!("missing required field: {missing} for connector type {conn_type}");
         // `POST /connectors` documents one 400 code, `ALREADY_EXISTS`.
-        // The object, file and cloud kinds answer with that code so the
-        // refusal body validates. Older kinds keep `BAD_REQUEST`.
+        // The http, device, object, file and cloud kinds answer with that
+        // code so the refusal body validates. Other kinds keep
+        // `BAD_REQUEST`.
         if matches!(
-            crate::v5::action_sinks::canonical_action_kind(&conn_type),
+            crate::v5::action_sinks::canonical_action_kind(&conn_type_early),
             "s3" | "azure_blob"
                 | "dynamodb"
                 | "bigquery"
@@ -6496,6 +6506,9 @@ pub async fn create_connector(
                 | "snowflake"
                 | "tablestore"
                 | "databricks"
+                | "http"
+                | "opc_ua"
+                | "sparkplug_b"
         ) {
             return ApiError::AlreadyExists(message).into_response();
         }
@@ -6563,7 +6576,7 @@ pub async fn create_connector(
             obj.insert("enable".to_string(), serde_json::Value::Bool(true));
         }
     }
-    normalize_connector_document(&conn_type, &mut body);
+    normalize_connector_document(&conn_type_early, &mut body);
 
     // Re-check under the write lock so two concurrent creates for the
     // same id cannot both pass the early check and push a duplicate pair.
@@ -6731,10 +6744,11 @@ pub async fn update_connector(
     if let Some(message) = kind_refusal(conn_type.as_str()) {
         return ApiError::BadRequest(message).into_response();
     }
+    let stored_type = conn_type.clone();
     // The reference names its HTTP connector `http`. The tree runs
-    // that connector in the `webhook` arm. Canonicalize before every
-    // check so the readiness gate and the stored row see the runtime
-    // that executes.
+    // that connector in the `webhook` arm. Canonicalize for the runtime
+    // and the readiness gate. The stored document keeps the documented
+    // type through `normalize_connector_document`.
     let conn_type = canonical_connector_kind(conn_type.as_str()).to_string();
     if let Some(message) = crate::removed_connector_refusal(&conn_type) {
         return ApiError::BadRequest(message.to_string()).into_response();
@@ -6890,7 +6904,7 @@ pub async fn update_connector(
         );
         obj.insert("enable".to_string(), serde_json::Value::Bool(enable));
     }
-    normalize_connector_document(&conn_type, &mut body);
+    normalize_connector_document(&stored_type, &mut body);
     if !state.connectors.replace(&bare, body.clone()) {
         state.engine.connectors().abort_stage();
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
@@ -7360,6 +7374,38 @@ fn http_target_host_port(reference: &str) -> Option<String> {
 }
 
 pub(crate) fn extract_target_host_port(body: &serde_json::Value) -> Option<String> {
+    // Read the MQTT target first. Sparkplug uses `mqtt_url` or
+    // `broker_address`. Parse the host and port from the value.
+    if let Some(s) = body
+        .get("mqtt_url")
+        .or_else(|| body.get("broker_address"))
+        .and_then(|v| v.as_str())
+    {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() && !broker_config::secrets::is_secret_ref(trimmed) {
+            let mut clean = trimmed;
+            if let Some((_, rest)) = clean.split_once("://") {
+                clean = rest;
+            }
+            let host_port = clean
+                .split('@')
+                .next_back()
+                .unwrap_or(clean)
+                .split('/')
+                .next()
+                .unwrap_or(clean)
+                .split('?')
+                .next()
+                .unwrap_or(clean);
+            if !host_port.is_empty() {
+                if host_port.contains(':') {
+                    return Some(host_port.to_string());
+                }
+                // Default MQTT port. Reason: IANA assigns 1883 to MQTT.
+                return Some(format!("{host_port}:1883"));
+            }
+        }
+    }
     if let Some(s) = body.get("server").and_then(|v| v.as_str()) {
         let mut clean = s.trim();
         if let Some((_, rest)) = clean.split_once("://") {
@@ -7531,7 +7577,7 @@ pub(crate) async fn check_tcp_reachable(addr: &str) -> Result<(), String> {
 fn document_kind_needs_target(kind: &str) -> bool {
     matches!(
         crate::v5::action_sinks::canonical_action_kind(kind),
-        "mongodb" | "couchbase" | "elasticsearch"
+        "mongodb" | "couchbase" | "elasticsearch" | "opc_ua" | "sparkplug_b"
     )
 }
 
@@ -7559,6 +7605,21 @@ fn probe_document_missing_field(kind: &str, body: &serde_json::Value) -> Option<
             }
             if !present(body, &["database"]) {
                 return Some("database");
+            }
+            None
+        }
+        "opc_ua" => {
+            if !present(body, &["endpoint_url", "server", "url", "endpoint"]) {
+                return Some("endpoint_url");
+            }
+            None
+        }
+        "sparkplug_b" => {
+            if !present(
+                body,
+                &["mqtt_url", "broker_address", "server", "endpoint", "url"],
+            ) {
+                return Some("mqtt_url");
             }
             None
         }
@@ -7930,7 +7991,16 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
         if document_kind_needs_target(&kind) {
             probe_string(
                 &body,
-                &["server", "servers", "endpoint", "url", "connection_string"],
+                &[
+                    "mqtt_url",
+                    "broker_address",
+                    "server",
+                    "servers",
+                    "endpoint",
+                    "endpoint_url",
+                    "url",
+                    "connection_string",
+                ],
             )
         } else {
             None
@@ -8108,7 +8178,16 @@ pub async fn probe_action(
         if document_kind_needs_target(&kind) {
             probe_string(
                 &body,
-                &["server", "servers", "endpoint", "url", "connection_string"],
+                &[
+                    "mqtt_url",
+                    "broker_address",
+                    "server",
+                    "servers",
+                    "endpoint",
+                    "endpoint_url",
+                    "url",
+                    "connection_string",
+                ],
             )
         } else {
             None

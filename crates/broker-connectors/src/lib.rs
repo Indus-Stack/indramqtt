@@ -217,6 +217,18 @@ pub trait Sink: Send + Sync {
     /// Stable kind name for management display (`webhook`, `console`,
     /// `kafka`, `rabbitmq`, ...).
     fn kind(&self) -> &'static str;
+
+    /// Report local deliveries. Return the count when the sink keeps
+    /// one. Return None when the sink keeps no count.
+    fn local_deliveries(&self) -> Option<u64> {
+        None
+    }
+
+    /// Return the last captured payload preview. Return the text when
+    /// the sink keeps one. Return None when the sink keeps none.
+    fn local_last_preview(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Unified connector identity: a registered, addressable sink.
@@ -402,12 +414,37 @@ impl HttpWebhookSink {
     }
 }
 
+/// Percent-encode one MQTT topic for a URL path. `/` stays
+/// structural so `a/b` dials `/ingest/a/b`. Other bytes outside the
+/// unreserved marks become `%XX`. Reason: RFC 3986 keeps `/` as the
+/// path separator and encodes the rest.
+fn encode_topic_path(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else if byte == b'/' {
+            out.push('/');
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 #[async_trait]
 impl Sink for HttpWebhookSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
+        // Render the `${topic}` template per event. The action path
+        // joins the event topic (for example `/ingest/${topic}` with
+        // topic `a/b` dials `/ingest/a/b`). The stored target keeps the
+        // braces literal. Only the topic value is encoded.
+        let url = self
+            .url
+            .replace("${topic}", &encode_topic_path(topic.as_str()));
         let response = self
             .client
-            .post(&self.url)
+            .post(&url)
             .headers(self.headers.clone())
             .header(CONTENT_TYPE, "application/json")
             .header("X-MQTT-Topic", topic.as_str())
@@ -420,8 +457,7 @@ impl Sink for HttpWebhookSink {
         let status = response.status();
         if !status.is_success() {
             return Err(ConnectorError::Dispatch(format!(
-                "webhook {} answered {}",
-                self.url, status
+                "webhook {url} answered {status}"
             )));
         }
         self.sent.fetch_add(1, Ordering::Relaxed);
@@ -475,11 +511,12 @@ async fn probe_webhook_target(url: &str, timeout: Duration) -> std::result::Resu
 
 /// Formatted diagnostic sink: traces every event at INFO with a payload
 /// preview (full payload when UTF-8 and short). Counts deliveries for
-/// tests and health reporting.
+/// tests and health reporting. Keeps the last preview for tests.
 pub struct ConsoleLoggerSink {
     name: String,
     max_preview_bytes: usize,
     logged: AtomicU64,
+    last_preview: parking_lot::Mutex<Option<String>>,
 }
 
 impl ConsoleLoggerSink {
@@ -488,6 +525,7 @@ impl ConsoleLoggerSink {
             name: name.into(),
             max_preview_bytes: 256,
             logged: AtomicU64::new(0),
+            last_preview: parking_lot::Mutex::new(None),
         }
     }
 
@@ -515,12 +553,21 @@ impl Sink for ConsoleLoggerSink {
             payload = %preview,
             "connector event"
         );
+        *self.last_preview.lock() = Some(preview);
         self.logged.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     fn kind(&self) -> &'static str {
         "console"
+    }
+
+    fn local_deliveries(&self) -> Option<u64> {
+        Some(self.logged_count())
+    }
+
+    fn local_last_preview(&self) -> Option<String> {
+        self.last_preview.lock().clone()
     }
 }
 
@@ -788,6 +835,13 @@ impl BackoffState {
             }
         }
         Ok(())
+    }
+
+    /// True while a failure set a retry time. The time clears only on a
+    /// success, so a caller can tell a pending retry from a new row that
+    /// is buffered for a normal batch.
+    pub fn is_failed(&self) -> bool {
+        self.retry_after.is_some()
     }
 
     pub fn success(&mut self) {

@@ -51,6 +51,8 @@ pub const SPEC_ACTION_TYPES: &[&str] = &[
     "couchbase",
     "dynamo",
     "azure_event_hub_producer",
+    "opc_ua",
+    "sparkplug_b",
 ];
 
 /// Source type names from the documented enum, in documented order,

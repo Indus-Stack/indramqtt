@@ -125,6 +125,8 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | [DynamoDB](./dynamodb.md) | Key-value items. |
 | [Snowflake](./snowflake.md) | Warehouse rows. |
 | [Tablestore](./tablestore.md) | Wide-column rows. |
+| [OPC-UA](./opc-ua.md) | Industrial nodes. |
+| [Sparkplug B](./sparkplug-b.md) | Sparkplug frames. |
 
 ## Check that it works
 
@@ -157,8 +159,8 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {key}"})
 with urllib.request.urlopen(req, timeout=5) as res:
     names = set(json.load(res))
-assert names == {"opents", "mongodb", "oracle", "tdengine", "azure_blob_storage", "snowflake_streaming", "elasticsearch", "influxdb", "pgsql", "cockroachdb", "iotdb", "mysql", "greptimedb", "disk_log", "datalayers", "sqlserver", "redshift", "clickhouse", "tablestore", "alloydb", "aws_timestream", "bigquery", "snowflake", "s3", "doris", "couchbase", "dynamo"}, names
-for pending in ("http", "mqtt", "kafka_producer", "redis", "cassandra"):
+assert names == {"opents", "mongodb", "oracle", "tdengine", "azure_blob_storage", "snowflake_streaming", "elasticsearch", "influxdb", "pgsql", "cockroachdb", "iotdb", "mysql", "greptimedb", "disk_log", "datalayers", "sqlserver", "redshift", "clickhouse", "tablestore", "alloydb", "aws_timestream", "bigquery", "snowflake", "s3", "doris", "couchbase", "dynamo", "http", "opc_ua", "sparkplug_b"}, names
+for pending in ("mqtt", "kafka_producer", "redis", "cassandra"):
     assert pending not in names, pending
 print("ok")
 PY

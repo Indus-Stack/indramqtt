@@ -424,6 +424,10 @@ pub(crate) fn canonical_action_kind(kind: &str) -> &str {
         "snowflake_streaming" | "snowflake_aggregated" => "snowflake",
         "ots" => "tablestore",
         "delta_lake" => "databricks",
+        "opcua" => "opc_ua",
+        "sparkplug" | "spb" => "sparkplug_b",
+        "rest" => "http",
+        "logger" => "console",
         _ => kind,
     }
 }
@@ -468,6 +472,9 @@ pub(crate) fn action_owned_kind(kind: &str) -> bool {
             | "snowflake"
             | "tablestore"
             | "rabbitmq"
+            | "opc_ua"
+            | "sparkplug_b"
+            | "console"
     )
 }
 
@@ -1144,6 +1151,14 @@ impl Sink for ActionRuntimeSink {
     fn kind(&self) -> &'static str {
         self.state.inner.kind()
     }
+
+    fn local_deliveries(&self) -> Option<u64> {
+        self.state.inner.local_deliveries()
+    }
+
+    fn local_last_preview(&self) -> Option<String> {
+        self.state.inner.local_last_preview()
+    }
 }
 
 /// Wrap one built action sink in its resource-option runtime. The metric
@@ -1222,6 +1237,27 @@ pub(crate) fn stage_action_sink(
         });
     }
     required_action_parameters(record)?;
+    if canonical_action_kind(&record.action_type) == "console"
+        && action_connector_references(record).is_empty()
+    {
+        // A console action without a connector has no captured-output
+        // target. Keep the row storable with no runtime; the fire path
+        // counts its failure. A non-default resource option needs a
+        // runtime, so refuse it as for a kind without one.
+        if let Some(field) = resource_opts.first_non_default_field() {
+            return Err(format!(
+                "action {:?} field `resource_opts.{field}` is not supported without a connector",
+                record.id
+            ));
+        }
+        return Ok(ActionSinkStage {
+            sink: None,
+            wiring: ActionWiring::None,
+            resource_opts,
+            health_target: None,
+            probe_on_create: false,
+        });
+    }
     let reference = action_connector_references(record)
         .into_iter()
         .next()
@@ -1318,6 +1354,9 @@ pub(crate) fn build_action_sink_with_dir(
             .map(|sink| Some(sink as Arc<dyn broker_connectors::Sink>)),
         "snowflake" => build_snowflake_sink(record, connector_doc, opts).map(Some),
         "tablestore" => build_tablestore_sink(record, connector_doc, opts).map(Some),
+        "opc_ua" => build_opc_ua_sink(record, connector_doc).map(Some),
+        "sparkplug_b" => build_sparkplug_b_sink(record, connector_doc).map(Some),
+        "console" => build_console_sink(record).map(Some),
         // Other kinds own no runtime yet: no sink, no registration.
         // Delivery stays refused-by-default (the fire counts one
         // failure) until the kind plots its own data path (KC-00).
@@ -1690,6 +1729,31 @@ fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
                     return Err(bad(
                         "write_mode",
                         format!("must be `sync` or `async`: {mode:?}"),
+                    ));
+                }
+            }
+        }
+        "opc_ua" => {
+            if param_string(record, "node_id").is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: node_id (field `parameters.node_id`)",
+                    record.id
+                ));
+            }
+        }
+        "sparkplug_b" => {
+            if let Some(prefix) = param_string(record, "topic_prefix") {
+                if prefix.contains('+') || prefix.contains('#') {
+                    return Err(bad(
+                        "topic_prefix",
+                        "must be concrete: no `+` or `#`".to_string(),
+                    ));
+                }
+                let parts: Vec<&str> = prefix.split('/').collect();
+                if parts.first() != Some(&"spBv1.0") || parts.iter().any(|part| part.is_empty()) {
+                    return Err(bad(
+                        "topic_prefix",
+                        "must start with `spBv1.0/`".to_string(),
                     ));
                 }
             }
@@ -2615,6 +2679,198 @@ pub(crate) fn build_webhook_sink(
     })?;
     Ok(Arc::new(broker_connectors::HttpWebhookSink::new(
         target, headers, client,
+    )))
+}
+
+/// Build the action's `opc_ua` sink: the endpoint comes from the
+/// connector, the node id comes from this action.
+///
+/// Values and defaults:
+/// - Connector `endpoint_url` (aliases `server`, `url`, `endpoint`),
+///   required; must start with `opc.tcp://`.
+/// - Action `parameters.node_id`, required; must parse as a node id.
+/// - Security stays at the documented default (anonymous, no policy,
+///   no mode). A non-default value is refused with the field named.
+/// - Sampling interval 1000 ms. Reason: OPC UA Part 4 sets
+///   1000 ms as the default monitored-item sampling interval.
+///   The server revises the rate.
+/// - Publish topic template `opcua/${node.sanitized_id}`. Reason: the
+///   rule engine routes by topic. The template carries the sanitized
+///   node id.
+/// - Write pattern `#`. Reason: the action target is the node id, so
+///   every event topic routes to that node.
+/// - One row per send with no linger. Reason: the action runtime owns
+///   batching (RO-01).
+/// - Buffer holds one row. Reason: one row bounds memory. The runtime
+///   owns batching (RO-01).
+pub(crate) fn build_opc_ua_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::opc_ua as enterprise_opc_ua;
+    let connector = record.connector.trim().to_string();
+    let endpoint_url = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["endpoint_url", "server", "url", "endpoint"],
+        "endpoint_url",
+    )?;
+    if !endpoint_url.starts_with("opc.tcp://") {
+        return Err(format!(
+            "connector {connector:?} field `endpoint_url` must start with `opc.tcp://` (action {:?})",
+            record.id
+        ));
+    }
+    for key in ["security_policy", "security_mode", "auth"] {
+        if let Some(value) = connector_doc.get(key) {
+            if !value.is_null() {
+                let text = value.as_str().unwrap_or("").trim().to_lowercase();
+                let is_default = match key {
+                    "security_policy" => text.is_empty() || text == "none",
+                    "security_mode" => text.is_empty() || text == "none",
+                    "auth" => value.as_object().is_none_or(|map| map.is_empty()),
+                    _ => false,
+                };
+                if !is_default {
+                    return Err(format!(
+                        "connector {connector:?} field `{key}` is not supported: this action runtime uses anonymous with no policy or mode (action {:?})",
+                        record.id
+                    ));
+                }
+            }
+        }
+    }
+    let node_id = param_string(record, "node_id").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: node_id (field `parameters.node_id`)",
+            record.id
+        )
+    })?;
+    enterprise_opc_ua::OpcUaNodeId::parse(&node_id).map_err(|error| {
+        format!(
+            "action {:?} field `parameters.node_id` is invalid: {error}",
+            record.id
+        )
+    })?;
+    // Sampling interval 1000 ms. Reason: OPC UA Part 4 default.
+    // The server revises the rate.
+    const SAMPLING_INTERVAL_MS: u64 = 1000;
+    let config = enterprise_opc_ua::OpcUaSinkConfig {
+        endpoint_url,
+        security_policy: enterprise_opc_ua::OpcUaSecurityPolicy::None,
+        security_mode: enterprise_opc_ua::OpcUaSecurityMode::None,
+        auth: enterprise_opc_ua::OpcUaAuth::Anonymous,
+        node_subscriptions: vec![enterprise_opc_ua::NodeSubscriptionConfig {
+            node_id: node_id.clone(),
+            sampling_interval_ms: SAMPLING_INTERVAL_MS,
+            publish_topic_template: "opcua/${node.sanitized_id}".to_string(),
+            write_topic_pattern: Some("#".to_string()),
+        }],
+        buffer_capacity: Some(1),
+        batch_size: Some(1),
+        linger_ms: Some(0),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport = enterprise_opc_ua::DriverOpcUaTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its opc_ua transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = enterprise_opc_ua::OpcUaSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its opc_ua sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `sparkplug_b` sink: the MQTT server comes from
+/// the connector, the namespace guard comes from this action.
+///
+/// Values and defaults:
+/// - Connector `mqtt_url` (aliases `broker_address`, `server`,
+///   `endpoint`, `url`), required; plain `mqtt://` only.
+/// - Action `parameters.topic_prefix`, optional; when set it must
+///   start with `spBv1.0/` and hold no wildcard.
+/// - Client id from the connector `client_id`, else derived per
+///   process by the driver. An empty value is refused.
+/// - Tier is always `enterprise`. Reason: the driver requires it.
+/// - One row per send with no linger. Reason: the action runtime owns
+///   batching (RO-01).
+/// - Alias ceiling 10_000. Reason: the driver default bounds the
+///   edge alias table near 1 MiB.
+pub(crate) fn build_sparkplug_b_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::sparkplug_b as enterprise_spb;
+    let connector = record.connector.trim().to_string();
+    let mqtt_url = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["mqtt_url", "broker_address", "server", "endpoint", "url"],
+        "mqtt_url",
+    )?;
+    if let Some(client_id) = connector_doc.get("client_id").and_then(|v| v.as_str()) {
+        if client_id.trim().is_empty() {
+            return Err(format!(
+                "connector {connector:?} field `client_id` must not be empty (action {:?})",
+                record.id
+            ));
+        }
+    }
+    let topic_prefix = param_string(record, "topic_prefix");
+    let client_id = connector_doc
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Alias ceiling 10_000. Reason: the driver default.
+    const MAX_ALIASES: usize = 10_000;
+    let config = enterprise_spb::SparkplugSinkConfig {
+        topic_prefix: topic_prefix.clone(),
+        tier: enterprise_spb::SPARKPLUG_TIER.to_string(),
+        batch_size: Some(1),
+        linger_ms: Some(0),
+        timeout_ms: connector_timeout_ms(connector_doc),
+        mqtt_url: Some(mqtt_url.clone()),
+        client_id,
+        max_aliases: Some(MAX_ALIASES),
+    };
+    // TODO(parity): which action field selects the Sparkplug group and
+    // edge node? The rulebook does not decide. The current choice
+    // guards on the optional `topic_prefix` only and forwards the
+    // event topic unchanged.
+    let transport =
+        enterprise_spb::RumqttcSparkplugTransport::new(&mqtt_url, config.client_id.as_deref())
+            .map_err(|error| {
+                format!(
+                    "action {:?} cannot build its sparkplug_b transport: {error}",
+                    record.id
+                )
+            })?;
+    let sink =
+        enterprise_spb::SparkplugBSink::new(config, Arc::new(transport)).map_err(|error| {
+            format!(
+                "action {:?} cannot build its sparkplug_b sink: {error}",
+                record.id
+            )
+        })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `console` sink. The sink keeps the captured
+/// output for tests. It uses the action id as the sink name.
+/// Reason: one action owns one sink, and the name shows the owner.
+pub(crate) fn build_console_sink(
+    record: &ActionRecord,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Ok(Arc::new(broker_connectors::ConsoleLoggerSink::new(
+        record.id.clone(),
     )))
 }
 
@@ -5809,6 +6065,17 @@ fn rebuild_action_sinks(
                         stage.resource_opts,
                         stage.health_target,
                     );
+                    // A console action shares its captured output with
+                    // the connector read path. Register the same runtime
+                    // under the bare connector name, as create does.
+                    if canonical_action_kind(&record.action_type) == "console" {
+                        let bare = record.connector.trim();
+                        if !bare.is_empty() {
+                            engine
+                                .connectors()
+                                .register(bare.to_string(), Arc::clone(&sink));
+                        }
+                    }
                     // Boot finds nothing here. A reload or restore swap
                     // hands the old generation to the caller for drain.
                     engine.connectors().register(key, sink);
@@ -5888,7 +6155,7 @@ mod tests {
     #[tokio::test]
     async fn stage_non_owned_kind_wires_nothing() {
         let connectors = ConnectorStore::new();
-        let stage = stage_action_sink(&connectors, &record("act", "console", "console:up"))
+        let stage = stage_action_sink(&connectors, &record("act", "no-such-kind", "no-such:up"))
             .expect("staging a kind with no runtime stages nothing");
         assert!(stage.sink.is_none());
         assert_eq!(stage.wiring, ActionWiring::None);
@@ -8370,5 +8637,62 @@ mod tests {
         assert_eq!(good_metrics.snapshot().failed, 0);
         assert_eq!(bad_metrics.snapshot().success, 0);
         assert_eq!(bad_metrics.snapshot().failed, 1);
+    }
+
+    #[tokio::test]
+    async fn mv03c_canonical_maps_every_alias() {
+        assert_eq!(canonical_action_kind("opcua"), "opc_ua");
+        assert_eq!(canonical_action_kind("sparkplug"), "sparkplug_b");
+        assert_eq!(canonical_action_kind("spb"), "sparkplug_b");
+        assert_eq!(canonical_action_kind("rest"), "http");
+        assert_eq!(canonical_action_kind("http"), "http");
+    }
+
+    #[tokio::test]
+    async fn mv03c_owned_kind_covers_device_and_http() {
+        assert!(action_owned_kind("http"));
+        assert!(action_owned_kind("rest"));
+        assert!(action_owned_kind("opc_ua"));
+        assert!(action_owned_kind("opcua"));
+        assert!(action_owned_kind("sparkplug_b"));
+        assert!(action_owned_kind("sparkplug"));
+        assert!(action_owned_kind("spb"));
+    }
+
+    #[tokio::test]
+    async fn mv03c_opc_ua_sink_uses_connector_and_action_fields() {
+        let doc = serde_json::json!({"endpoint_url": "opc.tcp://127.0.0.1:4840"});
+        let rec = record("act", "opc_ua", "opc_ua:up");
+        let error = build_opc_ua_sink(&rec, &doc)
+            .err()
+            .expect("a missing node id refuses");
+        assert!(error.contains("node_id"), "{error}");
+        let mut full = record("act", "opc_ua", "opc_ua:up");
+        full.parameters = serde_json::json!({"node_id": "ns=1;i=1001"});
+        let sink = build_opc_ua_sink(&full, &doc).expect("a full pair builds");
+        assert_eq!(sink.kind(), "opc_ua");
+        let bad_doc = serde_json::json!({"server": "127.0.0.1:4840"});
+        let error = build_opc_ua_sink(&full, &bad_doc)
+            .err()
+            .expect("a missing endpoint refuses");
+        assert!(error.contains("endpoint_url"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn mv03c_sparkplug_b_sink_uses_connector_and_action_fields() {
+        let doc = serde_json::json!({"mqtt_url": "mqtt://127.0.0.1:1883"});
+        let mut rec = record("act", "sparkplug_b", "sparkplug_b:up");
+        rec.parameters = serde_json::json!({"topic_prefix": "spBv1.0/plant1"});
+        let sink = build_sparkplug_b_sink(&rec, &doc).expect("a full pair builds");
+        assert_eq!(sink.kind(), "sparkplug_b");
+        let bare = record("act", "sparkplug_b", "sparkplug_b:up");
+        let error = build_sparkplug_b_sink(&bare, &serde_json::json!({}))
+            .err()
+            .expect("a missing mqtt url refuses");
+        assert!(error.contains("mqtt_url"), "{error}");
+        let mut bad_prefix = record("act", "sparkplug_b", "sparkplug_b:up");
+        bad_prefix.parameters = serde_json::json!({"topic_prefix": "spBv1.0/a/#/x"});
+        let error = required_action_parameters(&bad_prefix).expect_err("a wildcard prefix refuses");
+        assert!(error.contains("topic_prefix"), "{error}");
     }
 }

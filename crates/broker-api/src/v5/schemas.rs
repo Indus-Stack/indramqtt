@@ -844,6 +844,31 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         ),
     );
 
+    // 42a. OPC-UA device
+    schemas.insert(
+        "opc_ua.post_connector".to_string(),
+        obj_schema_with_type(
+            "opc_ua",
+            json!({
+                "endpoint_url": str_prop("opc.tcp://127.0.0.1:4840")
+            }),
+            &["name", "endpoint_url"],
+        ),
+    );
+
+    // 42b. Sparkplug B device
+    schemas.insert(
+        "sparkplug_b.post_connector".to_string(),
+        obj_schema_with_type(
+            "sparkplug_b",
+            json!({
+                "mqtt_url": str_prop("mqtt://127.0.0.1:1883"),
+                "client_id": str_prop("")
+            }),
+            &["name", "mqtt_url"],
+        ),
+    );
+
     // 42. SysKeeper
     schemas.insert(
         "syskeeper_forwarder.post".to_string(),
@@ -1208,6 +1233,32 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "qos": int_prop(1)
             }),
             &["name", "connector", "topic"],
+        ),
+    );
+
+    // OPC-UA action
+    schemas.insert(
+        "opc_ua.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "opc_ua",
+            json!({
+                "connector": str_prop(""),
+                "node_id": str_prop("ns=1;i=1001")
+            }),
+            &["name", "connector", "node_id"],
+        ),
+    );
+
+    // Sparkplug B action
+    schemas.insert(
+        "sparkplug_b.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "sparkplug_b",
+            json!({
+                "connector": str_prop(""),
+                "topic_prefix": str_prop("spBv1.0/plant1")
+            }),
+            &["name", "connector"],
         ),
     );
 

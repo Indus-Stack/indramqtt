@@ -419,7 +419,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["rest"],
         family: "http",
         owner: "MV-03c",
-        state: KindState::Pending("MV-03c"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -569,7 +569,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["opcua"],
         family: "device",
         owner: "MV-03c",
-        state: KindState::Pending("MV-03c"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -734,7 +734,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["sparkplug", "spb"],
         family: "device",
         owner: "MV-03c",
-        state: KindState::Pending("MV-03c"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -874,8 +874,9 @@ static TEST_KINDS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Family tickets whose kinds the plan accepts as `ready` at the close of
 /// KC-00. Add a ticket only after its family contract is accepted. The
 /// readiness test derives the expected state from this list.
-pub const ACCEPTED_FAMILY_TICKETS: &[&str] =
-    &["MV-01", "KC-00/D9", "MV-02a", "MV-02b", "MV-02c", "MV-02d"];
+pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &[
+    "MV-01", "KC-00/D9", "MV-02a", "MV-02b", "MV-02c", "MV-02d", "MV-03c",
+];
 
 /// Enable the test-only `test` kind for this process. Test builds call
 /// this; a release build does not.
@@ -953,6 +954,12 @@ pub const LIVE_SINK_KIND_TABLE: &[(&str, &str)] = &[
     ("elastic", "elasticsearch"),
     ("es", "elasticsearch"),
     ("opensearch", "elasticsearch"),
+    ("opcua", "opc_ua"),
+    ("sparkplug", "sparkplug_b"),
+    ("spb", "sparkplug_b"),
+    ("http", "webhook"),
+    ("rest", "webhook"),
+    ("logger", "console"),
 ];
 
 /// Map one accepted name to its runtime kind. Unknown names pass
@@ -1059,7 +1066,7 @@ pub fn render_markdown() -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Connector, action and source create answer `400` for a kind that is not ready. The code is `ALREADY_EXISTS` when the connector credential fields pass. A missing credential answers `400 BAD_REQUEST` and names the field. Update answers `400 BAD_REQUEST`. Probe answers `400 TEST_FAILED`. A non-ready refusal carries `connector type <kind> is not available in this broker`. Nothing is stored. A refused update keeps the old record. A strict config file load fails and names the file, key and kind. A stored record from an earlier version is kept and visible. It reports `disconnected` with a `status_reason`. It raises `connector_unavailable:<id>` or `action_unavailable:<id>`. A rule that uses it stays enabled and counts the forward as failed. The schema, action-type and source-type listings show only ready kinds."
+        "Connector, action and source create answer `400` for a kind that is not ready. The code is `ALREADY_EXISTS` when the connector credential fields pass. A missing credential names the field. `http`, `opc_ua`, `sparkplug_b` and the object, file and cloud kinds answer `400 ALREADY_EXISTS`; other kinds answer `400 BAD_REQUEST`. Update answers `400 BAD_REQUEST`. Probe answers `400 TEST_FAILED`. A non-ready refusal carries `connector type <kind> is not available in this broker`. Nothing is stored. A refused update keeps the old record. A strict config file load fails and names the file, key and kind. A stored record from an earlier version is kept and visible. It reports `disconnected` with a `status_reason`. It raises `connector_unavailable:<id>` or `action_unavailable:<id>`. A rule that uses it stays enabled and counts the forward as failed. The schema, action-type and source-type listings show only ready kinds."
     );
     out
 }
@@ -1171,7 +1178,13 @@ mod tests {
         assert_eq!(kind_row("mongodb").map(|row| row.owner), Some("MV-02c"));
         assert_eq!(kind_row("couchbase").map(|row| row.owner), Some("MV-02c"));
         assert_eq!(kind_row("opensearch").map(|row| row.owner), Some("MV-02c"));
-        assert!(!is_kind_ready("http"));
+        assert!(is_kind_ready("http"));
+        assert!(is_kind_ready("rest"));
+        assert!(is_kind_ready("opc_ua"));
+        assert!(is_kind_ready("opcua"));
+        assert!(is_kind_ready("sparkplug_b"));
+        assert!(is_kind_ready("sparkplug"));
+        assert!(is_kind_ready("spb"));
         assert!(!is_kind_ready("kafka"));
         assert!(is_kind_ready("mysql"));
         assert!(is_kind_ready("mssql"));

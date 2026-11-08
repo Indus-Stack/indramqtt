@@ -1466,6 +1466,13 @@ impl OpcUaSink {
     /// the buffer, engages backoff, and propagates.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
+        self.flush_batch().await
+    }
+
+    /// Flush buffered writes without the backoff gate. A new event
+    /// uses this path to retry the row a failed flush left behind, so
+    /// a temporary outage does not block later events.
+    async fn flush_batch(&self) -> Result<()> {
         let (rows, oldest) = self.buffer.lock().take_batch();
         if rows.is_empty() {
             return Ok(());
@@ -1578,6 +1585,17 @@ impl OpcUaSink {
 #[async_trait]
 impl Sink for OpcUaSink {
     async fn send(&self, topic: &Topic, payload: &Bytes, qos: QoS) -> Result<()> {
+        // Retry rows left by a failed flush once the backoff window has
+        // passed. A new event is the trigger. Before the window ends, the
+        // gate refuses the retry and the buffered row stays in place. A
+        // normal buffered row waits for its own batch trigger.
+        let retry_ready = {
+            let backoff = self.backoff.lock();
+            backoff.is_failed() && backoff.check().is_ok()
+        };
+        if retry_ready && !self.buffer.lock().is_empty() {
+            self.flush_batch().await?;
+        }
         if self.buffer_row(topic, payload, qos)? {
             self.flush().await?;
         }

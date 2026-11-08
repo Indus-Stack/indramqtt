@@ -23,6 +23,22 @@ flowchart LR
 
 ## Connector send-path records (DOC-04)
 
+### OPC-UA send path (2026-11-06)
+
+- Item: `opc_ua` connector send path.
+- Input: `POST /api/v5/connectors` with `endpoint_url` `opc.tcp://127.0.0.1:4840`, then a publish through a forwarding rule.
+- Expected from: the OPC-UA page of this documentation.
+- Broker gave: 201 on creation. No write reached a server. No server ran in the docs run.
+- State: not verified.
+
+### Sparkplug B send path (2026-11-06)
+
+- Item: `sparkplug_b` connector send path.
+- Input: `POST /api/v5/connectors` with `mqtt_url` `mqtt://127.0.0.1:1883`, then a publish through a forwarding rule.
+- Expected from: the Sparkplug B page of this documentation.
+- Broker gave: 201 on creation. No frame reached a server. No server ran in the docs run.
+- State: not verified.
+
 ### Kafka send path (2026-10-13)
 
 - Item: `kafka` connector send path.

@@ -834,6 +834,20 @@ pub async fn create_action(
                     .engine
                     .connectors()
                     .register(key.clone(), Arc::clone(&sink));
+                // Local kinds share the captured output. The connector
+                // read path (`GET /connectors/:id`) looks up the bare
+                // name, while delivery runs under the action key. Register
+                // the same runtime under the bare connector name so the
+                // captured output is visible in both places. Reason: the
+                // local check reads the connector entry.
+                if crate::v5::action_sinks::canonical_action_kind(entry.action_type.as_str())
+                    == "console"
+                {
+                    let bare = entry.connector.trim().to_string();
+                    if !bare.is_empty() {
+                        state.engine.connectors().register(bare, Arc::clone(&sink));
+                    }
+                }
                 // A down server is stored and reports `disconnected`
                 // from this real connection attempt; the sink keeps the
                 // action and retries on its interval.

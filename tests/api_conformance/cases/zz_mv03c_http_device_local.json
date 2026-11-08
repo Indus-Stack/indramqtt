@@ -1,0 +1,608 @@
+[
+  {
+    "body": {
+      "name": "mv03c-lc-http",
+      "type": "http",
+      "url": "http://127.0.0.1:9000/hook"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-http"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "name": "mv03c-lc-http-bad",
+      "type": "http"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "endpoint_url": "opc.tcp://127.0.0.1:4840",
+      "name": "mv03c-lc-opc",
+      "type": "opc_ua"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-opc"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "name": "mv03c-lc-opc-bad",
+      "type": "opc_ua"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "mqtt_url": "mqtt://127.0.0.1:1883",
+      "name": "mv03c-lc-spb",
+      "type": "sparkplug_b"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-spb"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "name": "mv03c-lc-spb-bad",
+      "type": "sparkplug_b"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "name": "mv03c-lc-console",
+      "type": "console"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-console"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "name": "mv03c-lc-rest",
+      "type": "rest",
+      "url": "http://127.0.0.1:9000/hook"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-rest"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /connectors",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "endpoint_url": "opc.tcp://127.0.0.1:4840",
+      "name": "mv03c-lc-opc",
+      "type": "opc_ua"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-opc"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "PUT /connectors/{id}",
+    "path_params": {
+      "id": "mv03c-lc-opc"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "endpoint_url": "opc.tcp://127.0.0.1:4840",
+            "name": "mv03c-lc-opc",
+            "type": "opc_ua"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "mv03c-lc-http",
+      "type": "http",
+      "url": "http://127.0.0.1:9000/other"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-http"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "PUT /connectors/{id}",
+    "path_params": {
+      "id": "mv03c-lc-http"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "name": "mv03c-lc-http",
+            "type": "http",
+            "url": "http://127.0.0.1:9000/hook"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "name": "p",
+      "type": "http",
+      "url": "http://127.0.0.1:9/hook"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "endpoint_url": "opc.tcp://127.0.0.1:9",
+      "name": "p",
+      "type": "opc_ua"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "mqtt_url": "mqtt://127.0.0.1:9",
+      "name": "p",
+      "type": "sparkplug_b"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /connectors_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "connector": "mv03c-lc-http",
+      "name": "mv03c-lc-http-act",
+      "parameters": {
+        "headers": {
+          "X-Source": "mv03c"
+        },
+        "method": "post",
+        "path": "/ingest/${topic}"
+      },
+      "type": "http"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv03c-lc-http-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-http"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "name": "mv03c-lc-http",
+            "type": "http",
+            "url": "http://127.0.0.1:9000/hook"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv03c-lc-http",
+      "name": "mv03c-lc-http-act-bad",
+      "parameters": {
+        "method": "get",
+        "path": "/ingest/${topic}"
+      },
+      "type": "http"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-http"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "name": "mv03c-lc-http",
+            "type": "http",
+            "url": "http://127.0.0.1:9000/hook"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv03c-lc-opc",
+      "name": "mv03c-lc-opc-act",
+      "parameters": {
+        "node_id": "ns=1;i=1001"
+      },
+      "type": "opc_ua"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv03c-lc-opc-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-opc"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "endpoint_url": "opc.tcp://127.0.0.1:4840",
+            "name": "mv03c-lc-opc",
+            "type": "opc_ua"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv03c-lc-opc",
+      "name": "mv03c-lc-opc-act-bad",
+      "parameters": {},
+      "type": "opc_ua"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-opc"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "endpoint_url": "opc.tcp://127.0.0.1:4840",
+            "name": "mv03c-lc-opc",
+            "type": "opc_ua"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv03c-lc-spb",
+      "name": "mv03c-lc-spb-act",
+      "parameters": {
+        "topic_prefix": "spBv1.0/plant1"
+      },
+      "type": "sparkplug_b"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv03c-lc-spb-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-spb"
+        }
+      }
+    ],
+    "expect_status": 201,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "mqtt_url": "mqtt://127.0.0.1:1883",
+            "name": "mv03c-lc-spb",
+            "type": "sparkplug_b"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv03c-lc-spb",
+      "name": "mv03c-lc-spb-act-bad",
+      "parameters": {
+        "topic_prefix": "spBv1.0/a/#/x"
+      },
+      "type": "sparkplug_b"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-spb"
+        }
+      }
+    ],
+    "expect_status": 400,
+    "operation": "POST /actions",
+    "path_params": {},
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "mqtt_url": "mqtt://127.0.0.1:1883",
+            "name": "mv03c-lc-spb",
+            "type": "sparkplug_b"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "mv03c-lc-http",
+      "name": "mv03c-lc-http-act",
+      "parameters": {
+        "path": "/updated/${topic}"
+      },
+      "type": "http"
+    },
+    "cleanup": [
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/actions/mv03c-lc-http-act"
+        }
+      },
+      {
+        "api": {
+          "method": "DELETE",
+          "path": "/connectors/mv03c-lc-http"
+        }
+      }
+    ],
+    "expect_status": 200,
+    "operation": "PUT /actions/{id}",
+    "path_params": {
+      "id": "mv03c-lc-http-act"
+    },
+    "query": {},
+    "setup": [
+      {
+        "api": {
+          "body": {
+            "name": "mv03c-lc-http",
+            "type": "http",
+            "url": "http://127.0.0.1:9000/hook"
+          },
+          "method": "POST",
+          "path": "/connectors"
+        }
+      },
+      {
+        "api": {
+          "body": {
+            "connector": "mv03c-lc-http",
+            "name": "mv03c-lc-http-act",
+            "parameters": {
+              "path": "/ingest/${topic}"
+            },
+            "type": "http"
+          },
+          "method": "POST",
+          "path": "/actions"
+        }
+      }
+    ]
+  },
+  {
+    "body": {
+      "connector": "c",
+      "name": "p",
+      "parameters": {
+        "path": "/p"
+      },
+      "type": "http"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": {
+      "connector": "c",
+      "name": "p",
+      "parameters": {
+        "node_id": "ns=1;i=1001"
+      },
+      "type": "opc_ua"
+    },
+    "cleanup": [],
+    "expect_status": 400,
+    "operation": "POST /actions_probe",
+    "path_params": {},
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /schemas/{name}",
+    "path_params": {
+      "name": "opc_ua.post_connector"
+    },
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /schemas/{name}",
+    "path_params": {
+      "name": "sparkplug_b.post_connector"
+    },
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /schemas/{name}",
+    "path_params": {
+      "name": "opc_ua.post_bridge_v2"
+    },
+    "query": {},
+    "setup": []
+  },
+  {
+    "body": null,
+    "cleanup": [],
+    "expect_status": 200,
+    "operation": "GET /schemas/{name}",
+    "path_params": {
+      "name": "sparkplug_b.post_bridge_v2"
+    },
+    "query": {},
+    "setup": []
+  }
+]

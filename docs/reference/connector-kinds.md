@@ -37,7 +37,7 @@ flowchart LR
 | gcp_iot | gcp_iot_core, cloud_iot | cloud-iot | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | gcp_iot |
 | gcp_pubsub | gcp, pubsub, gcp_pubsub_consumer, gcp_pubsub_producer | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | gcp_pubsub |
 | greptimedb | greptime | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
-| http | rest | http | MV-03c | pending MV-03c | yes | yes | yes | yes | yes | - |
+| http | rest | http | MV-03c | ready | yes | yes | yes | yes | yes | - |
 | influxdb |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | iotdb |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | kafka | kafka_producer, kafka_consumer | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | kafka |
@@ -47,7 +47,7 @@ flowchart LR
 | mssql | sqlserver | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | mysql | mariadb | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | oci_streaming | oci | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | - |
-| opc_ua | opcua | device | MV-03c | pending MV-03c | yes | yes | yes | yes | yes | - |
+| opc_ua | opcua | device | MV-03c | ready | yes | yes | yes | yes | yes | - |
 | opentsdb | opents | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | oracle |  | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | pgsql | postgres, postgresql | relational | MV-01 | ready | yes | yes | yes | yes | yes | - |
@@ -58,7 +58,7 @@ flowchart LR
 | rocketmq |  | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
 | s3 | minio | object-store | MV-02d | ready | yes | yes | yes | yes | yes | s3 |
 | snowflake | snowflake_streaming, snowflake_aggregated | object-store | MV-02d | ready | yes | yes | yes | yes | yes | - |
-| sparkplug_b | sparkplug, spb | device | MV-03c | pending MV-03c | yes | yes | yes | yes | yes | - |
+| sparkplug_b | sparkplug, spb | device | MV-03c | ready | yes | yes | yes | yes | yes | - |
 | tablestore | ots | object-store | MV-02d | ready | yes | yes | yes | yes | yes | - |
 | tdengine |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | test |  | local | MV-03c | test-only | yes | no | no | yes | yes | - |
@@ -77,4 +77,4 @@ flowchart LR
 
 ## Behaviour of a kind that is not ready
 
-Connector, action and source create answer `400` for a kind that is not ready. The code is `ALREADY_EXISTS` when the connector credential fields pass. A missing credential answers `400 BAD_REQUEST` and names the field. Update answers `400 BAD_REQUEST`. Probe answers `400 TEST_FAILED`. A non-ready refusal carries `connector type <kind> is not available in this broker`. Nothing is stored. A refused update keeps the old record. A strict config file load fails and names the file, key and kind. A stored record from an earlier version is kept and visible. It reports `disconnected` with a `status_reason`. It raises `connector_unavailable:<id>` or `action_unavailable:<id>`. A rule that uses it stays enabled and counts the forward as failed. The schema, action-type and source-type listings show only ready kinds.
+Connector, action and source create answer `400` for a kind that is not ready. The code is `ALREADY_EXISTS` when the connector credential fields pass. A missing credential names the field. `http`, `opc_ua`, `sparkplug_b` and the object, file and cloud kinds answer `400 ALREADY_EXISTS`; other kinds answer `400 BAD_REQUEST`. Update answers `400 BAD_REQUEST`. Probe answers `400 TEST_FAILED`. A non-ready refusal carries `connector type <kind> is not available in this broker`. Nothing is stored. A refused update keeps the old record. A strict config file load fails and names the file, key and kind. A stored record from an earlier version is kept and visible. It reports `disconnected` with a `status_reason`. It raises `connector_unavailable:<id>` or `action_unavailable:<id>`. A rule that uses it stays enabled and counts the forward as failed. The schema, action-type and source-type listings show only ready kinds.
