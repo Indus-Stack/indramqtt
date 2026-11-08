@@ -636,3 +636,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a real Kafka cluster delivers records through the broker ingress and sink paths.
 - Broker gave: not run. The source store keeps the registration and the enable flag, and this build has no Kafka pull loop. The v1 route refuses the name with 400 because the name is an alias. The v5 connector route maps the name to the `kafka` sink runtime; the default build refuses it with 400 and names the `kafka` feature. The page checks registration and creation only. The pull path and the send path stay not verified.
 - Date: 2026-11-08.
+
+## DX2-050 item `kafka_producer`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `kafka_producer` (refused) and `POST /api/v5/connectors` type `kafka_producer`. No Kafka cluster ran in this task.
+- Expected: a real Kafka cluster accepts the records through the broker rule path. Source: the `kafka` sink code comment in `crates/broker-connectors/src/kafka.rs`.
+- Broker gave: not run. The v1 route refuses the name with 400 because the name is an alias. The v5 route maps the name to the `kafka` sink runtime; the default build refuses it with 400 and names the `kafka` feature. The page checks the refusal and the creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-050 item `kinesis`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `kinesis` and `POST /api/v5/connectors` type `kinesis`. No Amazon Kinesis stream ran in this task.
+- Expected: a real Kinesis stream accepts the `PutRecords` batches through the broker rule path. Source: the `kinesis` sink code comment in `crates/broker-connectors-enterprise/src/kinesis.rs`.
+- Broker gave: not run. Both routes gate the kind behind the `kinesis` feature; the default build refuses it with 400 and names the feature. The page checks the refusal and the creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-050 item `mqtt`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `mqtt` (refused) and `POST /api/v5/connectors` type `mqtt`. No remote MQTT broker ran in this task.
+- Expected: a remote MQTT broker accepts the PUBLISH frames through the broker rule path. Source: the `mqtt_bridge` sink code comment in `crates/broker-connectors/src/mqtt_bridge.rs`.
+- Broker gave: not run. The v1 route refuses `mqtt`; it accepts `mqtt_bridge`. The v5 route maps `mqtt` to the `mqtt_bridge` runtime and creates the connector in the default build. No message reached a remote broker. The page checks the refusal and the creation only. The send path stays not verified.
+- Date: 2026-11-08.

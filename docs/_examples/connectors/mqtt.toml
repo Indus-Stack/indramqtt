@@ -1,0 +1,16 @@
+[example]
+area = "connectors"
+item = "mqtt"
+kind = "connector-create"
+
+[[case]]
+name = "mqtt-normal"
+server = "127.0.0.1:1883"
+client_id = "docs-bridge"
+expect_status = 201
+
+[[case]]
+name = "mqtt-edge-empty-client-id"
+server = "127.0.0.1:1883"
+client_id = ""
+expect_status = 400
