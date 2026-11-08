@@ -552,3 +552,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a real Confluent cluster accepts the records through the broker rule path.
 - Broker gave: not run. No Confluent cluster ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-08.
+
+## DX2-046 item `console`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `console` and `POST /api/v5/connectors` type `console`, plus a rule that forwards one published message to the connector.
+- Expected: the broker log holds one INFO line `connector event` with the topic, the QoS, and the payload preview.
+- Broker gave: the docs harness reads no broker log file. The page checks creation and the rule action counter only. The log line text stays not verified.
+- Date: 2026-11-08.
+
+## DX2-046 item `databricks`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `databricks` with the full config, and `POST /api/v5/connectors` type `databricks`. No live workspace ran in this task.
+- Expected: a real Databricks workspace accepts the rows through the broker rule path.
+- Broker gave: not run. No Databricks workspace ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-046 item `datalayers`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `datalayers` with the full config, and `POST /api/v5/connectors` type `datalayers`. No live server ran in this task.
+- Expected: a real Datalayers server accepts the records through the broker rule path.
+- Broker gave: not run. No Datalayers server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
