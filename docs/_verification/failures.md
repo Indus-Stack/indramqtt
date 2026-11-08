@@ -615,3 +615,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a real Google Cloud Pub/Sub subscription delivers messages through the broker rule path.
 - Broker gave: not run. The source store keeps the registration and the enable flag, and this build has no Pub/Sub pull loop. The connector route maps the name to the `gcp_pubsub` sink runtime; the default build refuses it with 400 and names the `gcp_pubsub` feature. The page checks registration and creation only. The pull path and the send path stay not verified.
 - Date: 2026-11-08.
+
+## DX2-049 item `gcp_pubsub_producer`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `gcp_pubsub_producer` (refused) and `POST /api/v5/connectors` type `gcp_pubsub_producer`. No Pub/Sub service ran in this task.
+- Expected: a real Google Cloud Pub/Sub topic accepts the published messages through the broker rule path.
+- Broker gave: not run. The v1 route refuses the name with 400 because the name is an alias. The v5 route maps the name to the `gcp_pubsub` sink runtime; the default build refuses it with 400 and names the `gcp_pubsub` feature. The page checks the refusal and the creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-049 item `http`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `http` and `POST /api/v5/connectors` type `http`, then one publish through a forwarding rule to a local HTTP receiver. No external HTTP service ran in this task.
+- Expected: an external HTTP endpoint accepts the posted batch through the broker rule path.
+- Broker gave: the docs run posts one message to a local loopback receiver and prints `http`. The v1 route stores the runtime as `webhook`. The remote endpoint and its authentication stay not verified.
+- Date: 2026-11-08.
+
+## DX2-049 item `kafka_consumer`
+
+- Input: docs harness check `POST /api/v5/sources` with type `kafka_consumer`, and `POST /api/v5/connectors` type `kafka_consumer`. No Kafka cluster ran in this task.
+- Expected: a real Kafka cluster delivers records through the broker ingress and sink paths.
+- Broker gave: not run. The source store keeps the registration and the enable flag, and this build has no Kafka pull loop. The v1 route refuses the name with 400 because the name is an alias. The v5 connector route maps the name to the `kafka` sink runtime; the default build refuses it with 400 and names the `kafka` feature. The page checks registration and creation only. The pull path and the send path stay not verified.
+- Date: 2026-11-08.

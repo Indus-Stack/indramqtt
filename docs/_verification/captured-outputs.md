@@ -46,12 +46,15 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/gcp_iot.md` | 98 | `ok` |
 | `connectors/gcp_pubsub.md` | 99 | `ok` |
 | `connectors/gcp_pubsub_consumer.md` | 89 | `ok` |
+| `connectors/gcp_pubsub_producer.md` | 85 | `ok` |
 | `connectors/greptimedb.md` | 90 | `greptimedb` |
 | `connectors/http.md` | 93 | `delivered` |
+| `connectors/http.md` | 192 | `http` |
 | `connectors/index.md` | 127 | `ok` |
 | `connectors/influxdb.md` | 89 | `influxdb` |
 | `connectors/iotdb.md` | 98 | `iotdb` |
 | `connectors/kafka.md` | 88 | `ok` |
+| `connectors/kafka_consumer.md` | 89 | `ok` |
 | `connectors/mongodb.md` | 94 | `ok` |
 | `connectors/mqtt-bridge.md` | 94 | `mqtt_bridge` |
 | `connectors/mssql.md` | 99 | `mssql` |
@@ -148,4 +151,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 132 blocks. Each output matches its page.
+The run captured 135 blocks. Each output matches its page.
