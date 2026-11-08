@@ -678,3 +678,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a real PostgreSQL server accepts the fixed insert through the broker rule path. Source: the PostgreSQL sink module comment and the v5 `pgsql` branch in `crates/broker-api/src/v5/rules.rs`.
 - Broker gave: the docs run reads the PostgreSQL startup message from a local listener and prints `connected`. The listener checks the user and the database. No server completes authentication or the insert. The insert stays not verified.
 - Date: 2026-11-08.
+
+## DX2-052 item `redshift`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `redshift` and `POST /api/v5/connectors` type `redshift`, then one publish through a forwarding rule to a local Data API receiver. No Redshift cluster ran in this task.
+- Expected: a real Redshift database executes the inserted rows through the broker rule path. Source: the Redshift sink module comment in `crates/broker-connectors-enterprise/src/redshift.rs`.
+- Broker gave: the docs run sends one signed `BatchExecuteStatement` body to a local receiver and prints `delivered`. The receiver checks the database, the workgroup, the SQL, the topic, the client id, and the payload, and answers `FINISHED` to the status poll. The real service, its SQL execution, and its signature check stay not verified.
+- Date: 2026-11-08.
+
+## DX2-052 item `s3`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `s3` and `POST /api/v5/connectors` type `s3`. No object store ran in this task.
+- Expected: a real S3 or S3-compatible bucket accepts the `PutObject` bodies through the broker rule path. Source: the S3 sink module comment in `crates/broker-connectors/src/s3.rs`.
+- Broker gave: not run. The default build refuses the kind with 400 and names the `s3` feature. A feature build creates the connector. No object reached a bucket. The page checks the refusal, the creation, and the bucket validation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-052 item `s3_tables`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `s3_tables` and `POST /api/v5/connectors` type `s3_tables`, then one publish through a forwarding rule to a local S3 receiver. No S3 Tables service ran in this task.
+- Expected: a real S3 Tables table accepts the gzip data files and the table commit through the broker rule path. Source: the S3 Tables sink module comment in `crates/broker-connectors-enterprise/src/s3_tables.rs`.
+- Broker gave: the docs run sends one signed gzip data file to a local receiver and prints `delivered`. The receiver checks the partition path, the gzip body, the content type, and the signature header. The real service, the table commit, and its signature check stay not verified.
+- Date: 2026-11-08.
