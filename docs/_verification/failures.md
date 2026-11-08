@@ -489,3 +489,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/azure_event_grid.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-08.
+
+## DX2-043 item `azure_event_hub_producer`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `azure_event_hub_producer` and `POST /api/v5/connectors` type `azure_event_hub_producer`. No live server ran in this task.
+- Expected: a real Event Hubs namespace accepts the batch through the broker rule path.
+- Broker gave: not run. No Event Hubs namespace ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-043 item `azure_eventhubs`
+
+- Input: docs harness creation check `POST /api/v5/connectors` type `azure_eventhubs` without a key, then `POST /api/v1/connectors` kind `azure_eventhubs` with the full config. No live server ran in this task.
+- Expected: a real Event Hubs namespace accepts the batch through the broker rule path.
+- Broker gave: not run. No Event Hubs namespace ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-043 item `azure_iot`
+
+- Input: docs harness creation check `POST /api/v5/connectors` type `azure_iot` without a key, then `POST /api/v1/connectors` kind `azure_iot` with the full config. No live server ran in this task.
+- Expected: a real IoT Hub accepts the device-to-cloud publish through the broker rule path.
+- Broker gave: not run. No IoT Hub ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
