@@ -22,6 +22,9 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/alloydb.md` | 93 | `alloydb` |
 | `connectors/aws_iot.md` | 100 | `ok` |
 | `connectors/aws_timestream.md` | 103 | `timestream` |
+| `connectors/azure_blob.md` | 91 | `ok` |
+| `connectors/azure_blob_storage.md` | 81 | `ok` |
+| `connectors/azure_event_grid.md` | 71 | `ok` |
 | `connectors/clickhouse.md` | 84 | `ok` |
 | `connectors/couchbase.md` | 99 | `ok` |
 | `connectors/gcp_iot.md` | 98 | `ok` |
@@ -128,4 +131,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 112 blocks. Each output matches its page.
+The run captured 115 blocks. Each output matches its page.

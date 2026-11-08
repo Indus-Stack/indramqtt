@@ -468,3 +468,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the docs run writes `docs/_verified/connectors/aws_timestream.json` through the broker rule path.
 - Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-08.
+
+## DX2-042 item `azure_blob`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `azure_blob`. No live server ran in this task.
+- Expected: the docs run writes `docs/_verified/connectors/azure_blob.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-042 item `azure_blob_storage`
+
+- Input: docs harness creation check `POST /api/v5/connectors` type `azure_blob_storage`. No live server ran in this task.
+- Expected: the docs run writes `docs/_verified/connectors/azure_blob_storage.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-042 item `azure_event_grid`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `azure_event_grid` plus `POST /api/v5/actions` type `azure_event_grid`. No live server ran in this task.
+- Expected: the docs run writes `docs/_verified/connectors/azure_event_grid.json` through the broker rule path.
+- Broker gave: not run. No server ran in this task. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
