@@ -1,0 +1,3 @@
+`sqlserver` is the documented console name for the `mssql` sink. The v1 route accepts `mssql`, `sqlserver`, and `azuresql`, and stores the runtime as `mssql`. The v5 route accepts `mssql` and `sqlserver`, stores the posted type, and registers the aliases `mssql:name` and `sqlserver:name`. The tier is enterprise.
+
+The sink writes each result as one table row. It sends typed rows through `sp_executesql` with the maintained driver. The v1 route reads the full sink settings. The v5 route reads the server, the database, the table, the user, the password, and the timeout. It fixes the auth type, the row shape, the certificate trust, and the batch policy.

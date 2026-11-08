@@ -1,0 +1,24 @@
+[example]
+area = "connectors"
+item = "sqlserver"
+kind = "connector-create"
+
+[[case]]
+name = "sqlserver-normal"
+server = "127.0.0.1:1433"
+database = "telemetry"
+table = "dbo.SensorEvents"
+username = "sa"
+password = "secret"
+timeout_ms = 5000
+expect_status = 201
+expect_type = "sqlserver"
+
+[[case]]
+name = "sqlserver-edge-empty-host"
+host = ""
+database = "telemetry"
+table = "dbo.SensorEvents"
+username = "sa"
+password = "secret"
+expect_status = 400

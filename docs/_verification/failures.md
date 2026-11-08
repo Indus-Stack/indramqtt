@@ -720,3 +720,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a connector create stores the name through the broker management route. Source: the connector type registry in `crates/broker-config/src/lib.rs`.
 - Broker gave: not run. Both connector routes refuse the name with 400 because it is not a connector type. The v5 actions route accepts the name, stores the posted type, and registers no live sink. The page checks the refusals and the action create only. The send path stays not verified.
 - Date: 2026-11-08.
+
+## DX2-054 item `sqlserver`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `sqlserver` with the full config, and `POST /api/v5/connectors` type `sqlserver`. No SQL Server instance ran in this task.
+- Expected: a real SQL Server instance accepts the typed rows through the broker rule path. Source: the MSSQL sink module comment in `crates/broker-connectors-enterprise/src/mssql.rs`.
+- Broker gave: not run. Creation validates the settings and opens no socket. The page checks creation, the aliases, and the empty-host refusal only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-054 item `tablestore`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `tablestore` and `POST /api/v5/connectors` type `tablestore`, then one publish through a forwarding rule to a local OTS receiver. No Alibaba Cloud instance ran in this task.
+- Expected: a real Tablestore instance accepts the signed `BatchWriteRow` bodies through the broker rule path. Source: the Tablestore sink module comment in `crates/broker-connectors-enterprise/src/tablestore.rs`.
+- Broker gave: the docs run sends one signed `BatchWriteRow` body to a local receiver and prints `delivered`. The receiver checks the path, the headers, the signature, and the row body. The real service and its own signature check stay not verified.
+- Date: 2026-11-08.
+
+## DX2-054 item `test`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `test` (refused) and `POST /api/v5/connectors` type `test`, plus a rule that forwards one published message to the connector.
+- Expected: the broker log holds one INFO line `connector event` with the topic, the QoS, and the payload preview. Source: the console logger sink in `crates/broker-connectors/src/lib.rs`.
+- Broker gave: the v1 route answers 400 with `unknown connector kind`. The v5 route answers 201 and registers the console logger sink. The docs harness reads no broker log file. The page checks the refusal, the creation, and the rule action counter only. The log line text stays not verified.
+- Date: 2026-11-08.
