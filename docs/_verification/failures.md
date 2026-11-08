@@ -594,3 +594,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: a real DynamoDB table accepts the items through the broker rule path.
 - Broker gave: not run. No DynamoDB table ran in this task. The default build refuses the kind with 400 and names the `dynamodb` feature. The page checks creation only. The send path stays not verified.
 - Date: 2026-11-08.
+
+## DX2-048 item `dynamodb`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `dynamodb` with the full config, and `POST /api/v5/connectors` type `dynamodb`. No live table ran in this task.
+- Expected: a real DynamoDB table accepts the items through the broker rule path.
+- Broker gave: not run. No DynamoDB table ran in this task. The default build refuses the kind with 400 and names the `dynamodb` feature. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-048 item `elasticsearch`
+
+- Input: docs harness creation check `POST /api/v1/connectors` kind `elasticsearch` with the full config, and `POST /api/v5/connectors` type `elasticsearch`. No live server ran in this task.
+- Expected: a real Elasticsearch server accepts the documents through the broker rule path.
+- Broker gave: not run. No Elasticsearch server ran in this task. The default build refuses the kind with 400 and names the `elasticsearch` feature. The page checks creation only. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-048 item `gcp_pubsub_consumer`
+
+- Input: docs harness check `POST /api/v5/sources` with type `gcp_pubsub_consumer`, and `POST /api/v5/connectors` type `gcp_pubsub_consumer`. No Pub/Sub service ran in this task.
+- Expected: a real Google Cloud Pub/Sub subscription delivers messages through the broker rule path.
+- Broker gave: not run. The source store keeps the registration and the enable flag, and this build has no Pub/Sub pull loop. The connector route maps the name to the `gcp_pubsub` sink runtime; the default build refuses it with 400 and names the `gcp_pubsub` feature. The page checks registration and creation only. The pull path and the send path stay not verified.
+- Date: 2026-11-08.

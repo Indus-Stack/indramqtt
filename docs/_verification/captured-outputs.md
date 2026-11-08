@@ -41,8 +41,11 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/disk_log.md` | 95 | `disk_log` |
 | `connectors/doris.md` | 106 | `doris` |
 | `connectors/dynamo.md` | 110 | `ok` |
+| `connectors/dynamodb.md` | 110 | `ok` |
+| `connectors/elasticsearch.md` | 95 | `ok` |
 | `connectors/gcp_iot.md` | 98 | `ok` |
 | `connectors/gcp_pubsub.md` | 99 | `ok` |
+| `connectors/gcp_pubsub_consumer.md` | 89 | `ok` |
 | `connectors/greptimedb.md` | 90 | `greptimedb` |
 | `connectors/http.md` | 93 | `delivered` |
 | `connectors/index.md` | 127 | `ok` |
@@ -145,4 +148,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 129 blocks. Each output matches its page.
+The run captured 132 blocks. Each output matches its page.
