@@ -245,6 +245,13 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
     "elastic",
     "es",
     "opensearch",
+    // MV-03b cloud messaging aliases. The KC-00 map owns each alias; each
+    // maps to the runtime of its base kind.
+    "aws_kinesis",
+    "gcp",
+    "pubsub",
+    "azure",
+    "eventhubs",
 ];
 
 /// Returns true for an action kind the kernel can execute.

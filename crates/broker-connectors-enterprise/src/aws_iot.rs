@@ -81,7 +81,7 @@ impl AwsIotAuth {
                 ] {
                     if !pem.contains(marker) {
                         return Err(ConnectorError::Dispatch(format!(
-                            "aws-iot {label} is not a PEM document"
+                            "aws_iot {label} is not a PEM document"
                         )));
                     }
                 }
@@ -695,6 +695,7 @@ impl TlsAwsIotTransport {
             .await
             .map_err(|_| ConnectorError::Connection("aws-iot publish timeout".to_string()))?
             .map_err(|e| ConnectorError::Connection(format!("aws-iot publish failed: {e}")))?;
+        // QoS 0 has no reply. Return after the write.
         Ok(())
     }
 
@@ -949,8 +950,9 @@ impl AwsIotSink {
     }
 
     /// Flush buffered rows (no-op when empty). Throttles and
-    /// disconnects retry in-loop with backoff; rejections and
-    /// exhaustion restore the buffer, engage backoff, propagate.
+    /// disconnects retry in-loop with backoff. Exhaustion drops the
+    /// batch and engages backoff. Rejections restore the buffer
+    /// and propagate.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = self.buffer.lock().take_batch();
@@ -1042,11 +1044,9 @@ impl AwsIotSink {
         // Local patterns may carry `${client_id}`; resolve with an
         // empty client here (patterns match structurally first).
         let remote_topic = mapping.resolve_remote(&self.config.client_id)?;
-        // AWS IoT Core speaks QoS 0 and 1 only. Preserve 0/1 from
-        // ingress; downgrade ExactlyOnce to AtLeastOnce so QoS 2
-        // ingress still delivers instead of failing the bridge.
-        // TODO(parity): should QoS 2 ingress be rejected instead of
-        // downgraded to QoS 1?
+        // AWS IoT Core speaks QoS 0 and 1 only.
+        // QoS 0 is fire-and-forget with no PUBACK.
+        // QoS 1 waits for PUBACK. A dead server counts one failed forward.
         let qos: u8 = match qos {
             QoS::AtMostOnce => 0,
             QoS::AtLeastOnce | QoS::ExactlyOnce => 1,

@@ -908,18 +908,31 @@ impl SdkGcpPubSubTransport {
         let auth = self.auth.clone();
         let project = self.project.clone();
         let has_endpoint = endpoint.is_some();
+        let timeout = self.timeout;
         self.publisher
             .get_or_try_init(|| async move {
-                let mut builder = google_cloud_pubsub::client::Publisher::builder(topic);
+                // The sink owns retry and backoff. An inner driver retry can
+                // redeliver a message after a transport flap and duplicate a
+                // restored event.
+                let mut builder = google_cloud_pubsub::client::Publisher::builder(topic)
+                    .with_retry_policy(google_cloud_gax::retry_policy::NeverRetry);
                 if let Some(endpoint) = endpoint {
                     builder = builder.with_endpoint(endpoint);
                 }
                 if let Some(creds) = driver_credentials(&auth, &project, has_endpoint)? {
                     builder = builder.with_credentials(creds);
                 }
-                builder.build().await.map_err(|e| {
-                    ConnectorError::Connection(format!("gcp driver build failed: {e}"))
-                })
+                // The request timeout also bounds the lazy client build, so a
+                // dead endpoint cannot hold the first publish forever.
+                match tokio::time::timeout(timeout, builder.build()).await {
+                    Ok(result) => result.map_err(|e| {
+                        ConnectorError::Connection(format!("gcp driver build failed: {e}"))
+                    }),
+                    Err(_) => Err(ConnectorError::Connection(format!(
+                        "gcp driver build timed out after {}ms",
+                        timeout.as_millis()
+                    ))),
+                }
             })
             .await
             .cloned()

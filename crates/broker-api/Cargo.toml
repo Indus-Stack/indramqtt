@@ -79,3 +79,8 @@ broker-connectors = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
 p256 = "0.14"
+# HTTP/2 server for the GCP Pub/Sub loopback fake. The production sink
+# uses the gRPC driver, so the fake must speak gRPC over HTTP/2.
+# `h2` is MIT; `http` is MIT or Apache-2.0.
+h2 = "0.4"
+http = "1"

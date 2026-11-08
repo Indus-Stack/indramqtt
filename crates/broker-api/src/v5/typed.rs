@@ -6,10 +6,9 @@
 //! The path id has the form `{type}:{name}`.
 //! Reads accept the bare name too. Old files stay readable.
 
-/// Action type names from the documented enum, in documented order,
-/// limited to the types this build has. Six names have no runtime
-/// here and stay out. `snowflake_streaming` shares the snowflake
-/// runtime.
+/// Action type names from the documented enum in documented order.
+/// The list holds each listed type that this build runs.
+/// New kinds with no reference schema stay out until the contract lands.
 pub const SPEC_ACTION_TYPES: &[&str] = &[
     "timescale",
     "opents",

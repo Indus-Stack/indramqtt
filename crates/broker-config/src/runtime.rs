@@ -305,6 +305,7 @@ pub fn validate_whole(snapshot: &FullSnapshot) -> Result<(), ConfigError> {
     // A stored legacy or pending-kind record stays readable. The
     // strict load still refuses a new pending create, but a whole
     // snapshot keeps the record and marks it pending at apply time.
+    // A refused kind never reloads. A pending kind stays readable.
     if let Err(err) = snapshot.connectors.validate_legacy() {
         problems.push(err.to_string());
     }
@@ -313,6 +314,39 @@ pub fn validate_whole(snapshot: &FullSnapshot) -> Result<(), ConfigError> {
     }
     if let Err(err) = snapshot.sources.validate_legacy() {
         problems.push(err.to_string());
+    }
+    for (index, entry) in snapshot.connectors.connectors.iter().enumerate() {
+        if matches!(
+            crate::kind_state(entry.connector_type.as_str()),
+            Some(crate::KindState::Refused(_))
+        ) {
+            problems.push(format!(
+                "connectors.connectors[{index}].connector_type {:?} is not available in this broker (field `connector_type`)",
+                entry.connector_type
+            ));
+        }
+    }
+    for (index, entry) in snapshot.actions.actions.iter().enumerate() {
+        if matches!(
+            crate::kind_state(entry.action_type.as_str()),
+            Some(crate::KindState::Refused(_))
+        ) {
+            problems.push(format!(
+                "actions.actions[{index}].action_type {:?} is not available in this broker (field `action_type`)",
+                entry.action_type
+            ));
+        }
+    }
+    for (index, entry) in snapshot.sources.sources.iter().enumerate() {
+        if matches!(
+            crate::kind_state(entry.source_type.as_str()),
+            Some(crate::KindState::Refused(_))
+        ) {
+            problems.push(format!(
+                "sources.sources[{index}].source_type {:?} is not available in this broker (field `source_type`)",
+                entry.source_type
+            ));
+        }
     }
     let known: HashSet<&str> = snapshot
         .connectors

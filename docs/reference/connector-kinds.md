@@ -17,10 +17,10 @@ flowchart LR
 | kind | aliases | family | owner | state | connector | action | source | probe | SQL INTO | feature |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | alloydb | google_alloydb, alloy_db | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
-| aws_iot | aws_iot_core | cloud-iot | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | aws_iot |
+| aws_iot | aws_iot_core | cloud-iot | SB-11 | pending SB-11 | yes | yes | yes | yes | yes | aws_iot |
 | azure_blob | azure_blob_storage, azureblob, azblob | object-store | MV-02d | ready | yes | yes | yes | yes | yes | azure_blob |
-| azure_eventhubs | azure_event_hubs, azure, eventhubs, azure_event_hub_producer | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | azure_eventhubs |
-| azure_iot | azure_iot_hub, azure_iothub, iothub | cloud-iot | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | azure_iot |
+| azure_eventhubs | azure_event_hubs, azure, eventhubs, azure_event_hub_producer | cloud-messaging | MV-03b | ready | yes | yes | yes | yes | yes | azure_eventhubs |
+| azure_iot | azure_iot_hub, azure_iothub, iothub | cloud-iot | SB-11 | pending SB-11 | yes | yes | yes | yes | yes | azure_iot |
 | bigquery | bq, gbq | object-store | MV-02d | ready | yes | yes | yes | yes | yes | bigquery |
 | cassandra | scylla, scylladb, cql | time-series | SB-27 | pending SB-27 | yes | yes | yes | yes | yes | cassandra |
 | clickhouse | ch | time-series | MV-02b | ready | yes | yes | yes | yes | yes | clickhouse |
@@ -34,19 +34,19 @@ flowchart LR
 | doris |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | dynamodb | dynamo, ddb | object-store | MV-02d | ready | yes | yes | yes | yes | yes | dynamodb |
 | elasticsearch | elastic, es, opensearch | document-store | MV-02c | ready | yes | yes | yes | yes | yes | elasticsearch |
-| gcp_iot | gcp_iot_core, cloud_iot | cloud-iot | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | gcp_iot |
-| gcp_pubsub | gcp, pubsub, gcp_pubsub_consumer, gcp_pubsub_producer | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | gcp_pubsub |
+| gcp_iot | gcp_iot_core, cloud_iot | cloud-iot | D3 | refused D3 | no | no | no | no | no | gcp_iot |
+| gcp_pubsub | gcp, pubsub, gcp_pubsub_consumer, gcp_pubsub_producer | cloud-messaging | MV-03b | ready | yes | yes | no | yes | yes | gcp_pubsub |
 | greptimedb | greptime | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | http | rest | http | MV-03c | ready | yes | yes | yes | yes | yes | - |
 | influxdb |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | iotdb |  | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | kafka | kafka_producer, kafka_consumer | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | kafka |
-| kinesis | aws_kinesis | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | kinesis |
+| kinesis | aws_kinesis | cloud-messaging | MV-03b | ready | yes | yes | yes | yes | yes | kinesis |
 | mongodb | mongo, documentdb | document-store | MV-02c | ready | yes | yes | yes | yes | yes | mongodb |
 | mqtt_bridge | mqtt, mqtt-bridge, bridge | message-broker | MV-03a | pending MV-03a | yes | yes | yes | yes | yes | - |
 | mssql | sqlserver | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
 | mysql | mariadb | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
-| oci_streaming | oci | cloud-messaging | MV-03b | pending MV-03b | yes | yes | yes | yes | yes | - |
+| oci_streaming | oci | cloud-messaging | SB-11 | pending SB-11 | yes | yes | yes | yes | yes | - |
 | opc_ua | opcua | device | MV-03c | ready | yes | yes | yes | yes | yes | - |
 | opentsdb | opents | time-series | MV-02b | ready | yes | yes | yes | yes | yes | - |
 | oracle |  | relational | MV-02a | ready | yes | yes | yes | yes | yes | - |
@@ -77,4 +77,8 @@ flowchart LR
 
 ## Behaviour of a kind that is not ready
 
-Connector, action and source create answer `400` for a kind that is not ready. The code is `ALREADY_EXISTS` when the connector credential fields pass. A missing credential names the field. `http`, `opc_ua`, `sparkplug_b` and the object, file and cloud kinds answer `400 ALREADY_EXISTS`; other kinds answer `400 BAD_REQUEST`. Update answers `400 BAD_REQUEST`. Probe answers `400 TEST_FAILED`. A non-ready refusal carries `connector type <kind> is not available in this broker`. Nothing is stored. A refused update keeps the old record. A strict config file load fails and names the file, key and kind. A stored record from an earlier version is kept and visible. It reports `disconnected` with a `status_reason`. It raises `connector_unavailable:<id>` or `action_unavailable:<id>`. A rule that uses it stays enabled and counts the forward as failed. The schema, action-type and source-type listings show only ready kinds.
+Connector, action and source create answer `400` for a kind that is not ready. The three IoT kinds `aws_iot`, `azure_iot` and `oci_streaming` answer `400 BAD_REQUEST` for create and update. The code is `ALREADY_EXISTS` for the other kinds when the connector credential fields pass. A missing credential names the field. `http`, `opc_ua`, `sparkplug_b` and the object, file and remaining cloud kinds answer `400 ALREADY_EXISTS`; other kinds answer `400 BAD_REQUEST`. Update answers `400 BAD_REQUEST`.
+
+Probe answers `400 TEST_FAILED`. A non-ready refusal carries `connector type <kind> is not available in this broker`. Nothing is stored. A refused update keeps the old record. A strict config file load fails and names the file, key and kind. A stored record from an earlier version is kept and visible and reports `disconnected` with a `status_reason`.
+
+A stored record raises `connector_unavailable:<id>` or `action_unavailable:<id>`. A rule that uses it stays enabled and counts the forward as failed. The schema, action-type and source-type listings show only ready kinds.

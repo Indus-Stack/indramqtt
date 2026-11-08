@@ -101,12 +101,14 @@ pub static KIND_ROWS: &[KindRow] = &[
         default_build: true,
         full_build: true,
     },
+    // The IoT kinds stay pending: the reference 6.3.0 has no schema
+    // and the CEO kept them out of the MVP on 2026-11-08.
     KindRow {
         name: "aws_iot",
         aliases: &["aws_iot_core"],
         family: "cloud-iot",
-        owner: "MV-03b",
-        state: KindState::Pending("MV-03b"),
+        owner: "SB-11",
+        state: KindState::Pending("SB-11"),
         connector: true,
         action: true,
         source: true,
@@ -141,7 +143,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         ],
         family: "cloud-messaging",
         owner: "MV-03b",
-        state: KindState::Pending("MV-03b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -155,8 +157,8 @@ pub static KIND_ROWS: &[KindRow] = &[
         name: "azure_iot",
         aliases: &["azure_iot_hub", "azure_iothub", "iothub"],
         family: "cloud-iot",
-        owner: "MV-03b",
-        state: KindState::Pending("MV-03b"),
+        owner: "SB-11",
+        state: KindState::Pending("SB-11"),
         connector: true,
         action: true,
         source: true,
@@ -364,17 +366,21 @@ pub static KIND_ROWS: &[KindRow] = &[
         default_build: false,
         full_build: true,
     },
+    // `gcp_iot` stays refused: the vendor closed the IoT Core
+    // service, so there is no live path to qualify. Connector,
+    // action, source and probe refuse with the documented message.
+    // A later CEO decision names a successor or keeps the refusal.
     KindRow {
         name: "gcp_iot",
         aliases: &["gcp_iot_core", "cloud_iot"],
         family: "cloud-iot",
-        owner: "MV-03b",
-        state: KindState::Pending("MV-03b"),
-        connector: true,
-        action: true,
-        source: true,
-        probe: true,
-        sql_into: true,
+        owner: "D3",
+        state: KindState::Refused("D3"),
+        connector: false,
+        action: false,
+        source: false,
+        probe: false,
+        sql_into: false,
         feature: Some("gcp_iot"),
         default_build: false,
         full_build: true,
@@ -389,10 +395,10 @@ pub static KIND_ROWS: &[KindRow] = &[
         ],
         family: "cloud-messaging",
         owner: "MV-03b",
-        state: KindState::Pending("MV-03b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
-        source: true,
+        source: false,
         probe: true,
         sql_into: true,
         feature: Some("gcp_pubsub"),
@@ -479,7 +485,7 @@ pub static KIND_ROWS: &[KindRow] = &[
         aliases: &["aws_kinesis"],
         family: "cloud-messaging",
         owner: "MV-03b",
-        state: KindState::Pending("MV-03b"),
+        state: KindState::Ready,
         connector: true,
         action: true,
         source: true,
@@ -553,8 +559,8 @@ pub static KIND_ROWS: &[KindRow] = &[
         name: "oci_streaming",
         aliases: &["oci"],
         family: "cloud-messaging",
-        owner: "MV-03b",
-        state: KindState::Pending("MV-03b"),
+        owner: "SB-11",
+        state: KindState::Pending("SB-11"),
         connector: true,
         action: true,
         source: true,
@@ -875,7 +881,7 @@ static TEST_KINDS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// KC-00. Add a ticket only after its family contract is accepted. The
 /// readiness test derives the expected state from this list.
 pub const ACCEPTED_FAMILY_TICKETS: &[&str] = &[
-    "MV-01", "KC-00/D9", "MV-02a", "MV-02b", "MV-02c", "MV-02d", "MV-03c",
+    "MV-01", "KC-00/D9", "MV-02a", "MV-02b", "MV-02c", "MV-02d", "MV-03b", "MV-03c",
 ];
 
 /// Enable the test-only `test` kind for this process. Test builds call
@@ -940,6 +946,19 @@ pub const LIVE_SINK_KIND_TABLE: &[(&str, &str)] = &[
     ("gcp_pubsub_producer", "gcp_pubsub"),
     ("gcp_pubsub_consumer", "gcp_pubsub"),
     ("azure_event_hub_producer", "azure_eventhubs"),
+    ("azure_event_hubs", "azure_eventhubs"),
+    ("azure", "azure_eventhubs"),
+    ("eventhubs", "azure_eventhubs"),
+    ("aws_kinesis", "kinesis"),
+    ("gcp", "gcp_pubsub"),
+    ("pubsub", "gcp_pubsub"),
+    ("oci", "oci_streaming"),
+    ("aws_iot_core", "aws_iot"),
+    ("azure_iot_hub", "azure_iot"),
+    ("azure_iothub", "azure_iot"),
+    ("iothub", "azure_iot"),
+    ("gcp_iot_core", "gcp_iot"),
+    ("cloud_iot", "gcp_iot"),
     ("aws_timestream", "timestream"),
     ("ch", "clickhouse"),
     ("opents", "opentsdb"),
@@ -1066,7 +1085,17 @@ pub fn render_markdown() -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Connector, action and source create answer `400` for a kind that is not ready. The code is `ALREADY_EXISTS` when the connector credential fields pass. A missing credential names the field. `http`, `opc_ua`, `sparkplug_b` and the object, file and cloud kinds answer `400 ALREADY_EXISTS`; other kinds answer `400 BAD_REQUEST`. Update answers `400 BAD_REQUEST`. Probe answers `400 TEST_FAILED`. A non-ready refusal carries `connector type <kind> is not available in this broker`. Nothing is stored. A refused update keeps the old record. A strict config file load fails and names the file, key and kind. A stored record from an earlier version is kept and visible. It reports `disconnected` with a `status_reason`. It raises `connector_unavailable:<id>` or `action_unavailable:<id>`. A rule that uses it stays enabled and counts the forward as failed. The schema, action-type and source-type listings show only ready kinds."
+        "Connector, action and source create answer `400` for a kind that is not ready. The three IoT kinds `aws_iot`, `azure_iot` and `oci_streaming` answer `400 BAD_REQUEST` for create and update. The code is `ALREADY_EXISTS` for the other kinds when the connector credential fields pass. A missing credential names the field. `http`, `opc_ua`, `sparkplug_b` and the object, file and remaining cloud kinds answer `400 ALREADY_EXISTS`; other kinds answer `400 BAD_REQUEST`. Update answers `400 BAD_REQUEST`."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Probe answers `400 TEST_FAILED`. A non-ready refusal carries `connector type <kind> is not available in this broker`. Nothing is stored. A refused update keeps the old record. A strict config file load fails and names the file, key and kind. A stored record from an earlier version is kept and visible and reports `disconnected` with a `status_reason`."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "A stored record raises `connector_unavailable:<id>` or `action_unavailable:<id>`. A rule that uses it stays enabled and counts the forward as failed. The schema, action-type and source-type listings show only ready kinds."
     );
     out
 }
@@ -1206,6 +1235,24 @@ mod tests {
             kind_state("azure_event_grid"),
             Some(KindState::Refused("D3"))
         );
+        assert!(is_kind_ready("kinesis"));
+        assert!(is_kind_ready("aws_kinesis"));
+        assert!(is_kind_ready("gcp_pubsub"));
+        assert!(is_kind_ready("gcp"));
+        assert!(is_kind_ready("azure_eventhubs"));
+        assert!(is_kind_ready("azure_event_hub_producer"));
+        assert_eq!(kind_state("aws_iot"), Some(KindState::Pending("SB-11")));
+        assert_eq!(kind_state("azure_iot"), Some(KindState::Pending("SB-11")));
+        assert_eq!(
+            kind_state("oci_streaming"),
+            Some(KindState::Pending("SB-11"))
+        );
+        assert!(!is_kind_ready("aws_iot"));
+        assert!(!is_kind_ready("azure_iot"));
+        assert!(!is_kind_ready("oci_streaming"));
+        assert!(!is_kind_ready("oci"));
+        assert_eq!(kind_state("gcp_iot"), Some(KindState::Refused("D3")));
+        assert_eq!(kind_state("gcp_iot_core"), Some(KindState::Refused("D3")));
         assert_eq!(kind_state("no_such_kind"), None);
     }
 

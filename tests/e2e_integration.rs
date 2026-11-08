@@ -8849,18 +8849,18 @@ async fn mv01_v5_action_and_v1_connector_share_a_name_and_survive_restart() {
 }
 
 /// A webhook connector that is down reads `disconnected` from its own
-/// probe at create and at read time, and `connected` after the target
-/// comes up and the update probes it again.
+/// probe at create and at read time, and `connected` after the update
+/// points it at a live target and probes it again.
 #[tokio::test]
 async fn mv01_down_webhook_connector_reads_disconnected_from_probe() {
-    let reserve = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
-    let address = reserve.local_addr().expect("reserved address");
-    drop(reserve);
     let kernel = spawn_kernel("").await;
+    // The down target uses the discard port. Nothing listens there,
+    // so the probe always fails. A reserved-then-freed port can be
+    // taken by a parallel kernel before the probe dials.
     let connector = serde_json::json!({
         "name": "mv01-probe-link",
         "type": "webhook",
-        "url": format!("http://{address}"),
+        "url": "http://127.0.0.1:9",
     });
     let (status, body) = mv00_api(
         &kernel,
@@ -8886,9 +8886,15 @@ async fn mv01_down_webhook_connector_reads_disconnected_from_probe() {
         body["status"], "disconnected",
         "the read keeps the probe result: {body}"
     );
-    let listener = tokio::net::TcpListener::bind(address)
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("the target starts on the reserved port");
+        .expect("the live target binds");
+    let live = listener.local_addr().expect("live target address");
+    let connector = serde_json::json!({
+        "name": "mv01-probe-link",
+        "type": "webhook",
+        "url": format!("http://{live}"),
+    });
     let (status, body) = mv00_api(
         &kernel,
         reqwest::Method::PUT,

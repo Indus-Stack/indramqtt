@@ -9,7 +9,15 @@
       "tier": "community"
     },
     {
+      "kind": "aws_kinesis",
+      "tier": "community"
+    },
+    {
       "kind": "aws_timestream",
+      "tier": "community"
+    },
+    {
+      "kind": "azure",
       "tier": "community"
     },
     {
@@ -125,6 +133,14 @@
       "tier": "community"
     },
     {
+      "kind": "eventhubs",
+      "tier": "community"
+    },
+    {
+      "kind": "gcp",
+      "tier": "community"
+    },
+    {
       "kind": "gcp_iot",
       "tier": "community"
     },
@@ -230,6 +246,10 @@
     },
     {
       "kind": "postgres",
+      "tier": "community"
+    },
+    {
+      "kind": "pubsub",
       "tier": "community"
     },
     {

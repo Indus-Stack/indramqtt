@@ -751,6 +751,10 @@ pub async fn create_action(
         let kind = kind.trim();
         if crate::removed_connector_refusal(kind).is_none() {
             if let Some(message) = super::rules::kind_refusal(kind) {
+                super::rules::raise_unavailable_kind_alarm(&state, kind);
+                if super::rules::is_mvp_pending_iot_kind(kind) {
+                    return ApiError::BadRequest(message).into_response();
+                }
                 return ApiError::AlreadyExists(message).into_response();
             }
         }
@@ -1038,6 +1042,9 @@ pub async fn update_action(
         Ok(entry) => entry,
         Err(reason) => return ApiError::BadRequest(reason).into_response(),
     };
+    if super::rules::kind_refusal(&entry.action_type).is_some() {
+        super::rules::raise_unavailable_kind_alarm(&state, &entry.action_type);
+    }
     // MV-01 (R2-03/04): stage the owned sink built from the NEW entry
     // (never registered). A build that cannot complete for an
     // action-side reason is refused with 400 naming the action and the

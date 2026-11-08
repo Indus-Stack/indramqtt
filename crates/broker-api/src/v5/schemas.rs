@@ -538,7 +538,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 23. Kinesis
     schemas.insert(
         "bridge_kinesis.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "kinesis",
             json!({
                 "endpoint": str_prop("https://kinesis.us-east-1.amazonaws.com"),
                 "region": str_prop("us-east-1"),
@@ -743,7 +744,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 35. GCP Pub/Sub
     schemas.insert(
         "gcp_pubsub_producer.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "gcp_pubsub",
             json!({
                 "gcp_project_id": str_prop(""),
                 "service_account_json": pwd_prop()
@@ -753,7 +755,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     );
     schemas.insert(
         "gcp_pubsub_consumer.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "gcp_pubsub",
             json!({
                 "gcp_project_id": str_prop(""),
                 "service_account_json": pwd_prop()
@@ -765,14 +768,14 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 36. Azure Event Hubs
     schemas.insert(
         "bridge_azure_event_hub.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "azure_eventhubs",
             json!({
                 "connection_string": pwd_prop()
             }),
             &["name", "connection_string"],
         ),
     );
-
     // 37. Snowflake
     schemas.insert(
         "connector_snowflake_aggregated.post_connector".to_string(),
@@ -1259,6 +1262,42 @@ static ACTIONS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "topic_prefix": str_prop("spBv1.0/plant1")
             }),
             &["name", "connector"],
+        ),
+    );
+
+    // MV-03b cloud messaging actions
+    schemas.insert(
+        "bridge_kinesis.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "kinesis",
+            json!({
+                "connector": str_prop(""),
+                "stream_name": str_prop(""),
+                "partition_key": str_prop("${client_id}")
+            }),
+            &["name", "connector", "stream_name", "partition_key"],
+        ),
+    );
+    schemas.insert(
+        "gcp_pubsub_producer.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "gcp_pubsub",
+            json!({
+                "connector": str_prop(""),
+                "pubsub_topic": str_prop("")
+            }),
+            &["name", "connector", "pubsub_topic"],
+        ),
+    );
+    schemas.insert(
+        "bridge_azure_event_hub.post_bridge_v2".to_string(),
+        obj_schema_with_type(
+            "azure_eventhubs",
+            json!({
+                "connector": str_prop(""),
+                "event_hub": str_prop("")
+            }),
+            &["name", "connector", "event_hub"],
         ),
     );
 

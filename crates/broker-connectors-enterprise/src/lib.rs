@@ -317,7 +317,9 @@ pub(crate) mod test_rsa_keys {
 
 #[cfg(test)]
 mod tests {
-    use super::{connector_tier, KinesisSink, KinesisSinkConfig, MockKinesisTransport};
+    use super::connector_tier;
+    #[cfg(feature = "kinesis")]
+    use super::{KinesisSink, KinesisSinkConfig, MockKinesisTransport};
     use broker_connectors::{
         HttpAuth, HttpBodyFormat, HttpMethod, HttpSink, HttpSinkConfig, MockHttpTransport,
         Sink as _,
@@ -350,6 +352,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "kinesis")]
     fn base64_decode(input: &str) -> Vec<u8> {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
@@ -420,6 +423,7 @@ mod tests {
     /// Split evidence (enterprise half): a Kinesis rule dispatches
     /// through the same rule path with identical framing to before
     /// the move, and the tier tag is unchanged.
+    #[cfg(feature = "kinesis")]
     #[tokio::test]
     async fn test_split_enterprise_kinesis_through_rule_engine() {
         let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);

@@ -62,6 +62,139 @@ const DEFAULT_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// Default health check timeout from the reference action resource options.
 /// Reason: a check that takes more than 60 s marks the target disconnected.
 const DEFAULT_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Kinesis batch ceiling from the driver default. Reason: one
+/// PutRecords call caps at 4 MiB in the driver.
+#[cfg(feature = "kinesis")]
+const MV03B_KINESIS_BATCH_BYTES: usize = 4_194_304;
+/// Kinesis rows per send from the driver default. Reason: one row per
+/// send keeps the runtime in charge of batching (RO-01).
+#[cfg(feature = "kinesis")]
+const MV03B_KINESIS_BATCH_SIZE: usize = 1;
+/// Kinesis linger from the driver default. Reason: zero wait means the
+/// runtime forms batches, never the driver (RO-01).
+#[cfg(feature = "kinesis")]
+const MV03B_KINESIS_LINGER_MS: u64 = 0;
+/// Kinesis send retries from the driver default. Reason: three tries
+/// ride out a short flap without a long stall.
+#[cfg(feature = "kinesis")]
+const MV03B_KINESIS_MAX_RETRIES: usize = 3;
+/// Kinesis retry start from the driver default. Reason: 100 ms spaces
+/// quick retries without blocking the queue.
+#[cfg(feature = "kinesis")]
+const MV03B_KINESIS_BACKOFF_FIRST_MS: u64 = 100;
+/// Kinesis retry cap from the driver default. Reason: 2 s caps one send
+/// so a dead endpoint fails fast to the runtime backoff.
+#[cfg(feature = "kinesis")]
+const MV03B_KINESIS_BACKOFF_MAX_MS: u64 = 2_000;
+/// Pub/Sub batch ceiling under the vendor cap. Reason: one
+/// Publish call caps at 10 MiB; 8 MB leaves headroom.
+#[cfg(feature = "gcp_pubsub")]
+const MV03B_GCP_BATCH_BYTES: usize = 8_000_000;
+/// Event Hubs token life from the driver default. Reason: the
+/// driver renews the SAS token each hour.
+#[cfg(feature = "azure_eventhubs")]
+const MV03B_EVENTHUBS_TOKEN_TTL_SECS: u64 = 3_600;
+/// Event Hubs batch ceiling under the vendor cap. Reason: one
+/// batch caps at 1 MiB; 1 MB stays under it.
+#[cfg(feature = "azure_eventhubs")]
+const MV03B_EVENTHUBS_BATCH_BYTES: usize = 1_000_000;
+/// IoT Hub SAS life from the driver default. Reason: the driver
+/// renews the SAS token each hour.
+#[cfg(feature = "azure_iot")]
+const MV03B_AZURE_IOT_SAS_TTL_SECS: u64 = 3_600;
+/// OCI batch ceiling from the driver default. Reason: one flush
+/// stays under the service body ceiling.
+const MV03B_OCI_BATCH_BYTES: usize = 4_000_000;
+/// GCP rows per send from the driver default. Reason: one row per
+/// send keeps the runtime in charge of batching (RO-01).
+#[cfg(feature = "gcp_pubsub")]
+const MV03B_GCP_BATCH_SIZE: usize = 1;
+/// GCP linger from the driver default. Reason: zero wait means the
+/// runtime forms batches, never the driver (RO-01).
+#[cfg(feature = "gcp_pubsub")]
+const MV03B_GCP_LINGER_MS: u64 = 0;
+/// GCP send retries from the driver default. Reason: three tries
+/// ride out a short flap without a long stall.
+#[cfg(feature = "gcp_pubsub")]
+const MV03B_GCP_MAX_RETRIES: usize = 3;
+/// GCP retry start from the driver default. Reason: 100 ms spaces
+/// quick retries without blocking the queue.
+#[cfg(feature = "gcp_pubsub")]
+const MV03B_GCP_BACKOFF_FIRST_MS: u64 = 100;
+/// GCP retry cap from the driver default. Reason: 2 s caps one send
+/// so a dead endpoint fails fast to the runtime backoff.
+#[cfg(feature = "gcp_pubsub")]
+const MV03B_GCP_BACKOFF_MAX_MS: u64 = 2_000;
+/// Event Hubs rows per send from the driver default. Reason: one row
+/// per send keeps the runtime in charge of batching (RO-01).
+#[cfg(feature = "azure_eventhubs")]
+const MV03B_EVENTHUBS_BATCH_SIZE: usize = 1;
+/// Event Hubs linger from the driver default. Reason: zero wait
+/// means the runtime forms batches, never the driver (RO-01).
+#[cfg(feature = "azure_eventhubs")]
+const MV03B_EVENTHUBS_LINGER_MS: u64 = 0;
+/// Event Hubs send retries from the driver default. Reason: three
+/// tries ride out a short flap without a long stall.
+#[cfg(feature = "azure_eventhubs")]
+const MV03B_EVENTHUBS_MAX_RETRIES: usize = 3;
+/// Event Hubs retry start from the driver default. Reason: 100 ms
+/// spaces quick retries without blocking the queue.
+#[cfg(feature = "azure_eventhubs")]
+const MV03B_EVENTHUBS_BACKOFF_FIRST_MS: u64 = 100;
+/// Event Hubs retry cap from the driver default. Reason: 2 s caps one
+/// send so a dead endpoint fails fast to the runtime backoff.
+#[cfg(feature = "azure_eventhubs")]
+const MV03B_EVENTHUBS_BACKOFF_MAX_MS: u64 = 2_000;
+/// AWS IoT rows per send from the driver default. Reason: one row per
+/// send keeps the runtime in charge of batching (RO-01).
+#[cfg(feature = "aws_iot")]
+const MV03B_AWS_IOT_BATCH_SIZE: usize = 1;
+/// AWS IoT buffer capacity from the driver default. Reason: a finite
+/// buffer bounds memory while backpressure builds.
+#[cfg(feature = "aws_iot")]
+const MV03B_AWS_IOT_BUFFER_CAPACITY: usize = 10_000;
+/// AWS IoT linger from the driver default. Reason: zero wait means
+/// the runtime forms batches, never the driver (RO-01).
+#[cfg(feature = "aws_iot")]
+const MV03B_AWS_IOT_LINGER_MS: u64 = 0;
+/// AWS IoT send retries from the driver default. Reason: three tries
+/// ride out a short flap without a long stall.
+#[cfg(feature = "aws_iot")]
+const MV03B_AWS_IOT_MAX_RETRIES: usize = 3;
+/// Azure IoT rows per send from the driver default. Reason: one row
+/// per send keeps the runtime in charge of batching (RO-01).
+#[cfg(feature = "azure_iot")]
+const MV03B_AZURE_IOT_BATCH_SIZE: usize = 1;
+/// Azure IoT buffer capacity from the driver default. Reason: a
+/// finite buffer bounds memory while backpressure builds.
+#[cfg(feature = "azure_iot")]
+const MV03B_AZURE_IOT_BUFFER_CAPACITY: usize = 10_000;
+/// Azure IoT linger from the driver default. Reason: zero wait means
+/// the runtime forms batches, never the driver (RO-01).
+#[cfg(feature = "azure_iot")]
+const MV03B_AZURE_IOT_LINGER_MS: u64 = 0;
+/// Azure IoT send retries from the driver default. Reason: three
+/// tries ride out a short flap without a long stall.
+#[cfg(feature = "azure_iot")]
+const MV03B_AZURE_IOT_MAX_RETRIES: usize = 3;
+/// OCI rows per send from the driver default. Reason: one row per
+/// send keeps the runtime in charge of batching (RO-01).
+const MV03B_OCI_BATCH_SIZE: usize = 1;
+/// OCI buffer capacity from the driver default. Reason: a finite
+/// buffer bounds memory while backpressure builds.
+const MV03B_OCI_BUFFER_CAPACITY: usize = 10_000;
+/// OCI linger from the driver default. Reason: zero wait means the
+/// runtime forms batches, never the driver (RO-01).
+const MV03B_OCI_LINGER_MS: u64 = 0;
+/// OCI send retries from the driver default. Reason: three tries ride
+/// out a short flap without a long stall.
+const MV03B_OCI_MAX_RETRIES: usize = 3;
+/// OCI retry start from the driver default. Reason: 100 ms spaces
+/// quick retries without blocking the queue.
+const MV03B_OCI_BACKOFF_FIRST_MS: u64 = 100;
+/// OCI retry cap from the driver default. Reason: 2 s caps one send
+/// so a dead endpoint fails fast to the runtime backoff.
+const MV03B_OCI_BACKOFF_MAX_MS: u64 = 2_000;
 
 /// Dispatch strategy of the reference action resource options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +561,15 @@ pub(crate) fn canonical_action_kind(kind: &str) -> &str {
         "sparkplug" | "spb" => "sparkplug_b",
         "rest" => "http",
         "logger" => "console",
+        "aws_kinesis" => "kinesis",
+        "gcp" | "pubsub" | "gcp_pubsub_producer" | "gcp_pubsub_consumer" => "gcp_pubsub",
+        "azure_event_hubs" | "azure" | "eventhubs" | "azure_event_hub_producer" => {
+            "azure_eventhubs"
+        }
+        "oci" => "oci_streaming",
+        "aws_iot_core" => "aws_iot",
+        "azure_iot_hub" | "azure_iothub" | "iothub" => "azure_iot",
+        "gcp_iot_core" | "cloud_iot" => "gcp_iot",
         _ => kind,
     }
 }
@@ -475,6 +617,12 @@ pub(crate) fn action_owned_kind(kind: &str) -> bool {
             | "opc_ua"
             | "sparkplug_b"
             | "console"
+            | "kinesis"
+            | "gcp_pubsub"
+            | "azure_eventhubs"
+            | "aws_iot"
+            | "azure_iot"
+            | "oci_streaming"
     )
 }
 
@@ -1357,6 +1505,12 @@ pub(crate) fn build_action_sink_with_dir(
         "opc_ua" => build_opc_ua_sink(record, connector_doc).map(Some),
         "sparkplug_b" => build_sparkplug_b_sink(record, connector_doc).map(Some),
         "console" => build_console_sink(record).map(Some),
+        "kinesis" => build_kinesis_sink(record, connector_doc).map(Some),
+        "gcp_pubsub" => build_gcp_pubsub_sink(record, connector_doc).map(Some),
+        "azure_eventhubs" => build_azure_eventhubs_sink(record, connector_doc).map(Some),
+        "aws_iot" => build_aws_iot_sink(record, connector_doc).map(Some),
+        "azure_iot" => build_azure_iot_sink(record, connector_doc).map(Some),
+        "oci_streaming" => build_oci_streaming_sink(record, connector_doc).map(Some),
         // Other kinds own no runtime yet: no sink, no registration.
         // Delivery stays refused-by-default (the fire counts one
         // failure) until the kind plots its own data path (KC-00).
@@ -1663,6 +1817,64 @@ fn required_action_parameters(record: &ActionRecord) -> Result<(), String> {
                         record.id
                     ));
                 }
+            }
+        }
+        "kinesis" => {
+            for field in ["stream_name", "partition_key"] {
+                if param_string(record, field).is_none() {
+                    return Err(format!(
+                        "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                        record.id
+                    ));
+                }
+            }
+        }
+        "gcp_pubsub" => {
+            let field = "pubsub_topic";
+            if param_string(record, field).is_none() {
+                // Accept the documented `topic` alias too.
+                if param_string(record, "topic").is_none()
+                    && param_string(record, "topic_id").is_none()
+                {
+                    return Err(format!(
+                        "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                        record.id
+                    ));
+                }
+            }
+        }
+        "azure_eventhubs" => {
+            let field = "event_hub";
+            if param_string(record, field).is_none()
+                && param_string(record, "hub").is_none()
+                && param_string(record, "topic").is_none()
+            {
+                return Err(format!(
+                    "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                    record.id
+                ));
+            }
+        }
+        "aws_iot" => {
+            let field = "remote_topic";
+            if param_string(record, field).is_none() && param_string(record, "topic").is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                    record.id
+                ));
+            }
+        }
+        "azure_iot" => {
+            // The hub topic is fixed by the device; the action needs no
+            // target field.
+        }
+        "oci_streaming" => {
+            let field = "stream_id";
+            if param_string(record, field).is_none() {
+                return Err(format!(
+                    "action {:?} is missing required field: {field} (field `parameters.{field}`)",
+                    record.id
+                ));
             }
         }
         "tablestore" => {
@@ -5926,6 +6138,660 @@ pub(crate) fn build_tablestore_sink(
     Ok(Arc::new(sink))
 }
 
+/// Build the action's `kinesis` sink. Connection (endpoint, region,
+/// keys) comes from the connector; the stream and key template come
+/// from the action.
+///
+/// Values and defaults:
+/// - `endpoint`: the connector endpoint (reference `endpoint`);
+///   a loopback `http://127.0.0.1:port` endpoint selects the HTTP
+///   transport used by offline tests.
+/// - `region`: the connector region, default `us-east-1`.
+/// - `stream_name`: the action target, required, no invented default.
+/// - `partition_key`: the action key template; absent means the
+///   driver hashes the topic.
+/// - Batching belongs to the action runtime, not this driver. The
+///   inner sink keeps one row per send with no linger (RO-01).
+#[cfg(feature = "kinesis")]
+pub(crate) fn build_kinesis_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::kinesis::{
+        KinesisSink, KinesisSinkConfig, SdkKinesisTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let endpoint =
+        first_string(connector_doc, &["endpoint", "url", "server"]).map(|value| value.into_owned());
+    let region = first_string(connector_doc, &["region"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let access_key_id = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["aws_access_key_id", "access_key_id", "ak"],
+        "aws_access_key_id",
+    )?;
+    let secret_access_key = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["aws_secret_access_key", "secret_access_key", "sk"],
+        "aws_secret_access_key",
+    )?;
+    let stream_name = param_string(record, "stream_name").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: stream_name",
+            record.id
+        )
+    })?;
+    let partition_key_template = param_string(record, "partition_key").ok_or_else(|| {
+        format!(
+            "action {:?} is missing required field: partition_key",
+            record.id
+        )
+    })?;
+    let config = KinesisSinkConfig {
+        stream_name,
+        region,
+        endpoint,
+        access_key_id,
+        secret_access_key,
+        session_token: first_string(connector_doc, &["session_token", "token"])
+            .map(|value| value.into_owned()),
+        partition_key_template: Some(partition_key_template),
+        explicit_hash_key: None,
+        // One row per send with no linger: the action runtime owns
+        // batching (RO-01). Retry 3 times with a 100 ms start.
+        batch_size: Some(MV03B_KINESIS_BATCH_SIZE),
+        batch_bytes: Some(MV03B_KINESIS_BATCH_BYTES),
+        linger_ms: Some(MV03B_KINESIS_LINGER_MS),
+        max_retries: Some(MV03B_KINESIS_MAX_RETRIES),
+        initial_backoff_ms: Some(MV03B_KINESIS_BACKOFF_FIRST_MS),
+        max_backoff_ms: Some(MV03B_KINESIS_BACKOFF_MAX_MS),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport = SdkKinesisTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its kinesis transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = KinesisSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its kinesis sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `gcp_pubsub` sink. The project and credentials
+/// come from the connector; the topic and templates come from the
+/// action.
+///
+/// Values and defaults:
+/// - `project_id`: the connector project (aliases `gcp_project_id`,
+///   `project`); required.
+/// - `endpoint`: the connector override for the emulator; absent
+///   means the public Pub/Sub endpoint.
+/// - `access_token`: the connector bearer token; absent means no
+///   `Authorization` header (emulator path).
+/// - `pubsub_topic`: the action topic (aliases `topic`, `topic_id`);
+///   required.
+/// - Batching belongs to the action runtime (RO-01): one row per
+///   send with no linger.
+#[cfg(feature = "gcp_pubsub")]
+pub(crate) fn build_gcp_pubsub_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::gcp_pubsub::{
+        GcpAuth, GcpPubSubSink, GcpPubSubSinkConfig, SdkGcpPubSubTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let project_id = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["project_id", "gcp_project_id", "project"],
+        "project_id",
+    )?;
+    let endpoint =
+        first_string(connector_doc, &["endpoint", "url", "server"]).map(|value| value.into_owned());
+    let auth = if let Some(sa_json) = first_string(connector_doc, &["service_account_json"]) {
+        match serde_json::from_str::<serde_json::Value>(&sa_json) {
+            Ok(sa) => {
+                let client_email = sa
+                    .get("client_email")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let private_key_pem = sa
+                    .get("private_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !client_email.is_empty() && !private_key_pem.is_empty() {
+                    GcpAuth::ServiceAccountKey {
+                        client_email,
+                        private_key_pem,
+                    }
+                } else {
+                    GcpAuth::None
+                }
+            }
+            Err(_) => GcpAuth::None,
+        }
+    } else {
+        first_string(connector_doc, &["access_token", "token"])
+            .map(|value| GcpAuth::AccessToken {
+                token: value.into_owned(),
+            })
+            .unwrap_or(GcpAuth::None)
+    };
+    let topic_id = param_string(record, "pubsub_topic")
+        .or_else(|| param_string(record, "topic"))
+        .or_else(|| param_string(record, "topic_id"))
+        .ok_or_else(|| {
+            format!(
+                "action {:?} is missing required field: pubsub_topic",
+                record.id
+            )
+        })?;
+    let config = GcpPubSubSinkConfig {
+        project_id,
+        topic_id,
+        endpoint,
+        auth,
+        ordering_key_template: param_string(record, "ordering_key_template")
+            .or_else(|| param_string(record, "ordering_key")),
+        attributes: param_string_map(record, "attributes"),
+        // One row per send with no linger: the action runtime owns
+        // batching (RO-01).
+        batch_size: Some(MV03B_GCP_BATCH_SIZE),
+        batch_bytes: Some(MV03B_GCP_BATCH_BYTES),
+        linger_ms: Some(MV03B_GCP_LINGER_MS),
+        max_retries: Some(MV03B_GCP_MAX_RETRIES),
+        initial_backoff_ms: Some(MV03B_GCP_BACKOFF_FIRST_MS),
+        max_backoff_ms: Some(MV03B_GCP_BACKOFF_MAX_MS),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport = SdkGcpPubSubTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its gcp_pubsub transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = GcpPubSubSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its gcp_pubsub sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `azure_eventhubs` sink. The namespace and SAS
+/// pair come from the connector; the hub and key template come from
+/// the action.
+///
+/// Values and defaults:
+/// - `namespace`: the connector namespace; required.
+/// - `endpoint`: the connector override; absent means
+///   `{namespace}.servicebus.windows.net`.
+/// - `shared_access_key_name` / `shared_access_key`: the connector
+///   SAS pair; both required.
+/// - `event_hub`: the action hub (aliases `hub`, `topic`); required.
+/// - Batching belongs to the action runtime (RO-01): one row per
+///   send with no linger.
+#[cfg(feature = "azure_eventhubs")]
+pub(crate) fn build_azure_eventhubs_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::azure_eventhubs::{
+        AzureEventHubsSink, AzureEventHubsSinkConfig, HttpAzureEventHubsTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let namespace = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["namespace"],
+        "namespace",
+    )?;
+    let shared_access_key_name = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["shared_access_key_name", "key_name", "policy"],
+        "shared_access_key_name",
+    )?;
+    let shared_access_key = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["shared_access_key", "key"],
+        "shared_access_key",
+    )?;
+    let event_hub = param_string(record, "event_hub")
+        .or_else(|| param_string(record, "hub"))
+        .or_else(|| param_string(record, "topic"))
+        .ok_or_else(|| {
+            format!(
+                "action {:?} is missing required field: event_hub",
+                record.id
+            )
+        })?;
+    let config = AzureEventHubsSinkConfig {
+        namespace,
+        event_hub,
+        endpoint: first_string(connector_doc, &["endpoint", "url", "server"])
+            .map(|value| value.into_owned()),
+        shared_access_key_name,
+        shared_access_key,
+        partition_key_template: param_string(record, "partition_key")
+            .or_else(|| param_string(record, "partition_key_template")),
+        user_properties: param_string_map(record, "user_properties"),
+        token_ttl_secs: MV03B_EVENTHUBS_TOKEN_TTL_SECS,
+        // One row per send with no linger: the action runtime owns
+        // batching (RO-01).
+        batch_size: Some(MV03B_EVENTHUBS_BATCH_SIZE),
+        batch_bytes: Some(MV03B_EVENTHUBS_BATCH_BYTES),
+        linger_ms: Some(MV03B_EVENTHUBS_LINGER_MS),
+        max_retries: Some(MV03B_EVENTHUBS_MAX_RETRIES),
+        initial_backoff_ms: Some(MV03B_EVENTHUBS_BACKOFF_FIRST_MS),
+        max_backoff_ms: Some(MV03B_EVENTHUBS_BACKOFF_MAX_MS),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let transport =
+        HttpAzureEventHubsTransport::new(&config, reqwest::Client::new()).map_err(|error| {
+            format!(
+                "action {:?} cannot build its azure_eventhubs transport: {error}",
+                record.id
+            )
+        })?;
+    let sink = AzureEventHubsSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its azure_eventhubs sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `aws_iot` sink. The endpoint and mTLS material
+/// come from the connector; the remote topic comes from the action.
+///
+/// Values and defaults:
+/// - `endpoint`: the connector host (`host:port`); required.
+/// - `client_cert_pem` / `client_key_pem`: the connector mTLS pair;
+///   both required. SigV4 has no transport and is refused.
+/// - `remote_topic`: the action topic (alias `topic`); required.
+/// - The bridge maps every local topic (`#`) to the remote topic.
+/// - Batching belongs to the action runtime (RO-01): one row per
+///   send with a short linger and a finite buffer.
+#[cfg(feature = "aws_iot")]
+pub(crate) fn build_aws_iot_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::aws_iot::{
+        AwsIotAuth, AwsIotConfig, AwsIotSink, BridgeDirection, BridgeTopicMapping,
+        TlsAwsIotTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let endpoint = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["endpoint", "url", "server"],
+        "endpoint",
+    )?;
+    let region = first_string(connector_doc, &["region"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let client_id = first_string(connector_doc, &["client_id", "client"])
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|| "indra-bridge".to_string());
+    // Flat fields first, then the nested `auth` object used by v1.
+    let nested = connector_doc
+        .get("auth")
+        .and_then(|value| value.as_object());
+    let field = |keys: &[&str]| -> Option<String> {
+        if let Some(value) = first_string(connector_doc, keys) {
+            return Some(value.into_owned());
+        }
+        nested.and_then(|auth| {
+            keys.iter().find_map(|key| {
+                auth.get(*key)
+                    .and_then(|value| value.as_str().map(str::trim))
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+            })
+        })
+    };
+    let client_cert_pem = field(&["client_cert_pem", "client_cert", "certificate", "cert_pem"])
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: client_cert_pem (action {:?})",
+                record.id
+            )
+        })?;
+    let client_key_pem = field(&["client_key_pem", "client_key", "private_key", "key_pem"])
+        .ok_or_else(|| {
+            format!(
+                "connector {connector:?} is missing required field: client_key_pem (action {:?})",
+                record.id
+            )
+        })?;
+    let remote_topic = param_string(record, "remote_topic")
+        .or_else(|| param_string(record, "topic"))
+        .ok_or_else(|| {
+            format!(
+                "action {:?} is missing required field: remote_topic",
+                record.id
+            )
+        })?;
+    // Read the CA from the connector. The bundle is a valid source.
+    let ca_cert_pem =
+        field(&["ca_cert_pem", "ca_cert", "ca", "ca_bundle_pem", "ca_bundle"]).unwrap_or_default();
+    let config = AwsIotConfig {
+        endpoint,
+        region,
+        client_id,
+        auth: AwsIotAuth::Mtls {
+            ca_cert_pem,
+            client_cert_pem,
+            client_key_pem,
+        },
+        topic_mappings: vec![BridgeTopicMapping {
+            local_topic: "#".to_string(),
+            remote_topic,
+            direction: BridgeDirection::LocalToRemote,
+        }],
+        shadow_sync: None,
+        batch_size: Some(MV03B_AWS_IOT_BATCH_SIZE),
+        buffer_capacity: Some(MV03B_AWS_IOT_BUFFER_CAPACITY),
+        linger_ms: Some(MV03B_AWS_IOT_LINGER_MS),
+        max_retries: Some(MV03B_AWS_IOT_MAX_RETRIES),
+        timeout_ms: connector_timeout_ms(connector_doc),
+        connect_timeout_ms: None,
+        handshake_timeout_ms: None,
+        ca_bundle_pem: first_string(connector_doc, &["ca_bundle_pem", "ca_bundle"])
+            .map(|value| value.into_owned()),
+        alpn_protocols: None,
+    };
+    let transport = TlsAwsIotTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its aws_iot transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = AwsIotSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its aws_iot sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `azure_iot` sink. The hub, device and SAS key
+/// come from the connector; the action carries no target (the hub
+/// topic is fixed by the device).
+///
+/// Values and defaults:
+/// - `iot_hub_name`: the connector hub (`host[:port]`); required.
+/// - `device_id`: the connector device; required.
+/// - `shared_access_key`: the connector SAS key; required.
+/// - Batching belongs to the action runtime (RO-01): one row per
+///   send with no linger.
+#[cfg(feature = "azure_iot")]
+pub(crate) fn build_azure_iot_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::azure_iot::{
+        AzureIotAuth, AzureIotConfig, AzureIotSink, TlsAzureIotTransport,
+    };
+    let connector = record.connector.trim().to_string();
+    let iot_hub_name = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["iot_hub_name", "hub_name", "server", "endpoint"],
+        "iot_hub_name",
+    )?;
+    let device_id = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["device_id", "device"],
+        "device_id",
+    )?;
+    let shared_access_key = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["shared_access_key", "key"],
+        "shared_access_key",
+    )?;
+    let config = AzureIotConfig {
+        iot_hub_name,
+        device_id,
+        module_id: first_string(connector_doc, &["module_id", "module"])
+            .map(|value| value.into_owned()),
+        auth: AzureIotAuth::SharedAccessKey {
+            key: shared_access_key,
+            key_name: first_string(connector_doc, &["key_name", "shared_access_key_name"])
+                .map(|value| value.into_owned()),
+        },
+        api_version: first_string(connector_doc, &["api_version"])
+            .map(|value| value.into_owned())
+            .unwrap_or_else(|| "2021-04-12".to_string()),
+        // The bridge sends telemetry only. It subscribes to nothing.
+        direct_methods_enabled: false,
+        twin_sync_enabled: false,
+        batch_size: Some(MV03B_AZURE_IOT_BATCH_SIZE),
+        buffer_capacity: Some(MV03B_AZURE_IOT_BUFFER_CAPACITY),
+        linger_ms: Some(MV03B_AZURE_IOT_LINGER_MS),
+        max_retries: Some(MV03B_AZURE_IOT_MAX_RETRIES),
+        timeout_ms: connector_timeout_ms(connector_doc),
+        connect_timeout_ms: None,
+        handshake_timeout_ms: None,
+        ca_bundle_pem: first_string(connector_doc, &["ca_bundle_pem", "ca_bundle"])
+            .map(|value| value.into_owned()),
+        sas_ttl_secs: Some(MV03B_AZURE_IOT_SAS_TTL_SECS),
+    };
+    // The action suffix is validated in `required_action_parameters`.
+    // It rides in the driver config, so each update rebuilds the
+    // sink with the new suffix.
+    let transport = TlsAzureIotTransport::new(&config).map_err(|error| {
+        format!(
+            "action {:?} cannot build its azure_iot transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = AzureIotSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its azure_iot sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+/// Build the action's `oci_streaming` sink. The endpoint and OCI
+/// identity come from the connector; the stream comes from the
+/// action.
+///
+/// Values and defaults:
+/// - `endpoint`, `stream_pool_id`, `stream_id`, `tenancy_ocid`,
+///   `user_ocid`, `fingerprint`, `private_key_pem`: the connector
+///   identity; all required.
+/// - `stream_id`: the action may override the connector stream;
+///   the connector value is the default.
+/// - `partition_key_template`: the action key template; default
+///   `${client_id}`.
+/// - Batching belongs to the action runtime (RO-01): one row per
+///   send with no linger and a finite buffer.
+pub(crate) fn build_oci_streaming_sink(
+    record: &ActionRecord,
+    connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    use broker_connectors_enterprise::oci_streaming::{
+        HttpOciStreamingTransport, OciStreamingSink, OciStreamingSinkConfig,
+    };
+    let connector = record.connector.trim().to_string();
+    let endpoint = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["endpoint", "url", "server"],
+        "endpoint",
+    )?;
+    let stream_pool_id = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["stream_pool_id", "pool_id", "pool"],
+        "stream_pool_id",
+    )?;
+    let stream_id = param_string(record, "stream_id").unwrap_or_default();
+    if stream_id.trim().is_empty() {
+        return Err(format!(
+            "action {:?} is missing required field: stream_id",
+            record.id
+        ));
+    }
+    let tenancy_ocid = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["tenancy_ocid", "tenancy"],
+        "tenancy_ocid",
+    )?;
+    let user_ocid = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["user_ocid", "user"],
+        "user_ocid",
+    )?;
+    let fingerprint = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["fingerprint"],
+        "fingerprint",
+    )?;
+    let private_key_pem = connector_field(
+        connector_doc,
+        &connector,
+        &record.id,
+        &["private_key_pem", "private_key"],
+        "private_key_pem",
+    )?;
+    let config = OciStreamingSinkConfig {
+        endpoint,
+        stream_pool_id,
+        stream_id,
+        tenancy_ocid,
+        user_ocid,
+        fingerprint,
+        private_key_pem,
+        partition_key_template: param_string(record, "partition_key")
+            .or_else(|| param_string(record, "partition_key_template"))
+            .unwrap_or_else(|| "${client_id}".to_string()),
+        // One row per send with no linger: the action runtime owns
+        // batching (RO-01). The buffer stays finite (default 10_000
+        // rows in the driver).
+        batch_size: Some(MV03B_OCI_BATCH_SIZE),
+        buffer_capacity: Some(MV03B_OCI_BUFFER_CAPACITY),
+        batch_bytes: Some(MV03B_OCI_BATCH_BYTES),
+        linger_ms: Some(MV03B_OCI_LINGER_MS),
+        max_retries: Some(MV03B_OCI_MAX_RETRIES),
+        initial_backoff_ms: Some(MV03B_OCI_BACKOFF_FIRST_MS),
+        max_backoff_ms: Some(MV03B_OCI_BACKOFF_MAX_MS),
+        timeout_ms: connector_timeout_ms(connector_doc),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout())
+        .build()
+        .unwrap_or_default();
+    let transport = HttpOciStreamingTransport::new(&config, client).map_err(|error| {
+        format!(
+            "action {:?} cannot build its oci_streaming transport: {error}",
+            record.id
+        )
+    })?;
+    let sink = OciStreamingSink::new(config, Arc::new(transport)).map_err(|error| {
+        format!(
+            "action {:?} cannot build its oci_streaming sink: {error}",
+            record.id
+        )
+    })?;
+    Ok(Arc::new(sink))
+}
+
+#[cfg(not(feature = "kinesis"))]
+pub(crate) fn build_kinesis_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `kinesis` (disabled in this build)",
+        record.id
+    ))
+}
+
+#[cfg(not(feature = "gcp_pubsub"))]
+pub(crate) fn build_gcp_pubsub_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `gcp_pubsub` (disabled in this build)",
+        record.id
+    ))
+}
+
+#[cfg(not(feature = "azure_eventhubs"))]
+pub(crate) fn build_azure_eventhubs_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `azure_eventhubs` (disabled in this build)",
+        record.id
+    ))
+}
+
+#[cfg(not(feature = "aws_iot"))]
+pub(crate) fn build_aws_iot_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `aws_iot` (disabled in this build)",
+        record.id
+    ))
+}
+
+#[cfg(not(feature = "azure_iot"))]
+pub(crate) fn build_azure_iot_sink(
+    record: &ActionRecord,
+    _connector_doc: &serde_json::Value,
+) -> Result<Arc<dyn broker_connectors::Sink>, String> {
+    Err(format!(
+        "action {:?} needs cargo feature `azure_iot` (disabled in this build)",
+        record.id
+    ))
+}
+
 /// Endpoint for one object-store connector: an explicit
 /// `endpoint`/`url`/`server`, else `https://host[:port]`.
 #[cfg(feature = "s3")]
@@ -8583,6 +9449,169 @@ mod tests {
         let sink = build_tablestore_sink(&rec, &doc, &ActionResourceOpts::default())
             .expect("a full tablestore pair builds");
         assert_eq!(sink.kind(), "tablestore");
+    }
+
+    #[test]
+    fn canonical_action_kind_maps_every_mv03b_alias() {
+        assert_eq!(canonical_action_kind("aws_kinesis"), "kinesis");
+        assert_eq!(canonical_action_kind("gcp"), "gcp_pubsub");
+        assert_eq!(canonical_action_kind("pubsub"), "gcp_pubsub");
+        assert_eq!(canonical_action_kind("gcp_pubsub_producer"), "gcp_pubsub");
+        assert_eq!(canonical_action_kind("gcp_pubsub_consumer"), "gcp_pubsub");
+        assert_eq!(canonical_action_kind("azure_event_hubs"), "azure_eventhubs");
+        assert_eq!(canonical_action_kind("azure"), "azure_eventhubs");
+        assert_eq!(canonical_action_kind("eventhubs"), "azure_eventhubs");
+        assert_eq!(
+            canonical_action_kind("azure_event_hub_producer"),
+            "azure_eventhubs"
+        );
+        assert_eq!(canonical_action_kind("oci"), "oci_streaming");
+        assert_eq!(canonical_action_kind("aws_iot_core"), "aws_iot");
+        assert_eq!(canonical_action_kind("azure_iot_hub"), "azure_iot");
+        assert_eq!(canonical_action_kind("azure_iothub"), "azure_iot");
+        assert_eq!(canonical_action_kind("iothub"), "azure_iot");
+        assert_eq!(canonical_action_kind("gcp_iot_core"), "gcp_iot");
+        assert_eq!(canonical_action_kind("cloud_iot"), "gcp_iot");
+    }
+
+    #[test]
+    fn action_owned_kind_covers_the_mv03b_kinds() {
+        for kind in [
+            "kinesis",
+            "aws_kinesis",
+            "gcp_pubsub",
+            "gcp",
+            "pubsub",
+            "gcp_pubsub_producer",
+            "gcp_pubsub_consumer",
+            "azure_eventhubs",
+            "azure_event_hubs",
+            "azure",
+            "eventhubs",
+            "azure_event_hub_producer",
+            "aws_iot",
+            "aws_iot_core",
+            "azure_iot",
+            "azure_iot_hub",
+            "azure_iothub",
+            "iothub",
+            "oci_streaming",
+            "oci",
+        ] {
+            assert!(action_owned_kind(kind), "{kind} owns a runtime");
+        }
+        assert!(!action_owned_kind("gcp_iot"));
+        assert!(!action_owned_kind("gcp_iot_core"));
+    }
+
+    #[cfg(feature = "kinesis")]
+    #[tokio::test]
+    async fn kinesis_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let doc = serde_json::json!({
+            "endpoint": "http://127.0.0.1:9",
+            "region": "us-east-1",
+            "aws_access_key_id": "AKID",
+            "aws_secret_access_key": "secret",
+        });
+        let rec = mv02d_record("act", "aws_kinesis", "k:up", serde_json::json!({}));
+        let error = build_kinesis_sink(&rec, &doc)
+            .err()
+            .expect("a missing stream refuses");
+        assert!(error.contains("stream_name"), "{error}");
+        let rec = mv02d_record(
+            "act",
+            "kinesis",
+            "k:up",
+            serde_json::json!({"stream_name": "telemetry", "partition_key": "${client_id}"}),
+        );
+        let sink = build_kinesis_sink(&rec, &doc).expect("a full kinesis pair builds");
+        assert_eq!(sink.kind(), "kinesis");
+    }
+
+    #[cfg(feature = "gcp_pubsub")]
+    #[tokio::test]
+    async fn gcp_pubsub_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let doc = serde_json::json!({"project_id": "demo-proj"});
+        let rec = mv02d_record("act", "gcp", "g:up", serde_json::json!({}));
+        let error = build_gcp_pubsub_sink(&rec, &doc)
+            .err()
+            .expect("a missing topic refuses");
+        assert!(error.contains("pubsub_topic"), "{error}");
+        let rec = mv02d_record(
+            "act",
+            "gcp_pubsub_producer",
+            "g:up",
+            serde_json::json!({"pubsub_topic": "events"}),
+        );
+        let sink = build_gcp_pubsub_sink(&rec, &doc).expect("a full pubsub pair builds");
+        assert_eq!(sink.kind(), "gcp_pubsub");
+    }
+
+    #[cfg(feature = "azure_eventhubs")]
+    #[tokio::test]
+    async fn azure_eventhubs_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let doc = serde_json::json!({
+            "namespace": "ns-1",
+            "shared_access_key_name": "send",
+            "shared_access_key": "secret",
+        });
+        let rec = mv02d_record("act", "azure", "e:up", serde_json::json!({}));
+        let error = build_azure_eventhubs_sink(&rec, &doc)
+            .err()
+            .expect("a missing hub refuses");
+        assert!(error.contains("event_hub"), "{error}");
+        let rec = mv02d_record(
+            "act",
+            "azure_event_hub_producer",
+            "e:up",
+            serde_json::json!({"event_hub": "hub-a"}),
+        );
+        let sink = build_azure_eventhubs_sink(&rec, &doc).expect("a full hub pair builds");
+        assert_eq!(sink.kind(), "azure_eventhubs");
+    }
+
+    #[cfg(feature = "aws_iot")]
+    #[tokio::test]
+    async fn aws_iot_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let doc = serde_json::json!({"endpoint": "127.0.0.1:8883"});
+        let rec = mv02d_record(
+            "act",
+            "aws_iot",
+            "a:up",
+            serde_json::json!({"remote_topic": "t/${client_id}"}),
+        );
+        let error = build_aws_iot_sink(&rec, &doc)
+            .err()
+            .expect("a missing cert refuses");
+        assert!(error.contains("client_cert_pem"), "{error}");
+    }
+
+    #[cfg(feature = "azure_iot")]
+    #[tokio::test]
+    async fn azure_iot_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let doc = serde_json::json!({"device_id": "edge-1", "shared_access_key": "s"});
+        let rec = mv02d_record("act", "azure_iot", "z:up", serde_json::json!({}));
+        let error = build_azure_iot_sink(&rec, &doc)
+            .err()
+            .expect("a missing hub refuses");
+        assert!(error.contains("iot_hub_name"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn oci_streaming_sink_uses_the_connector_settings_and_refuses_the_missing_fields() {
+        let doc = serde_json::json!({
+            "endpoint": "https://cell-1.streaming.us-east-1.oraclecloud.com",
+            "stream_pool_id": "ocid1.streampool.oc1.phx.aaa",
+            "tenancy_ocid": "ocid1.tenancy.oc1..aaa",
+            "user_ocid": "ocid1.user.oc1..aaa",
+            "fingerprint": "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99",
+            "private_key_pem": "k",
+        });
+        let rec = mv02d_record("act", "oci", "o:up", serde_json::json!({}));
+        let error = build_oci_streaming_sink(&rec, &doc)
+            .err()
+            .expect("a missing stream refuses");
+        assert!(error.contains("stream_id"), "{error}");
     }
 
     #[cfg(feature = "rabbitmq")]

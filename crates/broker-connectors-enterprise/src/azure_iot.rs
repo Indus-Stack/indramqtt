@@ -820,31 +820,48 @@ impl AzureIotTransport for TlsAzureIotTransport {
             &publish.body,
             false,
         )?;
+        // Reconnect rides the sink backoff loop. A `Connection`
+        // failure drops the stream. The next publish dials again.
+        // A `Dispatch` failure keeps the stream.
         let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("azure-iot not connected".to_string()))?;
-        tokio::time::timeout(self.io_timeout, stream.write_all(&bytes))
-            .await
-            .map_err(|_| ConnectorError::Connection("azure-iot publish timeout".to_string()))?
-            .map_err(|e| ConnectorError::Connection(format!("azure-iot publish failed: {e}")))?;
-        let mut ack = [0u8; 4];
-        tokio::time::timeout(self.io_timeout, stream.read_exact(&mut ack))
-            .await
-            .map_err(|_| ConnectorError::Connection("azure-iot PUBACK timeout".to_string()))?
-            .map_err(|e| ConnectorError::Connection(format!("azure-iot PUBACK failed: {e}")))?;
-        if ack[0] != 0x40 || ack[1] != 0x02 {
-            return Err(ConnectorError::Connection(
-                "azure-iot malformed PUBACK".to_string(),
-            ));
+        let outcome = async {
+            let stream = guard
+                .as_mut()
+                .ok_or_else(|| ConnectorError::Connection("azure-iot not connected".to_string()))?;
+            tokio::time::timeout(self.io_timeout, stream.write_all(&bytes))
+                .await
+                .map_err(|_| ConnectorError::Connection("azure-iot publish timeout".to_string()))?
+                .map_err(|e| {
+                    ConnectorError::Connection(format!("azure-iot publish failed: {e}"))
+                })?;
+            let mut ack = [0u8; 4];
+            tokio::time::timeout(self.io_timeout, stream.read_exact(&mut ack))
+                .await
+                .map_err(|_| ConnectorError::Connection("azure-iot PUBACK timeout".to_string()))?
+                .map_err(|e| ConnectorError::Connection(format!("azure-iot PUBACK failed: {e}")))?;
+            if ack[0] != 0x40 || ack[1] != 0x02 {
+                return Err(ConnectorError::Connection(
+                    "azure-iot malformed PUBACK".to_string(),
+                ));
+            }
+            let got = u16::from_be_bytes([ack[2], ack[3]]);
+            if got != packet_id {
+                return Err(ConnectorError::Connection(format!(
+                    "azure-iot PUBACK id mismatch: got {got}, want {packet_id}"
+                )));
+            }
+            Ok::<(), ConnectorError>(())
         }
-        let got = u16::from_be_bytes([ack[2], ack[3]]);
-        if got != packet_id {
-            return Err(ConnectorError::Connection(format!(
-                "azure-iot PUBACK id mismatch: got {got}, want {packet_id}"
-            )));
+        .await;
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if matches!(error, ConnectorError::Connection(_)) {
+                    *guard = None;
+                }
+                Err(error)
+            }
         }
-        Ok(())
     }
 }
 
@@ -987,8 +1004,9 @@ impl AzureIotSink {
     }
 
     /// Flush buffered rows (no-op when empty). 401 forces one SAS
-    /// renewal + retry; throttles retry in-loop; terminal failures
-    /// and exhaustion restore the buffer and propagate.
+    /// renewal and one retry. Throttles retry in-loop. Exhaustion
+    /// drops the batch and engages backoff. Rejections restore
+    /// the buffer and propagate.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = self.buffer.lock().take_batch();
@@ -1036,28 +1054,20 @@ impl AzureIotSink {
                 }
                 Err(ConnectorError::Connection(message)) => {
                     if attempt >= max_retries {
-                        return self.restore_err(rows, oldest, ConnectorError::Connection(message));
+                        self.buffer.lock().restore(rows, oldest);
+                        self.backoff.lock().failure();
+                        return Err(ConnectorError::Connection(message));
                     }
                     attempt += 1;
                     tokio::time::sleep(self.backoff_delay(attempt)).await;
                 }
                 Err(e) => {
-                    return self.restore_err(rows, oldest, e);
+                    self.buffer.lock().restore(rows, oldest);
+                    self.backoff.lock().failure();
+                    return Err(e);
                 }
             }
         }
-    }
-
-    fn restore_err(
-        &self,
-        rows: Vec<AzureIotRow>,
-        oldest: Option<std::time::Instant>,
-        error: ConnectorError,
-    ) -> Result<()> {
-        let mut buffer = self.buffer.lock();
-        buffer.restore(rows, oldest);
-        self.backoff.lock().failure();
-        Err(error)
     }
 
     /// Validate + buffer one publish. Returns true when the batch
@@ -1873,11 +1883,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_sink_buffers_through_broker() {
-        // The write path goes through the broker-facing `Sink`
-        // interface: `send` buffers, `flush` publishes through the real
-        // TLS transport. With no hub reachable (loopback port closed)
-        // the flush must fail as a retryable connection error and
-        // retain the rows.
+        // The write path uses the broker-facing `Sink`.
+        // `send` buffers one row. `flush` publishes through TLS.
+        // No hub listens on the loopback port.
+        // `flush` fails with a retryable error and drops the batch.
         let mut config = sas_test_config("127.0.0.1:1");
         config.max_retries = Some(0);
         config.connect_timeout_ms = Some(200);

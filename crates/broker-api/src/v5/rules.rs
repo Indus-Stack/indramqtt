@@ -78,6 +78,10 @@ const MAX_RULE_ID_LEN: usize = broker_config::MAX_RULE_ID_LEN;
 /// example shows an 8-char id, so a create without one assigns 8 chars.
 const GENERATED_RULE_ID_LEN: usize = 8;
 
+/// Event Hubs Kafka port from the vendor docs. Reason: the derived
+/// `bootstrap_hosts` must name the Kafka endpoint port.
+const AZURE_EVENTHUBS_KAFKA_PORT: u16 = 9093;
+
 /// Assign a rule id for a create without one. Returns 8 lowercase hex
 /// chars from secure random. A collision fails as a duplicate, never
 /// as an overwrite.
@@ -1343,6 +1347,91 @@ fn connector_node_status(status: &str) -> serde_json::Value {
     serde_json::json!([{ "node": local_node_name(), "status": status }])
 }
 
+/// Fill the driver fields of an Azure Event Hubs connector from the
+/// reference fields. The reference connector carries `authentication`,
+/// `bootstrap_hosts` and `ssl`; the driver reads `namespace` and the
+/// SAS pair. Each value comes from an operator input, never a constant.
+fn apply_cloud_reference_fields(conn_type: &str, body: &mut serde_json::Value) {
+    if canonical_connector_kind(conn_type) != "azure_eventhubs" {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    fn text(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+        map.get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+    let password = obj
+        .get("authentication")
+        .and_then(|value| value.as_object())
+        .and_then(|auth| text(auth, "password"));
+    let mut endpoint_namespace = None;
+    let mut key_name = None;
+    let mut secret = None;
+    if let Some(password) = &password {
+        for part in password.split(';') {
+            let Some((name, value)) = part.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match name.trim() {
+                "Endpoint" => {
+                    let host = value.trim_start_matches("sb://").trim_end_matches('/');
+                    if let Some(label) = host.split('.').next().filter(|label| !label.is_empty()) {
+                        endpoint_namespace = Some(label.to_string());
+                    }
+                }
+                "SharedAccessKeyName" => key_name = Some(value.to_string()),
+                "SharedAccessKey" => secret = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+    if text(obj, "namespace").is_none() {
+        let namespace = endpoint_namespace.or_else(|| {
+            text(obj, "bootstrap_hosts").and_then(|hosts| {
+                let host = hosts
+                    .split(',')
+                    .map(str::trim)
+                    .find(|host| !host.is_empty())?;
+                let host = host.rsplit_once(':').map_or(host, |(host, _)| host);
+                let label = host.split('.').next()?;
+                if label.is_empty() {
+                    None
+                } else {
+                    Some(label.to_string())
+                }
+            })
+        });
+        if let Some(namespace) = namespace {
+            obj.insert(
+                "namespace".to_string(),
+                serde_json::Value::String(namespace),
+            );
+        }
+    }
+    if text(obj, "shared_access_key_name").is_none() {
+        if let Some(key_name) = key_name {
+            obj.insert(
+                "shared_access_key_name".to_string(),
+                serde_json::Value::String(key_name),
+            );
+        }
+    }
+    if text(obj, "shared_access_key").is_none() {
+        if let Some(secret) = secret {
+            obj.insert(
+                "shared_access_key".to_string(),
+                serde_json::Value::String(secret),
+            );
+        }
+    }
+}
+
 /// Required-field gate for connector registration (S1-01): no connector
 /// may fall back to a built-in credential or an invented identity. Returns
 /// the first missing required field's canonical name, or `None` when the
@@ -1367,7 +1456,7 @@ fn missing_connector_field(
     }
 
     match conn_type {
-        "gcp_iot" | "gcp_iot_core" => {
+        "gcp_iot" | "gcp_iot_core" | "cloud_iot" => {
             // Credential first so a bare body names the credential, not an identity.
             if !present(body, &["private_key_pem", "private_key"]) {
                 return Some("private_key_pem");
@@ -1437,13 +1526,54 @@ fn missing_connector_field(
             }
             None
         }
-        "azure_eventhubs" | "azure_event_hubs" => {
+        "kinesis" | "aws_kinesis" => {
+            if !present(body, &["endpoint", "url", "server"]) {
+                return Some("endpoint");
+            }
+            if !present(body, &["aws_access_key_id", "access_key_id", "ak"]) {
+                return Some("aws_access_key_id");
+            }
+            if !present(body, &["aws_secret_access_key", "secret_access_key", "sk"]) {
+                return Some("aws_secret_access_key");
+            }
+            None
+        }
+        "gcp_pubsub" | "gcp" | "pubsub" | "gcp_pubsub_producer" | "gcp_pubsub_consumer" => {
+            // The driver reads `project_id`. The sink ignores
+            // `authentication`. A body with only `authentication`
+            // has no usable identity and is refused.
+            if !present(body, &["project_id", "gcp_project_id", "project"]) {
+                return Some("project_id");
+            }
+            None
+        }
+        "azure_eventhubs"
+        | "azure_event_hubs"
+        | "azure"
+        | "eventhubs"
+        | "azure_event_hub_producer" => {
+            // The driver reads `namespace` and the SAS pair.
+            // `apply_cloud_reference_fields` fills both from the
+            // reference `authentication` and `bootstrap_hosts` input
+            // before this check runs.
+            if !present(body, &["namespace"]) {
+                return Some("namespace");
+            }
+            if !present(body, &["shared_access_key_name", "key_name", "policy"]) {
+                return Some("shared_access_key_name");
+            }
             if !present(body, &["shared_access_key", "key"]) {
                 return Some("shared_access_key");
             }
             None
         }
         "azure_iot" | "azure_iot_hub" => {
+            if !present(body, &["iot_hub_name", "hub_name", "server", "endpoint"]) {
+                return Some("iot_hub_name");
+            }
+            if !present(body, &["device_id", "device"]) {
+                return Some("device_id");
+            }
             if !present(body, &["shared_access_key", "key"]) {
                 return Some("shared_access_key");
             }
@@ -2291,6 +2421,15 @@ pub(crate) fn disabled_connector_feature(conn_type: &str) -> Option<&'static str
         })
 }
 
+/// True for the three IoT kinds that the CEO kept out of the MVP on
+/// 2026-11-08. Create and update refuse them with `BAD_REQUEST`.
+pub(crate) fn is_mvp_pending_iot_kind(kind: &str) -> bool {
+    matches!(
+        broker_config::kind_row(kind).map(|row| row.name),
+        Some("aws_iot" | "azure_iot" | "oci_streaming")
+    )
+}
+
 /// KC-00 refusal for a kind whose capability state is not `ready`.
 ///
 /// Returns `None` for a ready kind (and for the `test` helper in a test
@@ -2312,6 +2451,22 @@ pub(crate) fn kind_refusal(kind: &str) -> Option<String> {
     Some(format!(
         "connector type {canonical} is not available in this broker"
     ))
+}
+
+/// Make a refused kind visible in the alarm list. The alarm name carries
+/// the kind so an operator can find the refusal that created it.
+pub(crate) fn raise_unavailable_kind_alarm(state: &ApiState, kind: &str) {
+    if kind_refusal(kind).is_none() {
+        return;
+    }
+    let canonical = broker_config::kind_row(kind)
+        .map(|row| row.name)
+        .unwrap_or(kind);
+    state.alarms.activate(
+        &format!("kind_unavailable:{canonical}"),
+        &format!("kind {canonical:?} is not available; the request is refused"),
+        serde_json::json!({"kind": canonical}),
+    );
 }
 
 /// Features compiled into this build, from the same table.
@@ -2336,6 +2491,9 @@ fn live_sink_kind(conn_type: &str) -> &str {
 /// Canonical type of a connector. Documented aliases map to the
 /// runtime kind that executes them. The reference names its HTTP
 /// connector `http`; the tree runs it in the `webhook` arm.
+/// The stored type keeps the reference name when the reference
+/// defines one. `gcp_pubsub_producer` stays `gcp_pubsub_producer`.
+/// All other aliases map to the base kind.
 fn canonical_connector_kind(conn_type: &str) -> &str {
     match conn_type {
         "http" | "rest" => "webhook",
@@ -2345,6 +2503,17 @@ fn canonical_connector_kind(conn_type: &str) -> &str {
         "elastic" | "es" | "opensearch" => "elasticsearch",
         "opcua" => "opc_ua",
         "sparkplug" | "spb" => "sparkplug_b",
+        "aws_kinesis" => "kinesis",
+        "gcp_pubsub_producer" => "gcp_pubsub_producer",
+        "gcp_pubsub_consumer" => "gcp_pubsub_consumer",
+        "gcp" | "pubsub" => "gcp_pubsub",
+        "azure_event_hubs" | "azure" | "eventhubs" | "azure_event_hub_producer" => {
+            "azure_eventhubs"
+        }
+        "oci" | "oracle_streaming" => "oci_streaming",
+        "aws_iot_core" => "aws_iot",
+        "azure_iot_hub" | "azure_iothub" | "iothub" => "azure_iot",
+        "gcp_iot_core" | "cloud_iot" => "gcp_iot",
         _ => conn_type,
     }
 }
@@ -2484,6 +2653,48 @@ fn normalize_connector_document(conn_type: &str, body: &mut serde_json::Value) {
         "s3" => normalize_s3_host_port(obj),
         "disk_log" => normalize_disk_log_retention(obj),
         _ => {}
+    }
+    // Live API compatibility: the read back document carries the
+    // required reference fields. The driver uses the original input
+    // before this step; nothing here changes delivery. The code
+    // invents no value: each derived field uses an operator input or
+    // the reference default named below.
+    if canonical == "azure_eventhubs" {
+        // The reference requires `bootstrap_hosts`, `authentication`
+        // and `ssl`. The driver needs `namespace` plus the SAS pair.
+        // Derive `bootstrap_hosts` from `namespace` plus the Kafka port.
+        // The Kafka port is the Event Hubs port.
+        //
+        // Derive `authentication` password from `shared_access_key`.
+        // Use empty `ssl` when the operator gives none.
+        // Empty `ssl` selects the reference default.
+        if obj.get("bootstrap_hosts").is_none() {
+            if let Some(namespace) = read(obj, "namespace") {
+                obj.insert(
+                    "bootstrap_hosts".to_string(),
+                    serde_json::Value::String(format!(
+                        "{namespace}.servicebus.windows.net:{AZURE_EVENTHUBS_KAFKA_PORT}"
+                    )),
+                );
+            }
+        }
+        if obj.get("authentication").is_none() {
+            if let Some(secret) = read(obj, "shared_access_key").or_else(|| read(obj, "key")) {
+                obj.insert(
+                    "authentication".to_string(),
+                    serde_json::json!({"password": secret}),
+                );
+            }
+        }
+        if obj.get("ssl").is_none() {
+            obj.insert("ssl".to_string(), serde_json::json!({}));
+        }
+        // The reference names this kind `azure_event_hub_producer`.
+        // Store the reference name so the response validates.
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("azure_event_hub_producer".to_string()),
+        );
     }
     if canonical != "mongodb" {
         return;
@@ -5244,8 +5455,16 @@ pub(crate) async fn register_live_sink(
             else {
                 return Ok(());
             };
-            let ca_cert_pem = field(&["ca_cert_pem", "ca_cert", "ca_pem", "certificate_authority"])
-                .unwrap_or_default();
+            let ca_cert_pem = field(&[
+                "ca_cert_pem",
+                "ca_cert",
+                "ca_pem",
+                "certificate_authority",
+                "ca",
+                "ca_bundle_pem",
+                "ca_bundle",
+            ])
+            .unwrap_or_default();
             let ca_bundle_pem = field(&["ca_bundle_pem", "ca_bundle"]);
             let timeout_ms = body
                 .get("timeout_ms")
@@ -5446,13 +5665,21 @@ pub(crate) async fn register_live_sink(
             }
         }
         #[cfg(not(feature = "azure_eventhubs"))]
-        "azure_eventhubs" | "azure_event_hubs" | "azure" | "eventhubs" => {
+        "azure_eventhubs"
+        | "azure_event_hubs"
+        | "azure"
+        | "eventhubs"
+        | "azure_event_hub_producer" => {
             // Feature disabled (X1-09): fail closed with no sink; the
             // checked wrapper names the missing feature.
             return Err(refuse_disabled_kind(conn_type, "azure_eventhubs"));
         }
         #[cfg(feature = "azure_eventhubs")]
-        "azure_eventhubs" | "azure_event_hubs" | "azure" | "eventhubs" => {
+        "azure_eventhubs"
+        | "azure_event_hubs"
+        | "azure"
+        | "eventhubs"
+        | "azure_event_hub_producer" => {
             let namespace = body
                 .get("namespace")
                 .and_then(|v| v.as_str())
@@ -5654,7 +5881,7 @@ pub(crate) async fn register_live_sink(
             }
         }
         #[cfg(feature = "gcp_pubsub")]
-        "gcp_pubsub" | "pubsub" => {
+        "gcp_pubsub" | "gcp" | "pubsub" | "gcp_pubsub_producer" | "gcp_pubsub_consumer" => {
             let project_id = body
                 .get("project_id")
                 .or_else(|| body.get("project"))
@@ -5709,7 +5936,7 @@ pub(crate) async fn register_live_sink(
             }
         }
         #[cfg(not(feature = "gcp_pubsub"))]
-        "gcp_pubsub" | "pubsub" => {
+        "gcp_pubsub" | "gcp" | "pubsub" | "gcp_pubsub_producer" | "gcp_pubsub_consumer" => {
             return Err(refuse_disabled_kind(conn_type, "gcp_pubsub"));
         }
         #[cfg(not(feature = "bigquery"))]
@@ -6444,11 +6671,16 @@ pub async fn create_connector(
     // or identity names that field first, even when the kind is not
     // ready yet. A credential-complete body whose kind is not ready is
     // refused with ALREADY_EXISTS after alias mapping, below.
+    apply_cloud_reference_fields(conn_type.as_str(), &mut body);
     let missing = missing_connector_field(conn_type.as_str(), &body, &state.connectors.data_dir());
     if missing.is_none() {
         // Refuse a pending kind before alias mapping: an alias of a
         // ready kind must not hide a pending one.
         if let Some(message) = kind_refusal(conn_type.as_str()) {
+            raise_unavailable_kind_alarm(&state, conn_type.as_str());
+            if is_mvp_pending_iot_kind(conn_type.as_str()) {
+                return ApiError::BadRequest(message).into_response();
+            }
             return ApiError::AlreadyExists(message).into_response();
         }
     }
@@ -6493,6 +6725,19 @@ pub async fn create_connector(
     // refuses to invent values.
     if let Some(missing) = missing {
         let message = format!("missing required field: {missing} for connector type {conn_type}");
+        // The three MVP-pending IoT kinds answer the documented
+        // `BAD_REQUEST` code for every create, before anything stores.
+        if is_mvp_pending_iot_kind(&conn_type_early) {
+            raise_unavailable_kind_alarm(&state, &conn_type_early);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "code": "BAD_REQUEST",
+                    "message": message,
+                })),
+            )
+                .into_response();
+        }
         // `POST /connectors` documents one 400 code, `ALREADY_EXISTS`.
         // The http, device, object, file and cloud kinds answer with that
         // code so the refusal body validates. Other kinds keep
@@ -6509,6 +6754,10 @@ pub async fn create_connector(
                 | "http"
                 | "opc_ua"
                 | "sparkplug_b"
+                | "kinesis"
+                | "gcp_pubsub"
+                | "azure_eventhubs"
+                | "gcp_iot"
         ) {
             return ApiError::AlreadyExists(message).into_response();
         }
@@ -6693,13 +6942,38 @@ pub async fn update_connector(
     Json(mut body): Json<serde_json::Value>,
 ) -> Response {
     let _sink_guard = state.action_sink_lock.lock().await;
-    // The path id is authoritative and accepts the bare id or the
-    // `{type}:{name}` key. No fuzzy matching: any other form is 404.
+    // A refused kind answers 400 before the existence check.
+    // Reason: fail closed for refused kinds.
+    let raw = body
+        .as_object()
+        .and_then(|obj| obj.get("type").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        return ApiError::BadRequest("missing required field: type".to_string()).into_response();
+    }
+    if let Some(message) = kind_refusal(raw.as_str()) {
+        raise_unavailable_kind_alarm(&state, raw.as_str());
+        return ApiError::BadRequest(message).into_response();
+    }
     // Existence before validation: an unknown id is 404 and creates
     // nothing, even when the body is also invalid.
     let Some(stored) = state.connectors.get(&id) else {
         return ApiError::NotFound(format!("connector {id:?} not found")).into_response();
     };
+    // Body validation after existence check.
+    let canonical = canonical_connector_kind(raw.as_str()).to_string();
+    if let Some(message) = crate::removed_connector_refusal(&canonical) {
+        return ApiError::BadRequest(message.to_string()).into_response();
+    }
+    if !broker_config::is_known_connector_type(&canonical) {
+        return ApiError::BadRequest(format!("unknown connector type: {canonical}"))
+            .into_response();
+    }
+    if let Some(message) = kind_refusal(&canonical) {
+        return ApiError::BadRequest(message).into_response();
+    }
     let bare = connector_bare_name(&stored);
     let Some(obj) = body.as_object() else {
         return ApiError::BadRequest("request body must be a JSON object".to_string())
@@ -6772,6 +7046,7 @@ pub async fn update_connector(
     }
     // Fail closed (S1-01): same required-field gate as create; an update
     // that drops a credential or identity is rejected with the field named.
+    apply_cloud_reference_fields(&conn_type, &mut body);
     if let Some(missing) = missing_connector_field(&conn_type, &body, &state.connectors.data_dir())
     {
         return ApiError::BadRequest(format!(
@@ -6872,7 +7147,7 @@ pub async fn update_connector(
             }
         }
     }
-    let enable = obj.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+    let enable = body.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
     let old_enable = stored
         .get("enable")
         .and_then(|v| v.as_bool())
@@ -7541,6 +7816,32 @@ pub(crate) fn extract_target_host_port(body: &serde_json::Value) -> Option<Strin
         let port = body.get("port").and_then(|v| v.as_u64()).unwrap_or(1433);
         return Some(format!("{}:{}", host_port, port));
     }
+    // IoT and messaging hubs name the target outside `host`. The probe
+    // dials the same closed-port value that delivery uses.
+    for key in ["iot_hub_name", "hub_name", "hub", "namespace"] {
+        if let Some(s) = body.get(key).and_then(|v| v.as_str()) {
+            let mut clean = s.trim();
+            if clean.is_empty() {
+                continue;
+            }
+            if let Some((_, rest)) = clean.split_once("://") {
+                clean = rest;
+            }
+            let host_port = clean
+                .split('@')
+                .next_back()
+                .unwrap_or(clean)
+                .split('/')
+                .next()
+                .unwrap_or(clean)
+                .split('?')
+                .next()
+                .unwrap_or(clean);
+            if !host_port.is_empty() {
+                return Some(host_port.to_string());
+            }
+        }
+    }
     // The reference-shaped `parameters` object carries the same target
     // keys one level down; read them the same way.
     if let Some(parameters) = body.get("parameters") {
@@ -7577,7 +7878,17 @@ pub(crate) async fn check_tcp_reachable(addr: &str) -> Result<(), String> {
 fn document_kind_needs_target(kind: &str) -> bool {
     matches!(
         crate::v5::action_sinks::canonical_action_kind(kind),
-        "mongodb" | "couchbase" | "elasticsearch" | "opc_ua" | "sparkplug_b"
+        "mongodb"
+            | "couchbase"
+            | "elasticsearch"
+            | "opc_ua"
+            | "sparkplug_b"
+            | "kinesis"
+            | "gcp_pubsub"
+            | "azure_eventhubs"
+            | "aws_iot"
+            | "azure_iot"
+            | "oci_streaming"
     )
 }
 
@@ -8000,6 +8311,10 @@ pub async fn probe_connector(body: Option<Json<serde_json::Value>>) -> Response 
                     "endpoint_url",
                     "url",
                     "connection_string",
+                    "iot_hub_name",
+                    "hub_name",
+                    "hub",
+                    "namespace",
                 ],
             )
         } else {
@@ -8187,6 +8502,10 @@ pub async fn probe_action(
                     "endpoint_url",
                     "url",
                     "connection_string",
+                    "iot_hub_name",
+                    "hub_name",
+                    "hub",
+                    "namespace",
                 ],
             )
         } else {
