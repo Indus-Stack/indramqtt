@@ -1,0 +1,9 @@
+{
+  "action": "Deny three CONNECTs with a password and read the circuit-open line in the boot log.",
+  "config": "[auth]\nallow_anonymous = true\n\n[logging]\nlevel = \"warn\"\n\n[webhook]\nurl = \"http://127.0.0.1:9/hook\"\nbreaker_threshold = 3\n",
+  "item": "webhook.breaker_threshold",
+  "kind": "setting",
+  "output": "breaker-open credential-denied",
+  "returncode": 0,
+  "verified": true
+}

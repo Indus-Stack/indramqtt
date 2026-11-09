@@ -1,0 +1,9 @@
+{
+  "action": "Connect anonymously and with a JWT-shaped password while the JWKS endpoint stays unreachable.",
+  "config": "[auth]\nallow_anonymous = true\n\n[jwks]\nurl = \"https://127.0.0.1:9/jwks.json\"\n",
+  "item": "jwks.url",
+  "kind": "setting",
+  "output": "anonymous-refused credential-denied",
+  "returncode": 0,
+  "verified": true
+}

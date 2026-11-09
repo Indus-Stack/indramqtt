@@ -1,0 +1,1 @@
+`webhook.breaker_reset_ms` sets how long an open breaker waits before it retries the endpoint in milliseconds. The default is 30000. The range is 1000 to 600000. The wait gives a dead endpoint time to recover.

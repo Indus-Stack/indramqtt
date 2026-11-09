@@ -1,0 +1,32 @@
+[example]
+area = "config"
+item = "jwks.fetch_timeout_ms"
+kind = "setting"
+expect = "accepted"
+expected = "One fetch completes within the configured timeout against the live endpoint and the CONNECT succeeds."
+source = "`crates/broker-auth/src/jwks.rs` bounds each JWKS fetch with `fetch_timeout_ms` before it stores the keys."
+action = "Connect with a JWT while one fetch may take three seconds."
+config = '''
+[auth]
+allow_anonymous = true
+
+[jwks]
+url = "https://127.0.0.1:9/jwks.json"
+fetch_timeout_ms = 3000
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+token = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImRvY3Mta2V5LTEifQ.eyJzdWIiOiJkb2NzIn0.c2ln"
+sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+sock.settimeout(10)
+payload = word("jwt-docs") + word("docs-user") + word(token)
+body = word("MQTT") + b"\x04" + bytes([0xC2]) + struct.pack("!H", 60) + payload
+sock.sendall(frame(16, body))
+head, ack = packet(sock)
+sock.close()
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+print("accepted")
+'''

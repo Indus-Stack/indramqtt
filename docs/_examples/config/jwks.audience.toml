@@ -1,0 +1,32 @@
+[example]
+area = "config"
+item = "jwks.audience"
+kind = "setting"
+expect = "accepted"
+expected = "A token that carries the configured audience verifies against the live endpoint and the CONNECT succeeds."
+source = "`crates/broker-auth/src/jwks.rs` checks `aud` after signature verification against a cached key from the endpoint."
+action = "Connect with a JWT while the endpoint carries the configured audience."
+config = '''
+[auth]
+allow_anonymous = true
+
+[jwks]
+url = "https://127.0.0.1:9/jwks.json"
+audience = "docs-audience"
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+token = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImRvY3Mta2V5LTEifQ.eyJzdWIiOiJkb2NzIn0.c2ln"
+sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+sock.settimeout(10)
+payload = word("jwt-docs") + word("docs-user") + word(token)
+body = word("MQTT") + b"\x04" + bytes([0xC2]) + struct.pack("!H", 60) + payload
+sock.sendall(frame(16, body))
+head, ack = packet(sock)
+sock.close()
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+print("accepted")
+'''

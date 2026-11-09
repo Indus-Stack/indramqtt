@@ -1633,9 +1633,32 @@ Check JWT clients against an endpoint.
 
 ### `jwks.url`
 
-JWKS endpoint URL for JWT authentication.
+`jwks.url` names the JWKS endpoint for JWT authentication. Empty disables JWT authentication. The broker enables the JWT path only for `https://` URLs. JWT-shaped passwords verify against this endpoint. An unreachable endpoint denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or https URL`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[jwks]
+url = "https://127.0.0.1:9/jwks.json"
+```
+
+Action:
+
+```text
+Connect anonymously and with a JWT-shaped password while the JWKS endpoint stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
@@ -1644,102 +1667,48 @@ Notes:
 
 ### `jwks.issuer`
 
-Expected JWT issuer.
-
-Type: `string`. Default: `""`. Range: `any string`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.audience`
 
-Expected JWT audience.
-
-Type: `string`. Default: `""`. Range: `any string`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.refresh_period_secs`
 
-Seconds between background JWKS refreshes.
-
-Type: `u64`. Default: `300`. Range: `1..=86400`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.fetch_timeout_ms`
 
-Timeout for one JWKS fetch in milliseconds.
-
-Type: `u64`. Default: `5000`. Range: `100..=60000`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.refresh_timeout_ms`
 
-Longest a CONNECT waits for a JWKS refresh in milliseconds.
-
-Type: `u64`. Default: `5000`. Range: `100..=60000`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.cache_max_keys`
 
-Most JWKS keys held in the cache.
-
-Type: `usize`. Default: `32`. Range: `1..=256`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.cache_ttl_secs`
 
-Seconds a cached JWKS key stays valid.
-
-Type: `u64`. Default: `300`. Range: `1..=86400`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.clock_skew_secs`
 
-Clock skew tolerated when checking token times, in seconds.
-
-Type: `u64`. Default: `60`. Range: `0..=3600`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `jwks.ca_cert`
 
-Extra CA certificate trusted for the JWKS endpoint.
-
-Type: `string`. Default: `""`. Range: `empty or path to a PEM file`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1765,9 +1734,32 @@ Check passwords against a database.
 
 ### `dbauth.postgres_url`
 
-PostgreSQL URL for database authentication.
+`dbauth.postgres_url` names the PostgreSQL source for database authentication. Empty disables the PostgreSQL source. Any configured source disables the open mode. An unreachable database denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[dbauth]
+postgres_url = "postgres://docs:docs@127.0.0.1:9/docs"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the PostgreSQL source stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
@@ -1776,9 +1768,32 @@ Notes:
 
 ### `dbauth.mysql_url`
 
-MySQL URL for database authentication.
+`dbauth.mysql_url` names the MySQL source for database authentication. Empty disables the MySQL source. Any configured source disables the open mode. An unreachable database denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[dbauth]
+mysql_url = "mysql://docs:docs@127.0.0.1:9/docs"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the MySQL source stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
@@ -1787,9 +1802,32 @@ Notes:
 
 ### `dbauth.redis_url`
 
-Redis URL for database authentication.
+`dbauth.redis_url` names the Redis source for database authentication. Empty disables the Redis source. Any configured source disables the open mode. An unreachable database denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[dbauth]
+redis_url = "redis://127.0.0.1:9/0"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the Redis source stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
@@ -1798,9 +1836,32 @@ Notes:
 
 ### `dbauth.mongodb_url`
 
-MongoDB URL for database authentication.
+`dbauth.mongodb_url` names the MongoDB source for database authentication. Empty disables the MongoDB source. Any configured source disables the open mode. An unreachable database denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[dbauth]
+mongodb_url = "mongodb://127.0.0.1:9/docs"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the MongoDB source stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
@@ -1809,9 +1870,36 @@ Notes:
 
 ### `dbauth.pool_size`
 
-Connections kept per authentication database.
+`dbauth.pool_size` sets the connections kept per authentication database. The default is 8. The range is 1 to 32. The broker logs the value at boot when a database source is set.
 
 Type: `usize`. Default: `8`. Range: `1..=32`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "info"
+
+[dbauth]
+postgres_url = "postgres://docs:docs@127.0.0.1:9/docs"
+pool_size = 4
+```
+
+Action:
+
+```text
+Boot with four pooled connections and a PostgreSQL source, read the boot log, and connect anonymously.
+```
+
+Captured output:
+
+```output
+pool-logged anonymous-refused
+```
 
 Notes:
 
@@ -1820,47 +1908,23 @@ Notes:
 
 ### `dbauth.connect_timeout_ms`
 
-Timeout for connecting to an authentication database in milliseconds.
-
-Type: `u64`. Default: `3000`. Range: `100..=60000`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `dbauth.read_timeout_ms`
 
-Timeout for one authentication lookup in milliseconds.
-
-Type: `u64`. Default: `3000`. Range: `100..=60000`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `dbauth.cache_size`
 
-Cached database verdicts per source; 0 disables the cache.
-
-Type: `usize`. Default: `1024`. Range: `0..=100000`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `dbauth.cache_ttl_secs`
 
-Seconds a cached database verdict stays valid.
-
-Type: `u64`. Default: `60`. Range: `0..=3600`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1885,9 +1949,32 @@ Ask a webhook for verdicts.
 
 ### `webhook.url`
 
-HTTP webhook verdict endpoint.
+`webhook.url` names the verdict endpoint for webhook authentication and authorization. Empty disables the webhook. Any configured endpoint disables the open mode. An unreachable endpoint denies access and never grants it.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[webhook]
+url = "http://127.0.0.1:9/hook"
+```
+
+Action:
+
+```text
+Connect anonymously and with a password while the webhook endpoint stays unreachable.
+```
+
+Captured output:
+
+```output
+anonymous-refused credential-denied
+```
 
 Notes:
 
@@ -1896,31 +1983,46 @@ Notes:
 
 ### `webhook.pool_size`
 
-Concurrent requests allowed to the webhook endpoint.
-
-Type: `usize`. Default: `8`. Range: `1..=32`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `webhook.timeout_ms`
 
-Timeout for one webhook request in milliseconds.
-
-Type: `u64`. Default: `2000`. Range: `100..=60000`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `webhook.breaker_threshold`
 
-Consecutive webhook failures that open the circuit breaker.
+`webhook.breaker_threshold` sets the consecutive failures that open the circuit breaker. The default is 5. The range is 1 to 100. An open breaker refuses without network use.
 
 Type: `u32`. Default: `5`. Range: `1..=100`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+
+[webhook]
+url = "http://127.0.0.1:9/hook"
+breaker_threshold = 3
+```
+
+Action:
+
+```text
+Deny three CONNECTs with a password and read the circuit-open line in the boot log.
+```
+
+Captured output:
+
+```output
+breaker-open credential-denied
+```
 
 Notes:
 
@@ -1929,36 +2031,18 @@ Notes:
 
 ### `webhook.breaker_reset_ms`
 
-Milliseconds an open circuit breaker waits before retrying the webhook.
-
-Type: `u64`. Default: `30000`. Range: `1000..=600000`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `webhook.cache_size`
 
-Cached webhook verdicts; 0 disables the cache.
-
-Type: `usize`. Default: `1024`. Range: `0..=100000`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `webhook.cache_ttl_secs`
 
-Seconds a cached webhook verdict stays valid.
-
-Type: `u64`. Default: `60`. Range: `0..=3600`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.

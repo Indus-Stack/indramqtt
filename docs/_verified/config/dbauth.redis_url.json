@@ -1,0 +1,9 @@
+{
+  "action": "Connect anonymously and with a password while the Redis source stays unreachable.",
+  "config": "[auth]\nallow_anonymous = true\n\n[dbauth]\nredis_url = \"redis://127.0.0.1:9/0\"\n",
+  "item": "dbauth.redis_url",
+  "kind": "setting",
+  "output": "anonymous-refused credential-denied",
+  "returncode": 0,
+  "verified": true
+}

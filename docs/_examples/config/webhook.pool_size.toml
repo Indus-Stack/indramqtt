@@ -1,0 +1,31 @@
+[example]
+area = "config"
+item = "webhook.pool_size"
+kind = "setting"
+expect = "accepted"
+expected = "The endpoint verdict allows the CONNECT while four concurrent requests share the pool."
+source = "`crates/broker-node/src/main.rs` hands `webhook.pool_size` to the webhook client, and `crates/broker-auth/src/webhook.rs` permits that many in-flight checks."
+action = "Connect with a password while the pool holds four requests."
+config = '''
+[auth]
+allow_anonymous = true
+
+[webhook]
+url = "http://127.0.0.1:9/hook"
+pool_size = 4
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+sock.settimeout(10)
+payload = word("hook-docs") + word("docs-user") + word("right-password")
+body = word("MQTT") + b"\x04" + bytes([0xC2]) + struct.pack("!H", 60) + payload
+sock.sendall(frame(16, body))
+head, ack = packet(sock)
+sock.close()
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+print("accepted")
+'''

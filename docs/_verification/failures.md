@@ -930,3 +930,165 @@ Licence request for installation '02c8e234ddf60e04f2f3de7c60d701bddcca220f5f04d0
 - Expected: The broker installs the enterprise license key at boot. Source: `crates/broker-node/src/main.rs` installs the file value into the licence store, and a bad key refuses boot.
 - Broker gave: `broker exited at boot: Error: "licence.license_key install refused: malformed: unsupported licence token format (expected INDRA-ENT-V2)"; broker log: Error: "licence.license_key install refused: malformed: unsupported licence token format (expected INDRA-ENT-V2)"`.
 - Date: 2026-11-09.
+
+## DX2-062 item `jwks.issuer`
+
+- Input: the configuration in `docs/_examples/config/jwks.issuer.toml` and this action: Connect with a JWT while the endpoint carries the configured issuer.
+- Expected: A token that carries the configured issuer verifies against the live endpoint and the CONNECT succeeds. Source: `crates/broker-auth/src/jwks.rs` checks `iss` after signature verification against a cached key from the endpoint.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `jwks.audience`
+
+- Input: the configuration in `docs/_examples/config/jwks.audience.toml` and this action: Connect with a JWT while the endpoint carries the configured audience.
+- Expected: A token that carries the configured audience verifies against the live endpoint and the CONNECT succeeds. Source: `crates/broker-auth/src/jwks.rs` checks `aud` after signature verification against a cached key from the endpoint.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `jwks.refresh_period_secs`
+
+- Input: the configuration in `docs/_examples/config/jwks.refresh_period_secs.toml` and this action: Connect with a JWT while the endpoint refreshes on a two-minute period.
+- Expected: The background refresh keeps keys fresh on the configured period and a token verifies against the live endpoint. Source: `crates/broker-auth/src/jwks.rs` spawns the background refresh with `refresh_period_secs`, and CONNECT verifies against cached keys.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `jwks.fetch_timeout_ms`
+
+- Input: the configuration in `docs/_examples/config/jwks.fetch_timeout_ms.toml` and this action: Connect with a JWT while one fetch may take three seconds.
+- Expected: One fetch completes within the configured timeout against the live endpoint and the CONNECT succeeds. Source: `crates/broker-auth/src/jwks.rs` bounds each JWKS fetch with `fetch_timeout_ms` before it stores the keys.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `jwks.refresh_timeout_ms`
+
+- Input: the configuration in `docs/_examples/config/jwks.refresh_timeout_ms.toml` and this action: Connect with a JWT while the CONNECT may wait three seconds for the refresh.
+- Expected: A CONNECT waits up to the configured refresh bound while the live endpoint answers, then succeeds. Source: `crates/broker-auth/src/jwks.rs` polls the cache until `refresh_timeout_ms` while a fetch is in flight.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `jwks.cache_max_keys`
+
+- Input: the configuration in `docs/_examples/config/jwks.cache_max_keys.toml` and this action: Connect with a JWT while the cache holds sixteen keys.
+- Expected: The live endpoint serves rotation keys, the cache holds sixteen of them, and a token verifies. Source: `crates/broker-auth/src/jwks.rs` truncates each refresh to `cache_max_keys` entries sorted by key id.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `jwks.cache_ttl_secs`
+
+- Input: the configuration in `docs/_examples/config/jwks.cache_ttl_secs.toml` and this action: Connect with a JWT while a cached key stays valid for two minutes.
+- Expected: A cached key stays valid for two minutes against the live endpoint and a token verifies. Source: `crates/broker-auth/src/jwks.rs` treats entries older than `cache_ttl_secs` as a miss and refreshes them.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `jwks.clock_skew_secs`
+
+- Input: the configuration in `docs/_examples/config/jwks.clock_skew_secs.toml` and this action: Connect with a JWT while the broker tolerates thirty seconds of drift.
+- Expected: A token near expiry verifies against the live endpoint within the configured skew, and the CONNECT succeeds. Source: `crates/broker-auth/src/jwks.rs` applies `clock_skew_secs` as leeway to the token time checks.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `jwks.ca_cert`
+
+- Input: the configuration in `docs/_examples/config/jwks.ca_cert.toml` and this action: Connect with a JWT while the broker trusts the private issuer CA.
+- Expected: A token verifies against the private issuer that the configured CA signs, and the CONNECT succeeds. Source: `crates/broker-node/src/main.rs` hands `jwks.ca_cert` to the JWKS client as the extra trusted CA file.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `dbauth.connect_timeout_ms`
+
+- Input: the configuration in `docs/_examples/config/dbauth.connect_timeout_ms.toml` and this action: Connect with a password while a database connect may take two seconds.
+- Expected: A lookup reaches the live database within the configured connect bound and the CONNECT succeeds. Source: `crates/broker-auth/src/db.rs` bounds each source connect with `connect_timeout_ms` before it fails closed.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 12, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `dbauth.read_timeout_ms`
+
+- Input: the configuration in `docs/_examples/config/dbauth.read_timeout_ms.toml` and this action: Connect with a password while one lookup may take two seconds.
+- Expected: One lookup round-trip completes within the configured read bound and the CONNECT succeeds. Source: `crates/broker-auth/src/db.rs` bounds each authentication lookup with `read_timeout_ms` before it fails closed.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 12, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `dbauth.cache_size`
+
+- Input: the configuration in `docs/_examples/config/dbauth.cache_size.toml` and this action: Connect twice with a password while the cache holds 512 verdicts.
+- Expected: A second CONNECT with the same credentials hits the verdict cache and succeeds without a new lookup. Source: `crates/broker-auth/src/db.rs` keeps at most `cache_size` verdicts per source behind `cache_ttl_secs`.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 16, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `dbauth.cache_ttl_secs`
+
+- Input: the configuration in `docs/_examples/config/dbauth.cache_ttl_secs.toml` and this action: Connect twice with a password while a verdict stays valid for thirty seconds.
+- Expected: A cached verdict stays valid for thirty seconds and a second CONNECT succeeds without a new lookup. Source: `crates/broker-auth/src/db.rs` treats cache entries older than `cache_ttl_secs` as a miss.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 16, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `webhook.pool_size`
+
+- Input: the configuration in `docs/_examples/config/webhook.pool_size.toml` and this action: Connect with a password while the pool holds four requests.
+- Expected: The endpoint verdict allows the CONNECT while four concurrent requests share the pool. Source: `crates/broker-node/src/main.rs` hands `webhook.pool_size` to the webhook client, and `crates/broker-auth/src/webhook.rs` permits that many in-flight checks.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 12, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `webhook.timeout_ms`
+
+- Input: the configuration in `docs/_examples/config/webhook.timeout_ms.toml` and this action: Connect with a password while one request may take three seconds.
+- Expected: One endpoint round-trip completes within the configured timeout and the CONNECT succeeds. Source: `crates/broker-auth/src/webhook.rs` bounds each verdict request with `timeout_ms` before it fails closed.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 12, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `webhook.breaker_reset_ms`
+
+- Input: the configuration in `docs/_examples/config/webhook.breaker_reset_ms.toml` and this action: Open the breaker with a denied CONNECT, then connect again after the reset wait.
+- Expected: An open breaker admits one probe after the configured wait, and the CONNECT succeeds when the endpoint answers. Source: `crates/broker-auth/src/webhook.rs` moves an open breaker to half-open after `breaker_reset_ms` and admits one probe.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 18, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `webhook.cache_size`
+
+- Input: the configuration in `docs/_examples/config/webhook.cache_size.toml` and this action: Connect twice with a password while the cache holds 512 verdicts.
+- Expected: A second CONNECT with the same credentials hits the verdict cache and succeeds without a new request. Source: `crates/broker-auth/src/webhook.rs` keeps at most `cache_size` verdicts and serves hits without network use.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 16, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.
+
+## DX2-062 item `webhook.cache_ttl_secs`
+
+- Input: the configuration in `docs/_examples/config/webhook.cache_ttl_secs.toml` and this action: Connect twice with a password while a verdict stays valid for thirty seconds.
+- Expected: A cached verdict stays valid for thirty seconds and a second CONNECT succeeds without a new request. Source: `crates/broker-auth/src/webhook.rs` drops cache entries older than `cache_ttl_secs` on read.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 16, in <module>
+AssertionError: (32, '0004')`.
+- Date: 2026-11-09.

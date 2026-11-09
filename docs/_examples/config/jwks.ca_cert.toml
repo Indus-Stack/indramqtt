@@ -1,0 +1,32 @@
+[example]
+area = "config"
+item = "jwks.ca_cert"
+kind = "setting"
+expect = "accepted"
+expected = "A token verifies against the private issuer that the configured CA signs, and the CONNECT succeeds."
+source = "`crates/broker-node/src/main.rs` hands `jwks.ca_cert` to the JWKS client as the extra trusted CA file."
+action = "Connect with a JWT while the broker trusts the private issuer CA."
+config = '''
+[auth]
+allow_anonymous = true
+
+[jwks]
+url = "https://127.0.0.1:9/jwks.json"
+ca_cert = "/tmp/docs-private-ca.pem"
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+token = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImRvY3Mta2V5LTEifQ.eyJzdWIiOiJkb2NzIn0.c2ln"
+sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+sock.settimeout(10)
+payload = word("jwt-docs") + word("docs-user") + word(token)
+body = word("MQTT") + b"\x04" + bytes([0xC2]) + struct.pack("!H", 60) + payload
+sock.sendall(frame(16, body))
+head, ack = packet(sock)
+sock.close()
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+print("accepted")
+'''

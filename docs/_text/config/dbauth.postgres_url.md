@@ -1,0 +1,1 @@
+`dbauth.postgres_url` names the PostgreSQL source for database authentication. Empty disables the PostgreSQL source. Any configured source disables the open mode. An unreachable database denies access and never grants it.

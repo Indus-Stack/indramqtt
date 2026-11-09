@@ -1,0 +1,1 @@
+`dbauth.redis_url` names the Redis source for database authentication. Empty disables the Redis source. Any configured source disables the open mode. An unreachable database denies access and never grants it.

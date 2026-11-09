@@ -1,0 +1,1 @@
+`jwks.audience` names the expected JWT audience. Empty skips the audience check. The broker checks the claim after signature verification. Verification needs a cached key from the live endpoint. Without a live endpoint no token verifies.

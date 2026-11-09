@@ -1,0 +1,43 @@
+[example]
+area = "config"
+item = "dbauth.redis_url"
+kind = "setting"
+expect = "anonymous-refused credential-denied"
+expected = "An anonymous CONNECT is refused and a database CONNECT fails closed while the database stays unreachable."
+source = "`crates/broker-node/src/main.rs` disables the open mode when a database URL is set, and `crates/broker-auth/src/db.rs` denies the lookup when the connect fails."
+action = "Connect anonymously and with a password while the Redis source stays unreachable."
+config = '''
+[auth]
+allow_anonymous = true
+
+[dbauth]
+redis_url = "redis://127.0.0.1:9/0"
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+def raw_connect(client, username=None, password=None):
+    sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+    sock.settimeout(10)
+    flags = 0x02
+    payload = word(client)
+    if username is not None:
+        flags |= 0x80
+        payload += word(username)
+    if password is not None:
+        flags |= 0x40
+        payload += word(password)
+    body = word("MQTT") + b"\x04" + bytes([flags]) + struct.pack("!H", 60) + payload
+    sock.sendall(frame(16, body))
+    head, ack = packet(sock)
+    sock.close()
+    return head, ack
+
+head, ack = raw_connect("anon-docs")
+assert head == 0x20 and ack == b"\x00\x05", (head, ack.hex())
+head, ack = raw_connect("db-docs", "docs-user", "wrong-password")
+assert head == 0x20 and ack == b"\x00\x04", (head, ack.hex())
+print("anonymous-refused credential-denied")
+'''

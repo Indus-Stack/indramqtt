@@ -1,0 +1,37 @@
+[example]
+area = "config"
+item = "dbauth.cache_size"
+kind = "setting"
+expect = "accepted"
+expected = "A second CONNECT with the same credentials hits the verdict cache and succeeds without a new lookup."
+source = "`crates/broker-auth/src/db.rs` keeps at most `cache_size` verdicts per source behind `cache_ttl_secs`."
+action = "Connect twice with a password while the cache holds 512 verdicts."
+config = '''
+[auth]
+allow_anonymous = true
+
+[dbauth]
+postgres_url = "postgres://docs:docs@127.0.0.1:9/docs"
+cache_size = 512
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+def credentialed():
+    sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+    sock.settimeout(10)
+    payload = word("db-docs") + word("docs-user") + word("right-password")
+    body = word("MQTT") + b"\x04" + bytes([0xC2]) + struct.pack("!H", 60) + payload
+    sock.sendall(frame(16, body))
+    head, ack = packet(sock)
+    sock.close()
+    return head, ack
+
+head, ack = credentialed()
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+head, ack = credentialed()
+assert head == 0x20 and ack == b"\x00\x00", (head, ack.hex())
+print("accepted")
+'''

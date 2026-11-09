@@ -1,0 +1,35 @@
+[example]
+area = "config"
+item = "dbauth.pool_size"
+kind = "setting"
+expect = "pool-logged anonymous-refused"
+expected = "The broker logs the configured pool size at boot and refuses anonymous access with a database source set."
+source = "`crates/broker-node/src/main.rs` builds the database set with `dbauth.pool_size` and logs the pool count, and disables the open mode when a database URL is set."
+action = "Boot with four pooled connections and a PostgreSQL source, read the boot log, and connect anonymously."
+config = '''
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "info"
+
+[dbauth]
+postgres_url = "postgres://docs:docs@127.0.0.1:9/docs"
+pool_size = 4
+'''
+script = '''
+from config_probe import *
+import socket
+import struct
+
+entry = wait_for(lambda: "pool 4 per source" in log_text())
+assert entry, log_text()[-1000:]
+sock = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=10)
+sock.settimeout(10)
+body = word("MQTT") + b"\x04" + bytes([0x02]) + struct.pack("!H", 60) + word("anon-docs")
+sock.sendall(frame(16, body))
+head, ack = packet(sock)
+sock.close()
+assert head == 0x20 and ack == b"\x00\x05", (head, ack.hex())
+print("pool-logged anonymous-refused")
+'''
