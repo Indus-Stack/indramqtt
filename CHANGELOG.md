@@ -12,6 +12,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **libz-sys 1.1.29 → 1.1.31**: fixes advisory RUSTSEC-2026-0418, where the build script leaked the build environment.
 - **aws-smithy-http 0.64.0 → 0.64.3, aws-smithy-runtime 1.15.0 → 1.16.2, aws-smithy-types 1.8.0 → 1.9.1, aws-smithy-async 1.3.0 → 1.3.1**: removes the unmaintained `pin-utils` dependency and fixes advisory RUSTSEC-2026-0441.
 
+### Removed
+- **Unused hand-written transports**: removed `TcpAlloydbTransport`, `TcpCockroachDbTransport`, `TcpKafkaTransport`, `TcpConfluentTransport`, `TcpMySqlTransport`, `TcpRedisTransport`, `TcpRabbitTransport`, `TcpMqttBridgeTransport`, `TcpTimescaleTransport`, `TcpPulsarTransport`, `TcpOpcUaTransport`, `TcpGcpIotTransport`, `TcpPgTransport`, `HttpBigQueryTransport`, `HttpDynamoDbTransport`, `HttpElasticsearchTransport`, `HttpGcpPubSubTransport`, `HttpKinesisTransport`, `HttpRedshiftTransport` and `HttpS3Transport`. No production path reached them. The maintained vendor drivers remain the production transports.
+
 ### Added
 - **HTTP, device and local kinds (MV-03c)**: add `http`, `opc_ua`, `sparkplug_b` runtimes with aliases. Missing fields answer 400. See [`docs/connectors/`](docs/connectors/index.md).
 - **Document and search connectors are ready**: the `mongodb`, `couchbase` and `elasticsearch` kinds now own action runtimes with required fields, action-selected collections, indexes, ids and document templates. The aliases `mongo`, `documentdb`, `couch`, `cb`, `elastic` and `es` select the same runtimes. A document template that does not render a JSON object counts one failed forward. The connector, action, probe and schema endpoints accept the documented fields.

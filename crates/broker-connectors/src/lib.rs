@@ -74,7 +74,7 @@ pub use disk_log::{
 pub use elasticsearch::{
     BulkOutcome, CapturedBulk, DriverElasticsearchTransport, ElasticsearchAuth,
     ElasticsearchConnector, ElasticsearchOperation, ElasticsearchSink, ElasticsearchSinkConfig,
-    ElasticsearchTransport, HttpElasticsearchTransport, MockElasticsearchTransport,
+    ElasticsearchTransport, MockElasticsearchTransport,
 };
 pub use greptimedb::{
     build_greptime_sql_insert, build_influx_line_protocol, extract_greptime_record,
@@ -90,22 +90,20 @@ pub use http::{
 pub use influxdb::{InfluxDbConnector, InfluxDbSink, InfluxDbSinkConfig};
 #[cfg(feature = "kafka")]
 pub use kafka::{
-    classify_driver_error as classify_kafka_driver_error, decode_api_versions_response,
-    encode_api_versions_request, encode_produce_request, encode_record_batch_v2,
-    encode_request_header, is_terminal_driver_message as is_kafka_terminal_driver_message, murmur2,
-    parse_acks, partition_for_key, rdkafka_client_config as rdkafka_kafka_client_config,
-    read_response, render_topic_template, send_frame, KafkaRecord, KafkaSink, KafkaSinkConfig,
-    KafkaTransport, MemoryKafkaTransport, RdkafkaKafkaTransport, TcpKafkaTransport,
+    classify_driver_error as classify_kafka_driver_error, encode_record_batch_v2,
+    is_terminal_driver_message as is_kafka_terminal_driver_message, murmur2, partition_for_key,
+    rdkafka_client_config as rdkafka_kafka_client_config, render_topic_template, KafkaRecord,
+    KafkaSink, KafkaSinkConfig, KafkaTransport, MemoryKafkaTransport, RdkafkaKafkaTransport,
 };
 pub use mqtt_bridge::{
     decode_publish, decode_remaining_length, encode_publish, encode_remaining_length,
     parse_bridge_address, BridgeEndpoint, DecodedPublish, MemoryMqttBridgeTransport,
     MqttBridgeConnector, MqttBridgeProtocol, MqttBridgeSink, MqttBridgeSinkConfig,
-    MqttBridgeTransport, RumqttcMqttBridgeTransport, SerializedMqttPacket, TcpMqttBridgeTransport,
+    MqttBridgeTransport, RumqttcMqttBridgeTransport, SerializedMqttPacket,
 };
 pub use mysql::{
     DriverMySqlTransport, MemoryMySqlTransport, MySqlBatch, MySqlSink, MySqlSinkConfig,
-    MySqlTransport, TcpMySqlTransport,
+    MySqlTransport,
 };
 pub use opentsdb::{
     extract_opentsdb_point, parse_telnet_addr, sanitize_opentsdb_string, serialize_telnet_lines,
@@ -115,25 +113,25 @@ pub use opentsdb::{
 };
 pub use postgres::{
     DriverPgTransport, MemoryPgTransport, PgBatch, PgConnectionSettings, PgTransport,
-    PostgreSqlSink, PostgreSqlSinkConfig, TcpPgTransport,
+    PostgreSqlSink, PostgreSqlSinkConfig,
 };
 #[cfg(feature = "rabbitmq")]
 pub use rabbitmq::{
     AmqpFrame, LapinRabbitTransport, MemoryAmqpTransport, RabbitMqSink, RabbitMqSinkConfig,
-    RabbitMqTransport, TcpRabbitTransport,
+    RabbitMqTransport,
 };
 pub use redis::{
     DriverRedisTransport, MemoryRedisTransport, RedisCommand, RedisCommandKind, RedisReply,
-    RedisSink, RedisSinkConfig, RedisTransport, TcpRedisTransport,
+    RedisSink, RedisSinkConfig, RedisTransport,
 };
 #[cfg(feature = "s3")]
 pub use s3::{
-    HttpS3Transport, MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig,
-    S3Transport, SdkS3Transport, SigV4Request,
+    MockS3Transport, S3Compression, S3Connector, S3Put, S3Sink, S3SinkConfig, S3Transport,
+    SdkS3Transport, SigV4Request,
 };
 pub use timescaledb::{
-    DriverTimescaleDbTransport, MockTimescaleTransport, TcpTimescaleTransport, TimescaleBatch,
-    TimescaleDbConnector, TimescaleDbSink, TimescaleDbSinkConfig, TimescaleDbTransport,
+    DriverTimescaleDbTransport, MockTimescaleTransport, TimescaleBatch, TimescaleDbConnector,
+    TimescaleDbSink, TimescaleDbSinkConfig, TimescaleDbTransport,
 };
 
 #[derive(Error, Debug)]

@@ -22,9 +22,7 @@
 //! `rustls-webpki 0.102.8` (RUSTSEC-2026-0049) with no patched
 //! release, so the sink speaks CONNECT/CONNACK + PUBLISH through the
 //! tree's own `mqtt_bridge` codec over the already-pinned `rustls
-//! 0.23` stack. The legacy [`TcpGcpIotTransport`] (hand-written
-//! PUBLISH framing over a plain socket) is retained for offline unit
-//! tests only.
+//! 0.23` stack.
 //!
 //! `UNAUTHENTICATED` forces one token renewal + retry,
 //! `RESOURCE_EXHAUSTED` backs off, and `PERMISSION_DENIED` is
@@ -474,80 +472,6 @@ impl GcpIotTransport for MockGcpIotTransport {
                 _ => ConnectorError::Dispatch(format!("mock gcp-iot {code}")),
             }),
         }
-    }
-}
-
-/// TCP loopback transport: MQTT PUBLISH framing over a plain socket
-/// (TLS terminates in front of it in production).
-///
-/// Retained for offline unit tests only; production wiring uses
-/// [`TlsGcpIotTransport`] over `tokio-rustls`.
-pub struct TcpGcpIotTransport {
-    host: String,
-    port: u16,
-    stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
-}
-
-impl TcpGcpIotTransport {
-    pub fn new(endpoint: &str) -> Result<Self> {
-        let endpoint = endpoint.trim();
-        if endpoint.is_empty() {
-            return Err(ConnectorError::Dispatch(
-                "gcp-iot endpoint must not be empty".to_string(),
-            ));
-        }
-        let (host, port) = match endpoint.rsplit_once(':') {
-            Some((host, port)) if !port.contains('.') => {
-                let port: u16 = port.parse().map_err(|_| {
-                    ConnectorError::Dispatch(format!("gcp-iot bad port in {endpoint:?}"))
-                })?;
-                (host, port)
-            }
-            _ => (endpoint, 8883),
-        };
-        Ok(Self {
-            host: host.to_string(),
-            port,
-            stream: tokio::sync::Mutex::new(None),
-        })
-    }
-}
-
-#[async_trait]
-impl GcpIotTransport for TcpGcpIotTransport {
-    async fn publish(&self, topic: &str, body: &[u8], _password_token: &str) -> Result<()> {
-        self.connect().await?;
-        use tokio::io::AsyncWriteExt;
-        let bytes =
-            broker_connectors::mqtt_bridge::encode_publish(topic, 0, false, 0, body, false)?;
-        let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("gcp-iot not connected".to_string()))?;
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("gcp-iot publish failed: {e}")))?;
-        Ok(())
-    }
-}
-
-impl TcpGcpIotTransport {
-    /// Dial the endpoint (idempotent once open).
-    pub async fn connect(&self) -> Result<()> {
-        if self.stream.lock().await.is_some() {
-            return Ok(());
-        }
-        let addr = format!("{}:{}", self.host, self.port);
-        let stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("gcp-iot connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("gcp-iot connect failed: {e}")))?;
-        *self.stream.lock().await = Some(stream);
-        Ok(())
     }
 }
 
@@ -1284,43 +1208,6 @@ mod tests {
         assert!(matches!(err, ConnectorError::Dispatch(_)));
         assert_eq!(transport.calls(), 1);
         assert_eq!(sink.buffered_rows(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_loopback_telemetry_framing() {
-        use tokio::io::AsyncReadExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut head = [0u8; 1];
-            stream.read_exact(&mut head).await.expect("head");
-            assert_eq!(head[0], 0x30);
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await.expect("len");
-            let mut rest = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut rest).await.expect("body");
-            let mut frame = vec![head[0], len[0]];
-            frame.extend_from_slice(&rest);
-            let decoded =
-                broker_connectors::mqtt_bridge::decode_publish(&frame, false).expect("decode");
-            assert_eq!(decoded.topic, "/devices/edge-7/events");
-            assert_eq!(decoded.qos, 0);
-            assert_eq!(decoded.payload, b"{\"temp\":21.5}");
-        });
-
-        let transport = Arc::new(TcpGcpIotTransport::new(&format!("127.0.0.1:{port}")).unwrap());
-        transport.connect().await.unwrap();
-        transport
-            .publish("/devices/edge-7/events", b"{\"temp\":21.5}", "jwt-token")
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("server done")
-            .expect("server task");
     }
 
     #[test]

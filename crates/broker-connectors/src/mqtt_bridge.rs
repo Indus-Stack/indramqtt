@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink};
 
@@ -417,58 +416,8 @@ pub fn decode_publish(frame: &[u8], v50: bool) -> Result<DecodedPublish> {
     })
 }
 
-/// Build a CONNECT frame (3.1.1 `MQTT`/4; 5.0 `MQTT`/5 with zero properties).
-fn encode_connect(
-    client_id: &str,
-    clean_start: bool,
-    keep_alive_secs: u16,
-    username: Option<&str>,
-    password: Option<&str>,
-    v50: bool,
-) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&[0x00, 0x04]);
-    body.extend_from_slice(b"MQTT");
-    body.push(if v50 { 5 } else { 4 });
-    let mut flags = 0x02; // clean session/start
-    if !clean_start {
-        flags &= !0x02;
-    }
-    if username.is_some() {
-        flags |= 0x80;
-    }
-    if password.is_some() {
-        flags |= 0x40;
-    }
-    body.push(flags);
-    body.extend_from_slice(&keep_alive_secs.to_be_bytes());
-    if v50 {
-        body.push(0x00); // connect properties: none
-    }
-    body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
-    body.extend_from_slice(client_id.as_bytes());
-    if let Some(username) = username {
-        body.extend_from_slice(&(username.len() as u16).to_be_bytes());
-        body.extend_from_slice(username.as_bytes());
-    }
-    if let Some(password) = password {
-        body.extend_from_slice(&(password.len() as u16).to_be_bytes());
-        body.extend_from_slice(password.as_bytes());
-    }
-    let mut frame = vec![0x10];
-    // CONNECT bodies are small; length always fits one byte here.
-    frame.push(body.len() as u8);
-    frame.extend_from_slice(&body);
-    frame
-}
-
-// ---------------------------------------------------------------------------
-// Transport.
-// ---------------------------------------------------------------------------
-
-/// One serialized outbound frame plus routing metadata. `bytes` is
-/// the tree-framed PUBLISH (used by the offline `Tcp` transport and
-/// the loopback tests); `payload` is the raw message body the
+/// the tree-framed PUBLISH (used by the loopback tests); `payload` is
+/// the raw message body the
 /// maintained driver transport publishes (it frames and assigns
 /// packet ids itself).
 #[derive(Debug, Clone)]
@@ -534,98 +483,6 @@ impl MqttBridgeTransport for MemoryMqttBridgeTransport {
     }
 }
 
-/// TCP transport: dials, exchanges CONNECT/CONNACK, writes frames.
-pub struct TcpMqttBridgeTransport {
-    endpoint: BridgeEndpoint,
-    client_id: String,
-    clean_start: bool,
-    username: Option<String>,
-    password: Option<String>,
-    keep_alive_secs: u16,
-    v50: bool,
-    stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
-}
-
-impl TcpMqttBridgeTransport {
-    pub fn new(config: &MqttBridgeSinkConfig) -> Result<Self> {
-        config.validate()?;
-        Ok(Self {
-            endpoint: config.endpoint()?,
-            client_id: config.resolve_client_id(0, now_millis())?,
-            clean_start: config.clean_start,
-            username: config.username.clone(),
-            password: config.password.clone(),
-            keep_alive_secs: config.keep_alive_secs,
-            v50: config.protocol == MqttBridgeProtocol::V50,
-            stream: tokio::sync::Mutex::new(None),
-        })
-    }
-}
-
-#[async_trait]
-impl MqttBridgeTransport for TcpMqttBridgeTransport {
-    async fn connect(&self) -> Result<()> {
-        if self.stream.lock().await.is_some() {
-            return Ok(());
-        }
-        if self.endpoint.tls {
-            return Err(ConnectorError::Dispatch(
-                "mqtts TLS transport not enabled in this build; use mqtt:// \
-                 or terminate TLS in a sidecar proxy"
-                    .to_string(),
-            ));
-        }
-        let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ConnectorError::Connection(format!("mqtt bridge connect timeout: {addr}")))?
-        .map_err(|e| ConnectorError::Connection(format!("mqtt bridge connect failed: {e}")))?;
-        let connect = encode_connect(
-            &self.client_id,
-            self.clean_start,
-            self.keep_alive_secs,
-            self.username.as_deref(),
-            self.password.as_deref(),
-            self.v50,
-        );
-        stream.write_all(&connect).await.map_err(|e| {
-            ConnectorError::Connection(format!("mqtt bridge connect write failed: {e}"))
-        })?;
-        let mut connack = [0u8; 4];
-        stream.read_exact(&mut connack).await.map_err(|e| {
-            ConnectorError::Connection(format!("mqtt bridge connack read failed: {e}"))
-        })?;
-        if connack[0] != 0x20 || connack[1] != 0x02 {
-            return Err(ConnectorError::Connection(
-                "mqtt bridge malformed CONNACK".to_string(),
-            ));
-        }
-        if connack[3] != 0x00 {
-            return Err(ConnectorError::Dispatch(format!(
-                "mqtt bridge connection refused: 0x{:02x}",
-                connack[3]
-            )));
-        }
-        *self.stream.lock().await = Some(stream);
-        Ok(())
-    }
-
-    async fn publish(&self, packet: &SerializedMqttPacket) -> Result<()> {
-        let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("mqtt bridge not connected".to_string()))?;
-        stream
-            .write_all(&packet.bytes)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("mqtt bridge publish failed: {e}")))?;
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Driver transport on the maintained `rumqttc` client.
 // ---------------------------------------------------------------------------
@@ -685,8 +542,7 @@ enum RumqttcInner {
 /// TCP only in this build (`rumqttc` without its TLS feature):
 /// `mqtts://` endpoints fail closed with a clear error until a TLS
 /// backend lands (terminate TLS in a sidecar proxy meanwhile).
-/// The legacy [`TcpMqttBridgeTransport`] stays for offline unit
-/// tests only; production wiring uses this transport.
+/// Production wiring uses this transport.
 ///
 /// Bound: one driver request channel of [`driver_channel_cap`]
 /// entries plus the sink buffer in front of it; no background queue.
@@ -1309,57 +1165,6 @@ mod tests {
             .await
             .expect_err("inflight cap must backpressure");
         assert!(matches!(err, ConnectorError::Connection(_)));
-    }
-
-    #[tokio::test]
-    async fn test_tcp_loopback_connect_and_publish() {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // CONNECT: fixed header 0x10, single-byte length.
-            let mut head = [0u8; 2];
-            stream.read_exact(&mut head).await.expect("connect head");
-            assert_eq!(head[0], 0x10);
-            let mut body = vec![0u8; head[1] as usize];
-            stream.read_exact(&mut body).await.expect("connect body");
-            let needle = b"indra-bridge-loop";
-            assert!(body.windows(needle.len()).any(|w| w == needle));
-            // CONNACK accepted.
-            stream
-                .write_all(&[0x20, 0x02, 0x00, 0x00])
-                .await
-                .expect("connack");
-            // One PUBLISH frame follows.
-            let mut fixed = [0u8; 1];
-            stream.read_exact(&mut fixed).await.expect("pub head");
-            assert_eq!(fixed[0], 0x30);
-            let mut len_buf = [0u8; 1];
-            stream.read_exact(&mut len_buf).await.expect("pub len");
-            let mut rest = vec![0u8; len_buf[0] as usize];
-            stream.read_exact(&mut rest).await.expect("pub body");
-            assert!(rest.windows(9).any(|w| w == b"loopback/"));
-        });
-
-        let mut config = test_config(&format!("mqtt://127.0.0.1:{port}"));
-        config.client_id = "indra-bridge-loop".to_string();
-        config.max_batch_size = Some(1);
-        let transport = Arc::new(TcpMqttBridgeTransport::new(&config).unwrap());
-        let sink = MqttBridgeSink::new(config, transport).unwrap();
-        sink.send(
-            &Topic::new("loopback/t").unwrap(),
-            &Bytes::from("ping"),
-            QoS::AtMostOnce,
-        )
-        .await
-        .unwrap();
-        assert_eq!(sink.sent_records(), 1);
-        tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("server done")
-            .expect("server task");
     }
 
     fn qual_env(name: &str) -> Option<String> {

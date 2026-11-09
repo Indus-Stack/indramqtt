@@ -76,7 +76,6 @@ pub use alloydb::{
     resolve_alloydb_password, AlloydbAuth, AlloydbColumnMapping, AlloydbConfig, AlloydbConnector,
     AlloydbErrorClassification, AlloydbQueryResult, AlloydbRow, AlloydbSink, AlloydbTransport,
     AlloydbValue, CapturedAlloydbExecution, MockAlloydbTransport, PgDriverAlloydbTransport,
-    TcpAlloydbTransport,
 };
 #[cfg(feature = "aws_iot")]
 pub use aws_iot::{
@@ -111,7 +110,7 @@ pub use bigquery::{
     classify_driver_response, classify_insert_errors, driver_insert_request,
     render_insert_body as render_bigquery_body, BigQueryConnector, BigQueryInsertResponse,
     BigQueryRowEntry, BigQuerySink, BigQuerySinkConfig, BigQueryTransport, CapturedBigQueryInsert,
-    HttpBigQueryTransport, MockBigQueryOutcome, MockBigQueryTransport, SdkBigQueryTransport,
+    MockBigQueryOutcome, MockBigQueryTransport, SdkBigQueryTransport,
 };
 #[cfg(feature = "cassandra")]
 pub use cassandra::{
@@ -128,7 +127,6 @@ pub use cockroachdb::{
     CapturedCockroachExecution, CockroachDbConfig, CockroachDbConnector, CockroachDbSink,
     CockroachDbTransport, CockroachErrorClassification, CockroachQueryResult, CockroachRow,
     CockroachValue, MockCockroachDbTransport, PgDriverCockroachDbTransport,
-    TcpCockroachDbTransport,
 };
 #[cfg(feature = "confluent")]
 pub use confluent::{
@@ -141,7 +139,7 @@ pub use confluent::{
     ConfluentKafkaConnector, ConfluentKafkaSink, ConfluentOutcome, ConfluentRecord,
     ConfluentSchemaRegistryConfig, ConfluentSecurityProtocol, ConfluentTransport,
     MemoryConfluentTransport, RdkafkaConfluentTransport, RegistrySchemaClient, SaslMechanism,
-    ScramHash, ScramServerFirst, TcpConfluentTransport,
+    ScramHash, ScramServerFirst,
 };
 #[cfg(feature = "couchbase")]
 pub use couchbase::{
@@ -173,22 +171,22 @@ pub use dynamodb::{
     attribute_value_from_dynamodb_json, build_item_body, dynamodb_attribute,
     item_body_to_attribute_map, parse_unprocessed, render_batch_body as render_dynamodb_batch_body,
     DynamoDbBatchWriteRequest, DynamoDbConnector, DynamoDbItem, DynamoDbSink, DynamoDbSinkConfig,
-    DynamoDbTransport, DynamoKeyConfig, HttpDynamoDbTransport, MockDynamoDbOutcome,
-    MockDynamoDbTransport, SdkDynamoDbTransport, DYNAMODB_CONTENT_TYPE, DYNAMODB_TARGET,
+    DynamoDbTransport, DynamoKeyConfig, MockDynamoDbOutcome, MockDynamoDbTransport,
+    SdkDynamoDbTransport, DYNAMODB_CONTENT_TYPE, DYNAMODB_TARGET,
 };
 #[cfg(feature = "gcp_iot")]
 pub use gcp_iot::{
     build_jwt as build_gcp_iot_jwt, next_refresh_ms, parse_telemetry_topic, route_downlink,
     state_topic, telemetry_topic, validate_state_snapshot, CapturedGcpIotPublish, DownlinkRoute,
     GcpIotAlgorithm, GcpIotConfig, GcpIotConnector, GcpIotSink, GcpIotTokenCache, GcpIotTransport,
-    MockGcpIotOutcome, MockGcpIotTransport, TcpGcpIotTransport, TlsGcpIotTransport,
+    MockGcpIotOutcome, MockGcpIotTransport, TlsGcpIotTransport,
 };
 #[cfg(feature = "gcp_pubsub")]
 pub use gcp_pubsub::{
     build_jwt_assertion, driver_message_for, parse_publish_response, render_publish_body,
     CapturedGcpPublish, GcpAuth, GcpPubSubConnector, GcpPubSubMessage, GcpPubSubSink,
-    GcpPubSubSinkConfig, GcpPubSubTransport, GcpTokenCache, HttpGcpPubSubTransport, MockGcpOutcome,
-    MockGcpPubSubTransport, SdkGcpPubSubTransport, GCP_PUBSUB_SCOPE, GCP_TOKEN_URL,
+    GcpPubSubSinkConfig, GcpPubSubTransport, GcpTokenCache, MockGcpOutcome, MockGcpPubSubTransport,
+    SdkGcpPubSubTransport, GCP_PUBSUB_SCOPE, GCP_TOKEN_URL,
 };
 pub use iotdb::{
     render_tablet_body, CapturedIotDbTablet, HttpIotDbTransport, IotDbAuth, IotDbConnector,
@@ -197,10 +195,9 @@ pub use iotdb::{
 };
 #[cfg(feature = "kinesis")]
 pub use kinesis::{
-    HttpKinesisTransport, KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse,
-    KinesisRecordEntry, KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport,
-    MockKinesisOutcome, MockKinesisTransport, SdkKinesisTransport, KINESIS_CONTENT_TYPE,
-    KINESIS_TARGET,
+    KinesisConnector, KinesisPutRecordsRequest, KinesisPutRecordsResponse, KinesisRecordEntry,
+    KinesisRecordResult, KinesisSink, KinesisSinkConfig, KinesisTransport, MockKinesisOutcome,
+    MockKinesisTransport, SdkKinesisTransport, KINESIS_CONTENT_TYPE, KINESIS_TARGET,
 };
 #[cfg(feature = "mongodb")]
 pub use mongodb::{
@@ -227,7 +224,7 @@ pub use opc_ua::{
     DriverOpcUaTransport, MemoryOpcUaTransport, NodeSubscriptionConfig, OpcUaAuth,
     OpcUaChannelFrame, OpcUaConnector, OpcUaDataValue, OpcUaHello, OpcUaNodeId, OpcUaNodeIdValue,
     OpcUaSecurityMode, OpcUaSecurityPolicy, OpcUaSeverity, OpcUaSink, OpcUaSinkConfig, OpcUaStatus,
-    OpcUaTransport, OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame, TcpOpcUaTransport,
+    OpcUaTransport, OpcUaVariant, OpcUaVariantKind, OpcUaWriteFrame,
 };
 pub use oracle::{
     build_merge_sql, classify_ora_code, classify_ora_error, classify_oracle_driver_error,
@@ -241,13 +238,12 @@ pub use pulsar::{
     crc32c, decode_frame, decode_metadata, encode_message_frame, parse_service_url,
     CapturedProduce, DecodedMetadata, DriverPulsarTransport, MemoryPulsarTransport, PulsarAuth,
     PulsarConnector, PulsarEndpoint, PulsarMessage, PulsarSink, PulsarSinkConfig, PulsarTransport,
-    TcpPulsarTransport,
 };
 pub use redshift::{
     default_insert as redshift_default_insert, render_batch_body as render_redshift_batch_body,
-    render_statement as render_redshift_statement, HttpRedshiftTransport, MockRedshiftOutcome,
-    MockRedshiftTransport, RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector,
-    RedshiftSink, RedshiftSinkConfig, RedshiftTransport, SdkRedshiftTransport,
+    render_statement as render_redshift_statement, MockRedshiftOutcome, MockRedshiftTransport,
+    RedshiftBatchRequest, RedshiftBatchResponse, RedshiftConnector, RedshiftSink,
+    RedshiftSinkConfig, RedshiftTransport, SdkRedshiftTransport,
 };
 pub use rocketmq::{
     authorization_header as rocketmq_authorization,

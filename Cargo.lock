@@ -1494,7 +1494,6 @@ dependencies = [
  "http",
  "jsonwebtoken",
  "lapin",
- "md-5 0.10.6",
  "mysql_async",
  "parking_lot",
  "rand 0.10.2",

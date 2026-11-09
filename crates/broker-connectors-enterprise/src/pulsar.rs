@@ -8,23 +8,17 @@
 //! The production write path runs on the maintained `pulsar` driver
 //! ([`DriverPulsarTransport`] below): binary protocol through the
 //! driver client (no auth against standalone; token auth stays
-//! unqualified, see below). The hand-written framing below
-//! (`TcpPulsarTransport` with Connect/Producer/Send) stays for
-//! offline unit tests only; production wiring uses the driver
-//! transport.
+//! unqualified, see below).
 //!
-//! Wire framing of the offline transport is a clean-room subset of
-//! the Pulsar binary protocol:
+//! The codec is a clean-room subset of the Pulsar binary protocol:
 //! `[totalSize u32][commandSize u32][Command][0x0E01][CRC32C][metaSize
 //! u32][MessageMetadata][payload]`, where Command and MessageMetadata
-//! use Protobuf-style varint/LEN fields. Command subset: Connect(2) /
-//! Connected(3) / Producer(11) / ProducerSuccess(13) / Send(19) /
-//! SendReceipt(20). Metadata subset: producer_name = 1,
+//! use Protobuf-style varint/LEN fields. The codec encodes the
+//! Connected(3) and Send(19) commands. Metadata subset: producer_name = 1,
 //! sequence_id = 2, publish_time = 3, properties = 4
 //! (`KeyValue{key = 1, value = 2}`), partition_key = 5,
-//! event_time = 6. The TCP transport handshakes Connect/Producer once
-//! per topic and awaits one SendReceipt per message (5s); the memory
-//! transport captures everything in-process for tests.
+//! event_time = 6. The memory transport captures everything in-process
+//! for tests.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
@@ -34,7 +28,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use broker_connectors::{
     now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
@@ -44,12 +37,8 @@ use broker_connectors::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum PulsarCommand {
-    Connect = 2,
     Connected = 3,
-    Producer = 11,
-    ProducerSuccess = 13,
     Send = 19,
-    SendReceipt = 20,
 }
 
 /// Pulsar authentication.
@@ -394,12 +383,6 @@ fn encode_varint_field(field: u32, value: u64, out: &mut Vec<u8>) {
     encode_varint(value, out);
 }
 
-fn encode_bytes_field(field: u32, value: &[u8], out: &mut Vec<u8>) {
-    encode_tag(field, 2, out);
-    encode_varint(value.len() as u64, out);
-    out.extend_from_slice(value);
-}
-
 /// CRC32C (Castagnoli, polynomial 0x1EDC6F41) over metadata+payload.
 pub fn crc32c(data: &[u8]) -> u32 {
     const TABLE: [u32; 256] = crc32c_table();
@@ -433,13 +416,8 @@ const fn crc32c_table() -> [u32; 256] {
 /// Command envelope field numbers used by the subset.
 mod fields {
     pub const TYPE: u32 = 1;
-    pub const TOPIC: u32 = 1;
     pub const PRODUCER_ID: u32 = 2;
-    pub const CLIENT_VERSION: u32 = 2;
     pub const SEQUENCE_ID: u32 = 2;
-    pub const PRODUCER_NAME: u32 = 4;
-    pub const AUTH_METHOD_NAME: u32 = 5;
-    pub const AUTH_DATA: u32 = 6;
     pub const PRODUCER_NAME_META: u32 = 1;
     pub const SEQUENCE_ID_META: u32 = 2;
     pub const PUBLISH_TIME: u32 = 3;
@@ -450,18 +428,6 @@ mod fields {
     pub const KV_VALUE: u32 = 2;
 }
 
-/// Encode a `Connect` command body.
-pub fn encode_connect(client_version: &str, auth: &PulsarAuth) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_varint_field(fields::TYPE, PulsarCommand::Connect as u64, &mut out);
-    encode_string_field(fields::CLIENT_VERSION, client_version, &mut out);
-    if let PulsarAuth::Token { token } = auth {
-        encode_string_field(fields::AUTH_METHOD_NAME, "token", &mut out);
-        encode_bytes_field(fields::AUTH_DATA, token.as_bytes(), &mut out);
-    }
-    out
-}
-
 /// Encode a `Connected` command body (fake brokers + tests).
 pub fn encode_connected() -> Vec<u8> {
     let mut out = Vec::new();
@@ -469,41 +435,10 @@ pub fn encode_connected() -> Vec<u8> {
     out
 }
 
-/// Encode a `Producer` command body.
-pub fn encode_producer(topic_path: &str, producer_id: u64, producer_name: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_varint_field(fields::TYPE, PulsarCommand::Producer as u64, &mut out);
-    encode_string_field(fields::TOPIC, topic_path, &mut out);
-    encode_varint_field(fields::PRODUCER_ID, producer_id, &mut out);
-    encode_string_field(fields::PRODUCER_NAME, producer_name, &mut out);
-    out
-}
-
-/// Encode a `ProducerSuccess` command body.
-pub fn encode_producer_success(producer_name: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_varint_field(
-        fields::TYPE,
-        PulsarCommand::ProducerSuccess as u64,
-        &mut out,
-    );
-    encode_string_field(fields::PRODUCER_NAME, producer_name, &mut out);
-    out
-}
-
 /// Encode a `Send` command body.
 pub fn encode_send(producer_id: u64, sequence_id: u64) -> Vec<u8> {
     let mut out = Vec::new();
     encode_varint_field(fields::TYPE, PulsarCommand::Send as u64, &mut out);
-    encode_varint_field(fields::PRODUCER_ID, producer_id, &mut out);
-    encode_varint_field(fields::SEQUENCE_ID, sequence_id, &mut out);
-    out
-}
-
-/// Encode a `SendReceipt` command body.
-pub fn encode_send_receipt(producer_id: u64, sequence_id: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_varint_field(fields::TYPE, PulsarCommand::SendReceipt as u64, &mut out);
     encode_varint_field(fields::PRODUCER_ID, producer_id, &mut out);
     encode_varint_field(fields::SEQUENCE_ID, sequence_id, &mut out);
     out
@@ -850,141 +785,6 @@ impl PulsarTransport for MemoryPulsarTransport {
             topic_path: topic_path.to_string(),
             messages: batch,
         });
-        Ok(())
-    }
-}
-
-/// TCP transport: Connect/Connected once, Producer per topic (cached),
-/// one Send frame plus receipt per message.
-pub struct TcpPulsarTransport {
-    endpoint: PulsarEndpoint,
-    auth: PulsarAuth,
-    timeout: Duration,
-    stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
-    producers: parking_lot::Mutex<HashMap<String, (u64, String)>>,
-    next_producer_id: AtomicU64,
-}
-
-impl TcpPulsarTransport {
-    pub fn new(config: &PulsarSinkConfig) -> Result<Self> {
-        config.validate()?;
-        Ok(Self {
-            endpoint: parse_service_url(&config.service_url)?,
-            auth: config.auth.clone(),
-            timeout: config.timeout(),
-            stream: tokio::sync::Mutex::new(None),
-            producers: parking_lot::Mutex::new(HashMap::new()),
-            next_producer_id: AtomicU64::new(1),
-        })
-    }
-
-    async fn ensure_connected(&self) -> Result<()> {
-        if self.stream.lock().await.is_some() {
-            return Ok(());
-        }
-        let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
-            .await
-            .map_err(|_| ConnectorError::Connection(format!("pulsar connect timeout: {addr}")))?
-            .map_err(|e| ConnectorError::Connection(format!("pulsar connect failed: {e}")))?;
-        let connect = encode_command_frame(&encode_connect("IndraMQTT-0.1.0", &self.auth));
-        stream
-            .write_all(&connect)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("pulsar connect write failed: {e}")))?;
-        let reply = read_frame(&mut stream, self.timeout).await?;
-        let (command, _, _) = decode_frame(&reply)?;
-        if decode_command_type(&command)? != PulsarCommand::Connected as u32 {
-            return Err(ConnectorError::Connection(
-                "pulsar expected Connected".to_string(),
-            ));
-        }
-        *self.stream.lock().await = Some(stream);
-        Ok(())
-    }
-
-    async fn ensure_producer(&self, topic_path: &str) -> Result<(u64, String)> {
-        if let Some(entry) = self.producers.lock().get(topic_path) {
-            return Ok(entry.clone());
-        }
-        let producer_id = self.next_producer_id.fetch_add(1, Ordering::SeqCst);
-        let producer_name = format!("indra-pulsar-{producer_id}");
-        let frame = encode_command_frame(&encode_producer(topic_path, producer_id, &producer_name));
-        let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("pulsar not connected".to_string()))?;
-        stream.write_all(&frame).await.map_err(|e| {
-            ConnectorError::Connection(format!("pulsar producer write failed: {e}"))
-        })?;
-        let reply = read_frame(stream, self.timeout).await?;
-        let (command, _, _) = decode_frame(&reply)?;
-        if decode_command_type(&command)? != PulsarCommand::ProducerSuccess as u32 {
-            return Err(ConnectorError::Connection(
-                "pulsar expected ProducerSuccess".to_string(),
-            ));
-        }
-        self.producers
-            .lock()
-            .insert(topic_path.to_string(), (producer_id, producer_name.clone()));
-        Ok((producer_id, producer_name))
-    }
-}
-
-async fn read_frame(stream: &mut tokio::net::TcpStream, timeout: Duration) -> Result<Vec<u8>> {
-    let mut head = [0u8; 4];
-    tokio::time::timeout(timeout, stream.read_exact(&mut head))
-        .await
-        .map_err(|_| ConnectorError::Connection("pulsar read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("pulsar read failed: {e}")))?;
-    let total = u32::from_be_bytes(head) as usize;
-    if total > 16 * 1024 * 1024 {
-        return Err(ConnectorError::Connection(
-            "pulsar frame too large".to_string(),
-        ));
-    }
-    let mut body = vec![0u8; total];
-    tokio::time::timeout(timeout, stream.read_exact(&mut body))
-        .await
-        .map_err(|_| ConnectorError::Connection("pulsar read timeout".to_string()))?
-        .map_err(|e| ConnectorError::Connection(format!("pulsar read failed: {e}")))?;
-    let mut frame = head.to_vec();
-    frame.extend_from_slice(&body);
-    Ok(frame)
-}
-
-#[async_trait]
-impl PulsarTransport for TcpPulsarTransport {
-    async fn produce(&self, topic_path: &str, batch: Vec<PulsarMessage>) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        self.ensure_connected().await?;
-        let (producer_id, producer_name) = self.ensure_producer(topic_path).await?;
-        let now = now_millis().max(0) as u64;
-        let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("pulsar not connected".to_string()))?;
-        for message in &batch {
-            let metadata = encode_metadata(&producer_name, message, now);
-            let frame = encode_message_frame(
-                &encode_send(producer_id, message.sequence_id),
-                &metadata,
-                &message.payload,
-            );
-            stream
-                .write_all(&frame)
-                .await
-                .map_err(|e| ConnectorError::Connection(format!("pulsar send failed: {e}")))?;
-            let reply = read_frame(stream, self.timeout).await?;
-            let (command, _, _) = decode_frame(&reply)?;
-            if decode_command_type(&command)? != PulsarCommand::SendReceipt as u32 {
-                return Err(ConnectorError::Connection(
-                    "pulsar expected SendReceipt".to_string(),
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -1639,79 +1439,6 @@ mod tests {
         assert!(sink.flush().await.is_err());
         assert_eq!(transport.calls(), calls);
         assert_eq!(sink.sent_batches(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_tcp_loopback_handshake_and_send() {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // Connect: command-only frame with type 2 + token auth data.
-            let connect = read_frame(&mut stream, Duration::from_secs(5))
-                .await
-                .expect("connect");
-            let (command, _, _) = decode_frame(&connect).expect("connect frame");
-            assert_eq!(
-                decode_command_type(&command).expect("type"),
-                PulsarCommand::Connect as u32
-            );
-            assert!(command.windows(3).any(|w| w == b"jwt"));
-            stream
-                .write_all(&encode_command_frame(&encode_connected()))
-                .await
-                .expect("connected");
-            // Producer: command-only frame with type 11.
-            let producer = read_frame(&mut stream, Duration::from_secs(5))
-                .await
-                .expect("producer");
-            let (command, _, _) = decode_frame(&producer).expect("producer frame");
-            assert_eq!(
-                decode_command_type(&command).expect("type"),
-                PulsarCommand::Producer as u32
-            );
-            stream
-                .write_all(&encode_command_frame(&encode_producer_success("p")))
-                .await
-                .expect("producer success");
-            // Send: message frame with type 19; answer one receipt.
-            let send = read_frame(&mut stream, Duration::from_secs(5))
-                .await
-                .expect("send");
-            let (command, metadata, payload) = decode_frame(&send).expect("send frame");
-            assert_eq!(
-                decode_command_type(&command).expect("type"),
-                PulsarCommand::Send as u32
-            );
-            assert_eq!(decode_metadata(&metadata).expect("meta").sequence_id, 0);
-            assert_eq!(payload, b"{\"v\":1}");
-            stream
-                .write_all(&encode_command_frame(&encode_send_receipt(1, 0)))
-                .await
-                .expect("receipt");
-        });
-
-        let mut config = test_config(&format!("pulsar://127.0.0.1:{port}"));
-        config.auth = PulsarAuth::Token {
-            token: "jwt".to_string(),
-        };
-        config.batch_size = Some(1);
-        let transport = Arc::new(TcpPulsarTransport::new(&config).unwrap());
-        let sink = PulsarSink::new(config, transport).unwrap();
-        sink.send(
-            &Topic::new("sensors/t1").unwrap(),
-            &Bytes::from_static(b"{\"v\":1}"),
-            QoS::AtMostOnce,
-        )
-        .await
-        .unwrap();
-        assert_eq!(sink.sent_records(), 1);
-        tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("server done")
-            .expect("server task");
     }
 
     /// It fails closed when the environment lacks the named address.

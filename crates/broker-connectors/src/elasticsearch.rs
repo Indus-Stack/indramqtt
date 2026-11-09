@@ -7,13 +7,7 @@
 //! `elasticsearch` driver ([`DriverElasticsearchTransport`]): the
 //! driver holds the HTTP pool and TLS, and each flush sends the
 //! sink-rendered NDJSON with the configured Basic/ApiKey
-//! `Authorization` value. The legacy [`HttpElasticsearchTransport`]
-//! (plain `reqwest`) is retained for offline unit tests and for
-//! OpenSearch nodes the driver's product check refuses.
-//! TODO(parity): the official driver checks the `X-Elastic-Product`
-//! response header, so OpenSearch clusters fail closed on the driver
-//! path; does the OpenSearch-compatible deployment need the HTTP
-//! fallback wired instead of the driver?
+//! `Authorization` value.
 //! Index names resolve `${YYYY}`/`${MM}`/`${DD}`/`${topic}` at flush
 //! time (`iot-telemetry-${YYYY.MM.dd}` works: each variable
 //! substitutes independently). Document ids come from an optional
@@ -577,58 +571,6 @@ impl ElasticsearchTransport for MockElasticsearchTransport {
                 429 | 503 => BulkOutcome::Retryable(status),
                 other => BulkOutcome::Failed(other),
             },
-        })
-    }
-}
-
-/// HTTP transport: `POST {endpoint}/_bulk` as `application/x-ndjson`.
-/// Transport errors are connection failures; status mapping follows
-/// [`BulkOutcome`] (429/503 retryable, other non-2xx fatal).
-///
-/// Retained for offline unit tests and for servers the official driver
-/// refuses (its transport checks the `X-Elastic-Product` response
-/// header, so OpenSearch nodes fail closed here); production wiring
-/// uses [`DriverElasticsearchTransport`].
-pub struct HttpElasticsearchTransport {
-    url: String,
-    client: reqwest::Client,
-}
-
-impl HttpElasticsearchTransport {
-    pub fn new(config: &ElasticsearchSinkConfig, client: reqwest::Client) -> Result<Self> {
-        config.validate()?;
-        Ok(Self {
-            url: format!("{}/_bulk", config.endpoint.trim_end_matches('/')),
-            client,
-        })
-    }
-}
-
-#[async_trait]
-impl ElasticsearchTransport for HttpElasticsearchTransport {
-    async fn bulk_post(&self, body: Vec<u8>, auth: Option<String>) -> Result<BulkOutcome> {
-        let mut request = self
-            .client
-            .post(&self.url)
-            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
-            .body(body);
-        if let Some(auth) = auth {
-            request = request.header(reqwest::header::AUTHORIZATION, auth);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("elasticsearch bulk failed: {e}")))?;
-        let status = response.status().as_u16();
-        Ok(match status {
-            200..=299 => match response.bytes().await {
-                Ok(body) => BulkOutcome::Indexed {
-                    body: body.to_vec(),
-                },
-                Err(e) => BulkOutcome::IndexedUnverified(e.to_string()),
-            },
-            429 | 503 => BulkOutcome::Retryable(status),
-            _ => BulkOutcome::Failed(status),
         })
     }
 }

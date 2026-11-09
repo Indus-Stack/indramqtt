@@ -27,7 +27,6 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use broker_connectors::{
     now_millis, render_template, BackoffState, BatchQueue, ConnectorError, Result, Sink,
@@ -998,139 +997,6 @@ impl OpcUaTransport for MemoryOpcUaTransport {
     }
 }
 
-/// TCP transport: HEL/ACK handshake, then framed writes with
-/// sequence accounting. Offline unit tests only; production wiring
-/// uses [`DriverOpcUaTransport`].
-pub struct TcpOpcUaTransport {
-    host: String,
-    port: u16,
-    hello: OpcUaHello,
-    stream: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
-    sequence: AtomicU64,
-    timeout: Duration,
-}
-
-impl TcpOpcUaTransport {
-    pub fn new(config: &OpcUaSinkConfig) -> Result<Self> {
-        config.validate()?;
-        let rest = config.endpoint_url.trim_start_matches("opc.tcp://");
-        let (host, port) = match rest.split_once('/') {
-            Some((authority, _)) => split_host_port(authority)?,
-            None => split_host_port(rest)?,
-        };
-        Ok(Self {
-            host,
-            port,
-            hello: OpcUaHello {
-                protocol_version: 0,
-                receive_buffer: 65536,
-                send_buffer: 65536,
-                max_message: 2 * 1024 * 1024,
-                max_chunk: 65536,
-                endpoint_url: config.endpoint_url.clone(),
-            },
-            stream: tokio::sync::Mutex::new(None),
-            sequence: AtomicU64::new(1),
-            timeout: config.timeout(),
-        })
-    }
-
-    pub fn next_sequence(&self) -> u32 {
-        self.sequence.fetch_add(1, Ordering::SeqCst) as u32
-    }
-}
-
-fn split_host_port(authority: &str) -> Result<(String, u16)> {
-    let authority = authority.split('@').next_back().unwrap_or_default();
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => {
-            let port: u16 = port.parse().map_err(|_| {
-                ConnectorError::Dispatch(format!("opc-ua bad port in {authority:?}"))
-            })?;
-            (host, port)
-        }
-        None => (authority, 4840),
-    };
-    if host.is_empty() {
-        return Err(ConnectorError::Dispatch(
-            "opc-ua host must not be empty".to_string(),
-        ));
-    }
-    Ok((host.to_string(), port))
-}
-
-#[async_trait]
-impl OpcUaTransport for TcpOpcUaTransport {
-    async fn connect(&self) -> Result<()> {
-        if self.stream.lock().await.is_some() {
-            return Ok(());
-        }
-        let addr = format!("{}:{}", self.host, self.port);
-        let mut stream = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr))
-            .await
-            .map_err(|_| ConnectorError::Connection(format!("opc-ua connect timeout: {addr}")))?
-            .map_err(|e| ConnectorError::Connection(format!("opc-ua connect failed: {e}")))?;
-        let mut body = Vec::new();
-        self.hello.encode(&mut body);
-        stream
-            .write_all(&encode_chunk(OpcUaChunk::Hello, &body))
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("opc-ua hello write failed: {e}")))?;
-        let mut header = [0u8; 8];
-        tokio::time::timeout(self.timeout, stream.read_exact(&mut header))
-            .await
-            .map_err(|_| ConnectorError::Connection("opc-ua ack timeout".to_string()))?
-            .map_err(|e| ConnectorError::Connection(format!("opc-ua ack read failed: {e}")))?;
-        let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-        if !(8..=64 * 1024).contains(&length) {
-            return Err(ConnectorError::Connection(
-                "opc-ua bad ACK length".to_string(),
-            ));
-        }
-        let mut rest = vec![0u8; length - 8];
-        stream
-            .read_exact(&mut rest)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("opc-ua ack read failed: {e}")))?;
-        let mut full = header.to_vec();
-        full.extend_from_slice(&rest);
-        let (kind, _) = decode_chunk(&full)?;
-        if kind != OpcUaChunk::Acknowledge {
-            return Err(ConnectorError::Connection(
-                "opc-ua expected ACK".to_string(),
-            ));
-        }
-        *self.stream.lock().await = Some(stream);
-        Ok(())
-    }
-
-    async fn write(&self, frame: &OpcUaWriteFrame) -> Result<()> {
-        let sequence = self.next_sequence();
-        let mut channel = Vec::new();
-        OpcUaChannelFrame {
-            secure_channel_id: 1,
-            sequence_number: sequence,
-            request_id: sequence,
-        }
-        .encode(&mut channel);
-        channel.extend_from_slice(&frame.bytes);
-        let packet = encode_chunk(OpcUaChunk::OpenSecureChannel, &channel);
-        let mut guard = self.stream.lock().await;
-        let stream = guard
-            .as_mut()
-            .ok_or_else(|| ConnectorError::Connection("opc-ua not connected".to_string()))?;
-        stream
-            .write_all(&packet)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("opc-ua write failed: {e}")))?;
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Driver transport (production): maintained `async-opcua` client.
-// ---------------------------------------------------------------------------
-
 /// Map a sink variant onto the driver variant of the same type.
 /// DateTime ticks use the same 1601 epoch on both sides, so the
 /// value crosses unchanged.
@@ -1192,8 +1058,7 @@ fn coerce_to_target(source: &OpcUaVariant, target: &Variant) -> Option<Variant> 
 
 /// Production transport on the maintained `async-opcua` driver: real
 /// session connect with username auth plus typed writes,
-/// negotiated by the driver instead of by hand. The hand-written
-/// [`TcpOpcUaTransport`] stays for offline unit tests only.
+/// negotiated by the driver instead of by hand.
 ///
 /// Bound: one cached driver session plus the sink buffer in front
 /// of it (batch rows default 100); no pool, no background queue.
@@ -1933,73 +1798,6 @@ mod tests {
             )
             .await
             .is_err());
-    }
-
-    #[tokio::test]
-    async fn test_loopback_hello_ack_and_datachange() {
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            // HEL: chunk tag + endpoint URL inside.
-            let mut header = [0u8; 8];
-            stream.read_exact(&mut header).await.expect("hel head");
-            assert_eq!(&header[..3], b"HEL");
-            let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-            let mut body = vec![0u8; length - 8];
-            stream.read_exact(&mut body).await.expect("hel body");
-            let mut cursor = body.as_slice();
-            let hello = OpcUaHello::decode(&mut cursor).expect("hello");
-            assert_eq!(hello.receive_buffer, 65_536);
-            // ACK with matching buffers.
-            let mut ack = Vec::new();
-            OpcUaHello {
-                protocol_version: hello.protocol_version,
-                receive_buffer: 65_536,
-                send_buffer: 65_536,
-                max_message: hello.max_message,
-                max_chunk: hello.max_chunk,
-                endpoint_url: hello.endpoint_url,
-            }
-            .encode(&mut ack);
-            stream
-                .write_all(&encode_chunk(OpcUaChunk::Acknowledge, &ack))
-                .await
-                .expect("ack");
-            // One OPN write frame follows (setpoint delivery).
-            let mut header = [0u8; 8];
-            stream.read_exact(&mut header).await.expect("opn head");
-            assert_eq!(&header[..3], b"OPN");
-            let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-            let mut body = vec![0u8; length - 8];
-            stream.read_exact(&mut body).await.expect("opn body");
-            let mut cursor = body.as_slice();
-            let channel = OpcUaChannelFrame::decode(&mut cursor).expect("channel");
-            assert_eq!(channel.sequence_number, 1);
-            // Remainder is the write request (node display + variant).
-            let needle = b"ns=2;s=Line1.Temperature";
-            assert!(cursor.windows(needle.len()).any(|w| w == needle));
-        });
-
-        let mut config = test_config();
-        config.endpoint_url = format!("opc.tcp://127.0.0.1:{port}");
-        config.batch_size = Some(1);
-        let transport = Arc::new(TcpOpcUaTransport::new(&config).unwrap());
-        let sink = OpcUaSink::new(config, transport).unwrap();
-        sink.send(
-            &Topic::new("factory/setpoint/zone1").unwrap(),
-            &Bytes::from("22"),
-            QoS::AtMostOnce,
-        )
-        .await
-        .unwrap();
-        assert_eq!(sink.sent_records(), 1);
-        tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("server done")
-            .expect("server task");
     }
 
     /// It fails closed when the environment lacks the named address.

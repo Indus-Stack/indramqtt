@@ -5,10 +5,7 @@
 //! bridge), and `XADD` (Streams append with optional `MAXLEN ~` trim).
 //! Key/channel/stream/field templates render `${topic}` against the
 //! MQTT topic. The [`RedisTransport`] boundary keeps unit tests
-//! broker-free ([`MemoryRedisTransport`]); [`TcpRedisTransport`] is the
-//! legacy hand-written RESP path (AUTH + SELECT on connect, pipelined
-//! execution), retained for offline unit tests only. Production wiring
-//! uses [`DriverRedisTransport`] on the maintained `redis` driver
+//! broker-free ([`MemoryRedisTransport`]). Production wiring uses [`DriverRedisTransport`] on the maintained `redis` driver
 //! (BSD-3-Clause) below.
 
 use super::{ConnectorError, Result, Sink};
@@ -19,8 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,280 +255,16 @@ impl RedisTransport for MemoryRedisTransport {
     }
 }
 
-#[derive(Debug, Clone)]
-struct RedisEndpoint {
-    host: String,
-    port: u16,
-    password: Option<String>,
-    database: u8,
-}
-
-/// Parse `redis://[:password@]host[:port][/db]`.
-fn parse_endpoint(endpoint: &str) -> Result<RedisEndpoint> {
-    let rest = endpoint.strip_prefix("redis://").ok_or_else(|| {
-        ConnectorError::Dispatch(format!(
-            "redis endpoint must start with redis://: {endpoint:?}"
-        ))
-    })?;
-    let (authority, db) = match rest.split_once('/') {
-        Some((authority, db)) => (authority, db),
-        None => (rest, "0"),
-    };
-    let database: u8 = if db.is_empty() {
-        0
-    } else {
-        db.parse().map_err(|_| {
-            ConnectorError::Dispatch(format!("redis bad database index in {endpoint:?}"))
-        })?
-    };
-    let (credentials, hostport) = match authority.rsplit_once('@') {
-        Some((credentials, hostport)) => (credentials, hostport),
-        None => ("", authority),
-    };
-    let password = credentials
-        .strip_prefix(':')
-        .map(str::to_string)
-        .filter(|password| !password.is_empty());
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((host, port)) => (
-            host.to_string(),
-            port.parse::<u16>()
-                .map_err(|_| ConnectorError::Dispatch(format!("redis bad port in {endpoint:?}")))?,
-        ),
-        None => (hostport.to_string(), 6379),
-    };
-    if host.is_empty() {
-        return Err(ConnectorError::Dispatch(format!(
-            "redis endpoint needs a host: {endpoint:?}"
-        )));
-    }
-    Ok(RedisEndpoint {
-        host,
-        port,
-        password,
-        database,
-    })
-}
-
-/// TCP transport with AUTH + SELECT on connect and true pipelining.
-/// Connects lazily; drops and redials once per failed call.
-///
-/// Legacy path retained for offline unit tests only (the in-process
-/// fake server in `tests` below); production wiring uses
-/// [`DriverRedisTransport`] on the maintained driver.
-pub struct TcpRedisTransport {
-    endpoint: RedisEndpoint,
-    conn: AsyncMutex<Option<TcpStream>>,
-}
-
-impl TcpRedisTransport {
-    pub fn new(endpoint: &str) -> Result<Self> {
-        Ok(Self {
-            endpoint: parse_endpoint(endpoint)?,
-            conn: AsyncMutex::new(None),
-        })
-    }
-
-    async fn dial(&self) -> Result<TcpStream> {
-        let addr = format!("{}:{}", self.endpoint.host, self.endpoint.port);
-        let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
-            .await
-            .map_err(|_| ConnectorError::Connection(format!("redis connect timeout: {addr}")))?
-            .map_err(|e| ConnectorError::Connection(format!("redis connect failed: {e}")))?;
-        if let Some(password) = &self.endpoint.password {
-            let reply = self
-                .roundtrip_raw(
-                    &mut stream,
-                    &RedisCommand {
-                        argv: vec![b"AUTH".to_vec(), password.as_bytes().to_vec()],
-                    },
-                )
-                .await?;
-            if reply != RedisReply::Simple("OK".to_string()) {
-                return Err(ConnectorError::Connection(format!(
-                    "redis AUTH rejected: {reply:?}"
-                )));
-            }
-        }
-        if self.endpoint.database != 0 {
-            let reply = self
-                .roundtrip_raw(
-                    &mut stream,
-                    &RedisCommand {
-                        argv: vec![
-                            b"SELECT".to_vec(),
-                            self.endpoint.database.to_string().into_bytes(),
-                        ],
-                    },
-                )
-                .await?;
-            if reply != RedisReply::Simple("OK".to_string()) {
-                return Err(ConnectorError::Connection(format!(
-                    "redis SELECT rejected: {reply:?}"
-                )));
-            }
-        }
-        Ok(stream)
-    }
-
-    async fn roundtrip_raw(
-        &self,
-        stream: &mut TcpStream,
-        command: &RedisCommand,
-    ) -> Result<RedisReply> {
-        stream
-            .write_all(&command.encode_resp())
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("redis write failed: {e}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("redis flush failed: {e}")))?;
-        let mut buf = Vec::new();
-        loop {
-            if let Some((reply, _)) = parse_reply(&buf) {
-                return Ok(reply);
-            }
-            let mut chunk = [0u8; 4096];
-            let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
-                .await
-                .map_err(|_| ConnectorError::Connection("redis read timeout".to_string()))?
-                .map_err(|e| ConnectorError::Connection(format!("redis read failed: {e}")))?;
-            if read == 0 {
-                return Err(ConnectorError::Connection(
-                    "redis closed the connection".to_string(),
-                ));
-            }
-            buf.extend_from_slice(&chunk[..read]);
-            if buf.len() > 4 * 1024 * 1024 {
-                return Err(ConnectorError::Connection(
-                    "redis reply too large".to_string(),
-                ));
-            }
-        }
-    }
-
-    async fn roundtrip_pipelined_raw(
-        &self,
-        stream: &mut TcpStream,
-        commands: &[RedisCommand],
-    ) -> Result<Vec<RedisReply>> {
-        let mut bytes = Vec::new();
-        for command in commands {
-            bytes.extend_from_slice(&command.encode_resp());
-        }
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("redis write failed: {e}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("redis flush failed: {e}")))?;
-        let mut buf = Vec::new();
-        let mut replies = Vec::with_capacity(commands.len());
-        while replies.len() < commands.len() {
-            let mut chunk = [0u8; 4096];
-            let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
-                .await
-                .map_err(|_| ConnectorError::Connection("redis read timeout".to_string()))?
-                .map_err(|e| ConnectorError::Connection(format!("redis read failed: {e}")))?;
-            if read == 0 {
-                return Err(ConnectorError::Connection(
-                    "redis closed the connection".to_string(),
-                ));
-            }
-            buf.extend_from_slice(&chunk[..read]);
-            while replies.len() < commands.len() {
-                match parse_reply(&buf) {
-                    Some((reply, consumed)) => {
-                        buf.drain(..consumed);
-                        replies.push(reply);
-                    }
-                    None => break,
-                }
-            }
-            if buf.len() > 4 * 1024 * 1024 {
-                return Err(ConnectorError::Connection(
-                    "redis reply too large".to_string(),
-                ));
-            }
-        }
-        Ok(replies)
-    }
-}
-
-#[async_trait]
-impl RedisTransport for TcpRedisTransport {
-    async fn execute(&self, command: RedisCommand) -> Result<RedisReply> {
-        for _ in 0..2 {
-            let mut guard = self.conn.lock().await;
-            if guard.is_none() {
-                *guard = Some(self.dial().await?);
-            }
-            let stream = guard.as_mut().expect("connected");
-            match self.roundtrip_raw(stream, &command).await {
-                Ok(reply) => {
-                    return match reply {
-                        RedisReply::Error(message) => Err(ConnectorError::Dispatch(format!(
-                            "redis command failed: {message}"
-                        ))),
-                        ok => Ok(ok),
-                    }
-                }
-                Err(_) => {
-                    *guard = None;
-                }
-            }
-        }
-        Err(ConnectorError::Connection(
-            "redis command failed after reconnect".to_string(),
-        ))
-    }
-
-    async fn execute_pipelined(&self, commands: Vec<RedisCommand>) -> Result<Vec<RedisReply>> {
-        if commands.is_empty() {
-            return Ok(Vec::new());
-        }
-        for _ in 0..2 {
-            let mut guard = self.conn.lock().await;
-            if guard.is_none() {
-                *guard = Some(self.dial().await?);
-            }
-            let stream = guard.as_mut().expect("connected");
-            match self.roundtrip_pipelined_raw(stream, &commands).await {
-                Ok(replies) => {
-                    for reply in &replies {
-                        if let RedisReply::Error(message) = reply {
-                            return Err(ConnectorError::Dispatch(format!(
-                                "redis pipelined command failed: {message}"
-                            )));
-                        }
-                    }
-                    return Ok(replies);
-                }
-                Err(_) => {
-                    *guard = None;
-                }
-            }
-        }
-        Err(ConnectorError::Connection(
-            "redis pipeline failed after reconnect".to_string(),
-        ))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Production transport on the maintained `redis` driver.
 // ---------------------------------------------------------------------------
 
-/// Dial timeout for the driver handshake: 5 s matches the legacy
-/// [`TcpRedisTransport`] dial timeout (the protocol requirement is a
-/// bounded handshake, not a specific value).
+/// Dial timeout for the driver handshake: 5 s bounds the handshake
+/// (the protocol requires a bound, not a specific value).
 const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-command timeout for single and pipelined executions: 10 s
-/// matches the legacy `read_packet` timeout on the same path.
+/// bounds each exchange.
 const DRIVER_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build a driver command from one [`RedisCommand`]: the first argv
@@ -584,13 +315,55 @@ fn map_driver_error(error: redis::RedisError) -> ConnectorError {
     }
 }
 
+/// Parse `redis://[:password@]host[:port][/db]` into
+/// `(host, port, password, database)`.
+fn parse_endpoint(endpoint: &str) -> Result<(String, u16, Option<String>, u8)> {
+    let rest = endpoint.strip_prefix("redis://").ok_or_else(|| {
+        ConnectorError::Dispatch(format!(
+            "redis endpoint must start with redis://: {endpoint:?}"
+        ))
+    })?;
+    let (authority, db) = match rest.split_once('/') {
+        Some((authority, db)) => (authority, db),
+        None => (rest, "0"),
+    };
+    let database: u8 = if db.is_empty() {
+        0
+    } else {
+        db.parse().map_err(|_| {
+            ConnectorError::Dispatch(format!("redis bad database index in {endpoint:?}"))
+        })?
+    };
+    let (credentials, hostport) = match authority.rsplit_once('@') {
+        Some((credentials, hostport)) => (credentials, hostport),
+        None => ("", authority),
+    };
+    let password = credentials
+        .strip_prefix(':')
+        .map(str::to_string)
+        .filter(|password| !password.is_empty());
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((host, port)) => (
+            host.to_string(),
+            port.parse::<u16>()
+                .map_err(|_| ConnectorError::Dispatch(format!("redis bad port in {endpoint:?}")))?,
+        ),
+        None => (hostport.to_string(), 6379),
+    };
+    if host.is_empty() {
+        return Err(ConnectorError::Dispatch(format!(
+            "redis endpoint needs a host: {endpoint:?}"
+        )));
+    }
+    Ok((host, port, password, database))
+}
+
 /// Production Redis transport on the maintained `redis` driver
 /// (BSD-3-Clause): RESP with AUTH/SELECT taken from the endpoint URL
 /// (`redis://[:password@]host[:port][/db]`), one shared multiplexed
 /// tokio connection created lazily and reused, pipelining via
 /// `redis::pipe` (all commands written back-to-back, replies read in
-/// order). The legacy [`TcpRedisTransport`] stays for offline unit
-/// tests only; production wiring uses this transport.
+/// order). Production wiring uses this transport.
 ///
 /// Bound: one shared connection and no background queue; each `send`
 /// is one round trip (or one pipeline round trip) with bounded
@@ -778,16 +551,18 @@ mod tests {
 
     #[test]
     fn test_endpoint_parsing() {
-        let endpoint = parse_endpoint("redis://:s3cret@cache.internal:6380/2").expect("parses");
-        assert_eq!(endpoint.host, "cache.internal");
-        assert_eq!(endpoint.port, 6380);
-        assert_eq!(endpoint.password, Some("s3cret".to_string()));
-        assert_eq!(endpoint.database, 2);
+        let (host, port, password, database) =
+            parse_endpoint("redis://:s3cret@cache.internal:6380/2").expect("parses");
+        assert_eq!(host, "cache.internal");
+        assert_eq!(port, 6380);
+        assert_eq!(password, Some("s3cret".to_string()));
+        assert_eq!(database, 2);
 
-        let endpoint = parse_endpoint("redis://127.0.0.1").expect("defaults");
-        assert_eq!(endpoint.port, 6379);
-        assert_eq!(endpoint.password, None);
-        assert_eq!(endpoint.database, 0);
+        let (_host, port, password, database) =
+            parse_endpoint("redis://127.0.0.1").expect("defaults");
+        assert_eq!(port, 6379);
+        assert_eq!(password, None);
+        assert_eq!(database, 0);
 
         assert!(parse_endpoint("http://x").is_err());
         assert!(parse_endpoint("redis://:pass@/db").is_err());
@@ -919,139 +694,6 @@ mod tests {
 
     /// In-process fake Redis: parses RESP arrays minimally, asserts the
     /// command shape, and answers canned replies (AUTH/SELECT +OK).
-    #[tokio::test]
-    async fn test_tcp_auth_select_and_pipelining() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let seen = Arc::new(parking_lot::Mutex::new(Vec::<Vec<String>>::new()));
-        let seen_rx = seen.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut buf = Vec::new();
-            let mut commands = 0;
-            loop {
-                let mut chunk = [0u8; 4096];
-                let n = stream.read(&mut chunk).await.expect("read");
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                // Drain every complete RESP array in the buffer.
-                while let Some(argv) = parse_command(&buf) {
-                    let consumed = argv_consumed(&buf);
-                    buf.drain(..consumed);
-                    commands += 1;
-                    let strings: Vec<String> = argv
-                        .iter()
-                        .map(|arg| String::from_utf8_lossy(arg).to_string())
-                        .collect();
-                    seen_rx.lock().push(strings.clone());
-                    let reply = match strings.first().map(String::as_str) {
-                        Some("AUTH") => b"+OK\r\n".to_vec(),
-                        Some("SELECT") => b"+OK\r\n".to_vec(),
-                        Some("SET") => b"+OK\r\n".to_vec(),
-                        Some("PUBLISH") => b":1\r\n".to_vec(),
-                        _ => b"-ERR unknown\r\n".to_vec(),
-                    };
-                    stream.write_all(&reply).await.expect("write");
-                    if commands >= 4 {
-                        return;
-                    }
-                }
-            }
-        });
-
-        // Password + non-zero db exercise AUTH and SELECT on connect.
-        let transport = TcpRedisTransport::new(&format!("redis://:pw@127.0.0.1:{port}/3"))
-            .expect("valid endpoint");
-        // Pipelined SET + PUBLISH: one write, ordered replies.
-        let set = build_command(
-            &set_config(),
-            &Topic::new("a/b").unwrap(),
-            &Bytes::from_static(b"online"),
-        );
-        let publish = build_command(
-            &RedisSinkConfig {
-                endpoint: format!("redis://127.0.0.1:{port}"),
-                command: RedisCommandKind::Publish {
-                    channel_template: "alerts".to_string(),
-                },
-            },
-            &Topic::new("t").unwrap(),
-            &Bytes::from_static(b"m"),
-        );
-        let replies = transport
-            .execute_pipelined(vec![set, publish])
-            .await
-            .expect("pipelined");
-        assert_eq!(
-            replies,
-            vec![RedisReply::Simple("OK".to_string()), RedisReply::Integer(1)]
-        );
-
-        let mut done = false;
-        for _ in 0..500 {
-            if server.is_finished() {
-                done = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(done, "fake server never finished");
-        server.await.expect("fake server task");
-        let seen = seen.lock().clone();
-        assert_eq!(seen[0][0], "AUTH");
-        assert_eq!(seen[1], vec!["SELECT".to_string(), "3".to_string()]);
-        assert_eq!(seen[2][0], "SET");
-        assert_eq!(seen[3][0], "PUBLISH");
-        assert_eq!(seen[3][2], "m");
-    }
-
-    /// Minimal RESP-array splitter for the fake server (bulk strings only).
-    fn parse_command(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
-        if buf.first() != Some(&b'*') {
-            return None;
-        }
-        let header_end = buf.windows(2).position(|w| w == b"\r\n")? + 2;
-        let count: usize = std::str::from_utf8(&buf[1..header_end - 2])
-            .ok()?
-            .parse()
-            .ok()?;
-        let mut argv = Vec::with_capacity(count);
-        let mut cursor = &buf[header_end..];
-        for _ in 0..count {
-            if cursor.first() != Some(&b'$') {
-                return None;
-            }
-            let end = cursor.windows(2).position(|w| w == b"\r\n")? + 2;
-            let len: usize = std::str::from_utf8(&cursor[1..end - 2])
-                .ok()?
-                .parse()
-                .ok()?;
-            cursor = &cursor[end..];
-            if cursor.len() < len + 2 {
-                return None;
-            }
-            argv.push(cursor[..len].to_vec());
-            cursor = &cursor[len + 2..];
-        }
-        Some(argv)
-    }
-
-    fn argv_consumed(buf: &[u8]) -> usize {
-        // Re-walk with the same parser to measure the consumed prefix.
-        let Some(argv) = parse_command(buf) else {
-            return 0;
-        };
-        let mut size = format!("*{}\r\n", argv.len()).len();
-        for arg in &argv {
-            size += format!("${}\r\n", arg.len()).len() + arg.len() + 2;
-        }
-        size
-    }
-
     #[test]
     fn test_driver_transport_rejects_bad_endpoint() {
         assert!(DriverRedisTransport::new("http://x").is_err());

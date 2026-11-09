@@ -8,10 +8,8 @@
 //! The write path runs on the maintained `aws-sdk-dynamodb` driver
 //! ([`SdkDynamoDbTransport`] below): typed `AttributeValue` maps
 //! with driver-owned SigV4 (static access-key credentials, session
-//! token when configured, endpoint override for local servers). The
-//! legacy hand-written [`HttpDynamoDbTransport`] (shared signer in
-//! `super`) is retained for endpoint overrides and offline unit
-//! tests only; production wiring uses the driver transport.
+//! token when configured, endpoint override for local servers).
+//! Production wiring uses the driver transport.
 //! Keys derive from templates, TTL attributes compute as
 //! `now + ttl_secs`, and whole JSON documents unpack into typed
 //! attributes (`S`, `N`, `BOOL`, `M`, `L`, `NULL`).
@@ -683,105 +681,6 @@ impl DynamoDbTransport for MockDynamoDbTransport {
             )),
             Some(MockDynamoDbOutcome::Terminal(message)) => Err(ConnectorError::Dispatch(message)),
         }
-    }
-}
-
-/// Production transport: signed `POST {endpoint}/` with the JSON body.
-/// Unprocessed items map back to row indices by deep-matching item
-/// bodies against the sent batch (first-unmatched wins).
-pub struct HttpDynamoDbTransport {
-    endpoint: String,
-    host: String,
-    region: String,
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-    client: reqwest::Client,
-}
-
-impl HttpDynamoDbTransport {
-    pub fn new(config: &DynamoDbSinkConfig, client: reqwest::Client) -> Result<Self> {
-        config.validate()?;
-        let endpoint = config.endpoint_url();
-        let host = endpoint
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        Ok(Self {
-            endpoint,
-            host,
-            region: config.region.clone(),
-            access_key_id: config.access_key_id.clone(),
-            secret_access_key: config.secret_access_key.clone(),
-            session_token: config.session_token.clone(),
-            client,
-        })
-    }
-}
-
-#[async_trait]
-impl DynamoDbTransport for HttpDynamoDbTransport {
-    async fn batch_write_item(&self, req: &DynamoDbBatchWriteRequest) -> Result<Vec<usize>> {
-        let bodies: Vec<String> = req.items.iter().map(|item| item.body.clone()).collect();
-        let body = render_batch_body(&req.table, &bodies);
-        let millis = now_millis();
-        let (auth, date) = sign_batch_write(
-            &self.access_key_id,
-            &self.secret_access_key,
-            self.session_token.as_deref(),
-            &self.region,
-            &self.host,
-            &body,
-            millis,
-        );
-        let mut request = self
-            .client
-            .post(&self.endpoint)
-            .header(reqwest::header::CONTENT_TYPE, DYNAMODB_CONTENT_TYPE)
-            .header("X-Amz-Target", DYNAMODB_TARGET)
-            .header("X-Amz-Date", date)
-            .header(reqwest::header::AUTHORIZATION, auth)
-            .body(body);
-        if let Some(token) = &self.session_token {
-            request = request.header("X-Amz-Security-Token", token.as_str());
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("dynamodb write failed: {e}")))?;
-        let status = response.status().as_u16();
-        if status == 429 || (500..=504).contains(&status) {
-            return Err(ConnectorError::Connection(format!(
-                "dynamodb throttled with {status}"
-            )));
-        }
-        if !(200..=299).contains(&status) {
-            return Err(ConnectorError::Dispatch(format!(
-                "dynamodb write failed with {status}"
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ConnectorError::Connection(format!("dynamodb read failed: {e}")))?;
-        let unprocessed = parse_unprocessed(&req.table, &bytes)?;
-        // Map unprocessed bodies back to row indices (first match wins).
-        let mut used = vec![false; req.items.len()];
-        let mut indices = Vec::new();
-        for body in unprocessed {
-            if let Some(position) = req
-                .items
-                .iter()
-                .position(|item| !used[item.row_index] && item.body == body)
-            {
-                used[req.items[position].row_index] = true;
-                indices.push(req.items[position].row_index);
-            }
-        }
-        Ok(indices)
     }
 }
 
