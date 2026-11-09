@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with custom warning days, call `GET /api/v1/licence/status`, and check `expiry_warn_days`.",
+  "config": "[licence]\nexpiry_warn_days = 7\n",
+  "item": "licence.expiry_warn_days",
+  "kind": "setting",
+  "output": "expiry_warn_days=7",
+  "returncode": 0,
+  "verified": true
+}

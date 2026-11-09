@@ -885,3 +885,48 @@ AssertionError: 100`.
 - Expected: The v5 CONNACK advertises Topic Alias Maximum 5. Source: `crates/broker-node/src/main.rs` applies the value, and `crates/broker-node/src/native.rs` writes it into CONNACK.
 - Broker gave: `binary indramqtt is missing`.
 - Date: 2026-11-09.
+
+## DX2-057 item `licence.install_file`
+
+- Input: the configuration in `docs/_examples/config/licence.install_file.toml` and this action: Start the broker with an install file path and check that it runs.
+- Expected: The broker installs the licence token from the given path and exits. Source: `crates/broker-config/src/schema.rs` documents `licence.install_file` as the path to install the licence token from and exit.
+- Broker gave: `broker exited at boot: Error: "cannot read licence file /tmp/docs-licence-install.key: No such file or directory (os error 2)"
+; broker log: Error: "cannot read licence file /tmp/docs-licence-install.key: No such file or directory (os error 2)"
+`.
+- Date: 2026-11-09.
+
+## DX2-057 item `licence.license_file`
+
+- Input: the configuration in `docs/_examples/config/licence.license_file.toml` and this action: Start the broker with a license file path and check that `/healthz` answers OK.
+- Expected: The broker accepts the license key file path and starts. Source: `crates/broker-config/src/schema.rs` documents `licence.license_file` as the path to the enterprise cryptographic license key file.
+- Broker gave: `broker exited at boot: Error: Load { file: "/tmp/dx-config-uxp_5hf1/cfg/conf.d/99-example.toml", reason: "`licence.license_file` value \"/tmp/docs-license.key\" is not supported in this release: the broker keeps the stored licence and never reads this path (field `licence.license_file`)" }
+; broker log: Error: Load { file: "/tmp/dx-config-uxp_5hf1/cfg/conf.d/99-example.toml", reason: "`licence.license_file` value \"/tmp/docs-license.key\" is not supported in this release: the broker keeps the stored licence and never reads this path (field `licence.license_file`)" }
+`.
+- Date: 2026-11-09.
+
+## DX2-057 item `licence.request_out`
+
+- Input: the configuration in `docs/_examples/config/licence.request_out.toml` and this action: Start the broker with a request output path and check that the request file exists.
+- Expected: The broker writes the installation licence request to the given path and exits. Source: `crates/broker-config/src/schema.rs` documents `licence.request_out` as the path to write the installation licence request to and exit.
+- Broker gave: `broker exited at boot: Licence request written to /tmp/docs-licence-request.json
+Licence request for installation '02c8e234ddf60e04f2f3de7c60d701bddcca220f5f04d02ee4f71457aca84fd4af' (product 0.1.0): max_nodes=3, features=[clustering]. Send this file to sales to receive a licence bound to this installation.
+; broker log: Licence request written to /tmp/docs-licence-request.json
+Licence request for installation '02c8e234ddf60e04f2f3de7c60d701bddcca220f5f04d02ee4f71457aca84fd4af' (product 0.1.0): max_nodes=3, features=[clustering]. Send this file to sales to receive a licence bound to this installation.
+`.
+- Date: 2026-11-09.
+
+## DX2-057 item `licence.trusted_keys_path`
+
+- Input: the configuration in `docs/_examples/config/licence.trusted_keys_path.toml` and this action: Start the broker with a trusted keys path and check that `/healthz` answers OK.
+- Expected: The broker accepts the trusted keys path and starts. Source: `crates/broker-config/src/schema.rs` documents `licence.trusted_keys_path` as trusted licence-signing keys: a JSON file or directory of JSON files.
+- Broker gave: `broker exited at boot: Error: "cannot load trusted licence keys from /tmp/docs-trusted-keys.json: cannot open trusted keys at /tmp/docs-trusted-keys.json: No such file or directory (os error 2)"
+; broker log: Error: "cannot load trusted licence keys from /tmp/docs-trusted-keys.json: cannot open trusted keys at /tmp/docs-trusted-keys.json: No such file or directory (os error 2)"
+`.
+- Date: 2026-11-09.
+
+## DX2-057 item `licence.license_key`
+
+- Input: the configuration in `docs/_examples/config/licence.license_key.toml` and this action: Start the broker with a license key and check that `/healthz` answers OK.
+- Expected: The broker installs the enterprise license key at boot. Source: `crates/broker-node/src/main.rs` installs the file value into the licence store, and a bad key refuses boot.
+- Broker gave: `broker exited at boot: Error: "licence.license_key install refused: malformed: unsupported licence token format (expected INDRA-ENT-V2)"; broker log: Error: "licence.license_key install refused: malformed: unsupported licence token format (expected INDRA-ENT-V2)"`.
+- Date: 2026-11-09.

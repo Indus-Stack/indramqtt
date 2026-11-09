@@ -849,9 +849,32 @@ Size the rule ingress buffer.
 
 ### `rules_engine.window_channel_depth`
 
-Ingress ring buffer channel depth for stateful window worker tasks.
+`rules_engine.window_channel_depth` sets the ingress ring buffer channel depth for stateful window worker tasks.
+
+The broker accepts values from 1 to 1000000. The default is 65536.
+Read the live value from `GET /api/v1/nodes`.
 
 Type: `u32`. Default: `65536`. Range: `1..=1000000`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[rules_engine]
+window_channel_depth = 1024
+```
+
+Action:
+
+```text
+Start the broker with a custom channel depth and read the live depth from `GET /api/v1/nodes`.
+```
+
+Captured output:
+
+```output
+depth=1024
+```
 
 Notes:
 
@@ -860,9 +883,32 @@ Notes:
 
 ### `rules_engine.backpressure_policy`
 
-Default memory backpressure policy when the rule buffer is full.
+`rules_engine.backpressure_policy` sets the default memory backpressure policy when the rule buffer is full. The values are Block, DropNewest, DropOldest, SpillToDisk and RejectPublisher.
+
+The default is DropOldest.
+Read the live value from `GET /api/v1/nodes`.
 
 Type: `enum string`. Default: `"DropOldest"`. Range: `Block | DropNewest | DropOldest | SpillToDisk | RejectPublisher`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[rules_engine]
+backpressure_policy = "Block"
+```
+
+Action:
+
+```text
+Start the broker with a backpressure policy and read the live policy from `GET /api/v1/nodes`.
+```
+
+Captured output:
+
+```output
+policy=Block
+```
 
 Notes:
 
@@ -871,9 +917,31 @@ Notes:
 
 ### `rules_engine.spill_dir`
 
-Rule ingress spill directory.
+`rules_engine.spill_dir` sets the rule ingress spill directory. Empty keeps memory-only delivery. Set a directory to spill rule ingress to disk.
+
+The default is empty.
 
 Type: `string`. Default: `""`. Range: `empty or directory path`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[rules_engine]
+spill_dir = "/tmp/docs-spill"
+```
+
+Action:
+
+```text
+Start the broker with a spill directory and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
@@ -957,9 +1025,31 @@ Join nodes into one cluster.
 
 ### `cluster.enabled`
 
-Refused clustering switch. The broker fails boot when true.
+`cluster.enabled` switches clustering on. The only accepted value is false. Setting it to true refuses boot.
+
+The broker starts in single-node mode when clustering is off. The default is false.
 
 Type: `bool`. Default: `false`. Range: `false only`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+enabled = false
+```
+
+Action:
+
+```text
+Start the broker and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
@@ -968,9 +1058,31 @@ Notes:
 
 ### `cluster.bind`
 
-Cluster SWIM UDP bind address for peer discovery and membership.
+`cluster.bind` sets the cluster SWIM UDP bind address for peer discovery and membership. The broker stores the address.
+
+Clustering binds from `--cluster-bind` only when clustering is on. The default is `127.0.0.1:19883`.
 
 Type: `socket address string`. Default: `"127.0.0.1:19883"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+bind = "127.0.0.1:19983"
+```
+
+Action:
+
+```text
+Start the broker with a cluster bind address and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
@@ -979,9 +1091,31 @@ Notes:
 
 ### `cluster.gossip_bind`
 
-Accepted gossip bind. The broker stores it. It binds clustering from --cluster-bind only.
+`cluster.gossip_bind` sets the gossip bind address. The broker stores the address. It binds clustering from `--cluster-bind` only.
+
+The default is `0.0.0.0:7946`.
 
 Type: `socket address string`. Default: `"0.0.0.0:7946"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+gossip_bind = "127.0.0.1:7996"
+```
+
+Action:
+
+```text
+Start the broker with a gossip bind address and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
@@ -991,9 +1125,31 @@ Notes:
 
 ### `cluster.quic_bind`
 
-Accepted data plane bind. The broker stores it. It binds clustering from --cluster-bind only.
+`cluster.quic_bind` sets the data plane bind address. The broker stores the address. It binds clustering from `--cluster-bind` only.
+
+The default is `0.0.0.0:9092`.
 
 Type: `socket address string`. Default: `"0.0.0.0:9092"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+quic_bind = "127.0.0.1:9992"
+```
+
+Action:
+
+```text
+Start the broker with a data plane bind address and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
@@ -1003,9 +1159,31 @@ Notes:
 
 ### `cluster.seed_nodes`
 
-Refused seed list. The broker fails boot when not empty.
+`cluster.seed_nodes` lists seed nodes for clustering. The broker refuses boot when the list is not empty.
+
+The list must stay empty. The default is an empty list.
 
 Type: `string list`. Default: `[]`. Range: `must stay empty`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[cluster]
+seed_nodes = []
+```
+
+Action:
+
+```text
+Start the broker with an empty seed list and check that `/healthz` answers OK.
+```
+
+Captured output:
+
+```output
+ok
+```
 
 Notes:
 
@@ -1031,64 +1209,56 @@ Install and monitor the commercial licence.
 
 ### `licence.license_file`
 
-Path to the enterprise cryptographic license key file.
-
-Type: `path string`. Default: `"/etc/indramqtt/license.key"`. Range: `any path; empty means none installed`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.license_key`
 
-Enterprise commercial license key for multi-node clustering.
-
-Type: `string`. Default: `""`. Range: `any string; empty means use stored token or environment`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.trusted_keys_path`
 
-Trusted licence-signing keys: a JSON file or directory of JSON files.
-
-Type: `path string`. Default: `""`. Range: `JSON file or directory; empty trusts nothing`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.request_out`
 
-Write the installation licence request to this path and exit.
-
-Type: `path string`. Default: `""`. Range: `any path; empty disables request generation`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.install_file`
 
-Install the licence token read from this path and exit.
-
-Type: `path string`. Default: `""`. Range: `any path; empty disables licence installation`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `licence.expiry_warn_days`
 
-Days before expiry that the approaching-expiry alarm and log warning start.
+`licence.expiry_warn_days` sets the days before expiry that the approaching-expiry alarm and log warning start. It applies to the trial and to licensed expiry alike.
+
+The value is 0 to 365 days. The default is 30.
 
 Type: `u64`. Default: `30`. Range: `0..=365 days`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[licence]
+expiry_warn_days = 7
+```
+
+Action:
+
+```text
+Start the broker with custom warning days, call `GET /api/v1/licence/status`, and check `expiry_warn_days`.
+```
+
+Captured output:
+
+```output
+expiry_warn_days=7
+```
 
 Notes:
 

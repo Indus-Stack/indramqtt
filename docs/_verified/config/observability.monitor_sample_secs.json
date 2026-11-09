@@ -1,0 +1,9 @@
+{
+  "action": "Wait two seconds and read `GET /api/v5/monitor`.",
+  "config": "[observability]\nmonitor_sample_secs = 1\n",
+  "item": "observability.monitor_sample_secs",
+  "kind": "setting",
+  "output": "monitor samples>=2",
+  "returncode": 0,
+  "verified": true
+}

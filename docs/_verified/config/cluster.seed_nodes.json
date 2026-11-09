@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with an empty seed list and check that `/healthz` answers OK.",
+  "config": "[cluster]\nseed_nodes = []\n",
+  "item": "cluster.seed_nodes",
+  "kind": "setting",
+  "output": "ok",
+  "returncode": 0,
+  "verified": true
+}

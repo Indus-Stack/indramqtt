@@ -1503,14 +1503,18 @@ fn node_id() -> String {
         .unwrap_or_else(|_| "local".to_string())
 }
 
-/// Node status, version, live connection count, and rule count.
+/// Node status, version, live counts, and live rule engine tuning.
 async fn get_nodes(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    // Live tuning values. Reason: the docs prove the file setting
+    // applies by reading the running engine, not the stored file.
     Json(serde_json::json!({
         "node_id": node_id(),
         "status": "running",
         "version": env!("CARGO_PKG_VERSION"),
         "connections": state.metrics.connections_active(),
         "rules": state.engine.list_rules().len(),
+        "window_channel_depth": state.engine.window_channel_depth(),
+        "backpressure_policy": format!("{:?}", state.engine.backpressure_policy()),
     }))
 }
 

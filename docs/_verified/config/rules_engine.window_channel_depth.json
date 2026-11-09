@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a custom channel depth and read the live depth from `GET /api/v1/nodes`.",
+  "config": "[rules_engine]\nwindow_channel_depth = 1024\n",
+  "item": "rules_engine.window_channel_depth",
+  "kind": "setting",
+  "output": "depth=1024",
+  "returncode": 0,
+  "verified": true
+}

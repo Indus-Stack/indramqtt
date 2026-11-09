@@ -1,0 +1,18 @@
+[example]
+area = "config"
+item = "cluster.seed_nodes"
+kind = "setting"
+expect = "ok"
+expected = "The broker starts with an empty seed node list."
+source = "`crates/broker-config/src/schema.rs` documents `cluster.seed_nodes` as a refused seed list that must stay empty."
+action = "Start the broker with an empty seed list and check that `/healthz` answers OK."
+config = '''
+[cluster]
+seed_nodes = []
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/healthz")
+assert status == 200, (status, body)
+print("ok")
+'''

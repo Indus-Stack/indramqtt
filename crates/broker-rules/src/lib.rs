@@ -10,7 +10,7 @@ use rekuiper_sql::{Evaluator, Expr, SelectStmt, TimeUnit, WindowDef};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -236,6 +236,28 @@ pub enum BackpressurePolicy {
     DropOldest,
     SpillToDisk,
     RejectPublisher,
+}
+
+// Map a policy to a small number for lock-free storage.
+fn backpressure_policy_to_u8(policy: BackpressurePolicy) -> u8 {
+    match policy {
+        BackpressurePolicy::Block => 0,
+        BackpressurePolicy::DropNewest => 1,
+        BackpressurePolicy::DropOldest => 2,
+        BackpressurePolicy::SpillToDisk => 3,
+        BackpressurePolicy::RejectPublisher => 4,
+    }
+}
+
+// Map a stored number back to a policy. Unknown values read as DropOldest.
+fn backpressure_policy_from_u8(value: u8) -> BackpressurePolicy {
+    match value {
+        0 => BackpressurePolicy::Block,
+        1 => BackpressurePolicy::DropNewest,
+        3 => BackpressurePolicy::SpillToDisk,
+        4 => BackpressurePolicy::RejectPublisher,
+        _ => BackpressurePolicy::DropOldest,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -651,7 +673,9 @@ pub trait BrokerSink: Send + Sync {
 pub struct BoundedEventInput {
     tx: mpsc::Sender<StreamEvent>,
     rx: Mutex<mpsc::Receiver<StreamEvent>>,
-    policy: BackpressurePolicy,
+    // Live backpressure policy. Reason: boot applies the file value
+    // without a restart. One relaxed load per push, no lock.
+    policy: AtomicU8,
     /// Disk behind `SpillToDisk`, if one was configured. `None` for the
     /// other four policies and for directory-less `SpillToDisk` inputs.
     /// Held across the check-send-spill sequence so concurrent pushes
@@ -691,7 +715,7 @@ impl BoundedEventInput {
         Arc::new(Self {
             tx,
             rx: Mutex::new(rx),
-            policy,
+            policy: AtomicU8::new(backpressure_policy_to_u8(policy)),
             spill: parking_lot::Mutex::new(None),
             spill_enabled: AtomicU64::new(0),
             spill_backlog: AtomicU64::new(0),
@@ -723,6 +747,18 @@ impl BoundedEventInput {
         input.spill_enabled.store(1, Ordering::Relaxed);
         *input.spill.lock() = Some(log);
         Ok(input)
+    }
+
+    /// Live backpressure policy. One relaxed load, no lock.
+    pub fn policy(&self) -> BackpressurePolicy {
+        backpressure_policy_from_u8(self.policy.load(Ordering::Relaxed))
+    }
+
+    /// Apply the file backpressure policy. Boot and management only.
+    /// One relaxed store, no lock on the publish path.
+    pub fn set_policy(&self, policy: BackpressurePolicy) {
+        self.policy
+            .store(backpressure_policy_to_u8(policy), Ordering::Relaxed);
     }
 
     /// Attach the node metrics mirror for the spill counters. The first
@@ -825,7 +861,7 @@ impl BoundedEventInput {
         // joins the disk (memory always predates it), so replay stays
         // memory-then-disk, oldest first. The backlog mirror is lock-free;
         // steady-state (`0`) skips the mutex entirely.
-        if self.policy == BackpressurePolicy::SpillToDisk
+        if self.policy() == BackpressurePolicy::SpillToDisk
             && self.spill_backlog.load(Ordering::Relaxed) != 0
         {
             return self.spill_or_refuse(event);
@@ -840,7 +876,7 @@ impl BoundedEventInput {
     }
 
     fn apply_full_policy(&self, event: StreamEvent) -> Result<PushOutcome, RuleEngineError> {
-        match self.policy {
+        match self.policy() {
             // Synchronous callers cannot block: use `push().await` for
             // true blocking behaviour under the Block policy.
             BackpressurePolicy::Block => Ok(PushOutcome::Dropped(OverflowReason::BufferFull)),
@@ -1012,7 +1048,7 @@ impl BoundedEventInput {
 #[async_trait]
 impl EventInput for BoundedEventInput {
     async fn push(&self, event: StreamEvent) -> Result<PushOutcome, RuleEngineError> {
-        match self.policy {
+        match self.policy() {
             BackpressurePolicy::Block => self
                 .tx
                 .send(event)
@@ -1443,7 +1479,9 @@ pub struct RuleEngine {
     /// (the rule task closed mid-admission). Counted with a warning; bus
     /// backpressure awaits capacity instead of dropping on full.
     runtime_feed_dropped: AtomicU64,
-    window_channel_depth: usize,
+    // Live window task feed depth. Reason: boot applies the file value
+    // without a restart. One relaxed load at task spawn, never on publish.
+    window_channel_depth: AtomicUsize,
     forward_throttle: Arc<parking_lot::Mutex<HashMap<(String, String), ThrottleEntry>>>,
     /// Kernel config registry receiving every rule mutation (`None` in
     /// unit tests and standalone state, which stay memory-only).
@@ -1543,7 +1581,7 @@ struct RuleTask {
     feeder: tokio::task::JoinHandle<()>,
     sink_worker: tokio::task::JoinHandle<()>,
     /// Bounded rule-task feed (replacement for the retired worker channel):
-    /// depth is [`DEFAULT_WINDOW_CHANNEL_DEPTH`]. A full feed drops with a
+    /// depth is the live window depth. A full feed drops with a
     /// warning and a counter, never blocks publish.
     feed_tx: mpsc::Sender<TimedRecord>,
     counters: Arc<RuleCounters>,
@@ -1899,7 +1937,7 @@ impl RuleEngine {
             rule_tasks: RwLock::new(HashMap::new()),
             window_executor: RwLock::new(None),
             runtime_feed_dropped: AtomicU64::new(0),
-            window_channel_depth: window_channel_depth.max(1),
+            window_channel_depth: AtomicUsize::new(window_channel_depth.max(1)),
             forward_throttle,
             registry: RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
@@ -1954,7 +1992,7 @@ impl RuleEngine {
             rule_tasks: RwLock::new(HashMap::new()),
             window_executor: RwLock::new(None),
             runtime_feed_dropped: AtomicU64::new(0),
-            window_channel_depth: window_channel_depth.max(1),
+            window_channel_depth: AtomicUsize::new(window_channel_depth.max(1)),
             forward_throttle,
             registry: RwLock::new(None),
             save_lock: parking_lot::Mutex::new(()),
@@ -1970,14 +2008,34 @@ impl RuleEngine {
 
     /// Override the rule-task feed channel depth after construction
     /// (floors at 1, no ceiling). Applies to tasks spawned from here on.
-    pub fn with_window_channel_depth(mut self, depth: usize) -> Self {
-        self.window_channel_depth = depth.max(1);
+    pub fn with_window_channel_depth(self, depth: usize) -> Self {
+        self.window_channel_depth
+            .store(depth.max(1), Ordering::Relaxed);
         self
     }
 
     /// Configured per-rule task feed channel depth.
     pub fn window_channel_depth(&self) -> usize {
+        self.window_channel_depth.load(Ordering::Relaxed)
+    }
+
+    /// Apply the file window depth. Boot and management only.
+    /// One relaxed store, no lock. Tasks spawned later use it.
+    pub fn set_window_channel_depth(&self, depth: usize) {
         self.window_channel_depth
+            .store(depth.max(1), Ordering::Relaxed);
+    }
+
+    /// Live backpressure policy of the ingress queue.
+    /// One relaxed load, no lock.
+    pub fn backpressure_policy(&self) -> BackpressurePolicy {
+        self.input.policy()
+    }
+
+    /// Apply the file backpressure policy. Boot and management only.
+    /// One relaxed store, no lock on the publish path.
+    pub fn set_backpressure_policy(&self, policy: BackpressurePolicy) {
+        self.input.set_policy(policy);
     }
 
     /// Bounded ingress queue for flood protection at outer boundaries.
@@ -3647,7 +3705,7 @@ impl RuleEngine {
             None => return,
         };
         let bus_rx = self.stream_bus.subscribe(runtime::RULE_INGRESS_STREAM);
-        let (feed_tx, feed_rx) = mpsc::channel(self.window_channel_depth);
+        let (feed_tx, feed_rx) = mpsc::channel(self.window_channel_depth.load(Ordering::Relaxed));
         let (sink_tx, sink_rx) = mpsc::channel(runtime::PER_RULE_SINK_QUEUE_DEPTH);
         let counters = Arc::new(RuleCounters::default());
         let status = Arc::new(RwLock::new("running".to_string()));

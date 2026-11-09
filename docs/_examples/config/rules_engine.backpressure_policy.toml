@@ -1,0 +1,19 @@
+[example]
+area = "config"
+item = "rules_engine.backpressure_policy"
+kind = "setting"
+expect = "policy=Block"
+expected = "The broker applies the backpressure policy and reports it from the live engine."
+source = "`crates/broker-node/src/main.rs` applies the file value, and `GET /api/v1/nodes` reports the live policy."
+action = "Start the broker with a backpressure policy and read the live policy from `GET /api/v1/nodes`."
+config = '''
+[rules_engine]
+backpressure_policy = "Block"
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/api/v1/nodes")
+assert status == 200, (status, body)
+assert body["backpressure_policy"] == "Block", body
+print("policy=Block")
+'''

@@ -4582,6 +4582,9 @@ impl Shared {
         let sessions = Arc::new(SessionManager::new());
         let router = Arc::new(Router::new());
         let conns = Arc::new(ConnTable::default());
+        // Boot default: 1024 is the ingress queue capacity. The window task
+        // depth defaults to 65,536 inside the engine. Boot applies the file
+        // `rules_engine.window_channel_depth` and `backpressure_policy` next.
         let engine = Arc::new(RuleEngine::new(1024, BackpressurePolicy::DropOldest));
         // Enterprise window split (X1-06): windowed rules execute in the
         // enterprise crate; attach its executor before any rule is
@@ -11325,6 +11328,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut shared = Shared::new();
     shared.allow_anonymous = args.allow_anonymous;
     shared.node_id = args.node_id.clone();
+    // DX2-057: apply the rule engine tuning from the startup layers.
+    // Reason: the file value must size live window tasks. Two relaxed
+    // stores at boot; task spawn pays one load, publish pays no new lock.
+    {
+        let depth = cfg.rules_engine.window_channel_depth.max(1) as usize;
+        shared.engine.set_window_channel_depth(depth);
+        let policy = match cfg.rules_engine.backpressure_policy.as_str() {
+            "Block" => BackpressurePolicy::Block,
+            "DropNewest" => BackpressurePolicy::DropNewest,
+            "DropOldest" => BackpressurePolicy::DropOldest,
+            "SpillToDisk" => BackpressurePolicy::SpillToDisk,
+            "RejectPublisher" => BackpressurePolicy::RejectPublisher,
+            _ => BackpressurePolicy::DropOldest,
+        };
+        if cfg.rules_engine.spill_dir.is_empty() {
+            if policy == BackpressurePolicy::SpillToDisk {
+                return Err(
+                    "rules_engine.backpressure_policy SpillToDisk needs rules_engine.spill_dir"
+                        .into(),
+                );
+            }
+            shared.engine.set_backpressure_policy(policy);
+        } else {
+            shared
+                .engine
+                .set_backpressure_policy(BackpressurePolicy::SpillToDisk);
+        }
+        info!(
+            "Rule engine tuning: window_channel_depth={} backpressure_policy={}",
+            depth, cfg.rules_engine.backpressure_policy
+        );
+    }
     // D1-02: apply the configured per-subscriber QoS 0 backlog bound to
     // the shared delivery table before any edge binds. One atomic store
     // at boot; the hot publish path pays a single relaxed load.
@@ -11742,6 +11777,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cfg.rules_engine.spill_dir.is_empty() {
         match RuleEngine::new_with_spill(1024, cfg.rules_engine.spill_dir.as_str()) {
             Ok(engine) => {
+                // DX2-057: carry the file window depth onto the spill engine.
+                // Reason: the spill path must use the same task depth.
+                // One relaxed store at boot; task spawn pays one load.
+                engine.set_window_channel_depth(
+                    cfg.rules_engine.window_channel_depth.max(1) as usize,
+                );
                 let engine = Arc::new(engine);
                 engine.set_metrics(&shared.metrics);
                 // B4-07 boot wiring: carry the live broker sink onto the
@@ -12038,7 +12079,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let licence_state = match shared
+    let mut licence_state = match shared
         .licence
         .load_from_data_dir(std::path::Path::new(&args.data_dir), now_licence)
     {
@@ -12047,6 +12088,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("cannot load licence state from {}: {e}", args.data_dir).into());
         }
     };
+    // DX2-057: apply `licence.license_key` from the startup layers.
+    // Reason: the file value must install the token. A bad token fails
+    // boot loudly, never with a silent trial. Empty keeps stored state.
+    let licence_key = cfg.licence.license_key.trim().to_string();
+    if !licence_key.is_empty() {
+        match shared.licence.install(&licence_key, now_licence) {
+            Ok(payload) => {
+                info!(
+                    "Licence key installed for '{}' (max {} nodes)",
+                    payload.customer, payload.max_nodes
+                );
+                licence_state = match shared
+                    .licence
+                    .load_from_data_dir(std::path::Path::new(&args.data_dir), now_licence)
+                {
+                    Ok(state) => state,
+                    Err(e) => {
+                        return Err(format!(
+                            "cannot reload licence state from {}: {e}",
+                            args.data_dir
+                        )
+                        .into());
+                    }
+                };
+            }
+            Err(e) => {
+                return Err(format!("licence.license_key install refused: {e}").into());
+            }
+        }
+    }
     // File commands for sites with no dashboard: generate the request or
     // install a licence, then exit without starting the broker.
     if !args.licence_request_out.trim().is_empty() {

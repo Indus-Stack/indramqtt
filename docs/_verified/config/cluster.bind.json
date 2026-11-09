@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with a cluster bind address and check that `/healthz` answers OK.",
+  "config": "[cluster]\nbind = \"127.0.0.1:19983\"\n",
+  "item": "cluster.bind",
+  "kind": "setting",
+  "output": "ok",
+  "returncode": 0,
+  "verified": true
+}
