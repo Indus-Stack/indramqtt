@@ -1,0 +1,20 @@
+[example]
+area = "config"
+item = "session.keep_alive_grace"
+kind = "setting"
+expect = "keepalive_multiplier=5.0"
+expected = "The live global zone reports the configured keepalive multiplier 5.0."
+source = "`crates/broker-node/src/native.rs` sets the keepalive deadline with a fixed 1.5 multiplier and does not read this field."
+action = "Read `GET /api/v5/configs/global_zone`."
+config = '''
+[session]
+keep_alive_grace = 5.0
+'''
+script = '''
+from config_probe import *
+status, zone = http("GET", "/api/v5/configs/global_zone")
+assert status == 200, (status, zone)
+value = zone["mqtt"]["keepalive_multiplier"]
+assert value == 5.0, value
+print("keepalive_multiplier=5.0")
+'''

@@ -1,0 +1,21 @@
+[example]
+area = "config"
+item = "session.max_inflight_messages"
+kind = "setting"
+expect = "inflight_max=5"
+expected = "A new session reports the configured inflight maximum of five."
+source = "The schema documents the field at `crates/broker-config/src/schema.rs`, and the live window is set in `crates/broker-node/src/main.rs`."
+action = "Connect a v5 client and read `GET /api/v5/clients/<id>`."
+config = '''
+[session]
+max_inflight_messages = 5
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("inflight-messages-client", v5=True)
+status, client = http("GET", "/api/v5/clients/inflight-messages-client")
+assert status == 200, (status, client)
+assert client.get("inflight_max") == 5, client.get("inflight_max")
+disconnect(sock)
+print("inflight_max=5")
+'''

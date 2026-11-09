@@ -29,7 +29,7 @@ flowchart LR
 
 > **Note:** The Restart column stays empty unless the code proves that a reload applies the setting. Deprecated settings are marked as such in the Description column and carry no restart value.
 
-Each setting owns one entry below with a verified example line. Each example line sits in the group file of its section. The drift test loads each group file through the production loader. The docs run boots each group file.
+Each setting owns one entry below. An entry with a verified example shows the configuration, the action and the output. An entry with a failure record shows the not-verified callout. The verification runner writes each record from its run.
 
 | Setting | Type | Default | Range | Description | Restart |
 |---|---|---|---|---|---|
@@ -192,7 +192,7 @@ Each setting owns one entry below with a verified example line. Each example lin
 
 ## Settings in detail
 
-Each entry names one setting with its verified example line.
+Each entry names one setting. A verified entry carries an example.
 
 ## `node`
 
@@ -200,42 +200,18 @@ Name the node. Point state at a directory.
 
 ### `node.id`
 
-Unique identifier for this broker node within the cluster.
-
-Type: `string`. Default: `"indra-node-1"`. Range: `1..=64 chars, letters/digits/dots/dashes`. Restart: `not proven`.
-
-Example: `id = "doc-node-1"` in the `[node]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `node.data_dir`
 
-Directory holding kernel persistent state (state.toml). Created on boot when missing.
-
-Type: `path string`. Default: `"./data"`. Range: `non-empty path`. Restart: `not proven`.
-
-Example: `data_dir = "./data"` (the default); the boot file omits it; the test pin sets an absolute path.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `node.brokerlink_bind`
 
-Deprecated. Ignored. The kernel serves clients directly.
-
-Type: `socket address string`. Default: `"127.0.0.1:18883"`. Range: `any string, ignored`. Restart: `not proven`.
-
-Example: `brokerlink_bind = "127.0.0.1:18883"` in the `[node]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -257,12 +233,10 @@ Whether the plaintext MQTT listener accepts connections.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = true` in the `[listeners.tcp]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tcp.bind`
 
@@ -270,12 +244,10 @@ Bind address for the plaintext MQTT listener.
 
 Type: `socket address string`. Default: `"0.0.0.0:1883"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:1883"` in the `[listeners.tcp]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tcp.max_connections`
 
@@ -283,12 +255,10 @@ Maximum concurrent connections on the plaintext MQTT listener.
 
 Type: `u32`. Default: `1000000`. Range: `1..=10000000`. Restart: `not proven`.
 
-Example: `max_connections = 500000` in the `[listeners.tcp]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tcp.backlog`
 
@@ -296,12 +266,10 @@ Listener accept backlog for the plaintext MQTT listener.
 
 Type: `u32`. Default: `1024`. Range: `1..=65536`. Restart: `not proven`.
 
-Example: `backlog = 2048` in the `[listeners.tcp]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tcp.native`
 
@@ -309,12 +277,10 @@ Deprecated. Ignored. The kernel always serves this listener.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `native = false` in the `[listeners.tcp]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.enabled`
 
@@ -322,12 +288,10 @@ Whether the secure TLS MQTT listener accepts connections.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = false` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.bind`
 
@@ -335,12 +299,10 @@ Bind address for the secure TLS MQTT listener.
 
 Type: `socket address string`. Default: `"0.0.0.0:8883"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:8883"` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.cert_file`
 
@@ -348,12 +310,10 @@ Path to the PEM server certificate for the TLS listener.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when TLS is enabled`. Restart: `not proven`.
 
-Example: `cert_file = ""` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.key_file`
 
@@ -361,12 +321,10 @@ Path to the PEM private key for the TLS listener.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when TLS is enabled`. Restart: `not proven`.
 
-Example: `key_file = ""` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.native`
 
@@ -374,12 +332,10 @@ Deprecated. Ignored. The kernel always serves this listener.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `native = false` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.psk_enabled`
 
@@ -387,12 +343,10 @@ Whether the kernel TLS listener accepts pre-shared-key handshakes. Off keeps cer
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `psk_enabled = false` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.psk_keys_file`
 
@@ -400,12 +354,10 @@ Path to the PSK identity file of the kernel TLS listener. Use it only when PSK i
 
 Type: `path string`. Default: `""`. Range: `file path; empty means no identities`. Restart: `not proven`.
 
-Example: `psk_keys_file = ""` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.verify_client_cert`
 
@@ -413,12 +365,10 @@ Whether the TLS listener requests and verifies a client certificate.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `verify_client_cert = false` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.verify`
 
@@ -426,12 +376,10 @@ Client certificate chain check mode of the TLS listener.
 
 Type: `string`. Default: `"verify_none"`. Range: `verify_none | verify_peer`. Restart: `not proven`.
 
-Example: `verify = "verify_none"` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.cacertfile`
 
@@ -439,12 +387,10 @@ CA file for client certificate checks of the TLS listener.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when client verification is on`. Restart: `not proven`.
 
-Example: `cacertfile = ""` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.fail_if_no_peer_cert`
 
@@ -452,12 +398,10 @@ Whether the TLS listener refuses a handshake without a certificate.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `fail_if_no_peer_cert = false` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.peer_cert_as_username`
 
@@ -465,12 +409,10 @@ Source for the bind username from the client certificate.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
 
-Example: `peer_cert_as_username = "disabled"` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.tls.peer_cert_as_clientid`
 
@@ -478,12 +420,10 @@ Source for the bind client identifier from the client certificate.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
 
-Example: `peer_cert_as_clientid = "disabled"` in the `[listeners.tls]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.ws.enabled`
 
@@ -491,12 +431,10 @@ Whether the MQTT-over-WebSocket listener accepts connections.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = true` in the `[listeners.ws]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.ws.bind`
 
@@ -504,12 +442,10 @@ Bind address for the MQTT-over-WebSocket listener.
 
 Type: `socket address string`. Default: `"0.0.0.0:8083"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:8083"` in the `[listeners.ws]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.ws.path`
 
@@ -517,12 +453,10 @@ HTTP path serving MQTT-over-WebSocket traffic.
 
 Type: `string`. Default: `"/mqtt"`. Range: `must start with '/'`. Restart: `not proven`.
 
-Example: `path = "/mqtt"` in the `[listeners.ws]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.ws.native`
 
@@ -530,12 +464,10 @@ Deprecated. Ignored. The kernel always serves this listener.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `native = false` in the `[listeners.ws]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.enabled`
 
@@ -543,12 +475,10 @@ Whether the secure WebSocket listener accepts connections.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = false` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.bind`
 
@@ -556,12 +486,10 @@ Bind address for the secure WebSocket listener.
 
 Type: `socket address string`. Default: `"0.0.0.0:8084"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:8084"` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.path`
 
@@ -569,12 +497,10 @@ HTTP path serving secure WebSocket traffic.
 
 Type: `string`. Default: `"/mqtt"`. Range: `must start with '/'`. Restart: `not proven`.
 
-Example: `path = "/mqtt"` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.cert_file`
 
@@ -582,12 +508,10 @@ Path to the PEM server certificate for the secure WebSocket listener.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when secure WebSocket is enabled`. Restart: `not proven`.
 
-Example: `cert_file = ""` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.key_file`
 
@@ -595,12 +519,10 @@ Path to the PEM private key for the secure WebSocket listener.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when secure WebSocket is enabled`. Restart: `not proven`.
 
-Example: `key_file = ""` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.verify_client_cert`
 
@@ -608,12 +530,10 @@ Whether the secure WebSocket listener requests and verifies a client certificate
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `verify_client_cert = false` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.verify`
 
@@ -621,12 +541,10 @@ Client certificate chain check mode of the secure WebSocket listener.
 
 Type: `string`. Default: `"verify_none"`. Range: `verify_none | verify_peer`. Restart: `not proven`.
 
-Example: `verify = "verify_none"` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.cacertfile`
 
@@ -634,12 +552,10 @@ CA file for client certificate checks of the secure WebSocket listener.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; required when client verification is on`. Restart: `not proven`.
 
-Example: `cacertfile = ""` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.fail_if_no_peer_cert`
 
@@ -647,12 +563,10 @@ Whether the secure WebSocket listener refuses a handshake without a certificate.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `fail_if_no_peer_cert = false` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.peer_cert_as_username`
 
@@ -660,12 +574,10 @@ Source for the bind username from the client certificate.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
 
-Example: `peer_cert_as_username = "disabled"` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.peer_cert_as_clientid`
 
@@ -673,12 +585,10 @@ Source for the bind client identifier from the client certificate.
 
 Type: `string`. Default: `"disabled"`. Range: `disabled | cn | dn`. Restart: `not proven`.
 
-Example: `peer_cert_as_clientid = "disabled"` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.wss.native`
 
@@ -686,12 +596,10 @@ Deprecated. Ignored. The kernel always serves this listener.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `native = false` in the `[listeners.wss]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.api.enabled`
 
@@ -699,12 +607,10 @@ Whether the management REST API and dashboard serve requests.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = true` in the `[listeners.api]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `listeners.api.bind`
 
@@ -712,12 +618,10 @@ Bind address for the management REST API. Empty disables the API.
 
 Type: `socket address string`. Default: `"0.0.0.0:18083"`. Range: `valid host:port, port 1..=65535; empty disables the API`. Restart: `not proven`.
 
-Example: `bind = "0.0.0.0:18083"` in the `[listeners.api]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -781,12 +685,10 @@ Default max connections per authenticated username (0 = unlimited).
 
 Type: `u32`. Default: `10000`. Range: `0..=1000000 (0 = unlimited opt-in)`. Restart: `not proven`.
 
-Example: `default_max_connections = 5000` in the `[quotas]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `quotas.max_connections_per_tenant`
 
@@ -794,12 +696,10 @@ Default max live connections per tenant (0 = unlimited).
 
 Type: `u32`. Default: `0`. Range: `0..=1000000 (0 = unlimited opt-in)`. Restart: `not proven`.
 
-Example: `max_connections_per_tenant = 100` in the `[quotas]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `quotas.max_sessions_per_tenant`
 
@@ -807,12 +707,10 @@ Default max sessions per tenant (0 = unlimited).
 
 Type: `u32`. Default: `0`. Range: `0..=100000 (0 = unlimited opt-in)`. Restart: `not proven`.
 
-Example: `max_sessions_per_tenant = 100` in the `[quotas]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `quotas.max_retained_per_tenant`
 
@@ -820,12 +718,10 @@ Default max retained topics per tenant (0 = unlimited).
 
 Type: `u32`. Default: `0`. Range: `0..=100000 (0 = unlimited opt-in)`. Restart: `not proven`.
 
-Example: `max_retained_per_tenant = 100` in the `[quotas]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `quotas.default_max_publish_rate`
 
@@ -833,12 +729,10 @@ Default token-bucket publish rate limit in messages per second (0 = unlimited).
 
 Type: `u32`. Default: `50000`. Range: `0..=10000000 msg/s (0 = unlimited opt-in)`. Restart: `not proven`.
 
-Example: `default_max_publish_rate = 10000` in the `[quotas]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `quotas.burst_multiplier`
 
@@ -846,12 +740,10 @@ Token bucket burst multiplier (allows bursts up to burst times rate).
 
 Type: `f64`. Default: `2.0`. Range: `1.0..=10.0`. Restart: `not proven`.
 
-Example: `burst_multiplier = 3.0` in the `[quotas]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -873,120 +765,48 @@ Bound queues, windows and packet sizes.
 
 ### `session.max_session_expiry_secs`
 
-Max session expiry interval in seconds.
-
-Type: `u64`. Default: `86400`. Range: `0..=2592000 seconds (0 = unlimited opt-in)`. Restart: `not proven`.
-
-Example: `max_session_expiry_secs = 3600` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_offline_queue`
 
-Maximum queued offline messages per session.
-
-Type: `u32`. Default: `50000`. Range: `1..=1000000`. Restart: `not proven`.
-
-Example: `max_offline_queue = 10000` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_inflight_messages`
 
-Maximum inflight unacknowledged QoS 1 and QoS 2 messages.
-
-Type: `u32`. Default: `65535`. Range: `1..=65535`. Restart: `not proven`.
-
-Example: `max_inflight_messages = 10000` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_qos0_backlog`
 
-Per-subscriber QoS 0 egress backlog bound; past it the oldest queued QoS 0 frame drops.
-
-Type: `usize`. Default: `1000`. Range: `1..=100000`. Restart: `not proven`.
-
-Example: `max_qos0_backlog = 2000` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.keep_alive_grace`
 
-Keep-alive grace multiplier before disconnect.
-
-Type: `f64`. Default: `1.5`. Range: `1.0..=5.0`. Restart: `not proven`.
-
-Example: `keep_alive_grace = 2.0` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_qos1_inflight`
 
-Per-session QoS 1 inflight window bound.
-
-Type: `usize`. Default: `100`. Range: `1..=100000`. Restart: `not proven`.
-
-Example: `max_qos1_inflight = 50` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_qos1_spill`
 
-Per-session QoS 1 spill bound past the window.
-
-Type: `usize`. Default: `1000`. Range: `1..=100000`. Restart: `not proven`.
-
-Example: `max_qos1_spill = 500` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.topic_alias_maximum`
 
-Inbound topic-alias maximum advertised in CONNACK.
-
-Type: `u16`. Default: `10`. Range: `0..=65535`. Restart: `not proven`.
-
-Example: `topic_alias_maximum = 5` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `session.max_packet_size`
 
-Largest MQTT packet in bytes. Sets the read limit and the WS frame cap. Advertised in CONNACK.
-
-Type: `u32`. Default: `1048576`. Range: `1..=268435455`. Restart: `not proven`.
-
-Example: `max_packet_size = 1048576` in the `[session]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1011,16 +831,8 @@ Set kernel log verbosity.
 
 ### `logging.level`
 
-Logging verbosity for the kernel (trace, debug, info, warn, error).
-
-Type: `enum string`. Default: `"info"`. Range: `trace | debug | info | warn | error`. Restart: `not proven`.
-
-Example: `level = "warn"` in the `[logging]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1041,12 +853,10 @@ Ingress ring buffer channel depth for stateful window worker tasks.
 
 Type: `u32`. Default: `65536`. Range: `1..=1000000`. Restart: `not proven`.
 
-Example: `window_channel_depth = 32768` in the `[rules_engine]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `rules_engine.backpressure_policy`
 
@@ -1054,12 +864,10 @@ Default memory backpressure policy when the rule buffer is full.
 
 Type: `enum string`. Default: `"DropOldest"`. Range: `Block | DropNewest | DropOldest | SpillToDisk | RejectPublisher`. Restart: `not proven`.
 
-Example: `backpressure_policy = "DropOldest"` in the `[rules_engine]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `rules_engine.spill_dir`
 
@@ -1067,12 +875,10 @@ Rule ingress spill directory.
 
 Type: `string`. Default: `""`. Range: `empty or directory path`. Restart: `not proven`.
 
-Example: `spill_dir = ""` in the `[rules_engine]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1095,12 +901,10 @@ Whether authentication checks apply to client connects.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = true` in the `[auth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `auth.password_hash`
 
@@ -1108,12 +912,10 @@ Password hashing algorithm for stored credentials.
 
 Type: `enum string`. Default: `"sha256"`. Range: `sha256 | bcrypt`. Restart: `not proven`.
 
-Example: `password_hash = "sha256"` in the `[auth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `auth.allow_anonymous`
 
@@ -1121,12 +923,10 @@ Whether anonymous connections are accepted while no users are configured.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `allow_anonymous = false` in the `[auth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `auth.superusers`
 
@@ -1134,12 +934,10 @@ Superuser usernames bypassing ACL rules.
 
 Type: `string list`. Default: `["admin", "root"]`. Range: `0..=100 entries`. Restart: `not proven`.
 
-Example: `superusers = ["admin", "root"]` in the `[auth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1163,12 +961,10 @@ Refused clustering switch. The broker fails boot when true.
 
 Type: `bool`. Default: `false`. Range: `false only`. Restart: `not proven`.
 
-Example: `enabled = false` in the `[cluster]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `cluster.bind`
 
@@ -1176,12 +972,10 @@ Cluster SWIM UDP bind address for peer discovery and membership.
 
 Type: `socket address string`. Default: `"127.0.0.1:19883"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `bind = "127.0.0.1:19883"` in the `[cluster]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `cluster.gossip_bind`
 
@@ -1189,13 +983,11 @@ Accepted gossip bind. The broker stores it. It binds clustering from --cluster-b
 
 Type: `socket address string`. Default: `"0.0.0.0:7946"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `gossip_bind = "0.0.0.0:7946"` in the `[cluster]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
+- A wrong type fails validation.
 - The broker stores this value. It does not apply it.
-- Related settings sit in the same group file.
+- Related settings sit in the same group.
 
 ### `cluster.quic_bind`
 
@@ -1203,13 +995,11 @@ Accepted data plane bind. The broker stores it. It binds clustering from --clust
 
 Type: `socket address string`. Default: `"0.0.0.0:9092"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
 
-Example: `quic_bind = "0.0.0.0:9092"` in the `[cluster]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
+- A wrong type fails validation.
 - The broker stores this value. It does not apply it.
-- Related settings sit in the same group file.
+- Related settings sit in the same group.
 
 ### `cluster.seed_nodes`
 
@@ -1217,12 +1007,10 @@ Refused seed list. The broker fails boot when not empty.
 
 Type: `string list`. Default: `[]`. Range: `must stay empty`. Restart: `not proven`.
 
-Example: `seed_nodes = []` in the `[cluster]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1247,12 +1035,10 @@ Path to the enterprise cryptographic license key file.
 
 Type: `path string`. Default: `"/etc/indramqtt/license.key"`. Range: `any path; empty means none installed`. Restart: `not proven`.
 
-Example: `license_file = "/etc/indramqtt/license.key"` in the `[licence]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `licence.license_key`
 
@@ -1260,12 +1046,10 @@ Enterprise commercial license key for multi-node clustering.
 
 Type: `string`. Default: `""`. Range: `any string; empty means use stored token or environment`. Restart: `not proven`.
 
-Example: `license_key = ""` in the `[licence]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `licence.trusted_keys_path`
 
@@ -1273,12 +1057,10 @@ Trusted licence-signing keys: a JSON file or directory of JSON files.
 
 Type: `path string`. Default: `""`. Range: `JSON file or directory; empty trusts nothing`. Restart: `not proven`.
 
-Example: `trusted_keys_path = ""` in the `[licence]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `licence.request_out`
 
@@ -1286,12 +1068,10 @@ Write the installation licence request to this path and exit.
 
 Type: `path string`. Default: `""`. Range: `any path; empty disables request generation`. Restart: `not proven`.
 
-Example: `request_out = ""` in the `[licence]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `licence.install_file`
 
@@ -1299,12 +1079,10 @@ Install the licence token read from this path and exit.
 
 Type: `path string`. Default: `""`. Range: `any path; empty disables licence installation`. Restart: `not proven`.
 
-Example: `install_file = ""` in the `[licence]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `licence.expiry_warn_days`
 
@@ -1312,12 +1090,10 @@ Days before expiry that the approaching-expiry alarm and log warning start.
 
 Type: `u64`. Default: `30`. Range: `0..=365 days`. Restart: `not proven`.
 
-Example: `expiry_warn_days = 7` in the `[licence]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1343,12 +1119,10 @@ Whether the MCP endpoint on the management listener serves tool calls.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enabled = true` in the `[mcp]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `mcp.read_only`
 
@@ -1356,12 +1130,10 @@ Whether the MCP endpoint refuses mutating tool calls; only read-only tools stay 
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `read_only = false` in the `[mcp]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1379,16 +1151,8 @@ Expose the CoAP gateway.
 
 ### `gateway.coap_bind`
 
-CoAP gateway UDP listen address. Empty disables the gateway.
-
-Type: `socket address string`. Default: `""`. Range: `empty disables the gateway, else valid host:port`. Restart: `not proven`.
-
-Example: `coap_bind = ""` in the `[gateway]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1405,16 +1169,8 @@ Journal publishes to disk.
 
 ### `persistence.stream_dir`
 
-Durable stream journal directory. Empty disables journaling.
-
-Type: `path string`. Default: `""`. Range: `any directory; empty disables journaling`. Restart: `not proven`.
-
-Example: `stream_dir = ""` in the `[persistence]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1435,12 +1191,10 @@ Directory server URL for LDAP authentication. Empty disables LDAP.
 
 Type: `string`. Default: `""`. Range: `empty disables LDAP, else ldap:// or ldaps:// URL`. Restart: `not proven`.
 
-Example: `server_url = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.base_dn`
 
@@ -1448,12 +1202,10 @@ Base DN under which directory users are searched.
 
 Type: `string`. Default: `""`. Range: `any DN; required when LDAP is enabled`. Restart: `not proven`.
 
-Example: `base_dn = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.bind_dn`
 
@@ -1461,12 +1213,10 @@ Service account DN used for the initial bind plus search.
 
 Type: `string`. Default: `""`. Range: `any DN`. Restart: `not proven`.
 
-Example: `bind_dn = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.bind_password`
 
@@ -1474,12 +1224,10 @@ Service account password for the initial bind.
 
 Type: `string`. Default: `""`. Range: `any string`. Restart: `not proven`.
 
-Example: `bind_password = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.user_filter`
 
@@ -1487,12 +1235,10 @@ User search filter with a {username} placeholder, escaped per RFC 4515.
 
 Type: `string`. Default: `"(uid={username})"`. Range: `must contain {username} when LDAP is enabled`. Restart: `not proven`.
 
-Example: `user_filter = "(uid={username})"` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.group_attribute`
 
@@ -1500,12 +1246,10 @@ User-entry attribute listing directory groups.
 
 Type: `string`. Default: `"memberOf"`. Range: `non-empty when LDAP is enabled`. Restart: `not proven`.
 
-Example: `group_attribute = "memberOf"` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.required_group`
 
@@ -1513,12 +1257,10 @@ Required group DN: the entry must list this DN to connect.
 
 Type: `string`. Default: `""`. Range: `any DN; empty disables the group check`. Restart: `not proven`.
 
-Example: `required_group = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.ca_cert_path`
 
@@ -1526,12 +1268,10 @@ Path to a PEM CA certificate for private directories.
 
 Type: `path string`. Default: `""`. Range: `PEM file path; empty uses system roots`. Restart: `not proven`.
 
-Example: `ca_cert_path = ""` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.pool_size`
 
@@ -1539,12 +1279,10 @@ Bound on concurrent directory authentications.
 
 Type: `usize`. Default: `8`. Range: `1..=32`. Restart: `not proven`.
 
-Example: `pool_size = 4` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.connect_timeout_ms`
 
@@ -1552,12 +1290,10 @@ Timeout covering TCP connect plus TLS handshake.
 
 Type: `u64`. Default: `5000`. Range: `100..=60000 ms`. Restart: `not proven`.
 
-Example: `connect_timeout_ms = 3000` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `ldap.read_timeout_ms`
 
@@ -1565,12 +1301,10 @@ Timeout covering each directory bind/search round-trip.
 
 Type: `u64`. Default: `5000`. Range: `100..=60000 ms`. Restart: `not proven`.
 
-Example: `read_timeout_ms = 3000` in the `[ldap]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1601,12 +1335,10 @@ Keytab file for Kerberos authentication. Empty disables Kerberos.
 
 Type: `path string`. Default: `""`. Range: `keytab v2 file; empty disables Kerberos`. Restart: `not proven`.
 
-Example: `keytab_path = ""` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.service_principal`
 
@@ -1614,12 +1346,10 @@ Service principal name held in the keytab.
 
 Type: `string`. Default: `""`. Range: `required when Kerberos is enabled`. Restart: `not proven`.
 
-Example: `service_principal = ""` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.realm`
 
@@ -1627,12 +1357,10 @@ Expected service realm. Empty disables the realm check on the service name.
 
 Type: `string`. Default: `""`. Range: `any realm; empty disables the realm check`. Restart: `not proven`.
 
-Example: `realm = ""` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.allowed_realms`
 
@@ -1640,12 +1368,10 @@ Trusted client realms. Empty allows any realm that verifies.
 
 Type: `string list`. Default: `[]`. Range: `0..=32 entries`. Restart: `not proven`.
 
-Example: `allowed_realms = []` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.clock_skew_secs`
 
@@ -1653,12 +1379,10 @@ Clock-skew allowance in seconds for ticket validity and authenticator timestamps
 
 Type: `u64`. Default: `300`. Range: `1..=3600 seconds`. Restart: `not proven`.
 
-Example: `clock_skew_secs = 120` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.role_map`
 
@@ -1666,12 +1390,10 @@ Comma-separated principal=role mappings for verified client principals.
 
 Type: `string`. Default: `""`. Range: `comma-separated principal=role pairs; empty leaves every principal at user`. Restart: `not proven`.
 
-Example: `role_map = ""` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `kerberos.replay_max_entries`
 
@@ -1679,12 +1401,10 @@ Replay-cache bound for Kerberos authenticators.
 
 Type: `usize`. Default: `1024`. Range: `16..=8192`. Restart: `not proven`.
 
-Example: `replay_max_entries = 512` in the `[kerberos]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1707,16 +1427,8 @@ Bound delayed message deferrals.
 
 ### `delayed.max_secs`
 
-Upper bound for delayed deferrals in seconds.
-
-Type: `u64`. Default: `86400`. Range: `1..=86400`. Restart: `not proven`.
-
-Example: `max_secs = 3600` in the `[delayed]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1733,16 +1445,8 @@ Set the monitor sampling interval.
 
 ### `observability.monitor_sample_secs`
 
-Monitor sampling interval in seconds.
-
-Type: `u64`. Default: `10`. Range: `0..=3600`. Restart: `not proven`.
-
-Example: `monitor_sample_secs = 5` in the `[observability]` table of the group file below.
-
-Notes:
-
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1763,12 +1467,10 @@ JWKS endpoint URL for JWT authentication.
 
 Type: `string`. Default: `""`. Range: `empty or https URL`. Restart: `not proven`.
 
-Example: `url = ""` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.issuer`
 
@@ -1776,12 +1478,10 @@ Expected JWT issuer.
 
 Type: `string`. Default: `""`. Range: `any string`. Restart: `not proven`.
 
-Example: `issuer = ""` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.audience`
 
@@ -1789,12 +1489,10 @@ Expected JWT audience.
 
 Type: `string`. Default: `""`. Range: `any string`. Restart: `not proven`.
 
-Example: `audience = ""` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.refresh_period_secs`
 
@@ -1802,12 +1500,10 @@ Seconds between background JWKS refreshes.
 
 Type: `u64`. Default: `300`. Range: `1..=86400`. Restart: `not proven`.
 
-Example: `refresh_period_secs = 120` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.fetch_timeout_ms`
 
@@ -1815,12 +1511,10 @@ Timeout for one JWKS fetch in milliseconds.
 
 Type: `u64`. Default: `5000`. Range: `100..=60000`. Restart: `not proven`.
 
-Example: `fetch_timeout_ms = 3000` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.refresh_timeout_ms`
 
@@ -1828,12 +1522,10 @@ Longest a CONNECT waits for a JWKS refresh in milliseconds.
 
 Type: `u64`. Default: `5000`. Range: `100..=60000`. Restart: `not proven`.
 
-Example: `refresh_timeout_ms = 3000` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.cache_max_keys`
 
@@ -1841,12 +1533,10 @@ Most JWKS keys held in the cache.
 
 Type: `usize`. Default: `32`. Range: `1..=256`. Restart: `not proven`.
 
-Example: `cache_max_keys = 16` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.cache_ttl_secs`
 
@@ -1854,12 +1544,10 @@ Seconds a cached JWKS key stays valid.
 
 Type: `u64`. Default: `300`. Range: `1..=86400`. Restart: `not proven`.
 
-Example: `cache_ttl_secs = 120` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.clock_skew_secs`
 
@@ -1867,12 +1555,10 @@ Clock skew tolerated when checking token times, in seconds.
 
 Type: `u64`. Default: `60`. Range: `0..=3600`. Restart: `not proven`.
 
-Example: `clock_skew_secs = 30` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `jwks.ca_cert`
 
@@ -1880,12 +1566,10 @@ Extra CA certificate trusted for the JWKS endpoint.
 
 Type: `string`. Default: `""`. Range: `empty or path to a PEM file`. Restart: `not proven`.
 
-Example: `ca_cert = ""` in the `[jwks]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -1915,12 +1599,10 @@ PostgreSQL URL for database authentication.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `postgres_url = ""` in the `[dbauth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.mysql_url`
 
@@ -1928,12 +1610,10 @@ MySQL URL for database authentication.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `mysql_url = ""` in the `[dbauth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.redis_url`
 
@@ -1941,12 +1621,10 @@ Redis URL for database authentication.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `redis_url = ""` in the `[dbauth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.mongodb_url`
 
@@ -1954,12 +1632,10 @@ MongoDB URL for database authentication.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `mongodb_url = ""` in the `[dbauth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.pool_size`
 
@@ -1967,12 +1643,10 @@ Connections kept per authentication database.
 
 Type: `usize`. Default: `8`. Range: `1..=32`. Restart: `not proven`.
 
-Example: `pool_size = 4` in the `[dbauth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.connect_timeout_ms`
 
@@ -1980,12 +1654,10 @@ Timeout for connecting to an authentication database in milliseconds.
 
 Type: `u64`. Default: `3000`. Range: `100..=60000`. Restart: `not proven`.
 
-Example: `connect_timeout_ms = 2000` in the `[dbauth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.read_timeout_ms`
 
@@ -1993,12 +1665,10 @@ Timeout for one authentication lookup in milliseconds.
 
 Type: `u64`. Default: `3000`. Range: `100..=60000`. Restart: `not proven`.
 
-Example: `read_timeout_ms = 2000` in the `[dbauth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.cache_size`
 
@@ -2006,12 +1676,10 @@ Cached database verdicts per source; 0 disables the cache.
 
 Type: `usize`. Default: `1024`. Range: `0..=100000`. Restart: `not proven`.
 
-Example: `cache_size = 512` in the `[dbauth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `dbauth.cache_ttl_secs`
 
@@ -2019,12 +1687,10 @@ Seconds a cached database verdict stays valid.
 
 Type: `u64`. Default: `60`. Range: `0..=3600`. Restart: `not proven`.
 
-Example: `cache_ttl_secs = 30` in the `[dbauth]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -2053,12 +1719,10 @@ HTTP webhook verdict endpoint.
 
 Type: `string`. Default: `""`. Range: `empty or URL`. Restart: `not proven`.
 
-Example: `url = ""` in the `[webhook]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `webhook.pool_size`
 
@@ -2066,12 +1730,10 @@ Concurrent requests allowed to the webhook endpoint.
 
 Type: `usize`. Default: `8`. Range: `1..=32`. Restart: `not proven`.
 
-Example: `pool_size = 4` in the `[webhook]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `webhook.timeout_ms`
 
@@ -2079,12 +1741,10 @@ Timeout for one webhook request in milliseconds.
 
 Type: `u64`. Default: `2000`. Range: `100..=60000`. Restart: `not proven`.
 
-Example: `timeout_ms = 3000` in the `[webhook]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `webhook.breaker_threshold`
 
@@ -2092,12 +1752,10 @@ Consecutive webhook failures that open the circuit breaker.
 
 Type: `u32`. Default: `5`. Range: `1..=100`. Restart: `not proven`.
 
-Example: `breaker_threshold = 3` in the `[webhook]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `webhook.breaker_reset_ms`
 
@@ -2105,12 +1763,10 @@ Milliseconds an open circuit breaker waits before retrying the webhook.
 
 Type: `u64`. Default: `30000`. Range: `1000..=600000`. Restart: `not proven`.
 
-Example: `breaker_reset_ms = 15000` in the `[webhook]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `webhook.cache_size`
 
@@ -2118,12 +1774,10 @@ Cached webhook verdicts; 0 disables the cache.
 
 Type: `usize`. Default: `1024`. Range: `0..=100000`. Restart: `not proven`.
 
-Example: `cache_size = 512` in the `[webhook]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `webhook.cache_ttl_secs`
 
@@ -2131,12 +1785,10 @@ Seconds a cached webhook verdict stays valid.
 
 Type: `u64`. Default: `60`. Range: `0..=3600`. Restart: `not proven`.
 
-Example: `cache_ttl_secs = 30` in the `[webhook]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.
@@ -2163,12 +1815,10 @@ Require credentials on the scrape endpoints.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enable_basic_auth = true` in the `[prometheus]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.latency_buckets`
 
@@ -2176,12 +1826,10 @@ Latency histogram buckets for the exposition.
 
 Type: `string`. Default: `"10ms, 100ms, 1s, 5s, 30s"`. Range: `comma-separated durations`. Restart: `not proven`.
 
-Example: `latency_buckets = "10ms, 100ms, 1s, 5s, 30s"` in the `[prometheus]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.enable`
 
@@ -2189,12 +1837,10 @@ Stored push intent. The broker runs no push client.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
 
-Example: `enable = false` in the `[prometheus.push_gateway]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.url`
 
@@ -2202,12 +1848,10 @@ Push target URL for the exposition.
 
 Type: `string`. Default: `"http://127.0.0.1:9091"`. Range: `http(s) URL`. Restart: `not proven`.
 
-Example: `url = "http://127.0.0.1:9091"` in the `[prometheus.push_gateway]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.interval`
 
@@ -2215,12 +1859,10 @@ Push interval for the exposition.
 
 Type: `string`. Default: `"15s"`. Range: `duration text`. Restart: `not proven`.
 
-Example: `interval = "15s"` in the `[prometheus.push_gateway]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.job_name`
 
@@ -2228,12 +1870,10 @@ Job name template for each push.
 
 Type: `string`. Default: `"${name}/instance/${name}~${host}"`. Range: `template text`. Restart: `not proven`.
 
-Example: `job_name = "${name}/instance/${name}~${host}"` in the `[prometheus.push_gateway]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.push_gateway.method`
 
@@ -2241,12 +1881,10 @@ Push method for the exposition.
 
 Type: `string`. Default: `"put"`. Range: `put | post`. Restart: `not proven`.
 
-Example: `method = "put"` in the `[prometheus.push_gateway]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.mnesia`
 
@@ -2254,12 +1892,10 @@ Stored collector name. The broker keeps it and shows it. No sampler reads it.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `mnesia = "disabled"` in the `[prometheus.collectors]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_dist`
 
@@ -2267,12 +1903,10 @@ Stored collector name. The broker keeps it and shows it. No sampler reads it.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_dist = "disabled"` in the `[prometheus.collectors]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_memory`
 
@@ -2280,12 +1914,10 @@ Stored collector name. The broker keeps it and shows it. No sampler reads it.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_memory = "disabled"` in the `[prometheus.collectors]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_msacc`
 
@@ -2293,12 +1925,10 @@ Stored collector name. The broker keeps it and shows it. No sampler reads it.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_msacc = "disabled"` in the `[prometheus.collectors]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_statistics`
 
@@ -2306,12 +1936,10 @@ Stored collector name. The broker keeps it and shows it. No sampler reads it.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_statistics = "disabled"` in the `[prometheus.collectors]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 ### `prometheus.collectors.vm_system_info`
 
@@ -2319,12 +1947,10 @@ Stored collector name. The broker keeps it and shows it. No sampler reads it.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
 
-Example: `vm_system_info = "disabled"` in the `[prometheus.collectors]` table of the group file below.
-
 Notes:
 
-- A bad value fails validation. Boot keeps the old file.
-- Related settings sit in the same group file.
+- A wrong type fails validation.
+- Related settings sit in the same group.
 
 Group file. The docs run boots this file.
 Boot fails on a bad value.

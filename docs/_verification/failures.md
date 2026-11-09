@@ -762,3 +762,126 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: an external HTTPS receiver accepts the requests and checks the HMAC signature. Source: the HTTP sink module comment in `crates/broker-connectors/src/http.rs`.
 - Broker gave: the docs run sends the two requests to a local HTTP receiver and prints `delivered`. The receiver checks the v1 path, auth header, custom header, HMAC-SHA256 signature, and body. It checks the v5 path, topic header, QoS header, and body. The HTTPS path and a third-party signature check stay not verified.
 - Date: 2026-11-08.
+
+## DX2-056 item `session.keep_alive_grace`
+
+- Input: the configuration in `docs/_examples/config/session.keep_alive_grace.toml` and this action: Read `GET /api/v5/configs/global_zone`.
+- Expected: The live global zone reports the configured keepalive multiplier 5.0. Source: `crates/broker-node/src/native.rs` sets the keepalive deadline with a fixed 1.5 multiplier and does not read this field.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+AssertionError: 1.5`.
+- Date: 2026-11-09.
+
+## DX2-056 item `session.max_inflight_messages`
+
+- Input: the configuration in `docs/_examples/config/session.max_inflight_messages.toml` and this action: Connect a v5 client and read `GET /api/v5/clients/<id>`.
+- Expected: A new session reports the configured inflight maximum of five. Source: The schema documents the field at `crates/broker-config/src/schema.rs`, and the live window is set in `crates/broker-node/src/main.rs`.
+- Broker gave: `Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+AssertionError: 100`.
+- Date: 2026-11-09.
+
+## DX2-056 item `delayed.max_secs`
+
+- Input: the configuration in `docs/_examples/config/delayed.max_secs.toml` and this action: Publish one `$delayed/1/...` and one `$delayed/10/...` message, then read the subscriber and the log.
+- Expected: A one-second deferral arrives, and a ten-second deferral above the cap is dropped with a warning. Source: `crates/broker-node/src/main.rs` applies the bound, and `crates/broker-delayed/src/lib.rs` drops a request above it.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `gateway.coap_bind`
+
+- Input: the configuration in `docs/_examples/config/gateway.coap_bind.toml` and this action: Send a CoAP POST to `/ps/docs/coap` and read the MQTT subscriber.
+- Expected: A CoAP POST to `/ps/docs/coap` publishes on topic `docs/coap`, and a subscriber receives the payload. Source: `crates/broker-node/src/main.rs` binds the UDP gateway when the setting is not empty.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `logging.level`
+
+- Input: the configuration in `docs/_examples/config/logging.level.toml` and this action: Start the broker and read its log file.
+- Expected: At the info level, the broker log holds the startup info line. Source: `crates/broker-node/src/main.rs` starts the log output at the configured level.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `node.brokerlink_bind`
+
+- Input: the configuration in `docs/_examples/config/node.brokerlink_bind.toml` and this action: Dial the configured address, then connect one MQTT client to the kernel.
+- Expected: No socket listens on the configured address, and the kernel still serves MQTT. Source: `crates/broker-node/src/main.rs` warns about the deprecated setting and starts no edge socket.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `node.data_dir`
+
+- Input: the configuration in `docs/_examples/config/node.data_dir.toml` and this action: Read the node list with `GET /api/v5/nodes` and check the directory.
+- Expected: The node reports the configured state directory and the broker creates it. Source: `crates/broker-node/src/main.rs` loads the registry and the offline store from the configured directory at boot.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `node.id`
+
+- Input: the configuration in `docs/_examples/config/node.id.toml` and this action: Read the node list with `GET /api/v5/nodes`.
+- Expected: The v5 nodes list names the configured node `docs-node-7`. Source: `crates/broker-node/src/main.rs` fixes the node name at boot, and `crates/broker-api/src/v5/nodes.rs` renders it.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `observability.monitor_sample_secs`
+
+- Input: the configuration in `docs/_examples/config/observability.monitor_sample_secs.toml` and this action: Wait two seconds and read `GET /api/v5/monitor`.
+- Expected: The monitor list grows past one sample within three seconds at a one-second interval. Source: `crates/broker-node/src/main.rs` starts the sampler at the configured interval.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `persistence.stream_dir`
+
+- Input: the configuration in `docs/_examples/config/persistence.stream_dir.toml` and this action: Publish one message and read the journal files in the configured directory.
+- Expected: The configured directory holds a journal file with the published payload. Source: `crates/broker-node/src/main.rs` opens the journal when the setting is not empty.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `session.max_offline_queue`
+
+- Input: the configuration in `docs/_examples/config/session.max_offline_queue.toml` and this action: Detach a v5 session, publish six QoS 1 messages, and read `GET /api/v5/clients/<id>`.
+- Expected: A detached durable session keeps at most the configured three queued messages. Source: `crates/broker-node/src/main.rs` applies the bound to the session manager before any listener binds.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `session.max_packet_size`
+
+- Input: the configuration in `docs/_examples/config/session.max_packet_size.toml` and this action: Connect a v5 client, read CONNACK property 0x27, then publish an oversize packet.
+- Expected: The v5 CONNACK advertises 2048 bytes, and an oversize publish closes the connection. Source: `crates/broker-node/src/main.rs` applies the cap, and `crates/broker-node/src/native.rs` enforces the read limit.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `session.max_qos0_backlog`
+
+- Input: the configuration in `docs/_examples/config/session.max_qos0_backlog.toml` and this action: Flood a stalled QoS 0 subscriber and read `GET /api/v1/metrics`.
+- Expected: A flood to a subscriber that stops reading sheds QoS 0 frames, so the shed counter is above zero. Source: `crates/broker-node/src/main.rs` applies the bound, and `crates/broker-router/src/lib.rs` sheds the oldest frame past it.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `session.max_qos1_inflight`
+
+- Input: the configuration in `docs/_examples/config/session.max_qos1_inflight.toml` and this action: Publish ten QoS 1 messages to a subscriber that does not acknowledge them, then read `GET /api/v5/clients/<id>`.
+- Expected: The live session reports the configured window of five, and ten unacknowledged messages spill past it. Source: `crates/broker-node/src/main.rs` applies the window to the session manager before any listener binds.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `session.max_qos1_spill`
+
+- Input: the configuration in `docs/_examples/config/session.max_qos1_spill.toml` and this action: Publish 150 QoS 1 messages to a subscriber that does not acknowledge them, then read `GET /api/v5/clients/<id>`.
+- Expected: A session with the default window of 100 and a spill of two tracks at most 102 unacknowledged messages. Source: `crates/broker-node/src/main.rs` applies the spill bound to the session manager before any listener binds.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `session.max_session_expiry_secs`
+
+- Input: the configuration in `docs/_examples/config/session.max_session_expiry_secs.toml` and this action: Connect a v5 client with session expiry 3600 and read `GET /api/v5/clients/<id>`.
+- Expected: A v5 client that asks for 3600 seconds gets the configured cap of 60 seconds. Source: `crates/broker-node/src/main.rs` applies the cap, and `crates/broker-api/src/v5/clients.rs` reports the stored value.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.
+
+## DX2-056 item `session.topic_alias_maximum`
+
+- Input: the configuration in `docs/_examples/config/session.topic_alias_maximum.toml` and this action: Connect a v5 client and read the CONNACK property 0x22.
+- Expected: The v5 CONNACK advertises Topic Alias Maximum 5. Source: `crates/broker-node/src/main.rs` applies the value, and `crates/broker-node/src/native.rs` writes it into CONNACK.
+- Broker gave: `binary indramqtt is missing`.
+- Date: 2026-11-09.

@@ -1,0 +1,19 @@
+[example]
+area = "config"
+item = "logging.level"
+kind = "setting"
+expect = "info line"
+expected = "At the info level, the broker log holds the startup info line."
+source = "`crates/broker-node/src/main.rs` starts the log output at the configured level."
+action = "Start the broker and read its log file."
+config = '''
+[logging]
+level = "info"
+'''
+script = '''
+from config_probe import *
+time.sleep(0.2)
+text = log_text()
+assert "Starting IndraMQTT" in text, text[:200]
+print("info line")
+'''

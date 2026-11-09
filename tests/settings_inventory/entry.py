@@ -81,10 +81,16 @@ class Broker:
         self.cfg = base / "config"
         self.data = base / "data"
         self.cfg.mkdir()
-        ports = set()
-        while len(ports) < 3:
-            ports.add(port())
-        self.api, self.mqtt, self.ws = ports
+        # Hold the three ports until start. A receiver, a peer or a
+        # second broker can take a port between construction and start.
+        self.reserved = []
+        for _ in range(3):
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            self.reserved.append(sock)
+        self.api, self.mqtt, self.ws = [
+            sock.getsockname()[1] for sock in self.reserved
+        ]
         self.child = None
         self.sockets = []
         self.key = secrets.token_hex(24)
@@ -120,6 +126,10 @@ burst_multiplier=1.0
         (self.cfg / "indra.toml").write_text(text + extra)
 
     def start(self, wait_for_api=True):
+        # Release the held ports just before the broker binds them.
+        for sock in self.reserved:
+            sock.close()
+        self.reserved = []
         env = {key: value for key, value in os.environ.items() if not key.startswith("INDRA_")}
         env["INDRA_API_KEYS"] = self.key
         env.update(self.extra_env)
@@ -150,6 +160,9 @@ burst_multiplier=1.0
         raise AssertionError("boot timeout")
 
     def stop(self):
+        for sock in self.reserved:
+            sock.close()
+        self.reserved = []
         for sock in self.sockets:
             sock.close()
         self.sockets = []

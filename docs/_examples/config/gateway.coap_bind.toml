@@ -1,0 +1,36 @@
+[example]
+area = "config"
+item = "gateway.coap_bind"
+kind = "setting"
+expect = "coap delivered"
+expected = "A CoAP POST to `/ps/docs/coap` publishes on topic `docs/coap`, and a subscriber receives the payload."
+source = "`crates/broker-node/src/main.rs` binds the UDP gateway when the setting is not empty."
+action = "Send a CoAP POST to `/ps/docs/coap` and read the MQTT subscriber."
+config = '''
+[gateway]
+coap_bind = "127.0.0.1:${COAP_PORT}"
+'''
+display_config = '''
+[gateway]
+coap_bind = "127.0.0.1:5683"
+'''
+script = '''
+from config_probe import *
+import os
+import socket
+sub, ack, props = connect("coap-sub", v5=True)
+subscribe(sub, "docs/coap", 0, v5=True)
+port = int(os.environ["COAP_PORT"])
+client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+client.settimeout(5)
+request = b"\x40\x02\x00\x01\xb2ps\x04docs\x04coap\xffcoap-payload"
+client.sendto(request, ("127.0.0.1", port))
+ack = client.recv(1024)
+assert ack[:4] == b"\x60\x44\x00\x01", ack
+head, body = packet(sub)
+assert head & 0xF0 == 0x30, head
+assert body.endswith(b"coap-payload"), body
+disconnect(sub)
+client.close()
+print("coap delivered")
+'''

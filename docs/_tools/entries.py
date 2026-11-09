@@ -2916,7 +2916,11 @@ def area_counts(area):
     if area == "cli":
         ids = [item for item, _, _ in cli_items()]
     elif area == "config":
-        ids = [s["path"] for s in data["settings"]]
+        ids = [
+            s["path"]
+            for s in data["settings"]
+            if read_text("config", s["path"]) is not None
+        ]
     elif area == "api":
         ids = [o["method"] + " " + o["path"] for o in data["operations"]]
     elif area == "mcp":
@@ -2951,6 +2955,25 @@ def coverage(area=""):
         if name == "cli" and missing:
             print(f"coverage: cli misses {missing} items")
             code = 1
+        if name == "config":
+            claimed_missing = 0
+            data = json.loads(
+                (INVENTORY / "config.json").read_text(encoding="utf-8")
+            )
+            for setting in data["settings"]:
+                item = setting["path"]
+                if read_text(name, item) is None:
+                    continue
+                if read_verified(name, item):
+                    print(f"item={item} verified")
+                elif failure_recorded(item):
+                    print(f"item={item} failed")
+                else:
+                    print(f"item={item} missing")
+                    claimed_missing += 1
+            if claimed_missing:
+                print(f"coverage: config misses {claimed_missing} claimed items")
+                code = 1
         if name == "rules":
             claimed_missing = 0
             for label, stem in rules_inventory_ids():

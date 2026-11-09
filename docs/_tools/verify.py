@@ -13,6 +13,7 @@ example to make it pass. Standard library only.
 Run from the workspace root:
   python3 docs/_tools/verify.py --area cli [--write]
   python3 docs/_tools/verify.py --area rules [--write]
+  python3 docs/_tools/verify.py --area config [--write]
   python3 docs/_tools/verify.py --all [--write]
 Without --write, check only. It prints items, verified,
 failed. It fails when an item has no verified file and
@@ -115,6 +116,11 @@ def load_example(path):
             if not isinstance(case["expect_status"], int):
                 raise SystemExit(f"{path}: expect_status is not a number")
         ex["cases"] = cases
+    elif ex["kind"] == "setting":
+        for key in ("config", "action", "script"):
+            if key not in ex:
+                raise SystemExit(f"{path}: setting example misses {key}")
+        ex.setdefault("expect", "ok")
     else:
         for key in ("binary", "args"):
             if key not in ex:
@@ -178,6 +184,170 @@ def free_port():
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+
+# Key that the started configuration broker accepts. The length passes
+# the operator-key minimum.
+CONFIG_KEY = "docs-config-key-0001"
+
+
+def config_ports(count):
+    """Take distinct loopback ports. A repeat is redrawn."""
+    ports = []
+    while len(ports) < count:
+        port = free_port()
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
+def wait_health(api, proc, log_path, timeout=30):
+    """Wait until /healthz answers OK. Raise when the broker exits."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            sock = socket.create_connection(("127.0.0.1", api), timeout=2)
+            sock.sendall(b"GET /healthz HTTP/1.0\r\nHost: docs\r\n\r\n")
+            body = sock.makefile().read()
+            sock.close()
+            if body.strip().splitlines()[-1] == "OK":
+                return
+        except (OSError, IndexError):
+            pass
+        if proc.poll() is not None:
+            tail = log_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+            raise RuntimeError(f"broker exited at boot: {tail}")
+        time.sleep(0.05)
+    raise RuntimeError("broker never answered /healthz")
+
+
+def substitute(text, values):
+    """Replace each placeholder in one example text."""
+    for key, value in values.items():
+        text = text.replace("${" + key + "}", str(value))
+    return text
+
+
+def verify_setting(ex):
+    """Boot a broker with one setting. Run the action. Return (ok, record)."""
+    binary = find_binary("indramqtt")
+    if binary is None:
+        return False, {
+            "item": ex["item"],
+            "error": "binary indramqtt is missing",
+        }
+    item = ex["item"]
+    with tempfile.TemporaryDirectory(prefix="dx-config-") as tmp:
+        work = Path(tmp)
+        cfg = work / "cfg"
+        (cfg / "conf.d").mkdir(parents=True)
+        mqtt, api, coap, brokerlink = config_ports(4)
+        values = {
+            "WORK_DIR": work,
+            "MQTT_PORT": mqtt,
+            "API_PORT": api,
+            "COAP_PORT": coap,
+            "BROKERLINK_PORT": brokerlink,
+        }
+        (cfg / "indra.toml").write_text(
+            "[node]\n"
+            f'data_dir = "{work / "data"}"\n'
+            "\n[listeners.tcp]\n"
+            f'bind = "127.0.0.1:{mqtt}"\n'
+            "\n[listeners.api]\n"
+            f'bind = "127.0.0.1:{api}"\n'
+            "\n[logging]\n"
+            'level = "error"\n',
+            encoding="utf-8",
+        )
+        (cfg / "conf.d" / "99-example.toml").write_text(
+            substitute(ex["config"], values), encoding="utf-8"
+        )
+        log_path = work / "broker.log"
+        log = log_path.open("w", encoding="utf-8")
+        env = {key: value for key, value in os.environ.items() if not key.startswith("INDRA_")}
+        env["INDRA_API_KEYS"] = CONFIG_KEY
+        env["INDRA_API_KEY"] = CONFIG_KEY
+        proc = subprocess.Popen(  # noqa: S603
+            [binary, "--config-dir", str(cfg)],
+            cwd=str(work),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            wait_health(api, proc, log_path)
+            run_env = dict(os.environ)
+            run_env.update(
+                {
+                    "API_PORT": str(api),
+                    "MQTT_PORT": str(mqtt),
+                    "COAP_PORT": str(coap),
+                    "BROKERLINK_PORT": str(brokerlink),
+                    "API_KEY": CONFIG_KEY,
+                    "WORK_DIR": str(work),
+                    "CONFIG_DIR": str(cfg),
+                    "DATA_DIR": str(work / "data"),
+                }
+            )
+            tools = str(ROOT / "docs" / "_tools")
+            old_path = run_env.get("PYTHONPATH", "")
+            run_env["PYTHONPATH"] = tools + (os.pathsep + old_path if old_path else "")
+            done = subprocess.run(  # noqa: S603
+                [sys.executable, "-"],
+                input=ex["script"],
+                text=True,
+                capture_output=True,
+                timeout=int(ex.get("timeout", 60)),
+                cwd=str(work),
+                env=run_env,
+            )
+            got = done.stdout.strip()
+            if done.returncode != 0:
+                error = (done.stderr.strip() or got or "action exited non-zero")[-1000:]
+                return False, {
+                    "item": item,
+                    "kind": "setting",
+                    "error": error,
+                    "config": ex.get("display_config", ex["config"]),
+                    "action": ex.get("display_action", ex["action"]),
+                }
+            want = ex.get("expect", "ok")
+            if got != want:
+                return False, {
+                    "item": item,
+                    "kind": "setting",
+                    "error": f"output is {got!r}, wanted {want!r}",
+                    "config": ex.get("display_config", ex["config"]),
+                    "action": ex.get("display_action", ex["action"]),
+                }
+            return True, {
+                "item": item,
+                "kind": "setting",
+                "config": ex.get("display_config", ex["config"]),
+                "action": ex.get("display_action", ex["action"]),
+                "output": got,
+                "returncode": 0,
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.flush()
+            tail = log_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+            return False, {
+                "item": item,
+                "kind": "setting",
+                "error": f"{exc}; broker log: {tail}",
+                "config": ex.get("display_config", ex["config"]),
+                "action": ex.get("display_action", ex["action"]),
+            }
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            log.close()
 
 
 class RuleBroker:
@@ -677,6 +847,24 @@ def failure_marker(item):
         return "DX2-017"
     if item in DX2_018_ITEMS:
         return "DX2-018"
+    if item.startswith(("node.", "session.", "delayed.", "gateway.", "persistence.")):
+        return "DX2-056"
+    if item.startswith(("observability.", "logging.")):
+        return "DX2-056"
+    if item.startswith(("cluster.", "rules_engine.", "licence.")):
+        return "DX2-057"
+    if item.startswith("prometheus."):
+        return "DX2-058"
+    if item.startswith(("listeners.tcp.", "listeners.ws.", "listeners.api.")):
+        return "DX2-059"
+    if item.startswith(("listeners.tls.", "listeners.wss.")):
+        return "DX2-060"
+    if item.startswith(("ldap.", "kerberos.")):
+        return "DX2-061"
+    if item.startswith(("jwks.", "dbauth.", "webhook.")):
+        return "DX2-062"
+    if item.startswith("quotas."):
+        return "DX2-063"
     return "DX-01"
 
 
@@ -709,6 +897,18 @@ def append_failure(item, ex, record):
             f"- Broker gave: `{record.get('error', record)}`.\n"
             f"- Date: {day}.\n"
         )
+    elif ex.get("kind") == "setting":
+        block = (
+            f"\n## {task} item `{item}`\n\n"
+            f"- Input: the configuration in `docs/_examples/config/{item}.toml` "
+            f"and this action: {ex.get('action', '')}\n"
+            f"- Expected: {ex.get('expected', 'the action shows the configured effect')} "
+            f"Source: {ex.get('source', 'the code path for this setting')}\n"
+            f"- Broker gave: `{record.get('error', record)}`.\n"
+        )
+        if ex.get("note"):
+            block += f"- Note: {ex['note']}\n"
+        block += f"- Date: {day}.\n"
     else:
         block = (
             f"\n## {task} item `{item}`\n\n"
@@ -1120,6 +1320,8 @@ def run_area(area, write, only_item=""):
                 ok, record = verify_rule_test(ex, broker)
             elif ex["kind"] == "action-create":
                 ok, record = verify_action_create(ex, broker)
+            elif ex["kind"] == "setting":
+                ok, record = verify_setting(ex)
             else:
                 ok, record = verify_one(ex)
             target = VERIFIED / area / (path.stem + ".json")

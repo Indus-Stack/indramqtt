@@ -1,0 +1,27 @@
+[example]
+area = "config"
+item = "session.max_packet_size"
+kind = "setting"
+expect = "maximum_packet_size=2048"
+expected = "The v5 CONNACK advertises 2048 bytes, and an oversize publish closes the connection."
+source = "`crates/broker-node/src/main.rs` applies the cap, and `crates/broker-node/src/native.rs` enforces the read limit."
+action = "Connect a v5 client, read CONNACK property 0x27, then publish an oversize packet."
+config = '''
+[session]
+max_packet_size = 2048
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("packet-client", v5=True)
+assert props.get(0x27) == 2048, props.get(0x27)
+body = word("docs/big") + b"\x00" + b"x" * 4096
+sock.sendall(frame(0x30, body))
+sock.settimeout(2)
+try:
+    first = sock.recv(1)
+except OSError as error:
+    raise AssertionError(f"oversize publish did not close the connection: {error}")
+assert first in (b"", b"\xe0"), first
+sock.close()
+print("maximum_packet_size=2048")
+'''

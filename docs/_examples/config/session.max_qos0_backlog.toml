@@ -1,0 +1,33 @@
+[example]
+area = "config"
+item = "session.max_qos0_backlog"
+kind = "setting"
+expect = "shed>0"
+timeout = 90
+expected = "A flood to a subscriber that stops reading sheds QoS 0 frames, so the shed counter is above zero."
+source = "`crates/broker-node/src/main.rs` applies the bound, and `crates/broker-router/src/lib.rs` sheds the oldest frame past it."
+action = "Flood a stalled QoS 0 subscriber and read `GET /api/v1/metrics`."
+config = '''
+[session]
+max_qos0_backlog = 2
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("qos0-sub", v5=True)
+subscribe(sock, "docs/qos0", 0, v5=True)
+pub, ack, props = connect("qos0-pub", v5=True)
+payload = b"x" * 200000
+for _ in range(200):
+    publish(pub, "docs/qos0", payload, v5=True)
+time.sleep(0.5)
+status, body = http("GET", "/api/v1/metrics")
+assert status == 200, status
+shed = 0
+for line in body.splitlines():
+    if line.startswith("indramqtt_egress_qos0_shed_total"):
+        shed = int(line.split()[-1])
+assert shed > 0, shed
+disconnect(sock)
+disconnect(pub)
+print("shed>0")
+'''

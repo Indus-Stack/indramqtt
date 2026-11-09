@@ -1,0 +1,39 @@
+[example]
+area = "config"
+item = "delayed.max_secs"
+kind = "setting"
+expect = "on-time delivered, late dropped"
+timeout = 30
+expected = "A one-second deferral arrives, and a ten-second deferral above the cap is dropped with a warning."
+source = "`crates/broker-node/src/main.rs` applies the bound, and `crates/broker-delayed/src/lib.rs` drops a request above it."
+action = "Publish one `$delayed/1/...` and one `$delayed/10/...` message, then read the subscriber and the log."
+config = '''
+[delayed]
+max_secs = 1
+
+[logging]
+level = "warn"
+'''
+script = '''
+from config_probe import *
+sub, ack, props = connect("delay-sub", v5=True)
+subscribe(sub, "docs/delayed", 0, v5=True)
+pub, ack, props = connect("delay-pub", v5=True)
+publish(pub, "$delayed/10/docs/delayed", b"late", v5=True)
+publish(pub, "$delayed/1/docs/delayed", b"on-time", v5=True)
+sub.settimeout(3)
+head, body = packet(sub)
+assert head & 0xF0 == 0x30, head
+assert body.endswith(b"on-time"), body
+sub.settimeout(1)
+try:
+    packet(sub)
+except OSError:
+    pass
+else:
+    raise AssertionError("the request above the cap was delivered")
+assert "exceeds the 1s cap" in log_text(), log_text()[-400:]
+disconnect(sub)
+disconnect(pub)
+print("on-time delivered, late dropped")
+'''
