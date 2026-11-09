@@ -1,0 +1,28 @@
+[example]
+area = "connectors"
+item = "webhook"
+kind = "connector-create"
+
+[[case]]
+name = "webhook-normal"
+url = "https://hooks.example.com/ingest/${topic}"
+method = "post"
+headers = { "X-Source" = "docs" }
+auth = { type = "bearer", token = "tok" }
+body_format = "rawjson"
+signature = { header_name = "X-Signature", algorithm = "sha256", secret = "sig-secret", encoding = "hex" }
+batch_size = 1
+batch_bytes = 65536
+linger_ms = 10
+timeout_ms = 5000
+max_retries = 1
+initial_backoff_ms = 10
+max_backoff_ms = 100
+buffer_capacity = 100
+expect_status = 201
+expect_type = "webhook"
+
+[[case]]
+name = "webhook-edge-non-http-url"
+url = "ftp://example.com/hook"
+expect_status = 400

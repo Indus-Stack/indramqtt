@@ -83,7 +83,10 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/tablestore.md` | 112 | `delivered` |
 | `connectors/tdengine.md` | 101 | `tdengine` |
 | `connectors/test.md` | 66 | `ok` |
+| `connectors/timescale.md` | 87 | `created` |
 | `connectors/timescaledb.md` | 85 | `timescaledb` |
+| `connectors/timestream.md` | 107 | `delivered` |
+| `connectors/webhook.md` | 103 | `delivered` |
 | `getting-started/console.md` | 48 | `200` |
 | `getting-started/first-publish.md` | 49 | `hello-docs` |
 | `getting-started/first-start.md` | 43 | `ok` |
@@ -165,4 +168,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 149 blocks. Each output matches its page.
+The run captured 152 blocks. Each output matches its page.

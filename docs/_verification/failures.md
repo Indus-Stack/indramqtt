@@ -741,3 +741,24 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the broker log holds one INFO line `connector event` with the topic, the QoS, and the payload preview. Source: the console logger sink in `crates/broker-connectors/src/lib.rs`.
 - Broker gave: the v1 route answers 400 with `unknown connector kind`. The v5 route answers 201 and registers the console logger sink. The docs harness reads no broker log file. The page checks the refusal, the creation, and the rule action counter only. The log line text stays not verified.
 - Date: 2026-11-08.
+
+## DX2-055 item `timescale`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `timescale` with the full config, and `POST /api/v5/connectors` type `timescale`. No TimescaleDB instance ran in this task.
+- Expected: a real TimescaleDB instance accepts the bound hypertable rows through the broker rule path. Source: the TimescaleDB sink module comment in `crates/broker-connectors/src/timescaledb.rs`.
+- Broker gave: the v1 route answers 201 and registers the `timescaledb` runtime. The v5 route answers 201, stores the posted type, and registers no live sink, so it reads back `disconnected`. Creation validates only and writes no row. The send path stays not verified.
+- Date: 2026-11-08.
+
+## DX2-055 item `timestream`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `timestream` and `POST /api/v5/connectors` type `timestream`, then one publish through a forwarding rule to a local ingest receiver. No Amazon Timestream service ran in this task.
+- Expected: the real Timestream service accepts the signed `WriteRecords` bodies through the broker rule path. Source: the Timestream sink module comment in `crates/broker-connectors-enterprise/src/timestream.rs`.
+- Broker gave: the docs run sends one signed `WriteRecords` body to a local receiver and prints `delivered`. The receiver checks the target, the content type, the SigV4 signature, and the record body. The real service and its own signature check stay not verified.
+- Date: 2026-11-08.
+
+## DX2-055 item `webhook`
+
+- Input: docs harness check `POST /api/v1/connectors` kind `webhook` with auth, a custom header, a URL template, and a signature. Also check `POST /api/v5/connectors` type `webhook` with a URL. Then publish once for each connector through a forwarding rule to a local receiver. No external HTTPS receiver ran in this task.
+- Expected: an external HTTPS receiver accepts the requests and checks the HMAC signature. Source: the HTTP sink module comment in `crates/broker-connectors/src/http.rs`.
+- Broker gave: the docs run sends the two requests to a local HTTP receiver and prints `delivered`. The receiver checks the v1 path, auth header, custom header, HMAC-SHA256 signature, and body. It checks the v5 path, topic header, QoS header, and body. The HTTPS path and a third-party signature check stay not verified.
+- Date: 2026-11-08.
