@@ -2065,9 +2065,31 @@ Shape the metrics exposition.
 
 ### `prometheus.enable_basic_auth`
 
-Require credentials on the scrape endpoints.
+`prometheus.enable_basic_auth` sets the scrape auth flag. The broker stores the flag and shows it in `GET /api/v5/prometheus`. It does not change scrape auth.
+
+The default is true.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus]
+enable_basic_auth = false
+```
+
+Action:
+
+```text
+Start the broker with the flag off and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+basic_auth=false
+```
 
 Notes:
 
@@ -2076,9 +2098,31 @@ Notes:
 
 ### `prometheus.latency_buckets`
 
-Latency histogram buckets for the exposition.
+`prometheus.latency_buckets` sets the latency bucket list text. The broker stores the text and shows it in `GET /api/v5/prometheus`. No histogram reads it.
+
+The default is `10ms, 100ms, 1s, 5s, 30s`.
 
 Type: `string`. Default: `"10ms, 100ms, 1s, 5s, 30s"`. Range: `comma-separated durations`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus]
+latency_buckets = "5ms, 50ms"
+```
+
+Action:
+
+```text
+Start the broker with a custom bucket list and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+buckets=5ms, 50ms
+```
 
 Notes:
 
@@ -2087,9 +2131,31 @@ Notes:
 
 ### `prometheus.push_gateway.enable`
 
-Stored push intent. The broker runs no push client.
+`prometheus.push_gateway.enable` sets the push intent flag. The broker stores the flag and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The default is false.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+enable = true
+```
+
+Action:
+
+```text
+Start the broker with push intent on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_enable=true
+```
 
 Notes:
 
@@ -2098,9 +2164,31 @@ Notes:
 
 ### `prometheus.push_gateway.url`
 
-Push target URL for the exposition.
+`prometheus.push_gateway.url` sets the push target URL text. The broker stores the text and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The default is `http://127.0.0.1:9091`.
 
 Type: `string`. Default: `"http://127.0.0.1:9091"`. Range: `http(s) URL`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+url = "http://127.0.0.1:9092"
+```
+
+Action:
+
+```text
+Start the broker with a custom push URL and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_url=9092
+```
 
 Notes:
 
@@ -2109,9 +2197,31 @@ Notes:
 
 ### `prometheus.push_gateway.interval`
 
-Push interval for the exposition.
+`prometheus.push_gateway.interval` sets the push interval text. The broker stores the text and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The default is `15s`.
 
 Type: `string`. Default: `"15s"`. Range: `duration text`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+interval = "30s"
+```
+
+Action:
+
+```text
+Start the broker with a custom push interval and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_interval=30s
+```
 
 Notes:
 
@@ -2120,9 +2230,31 @@ Notes:
 
 ### `prometheus.push_gateway.job_name`
 
-Job name template for each push.
+`prometheus.push_gateway.job_name` sets the push job name template. The broker stores the template and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The default is `${name}/instance/${name}~${host}`.
 
 Type: `string`. Default: `"${name}/instance/${name}~${host}"`. Range: `template text`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+job_name = "docs-push-job"
+```
+
+Action:
+
+```text
+Start the broker with a custom job name and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_job=docs-push-job
+```
 
 Notes:
 
@@ -2131,9 +2263,31 @@ Notes:
 
 ### `prometheus.push_gateway.method`
 
-Push method for the exposition.
+`prometheus.push_gateway.method` sets the push method. The broker stores the value and shows it in `GET /api/v5/prometheus`. It runs no push client.
+
+The value is `put` or `post`. The default is `put`.
 
 Type: `string`. Default: `"put"`. Range: `put | post`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.push_gateway]
+method = "post"
+```
+
+Action:
+
+```text
+Start the broker with method post and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+push_method=post
+```
 
 Notes:
 
@@ -2142,9 +2296,31 @@ Notes:
 
 ### `prometheus.collectors.mnesia`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.mnesia` sets the store collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+mnesia = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+mnesia=enabled
+```
 
 Notes:
 
@@ -2153,9 +2329,31 @@ Notes:
 
 ### `prometheus.collectors.vm_dist`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_dist` sets the distribution collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_dist = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_dist=enabled
+```
 
 Notes:
 
@@ -2164,9 +2362,31 @@ Notes:
 
 ### `prometheus.collectors.vm_memory`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_memory` sets the memory collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_memory = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_memory=enabled
+```
 
 Notes:
 
@@ -2175,9 +2395,31 @@ Notes:
 
 ### `prometheus.collectors.vm_msacc`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_msacc` sets the microstate collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_msacc = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_msacc=enabled
+```
 
 Notes:
 
@@ -2186,9 +2428,31 @@ Notes:
 
 ### `prometheus.collectors.vm_statistics`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_statistics` sets the statistics collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_statistics = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_statistics=enabled
+```
 
 Notes:
 
@@ -2197,9 +2461,31 @@ Notes:
 
 ### `prometheus.collectors.vm_system_info`
 
-Stored collector name. The broker keeps it and shows it. No sampler reads it.
+`prometheus.collectors.vm_system_info` sets the system collector switch. The broker stores the value and shows it in `GET /api/v5/prometheus`. No sampler reads it.
+
+The value is `enabled` or `disabled`. The default is `disabled`.
 
 Type: `enum string`. Default: `"disabled"`. Range: `enabled | disabled`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[prometheus.collectors]
+vm_system_info = "enabled"
+```
+
+Action:
+
+```text
+Start the broker with the collector on and read `GET /api/v5/prometheus`.
+```
+
+Captured output:
+
+```output
+vm_system_info=enabled
+```
 
 Notes:
 

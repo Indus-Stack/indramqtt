@@ -169,7 +169,9 @@ burst_multiplier=1.0
         if self.child is not None:
             self.child.terminate()
             try:
-                self.last_output = self.child.communicate(timeout=10)
+                # Wait 15 seconds for graceful shutdown.
+                # Reason: the broker uses 10 seconds for graceful shutdown.
+                self.last_output = self.child.communicate(timeout=15)
             except subprocess.TimeoutExpired:
                 self.child.kill()
                 self.last_output = self.child.communicate(timeout=10)

@@ -1,0 +1,9 @@
+{
+  "action": "Start the broker with the collector on and read `GET /api/v5/prometheus`.",
+  "config": "[prometheus.collectors]\nvm_statistics = \"enabled\"\n",
+  "item": "prometheus.collectors.vm_statistics",
+  "kind": "setting",
+  "output": "vm_statistics=enabled",
+  "returncode": 0,
+  "verified": true
+}
