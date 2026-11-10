@@ -118,10 +118,6 @@ fn obj_schema_with_type(conn_type: &str, properties: Value, required: &[&str]) -
     })
 }
 
-fn obj_schema(properties: Value, required: &[&str]) -> Value {
-    obj_schema_with_type("http", properties, required)
-}
-
 static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     let mut schemas = serde_json::Map::new();
 
@@ -162,7 +158,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 3. Kafka Consumer
     schemas.insert(
         "kafka_consumer.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "kafka_consumer",
             json!({
                 "bootstrap_hosts": str_prop("127.0.0.1:9092"),
                 "topic": str_prop("mqtt_ingress"),
@@ -225,6 +222,32 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             }),
             &["name", "url"],
         ),
+    );
+
+    // 6b. Webhook alias (canonical runtime name; same shape as `http`).
+    schemas.insert(
+        "bridge_webhook.post_connector".to_string(),
+        obj_schema_with_type(
+            "webhook",
+            json!({
+                "url": str_prop("http://127.0.0.1:8080"),
+                "headers": json!({
+                    "type": "object",
+                    "default": { "content-type": "application/json" }
+                }),
+                "connect_timeout": str_prop("5s"),
+                "enable_pipelining": bool_prop(true),
+                "pool_size": int_prop(8),
+                "ssl": ssl_prop()
+            }),
+            &["name", "url"],
+        ),
+    );
+
+    // 6c. Console logger (no target; the broker log is the target).
+    schemas.insert(
+        "connector_console.post_connector".to_string(),
+        obj_schema_with_type("console", json!({}), &["name"]),
     );
 
     // 7. ClickHouse
@@ -312,7 +335,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 11. RabbitMQ
     schemas.insert(
         "rabbitmq.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "rabbitmq",
             json!({
                 "server": str_prop("127.0.0.1:5672"),
                 "virtual_host": str_prop("/"),
@@ -327,7 +351,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 12. Pulsar
     schemas.insert(
         "pulsar.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "pulsar",
             json!({
                 "servers": str_prop("pulsar://127.0.0.1:6650"),
                 "ssl": ssl_prop()
@@ -355,7 +380,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 14. Azure Blob Storage
     schemas.insert(
         "connector_azure_blob_storage.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "azure_blob_storage",
             json!({
                 "account_name": str_prop(""),
                 "account_key": pwd_prop(),
@@ -384,7 +410,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 16. TimescaleDB
     schemas.insert(
         "bridge_timescale.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "timescaledb",
             json!({
                 "server": str_prop("127.0.0.1:5432"),
                 "database": str_prop("timeseries"),
@@ -463,7 +490,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // `types`, which thrift bodies do not carry.
     schemas.insert(
         "iotdb.post_thrift".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "iotdb",
             json!({
                 "server": str_prop("127.0.0.1:6667"),
                 "username": str_prop("root"),
@@ -474,7 +502,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     );
     schemas.insert(
         "iotdb.put_thrift".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "iotdb",
             json!({
                 "server": str_prop("127.0.0.1:6667"),
                 "username": str_prop("root"),
@@ -524,7 +553,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 22. DynamoDB
     schemas.insert(
         "bridge_dynamodb.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "dynamodb",
             json!({
                 "url": str_prop("https://dynamodb.us-east-1.amazonaws.com"),
                 "region": str_prop("us-east-1"),
@@ -553,7 +583,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 24. Confluent
     schemas.insert(
         "confluent.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "confluent",
             json!({
                 "bootstrap_hosts": str_prop(""),
                 "ssl": ssl_prop()
@@ -582,7 +613,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 26. BigQuery
     schemas.insert(
         "connector_bigquery.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "bigquery",
             json!({
                 "gcp_project_id": str_prop(""),
                 "service_account_json": pwd_prop()
@@ -610,7 +642,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 28. RocketMQ
     schemas.insert(
         "rocketmq.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "rocketmq",
             json!({
                 "servers": str_prop("127.0.0.1:9876"),
                 "access_key": str_prop(""),
@@ -705,7 +738,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 33. Tablestore
     schemas.insert(
         "bridge_tablestore.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "tablestore",
             json!({
                 "endpoint": str_prop(""),
                 "instance_name": str_prop(""),
@@ -779,7 +813,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 37. Snowflake
     schemas.insert(
         "connector_snowflake_aggregated.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "snowflake",
             json!({
                 "account": str_prop(""),
                 "database": str_prop(""),
@@ -792,7 +827,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     );
     schemas.insert(
         "connector_snowflake_streaming.post_connector".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "snowflake",
             json!({
                 "account": str_prop(""),
                 "database": str_prop(""),
@@ -875,7 +911,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     // 42. SysKeeper
     schemas.insert(
         "syskeeper_forwarder.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "syskeeper_forwarder",
             json!({
                 "server": str_prop("127.0.0.1:9000")
             }),
@@ -884,7 +921,8 @@ static CONNECTORS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     );
     schemas.insert(
         "connector_syskeeper_proxy.post".to_string(),
-        obj_schema(
+        obj_schema_with_type(
+            "syskeeper_proxy",
             json!({
                 "listen": str_prop("0.0.0.0:9000"),
                 "acceptors": int_prop(16),

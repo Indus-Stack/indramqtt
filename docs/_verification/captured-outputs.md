@@ -62,7 +62,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/greptimedb.md` | 226 | `ok` |
 | `connectors/greptimedb.md` | 292 | `ok` |
 | `connectors/http.md` | 93 | `delivered` |
-| `connectors/index.md` | 155 | `ok` |
+| `connectors/index.md` | 169 | `ok` |
 | `connectors/influxdb.md` | 86 | `influxdb` |
 | `connectors/iotdb.md` | 45 | `ok` |
 | `connectors/iotdb.md` | 73 | `ok` |

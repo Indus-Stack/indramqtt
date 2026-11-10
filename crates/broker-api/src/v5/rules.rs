@@ -7443,16 +7443,19 @@ pub async fn set_connector_enabled(
 }
 
 /// `POST /api/v5/connectors/:id/:operation`: run one named lifecycle
-/// operation against one connector (W3-20, C07-07).
+/// operation against one connector (W3-20, C07-07, MV-06b).
 ///
 /// Only the operations the lifecycle supports are served: `start`
-/// (enable the connector) and `stop` (disable it). Both flip the stored
-/// enable flag in place, mirror the flag into the engine's lock-free
-/// dispatch snapshot (disabled forwards are skipped at fire time before
-/// reaching `ConnectorManager::send`, shared with the W3-19 enable
-/// route), persist through the config core like every other connector
-/// write, and report the resulting connector with 200 so the state
-/// change is visible without a second read.
+/// (enable the connector), `stop` (disable it) and `restart` (run a
+/// fresh connection test, then enable it). All three keep the stored
+/// settings: they flip only the enable flag in place, mirror the flag
+/// into the engine's lock-free dispatch snapshot (disabled forwards are
+/// skipped at fire time before reaching `ConnectorManager::send`,
+/// shared with the W3-19 enable route) and persist through the config
+/// core like every other connector write. `restart` then probes the
+/// connector sink, so the next read reports the fresh connection test.
+/// Every operation answers 204 with no body, as the reference API
+/// documents for `start`.
 ///
 /// An unknown connector id returns 404 with the documented `{code,
 /// message}` shape and persists nothing; an unknown operation name is
@@ -7475,12 +7478,13 @@ pub async fn set_connector_enabled(
 /// route already pays (one `Arc` of the disabled set per ingress plus
 /// one `HashSet` lookup per forward, lock-free, no per-fire
 /// allocation).
-// TODO(parity): which operation names does the documented spec serve
-// beyond `start` (for example `stop`, `restart`)? The rulebook does not
-// decide the exact verb set; the current choice serves exactly
-// `start`/`stop` as enable flips (the only lifecycle the kernel tracks,
-// mirroring the W3-06 action operation) and rejects everything else
-// with `BAD_REQUEST` until the checker pins it.
+// TODO(parity): the documented spec names only `start` in the operation
+// enum and answers an unknown operation with 404, while this route also
+// serves `stop`/`restart` and answers an unknown operation with
+// `BAD_REQUEST`. The rulebook does not decide the verb set; the MV-06b
+// binding requires `start`, `stop` and `restart`, so the current choice
+// keeps all three and the `BAD_REQUEST` refusal until the checker pins
+// the shape.
 // TODO(parity): are operation names case-sensitive (`START` versus
 // `start`)? The rulebook does not decide; the current choice matches
 // exactly `start`/`stop` in lower case and rejects every other spelling
@@ -7555,7 +7559,9 @@ pub async fn run_node_connector_operation(
 /// (unknown id is 404, creates nothing), operation validity check
 /// (unknown name is `BAD_REQUEST`, persists nothing), then the enable
 /// flip with the engine snapshot mirror, persistence and the 204 answer
-/// with no body. Management-plane only; see the caller for the
+/// with no body. `restart` enables like `start`, then probes the
+/// connector sink so the next read reports the fresh connection test.
+/// Management-plane only; see the caller for the
 /// locking and fire-path notes.
 async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) -> Response {
     let _sink_guard = state.action_sink_lock.lock().await;
@@ -7567,11 +7573,11 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     };
     let bare = connector_bare_name(&stored);
     let enable = match operation {
-        "start" => true,
+        "start" | "restart" => true,
         "stop" => false,
         _ => {
             return ApiError::BadRequest(format!(
-                "unknown connector operation {operation:?}: expected \"start\" or \"stop\" (field `operation`)"
+                "unknown connector operation {operation:?}: expected \"start\", \"stop\" or \"restart\" (field `operation`)"
             ))
             .into_response();
         }
@@ -7603,6 +7609,13 @@ async fn apply_connector_operation(state: &ApiState, id: &str, operation: &str) 
     }
     if let Err(error) = state.connectors.persist() {
         return connector_persist_error(error);
+    }
+    // MV-06b: a restart runs a fresh connection test after the enable,
+    // so the next read reports the new probe result from the sink state.
+    if operation == "restart" {
+        if let Some(sink) = state.engine.connectors().get(&bare) {
+            let _ = sink.probe().await;
+        }
     }
     StatusCode::NO_CONTENT.into_response()
 }

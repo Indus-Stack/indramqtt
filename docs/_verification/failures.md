@@ -334,3 +334,11 @@ areas. Their counts come from `entries.py --coverage`.
 - Expected: the cased match results in the example.
 - Broker gave: `rules/test gave 400: {"error":"invalid sql_query: line 1, column 12: expected keyword FROM"}`.
 - Date: 2026-10-17.
+
+## Connector lifecycle stop call (2026-11-10)
+
+- Item: `POST /api/v5/connectors/{id}/stop` example in `connectors/index.md`.
+- Input: `curl -X POST http://127.0.0.1:18083/api/v5/connectors/hook-1/stop` with a bearer key.
+- Expected: `204` with no body. Source: `docs/connectors/index.md` Lifecycle section.
+- Broker gave: not run. No broker ran in this task. No tool captured output.
+- State: not verified.

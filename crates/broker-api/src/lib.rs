@@ -3405,6 +3405,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sb15_connector_schemas_match_ready_capability_kinds() {
+        // MV-06b broker-through test: the connector schema listing names
+        // exactly ready kinds. Each entry resolves to a ready capability
+        // row. Pending kinds stay hidden. Ready kinds keep their form.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, schema) = server.get_auth("/schemas/connectors", &token).await;
+        assert_eq!(status, 200);
+        let schema: serde_json::Value =
+            serde_json::from_str(schema.as_str().expect("schema body is a JSON string"))
+                .expect("schema string holds JSON");
+        let rows = schema.as_object().expect("schema object");
+        let mut kinds = Vec::new();
+        for value in rows.values() {
+            let kind = value
+                .get("properties")
+                .and_then(|properties| properties.get("type"))
+                .and_then(|type_prop| type_prop.get("default"))
+                .and_then(|default| default.as_str())
+                .expect("schema names its kind");
+            assert!(
+                broker_config::is_kind_ready(kind),
+                "connectors schema lists non-ready kind {kind}"
+            );
+            kinds.push(kind.to_string());
+        }
+        // Derive the expected set from the capability map.
+        // Each ready connector row needs one served form.
+        // Each pending or refused row needs none.
+        for row in broker_config::KIND_ROWS {
+            let resolves = |served: &str| {
+                broker_config::kind_row(served).is_some_and(|found| found.name == row.name)
+            };
+            if row.connector && broker_config::row_is_ready(row) {
+                assert!(
+                    kinds.iter().any(|kind| resolves(kind)),
+                    "connectors schema lists ready kind {}: {kinds:?}",
+                    row.name
+                );
+            } else if !broker_config::row_is_ready(row) {
+                assert!(
+                    !kinds.iter().any(|kind| resolves(kind)),
+                    "connectors schema hides non-ready kind {}: {kinds:?}",
+                    row.name
+                );
+            }
+        }
+    }
+
     struct NoopBrokerSink;
     #[async_trait::async_trait]
     impl broker_rules::BrokerSink for NoopBrokerSink {
@@ -24206,6 +24256,397 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
         assert_eq!(status, 204);
         let (status, _) = server
             .delete_auth("/api/v5/connectors/w3-20-conn", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn sb15_connector_restart_keeps_settings_and_gates_delivery() {
+        // MV-06b broker-through test: `restart` enables the connector,
+        // keeps every stored setting and gates delivery. Each step goes
+        // through the HTTP router. Publishes go through
+        // `dispatch_ingress` (the broker rule path).
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct CountingSink {
+            hits: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for CountingSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                self.hits.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(())
+            }
+            fn kind(&self) -> &'static str {
+                "test-counter"
+            }
+        }
+        struct ProbeFlipSink {
+            healthy: std::sync::atomic::AtomicBool,
+            reason: std::sync::Mutex<Option<String>>,
+        }
+        impl ProbeFlipSink {
+            fn new() -> Self {
+                Self {
+                    healthy: std::sync::atomic::AtomicBool::new(true),
+                    reason: std::sync::Mutex::new(None),
+                }
+            }
+        }
+        #[async_trait::async_trait]
+        impl broker_connectors::Sink for ProbeFlipSink {
+            async fn send(
+                &self,
+                _topic: &broker_protocol::Topic,
+                _payload: &bytes::Bytes,
+                _qos: broker_protocol::QoS,
+            ) -> broker_connectors::Result<()> {
+                Ok(())
+            }
+            async fn probe(&self) -> std::result::Result<(), String> {
+                // Flip the health on each call.
+                let was = self.healthy.load(AtomicOrdering::Relaxed);
+                self.healthy.store(!was, AtomicOrdering::Relaxed);
+                if was {
+                    let text = "sb15 restart probe flipped to down: connection refused".to_string();
+                    *self.reason.lock().expect("probe lock") = Some(text.clone());
+                    Err(text)
+                } else {
+                    *self.reason.lock().expect("probe lock") = None;
+                    Ok(())
+                }
+            }
+            fn health(&self) -> Option<broker_connectors::SinkHealth> {
+                Some(broker_connectors::SinkHealth {
+                    healthy: self.healthy.load(AtomicOrdering::Relaxed),
+                    reason: self.reason.lock().expect("health lock").clone(),
+                })
+            }
+            fn kind(&self) -> &'static str {
+                "webhook"
+            }
+        }
+        struct NoopBrokerSink;
+        #[async_trait::async_trait]
+        impl broker_rules::BrokerSink for NoopBrokerSink {
+            async fn publish(
+                &self,
+                _topic: broker_protocol::Topic,
+                _payload: bytes::Bytes,
+                _qos: broker_protocol::QoS,
+                _retain: bool,
+            ) -> Result<(), broker_rules::RuleEngineError> {
+                Ok(())
+            }
+        }
+
+        let (server, state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "sb15-restart", "type": "webhook",
+                       "url": "http://127.0.0.1:9",
+                       "description": "sb15 settings"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        // Register a probe fixture under the connector id.
+        // Its `probe` flips `health`, so only a real
+        // restart changes the next read.
+        let probe_sink = std::sync::Arc::new(ProbeFlipSink::new());
+        state
+            .engine
+            .connectors()
+            .register("sb15-restart", probe_sink.clone());
+        // Unknown operation is refused and keeps the stored state.
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sb15-restart/frobnicate",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], json!("BAD_REQUEST"));
+        let (status, body) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/no-such-sb15/restart",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 404);
+        assert_eq!(body["code"], json!("NOT_FOUND"));
+        // Stop disables; restart enables and keeps the settings.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sb15-restart/stop",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/sb15-restart", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(false));
+        assert_eq!(body["status"], json!("connected"));
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sb15-restart/restart",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/sb15-restart", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        assert_eq!(body["url"], json!("http://127.0.0.1:9"));
+        assert_eq!(body["description"], json!("sb15 settings"));
+        assert_eq!(body["status"], json!("disconnected"));
+        assert!(
+            body["status_reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "restart must run a fresh probe: {body}"
+        );
+        // Restart while enabled keeps the connector enabled.
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sb15-restart/restart",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/sb15-restart", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enable"], json!(true));
+        // Delivery follows the lifecycle through the rule path.
+        // The action id differs from the connector id.
+        // Its `connector` field drives the dependent path.
+        let connector_id = "sb15-restart";
+        let action_id = "sb15-restart-act";
+        assert_ne!(connector_id, action_id);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "sb15-restart-act", "type": "console", "server": "127.0.0.1:1883",
+                       "connector": "sb15-restart"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let counter = std::sync::Arc::new(CountingSink {
+            hits: AtomicU64::new(0),
+        });
+        state.engine.connectors().register(
+            broker_config::v5_action_sink_key("sb15-restart-act"),
+            counter.clone(),
+        );
+        let (status, rule_body) = server
+            .post_auth(
+                "/api/v5/rules",
+                json!({
+                    "name": "sb15-restart-rule",
+                    "sql": "SELECT * FROM \"sb15/restart\"",
+                    "actions": ["sb15-restart-act"],
+                }),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let rule_id = rule_body["id"].as_str().expect("rule id").to_string();
+        let broker_sink: std::sync::Arc<dyn broker_rules::BrokerSink> =
+            std::sync::Arc::new(NoopBrokerSink);
+        let topic = broker_protocol::Topic::new("sb15/restart").expect("valid topic");
+        let payload = bytes::Bytes::from_static(b"{\"k\":1}");
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(counter.hits.load(AtomicOrdering::Relaxed), 1);
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sb15-restart/stop",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            1,
+            "stopped connector must be skipped at fire time"
+        );
+        let (status, _) = server
+            .send(
+                "POST",
+                "/api/v5/connectors/sb15-restart/restart",
+                None,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, 204);
+        state
+            .engine
+            .dispatch_ingress(
+                &topic,
+                &payload,
+                broker_protocol::QoS::AtMostOnce,
+                &broker_sink,
+            )
+            .await;
+        assert_eq!(
+            counter.hits.load(AtomicOrdering::Relaxed),
+            2,
+            "restarted connector must fire again"
+        );
+        let (status, _) = server
+            .delete_auth(&format!("/api/v5/rules/{rule_id}"), &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/sb15-restart-act", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/sb15-restart", &token)
+            .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn sb15_connector_health_reports_sink_state_per_action() {
+        // MV-06b broker-through test: `status` and `status_reason` come
+        // from the sink state. A connector with no actions reads fine. A
+        // valid offline server reads `disconnected` with a reason. Two
+        // actions report their own health. A failed update keeps the old
+        // settings. Each step goes through the HTTP router.
+        let (server, _state) = TestServer::start().await;
+        let token = server.login_as_admin().await;
+        let (status, created) = server
+            .post_auth(
+                "/api/v5/connectors",
+                json!({"name": "sb15-lonely", "type": "webhook",
+                       "url": "http://127.0.0.1:9"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        assert_eq!(created["status"], json!("disconnected"));
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/sb15-lonely", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], json!("disconnected"));
+        assert!(
+            body["status_reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "offline server must name a reason: {body}"
+        );
+        assert_eq!(body["node_status"][0]["status"], json!("disconnected"));
+        assert_eq!(body["enable"], json!(true));
+        let (status, list) = server.get_auth("/api/v5/connectors", &token).await;
+        assert_eq!(status, 200);
+        assert!(
+            list.as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["name"] == json!("sb15-lonely"))),
+            "connector with no actions still lists"
+        );
+        // Two actions on one connector report their own health.
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "sb15-act-up", "type": "console", "server": "127.0.0.1:1883",
+                       "connector": "sb15-lonely"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, _) = server
+            .post_auth(
+                "/api/v5/actions",
+                json!({"name": "sb15-act-down", "type": "http",
+                       "connector": "sb15-lonely",
+                       "parameters": {"path": "/ingest/${topic}", "method": "post"}}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 201);
+        let (status, up) = server.get_auth("/api/v5/actions/sb15-act-up", &token).await;
+        assert_eq!(status, 200);
+        assert_eq!(up["status"], json!("connected"));
+        let (status, down) = server
+            .get_auth("/api/v5/actions/sb15-act-down", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(down["status"], json!("disconnected"));
+        assert!(
+            down["status_reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "down action must name a reason: {down}"
+        );
+        // A failed update keeps the old settings in place.
+        let (status, _) = server
+            .put_auth(
+                "/api/v5/connectors/sb15-lonely",
+                json!({"name": "sb15-lonely", "type": "webhook"}),
+                &token,
+            )
+            .await;
+        assert_eq!(status, 400);
+        let (status, body) = server
+            .get_auth("/api/v5/connectors/sb15-lonely", &token)
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["url"], json!("http://127.0.0.1:9"));
+        assert_eq!(body["enable"], json!(true));
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/sb15-act-up", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/actions/sb15-act-down", &token)
+            .await;
+        assert_eq!(status, 204);
+        let (status, _) = server
+            .delete_auth("/api/v5/connectors/sb15-lonely", &token)
             .await;
         assert_eq!(status, 204);
     }

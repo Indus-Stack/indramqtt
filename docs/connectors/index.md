@@ -131,6 +131,20 @@ Direction `out` means the broker writes to the system. State `implemented` means
 | [GCP Pub/Sub](./gcp-pubsub.md) | Topic messages. |
 | [Azure Event Hubs](./azure-event-hubs.md) | Hub events. |
 
+## Lifecycle
+
+Each connector reports `status` from its live sink state. The webhook kind reports its last connection test. `connected` means the last test reached the target. `disconnected` means the last test failed. Kinds without a probe report registration presence. A registered sink reads `connected`. A missing sink reads `disconnected`. A pending or refused kind reads `disconnected` with a reason. Each action reports its own status. A connector never sets the status of its actions.
+
+`start` enables a connector. `stop` disables it and stops its actions. `restart` runs a fresh connection test and enables it. All three keep the stored settings. All three answer 204.
+
+```sh no-test
+# Not verified: needs a live broker run.
+curl -X POST http://127.0.0.1:18083/api/v5/connectors/hook-1/stop \
+  -H "Authorization: Bearer $API_KEY" -i
+```
+
+> Not verified: see `../_verification/failures.md`. The stop call needs a live broker run.
+
 ## Check that it works
 
 Ask the broker for its action type names. The list holds the documented action kinds that are ready in this build.

@@ -1428,7 +1428,10 @@ pub(crate) fn stage_action_sink(
     };
     let sink = build_action_sink_with_dir(record, &doc, &resource_opts, &connectors.data_dir())?;
     let has_sink = sink.is_some();
-    let health_target = if has_sink {
+    // A console sink logs locally and dials no target. It keeps no
+    // health target, so it never reports the connector target state.
+    // Other kinds probe the connector target.
+    let health_target = if has_sink && canonical_action_kind(&record.action_type) != "console" {
         super::rules::extract_target_host_port(&doc)
     } else {
         None
