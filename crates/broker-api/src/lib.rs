@@ -1553,13 +1553,13 @@ async fn get_connectors(State(state): State<ApiState>) -> Json<Vec<serde_json::V
 /// Creation payload for a streaming connector. `kind` selects the sink
 /// family; `config` carries that family's fields verbatim. Streaming
 /// sinks connect lazily on first delivery, so creation never blocks on
-/// external brokers.
+/// external brokers. Qualification builds this payload directly.
 #[derive(Debug, Deserialize)]
-struct CreateConnectorRequest {
-    id: String,
-    kind: String,
+pub struct CreateConnectorRequest {
+    pub id: String,
+    pub kind: String,
     #[serde(default)]
-    config: serde_json::Value,
+    pub config: serde_json::Value,
 }
 
 async fn create_connector(
@@ -1586,8 +1586,8 @@ async fn create_connector(
 /// Build one streaming connector from a creation request: parse the
 /// kind-specific config, validate it, and wire the sink to its
 /// transport. Pure construction except `disk_log`, which opens its
-/// directory (hence async).
-async fn build_connector(
+/// directory (hence async). Qualification calls this entry directly.
+pub async fn build_connector(
     req: &CreateConnectorRequest,
 ) -> Result<(String, std::sync::Arc<dyn broker_connectors::Sink>), String> {
     let kind = req.kind.to_ascii_lowercase();
@@ -2146,9 +2146,15 @@ async fn build_connector(
                 config
                     .validate()
                     .map_err(|e| format!("invalid rocketmq config: {e}"))?;
-                let transport = std::sync::Arc::new(
-                    broker_connectors_enterprise::TcpRocketMqTransport::new(&config)
-                        .map_err(|e| format!("invalid rocketmq transport: {e}"))?,
+                // All configs use the vendor path.
+                // Reason: the vendor server only speaks remoting.
+                let transport: std::sync::Arc<
+                    dyn broker_connectors_enterprise::rocketmq::RocketMqTransport,
+                > = std::sync::Arc::new(
+                    broker_connectors_enterprise::rocketmq::RemotingRocketMqTransport::new(
+                        &config,
+                    )
+                    .map_err(|e| format!("invalid rocketmq transport: {e}"))?,
                 );
                 let sink = broker_connectors_enterprise::RocketMqSink::new(config, transport)
                     .map_err(|e| format!("invalid rocketmq sink: {e}"))?;

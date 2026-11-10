@@ -1559,6 +1559,8 @@ fn connector_live_view(
 /// response: every `file:`/`env:` string leaf renders as its
 /// `<redacted:...>` marker naming the reference, never the value. The
 /// store keeps the reference; only the response is redacted.
+/// A RocketMQ plaintext signing key never renders either: the access
+/// key stays since it names the credential, the secret does not.
 fn redact_connector_doc(value: &serde_json::Value) -> serde_json::Value {
     fn walk(node: &mut serde_json::Value) {
         match node {
@@ -1581,6 +1583,29 @@ fn redact_connector_doc(value: &serde_json::Value) -> serde_json::Value {
         }
     }
     let mut out = value.clone();
+    // Reads must not leak the vendor signing key.
+    // Reason: the secret signs requests, the access key only names them.
+    let is_rocketmq = matches!(
+        out.get("type").and_then(|v| v.as_str()),
+        Some("rocketmq") | Some("rocket_mq") | Some("apache_rocketmq")
+    );
+    if is_rocketmq {
+        if let Some(obj) = out.as_object_mut() {
+            for key in ["secret_key", "security_token"] {
+                let plain = obj
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(|s| !broker_config::secrets::is_secret_ref(s.trim()))
+                    .unwrap_or(false);
+                if plain {
+                    obj.insert(
+                        key.to_string(),
+                        serde_json::Value::String(super::sso::REDACTED_SECRET.to_string()),
+                    );
+                }
+            }
+        }
+    }
     walk(&mut out);
     out
 }
@@ -1833,7 +1858,8 @@ fn live_sink_kind(conn_type: &str) -> &str {
 /// skip, never a fallback identity. A sink or transport that fails to
 /// build fails the same way with its own error text. Enabled kinds go
 /// through [`register_live_sink`], the same path `create_connector` uses.
-pub(crate) async fn try_register_live_sink(
+/// Qualification calls this entry directly.
+pub async fn try_register_live_sink(
     engine: &broker_rules::RuleEngine,
     conn_type: &str,
     name: &str,
@@ -1859,7 +1885,9 @@ fn refuse_disabled_kind(conn_type: &str, feature: &str) -> String {
     format!("connector kind '{conn_type}' needs cargo feature '{feature}' (disabled in this build)")
 }
 
-pub(crate) async fn register_live_sink(
+/// Register one live sink on the engine. Qualification calls this entry.
+/// Qualification covers both this entry and `build_connector`.
+pub async fn register_live_sink(
     engine: &broker_rules::RuleEngine,
     conn_type: &str,
     name: &str,
@@ -3559,6 +3587,11 @@ pub(crate) async fn register_live_sink(
                 .get("secret_key")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let security_token = body
+                .get("security_token")
+                .or_else(|| body.get("securityToken"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let timeout_ms = body
                 .get("timeout_ms")
                 .or_else(|| body.get("timeout"))
@@ -3573,15 +3606,25 @@ pub(crate) async fn register_live_sink(
                 message_group_template: None,
                 access_key,
                 secret_key,
+                security_token,
                 batch_size: Some(1),
-                buffer_capacity: None,
+                // Use the shared default buffer bound.
+                // Reason: the bound caps memory per rule sink.
+                buffer_capacity: Some(
+                    broker_connectors_enterprise::rocketmq::DEFAULT_BUFFER_CAPACITY,
+                ),
                 linger_ms: Some(10),
                 timeout_ms,
             };
-            if let Some(transport) = record_sink_error!(
-                broker_connectors_enterprise::rocketmq::TcpRocketMqTransport::new(&config)
-            ) {
-                let transport = Arc::new(transport);
+            // All configs use the vendor path.
+            // Reason: the vendor server only speaks remoting.
+            let transport: Option<
+                std::sync::Arc<dyn broker_connectors_enterprise::rocketmq::RocketMqTransport>,
+            > = record_sink_error!(
+                broker_connectors_enterprise::rocketmq::RemotingRocketMqTransport::new(&config)
+            )
+            .map(|built| std::sync::Arc::new(built) as _);
+            if let Some(transport) = transport {
                 if let Some(sink) = record_sink_error!(
                     broker_connectors_enterprise::rocketmq::RocketMqSink::new(config, transport)
                 ) {

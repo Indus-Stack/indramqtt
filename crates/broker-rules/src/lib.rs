@@ -10373,6 +10373,7 @@ Y7LzJJ6LCjfUFy8dMINZC7M=
                     message_group_template: None,
                     access_key: None,
                     secret_key: None,
+                    security_token: None,
                     batch_size: Some(1),
                     buffer_capacity: None,
                     linger_ms: Some(10),

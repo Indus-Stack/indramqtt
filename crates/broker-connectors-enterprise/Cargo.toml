@@ -220,3 +220,6 @@ opc_ua = []
 axum = { workspace = true }
 apache-avro = { version = "0.15" }
 broker-rules = { workspace = true }
+# Qual only: the rocketmq qual drives both production entries.
+# Reason: the qual must fail when either entry breaks.
+broker-api = { workspace = true }

@@ -1151,6 +1151,17 @@ CONNECTOR_QUALS = {
         "timeout": 1800,
         "markers": ["qual rows asserted", "qual auth asserted"],
     },
+    "rocketmq": {
+        "crate": "broker-connectors-enterprise",
+        "test": "rocketmq::tests::test_qualify_driver_write_path",
+        "env": [
+            "ROCKETMQ_NAMESRV",
+            "ROCKETMQ_TOPIC",
+            "ROCKETMQ_GROUP",
+        ],
+        "timeout": 1800,
+        "markers": ["qual rows asserted", "qual fault asserted"],
+    },
     "sparkplug_b": {
         "crate": "broker-connectors",
         "test": "sparkplug_b::tests::test_qualify_birth_data_write_path",

@@ -73,6 +73,7 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `connectors/rabbitmq.md` | 80 | `ok` |
 | `connectors/redis.md` | 86 | `redis` |
 | `connectors/redshift.md` | 116 | `delivered` |
+| `connectors/rocketmq.md` | 93 | `rocketmq` |
 | `connectors/s3.md` | 97 | `ok` |
 | `connectors/s3_tables.md` | 115 | `delivered` |
 | `connectors/s3tables.md` | 105 | `delivered` |
@@ -168,4 +169,4 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `security/tls.md` | 93 | `ok` |
 | `security/tls.md` | 103 | `OK` |
 
-The run captured 152 blocks. Each output matches its page.
+The run captured 153 blocks. Each output matches its page.

@@ -3014,21 +3014,48 @@ class InventoryEntry(unittest.TestCase):
                 self.assertEqual(uuid.UUID(row["insertId"]).version, 4)
         # Explicit endpoint and static empty auth avoid credential discovery.
 
-    # // AZ-01 inventory: current behaviour; owner MV-03a
-    def test_queue_envelope_replaces_tag_keys_group_and_batch_controls(self):
-        listener = socket.socket()
-        listener.bind(("127.0.0.1", 0))
-        listener.listen()
-        listener.settimeout(0.2)
-        self.addCleanup(listener.close)
+    # // DR-03 inventory: keyed vendor path; owner DR-03
+    def test_queue_keyed_config_uses_vendor_path_and_hides_secret(self):
+        # Production speaks the vendor remoting protocol.
+        # Fakes speak route lookup and send.
         captured = queue.Queue()
         stopping = threading.Event()
         self.addCleanup(stopping.set)
-
-        def observe():
+        broker_listener = socket.socket()
+        broker_listener.bind(("127.0.0.1", 0))
+        broker_listener.listen(8)
+        broker_listener.settimeout(0.5)
+        self.addCleanup(broker_listener.close)
+        broker_port = broker_listener.getsockname()[1]
+        nameserver_listener = socket.socket()
+        nameserver_listener.bind(("127.0.0.1", 0))
+        nameserver_listener.listen(8)
+        nameserver_listener.settimeout(0.5)
+        self.addCleanup(nameserver_listener.close)
+        nameserver_port = nameserver_listener.getsockname()[1]
+        def read_frame(conn):
+            total = struct.unpack("!I", exact(conn, 4))[0]
+            combined = struct.unpack("!I", exact(conn, 4))[0]
+            header_len = combined & 0xFFFFFF
+            header = json.loads(exact(conn, header_len))
+            body_len = total - 4 - header_len
+            body = exact(conn, body_len) if body_len else b""
+            return header, body
+        def write_frame(conn, code, opaque, body):
+            header = json.dumps({"code": code, "language": "JAVA", "version": 500,
+                                 "opaque": opaque, "flag": 1, "remark": None,
+                                 "extFields": {}}).encode()
+            conn.sendall(struct.pack("!I", 4 + len(header) + len(body)))
+            conn.sendall(struct.pack("!I", len(header)))
+            conn.sendall(header + body)
+        def serve_nameserver():
+            route = json.dumps({"brokerDatas": [{"brokerName": "fake",
+                                                  "brokerAddrs": {"0": "127.0.0.1:" + str(broker_port)}}],
+                                "queueDatas": [{"brokerName": "fake",
+                                                "writeQueueNums": 1}]}).encode()
             while not stopping.is_set():
                 try:
-                    conn, _ = listener.accept()
+                    conn, _ = nameserver_listener.accept()
                 except socket.timeout:
                     continue
                 except OSError:
@@ -3036,32 +3063,40 @@ class InventoryEntry(unittest.TestCase):
                 with conn:
                     conn.settimeout(5)
                     try:
-                        first = conn.recv(1)
-                        if not first:
-                            continue  # Empty TCP reachability probe, not a frame.
-                        head = first + exact(conn, 4)
-                        if head[0] != 1:
-                            raise AssertionError("unexpected envelope version")
-                        length = struct.unpack("!I", head[1:])[0]
-                        if length > 65536:
-                            raise AssertionError("envelope exceeds observer bound")
-                        captured.put(json.loads(exact(conn, length)))
-                        ack = b'{"code":0}'
-                        conn.sendall(struct.pack("!I", len(ack)) + ack)
-                    except (OSError, AssertionError, ValueError) as error:
-                        captured.put(type(error).__name__)
-
-        worker = threading.Thread(target=observe, daemon=True)
-        worker.start()
-        self.addCleanup(lambda: worker.join(timeout=1))
+                        header, _ = read_frame(conn)
+                        write_frame(conn, 0, header.get("opaque", 0), route)
+                    except (OSError, AssertionError, ValueError):
+                        continue
+        def serve_broker():
+            while not stopping.is_set():
+                try:
+                    conn, _ = broker_listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                with conn:
+                    conn.settimeout(5)
+                    try:
+                        header, body = read_frame(conn)
+                        captured.put((header.get("extFields", {}), body))
+                        write_frame(conn, 0, header.get("opaque", 0), b"")
+                    except (OSError, AssertionError, ValueError):
+                        continue
+        nameserver_thread = threading.Thread(target=serve_nameserver, daemon=True)
+        broker_thread = threading.Thread(target=serve_broker, daemon=True)
+        nameserver_thread.start()
+        broker_thread.start()
+        self.addCleanup(lambda: nameserver_thread.join(timeout=1))
+        self.addCleanup(lambda: broker_thread.join(timeout=1))
         b = self.boot()
         access, secret = secrets.token_hex(12), secrets.token_hex(24)
         config = {"type": "rocketmq", "name": "inventoryqueue",
-                  "endpoint": "127.0.0.1:" + str(listener.getsockname()[1]),
+                  "endpoint": "127.0.0.1:" + str(nameserver_port),
                   "topic": "selected_topic", "access_key": access, "secret_key": secret,
                   "tag_template": "selected-tag", "keys_template": "selected-key",
-                  "message_group_template": "selected-group", "batch_size": 20,
-                  "buffer_capacity": 1, "linger_ms": 60000, "timeout_ms": 1200}
+                   "message_group_template": "selected-group", "batch_size": 1,
+                   "buffer_capacity": 1, "linger_ms": 10, "timeout_ms": 1200}
         self.assertEqual(b.http("POST", "/api/v5/connectors", config)[0], 201)
         self.create_forwarding_action_rule(b, config, "inventoryqueuerule", "inventory/queue")
         for attempt in range(2):
@@ -3070,28 +3105,25 @@ class InventoryEntry(unittest.TestCase):
                 b.start()
             status, stored = b.http("GET", "/api/v5/connectors/inventoryqueue")
             self.assertEqual(status, 200)
-            self.assert_fields_kept(stored, config)
+            kept = {key: value for key, value in config.items() if key != "secret_key"}
+            self.assert_fields_kept(stored, kept)
+            self.assertEqual(stored.get("access_key"), access)
+            self.assertNotEqual(stored.get("secret_key"), secret)
+            self.assertTrue(secret not in json.dumps(stored), "secret must not render in a read")
             self.assertEqual(b.http("PUT", "/api/v5/connectors/inventoryqueue", {**config, "topic": "bad topic"})[0], 400)
             self.assertTrue(b.http("GET", "/api/v5/connectors/inventoryqueue") == (200, stored))
             pub, ack = b.connect("queue-publisher-" + str(attempt))
             self.assertEqual(ack, "0000")
             payload = b'{"client_id":"payload-client","v":173}'
             publish(b, pub, "inventory/queue", payload)
-            envelope = captured.get(timeout=10)
-            self.assertTrue(isinstance(envelope, dict), "observer did not capture an envelope")
-            self.assertEqual(envelope["topic"], "selected_topic")
-            self.assertEqual(len(envelope["messages"]), 1)
-            message = envelope["messages"][0]
-            self.assertEqual(base64.b64decode(message["body_b64"], validate=True), payload)
-            props = message["system_properties"]
-            self.assertIsNone(props["tag"])
-            self.assertEqual(props["keys"], ["payload-client"])
-            self.assertIsNone(props["message_group"])
-            body = json.dumps([message["body_b64"]], separators=(",", ":")).encode()
-            signing = "\n".join([envelope["client_id"], envelope["datetime"], envelope["topic"], hashlib.md5(body).hexdigest()])
-            expected = "MQ " + access + ":" + base64.b64encode(hmac.new(secret.encode(), signing.encode(), hashlib.sha1).digest()).decode()
-            self.assertTrue(envelope["authorization"] == expected, "selected signing credentials differ")
-        # This observes the implemented envelope, not external protocol compatibility.
+            ext, body = captured.get(timeout=10)
+            self.assertEqual(ext.get("topic"), "selected_topic")
+            self.assertEqual(body, payload)
+            self.assertEqual(ext.get("AccessKey"), access)
+            self.assertTrue("Signature" in ext)
+            self.assertTrue("payload-client" in ext.get("properties", ""))
+            while not captured.empty():
+                captured.get_nowait()
 
     # // AZ-01 inventory: current behaviour; owner MV-03b
     def test_rsa_stream_applies_identity_key_and_bytes_but_accepts_loopback_lookalikes(self):

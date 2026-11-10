@@ -1534,6 +1534,7 @@ dependencies = [
  "aws-sigv4",
  "axum",
  "base64 0.22.1",
+ "broker-api",
  "broker-connectors",
  "broker-protocol",
  "broker-rules",

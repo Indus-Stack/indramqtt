@@ -1,31 +1,25 @@
-//! Apache RocketMQ 5.0 streaming producer sink (INDRA-154).
+//! RocketMQ sink.
 //!
-//! MQTT events become RocketMQ 5.0 `SendMessage` envelopes sent to a
-//! proxy endpoint over TCP with a length-prefixed JSON envelope frame:
+//! Rule results become vendor messages.
+//! All production uses the vendor remoting protocol.
+//! Keyed production signs each request with the vendor ACL.
 //!
-//! ```text
-//! [version:1 = 0x01][body_len:4 BE][JSON envelope]
-//! ```
+//! Production path:
+//! rule engine -> sink -> vendor transport -> nameserver -> broker.
+//! The transport fetches the route, then sends each row.
+//! The offline path keeps the envelope frame below for unit tests.
 //!
-//! The envelope carries request headers (`x-mq-client-id`,
-//! `x-mq-date-time`, `x-mq-authorization`), per-message
-//! `SystemProperties` (tag, keys, FIFO message group, born
-//! timestamp) and the raw body bytes (base64). Request signing is
-//! clean-room HMAC-SHA1 (`MQ {access_key}:{signature}`).
-//! Authentication is optional: without credentials the authorization
-//! header is omitted (plain proxy testing).
-//!
-//! Response handling classifies `Status.Code`: `OK` commits,
-//! `TOO_MANY_REQUESTS` / `MASTER_NOT_AVAILABLE` retry with backoff,
-//! `ILLEGAL_TOPIC` / `ACCESS_DENIED` abort terminally. Batching,
-//! restore-on-failure and backoff reuse the shared
+//! Response handling classifies remoting codes: 0 commits.
+//! All errors restore rows and engage backoff for retry.
+//! Batching, restore-on-failure and backoff reuse the shared
 //! [`broker_connectors::BatchQueue`] / [`broker_connectors::BackoffState`] helpers.
 
 use async_trait::async_trait;
 use broker_protocol::{QoS, Topic};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,11 +33,73 @@ use broker_connectors::{
 /// Envelope wire version.
 pub const ENVELOPE_VERSION: u8 = 0x01;
 
-/// RocketMQ 5.0 sink configuration. Every depth is user-configurable
-/// with no clamped ceiling (`None` = unbounded).
+// Default batch holds 128 rows.
+// Reason: the old default stays, one flush stays small.
+const DEFAULT_BATCH_SIZE: usize = 128;
+// Default buffer holds 10000 rows.
+// Reason: the bound caps memory, 10000 small rows use ~10 MB.
+pub const DEFAULT_BUFFER_CAPACITY: usize = 10_000;
+// Default linger waits 100 ms.
+// Reason: the old default stays, idle batches flush fast.
+const DEFAULT_LINGER_MS: u64 = 100;
+// Default timeout waits 5000 ms.
+// Reason: the vendor send timeout is 3000 ms, route lookup needs margin.
+const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+// Largest ack or header frame the sink reads.
+// Reason: vendor acks are small JSON, a larger frame means a fault.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+// Vendor client version.
+// Reason: the vendor 5.3.0 line reports version 500.
+const REMOTING_VERSION: i32 = 500;
+// JSON serialization type.
+// Reason: the vendor protocol uses 0 for JSON.
+const SERIALIZE_JSON: u32 = 0;
+// Vendor request code for route lookup.
+// Reason: the vendor nameserver uses 105 for this lookup.
+const REQUEST_GET_ROUTEINFO: i32 = 105;
+// Vendor request code for send.
+// Reason: the vendor broker uses 10 for send.
+const REQUEST_SEND_MESSAGE: i32 = 10;
+// Vendor success code.
+// Reason: the vendor uses 0 for success.
+const RESPONSE_SUCCESS: i32 = 0;
+// Vendor bad message code.
+// Reason: the vendor uses 13 for an illegal message.
+const RESPONSE_MESSAGE_ILLEGAL: i32 = 13;
+// Vendor denied code.
+// Reason: the vendor uses 16 for no permission.
+const RESPONSE_NO_PERMISSION: i32 = 16;
+// Vendor missing topic code.
+// Reason: the vendor uses 17 for a missing topic.
+const RESPONSE_TOPIC_NOT_EXIST: i32 = 17;
+// Fixed producer group.
+// Reason: the vendor needs a group, one fixed group avoids a setting.
+const PRODUCER_GROUP: &str = "indra_producer";
+// Vendor auto-create key.
+// Reason: the vendor uses TBW102 for auto-create.
+const DEFAULT_TOPIC_KEY: &str = "TBW102";
+// Vendor default queue count.
+// Reason: the vendor creates 4 queues for a new topic.
+const DEFAULT_QUEUE_NUMS: u32 = 4;
+// Redial count per exchange.
+// Reason: one retry survives a dropped socket.
+const EXCHANGE_ATTEMPTS: usize = 2;
+// Broker pushes to skip per exchange.
+// Reason: one heartbeat wakes one push, 8 covers bursts.
+const MAX_PUSH_SKIPS: usize = 8;
+
+/// Decoded header: code, fields, remark, flag, opaque.
+type DecodedRemoting = (i32, HashMap<String, String>, String, i32, i32);
+
+/// Exchange result: code, fields, body, remark.
+type RemotingResult = (i32, HashMap<String, String>, Vec<u8>, String);
+
+/// RocketMQ sink configuration.
+/// Each depth has a finite default.
+/// `None` opts into no bound explicitly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RocketMqSinkConfig {
-    /// Proxy / nameserver endpoints, e.g. `["127.0.0.1:8081"]`.
+    /// Nameserver endpoints, e.g. `["127.0.0.1:9876"]`.
     pub endpoints: Vec<String>,
     /// Target RocketMQ topic string.
     pub topic: String,
@@ -63,31 +119,38 @@ pub struct RocketMqSinkConfig {
     /// ACL secret key for HMAC-SHA1 request signing.
     #[serde(default)]
     pub secret_key: Option<String>,
+    /// ACL session token; sent only when set.
+    #[serde(default)]
+    pub security_token: Option<String>,
     /// Flush trigger record count (default 128).
     #[serde(default = "default_batch_size")]
     pub batch_size: Option<usize>,
-    /// Buffer capacity (`None` = unbounded).
-    #[serde(default)]
+    /// Buffer capacity (default 10000).
+    #[serde(default = "default_buffer_capacity")]
     pub buffer_capacity: Option<usize>,
     /// Linger flush window in ms (default 100).
     #[serde(default = "default_linger_ms")]
     pub linger_ms: Option<u64>,
-    /// Network request / connect timeout in ms (default 5000).
+    /// Network request and connect timeout in ms (default 5000).
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
 
 fn default_batch_size() -> Option<usize> {
-    Some(128)
+    Some(DEFAULT_BATCH_SIZE)
+}
+
+fn default_buffer_capacity() -> Option<usize> {
+    Some(DEFAULT_BUFFER_CAPACITY)
 }
 
 fn default_linger_ms() -> Option<u64> {
-    Some(100)
+    Some(DEFAULT_LINGER_MS)
 }
 
 impl RocketMqSinkConfig {
     pub fn timeout(&self) -> Duration {
-        Duration::from_millis(self.timeout_ms.unwrap_or(5000).max(1))
+        Duration::from_millis(self.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).max(1))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -122,6 +185,18 @@ impl RocketMqSinkConfig {
                 ))
             }
         }
+        if let Some(token) = &self.security_token {
+            if self.access_key.is_none() || self.secret_key.is_none() {
+                return Err(ConnectorError::Dispatch(
+                    "rocketmq security_token needs access_key and secret_key".to_string(),
+                ));
+            }
+            if token.is_empty() {
+                return Err(ConnectorError::Dispatch(
+                    "rocketmq security_token must not be empty".to_string(),
+                ));
+            }
+        }
         // Strict template checks with dummy values.
         if let Some(template) = &self.tag_template {
             resolve_system_field(template, "dummy/t", "dummy", 0)?;
@@ -153,7 +228,7 @@ impl RocketMqSinkConfig {
     }
 
     pub(crate) fn linger(&self) -> Duration {
-        Duration::from_millis(self.linger_ms.unwrap_or(100).max(1))
+        Duration::from_millis(self.linger_ms.unwrap_or(DEFAULT_LINGER_MS).max(1))
     }
 }
 
@@ -300,6 +375,54 @@ pub fn authorization_header(access_key: &str, secret_key: &str, signing_string: 
     let signature = base64::engine::general_purpose::STANDARD
         .encode(hmac_sha1(secret_key.as_bytes(), signing_string.as_bytes()));
     format!("MQ {access_key}:{signature}")
+}
+
+// ---------------------------------------------------------------------------
+// Vendor ACL request signing.
+// ---------------------------------------------------------------------------
+
+/// Vendor ACL signature for one remoting request.
+/// Sort the extension fields by name, join the values in order,
+/// append the body bytes, then Base64(HMAC-SHA1(secret, data)).
+/// Mirrors the vendor ACL client hook. A stale `Signature` entry
+/// never signs itself, so it is skipped.
+pub fn acl_signature(secret_key: &str, ext: &HashMap<String, String>, body: &[u8]) -> String {
+    use base64::Engine;
+    let mut keys: Vec<&String> = ext.keys().collect();
+    keys.sort();
+    let mut data = Vec::new();
+    for key in keys {
+        if key == "Signature" {
+            continue;
+        }
+        data.extend_from_slice(ext[key].as_bytes());
+    }
+    data.extend_from_slice(body);
+    base64::engine::general_purpose::STANDARD.encode(hmac_sha1(secret_key.as_bytes(), &data))
+}
+
+/// Add vendor ACL fields to one request map.
+/// Insert `AccessKey`, insert `SecurityToken` only when set,
+/// then compute `Signature` over the rest plus the body.
+/// Keyless requests stay unsigned.
+fn apply_acl_auth(
+    ext: &mut HashMap<String, String>,
+    body: &[u8],
+    access_key: Option<&str>,
+    secret_key: Option<&str>,
+    security_token: Option<&str>,
+) {
+    let (Some(access_key), Some(secret_key)) = (access_key, secret_key) else {
+        return;
+    };
+    ext.insert("AccessKey".to_string(), access_key.to_string());
+    if let Some(token) = security_token {
+        if !token.is_empty() {
+            ext.insert("SecurityToken".to_string(), token.to_string());
+        }
+    }
+    let signature = acl_signature(secret_key, ext, body);
+    ext.insert("Signature".to_string(), signature);
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +665,7 @@ impl TcpRocketMqTransport {
 
     async fn roundtrip(&self, frame: Vec<u8>) -> Result<Vec<u8>> {
         let mut guard = self.conn.lock().await;
-        for attempt in 0..2 {
+        for attempt in 0..EXCHANGE_ATTEMPTS {
             if guard.is_none() {
                 let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
                     .await
@@ -566,7 +689,7 @@ impl TcpRocketMqTransport {
                 let mut len_buf = [0u8; 4];
                 stream.read_exact(&mut len_buf).await?;
                 let len = u32::from_be_bytes(len_buf) as usize;
-                if len > 8 * 1024 * 1024 {
+                if len > MAX_FRAME_BYTES {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "rocketmq ack frame too large",
@@ -645,6 +768,519 @@ impl RocketMqTransport for TcpRocketMqTransport {
 }
 
 // ---------------------------------------------------------------------------
+// Vendor remoting protocol.
+// ---------------------------------------------------------------------------
+
+/// Strip URL schemes from an endpoint.
+/// Keep host and port only.
+fn strip_scheme(endpoint: &str) -> String {
+    endpoint
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_start_matches("tcp://")
+        .to_string()
+}
+
+/// Host part of an address.
+/// Return the full address when it has no port.
+fn host_of(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((host, _)) => host.to_string(),
+        None => addr.to_string(),
+    }
+}
+
+/// Port part of an address.
+/// Return empty when it has no port.
+fn port_of(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((_, port)) => port.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Encode one remoting frame.
+/// Layout is total + combined + header + body.
+fn encode_remoting(
+    code: i32,
+    ext: &HashMap<String, String>,
+    body: &[u8],
+    opaque: i32,
+) -> Result<Vec<u8>> {
+    let header = serde_json::json!({
+        "code": code,
+        "language": "JAVA",
+        "version": REMOTING_VERSION,
+        "opaque": opaque,
+        "flag": 0,
+        "remark": null,
+        "extFields": ext,
+    });
+    let header_bytes = serde_json::to_vec(&header).map_err(|e| {
+        ConnectorError::Dispatch(format!("rocketmq header is not JSON-encodable: {e}"))
+    })?;
+    let header_len = header_bytes.len();
+    if header_len > MAX_FRAME_BYTES {
+        return Err(ConnectorError::Dispatch(
+            "rocketmq header exceeds the frame bound".to_string(),
+        ));
+    }
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(ConnectorError::Dispatch(
+            "rocketmq body exceeds the frame bound".to_string(),
+        ));
+    }
+    let combined = (SERIALIZE_JSON << 24) | (header_len as u32);
+    let total = (4 + header_len + body.len()) as u32;
+    let mut frame = Vec::with_capacity(8 + header_len + body.len());
+    frame.extend_from_slice(&total.to_be_bytes());
+    frame.extend_from_slice(&combined.to_be_bytes());
+    frame.extend_from_slice(&header_bytes);
+    frame.extend_from_slice(body);
+    Ok(frame)
+}
+
+/// Decode one remoting reply.
+/// Return code, fields, remark, flag and opaque.
+fn decode_remoting(combined: u32, header_bytes: &[u8]) -> Result<DecodedRemoting> {
+    let header_len = (combined & 0x00FF_FFFF) as usize;
+    if header_len != header_bytes.len() {
+        return Err(ConnectorError::Connection(
+            "rocketmq header length mismatch".to_string(),
+        ));
+    }
+    let header: serde_json::Value = serde_json::from_slice(header_bytes)
+        .map_err(|e| ConnectorError::Connection(format!("rocketmq header is not JSON: {e}")))?;
+    let code = header.get("code").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
+    let flag = header.get("flag").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let opaque = header.get("opaque").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
+    let remark = header
+        .get("remark")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut fields = HashMap::new();
+    if let Some(map) = header.get("extFields").and_then(|v| v.as_object()) {
+        for (key, value) in map {
+            if let Some(text) = value.as_str() {
+                fields.insert(key.clone(), text.to_string());
+            } else {
+                fields.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    Ok((code, fields, remark, flag, opaque))
+}
+
+/// One remoting exchange.
+/// Open a socket, send one frame, read one reply.
+/// Skip broker pushes on the same socket.
+async fn remoting_exchange(
+    addr: &str,
+    frame: Vec<u8>,
+    expect_opaque: i32,
+    timeout: Duration,
+) -> Result<RemotingResult> {
+    let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .map_err(|_| ConnectorError::Connection(format!("rocketmq connect timeout: {addr}")))?
+        .map_err(|e| {
+            ConnectorError::Connection(format!("rocketmq connect to {addr} failed: {e}"))
+        })?;
+    let reply = async {
+        stream.write_all(&frame).await?;
+        for _ in 0..=MAX_PUSH_SKIPS {
+            let mut total_buf = [0u8; 4];
+            stream.read_exact(&mut total_buf).await?;
+            let total = u32::from_be_bytes(total_buf) as usize;
+            if !(4..=MAX_FRAME_BYTES + 1024).contains(&total) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "rocketmq frame total out of bound",
+                ));
+            }
+            let mut combined_buf = [0u8; 4];
+            stream.read_exact(&mut combined_buf).await?;
+            let combined = u32::from_be_bytes(combined_buf);
+            let header_len = (combined & 0x00FF_FFFF) as usize;
+            if header_len > MAX_FRAME_BYTES || header_len + 4 > total {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "rocketmq header out of bound",
+                ));
+            }
+            let body_len = total - 4 - header_len;
+            if body_len > MAX_FRAME_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "rocketmq body out of bound",
+                ));
+            }
+            let mut header_bytes = vec![0u8; header_len];
+            stream.read_exact(&mut header_bytes).await?;
+            let mut body = vec![0u8; body_len];
+            if body_len > 0 {
+                stream.read_exact(&mut body).await?;
+            }
+            // Broker push is a request on the same socket.
+            // Reason: heartbeat register wakes a notify.
+            let header: serde_json::Value =
+                serde_json::from_slice(&header_bytes).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "rocketmq header is not JSON",
+                    )
+                })?;
+            let flag = header.get("flag").and_then(|v| v.as_i64()).unwrap_or(0);
+            let opaque = header.get("opaque").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if (flag & 1) == 0 {
+                continue;
+            }
+            if opaque != expect_opaque as i64 {
+                continue;
+            }
+            return Ok::<(u32, u32, Vec<u8>, Vec<u8>), std::io::Error>((
+                total as u32,
+                combined,
+                header_bytes,
+                body,
+            ));
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "rocketmq exchange got only pushes",
+        ))
+    };
+    let (_, combined, header_bytes, body) = tokio::time::timeout(timeout, reply)
+        .await
+        .map_err(|_| ConnectorError::Connection("rocketmq exchange timed out".to_string()))?
+        .map_err(|e| ConnectorError::Connection(format!("rocketmq exchange failed: {e}")))?;
+    let (code, fields, remark, _, _) = decode_remoting(combined, &header_bytes)?;
+    Ok((code, fields, body, remark))
+}
+
+/// One exchange on an open socket.
+/// Send one frame, read one reply on the same stream.
+/// Skip broker pushes on the same socket.
+/// Keep the heartbeat and the pulls on one stream.
+/// Reason: the broker ties the group to the channel.
+#[cfg(test)]
+async fn remoting_exchange_on_stream(
+    stream: &mut TcpStream,
+    frame: Vec<u8>,
+    expect_opaque: i32,
+    timeout: Duration,
+) -> Result<RemotingResult> {
+    let reply = async {
+        stream.write_all(&frame).await?;
+        for _ in 0..=MAX_PUSH_SKIPS {
+            let mut total_buf = [0u8; 4];
+            stream.read_exact(&mut total_buf).await?;
+            let total = u32::from_be_bytes(total_buf) as usize;
+            if !(4..=MAX_FRAME_BYTES + 1024).contains(&total) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "rocketmq frame total out of bound",
+                ));
+            }
+            let mut combined_buf = [0u8; 4];
+            stream.read_exact(&mut combined_buf).await?;
+            let combined = u32::from_be_bytes(combined_buf);
+            let header_len = (combined & 0x00FF_FFFF) as usize;
+            if header_len > MAX_FRAME_BYTES || header_len + 4 > total {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "rocketmq header out of bound",
+                ));
+            }
+            let body_len = total - 4 - header_len;
+            if body_len > MAX_FRAME_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "rocketmq body out of bound",
+                ));
+            }
+            let mut header_bytes = vec![0u8; header_len];
+            stream.read_exact(&mut header_bytes).await?;
+            let mut body = vec![0u8; body_len];
+            if body_len > 0 {
+                stream.read_exact(&mut body).await?;
+            }
+            // Broker push is a request on the same socket.
+            // Reason: heartbeat register wakes a notify.
+            let header: serde_json::Value =
+                serde_json::from_slice(&header_bytes).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "rocketmq header is not JSON",
+                    )
+                })?;
+            let flag = header.get("flag").and_then(|v| v.as_i64()).unwrap_or(0);
+            let opaque = header.get("opaque").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if (flag & 1) == 0 {
+                continue;
+            }
+            if opaque != expect_opaque as i64 {
+                continue;
+            }
+            return Ok::<(u32, u32, Vec<u8>, Vec<u8>), std::io::Error>((
+                total as u32,
+                combined,
+                header_bytes,
+                body,
+            ));
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "rocketmq exchange got only pushes",
+        ))
+    };
+    let (_, combined, header_bytes, body) = tokio::time::timeout(timeout, reply)
+        .await
+        .map_err(|_| ConnectorError::Connection("rocketmq exchange timed out".to_string()))?
+        .map_err(|e| ConnectorError::Connection(format!("rocketmq exchange failed: {e}")))?;
+    let (code, fields, remark, _, _) = decode_remoting(combined, &header_bytes)?;
+    Ok((code, fields, body, remark))
+}
+
+/// Route result: broker address and queue count.
+#[derive(Debug)]
+struct BrokerRoute {
+    addr: String,
+    queues: u32,
+}
+
+/// Fetch the broker route from the nameserver.
+/// Replace a loopback broker host with the nameserver host.
+/// Signs the lookup when keys are set.
+async fn fetch_broker_route(
+    namesrv: &str,
+    topic: &str,
+    timeout: Duration,
+    opaque: &AtomicI32,
+    access_key: Option<&str>,
+    secret_key: Option<&str>,
+    security_token: Option<&str>,
+) -> Result<BrokerRoute> {
+    let mut lookup = topic;
+    // Missing topics use the default route.
+    // Reason: the vendor auto-creates on send.
+    for attempt in 0..2 {
+        let mut ext = HashMap::new();
+        ext.insert("topic".to_string(), lookup.to_string());
+        apply_acl_auth(&mut ext, &[], access_key, secret_key, security_token);
+        let id = opaque.fetch_add(1, Ordering::SeqCst);
+        let frame = encode_remoting(REQUEST_GET_ROUTEINFO, &ext, &[], id)?;
+        let (code, _fields, body, remark) = remoting_exchange(namesrv, frame, id, timeout).await?;
+        if code == RESPONSE_TOPIC_NOT_EXIST && attempt == 0 && lookup != DEFAULT_TOPIC_KEY {
+            lookup = DEFAULT_TOPIC_KEY;
+            continue;
+        }
+        if code != RESPONSE_SUCCESS {
+            return Err(ConnectorError::Connection(format!(
+                "rocketmq route for {topic} failed code {code}: {remark}"
+            )));
+        }
+        let route: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| ConnectorError::Connection(format!("rocketmq route is not JSON: {e}")))?;
+        let mut broker_name = String::new();
+        let mut broker_addr = String::new();
+        if let Some(list) = route.get("brokerDatas").and_then(|v| v.as_array()) {
+            for entry in list {
+                let name = entry
+                    .get("brokerName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(addrs) = entry.get("brokerAddrs").and_then(|v| v.as_object()) {
+                    if let Some(addr) = addrs.get("0").and_then(|v| v.as_str()) {
+                        broker_name = name;
+                        broker_addr = addr.to_string();
+                        break;
+                    }
+                }
+            }
+        }
+        if broker_addr.is_empty() {
+            return Err(ConnectorError::Connection(format!(
+                "rocketmq route for {topic} has no master"
+            )));
+        }
+        let mut queues = DEFAULT_QUEUE_NUMS;
+        if let Some(list) = route.get("queueDatas").and_then(|v| v.as_array()) {
+            for entry in list {
+                let name = entry
+                    .get("brokerName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if name == broker_name {
+                    if let Some(count) = entry.get("writeQueueNums").and_then(|v| v.as_u64()) {
+                        if count > 0 {
+                            queues = count as u32;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        // New topics use the vendor queue count.
+        // Reason: auto-create uses the send queue count.
+        if lookup == DEFAULT_TOPIC_KEY && topic != DEFAULT_TOPIC_KEY {
+            queues = DEFAULT_QUEUE_NUMS;
+        }
+        let host = host_of(&broker_addr);
+        let port = port_of(&broker_addr);
+        let fixed = if host == "127.0.0.1" || host == "localhost" {
+            format!("{}:{port}", host_of(namesrv))
+        } else {
+            broker_addr
+        };
+        return Ok(BrokerRoute {
+            addr: fixed,
+            queues: queues.max(1),
+        });
+    }
+    Err(ConnectorError::Connection(format!(
+        "rocketmq route for {topic} failed code {RESPONSE_TOPIC_NOT_EXIST}"
+    )))
+}
+
+/// Encode vendor message properties.
+/// Use NAME_VALUE_SEPARATOR (0x01) and PROPERTY_SEPARATOR (0x02).
+fn encode_vendor_properties(tag: Option<&str>, keys: &[String]) -> String {
+    let mut out = String::new();
+    if let Some(tag) = tag {
+        if !tag.is_empty() {
+            out.push_str("TAGS");
+            out.push('\u{1}');
+            out.push_str(tag);
+            out.push('\u{2}');
+        }
+    }
+    if !keys.is_empty() {
+        let joined = keys.join(" ");
+        if !joined.trim().is_empty() {
+            out.push_str("KEYS");
+            out.push('\u{1}');
+            out.push_str(&joined);
+            out.push('\u{2}');
+        }
+    }
+    out
+}
+
+/// Vendor transport on the remoting protocol.
+/// It dials the nameserver, then the broker.
+/// It signs each request when keys are set.
+pub struct RemotingRocketMqTransport {
+    namesrv: String,
+    timeout: Duration,
+    opaque: AtomicI32,
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    security_token: Option<String>,
+}
+
+impl RemotingRocketMqTransport {
+    pub fn new(config: &RocketMqSinkConfig) -> Result<Self> {
+        config.validate()?;
+        let raw = config.endpoints[0].clone();
+        let namesrv = strip_scheme(&raw);
+        if namesrv.trim().is_empty() {
+            return Err(ConnectorError::Dispatch(
+                "rocketmq endpoints must not be empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            namesrv,
+            timeout: config.timeout(),
+            opaque: AtomicI32::new(1),
+            access_key: config.access_key.clone(),
+            secret_key: config.secret_key.clone(),
+            security_token: config.security_token.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl RocketMqTransport for RemotingRocketMqTransport {
+    async fn send_messages(
+        &self,
+        topic: &str,
+        _client_id: &str,
+        _datetime: &str,
+        _authorization: Option<&str>,
+        messages: Vec<RocketMqMessage>,
+    ) -> Result<()> {
+        let route = fetch_broker_route(
+            &self.namesrv,
+            topic,
+            self.timeout,
+            &self.opaque,
+            self.access_key.as_deref(),
+            self.secret_key.as_deref(),
+            self.security_token.as_deref(),
+        )
+        .await?;
+        for message in &messages {
+            let queue = match &message.properties.message_group {
+                Some(group) => fifo_partition(Some(group), route.queues),
+                None => 0,
+            };
+            let props = encode_vendor_properties(
+                message.properties.tag.as_deref(),
+                &message.properties.keys,
+            );
+            let mut ext = HashMap::new();
+            ext.insert(PRODUCER_GROUP.to_string(), PRODUCER_GROUP.to_string());
+            ext.insert("topic".to_string(), topic.to_string());
+            ext.insert("defaultTopic".to_string(), DEFAULT_TOPIC_KEY.to_string());
+            ext.insert(
+                "defaultTopicQueueNums".to_string(),
+                DEFAULT_QUEUE_NUMS.to_string(),
+            );
+            ext.insert("queueId".to_string(), queue.to_string());
+            ext.insert("sysFlag".to_string(), "0".to_string());
+            ext.insert("bornTimestamp".to_string(), now_millis().to_string());
+            ext.insert("flag".to_string(), "0".to_string());
+            ext.insert("properties".to_string(), props);
+            ext.insert("reconsumeTimes".to_string(), "0".to_string());
+            ext.insert("unitMode".to_string(), "false".to_string());
+            // Keyed sends sign here, never on the envelope path.
+            // Reason: production only speaks remoting.
+            apply_acl_auth(
+                &mut ext,
+                &message.body,
+                self.access_key.as_deref(),
+                self.secret_key.as_deref(),
+                self.security_token.as_deref(),
+            );
+            let id = self.opaque.fetch_add(1, Ordering::SeqCst);
+            let frame = encode_remoting(REQUEST_SEND_MESSAGE, &ext, &message.body, id)?;
+            let (code, _fields, _body, remark) =
+                remoting_exchange(&route.addr, frame, id, self.timeout).await?;
+            if code == RESPONSE_SUCCESS {
+                continue;
+            }
+            if code == RESPONSE_MESSAGE_ILLEGAL
+                || code == RESPONSE_NO_PERMISSION
+                || code == RESPONSE_TOPIC_NOT_EXIST
+            {
+                return Err(ConnectorError::Dispatch(format!(
+                    "rocketmq {topic} refused code {code}: {remark}"
+                )));
+            }
+            return Err(ConnectorError::Connection(format!(
+                "rocketmq {topic} to {} failed code {code}: {remark}",
+                route.addr
+            )));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sink.
 // ---------------------------------------------------------------------------
 
@@ -656,8 +1292,8 @@ struct RocketMqRow {
     message_id: u64,
 }
 
-/// RocketMQ sink: buffers events, sends one envelope per flush with
-/// fresh timestamps + signatures per attempt.
+/// RocketMQ sink: buffers events, sends one vendor message per row.
+/// Each attempt uses fresh timestamps and signatures.
 pub struct RocketMqSink {
     config: RocketMqSinkConfig,
     transport: Arc<dyn RocketMqTransport>,
@@ -737,9 +1373,9 @@ impl RocketMqSink {
         Ok(messages)
     }
 
-    /// Flush buffered rows as one envelope (no-op when empty). The
-    /// datetime + signature are fresh per flush; any failure restores
-    /// the pending rows, engages backoff and propagates.
+    /// Flush buffered rows as remoting frames (no-op when empty).
+    /// Each flush uses fresh timestamps and signatures.
+    /// Any failure restores rows, engages backoff and propagates.
     pub async fn flush(&self) -> Result<()> {
         self.backoff.lock().check()?;
         let (rows, oldest) = {
@@ -876,6 +1512,16 @@ mod tests {
     use super::*;
     use broker_connectors::Sink;
 
+    // Vendor request code for pull.
+    // Reason: the vendor broker uses 11 for pull.
+    const REQUEST_PULL_MESSAGE: i32 = 11;
+    // Vendor pull miss code.
+    // Reason: the vendor uses 19 when no message exists.
+    const RESPONSE_PULL_NOT_FOUND: i32 = 19;
+    // Pull batch reads 32 rows.
+    // Reason: 32 rows keep one pull small.
+    const PULL_BATCH_SIZE: usize = 32;
+
     fn test_config() -> RocketMqSinkConfig {
         RocketMqSinkConfig {
             endpoints: vec!["127.0.0.1:8081".to_string()],
@@ -885,6 +1531,7 @@ mod tests {
             message_group_template: Some("group-${client_id}".to_string()),
             access_key: Some("rocket-key".to_string()),
             secret_key: Some("rocket-secret".to_string()),
+            security_token: None,
             batch_size: Some(128),
             buffer_capacity: None,
             linger_ms: Some(100),
@@ -921,6 +1568,18 @@ mod tests {
         assert!(config.validate().is_err());
         config.secret_key = test_config().secret_key;
 
+        // A token needs both keys and must not be empty.
+        config.security_token = Some(String::new());
+        assert!(config.validate().is_err(), "empty token must fail");
+        config.security_token = Some("token-1".to_string());
+        assert!(config.validate().is_ok());
+        config.access_key = None;
+        config.secret_key = None;
+        assert!(config.validate().is_err(), "lone token must fail");
+        config.access_key = test_config().access_key;
+        config.secret_key = test_config().secret_key;
+        config.security_token = None;
+
         config.tag_template = Some("${bogus}".to_string());
         assert!(config.validate().is_err());
         config.tag_template = test_config().tag_template;
@@ -950,6 +1609,62 @@ mod tests {
             authorization_header("rocket-key", "rocket-secret", &sts),
             "MQ rocket-key:QQN6h/kBpUCyFPOPZ60kUDksydc="
         );
+    }
+
+    #[test]
+    fn test_acl_signature_known_answer() {
+        // Independent vector from Python, never from the code under test.
+        // Made with: python3 -c "import hmac,hashlib,base64;
+        // ext={'AccessKey':'AK-1','queueId':'0','topic':'T9'};
+        // data=''.join(ext[k] for k in sorted(ext)).encode()+b'body-12';
+        // print(base64.b64encode(hmac.new(b'test-secret-7',data,hashlib.sha1).digest()).decode())"
+        // which prints G+gWda8KrZ5ka1k/BGN8OCufQX0=.
+        let mut ext = HashMap::new();
+        ext.insert("topic".to_string(), "T9".to_string());
+        ext.insert("queueId".to_string(), "0".to_string());
+        ext.insert("AccessKey".to_string(), "AK-1".to_string());
+        assert_eq!(
+            acl_signature("test-secret-7", &ext, b"body-12"),
+            "G+gWda8KrZ5ka1k/BGN8OCufQX0="
+        );
+        // A stale Signature entry never signs itself.
+        ext.insert("Signature".to_string(), "stale".to_string());
+        assert_eq!(
+            acl_signature("test-secret-7", &ext, b"body-12"),
+            "G+gWda8KrZ5ka1k/BGN8OCufQX0="
+        );
+        // Keyed requests carry AccessKey plus Signature.
+        // A set token rides along, an absent token stays out.
+        let mut signed = HashMap::new();
+        signed.insert("topic".to_string(), "T9".to_string());
+        apply_acl_auth(
+            &mut signed,
+            b"body-12",
+            Some("AK-1"),
+            Some("test-secret-7"),
+            None,
+        );
+        assert_eq!(signed.get("AccessKey").map(String::as_str), Some("AK-1"));
+        assert!(!signed.contains_key("SecurityToken"));
+        let first = signed.get("Signature").cloned().expect("signed");
+        assert!(!first.is_empty());
+        apply_acl_auth(
+            &mut signed,
+            b"body-12",
+            Some("AK-1"),
+            Some("test-secret-7"),
+            Some("TOK-2"),
+        );
+        assert_eq!(
+            signed.get("SecurityToken").map(String::as_str),
+            Some("TOK-2")
+        );
+        // Keyless requests stay unsigned.
+        let mut bare = HashMap::new();
+        bare.insert("topic".to_string(), "T9".to_string());
+        apply_acl_auth(&mut bare, b"body-12", None, None, None);
+        assert!(!bare.contains_key("AccessKey"));
+        assert!(!bare.contains_key("Signature"));
     }
 
     #[test]
@@ -1215,5 +1930,441 @@ mod tests {
         let mut config = test_config();
         config.endpoints = vec![format!("127.0.0.1:{port}")];
         config
+    }
+
+    /// Fail closed when the named env is missing.
+    fn qual_required(name: &str) -> String {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| panic!("{name} must name a real server for qualification"))
+    }
+
+    /// Drop unmatched egress for the rule path.
+    struct NullBrokerSink;
+
+    #[async_trait::async_trait]
+    impl broker_rules::BrokerSink for NullBrokerSink {
+        async fn publish(
+            &self,
+            _topic: Topic,
+            _payload: Bytes,
+            _qos: QoS,
+            _retain: bool,
+        ) -> std::result::Result<(), broker_rules::RuleEngineError> {
+            Ok(())
+        }
+    }
+
+    /// Vendor request code for heartbeat.
+    /// Reason: the vendor broker uses 34 for the client heartbeat.
+    /// Code 32 is GET_EARLIEST_MSG_STORETIME, not a heartbeat.
+    const REQUEST_HEART_BEAT: i32 = 34;
+
+    /// Register the consumer group with the broker before pulling.
+    /// The vendor rejects pulls from a group it has never seen (code 24).
+    /// The heartbeat body carries the consumer group and its subscription,
+    /// as a real consumer client sends. Without it the broker never
+    /// registers the group and every pull returns code 24.
+    /// Run on the pull stream and keep it open.
+    /// Reason: the broker ties the group to the channel.
+    async fn qual_register_group(
+        stream: &mut TcpStream,
+        broker_label: &str,
+        group: &str,
+        topic: &str,
+        timeout: Duration,
+        opaque: &AtomicI32,
+        sub_version: i64,
+    ) -> Result<()> {
+        let ext = HashMap::new();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "clientID": format!("indra-qual-{group}"),
+            "producerDataSet": [],
+            "consumerDataSet": [{
+                "groupName": group,
+                "consumeType": "CONSUME_PASSIVELY",
+                "messageModel": "CLUSTERING",
+                "consumeFromWhere": "CONSUME_FROM_LAST_OFFSET",
+                "subscriptionDataSet": [{
+                    "classFilterMode": false,
+                    "topic": topic,
+                    "subString": "*",
+                    "tagsSet": ["*"],
+                    "codeSet": [],
+                    "subVersion": sub_version,
+                    "expressionType": "TAG"
+                }],
+                "unitMode": false
+            }],
+        }))
+        .map_err(|e| {
+            ConnectorError::Connection(format!("rocketmq heartbeat body is not JSON: {e}"))
+        })?;
+        let id = opaque.fetch_add(1, Ordering::SeqCst);
+        let frame = encode_remoting(REQUEST_HEART_BEAT, &ext, &body, id)?;
+        let (code, _fields, _body, remark) =
+            remoting_exchange_on_stream(stream, frame, id, timeout).await?;
+        eprintln!("qual register: broker={broker_label} code={code} remark={remark}");
+        if code != RESPONSE_SUCCESS {
+            return Err(ConnectorError::Connection(format!(
+                "rocketmq register group {group} at {broker_label} failed code {code}: {remark}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Arguments for one remoting pull.
+    /// Grouped so `qual_pull_once` stays under the seven-argument
+    /// clippy limit without an `allow` attribute.
+    struct QualPullOnce<'a> {
+        topic: &'a str,
+        group: &'a str,
+        timeout: Duration,
+        opaque: &'a AtomicI32,
+        sub_version: i64,
+    }
+
+    /// Pull one queue at one offset through remoting.
+    /// Run on the registered stream.
+    /// Return code, fields and body.
+    async fn qual_pull_once(
+        stream: &mut TcpStream,
+        args: &QualPullOnce<'_>,
+        queue: u32,
+        offset: i64,
+    ) -> Result<(i32, HashMap<String, String>, Vec<u8>, String)> {
+        let mut ext = HashMap::new();
+        ext.insert("consumerGroup".to_string(), args.group.to_string());
+        ext.insert("topic".to_string(), args.topic.to_string());
+        ext.insert("queueId".to_string(), queue.to_string());
+        ext.insert("queueOffset".to_string(), offset.to_string());
+        ext.insert("maxMsgNums".to_string(), PULL_BATCH_SIZE.to_string());
+        ext.insert("sysFlag".to_string(), "0".to_string());
+        ext.insert("commitOffset".to_string(), "0".to_string());
+        ext.insert("suspendTimeoutMillis".to_string(), "0".to_string());
+        ext.insert("subscription".to_string(), "*".to_string());
+        ext.insert("expressionType".to_string(), "TAG".to_string());
+        ext.insert("subVersion".to_string(), args.sub_version.to_string());
+        let id = args.opaque.fetch_add(1, Ordering::SeqCst);
+        let frame = encode_remoting(REQUEST_PULL_MESSAGE, &ext, &[], id)?;
+        remoting_exchange_on_stream(stream, frame, id, args.timeout).await
+    }
+
+    /// Qualification against a real vendor server.
+    ///
+    /// Run with e.g.:
+    /// `ROCKETMQ_NAMESRV=127.0.0.1:9876 ROCKETMQ_TOPIC=qual-b339
+    ///  ROCKETMQ_GROUP=qual-group
+    ///  cargo test -p broker-connectors-enterprise --lib
+    ///  rocketmq::tests::test_qualify_driver_write_path --
+    ///  --ignored --nocapture --test-threads=1`
+    ///
+    /// It streams rows through the broker rule path on the vendor
+    /// transport. It drives both production entries. It reads rows
+    /// back through an independent pull. It asserts the exact count
+    /// plus the first and the last payload. It proves a bad node
+    /// fails closed. It panics when env is missing.
+    ///
+    /// TODO(parity): token auth against a secured server stays
+    /// unqualified, which error codes are terminal is open.
+    #[tokio::test]
+    #[ignore = "needs a real vendor server (see ROCKETMQ_* env)"]
+    async fn test_qualify_driver_write_path() {
+        use broker_protocol::TopicFilter;
+        use broker_rules::{BackpressurePolicy, RuleEngine};
+
+        // Qual writes 100 rows, 50 per entry.
+        // Reason: two entries need equal halves.
+        const ROWS: usize = 100;
+
+        let namesrv = qual_required("ROCKETMQ_NAMESRV");
+        let topic = qual_required("ROCKETMQ_TOPIC");
+        let group = qual_required("ROCKETMQ_GROUP");
+        assert!(
+            namesrv.contains(':'),
+            "qual namesrv must carry a port, got {namesrv:?}"
+        );
+        assert!(!topic.trim().is_empty(), "qual topic must not be empty");
+        assert!(!group.trim().is_empty(), "qual group must not be empty");
+
+        // Unique run tag keeps old rows out of the count.
+        let run_id = format!("{}-{}", now_millis(), std::process::id());
+        // One subscription version for the whole session: the heartbeat
+        // registers it and every pull repeats it, as a real consumer does.
+        // A fresh subVersion per pull makes the broker reject the pull with
+        // code 25 (the consumer's subscription not latest).
+        let sub_version = now_millis();
+        eprintln!("qual server: namesrv={namesrv} topic={topic} group={group}");
+
+        // Good path rides both production entries.
+        // Reason: the qual must fail when either entry breaks.
+        // Rule-task channels hold 65536 events.
+        // Reason: the default window depth fits the qual burst.
+        let engine = RuleEngine::new(65_536, BackpressurePolicy::DropOldest);
+
+        // Entry one runs through `build_connector`.
+        // Batch one flushes each send, so no explicit flush runs.
+        // Buffer 10000 caps memory per rule sink.
+        // Linger 10 flushes idle batches fast.
+        // Timeout 30000 covers vendor send plus route lookup.
+        let api_config = serde_json::json!({
+            "endpoints": [namesrv.clone()],
+            "topic": topic.clone(),
+            "batch_size": 1,
+            "buffer_capacity": 10000,
+            "linger_ms": 10,
+            "timeout_ms": 30_000
+        });
+        let api_req = broker_api::CreateConnectorRequest {
+            id: "qual-rocketmq-api".to_string(),
+            kind: "rocketmq".to_string(),
+            config: api_config,
+        };
+        let (api_kind, api_sink) = broker_api::build_connector(&api_req)
+            .await
+            .expect("qual build_connector builds");
+        assert_eq!(api_kind, "rocketmq");
+        assert_eq!(api_sink.kind(), "rocketmq");
+        engine.connectors().register("qual-rocketmq-api", api_sink);
+
+        // Entry two runs through `register_live_sink`.
+        // Timeout 30000 covers vendor send plus route lookup.
+        let v5_body = serde_json::json!({
+            "endpoint": namesrv.clone(),
+            "topic": topic.clone(),
+            "timeout_ms": 30_000
+        });
+        broker_api::v5::rules::register_live_sink(
+            &engine,
+            "rocketmq",
+            "qual-rocketmq-v5",
+            &v5_body,
+        )
+        .await
+        .expect("qual register_live_sink builds");
+        let v5_sink = engine
+            .connectors()
+            .get("qual-rocketmq-v5")
+            .expect("qual v5 sink registers");
+        assert_eq!(v5_sink.kind(), "rocketmq");
+
+        // Broker path: rule actions send through the shared manager.
+        // The qual sends through it, never `sink.send` direct.
+        engine
+            .create_rule(
+                "qual-rocketmq-rule-api".to_string(),
+                TopicFilter::new("qual/rocketmq/a/+").unwrap(),
+                Some(
+                    r#"SELECT seq, run_id, client_id FROM "qual/rocketmq/a/+" INTO connector("qual-rocketmq-api")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        engine
+            .create_rule(
+                "qual-rocketmq-rule-v5".to_string(),
+                TopicFilter::new("qual/rocketmq/b/+").unwrap(),
+                Some(
+                    r#"SELECT seq, run_id, client_id FROM "qual/rocketmq/b/+" INTO connector("qual-rocketmq-v5")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("rule creates");
+        let egress: Arc<dyn broker_rules::BrokerSink> = Arc::new(NullBrokerSink);
+
+        for seq in 0..50 {
+            let mqtt_topic =
+                Topic::new(format!("qual/rocketmq/a/dev-{seq:04}")).expect("qual topic builds");
+            let payload = Bytes::from(format!(
+                r#"{{"seq":{seq},"run_id":"{run_id}","client_id":"dev-{seq:04}"}}"#
+            ));
+            engine
+                .dispatch_ingress(&mqtt_topic, &payload, QoS::AtLeastOnce, &egress)
+                .await;
+        }
+        for seq in 50..ROWS {
+            let mqtt_topic =
+                Topic::new(format!("qual/rocketmq/b/dev-{seq:04}")).expect("qual topic builds");
+            let payload = Bytes::from(format!(
+                r#"{{"seq":{seq},"run_id":"{run_id}","client_id":"dev-{seq:04}"}}"#
+            ));
+            engine
+                .dispatch_ingress(&mqtt_topic, &payload, QoS::AtLeastOnce, &egress)
+                .await;
+        }
+
+        // Independent pull reads the rows back.
+        let timeout = Duration::from_secs(30);
+        let opaque = AtomicI32::new(1);
+        let route = fetch_broker_route(&namesrv, &topic, timeout, &opaque, None, None, None)
+            .await
+            .expect("qual route fetches");
+        eprintln!("qual route: broker={} queues={}", route.addr, route.queues);
+        // The vendor creates four queues for a new topic.
+        // Reason: auto-create uses the send queue count.
+        assert_eq!(route.queues, 4, "qual route must carry four queues");
+        // Open one broker session for register plus pulls.
+        // Reason: the broker ties the group to the channel.
+        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&route.addr))
+            .await
+            .expect("qual broker connects")
+            .expect("qual broker connects");
+        // The vendor rejects pulls from an unregistered group (code 24).
+        // Register the group with a heartbeat first, as a real consumer client does.
+        // Pass the topic and the group, then wait for code 0.
+        qual_register_group(
+            &mut stream,
+            &route.addr,
+            &group,
+            &topic,
+            timeout,
+            &opaque,
+            sub_version,
+        )
+        .await
+        .expect("qual register group");
+        let pull = QualPullOnce {
+            topic: &topic,
+            group: &group,
+            timeout,
+            opaque: &opaque,
+            sub_version,
+        };
+        let mut collected = Vec::new();
+        // Drain each queue on the registered stream.
+        // Reason: one pull reads at most 32 rows.
+        for queue in 0..route.queues {
+            let mut offset: i64 = 0;
+            // Pull up to 200 times to drain one queue.
+            // Reason: one pull reads at most 32 rows.
+            for _ in 0..200 {
+                let (code, fields, body, remark) =
+                    qual_pull_once(&mut stream, &pull, queue, offset)
+                        .await
+                        .expect("qual pull sends");
+                if code == RESPONSE_SUCCESS {
+                    collected.extend_from_slice(&body);
+                    let next = fields
+                        .get("nextBeginOffset")
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(offset + 1);
+                    if next <= offset {
+                        break;
+                    }
+                    offset = next;
+                    // Cap collected bytes at four max frames.
+                    // Reason: a larger reply means a fault.
+                    if collected.len() > MAX_FRAME_BYTES * 4 {
+                        break;
+                    }
+                } else if code == RESPONSE_PULL_NOT_FOUND {
+                    break;
+                } else {
+                    panic!("qual pull failed code {code}: {remark}");
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&collected).to_string();
+        for seq in 0..ROWS {
+            let needle = format!(r#""seq":{seq},"run_id":"{run_id}""#);
+            assert!(text.contains(&needle), "qual missing seq {seq}");
+        }
+        let first = format!(r#""seq":0,"run_id":"{run_id}""#);
+        let last = format!(r#""seq":{},"run_id":"{run_id}""#, ROWS - 1);
+        assert!(text.contains(&first), "qual first row");
+        assert!(text.contains(&last), "qual last row");
+        eprintln!("qual rows asserted: count={ROWS} first={first} last={last}");
+
+        // Fault: a bad node fails closed with the node text.
+        let probe = tokio::net::TcpStream::connect("127.0.0.1:1")
+            .await
+            .expect_err("qual probe: port 1 must refuse");
+        let probe_text = probe.to_string().to_lowercase();
+        assert!(
+            probe_text.contains("refus"),
+            "qual probe text: {probe_text}"
+        );
+        // Fault rides the production entry with a bad node.
+        // Fault goes through the rule path, never direct send.
+        // Reason: the rule path is the production path.
+        // Batch one flushes on send, so dispatch must fail.
+        // Buffer 10000 caps memory. Linger 10 keeps the fault fast.
+        // Timeout 5000 keeps the fault fast.
+        let bad_config = serde_json::json!({
+            "endpoints": ["127.0.0.1:1"],
+            "topic": topic.clone(),
+            "batch_size": 1,
+            "buffer_capacity": 10000,
+            "linger_ms": 10,
+            "timeout_ms": 5_000
+        });
+        let bad_req = broker_api::CreateConnectorRequest {
+            id: "qual-rocketmq-bad".to_string(),
+            kind: "rocketmq".to_string(),
+            config: bad_config,
+        };
+        let (_, bad_sink) = broker_api::build_connector(&bad_req)
+            .await
+            .expect("qual bad build succeeds");
+        // Fault engine holds 1024 events.
+        // Reason: one bad row needs a small queue.
+        let bad_engine = RuleEngine::new(1024, BackpressurePolicy::DropOldest);
+        bad_engine
+            .connectors()
+            .register("qual-rocketmq-bad", bad_sink);
+        // Use the returned id.
+        // Reason: create_rule assigns id rule-N.
+        let bad_rule_id = bad_engine
+            .create_rule(
+                "qual-rocketmq-rule-bad".to_string(),
+                TopicFilter::new("qual/rocketmq/bad/+").unwrap(),
+                Some(
+                    r#"SELECT seq FROM "qual/rocketmq/bad/+" INTO connector("qual-rocketmq-bad")"#
+                        .to_string(),
+                ),
+                true,
+                vec![],
+            )
+            .expect("bad rule creates")
+            .id
+            .clone();
+        let bad_egress: Arc<dyn broker_rules::BrokerSink> = Arc::new(NullBrokerSink);
+        bad_engine
+            .dispatch_ingress(
+                &Topic::new("qual/rocketmq/bad/0").expect("qual bad topic builds"),
+                &Bytes::from_static(br#"{"seq":-1}"#),
+                QoS::AtLeastOnce,
+                &bad_egress,
+            )
+            .await;
+        let bad_rule = bad_engine.get_rule(&bad_rule_id).expect("bad rule stays");
+        assert!(
+            bad_rule.actions_failed_cnt.load(Ordering::Relaxed) == 1,
+            "wrong node must fail closed"
+        );
+        let route_err = fetch_broker_route(
+            "127.0.0.1:1",
+            &topic,
+            Duration::from_secs(5),
+            &opaque,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("wrong node must fail");
+        match &route_err {
+            ConnectorError::Connection(message) => assert!(
+                message.to_lowercase().contains("refus") || message.contains("127.0.0.1:1"),
+                "qual fault must carry the node text, got {message:?}"
+            ),
+            other => panic!("wrong node must be a connection error, got {other:?}"),
+        }
+        eprintln!("qual fault asserted: wrong node fails closed");
     }
 }
