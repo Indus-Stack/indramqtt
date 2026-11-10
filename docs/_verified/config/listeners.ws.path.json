@@ -1,0 +1,9 @@
+{
+  "action": "Run the upgrade on the configured path and on a wrong path.",
+  "config": "[listeners.ws]\nbind = \"127.0.0.1:8083\"\npath = \"/docs-mqtt\"\n",
+  "item": "listeners.ws.path",
+  "kind": "setting",
+  "output": "path-ok",
+  "returncode": 0,
+  "verified": true
+}

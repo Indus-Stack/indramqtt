@@ -1,0 +1,22 @@
+[example]
+area = "config"
+item = "listeners.api.bind"
+kind = "setting"
+expect = "api-bind-ok"
+expected = "The broker binds the configured API address and the health endpoint answers."
+source = "`crates/broker-node/src/main.rs` binds the API socket from the file value."
+action = "Read the health endpoint on the configured bind."
+config = '''
+[listeners.api]
+bind = "127.0.0.1:${API_PORT}"
+'''
+display_config = '''
+[listeners.api]
+bind = "127.0.0.1:18083"
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/healthz")
+assert status == 200, (status, body)
+print("api-bind-ok")
+'''

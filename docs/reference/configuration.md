@@ -229,9 +229,34 @@ Open the MQTT, WebSocket and API sockets.
 
 ### `listeners.tcp.enabled`
 
-Whether the plaintext MQTT listener accepts connections.
+`listeners.tcp.enabled` switches the plaintext MQTT listener on. Set it to false to close the TCP socket. The API still answers when MQTT is off.
+
+The default is true.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tcp]
+enabled = false
+
+[auth]
+allow_anonymous = true
+```
+
+Action:
+
+```text
+Stop the TCP listener and dial the MQTT port.
+```
+
+Captured output:
+
+```output
+refused
+```
 
 Notes:
 
@@ -240,9 +265,31 @@ Notes:
 
 ### `listeners.tcp.bind`
 
-Bind address for the plaintext MQTT listener.
+`listeners.tcp.bind` sets the bind address of the plaintext MQTT listener. Use loopback for local clients only.
+
+The default is `0.0.0.0:1883`.
 
 Type: `socket address string`. Default: `"0.0.0.0:1883"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tcp]
+bind = "127.0.0.1:1883"
+```
+
+Action:
+
+```text
+Connect one client to the configured bind.
+```
+
+Captured output:
+
+```output
+connected
+```
 
 Notes:
 
@@ -251,9 +298,34 @@ Notes:
 
 ### `listeners.tcp.max_connections`
 
-Maximum concurrent connections on the plaintext MQTT listener.
+`listeners.tcp.max_connections` caps concurrent connections on the plaintext listener. The kernel closes a new connection past the cap. The same cap also sizes the TLS, WS and WSS rows.
+
+The default is 1000000.
 
 Type: `u32`. Default: `1000000`. Range: `1..=10000000`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tcp]
+max_connections = 1
+
+[auth]
+allow_anonymous = true
+```
+
+Action:
+
+```text
+Connect two clients with a cap of one.
+```
+
+Captured output:
+
+```output
+limited
+```
 
 Notes:
 
@@ -262,20 +334,42 @@ Notes:
 
 ### `listeners.tcp.backlog`
 
-Listener accept backlog for the plaintext MQTT listener.
-
-Type: `u32`. Default: `1024`. Range: `1..=65536`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `listeners.tcp.native`
 
-Deprecated. Ignored. The kernel always serves this listener.
+`listeners.tcp.native` is deprecated. The kernel ignores the value and always serves the listener. Boot logs a warning when a file sets it.
+
+The default is false.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.tcp]
+native = true
+
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+```
+
+Action:
+
+```text
+Set the deprecated flag and connect one client.
+```
+
+Captured output:
+
+```output
+ignored
+```
 
 Notes:
 
@@ -427,9 +521,32 @@ Notes:
 
 ### `listeners.ws.enabled`
 
-Whether the MQTT-over-WebSocket listener accepts connections.
+`listeners.ws.enabled` switches the WebSocket listener on. Set it to false to close the WebSocket socket. Plain MQTT still serves when WebSocket is off.
+
+The default is true.
 
 Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.ws]
+enabled = false
+bind = "127.0.0.1:8083"
+```
+
+Action:
+
+```text
+Stop the WebSocket listener and dial its port.
+```
+
+Captured output:
+
+```output
+refused
+```
 
 Notes:
 
@@ -438,9 +555,31 @@ Notes:
 
 ### `listeners.ws.bind`
 
-Bind address for the MQTT-over-WebSocket listener.
+`listeners.ws.bind` sets the bind address of the WebSocket listener. Use loopback for local clients only.
+
+The default is `0.0.0.0:8083`.
 
 Type: `socket address string`. Default: `"0.0.0.0:8083"`. Range: `valid host:port, port 1..=65535`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.ws]
+bind = "127.0.0.1:8083"
+```
+
+Action:
+
+```text
+Run the WebSocket upgrade on the configured bind.
+```
+
+Captured output:
+
+```output
+ws-ok
+```
 
 Notes:
 
@@ -449,9 +588,32 @@ Notes:
 
 ### `listeners.ws.path`
 
-HTTP path serving MQTT-over-WebSocket traffic.
+`listeners.ws.path` sets the HTTP path of the WebSocket listener. The upgrade must name this path. A wrong path gets 404.
+
+The default is `/mqtt`.
 
 Type: `string`. Default: `"/mqtt"`. Range: `must start with '/'`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.ws]
+bind = "127.0.0.1:8083"
+path = "/docs-mqtt"
+```
+
+Action:
+
+```text
+Run the upgrade on the configured path and on a wrong path.
+```
+
+Captured output:
+
+```output
+path-ok
+```
 
 Notes:
 
@@ -460,9 +622,32 @@ Notes:
 
 ### `listeners.ws.native`
 
-Deprecated. Ignored. The kernel always serves this listener.
+`listeners.ws.native` is deprecated. The kernel ignores the value and always serves the listener. Boot logs a warning when a file sets it.
+
+The default is false.
 
 Type: `bool`. Default: `false`. Range: `true | false`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.ws]
+native = true
+bind = "127.0.0.1:8083"
+```
+
+Action:
+
+```text
+Set the deprecated flag and run the upgrade.
+```
+
+Captured output:
+
+```output
+ignored
+```
 
 Notes:
 
@@ -603,20 +788,36 @@ Notes:
 
 ### `listeners.api.enabled`
 
-Whether the management REST API and dashboard serve requests.
-
-Type: `bool`. Default: `true`. Range: `true | false`. Restart: `not proven`.
-
-Notes:
-
-- A wrong type fails validation.
-- Related settings sit in the same group.
+> [!WARNING]
+> Not verified: see the failure record in [Verification failures](../_verification/failures.md).
 
 ### `listeners.api.bind`
 
-Bind address for the management REST API. Empty disables the API.
+`listeners.api.bind` sets the bind address of the management API.
+
+The default is `0.0.0.0:18083`.
 
 Type: `socket address string`. Default: `"0.0.0.0:18083"`. Range: `valid host:port, port 1..=65535; empty disables the API`. Restart: `not proven`.
+
+Example configuration:
+
+```toml no-test
+# Reason: the verifier boots the broker with this file.
+[listeners.api]
+bind = "127.0.0.1:18083"
+```
+
+Action:
+
+```text
+Read the health endpoint on the configured bind.
+```
+
+Captured output:
+
+```output
+api-bind-ok
+```
 
 Notes:
 

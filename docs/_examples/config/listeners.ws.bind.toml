@@ -1,0 +1,44 @@
+[example]
+area = "config"
+item = "listeners.ws.bind"
+kind = "setting"
+expect = "ws-ok"
+expected = "The broker binds the configured WebSocket address and the upgrade answers 101."
+source = "`crates/broker-node/src/main.rs` binds each enabled listener from the file, and `crates/broker-node/src/native.rs` answers the upgrade on it."
+action = "Run the WebSocket upgrade on the configured bind."
+config = '''
+[listeners.ws]
+bind = "127.0.0.1:${COAP_PORT}"
+
+[auth]
+allow_anonymous = true
+'''
+display_config = '''
+[listeners.ws]
+bind = "127.0.0.1:8083"
+'''
+script = '''
+from config_probe import *
+import os
+import socket
+ws_port = int(os.environ["COAP_PORT"])
+sock = socket.create_connection(("127.0.0.1", ws_port), timeout=5)
+sock.settimeout(5)
+sock.sendall(
+    f"GET /mqtt HTTP/1.1\r\nHost: 127.0.0.1:{ws_port}\r\n"
+    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "Sec-WebSocket-Protocol: mqtt\r\n\r\n".encode()
+)
+answer = b""
+while b"\r\n\r\n" not in answer and len(answer) < 2048:
+    chunk = sock.recv(512)
+    if not chunk:
+        break
+    answer += chunk
+sock.close()
+line = answer.decode(errors="replace").splitlines()[0]
+assert "101" in line, line
+print("ws-ok")
+'''

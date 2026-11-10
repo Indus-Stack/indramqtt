@@ -137,8 +137,8 @@ The list holds one row per `sh test` block. The output column holds the real out
 | `reference/api/rule-engine.md` | 516 | `OK` |
 | `reference/cli.md` | 2330 | `OK` |
 | `reference/cli.md` | 2346 | `OK` |
-| `reference/configuration.md` | 2547 | `OK` |
-| `reference/configuration.md` | 2563 | `OK` |
+| `reference/configuration.md` | 2748 | `OK` |
+| `reference/configuration.md` | 2764 | `OK` |
 | `reference/index.md` | 41 | `OK` |
 | `reference/metrics.md` | 118 | `OK` |
 | `reference/metrics.md` | 134 | `OK` |

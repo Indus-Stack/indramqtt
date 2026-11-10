@@ -1092,3 +1092,17 @@ AssertionError: (32, '0004')`.
   File "<stdin>", line 16, in <module>
 AssertionError: (32, '0004')`.
 - Date: 2026-11-09.
+
+## DX2-059 item `listeners.tcp.backlog`
+
+- Input: the configuration in `docs/_examples/config/listeners.tcp.backlog.toml` and this action: Read the live listener value for the configured accept queue.
+- Expected: The live listener reports the configured accept queue 2048. Source: `crates/broker-node/src/native.rs` passes the file value to the socket at bind.
+- Broker gave: `GET /api/v5/listeners/tcp:default` returns 200. The body holds no `backlog` field. `detail_json` omits backlog for built-in rows and `tcp_options` is None.
+- Date: 2026-11-10.
+
+## DX2-059 item `listeners.api.enabled`
+
+- Input: the configuration in `docs/_examples/config/listeners.api.enabled.toml` and this action: Dial the API port and the MQTT port with the API off.
+- Expected: With the API off, the health endpoint refuses and MQTT accepts. Source: `crates/broker-node/src/main.rs` opens no socket when the flag is false.
+- Broker gave: The docs runner waits for `/healthz` on the API port. A run with the flag off never reaches the action. The broker opens no API socket per `main.rs:12192`.
+- Date: 2026-11-10.

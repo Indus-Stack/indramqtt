@@ -1,0 +1,9 @@
+{
+  "action": "Read the health endpoint on the configured bind.",
+  "config": "[listeners.api]\nbind = \"127.0.0.1:18083\"\n",
+  "item": "listeners.api.bind",
+  "kind": "setting",
+  "output": "api-bind-ok",
+  "returncode": 0,
+  "verified": true
+}

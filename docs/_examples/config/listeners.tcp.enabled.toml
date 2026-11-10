@@ -1,0 +1,28 @@
+[example]
+area = "config"
+item = "listeners.tcp.enabled"
+kind = "setting"
+expect = "refused"
+expected = "With the TCP listener off, the API answers but the MQTT port refuses."
+source = "`crates/broker-node/src/main.rs` skips a disabled listener at boot, and `crates/broker-api/src/v5/listeners.rs` stores the enable flag."
+action = "Stop the TCP listener and dial the MQTT port."
+config = '''
+[listeners.tcp]
+enabled = false
+
+[auth]
+allow_anonymous = true
+'''
+script = '''
+from config_probe import *
+import socket
+status, body = http("GET", "/healthz")
+assert status == 200, (status, body)
+try:
+    probe = socket.create_connection(("127.0.0.1", MQTT_PORT), timeout=3)
+except OSError:
+    print("refused")
+else:
+    probe.close()
+    raise AssertionError("the disabled TCP listener answered")
+'''

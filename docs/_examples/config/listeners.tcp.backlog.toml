@@ -1,0 +1,22 @@
+[example]
+area = "config"
+item = "listeners.tcp.backlog"
+kind = "setting"
+expect = "backlog=2048"
+expected = "The live listener reports the configured accept queue 2048."
+source = "`crates/broker-node/src/native.rs` passes the file value to the socket at bind."
+action = "Read the live listener value for the configured accept queue."
+config = '''
+[listeners.tcp]
+backlog = 2048
+
+[auth]
+allow_anonymous = true
+'''
+script = '''
+from config_probe import *
+status, body = http("GET", "/api/v5/listeners/tcp:default")
+assert status == 200, (status, body)
+assert body.get("backlog") == 2048, body
+print("backlog=2048")
+'''

@@ -1,0 +1,26 @@
+[example]
+area = "config"
+item = "listeners.tcp.native"
+kind = "setting"
+expect = "ignored"
+expected = "The broker ignores the deprecated flag and still serves MQTT."
+source = "`crates/broker-node/src/main.rs` warns about the deprecated flag and serves the listener from the kernel."
+action = "Set the deprecated flag and connect one client."
+config = '''
+[listeners.tcp]
+native = true
+
+[auth]
+allow_anonymous = true
+
+[logging]
+level = "warn"
+'''
+script = '''
+from config_probe import *
+sock, ack, props = connect("tcp-native-client", v5=True)
+disconnect(sock)
+text = log_text()
+assert "listeners.tcp.native" in text, text[:500]
+print("ignored")
+'''

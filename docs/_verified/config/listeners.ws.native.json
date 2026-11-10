@@ -1,0 +1,9 @@
+{
+  "action": "Set the deprecated flag and run the upgrade.",
+  "config": "[listeners.ws]\nnative = true\nbind = \"127.0.0.1:8083\"\n",
+  "item": "listeners.ws.native",
+  "kind": "setting",
+  "output": "ignored",
+  "returncode": 0,
+  "verified": true
+}
