@@ -1681,8 +1681,8 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual([row["id"] for row in chain], [external["id"], builtin["id"]])
         self.assert_fields_kept(chain[0], external)
 
-    # // AZ-01 inventory: current behaviour; owner MV-09a
-    def test_ldap_file_deadlines_are_replaced_by_runtime_defaults(self):
+    # // AZ-01 inventory: applied deadlines; owner MV-09a
+    def test_ldap_file_deadlines_are_applied(self):
         b = self.broker
         for scheme in ["ldap", "ldaps"]:
             with self.subTest(scheme=scheme):
@@ -1697,8 +1697,7 @@ class InventoryEntry(unittest.TestCase):
                     _, ack = b.connect("ldap-deadline-" + scheme, True)
                     elapsed = time.monotonic() - started
                     self.assertEqual(ack, "0004")
-                    self.assertGreater(elapsed, 1.0)
-                    self.assertLess(elapsed, 9.0)
+                    self.assertLess(elapsed, 1.0)
                     self.assertGreaterEqual(len(peer.clients), 1)
                     for key in ["pool_size", "connect_timeout_ms", "read_timeout_ms"]:
                         status, loaded = b.http("GET", "/api/v1/config/explain?key=ldap." + key)
@@ -2285,15 +2284,16 @@ class InventoryEntry(unittest.TestCase):
         self.assertEqual(b.http("GET", path), (200, original))
 
 
-    # // AZ-01 inventory: current behaviour; owner MV-09a
-    def test_ldap_file_pool_one_allows_three_simultaneous_backend_binds(self):
+    # // AZ-01 inventory: applied pool bound; owner MV-09a
+    def test_ldap_file_pool_one_serializes_backend_binds(self):
         peer = SilentPeer()
         self.addCleanup(peer.close)
         b = self.boot(extra='[ldap]\nserver_url="ldap://127.0.0.1:' + str(peer.port)
                       + '"\nbase_dn="dc=inventory"\nbind_dn="cn=inventory"\nbind_password="'
-                      + secrets.token_hex(20) + '"\npool_size=1\nconnect_timeout_ms=100\nread_timeout_ms=100\n')
+                      + secrets.token_hex(20) + '"\npool_size=1\nconnect_timeout_ms=1000\nread_timeout_ms=100\n')
         ready = threading.Event()
         answers = []
+        completed = []
         errors = []
 
         def connect(index):
@@ -2302,25 +2302,37 @@ class InventoryEntry(unittest.TestCase):
                 answers.append(b.connect("ldap-pool-" + str(index), authenticated=True)[1])
             except Exception as error:
                 errors.append(type(error).__name__)
+            finally:
+                completed.append(time.monotonic())
 
         workers = [threading.Thread(target=connect, args=(index,), daemon=True)
                    for index in range(3)]
         for worker in workers:
             worker.start()
         ready.set()
-        try:
-            deadline = time.monotonic() + 2
-            while len(peer.clients) < 3 and time.monotonic() < deadline:
-                time.sleep(0.02)
-            # No backend has answered, yet all three binds have reached it.
-            # A pool with capacity one would hold the other two callers.
-            self.assertEqual(len(peer.clients), 3)
-        finally:
-            for worker in workers:
-                worker.join(timeout=10)
-            self.assertFalse(any(worker.is_alive() for worker in workers))
+        first_seen = None
+        third_seen = None
+        watch_start = time.monotonic()
+        while time.monotonic() - watch_start < 10:
+            seen = len(peer.clients)
+            if seen >= 1 and first_seen is None:
+                first_seen = time.monotonic()
+            if seen >= 3:
+                third_seen = time.monotonic()
+                break
+            time.sleep(0.005)
+        for worker in workers:
+            worker.join(timeout=10)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
         self.assertEqual(errors, [])
         self.assertEqual(answers, ["0004"] * 3)
+        self.assertEqual(len(peer.clients), 3)
+        # Pool bound (1) applied: binds serialize through one slot.
+        # Each silent bind holds about 100 ms. Three arrivals span 200 ms.
+        # The pool wait uses connect timeout (1000 ms), so all three queue.
+        self.assertIsNotNone(first_seen)
+        self.assertIsNotNone(third_seen)
+        self.assertGreaterEqual(third_seen - first_seen, 0.15, "pool bound not applied: binds ran together")
 
 
     # // AZ-01 inventory: current behaviour; owner MV-15

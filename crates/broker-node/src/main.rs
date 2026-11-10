@@ -11898,6 +11898,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             user_filter: args.ldap_user_filter.clone(),
             group_attribute: args.ldap_group_attribute.clone(),
             required_group: args.ldap_required_group.clone(),
+            // Bound on concurrent directory authentications.
+            // Reason: one slot per CONNECT keeps bursts bounded.
+            // Exhaustion fails closed and never stalls accepts.
+            pool_size: cfg.ldap.pool_size,
+            // Bound on TCP connect plus TLS handshake.
+            // Reason: a slow directory fails fast and never stalls accepts.
+            connect_timeout_ms: cfg.ldap.connect_timeout_ms,
+            // Bound on each bind and search round-trip.
+            // Reason: a silent directory fails fast and never stalls accepts.
+            read_timeout_ms: cfg.ldap.read_timeout_ms,
             ca_cert_path: if args.ldap_ca_cert.is_empty() {
                 None
             } else {
